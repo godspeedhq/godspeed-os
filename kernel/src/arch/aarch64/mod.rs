@@ -1120,11 +1120,12 @@ pub(crate) fn put_str(s: &[u8]) {
     // reporting how many cores had come up. An instrument that loses the measurement is worse than no
     // instrument, because it looks like a result.
     #[cfg(feature = "pi4")]
-    serial_emit(s, true);
-    #[cfg(not(feature = "pi4"))]
+    let claim = claim_serial();
     for &b in s {
         put_byte(b);
     }
+    #[cfg(feature = "pi4")]
+    release_serial(claim);
     // Serial first, then the display: serial is the source of truth, and a mirror that ran first would
     // put the display ahead of the log it is mirroring.
     #[cfg(feature = "pi4")]
@@ -1504,219 +1505,152 @@ pub fn serial_write_byte(b: u8) {
     if b == b'\n' { put_byte(b'\r'); }
     put_byte(b);
 }
-// ---------------------------------------------------------------------------
-// THE SERIAL LINE RING - why no core waits for the UART.
-//
-// Four cores writing a byte at a time into one 32-entry FIFO interleave at character granularity, so
-// lines vanish into each other. The first four-core boot printed `3 of 3 secondaries checked in` and
-// then NO "core N online" lines at all, while QEMU printed every one - not because the cores did not
-// run, but because their output was shredded by the boot core's. An instrument that destroys the
-// measurement is worse than no instrument, because it looks like a result.
-//
-// TWO DESIGNS WERE TRIED AND BOTH FAILED, on hardware, in ways worth recording so they are not tried
-// again:
-//
-//   1. Claim the UART and SPIN for it. An early version spun two million times AND held the claim
-//      across the framebuffer render: boot took 104 seconds and cores were declared wedged.
-//   2. Claim it and spin only for a BOUNDED time. At a 10 ms deadline chaos rounds ran ~2x slow and
-//      splices survived; at 150 ms - sized to actually cover a 512-byte flush, which is ~44 ms of
-//      UART time at 115200 - rounds went to 6.4 SECONDS against a baseline near one.
-//
-// The lesson both teach is the same: the UART is slow, so ANY design where a core waits its turn
-// spends scheduler time to buy tidy output, and that trade is never worth making. The argument that
-// waiting is "cost-neutral because the UART is the bottleneck either way" is right about total wire
-// time and wrong about the core: interleaving, it makes progress and produces ugly output; waiting,
-// it does nothing at all.
-//
-// So nobody waits. A writer copies its whole line into a bounded ring - a memcpy, microseconds - and
-// returns. Whichever core finds the wire free drains the ring onto it. Lines cannot interleave
-// because a line is only ever written by one core, entire; and no writer blocks, because handing a
-// line over is not the same as putting it on the wire.
-// ---------------------------------------------------------------------------
-
-/// Longest line the ring will take. Matches `log::SERIAL_STAGE`, which is the largest single flush
-/// the neutral log produces; anything longer is written directly rather than truncated.
-#[cfg(feature = "pi4")]
-const SERIAL_LINE_MAX: usize = 512;
-
-/// Lines the ring holds. 12 KiB of `.bss`, fixed - no heap (§26.6.1), and the bound is readable off
-/// this constant rather than hiding in an allocator.
-#[cfg(feature = "pi4")]
-const SERIAL_RING_LINES: usize = 24;
-
-/// Lines one core will put on the wire before letting another take over.
+/// Held by whichever core is mid-line on the UART, as `core_id + 1`. `0` means free.
 ///
-/// The drainer is doing everyone's UART work, so it must not be able to be held there indefinitely by
-/// other cores queueing faster than it writes. Two passes of this covers a full ring, which is enough
-/// that a burst is drained by whoever caught it rather than dribbling out one line per later write.
+/// **Without this, multi-core logging is not merely untidy - it is unreadable, and it lies.** Four cores
+/// writing a byte at a time into one FIFO interleave at character granularity, so lines vanish into each
+/// other. The first four-core hardware boot printed `3 of 3 secondaries checked in` and then **no**
+/// "core N online" lines at all, while QEMU printed every one: not because the cores did not run, but
+/// because their output was shredded by the boot core's. Debugging SMP through that instrument means
+/// drawing conclusions from evidence the instrument destroyed.
+///
+/// The claim is BOUNDED and never fatal: a core that cannot get it within a deadline writes anyway
+/// rather than spinning forever. A garbled line is bad; a core deadlocked inside the panic handler
+/// trying to report why is worse, and this path is reachable from panics and ISRs.
+///
+/// The OWNER is stored, not just a flag, so a write that re-enters this path on the same core - an ISR
+/// logging while that core is mid-line, or a panic raised inside a write - is recognised as nested and
+/// proceeds instead of waiting for a claim it already holds.
 #[cfg(feature = "pi4")]
-const SERIAL_DRAIN_BUDGET: usize = SERIAL_RING_LINES;
+static SERIAL_OWNER: AtomicU32 = AtomicU32::new(0);
 
+/// Guards the DISPLAY mirror, separately from the UART.
+///
+/// Two different costs want two different policies. The UART run is the bottleneck and is worth waiting
+/// for; the framebuffer render is expensive, happens only while the boot log still mirrors, and is
+/// never worth making another core wait for. So the mirror keeps the original try-once rule - a
+/// contended core simply skips it - while the UART gets a bounded wait.
 #[cfg(feature = "pi4")]
-struct SerialRing {
-    buf: [[u8; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
-    len: [u16; SERIAL_RING_LINES],
-    head: usize,
-    count: usize,
-    /// Lines lost to a full ring. REPORTED when the ring next drains, never silently discarded
-    /// (invariant 12) - a log that quietly loses lines is the instrument lying again, in a new way.
-    dropped: u32,
+static MIRROR_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// What a claim attempt produced.
+#[cfg(feature = "pi4")]
+enum SerialClaim {
+    /// Acquired here; this writer must release it.
+    Held,
+    /// Already held BY THIS CORE further up the stack. Proceed, and do NOT release - the outer writer
+    /// still owns it and releasing here would hand the UART away mid-line.
+    Nested,
+    /// The deadline passed with another core still holding. Write anyway: interleaved output is bad,
+    /// a stalled core is worse, and this is exactly the behaviour the port had before the wait existed.
+    Expired,
 }
 
+/// Longest a core will wait for the UART before writing anyway.
+///
+/// A DURATION, not a spin count, because a count means a different wait on every machine and the two
+/// boards this runs on clock the generic timer differently (54 MHz on the Pi 4, 62.5 MHz under QEMU).
+///
+/// **DELIBERATELY SHORTER THAN THE LONGEST WRITE, which is a compromise and not an oversight.**
+///
+/// The tempting reasoning is: the neutral log flushes up to `SERIAL_STAGE` (512) bytes in one call,
+/// 512 bytes at 115200 baud is ~44 ms, so a deadline below that expires mid-write and accomplishes
+/// nothing. That reasoning is correct about the mechanism and wrong about the remedy. Raising the
+/// deadline to 150 ms was tried on hardware and made chaos rounds take 6.4 SECONDS each against a
+/// baseline near 1 - cores spending their quanta waiting on a UART instead of running services. That
+/// is the 104-second-boot failure returning by a different route, and it is a far worse bug than a
+/// garbled log line.
+///
+/// So the wait is sized to serialise the SHORT lines that make up most of the log, and to give up
+/// rather than queue behind a long flush. Splices therefore still occur, concentrated exactly where
+/// the writes are longest. That residual is real and is recorded in the audit rather than implied
+/// away.
+///
+/// THE ACTUAL FIX IS NOT A LONGER WAIT. It is not waiting: a bounded ring that accepts whole lines
+/// from any core and lets a single drainer write them, so no writer ever blocks on the UART and lines
+/// cannot interleave by construction. That is a larger change to the machine's only diagnostic path
+/// and wants its own careful pass; this constant is the honest interim.
 #[cfg(feature = "pi4")]
-impl SerialRing {
-    const fn new() -> Self {
-        SerialRing {
-            buf: [[0; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
-            len: [0; SERIAL_RING_LINES],
-            head: 0,
-            count: 0,
-            dropped: 0,
-        }
+fn serial_claim_deadline_ticks() -> u64 {
+    // 10 ms - about one short line's worth of UART time. `timer::frequency` reads CNTFRQ_EL0; a
+    // machine reporting 0 gets no wait at all, which is the old behaviour rather than an unbounded one.
+    timer::frequency() / 100
+}
+
+/// Claim the UART for one line, waiting a BOUNDED time for it.
+///
+/// **Why waiting is affordable here, when spinning for this claim once cost a 104-second boot.** That
+/// disaster was not the wait itself: it was holding the claim across the framebuffer render, so every
+/// core queued behind every other core's glyph drawing and cache maintenance. The render is now outside
+/// the claim entirely (see `MIRROR_BUSY`), and what remains inside it is the UART byte run.
+///
+/// THE WAIT IS VERY NEARLY FREE, and that is the argument this rests on rather than a measurement.
+/// `put_byte` spins for FIFO space, so a contended writer was never proceeding cheaply - it was
+/// already blocking, just destructively. The UART is the bottleneck either way: two cores interleaving
+/// two 80-byte lines occupy it for the same total time as writing those lines one after the other, and
+/// the last core to finish finishes at the same moment under both schemes. Serialising spends time
+/// that was being spent anyway, and buys whole lines with it. What it does NOT do is add a new class
+/// of stall: the pre-existing one is simply relocated from the FIFO wait to the claim wait.
+///
+/// Heavy contention degrades to the OLD behaviour rather than to a stalled core: past the deadline a
+/// writer interleaves exactly as it always did. So this is a strict improvement in the common case
+/// (one other core mid-line, waited out) and a no-op in the pathological one.
+#[cfg(feature = "pi4")]
+fn claim_serial() -> SerialClaim {
+    // SAFETY: a side-effect-free MPIDR_EL1 read. Valid at any point including early boot, which is why
+    // the owner can be identified on THIS path - unlike x86, where core identity costs an APIC MMIO
+    // read with a boot-ordering precondition and must not be taken on every log line.
+    let me = unsafe { boot::get_lapic_id() } + 1;
+    if SERIAL_OWNER.load(Ordering::Acquire) == me {
+        return SerialClaim::Nested;
     }
-}
-
-/// The queue itself.
-///
-/// Every acquisition uses `lock_irq`: this is taken from ordinary code AND from interrupt context (an
-/// ISR that logs), and a lock taken in both on one core deadlocks unless the hold masks interrupts.
-/// The hold is a memcpy either way, so masking costs nothing measurable.
-#[cfg(feature = "pi4")]
-static SERIAL_RING: crate::smp::SpinLock<SerialRing> = crate::smp::SpinLock::new(SerialRing::new());
-
-/// Set while a core is putting lines on the wire. `false` means the wire is free.
-///
-/// This is NOT a lock anyone waits on - a core that finds it taken has already handed its line over
-/// and simply returns.
-#[cfg(feature = "pi4")]
-static SERIAL_DRAINING: AtomicBool = AtomicBool::new(false);
-
-/// Once a panic starts, the ring is bypassed entirely.
-///
-/// A machine that is stopping may never drain a queue, and the last thing it says is the thing worth
-/// saying. Interleaved panic output is a fair price for output that actually appears.
-#[cfg(feature = "pi4")]
-static SERIAL_PANIC_MODE: AtomicBool = AtomicBool::new(false);
-
-/// Stop queueing; write straight to the wire from here on. Called at the top of the panic path.
-#[cfg(feature = "pi4")]
-pub fn serial_enter_panic_mode() {
-    SERIAL_PANIC_MODE.store(true, Ordering::Release);
-}
-
-/// Straight onto the wire, no queue. `raw` writes bytes verbatim; otherwise `\n` becomes `\r\n`,
-/// which a serial terminal needs or every line starts where the last one ended.
-#[cfg(feature = "pi4")]
-fn serial_write_direct(s: &[u8], raw: bool) {
-    if raw {
-        for &b in s { put_byte(b); }
-    } else {
-        for &b in s { serial_write_byte(b); }
-    }
-}
-
-/// Hand one whole line to the ring, then put queued lines on the wire if nobody else is.
-///
-/// The CR expansion happens HERE rather than in the drainer, so the ring holds bytes exactly as they
-/// belong on the wire and the drainer needs to know nothing about who queued them.
-#[cfg(feature = "pi4")]
-fn serial_emit(s: &[u8], raw: bool) {
-    if SERIAL_PANIC_MODE.load(Ordering::Acquire) {
-        serial_write_direct(s, raw);
-        return;
-    }
-
-    {
-        let mut r = SERIAL_RING.lock_irq();
-        if r.count == SERIAL_RING_LINES {
-            // Full: the wire is slower than the system is talking. Count it and say so on the next
-            // drain rather than pretending the line was written.
-            r.dropped = r.dropped.saturating_add(1);
-        } else {
-            let idx = (r.head + r.count) % SERIAL_RING_LINES;
-            let mut n = 0usize;
-            let mut fits = true;
-            for &b in s {
-                if !raw && b == b'\n' {
-                    if n == SERIAL_LINE_MAX { fits = false; break; }
-                    r.buf[idx][n] = b'\r';
-                    n += 1;
-                }
-                if n == SERIAL_LINE_MAX { fits = false; break; }
-                r.buf[idx][n] = b;
-                n += 1;
-            }
-            if fits {
-                r.len[idx] = n as u16;
-                r.count += 1;
-            } else {
-                // Too long to queue whole, and a half-queued line is worse than an interleaved one.
-                drop(r);
-                serial_write_direct(s, raw);
-                return;
-            }
-        }
-    }
-
-    serial_drain();
-}
-
-/// Put queued lines on the wire. At most one core does this at a time; the rest have already handed
-/// their line over and returned.
-#[cfg(feature = "pi4")]
-fn serial_drain() {
-    // Two passes: the second closes the window where a line is queued between the last pop and the
-    // release, which would otherwise sit until some later write happened to drain it.
-    for _ in 0..2 {
-        if SERIAL_DRAINING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+    let deadline = read_cycle_counter().wrapping_add(serial_claim_deadline_ticks());
+    loop {
+        if SERIAL_OWNER
+            .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
         {
-            return; // someone else has the wire; our line is queued and they will write it
+            return SerialClaim::Held;
         }
-
-        let mut line = [0u8; SERIAL_LINE_MAX];
-        let mut lost = 0u32;
-        let mut wrote = 0usize;
-        while wrote < SERIAL_DRAIN_BUDGET {
-            let n = {
-                let mut r = SERIAL_RING.lock_irq();
-                if r.dropped > 0 {
-                    lost = lost.saturating_add(r.dropped);
-                    r.dropped = 0;
-                }
-                if r.count == 0 { break; }
-                let idx = r.head;
-                let n = r.len[idx] as usize;
-                line[..n].copy_from_slice(&r.buf[idx][..n]);
-                r.head = (r.head + 1) % SERIAL_RING_LINES;
-                r.count -= 1;
-                n
-            };
-            serial_write_direct(&line[..n], true);
-            wrote += 1;
+        if read_cycle_counter() >= deadline {
+            return SerialClaim::Expired;
         }
+        core::hint::spin_loop();
+    }
+}
 
-        SERIAL_DRAINING.store(false, Ordering::Release);
-
-        if lost > 0 {
-            // Said on the wire, not swallowed. Written directly: it is a report ABOUT the queue.
-            serial_write_direct(b"\r\nserial: log lines lost to a full ring\r\n", true);
-        }
-
-        let pending = { SERIAL_RING.lock_irq().count > 0 };
-        if !pending { return; }
+/// Release the claim, but ONLY if this writer is the one that took it.
+///
+/// A nested writer must not release: the outer one on this core still owns the line it is midway
+/// through, and handing the UART away here would let another core land inside it - reintroducing
+/// exactly the interleaving the claim exists to prevent.
+#[cfg(feature = "pi4")]
+fn release_serial(claim: SerialClaim) {
+    if matches!(claim, SerialClaim::Held) {
+        SERIAL_OWNER.store(0, Ordering::Release);
     }
 }
 
 #[cfg(feature = "pi4")]
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
-    serial_emit(s, false);
-    // The display mirror stays at the CALL SITE and outside the queue. It is a different device with
-    // its own ordering, it is a no-op once the shell owns the console, and putting it in the drainer
-    // would make one core do everyone's glyph rendering - which is the exact cost that turned a boot
-    // into 104 seconds.
-    video::mirror_log(s);
+    let claim = claim_serial();
+
+    for &b in s { serial_write_byte(b); }
+
+    // RELEASED BEFORE THE MIRROR, and that ordering is the whole reason a wait is affordable above.
+    // Holding the UART across the render is what turned a boot into a two-minute crawl.
+    release_serial(claim);
+
+    // The mirror keeps the ORIGINAL rule: one attempt, and a contended core skips it. It is expensive,
+    // it only does anything while the boot log still reaches the display, and nobody is reading the
+    // screen during contention anyway. Serial keeps the full record either way.
+    if MIRROR_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        video::mirror_log(s);
+        MIRROR_BUSY.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(not(feature = "pi4"))]
@@ -1745,7 +1679,11 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     // so the two shredded each other: a chaos separator woven through a `cap::get:` line, a device
     // descriptor spliced into a service banner. Serialising only the kernel's own writers fixes half
     // a problem and leaves the half a person actually reads - the shell's output - still broken.
-    serial_emit(s, false);
+    let claim = claim_serial();
+    for &b in s {
+        serial_write_byte(b);
+    }
+    release_serial(claim);
     // The gate is now real: `false` means a full-screen app owns the display, so this text belongs on
     // serial only.
     if to_fb {
@@ -1854,7 +1792,11 @@ pub fn console_notice(s: &[u8]) {
 /// call is still a line another core can land inside.
 #[cfg(feature = "pi4")]
 fn serial_write_bytes_lockfree_no_fb(s: &[u8]) {
-    serial_emit(s, false);
+    let claim = claim_serial();
+    for &b in s {
+        serial_write_byte(b);
+    }
+    release_serial(claim);
 }
 
 /// A fixed stack buffer that `write!` can render into. No heap (§26.6.1): the bound is the buffer,

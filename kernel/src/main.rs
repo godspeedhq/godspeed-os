@@ -400,14 +400,6 @@ fn panic(info: &PanicInfo) -> ! {
     // and then simply never called here - the guarantee was in the constitution and absent from the
     // code, and the first real panic on hardware showed a black screen and said nothing.
     bootcon::reclaim_for_panic();
-    // STOP QUEUEING SERIAL OUTPUT. Log lines are normally handed to a ring and put on the wire by
-    // whichever core finds it free - which is what keeps four cores from shredding each other's lines
-    // without any of them waiting. A panic halts every core, so a queued line may never be drained by
-    // anyone: the last thing the machine says would be the thing that never arrives. From here the
-    // writes go straight to the UART. They can interleave; that is a fair price for output that
-    // exists.
-    #[cfg(all(target_arch = "aarch64", feature = "pi4"))]
-    crate::arch::imp::serial_enter_panic_mode();
     kprintln!("KERNEL PANIC: {}", info);
     // FLUSH THE CONSOLE RING BEFORE HALTING. Console writes are queued and drained by the timer tick
     // (arm32), and after this function no tick will ever run again - so without an explicit flush the
