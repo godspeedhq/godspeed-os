@@ -790,6 +790,47 @@ pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomi
 /// covers any line this console writes.
 const SERIAL_ACQUIRE_US: u32 = 40_000;
 
+/// Write a whole message to the UART in order, waiting for the hardware rather than discarding.
+/// **Only the line-ring drainer calls this**, and that is what makes waiting correct here.
+///
+/// The byte ring exists so an ORDINARY writer never waits on a 115200 line. That is still right, and
+/// it is why every runtime writer queues into the line ring and returns. But the drainer is not an
+/// ordinary writer: it is the single agent whose whole job is to put bytes on the wire, and there is
+/// nothing behind it to starve. Making IT discard was the mistake - it turned "the wire is slower than
+/// we are talking" into corrupted output, because a byte dropped from the middle of a line leaves a
+/// line that reads exactly like a spliced one.
+///
+/// The previous run measured that precisely: 0 lines dropped, 0 bypassed, 0 producer collisions - the
+/// whole structure above held - and ~95 BYTES discarded per drain, forty-nine times. The bytes were
+/// coming out of the middles of lines.
+///
+/// So the granularity of loss has to match the granularity of meaning. A LINE may be dropped, loudly
+/// and counted, because a missing line is visibly missing. Part of a line may not, because a line with
+/// a hole in it still looks like a line and lies to whoever reads it. §26.7: loud failure over silent
+/// corruption.
+///
+/// Waiting is bounded twice over: the FIFO poll gives up rather than hanging on a wedged UART, and the
+/// drainer writes at most `SERIAL_DRAIN_BUDGET` lines before handing on.
+fn pl011_write_blocking(s: &[u8]) {
+    // Order first: anything already queued by the boot path or a panic must reach the wire before this
+    // message, or writing directly here would be the very queue-jump this fixes.
+    for _ in 0..TX_MAKE_ROOM_TRIES { tx_ring_drain(); }
+    // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers in the Device-mapped
+    // peripheral window. Volatile MMIO: poll until the TX FIFO has room, then write one byte.
+    unsafe {
+        for &b in s {
+            // Bounded: a wedged or absent UART with a permanently full TX FIFO must never hang the
+            // output path (invariant 12 / §26.6). On a healthy UART the FIFO drains far faster.
+            let mut t: u32 = 0;
+            while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+                t += 1;
+                if t > 1_000_000 { break; } // give up on this byte rather than hang forever
+            }
+            PL011_DR.write_volatile(b as u32);
+        }
+    }
+}
+
 /// Put a message on the wire NOW, under the claim, whole. The bottom of the stack: everything else
 /// either queues into the line ring or ends up here.
 ///
@@ -804,6 +845,8 @@ const SERIAL_ACQUIRE_US: u32 = 40_000;
 /// genuinely cannot queue.
 pub(super) fn pl011_write_raw(s: &[u8], fb: bool) {
     if !SERIAL_SMP.load(Ordering::Relaxed) {
+        // Boot keeps the queueing byte path: there is one core, so nothing can interleave, and the
+        // ring is what stops early output from waiting on the wire a byte at a time.
         for &b in s { pl011_write_byte(b); }
         // Mirror to the TV once the console is up (no-op before that). `mirror` tests a plain
         // `AtomicBool` BEFORE any exclusive access, which is load-bearing on this path: the first boot
@@ -814,7 +857,7 @@ pub(super) fn pl011_write_raw(s: &[u8], fb: bool) {
         return;
     }
     let held = claim_serial();
-    for &b in s { pl011_write_byte(b); }
+    pl011_write_blocking(s);
     // Mirror ONLY as the claim HOLDER. The boot floor has shared cursor/scroll state and assumes a
     // single writer; a contended writer that could not claim must not also render, or two writers
     // corrupt its position and the TV shows overlapping text. Its bytes still reached serial above,

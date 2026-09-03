@@ -13,6 +13,26 @@ comment.
 
 ---
 
+## 2026-09-03 - arm32: the drainer waits for the wire rather than dropping bytes out of a line
+
+Measurement, not reasoning, produced this one. With the line ring and the single-writer rule in place
+the hardware reported `0 line(s) dropped, 0 bypassed, 0 producer collision(s)` - the whole structure
+above the byte layer held - and **95 bytes discarded per drain, forty-nine times**. The bytes were
+coming out of the MIDDLE of lines, which reads exactly like the splicing the structure was built to
+stop.
+
+So the granularity of loss has to match the granularity of meaning. A line may be dropped, loudly and
+counted, because a missing line is visibly missing. Part of a line may not, because a line with a hole
+in it still looks like a line and lies to whoever reads it.
+
+The byte ring stays where it belongs - stopping an ORDINARY writer from waiting on a 115200 line - and
+the drainer, which is the single agent whose job is the wire and has nothing behind it to starve, now
+waits instead.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 52 -> 53 (+1) | `pl011_write_blocking`: the volatile MMIO loop that polls `PL011_FR.TXFF` and writes `PL011_DR`. Identical to the loop it replaces inside `pl011_write_byte` - same registers, same Device-mapped window, same bounded poll that gives up rather than hanging on a wedged UART - lifted into its own function so the drainer can use it without the discard path attached. One block moved and specialised, not a new kind of access. |
+
 ## 2026-09-03 - arm32: one claim, factored out, so a whole line stays whole (feat/supervisor-owns-images)
 
 The line ring added earlier the same day did not reduce the splice rate at all - 0.36% of lines carried
@@ -2415,7 +2435,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 52 | permitted |
+| arch/arm/mod.rs | 53 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
