@@ -79,9 +79,7 @@ static mut TX_RING: [u8; TX_RING_LEN] = [0; TX_RING_LEN];
 /// occupancy is their difference, so neither needs clamping and the wrap is arithmetic, not a branch.
 static TX_HEAD: AtomicU32 = AtomicU32::new(0);
 static TX_TAIL: AtomicU32 = AtomicU32::new(0);
-/// Bytes dropped because the ring was full. Reported rather than silently swallowed (invariant 12) -
-/// losing console output is exactly the kind of thing that must not happen quietly.
-static TX_DROPPED: AtomicU32 = AtomicU32::new(0);
+
 /// Until the tick is running there is nobody to drain the ring, so writes must go out synchronously.
 /// Boot output therefore behaves exactly as it always has, which also keeps a panic before the first
 /// tick readable.
@@ -94,21 +92,58 @@ pub fn tx_ring_enable() {
 
 /// Queue one byte. False if the ring is full (the caller then blocks, so output is never lost
 /// silently - a dropped byte is counted and reported instead).
+/// How many drain-and-retry rounds a byte gets before it is discarded. Each round moves at most one
+/// FIFO-load (16 bytes) and never waits on the UART, so this is bounded work, not a spin: at 115200 a
+/// full 16-byte FIFO clears in ~1.4 ms and the tick keeps draining regardless. Four rounds is enough
+/// to ride out a burst without ever becoming a wait.
+const TX_MAKE_ROOM_TRIES: u32 = 4;
+
+/// Two producers were inside `tx_push` at once. COUNTED, because the ring's correctness depends on
+/// there being exactly one and that was previously only asserted in a comment.
+static TX_PRODUCER_COLLISIONS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_PRODUCER_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Bytes discarded because the byte ring stayed full. Genuinely dropped now - the old code wrote them
+/// straight to the FIFO instead, which is worse (see below).
+static TX_DISCARDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Reserve the next slot and store one byte. **Single producer.**
+///
+/// `head` is read, used, then stored back. That is a read-modify-write with no atomicity, so two cores
+/// inside this function both read the same `head`, both write the same slot, and both store `head + 1`:
+/// one byte overwrites the other and the stream is corrupted at an arbitrary character position -
+/// `kernel: supervisor died` arriving as `kernel: supervisor dieds`, or `min 2 us` as `min 2 u` with
+/// somebody else's line spliced in after the `u`.
+///
+/// The comment that used to sit here said the single-producer property was "serialised by the same
+/// best-effort serial flag that already orders every write to this UART". That flag is BOUNDED and a
+/// writer that times out proceeds anyway - so it never provided the property this code depends on, and
+/// the claim was the bug rather than the justification. It is true now for a different reason: at
+/// runtime the ring drainer is the only caller, and before SMP there is only one core.
+///
+/// `TX_PRODUCER_COLLISIONS` measures that rather than trusting it. It is reported with the other loss
+/// counters, so "the assumption holds" is a zero in the log instead of a sentence in a comment.
 fn tx_push(b: u8) -> bool {
+    let reentered = TX_PRODUCER_ACTIVE.swap(true, Ordering::Acquire);
+    if reentered { TX_PRODUCER_COLLISIONS.fetch_add(1, Ordering::Relaxed); }
+
     let head = TX_HEAD.load(Ordering::Relaxed);
     let tail = TX_TAIL.load(Ordering::Acquire);
-    if head.wrapping_sub(tail) as usize >= TX_RING_LEN {
-        return false;
-    }
-    // SAFETY: single logical producer region, serialised by the same best-effort serial flag that
-    // already orders every write to this UART. The index is masked into the array, so the write is
-    // always in bounds.
-    unsafe {
-        let p = core::ptr::addr_of_mut!(TX_RING) as *mut u8;
-        p.add((head as usize) & (TX_RING_LEN - 1)).write_volatile(b);
-    }
-    TX_HEAD.store(head.wrapping_add(1), Ordering::Release);
-    true
+    let ok = if head.wrapping_sub(tail) as usize >= TX_RING_LEN {
+        false
+    } else {
+        // SAFETY: single producer (measured by the collision counter above). The index is masked into
+        // the array, so the write is always in bounds.
+        unsafe {
+            let p = core::ptr::addr_of_mut!(TX_RING) as *mut u8;
+            p.add((head as usize) & (TX_RING_LEN - 1)).write_volatile(b);
+        }
+        TX_HEAD.store(head.wrapping_add(1), Ordering::Release);
+        true
+    };
+
+    if !reentered { TX_PRODUCER_ACTIVE.store(false, Ordering::Release); }
+    ok
 }
 
 /// Push as many queued bytes into the TX FIFO as it will take WITHOUT WAITING. Called from the timer
@@ -165,8 +200,13 @@ pub fn tx_ring_flush_blocking() {
 }
 
 /// Bytes lost to a full ring, for reporting.
+///
+/// Reads `TX_DISCARDED`, the counter the ring-full path actually increments. It used to read
+/// `TX_DROPPED`, which nothing incremented after the out-of-order fallback was removed - a statistic
+/// that would have read a confident zero forever while bytes were genuinely being lost. A counter
+/// nothing feeds is worse than no counter, because it looks like evidence.
 pub fn tx_dropped() -> u32 {
-    TX_DROPPED.load(Ordering::Relaxed)
+    TX_DISCARDED.load(Ordering::Relaxed)
 }
 const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
 /// Error flags the PL011 returns **in the data register itself**, alongside the byte: framing (8),
@@ -679,17 +719,33 @@ pub(super) fn pl011_write_byte(b: u8) {
             // stops the moment the TX FIFO is full, the FIFO is 16 bytes, and the tick is 100 Hz -
             // so one FIFO-load per tick, against a line that carries 11.5 KB/s. Under storm-volume
             // logging the ring filled, every writer fell back to the blocking path, and the machine
-            // went silent for ~15 s while the backlog trickled out. The ring made sustained output
-            // SEVEN TIMES SLOWER than the blocking writes it replaced.
+            // went silent for ~15 s while the backlog trickled out.
             //
             // This still never waits: it pushes only while the FIFO reports room and returns the
-            // instant it does not. The writer therefore keeps the hardware fed at its own pace
-            // without ever blocking on it, and the tick drain remains as the path that empties the
-            // ring when nobody is writing.
+            // instant it does not.
             tx_ring_drain();
             return;
         }
-        TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        // RING FULL. Make room by draining, then retry - and if it is STILL full, DISCARD the byte.
+        //
+        // What this replaces was the last stream-corrupting path on this UART, and it needed no second
+        // core to do it: the old code wrote the byte straight to PL011_DR while other bytes were still
+        // queued in the ring, so that byte JUMPED AHEAD of everything waiting and landed in the middle
+        // of whatever the tick drained next. A message could therefore interleave with ITSELF. Which is
+        // why `kernel: supervisor died` - one kprintln, one write, one producer - still came out as
+        // `kernel: supervisor dieds` after every writer above this layer had been made line-atomic.
+        //
+        // It is the same rule as `serial_emit`, one layer down: a writer that cannot get into the ring
+        // does not write. Order is the property the whole path exists to preserve, and a byte written
+        // out of order destroys a line just as thoroughly as a second writer does - it just does it
+        // without needing one. A discarded byte is counted and reported; an out-of-order byte is
+        // silent corruption (§26.7).
+        for _ in 0..TX_MAKE_ROOM_TRIES {
+            tx_ring_drain();
+            if tx_push(b) { return; }
+        }
+        TX_DISCARDED.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
     // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
@@ -1476,13 +1532,17 @@ fn serial_emit(s: &[u8], fb: bool) {
 /// Render the loss report into a caller-supplied buffer. Bounded, on the stack, no heap (§26.6.1);
 /// written by hand rather than through `log_fmt` because this runs INSIDE the drainer and must not
 /// re-enter the log path it is reporting on.
-fn fmt_lost(buf: &mut [u8], dropped: u32, bypassed: u32) -> usize {
+fn fmt_lost(buf: &mut [u8], dropped: u32, bypassed: u32, discarded: u32, collisions: u32) -> usize {
     let mut n = 0usize;
     n = fmt_bytes(buf, n, b"serial: ");
     n = fmt_u32(buf, n, dropped);
-    n = fmt_bytes(buf, n, b" line(s) dropped (ring full), ");
+    n = fmt_bytes(buf, n, b" line(s) dropped, ");
     n = fmt_u32(buf, n, bypassed);
-    n = fmt_bytes(buf, n, b" bypassed (ring unreachable) - the log is INCOMPLETE by that many lines");
+    n = fmt_bytes(buf, n, b" bypassed, ");
+    n = fmt_u32(buf, n, discarded);
+    n = fmt_bytes(buf, n, b" byte(s) discarded, ");
+    n = fmt_u32(buf, n, collisions);
+    n = fmt_bytes(buf, n, b" producer collision(s) - the log is INCOMPLETE by that much");
     n = fmt_bytes(buf, n, &[13, 10]);
     n
 }
@@ -1548,9 +1608,11 @@ fn serial_drain() {
         // itself is missing - "0 dropped, 0 bypassed" is what makes a count over the log trustworthy,
         // and any other figure says exactly how far to trust it.
         let bypassed = SERIAL_BYPASSED.swap(0, Ordering::Relaxed);
-        if lost > 0 || bypassed > 0 {
+        let discarded = TX_DISCARDED.swap(0, Ordering::Relaxed);
+        let collisions = TX_PRODUCER_COLLISIONS.swap(0, Ordering::Relaxed);
+        if lost > 0 || bypassed > 0 || discarded > 0 || collisions > 0 {
             let mut note = [0u8; 96];
-            let n = fmt_lost(&mut note, lost, bypassed);
+            let n = fmt_lost(&mut note, lost, bypassed, discarded, collisions);
             pl011_write_raw(&note[..n], false);
         }
 
