@@ -13,6 +13,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -4696,4 +4697,246 @@ fn gsfs_read_file(image_path: &str, name: &[u8]) -> Option<Vec<u8>> {
         return Some(out);
     }
     None
+}
+
+/// **The forced-window test.** Kill `block-driver` continuously over the control channel while the
+/// shell drives file I/O, and see what `fs` does when its peer's name is unregistered more often than
+/// it is registered.
+///
+/// WHY THIS EXISTS. On hardware, `fs` occasionally loses `block-driver` and does not get it back -
+/// storage dies for the rest of the run and 100 file assertions fail. It has happened in roughly half
+/// the Pi 2 chaos runs and never once in QEMU, for two structural reasons rather than luck: the arm32
+/// QEMU machine never enumerates a USB mass-storage stick at all (`block-driver` reports 0 sectors, so
+/// `fs` issues no block I/O and cannot miss a peer it never talks to), and on x86 the supervisor
+/// respawns `block-driver` far faster than a guest doing ordinary work can notice. Waiting for the
+/// failure under emulation is waiting for something that structurally cannot happen.
+///
+/// So this does not wait. It MANUFACTURES the window: one thread sends `KILL block-driver` every
+/// `KILL_EVERY_MS` while the main thread keeps the shell writing and reading files. The name spends
+/// most of the storm unregistered, which is the state a hardware outage sits in for 1,680 ms and this
+/// test sustains for seconds.
+///
+/// WHAT IT PROVES, AND WHAT IT DOES NOT. It cannot show what OPENS the window on hardware - that is a
+/// timing property of a real machine, and a forced test is not evidence about a race it did not run.
+/// What it does prove is what happens once the window is open, which is the half nobody has been able
+/// to observe: whether `fs` recovers when the name finally comes back, whether it gets permanently
+/// stuck, and whether the kernel survives a name being cleared and re-registered hundreds of times in
+/// a few seconds. That is the half the fix has to be right about.
+///
+/// The bar is deliberately not "no outages" - outages are the POINT, and `fs` reporting them is
+/// correct behaviour. The bar is: the kernel does not panic, the shell stays responsive, and when the
+/// storm stops the filesystem WORKS AGAIN. A permanent loss is the bug, reproduced.
+pub fn run_peer_storm(image_path: &Path, persist_path: &str, smp: u32) {
+    /// How often the killer thread fires. Fast enough that the name is unregistered more often than
+    /// not, slow enough that the supervisor gets to finish a respawn sometimes - a window that is
+    /// never open is as useless as one that never closes.
+    const KILL_EVERY_MS: u64 = 60;
+    /// How long the storm runs. Long enough for many open/close cycles against a `fs` retry budget
+    /// measured in hundreds of milliseconds.
+    const STORM_SECS: u64 = 20;
+
+    println!("peer-storm: booting (smp={smp}) bare-metal + AHCI disk; shell on COM1, control on COM2");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("peer-storm: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("peer-storm: could not connect to shell serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("peer-storm: PASS - {}", $label); pass += 1; }
+        else   { println!("peer-storm: FAIL - {}", $label); fail += 1; }
+    }; }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("peer-storm: FAIL - timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // Baseline: a working filesystem, so a later failure is attributable to the storm and not to a
+    // disk that never worked.
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+            Some(r) => check!(r.contains("formatted as GSFS"), "setup: flashed GSFS"),
+            None    => { println!("peer-storm: FAIL - flash timeout"); fail += 1; }
+        }
+    } else { println!("peer-storm: FAIL - no flash confirm"); fail += 1; }
+    match run!(b"write /p.txt baseline\r", 10) {
+        Some(r) => check!(r.contains("wrote /p.txt"), "baseline: wrote /p.txt before the storm"),
+        None    => { println!("peer-storm: FAIL - baseline write timeout"); fail += 1; }
+    }
+
+    // ── THE STORM ───────────────────────────────────────────────────────────
+    // A thread on the CONTROL channel kills `block-driver` on a fixed cadence. The control channel is
+    // serviced from the timer ISR, so this is genuinely concurrent with whatever the shell is doing -
+    // which is the property the whole test needs and the reason it cannot be written as a shell script.
+    let storming = Arc::new(AtomicBool::new(true));
+    let kills    = Arc::new(AtomicU32::new(0));
+    let killer = {
+        let storming = Arc::clone(&storming);
+        let kills    = Arc::clone(&kills);
+        thread::spawn(move || {
+            let Some(mut ctrl) = retry_tcp_connect(ctrl_port, Duration::from_secs(10)) else {
+                eprintln!("peer-storm: could not connect to the control channel");
+                return;
+            };
+            thread::sleep(Duration::from_millis(100));
+            while storming.load(Ordering::Relaxed) {
+                if ctrl.write_all(b"\nKILL block-driver\n").is_err() { break; }
+                kills.fetch_add(1, Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(KILL_EVERY_MS));
+            }
+        })
+    };
+
+    // File I/O straight through the storm. Each command is allowed to FAIL - `fs` losing its peer
+    // mid-request is the condition under test, not a defect - so nothing here is asserted. What is
+    // being collected is the behaviour, and what is asserted comes after the storm stops.
+    println!("peer-storm: storming for {STORM_SECS}s, killing block-driver every {KILL_EVERY_MS}ms …");
+    let deadline = std::time::Instant::now() + Duration::from_secs(STORM_SECS);
+    let mut ops = 0usize;
+    while std::time::Instant::now() < deadline {
+        let _ = run!(b"write /p.txt storm\r", 8);
+        let _ = run!(b"read /p.txt\r", 8);
+        ops += 2;
+    }
+    storming.store(false, Ordering::Relaxed);
+    let _ = killer.join();
+    let kills = kills.load(Ordering::Relaxed);
+    println!("peer-storm: storm over - {kills} kills sent, {ops} shell file operations attempted");
+
+    // ── RECOVERY ────────────────────────────────────────────────────────────
+    // The bar. Nothing above was required to succeed; everything below is.
+    //
+    // The supervisor needs a moment with nobody killing its services before the last respawn settles.
+    // Waiting for a fixed time is the wrong instrument in general (Commandment VIII), but there is no
+    // truth to wait on here - the shell is the only thing that can tell us, and asking it IS the test.
+    // So this retries the question rather than trusting one answer to it.
+    // ── RESYNCHRONISE THE HARNESS BEFORE JUDGING ANYTHING ───────────────────
+    //
+    // A command that timed out during the storm was still executing when the next one was sent, so
+    // the shell has been receiving concatenated lines and this side's cursor is somewhere in the
+    // middle of the mess. Judging recovery from that state produced a check that passed and failed on
+    // alternate runs of an unchanged system - which is the worst kind of test, because it eventually
+    // gets believed in whichever direction is convenient.
+    //
+    // So: bare ESC to abandon whatever half-typed line the shell is holding, a newline to get a fresh
+    // prompt, then discard everything buffered so far. What follows is measured against a shell in a
+    // known state. This is harness hygiene, not a system property - it asserts nothing.
+    thread::sleep(Duration::from_millis(500));
+    send(&mut write_half, b"\x1b\r");
+    thread::sleep(Duration::from_millis(500));
+    send(&mut write_half, b"\r");
+    thread::sleep(Duration::from_millis(1500));
+    cursor = buf.lock().unwrap().len();
+
+    // A FRESH file, not the one the storm was scribbling on.
+    //
+    // The first version read `/p.txt` back and required its content. That was a bad assertion and it
+    // failed for a reason that had nothing to do with the system: when a shell command times out
+    // mid-storm this harness sends the next one anyway, so two lines concatenate and the shell is
+    // handed a garbled command. `/p.txt` came back containing the literal word "write". The file the
+    // storm was writing is the LEAST trustworthy thing to judge recovery by - its content says more
+    // about the harness than about `fs` - and an assertion that flaps between runs for harness reasons
+    // is worse than no assertion, because someone will eventually believe it.
+    //
+    // Writing something NEW is the honest question: it needs the whole path working. Reading it back
+    // proves the answer round-trips.
+    let mut recovered = false;
+    for attempt in 0..12 {
+        if let Some(r) = run!(b"write /after.txt done\r", 10) {
+            if r.contains("wrote /after.txt") { recovered = true; break; }
+        }
+        if attempt == 0 { println!("peer-storm: storage not back yet - retrying"); }
+        thread::sleep(Duration::from_secs(1));
+    }
+    check!(recovered, "storage WORKS AGAIN once the storm stops (a permanent loss is the bug)");
+    match run!(b"read /after.txt\r", 10) {
+        Some(r) => check!(r.contains("done"), "and the new file reads back"),
+        None    => { println!("peer-storm: FAIL - post-storm read timed out"); fail += 1; }
+    }
+    match run!(b"cores\r", 10) {
+        Some(r) => check!(r.contains("cores:"), "the shell is still responsive"),
+        None    => { println!("peer-storm: FAIL - shell unresponsive after the storm"); fail += 1; }
+    }
+
+    // ── WHAT THE RUN SAW ────────────────────────────────────────────────────
+    // Reported, not asserted. These are the numbers the hardware outage is described in, and having
+    // them from a run that can be repeated in minutes is most of what this test is for.
+    let all = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let count = |needle: &str| all.matches(needle).count();
+    let panicked = all.contains("KERNEL PANIC") || all.contains("LIVENESS WEDGE");
+    check!(!panicked, "the kernel never panicked (name cleared + re-registered hundreds of times)");
+    // THE REAL BAR, and it is an equality rather than a zero. Outages are the POINT of this test -
+    // `fs` reporting that its peer vanished is correct behaviour under a storm, not a defect. What
+    // must hold is that every one of them ENDED. An outage with no matching recovery is `fs`
+    // permanently unable to reach a `block-driver` that is running, which is the hardware failure this
+    // test exists to chase.
+    //
+    // `fs` itself restarts during a storm and a latch dies with the instance that set it, so
+    // recoveries may legitimately trail outages by a few. What may not happen is the two diverging.
+    let outages    = count("could not be reacquired");
+    let recoveries = count("storage is back");
+    check!(recoveries + 4 >= outages,
+           "every peer outage ENDED - fs was never permanently stranded");
+    println!("peer-storm: fs peer outages       {outages}");
+    println!("peer-storm: fs recoveries         {recoveries}");
+    println!("peer-storm: name cleared          {}", count("cleared by its own dying endpoint"));
+    println!("peer-storm: name registered       {}", count("' registered ->"));
+    println!("peer-storm: name ALREADY absent   {}", count("was ALREADY absent"));
+    println!("peer-storm: name re-pointed       {}", count("' re-pointed"));
+    println!("peer-storm: live-instance cleared {}", count("UNREGISTERED by dying"));
+    println!("peer-storm: stale kept            {}", count("kept - dying endpoint"));
+
+    let _ = std::fs::create_dir_all("build/tests");
+    let _ = std::fs::write("build/tests/peer_storm_serial.log", all.as_bytes());
+    println!("peer-storm: serial saved to build/tests/peer_storm_serial.log");
+
+    child.kill().ok(); child.wait().ok();
+    println!("\npeer-storm: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
 }

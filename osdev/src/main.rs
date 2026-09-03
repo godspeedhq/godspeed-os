@@ -1327,6 +1327,7 @@ fn cmd_test(suite: &str) {
         "fs-journal"   => run_fs_journal_test(),
         "fs-djournal"  => run_fs_djournal_test(),
         "fs-restart"   => run_fs_restart_test(),
+        "peer-storm"   => run_peer_storm_test(),
         "counter"      => run_counter_test(),
         "reply-server" => run_reply_server_test(),
         "reply-dead"   => run_reply_dead_test(),
@@ -2421,6 +2422,30 @@ fn run_fmt_demo_test() {
 /// §22 Test 13 (Phase D): fs survives its own restart. Bare-metal shell + AHCI disk; the
 /// harness writes a file, KILLs fs over the control channel, and reads it back after the
 /// supervisor respawns fs and the shell reacquires it by name.
+/// The FORCED-WINDOW test (`osdev test peer-storm`). Kill `block-driver` on a fixed cadence over the
+/// control channel while the shell drives file I/O, so `fs` spends most of the run unable to resolve
+/// its peer - the state a hardware outage sits in, manufactured instead of waited for.
+///
+/// It exists because the hardware failure cannot be reproduced under emulation. arm32 QEMU never
+/// enumerates a USB stick, so `block-driver` reports 0 sectors and `fs` issues no block I/O at all;
+/// x86 respawns faster than a guest can miss. This does not reproduce the CAUSE - a forced window is
+/// not evidence about the race that opens one - it reproduces the CONSEQUENCE, which is the half
+/// nobody has been able to watch: what `fs` does once the peer is gone, and whether it comes back.
+fn run_peer_storm_test() {
+    println!("
+=== peer-storm: fs against a block-driver that keeps dying (forced window) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_peer_storm.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_peer_storm(&image_path, persist, 4);
+}
+
 fn run_fs_restart_test() {
     println!("\n=== fs: restartable - survives its own restart (Phase D, §22 Test 13) ===");
     cmd_build_bare_metal();
