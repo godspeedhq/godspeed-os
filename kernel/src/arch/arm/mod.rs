@@ -1421,8 +1421,20 @@ fn release_serial(held: bool) {
 /// log produces; anything longer goes straight to the wire rather than being truncated.
 const SERIAL_LINE_MAX: usize = 512;
 
-/// Lines the ring holds. 12 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
-const SERIAL_RING_LINES: usize = 24;
+/// Lines the ring holds. 48 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
+///
+/// Sized from a measurement, not a guess. At 24 the hardware reported 44 lines dropped across a
+/// three-minute chaos run - and dropped them in three BURSTS of 5, 12 and 27, not at a steady rate.
+/// That distinction is the whole justification: a sustained overflow means the wire is simply slower
+/// than the system talks and a deeper ring only postpones the loss, while a bursty one means the ring
+/// is too small to ride out a storm the wire could otherwise catch up with. Three discrete reports in
+/// three minutes is the second case, and 27 is the burst to survive.
+///
+/// 96 gives that better than three times over. It does NOT make loss impossible, and it is not meant
+/// to: a full ring still drops a whole line and still says so. What it buys is a log that is complete
+/// through a chaos run, which is the difference between a spawn/kill count being evidence and being a
+/// number that might be missing a line.
+const SERIAL_RING_LINES: usize = 96;
 
 /// Lines one core puts on the wire before letting another take over.
 ///
