@@ -1377,6 +1377,19 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 /// names are reported - a deliberate ceiling, because the alternative is an unbounded log on a serial
 /// wire that is already the system's bottleneck. Sixteen distinct names is more than the whole managed
 /// roster, so filling it means something is acquiring names nobody declared.
+///
+/// **THIS IS NOT A SERVICE CATALOGUE, and the distinction matters because the kernel is under standing
+/// orders to shrink one.** `I-service-table` pins the kernel's per-service POLICY - memory limits,
+/// placement, what a named service may hold - and records 218 entries as debt against a target of one.
+/// Nothing here is policy: this table changes no service's behaviour, grants nothing, is consulted by
+/// no decision, and its entire effect is to suppress a duplicate LOG LINE. It is a dedup cache for
+/// diagnostics that happens to be keyed by a string the caller supplied.
+///
+/// The alternative considered was a name-free counter - log the first N refusals of any name - which
+/// stores nothing about userspace at all. It was rejected because it answers a worse question: the
+/// failure this exists to make visible is one NAME failing repeatedly (293 lines for a single peer in
+/// one chaos run), and a total cap reports the first few of a boot and then goes silent for everything
+/// after, including the name that is actually broken.
 fn warn_once_for(name: &str) -> bool {
     const MAX_NAMES: usize = 16;
     const NAME_MAX: usize = 32;

@@ -636,10 +636,22 @@ pub fn serial_fault_lock_release(held: bool) {
     }
 }
 
-/// Spin budget for the FAULT path - microseconds, not milliseconds. An ordinary writer can afford to
-/// wait out a whole line; a fault handler cannot, and the fallback (write unlocked, exactly as before)
-/// is always available. Small enough that the same-core case - where the spin can never succeed -
-/// costs almost nothing.
+/// Spin budget for the FAULT path, deliberately expressed in ITERATIONS rather than as a duration.
+///
+/// **A COUNT IS NOT A DURATION** (Commandment VIII), and an earlier version of this comment claimed
+/// "microseconds, not milliseconds" - a claim about time made by a bound on iterations, which means
+/// something different on every machine and was measured on none of them. Elsewhere on this path that
+/// would be a defect: `claim_serial` bounds its wait with `read_cycle_counter` for exactly that reason.
+///
+/// Here the count is the right primitive, and the reason is the path it runs on. This spins inside a
+/// FAULT HANDLER, and a clock is a thing that can be part of what is broken - a wedged or
+/// mis-calibrated timer would turn a bounded retry into an unbounded one at the worst possible moment.
+/// An iteration count cannot fail that way. What the bound has to guarantee is only "briefly, then
+/// give up", and the fallback (write unlocked, exactly as before) is always available, so being wrong
+/// about the duration costs a slightly longer or shorter spin and nothing else.
+///
+/// So: no promise about wall time is made or needed. Small enough that the same-core case - where the
+/// spin can never succeed - costs little on any machine this runs on.
 const SERIAL_FAULT_SPIN_CAP: u32 = 2_000;
 
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
