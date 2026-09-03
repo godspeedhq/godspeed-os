@@ -338,6 +338,30 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
+/// The PCI BDF this task's driver was given at spawn, or `0xFFFF` for a task that drives no device.
+///
+/// **The kill path used to look this up by NAME.** It carried a `match task_name { "xhci" => …,
+/// "ehci" => …, "nic-driver" => …, _ => AHCI_BDF }` so it could quiesce the right controller when a
+/// driver died - which is the kernel holding a table of which service drives which device, the exact
+/// knowledge step D exists to remove. It also could not be right for a fifth driver: anything not in
+/// that list fell through to the AHCI arm and quiesced the disk controller on the death of a service
+/// that had nothing to do with it.
+///
+/// The spawn already resolved a BDF for this task. Remembering it costs one word per slot and makes
+/// the kill path work for any driver, named or not, without the kernel knowing what any of them is.
+static TASK_HW_BDF: [core::sync::atomic::AtomicU32; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0xFFFF) }; MAX_TASKS];
+
+/// Record the device a spawning task was given. `0xFFFF` means none.
+pub fn set_task_hw_bdf(slot: usize, bdf: u32) {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].store(bdf, Ordering::Relaxed); }
+}
+
+/// The device this task was given at spawn, or `0xFFFF`.
+pub fn task_hw_bdf(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
+}
+
 /// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
 /// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
 /// datetime, which needed an `epoch_secs()` conversion and - fatally - read 0 on a board with no RTC (the
@@ -2398,12 +2422,11 @@ pub fn kill_task_by_slot(slot: usize) {
         {
             use core::sync::atomic::Ordering::Relaxed;
             use crate::arch::imp::pci;
-            let bdf = match task_name {
-                "xhci"       => pci::XHCI_BDF.load(Relaxed),
-                "ehci"       => pci::EHCI_BDF.load(Relaxed),
-                "nic-driver" => pci::NIC_BDF.load(Relaxed),
-                _            => pci::AHCI_BDF.load(Relaxed), // block-driver
-            };
+            // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which
+            // service drives which controller. See `TASK_HW_BDF`. A task that drives nothing reports
+            // 0xFFFF and the quiesce below is skipped, which is also the fix for the old default arm
+            // quiescing the DISK on the death of any service it did not recognise.
+            let bdf = task_hw_bdf(slot);
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
             // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI

@@ -2190,6 +2190,9 @@ fn spawn_service_with_image(
                     // it only once at boot - so a RESPAWN must re-enable it or the new instance's DMA silently
                     // never starts. Idempotent (no-op if already set). Per-driver BDF.
                     let bdf = hw.bdf();
+                    // REMEMBERED, so the kill path can quiesce this exact controller without the
+                    // kernel keeping a name->device table (see `scheduler::TASK_HW_BDF`).
+                    scheduler::set_task_hw_bdf(task_slot, bdf);
                     pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }
