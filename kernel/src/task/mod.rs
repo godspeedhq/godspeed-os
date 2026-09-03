@@ -625,8 +625,21 @@ impl HwClass {
                 }
                 bdf
             }
-            HwClass::Pci { class_code, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf),
+            // NO BDF SUPPLIED - the kernel falls back to its own scan, and SAYS SO.
+            //
+            // This is the last thing standing between here and D3's actual goal, and until now it was
+            // silent. Every driver spawn on all four machines logged "chosen by SUPPLIED BDF", but a
+            // spawn that took THIS path logged nothing at all, so "the reporter always answers" was an
+            // inference from an absence rather than a fact - which is the exact shape of mistake this
+            // work keeps uncovering. One line converts it into evidence: if no hardware run ever
+            // prints it, the fallback is dead code and the scan can go with it.
+            HwClass::Pci { class_code, .. } => {
+                let by_class = crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf);
+                crate::kprintln!(
+                    "task: NO BDF supplied for class {:#08x} - fell back to the kernel's own scan, which says {:#06x}",
+                    class_code, by_class);
+                by_class
+            }
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
