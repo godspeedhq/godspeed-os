@@ -684,6 +684,26 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 }
 
 // ---------------------------------------------------------------------------
+/// `AcquireSendCap` (10) failure codes, DISTINCT because the two failures want opposite responses and
+/// the caller could not tell them apart.
+///
+/// Both used to be a bare `-1`. The kernel logged which one it was, but the CALLER could not know, so
+/// every service that failed to reacquire a peer had to print a message naming both possibilities and
+/// committing to neither - "either the name is not registered right now, or this service has no free
+/// cap slot left". On the Pi 2 that ambiguity cost a whole debugging pass: a `block-driver` that was
+/// alive the entire time read identically to one whose reader had run out of cap slots.
+///
+/// They are genuinely different failures. A name that is not registered is TRANSIENT - the peer is
+/// mid-restart and the next attempt succeeds. A full cap table is PERMANENT - the service can never
+/// hold another cap and will not recover until it is restarted (§26.7: a failed recovery must stay as
+/// visible as the original failure). A caller that can distinguish them can retry the first quietly
+/// and report the second as terminal, which is exactly what it should do.
+///
+/// Outside the `cap_err_to_i64` range (-2..-7) and clear of `ReplyDead` (-12) so no existing decoder
+/// mistakes one for the other. `-1` stays "malformed request" (name empty, too long, unreadable).
+const ACQUIRE_NAME_NOT_REGISTERED: i64 = -20;
+const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
+
 // Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
 // ---------------------------------------------------------------------------
 
@@ -1478,7 +1498,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
                 crate::kprintln!(
                     "acquire: '{}' is not in the name directory - nothing to acquire (further occurrences for this name are not logged)", name);
             }
-            return -1;
+            return ACQUIRE_NAME_NOT_REGISTERED;
         }
     };
 
@@ -1505,7 +1525,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
             // difference between diagnosing that in one boot and chasing the peer for several.
             crate::kprintln!(
                 "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold                  the cap. This service will not recover until it is restarted.", name);
-            -1
+            ACQUIRE_CAP_TABLE_FULL
         }
     }
 }

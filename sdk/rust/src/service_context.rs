@@ -9,6 +9,53 @@ use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
 use crate::syscall::raw_syscall;
 
+/// Why a `reacquire_cap_detail` failed. The two real cases want OPPOSITE responses, which is the
+/// entire reason this type exists rather than a `bool`.
+///
+/// `NameNotRegistered` is **transient and expected**: peers are acquired before they are spawned at
+/// boot, and again while one is mid-restart. Retry; it heals. `CapTableFull` is **permanent**: this
+/// service cannot hold another capability, so it can never reacquire anything again and will not
+/// recover until it is restarted - a failed recovery, which §26.7 says must stay exactly as visible as
+/// the original failure.
+///
+/// Collapsed into one value (as `reacquire_cap` still does, for callers that only retry) a service can
+/// only print both and commit to neither. That ambiguity cost a full debugging pass on the Pi 2: a
+/// `block-driver` that was alive the whole time produced the same line as a reader out of cap slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireFailure {
+    /// The name does not resolve right now - no live instance is registered under it. Transient.
+    NameNotRegistered,
+    /// The name resolved, but this service's own capability table is full. Terminal until restart.
+    CapTableFull,
+    /// The request itself was refused (name empty, too long, or not a declared peer).
+    Refused,
+}
+
+impl AcquireFailure {
+    /// Decode the kernel's negative return. Codes are fixed at the syscall boundary
+    /// (`kernel/src/syscall/dispatch.rs`); an UNRECOGNISED negative maps to `Refused` rather than
+    /// being guessed at, so a future code cannot silently masquerade as one of the two named cases.
+    fn from_code(ret: i64) -> Self {
+        match ret {
+            -20 => AcquireFailure::NameNotRegistered,
+            -21 => AcquireFailure::CapTableFull,
+            _   => AcquireFailure::Refused,
+        }
+    }
+
+    /// One clause naming the cause, for a caller assembling a log line.
+    pub fn reason(self) -> &'static str {
+        match self {
+            AcquireFailure::NameNotRegistered =>
+                "the name does not resolve - no live instance is registered under it",
+            AcquireFailure::CapTableFull =>
+                "this service's capability table is FULL - it cannot hold another cap and will not recover until restarted",
+            AcquireFailure::Refused =>
+                "the kernel refused the request (name empty, too long, or not a declared peer)",
+        }
+    }
+}
+
 /// Outcome of an abortable request/reply ([`ServiceContext::request_with_reply_abortable`]): the reply
 /// arrived, the user pressed `q`/`Q`/ESC to abort the wait, or the deadline expired with no reply.
 /// Outcome of [`ServiceContext::request_with_reply_deadline_outcome_into`] - the buffer-writing twin
@@ -918,15 +965,25 @@ impl ServiceContext {
     /// per-service dynamic cap cache so subsequent `try_send` calls use the
     /// new slot without going to the kernel again.
     pub fn reacquire_cap(&self, peer: &str) -> Result<CapHandle, CapError> {
+        self.reacquire_cap_detail(peer).map_err(|_| CapError::CapNotHeld)
+    }
+
+    /// `reacquire_cap`, but saying WHICH failure - see [`AcquireFailure`].
+    ///
+    /// Use this wherever the answer changes what the caller does or prints. The plain
+    /// `reacquire_cap`/`reacquire_by_name` collapse every failure to one value, which is fine for a
+    /// caller that only retries, and wrong for one that reports: a message naming two possible causes
+    /// and committing to neither is a message that sends the reader to the wrong service (§26.7).
+    pub fn reacquire_cap_detail(&self, peer: &str) -> Result<CapHandle, AcquireFailure> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return Err(CapError::CapNotHeld); }
+        if len == 0 || len > PEER_NAME_BYTES { return Err(AcquireFailure::Refused); }
 
         // SAFETY: syscall(10) = AcquireSendCap; peer bytes are in user space.
         let ret = unsafe {
             raw_syscall(10, bytes.as_ptr() as u64, len as u64, 0)
         };
-        if ret < 0 { return Err(CapError::CapNotHeld); }
+        if ret < 0 { return Err(AcquireFailure::from_code(ret)); }
         let new_slot = ret as u32;
 
         // Update the dynamic cache. Reuse this peer's EXISTING entry if it has one (and reclaim its

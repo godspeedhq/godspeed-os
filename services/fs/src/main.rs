@@ -22,7 +22,7 @@
 #![no_main]
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
-use godspeed_sdk::service_context::DeadlineOutcomeInto;
+use godspeed_sdk::service_context::{AcquireFailure, DeadlineOutcomeInto};
 
 mod crc32;
 use crc32::crc32;
@@ -3503,6 +3503,57 @@ impl BlockReply {
 static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Is the peer currently unreachable, and how many times has that been true without being said?
+///
+/// **THE FLOOD THIS PREVENTS DESTROYED A DEBUGGING SESSION.** Every block request that cannot reach
+/// `block-driver` used to print a line, and `fs` is asked for blocks continuously - so a peer that
+/// stayed unreachable produced one line every ~30 ms, 1135 of them in a single Pi 2 run, until the log
+/// ended. On a 115200 serial port that is most of the wire: the lines were SPLICED into every other
+/// message, including the fault report naming the service that had just died, which had to be
+/// reassembled character by character to be read at all.
+///
+/// So the instrument destroyed the evidence it existed to provide - the same defect the kernel's own
+/// acquire diagnostic had (`fe09e428`), and the same fix. The outage is still LOUD (§26.7), but loud
+/// ONCE. What makes that safe rather than a silent fallback is the RE-ARM: the latch clears the moment
+/// a reacquire succeeds, and the recovery line carries the suppressed count - so a second, later
+/// outage is reported in full, and no occurrence is ever unaccounted for. A latch that never cleared
+/// would be hiding failures, which is the thing this project does not do.
+static PEER_UNREACHABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static PEER_UNREACHABLE_SUPPRESSED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Report that `block-driver` could not be reacquired, saying WHICH failure it was - once per outage.
+///
+/// The message this replaces named two causes and committed to neither ("either the name is not
+/// registered right now, or this service has no free cap slot left"), because the kernel returned a
+/// bare `-1` for both. They are opposite failures: an unregistered name is transient and heals on the
+/// next attempt, while a full cap table is terminal - this service can never hold another capability
+/// and will not recover until it is restarted. Reading the first as the second (or the reverse) sends
+/// the reader after the wrong service, and on the Pi 2 it did exactly that.
+fn report_peer_unreachable(ctx: &ServiceContext, why: AcquireFailure) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if PEER_UNREACHABLE.swap(true, Relaxed) {
+        // Already reported for this outage. Counted, so the recovery line can account for it.
+        PEER_UNREACHABLE_SUPPRESSED.fetch_add(1, Relaxed);
+        return;
+    }
+    PEER_UNREACHABLE_SUPPRESSED.store(0, Relaxed);
+    ctx.log_fmt(format_args!(
+        "fs: block-driver send failed AND it could not be reacquired - {}. Storage is unavailable until this clears; further attempts are counted, not logged",
+        why.reason()));
+}
+
+/// Clear the outage latch and say so, with what was suppressed while it was set.
+fn report_peer_recovered(ctx: &ServiceContext) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !PEER_UNREACHABLE.swap(false, Relaxed) { return; }
+    let n = PEER_UNREACHABLE_SUPPRESSED.swap(0, Relaxed);
+    ctx.log_fmt(format_args!(
+        "fs: block-driver reacquired - storage is back ({} further failure(s) went unlogged during the outage)",
+        n));
+}
+
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
@@ -3589,13 +3640,16 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     let mut last = "";
     for attempt in 0..2 {
         if attempt == 1 && last == "send failed" {
-            if !ctx.reacquire_by_name("block-driver") {
-                ctx.log("fs: block-driver send failed AND it could not be reacquired by name - \
-                         either the name is not registered right now, or this service has no free \
-                         cap slot left to hold it");
-                return None;
+            // The DETAIL form, because the two failures want different readings and this is the line
+            // an operator acts on. Rate-limited to once per outage (see `PEER_UNREACHABLE`), after a
+            // flood of these shredded a hardware log.
+            match ctx.reacquire_cap_detail("block-driver") {
+                Err(why) => {
+                    report_peer_unreachable(ctx, why);
+                    return None;
+                }
+                Ok(_) => report_peer_recovered(ctx),
             }
-            ctx.log("fs: block-driver send failed - reacquired by name, retrying once");
         }
         match ctx.request_with_reply_deadline_outcome_into(
             "block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
