@@ -3246,6 +3246,18 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("edit-test: FAIL - could not read /big.txt back from the disk (×3)"); fail += 3; }
     }
 
+    // SAVE THE SERIAL, always - a failing test whose log cannot be read is a test that reports a
+    // symptom and withholds the cause. This suite is the only one that loads the block driver's queue
+    // hard enough to expose a slow-path bug (creating a file is a burst of writes against a cold
+    // queue), so when it fails it is precisely the log worth having - and it was the one suite not
+    // keeping it.
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let _ = std::fs::create_dir_all("build/tests");
+        let _ = std::fs::write("build/tests/edit_serial.log", whole.as_bytes());
+        println!("edit-test: serial saved to build/tests/edit_serial.log");
+    }
+
     println!("\nedit-test: {pass} passed, {fail} failed");
     if fail > 0 {
         std::process::exit(1);
