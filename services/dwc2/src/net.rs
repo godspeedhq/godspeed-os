@@ -75,6 +75,13 @@ pub struct Stats {
     /// the register values beside it are partly fiction, which is a different problem from whatever
     /// they appear to say.
     pub reg_read_fails: u32,
+    /// Times the chip was found reset after bring-up and re-initialised. A number that should be zero;
+    /// any other value says the NIC was silently dead for however long it took the poll to notice.
+    pub chip_reinits: u32,
+    /// Latched so the "all registers zero" report is loud ONCE per outage, not once per poll. Cleared
+    /// the moment the chip answers non-zero, so a LATER reset is reported in full (the same re-arm
+    /// discipline `fs` uses for a lost peer).
+    pub chip_reset_reported: bool,
     /// Transfers that ended with a DATA TOGGLE ERROR: the device's packet was rejected by the core and
     /// the frame destroyed. Counted so the fix for it is checkable rather than believed - this should
     /// read 0, and any other number is receive loss with a name on it.
@@ -673,6 +680,62 @@ fn mii_read(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, reg: u32) -> Op
     if !smsc_write(ctx, m, d, t, SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1) { return None; }
     if !mii_idle(ctx, m, d, t) { return None; }
     smsc_read(ctx, m, d, t, SMSC_MII_DATA).map(|v| (v & 0xFFFF) as u16)
+}
+
+/// Has the chip been reset out from under us since bring-up, and if so, bring it up again.
+///
+/// **AN ALL-ZERO CHIP IS A STATE, NOT A READING.** `HW_CFG` and `MAC_CR` are both written by
+/// `smsc_bring_up` and neither is zero afterwards - `HW_CFG` carries the bus-mode and turbo bits,
+/// `MAC_CR` carries TXEN/RXEN/duplex. Both reading zero at the same time cannot describe a chip this
+/// driver has configured. It describes a chip that has been reset since.
+///
+/// That is exactly what a Pi 2 chaos run produced, and the shape of it is worth recording because the
+/// symptom pointed somewhere else entirely. The last `dwc2` instance enumerated the NIC and brought it
+/// up (`smsc readback MAC`, `NIC using the board MAC`, 18:00:15). Ninety seconds later every register
+/// read `0x0000` - `BMSR`, `RX_FIFO_INF`, `TX_FIFO_INF`, `INT_STS` - while the control transfers
+/// carrying those reads all SUCCEEDED, so `reg_read_fails` sat at a truthful zero and the periodic
+/// report printed the zeros as facts about the device. DHCP then failed for twenty seconds and the
+/// selfcheck said "the receive path or DHCP is broken", which sent the reader after the network stack.
+/// The network stack was fine. The chip had been reset - a port reset during hot-plug probing is the
+/// obvious candidate - and nothing noticed, because nothing was asking.
+///
+/// So this asks. It is the §26.7 rule applied to a value rather than to an error: a reading that
+/// cannot be true of a working device is a failure report, and treating it as data is the silent
+/// degradation the constitution forbids. And having noticed, the driver RECOVERS rather than merely
+/// complaining - `smsc_bring_up` is bounded and idempotent, and re-running it is what the service
+/// would do on a restart anyway (§14.3: re-establish what was derived from the dead instance).
+///
+/// Cheap: two control transfers, only on the periodic status poll, and only acted on when both come
+/// back zero. A chip that is genuinely working answers non-zero and this costs nothing else.
+fn smsc_reinit_if_reset(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) {
+    // A read that FAILED is not a register that is zero (`smsc_read_for_log`'s warning, applied). Only
+    // a successful read of zero counts as evidence here; `None` means "ask again later".
+    let (Some(hw), Some(mac_cr)) = (
+        smsc_read(ctx, m, d, t, SMSC_HW_CFG),
+        smsc_read(ctx, m, d, t, SMSC_MAC_CR),
+    ) else { return };
+    if hw != 0 || mac_cr != 0 {
+        nic.stats.chip_reset_reported = false;   // healthy again - re-arm the report
+        return;
+    }
+
+    if !nic.stats.chip_reset_reported {
+        nic.stats.chip_reset_reported = true;
+        ctx.log("dwc2-svc: NIC registers all read ZERO (HW_CFG and MAC_CR both 0) - the chip has been \
+                 RESET since bring-up, so every value reported since is a fact about a dead chip, not \
+                 about the network. Re-initialising it");
+    }
+    nic.stats.chip_reinits = nic.stats.chip_reinits.saturating_add(1);
+
+    match smsc_bring_up(ctx, m, d, t) {
+        Some(mac) => {
+            nic.mac = mac;
+            ctx.log("dwc2-svc: NIC re-initialised after a reset - the link and DHCP can recover now");
+        }
+        // Loud, and NOT latched as recovered: the next poll tries again. A recovery that itself fails
+        // must stay as visible as the original failure (§26.7).
+        None => ctx.log("dwc2-svc: NIC re-initialisation FAILED - the NIC stays down (will retry)"),
+    }
 }
 
 /// Reset the chip and its PHY, program the station MAC, enable turbo RX, start auto-negotiation, and
@@ -1614,6 +1677,9 @@ pub fn serve(
             // a yes.
             // This is a fresh read of the PHY, so let the transmit cache learn from it too - the
             // link question and the transmit guard must never disagree about the same cable.
+            // BEFORE the reads below, because those are what would otherwise report a reset chip's
+            // zeros as measurements of the network.
+            smsc_reinit_if_reset(ctx, mmio, dma, t, nic);
             let up = link_up(ctx, mmio, dma, t, nic);
             let now = ctx.read_tsc();
             link_observed(ctx, mmio, dma, t, nic, up, now);
