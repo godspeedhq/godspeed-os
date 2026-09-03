@@ -1430,11 +1430,19 @@ const SERIAL_LINE_MAX: usize = 512;
 /// is too small to ride out a storm the wire could otherwise catch up with. Three discrete reports in
 /// three minutes is the second case, and 27 is the burst to survive.
 ///
-/// 96 gives that better than three times over. It does NOT make loss impossible, and it is not meant
-/// to: a full ring still drops a whole line and still says so. What it buys is a log that is complete
-/// through a chaos run, which is the difference between a spawn/kill count being evidence and being a
-/// number that might be missing a line.
-const SERIAL_RING_LINES: usize = 96;
+/// 96 cleared that burst and the run came back with zero lines lost. Then the name-directory trace
+/// added about 1,100 lines to a three-minute run and the bursts grew with it - 30, 31 and 26 lines
+/// beyond capacity - so 256 now, for 128 KiB of `.bss` on a board with a gigabyte.
+///
+/// Sizing the ring to the traffic is the right lever here and filtering the traffic is not, which is
+/// worth saying because the cheaper fix is obvious and wrong. Deciding which names are worth tracing
+/// is a judgement about what matters, and a judgement is policy (§26.10) - it does not belong in the
+/// kernel, and a diagnostic that quietly omits the case nobody predicted is how the last week went.
+///
+/// It does NOT make loss impossible, and is not meant to: a full ring still drops a whole line and
+/// still says so. What it buys is a log that is complete through a chaos run, which is the difference
+/// between a name's history being evidence and being a sequence that might be missing a step.
+const SERIAL_RING_LINES: usize = 256;
 
 /// Lines one core puts on the wire before letting another take over.
 ///
