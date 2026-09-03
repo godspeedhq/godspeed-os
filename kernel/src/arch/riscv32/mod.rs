@@ -101,6 +101,16 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
 
+/// Who made this CPU - see the x86 implementation for what this is for. RISC-V reports its vendor in
+/// `mvendorid`, which is an M-mode CSR: this port runs under OpenSBI in S-mode and cannot read it, so
+/// the ISA is all that can be said honestly here.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let name = b"RISC-V";
+    let n = name.len().min(buf.len());
+    buf[..n].copy_from_slice(&name[..n]);
+    n
+}
+
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.

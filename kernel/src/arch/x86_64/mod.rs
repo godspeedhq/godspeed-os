@@ -1176,6 +1176,56 @@ pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
     pci::cfg_read_gated(sel, off)
 }
 
+/// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
+///
+/// **A log has to say which MACHINE it came from.** The boot banner reports the ARCH
+/// (`GodspeedOS 0.12.0 x86_64`), and "x86_64" is two very different boards here: an AMD GX-420GI and
+/// an Intel Gemini Lake, which have already diverged in ways that mattered - the AMD box needs IOMMU
+/// passthrough for a firmware DMA quirk, the Intel one has a device with no function 0 and a NIC
+/// behind a bridge. Reading a serial log and having to ASK which machine produced it is how a fact
+/// about one board gets generalised into a claim about the port.
+///
+/// The BRAND string is preferred over the vendor id because it names the exact part, not just who
+/// made it. It lives in CPUID leaves 0x80000002-4 as 48 bytes of ASCII; leaf 0x80000000 reports the
+/// highest extended leaf, and a CPU that does not reach 0x80000004 falls back to the 12-byte vendor
+/// id from leaf 0 (`GenuineIntel`, `AuthenticAMD`), which every x86_64 CPU has.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    let mut push = |b: u8, n: &mut usize| {
+        if *n < buf.len() { buf[*n] = b; *n += 1; }
+    };
+    // SAFETY: CPUID is unprivileged and universally available on x86_64. Leaf 0x80000000 reports the
+    // highest extended leaf supported, which is the documented way to ask before using 2..4.
+    let ext = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    if ext >= 0x8000_0004 {
+        for leaf in 0x8000_0002u32..=0x8000_0004 {
+            // SAFETY: guarded by the `ext` check immediately above.
+            let r = unsafe { core::arch::x86_64::__cpuid(leaf) };
+            for word in [r.eax, r.ebx, r.ecx, r.edx] {
+                for b in word.to_le_bytes() {
+                    // The brand string is NUL-padded and often leading-space padded; keep it printable
+                    // and stop at the terminator so the banner is one tidy line.
+                    if b == 0 { return trim_len(buf, n); }
+                    push(b, &mut n);
+                }
+            }
+        }
+        return trim_len(buf, n);
+    }
+    // SAFETY: leaf 0 is present on every x86_64 CPU.
+    let r = unsafe { core::arch::x86_64::__cpuid(0) };
+    for word in [r.ebx, r.edx, r.ecx] {
+        for b in word.to_le_bytes() { push(b, &mut n); }
+    }
+    trim_len(buf, n)
+}
+
+/// Drop trailing spaces so a brand string padded to 48 bytes does not pad the log line too.
+fn trim_len(buf: &[u8], mut n: usize) -> usize {
+    while n > 0 && (buf[n - 1] == b' ' || buf[n - 1] == 0) { n -= 1; }
+    n
+}
+
 unsafe fn outb(port: u16, val: u8) {
     // SAFETY: caller is responsible for port validity and timing.
     unsafe {

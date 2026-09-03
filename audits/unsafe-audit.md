@@ -13,6 +13,34 @@ comment.
 
 ---
 
+## 2026-09-03 - the boot log now says which MACHINE it came from (feat/supervisor-owns-images)
+
+`GodspeedOS 0.12.0 x86_64` names an ARCH, and an arch is not a machine. Two of the four boards this
+system runs on report `x86_64` - an AMD GX-420GI and an Intel Gemini Lake - and they have already
+diverged in ways that mattered: the AMD box needs IOMMU passthrough for a firmware DMA quirk, the Intel
+one has a device with no function 0 and a NIC behind a bridge. Reading a serial log while having to ASK
+which board produced it is how a fact about one machine becomes a claim about the port, which is a
+mistake this project has made before and paid for.
+
+So the banner gained a `cpu:` line, and moved. It used to be printed by `bootcon::init`, which only
+runs on a machine that HAS a framebuffer - so a headless boot printed no identity at all, which is the
+wrong way round for a line whose whole job is to identify a serial log. It is now printed by neutral
+`kernel_main` right after `arch::imp::init`, where serial is up on every arch and the framebuffer
+floor, if the machine has one, is already mirroring. Unconditional, every arch, every machine.
+
+The buffer is a fixed 64-byte stack array (§26.6.1); a longer name is truncated, never grown.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/mod.rs` | 37 -> 40 (+3) | `cpu_identity`: three `__cpuid` calls - leaf `0x80000000` to ask the highest extended leaf supported, leaves `0x80000002`-`4` for the 48-byte brand string, and leaf 0 for the 12-byte vendor id when the brand string is unavailable. CPUID is unprivileged, side-effect-free, and present on every x86_64 CPU; the extended leaves are read only after the leaf-`0x80000000` guard says they exist, which is the documented way to ask. Writes nothing, reads no memory. |
+| `arch/aarch64/mod.rs` | 69 -> 70 (+1) | `cpu_identity`: one `mrs midr_el1`. A side-effect-free system-register read valid at EL1, carrying the implementer in bits [31:24] and the part in [15:4]. Touches no memory. |
+| `arch/arm/mod.rs` | 50 -> 51 (+1) | `cpu_identity`: the ARMv7 form of the same read, `mrc p15, 0, <Rd>, c0, c0, 0`. Same register, same guarantees. |
+
+Only the parts actually run on are NAMED (Cortex-A72 for the Pi 4, Cortex-A7 for the Pi 2); anything
+else prints its raw implementer and part ids rather than a guess, because a confidently wrong name in a
+log is worse than a number the reader can look up. The x86 side prefers the brand string over the
+vendor id for the same reason - it names the part, not just who made it.
+
 ## 2026-08-04 - Pi 4 milestone 22: the display (feat/pi4-aarch64)
 
 The Pi has no bootloader-supplied framebuffer descriptor the way x86 does with Limine, so the ARM asks
@@ -2336,7 +2364,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 69 | permitted |
+| arch/aarch64/mod.rs | 70 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |
@@ -2371,7 +2399,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 50 | permitted |
+| arch/arm/mod.rs | 51 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
@@ -2383,7 +2411,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/interrupts.rs | 26 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 37 | permitted |
+| arch/x86_64/mod.rs | 40 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 21 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |

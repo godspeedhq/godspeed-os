@@ -861,6 +861,10 @@ extern "C" fn arm_boot_main() -> ! {
         bootcon::init(fb.base, fb.pitch, fb.width, fb.height);
         pl011_write(b"arm32: framebuffer console up - this line should appear on the TV\r\n");
     }
+    // Which image, which machine (see `crate::banner`). OUTSIDE the framebuffer check on purpose: a
+    // headless Pi is exactly the case whose log is read over the serial cable. This port does not
+    // reach `kernel_main`, so the call is here rather than there.
+    crate::banner();
     // Route the SD-card pins to the Arasan EMMC (and report what the firmware left them as). After
     // `mmu::enable` because it touches the Device-mapped peripheral window, unlike the mailbox calls
     // above which must run caches-off.
@@ -1907,6 +1911,60 @@ pub mod syscall_entry {
 ///
 /// Safe, and performs no I/O - there is none to perform.
 pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+
+/// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
+///
+/// **A log has to say which MACHINE it came from.** The boot banner reports the ARCH, and an arch name
+/// is not a board: this project runs two ARM boards whose behaviour has already diverged in ways that
+/// mattered (one has PCIe and an SMMU-less DMA posture, the other has no PCI at all), and reading a
+/// serial log while having to ASK which produced it is how a fact about one board becomes a claim
+/// about the port.
+///
+/// `MIDR` carries the implementer in bits [31:24] and the part number in [15:4]. Only the parts this
+/// project actually runs on are named; anything else prints its raw ids rather than a guess, because a
+/// wrong name is worse than a number a reader can look up.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let midr: u64;
+    // SAFETY: reading MIDR is a side-effect-free system-register read, available at this exception level.
+    unsafe { { let v: u32; core::arch::asm!("mrc p15, 0, {}, c0, c0, 0", out(reg) v, options(nomem, nostack)); midr = v as u64; } };
+    let implementer = ((midr >> 24) & 0xFF) as u32;
+    let part        = ((midr >> 4) & 0xFFF) as u32;
+
+    let name: &[u8] = match (implementer, part) {
+        (0x41, 0xD08) => b"ARM Cortex-A72",       // Raspberry Pi 4 (BCM2711)
+        (0x41, 0xC07) => b"ARM Cortex-A7",        // Raspberry Pi 2 (BCM2836)
+        (0x41, 0xD03) => b"ARM Cortex-A53",
+        (0x41, 0xD0B) => b"ARM Cortex-A76",
+        (0x42, _)     => b"Broadcom",
+        (0x41, _)     => b"ARM",
+        _             => b"",
+    };
+
+    let mut n = 0usize;
+    for &b in name { if n < buf.len() { buf[n] = b; n += 1; } }
+    // Always append the raw ids. A named part still benefits from them (two boards can share a core),
+    // and an unnamed one has nothing else to go on.
+    for &b in b" (impl 0x" { if n < buf.len() { buf[n] = b; n += 1; } }
+    n = push_hex(buf, n, implementer);
+    for &b in b" part 0x" { if n < buf.len() { buf[n] = b; n += 1; } }
+    n = push_hex(buf, n, part);
+    if n < buf.len() { buf[n] = b')'; n += 1; }
+    n
+}
+
+/// Lower-case hex, no padding - enough for the two small ids above.
+fn push_hex(buf: &mut [u8], mut n: usize, v: u32) -> usize {
+    let mut started = false;
+    for shift in (0..8).rev() {
+        let nib = ((v >> (shift * 4)) & 0xF) as u8;
+        if nib == 0 && !started && shift != 0 { continue; }
+        started = true;
+        let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        if n < buf.len() { buf[n] = c; n += 1; }
+    }
+    n
+}
+
 
 pub fn serial_unlocked_emit_count() -> u64 { 0 }
 
