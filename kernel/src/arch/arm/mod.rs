@@ -1252,12 +1252,214 @@ pub fn gpio_op(op: u32, pin: u32) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LINE-ATOMIC SERIAL OUTPUT.
+//
+// Four cores wrote this UART a BYTE at a time with nothing serialising a line, so lines shredded each
+// other: `rvisor' spawned OK on ctask: 'time' spawned OKdwc2-svc: =7 'shell' freed 161 frames` is one
+// real line from one real run, carrying fragments of three messages and the whole of none.
+//
+// That is not cosmetic. A spliced line matches no pattern, so it is invisible to any count made over
+// the log - and counting task spawns against task kills is how a duplicate-instance bug is found. It
+// produced three wrong readings of the same Pi 2 run in a row, and one of them was reported as fact
+// before the arithmetic gave it away (52 spawns, 52 kills, and a filesystem demonstrably working
+// afterwards - so at least one spawn line had been destroyed outright). An instrument that silently
+// deletes evidence is worse than no instrument, because its output still looks like data.
+//
+// WHY THE EXISTING MACHINERY DID NOT COVER THIS, both parts of it:
+//
+//   - `SERIAL_BUSY` (the bounded claim in `pl011_write`) is only taken while `BOOT_LOG_TO_FB` is set,
+//     which stops at the shell's first prompt. Every runtime log line after that goes through
+//     `pl011_write_no_fb`, which by design takes no claim at all. So the lock existed and the traffic
+//     that splices never went near it.
+//   - `TX_RING` (the byte ring under `pl011_write_byte`) stops a writer WAITING on the FIFO, which is
+//     a different problem and a real fix. It cannot help here: two cores pushing bytes into it
+//     interleave in the ring exactly as they interleaved on the wire.
+//
+// This is the aarch64 design (`arch/aarch64/mod.rs`), ported, including the three attempts recorded
+// there that came before it: spinning for the claim cost 104-second boots; a bounded spin still
+// spliced at 10 ms and made chaos rounds 6x slower at 150 ms - waiting is never worth it, because an
+// interleaving core at least makes progress; and routing EVERY writer through the ring, early boot
+// included, hung the machine before its first line. So the ring serves the RUNTIME writers only, and
+// `pl011_write`'s pre-SMP path is left exactly as it is, because that is the code that boots.
+// ---------------------------------------------------------------------------
+
+/// Longest line the ring will take. Matches `log::SERIAL_STAGE`, the largest single flush the neutral
+/// log produces; anything longer goes straight to the wire rather than being truncated.
+const SERIAL_LINE_MAX: usize = 512;
+
+/// Lines the ring holds. 12 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
+const SERIAL_RING_LINES: usize = 24;
+
+/// Lines one core puts on the wire before letting another take over.
+///
+/// A WRITER BECOMES THE DRAINER, so this is work conscripted from whoever happened to log next. At a
+/// full ring over two passes that would be 48 lines - roughly a third of a second of wire time at
+/// 115200 - and a core vanishing for 340 ms to do everyone else's logging is not bounded behaviour in
+/// any useful sense (§26.6); it is the same "one core pays for everyone" shape that made the spin
+/// design unusable, relocated. Four is enough to keep the wire busy: the next writer picks up where
+/// this one stopped, and under any load worth draining there is always a next writer.
+const SERIAL_DRAIN_BUDGET: usize = 4;
+
+struct SerialRing {
+    buf: [[u8; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
+    len: [u16; SERIAL_RING_LINES],
+    /// Does this line belong on the TV as well as the wire? Carried PER LINE because the two runtime
+    /// writers disagree: kernel log output stops mirroring at the shell's first prompt, and console
+    /// output is gated on whether a full-screen app owns the display. The drainer must not have to
+    /// guess, and must not answer from whatever the flags happen to say by the time it runs.
+    fb:  [bool; SERIAL_RING_LINES],
+    head: usize,
+    count: usize,
+    /// Lines lost to a full ring. REPORTED on the next drain, never silently discarded (invariant 12).
+    dropped: u32,
+}
+
+impl SerialRing {
+    const fn new() -> Self {
+        SerialRing {
+            buf: [[0; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
+            len: [0; SERIAL_RING_LINES],
+            fb:  [false; SERIAL_RING_LINES],
+            head: 0,
+            count: 0,
+            dropped: 0,
+        }
+    }
+}
+
+/// The queue.
+///
+/// **Every acquisition is `try_lock`, never `lock`.** This path is reachable from ordinary code, from
+/// interrupt handlers, and from the panic path, and it must not be able to spin or to touch interrupt
+/// state. A failed try writes straight to the wire instead - so a same-core ISR that logs while the
+/// task it interrupted holds the lock DEGRADES to an interleaved line rather than deadlocking, and no
+/// caller can ever be parked here. The hold is a memcpy, so a failed try is rare.
+static SERIAL_RING: crate::smp::SpinLock<SerialRing> = crate::smp::SpinLock::new(SerialRing::new());
+
+/// Set while a core is putting queued lines on the wire. Not a lock anyone waits on: a core that finds
+/// it taken has already handed its line over and simply returns.
+static SERIAL_DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Once a panic starts the ring is bypassed entirely: a machine that is stopping may never drain a
+/// queue, and the last thing it says is the thing worth saying.
+static SERIAL_PANIC_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Stop queueing; write straight to the wire from here on. Called before the panic's first line.
+pub fn serial_enter_panic_mode() {
+    SERIAL_PANIC_MODE.store(true, Ordering::Release);
+}
+
+/// Straight onto the wire, whole. `fb` also mirrors to the display, which needs the `SERIAL_BUSY`
+/// claim because the boot floor has shared cursor state and assumes one writer at a time.
+fn serial_write_direct(s: &[u8], fb: bool) {
+    if fb { pl011_write(s); } else { pl011_write_no_fb(s); }
+}
+
+/// Hand one whole line to the ring, then put queued lines on the wire if nobody else is.
+fn serial_emit(s: &[u8], fb: bool) {
+    if SERIAL_PANIC_MODE.load(Ordering::Acquire) {
+        serial_write_direct(s, fb);
+        return;
+    }
+    // Before SMP there is one writer and nothing to serialise, and the exclusive monitor the ring's
+    // lock needs is UNPREDICTABLE with the MMU off on this silicon (see `pl011_write`). Early boot
+    // keeps the path it has always had - the rainbow-screen lesson from the aarch64 port, which cost
+    // a boot to learn.
+    if !SERIAL_SMP.load(Ordering::Relaxed) {
+        serial_write_direct(s, fb);
+        return;
+    }
+
+    let queued = match SERIAL_RING.try_lock() {
+        None => false, // contended for the microsecond of a memcpy - just write it
+        Some(mut r) => {
+            if r.count == SERIAL_RING_LINES {
+                // The wire is slower than the system is talking. Count it and say so on the next
+                // drain rather than pretending the line was written.
+                r.dropped = r.dropped.saturating_add(1);
+                true
+            } else if s.len() > SERIAL_LINE_MAX {
+                false // too long to queue whole; a half-queued line is worse than an interleaved one
+            } else {
+                let idx = (r.head + r.count) % SERIAL_RING_LINES;
+                r.buf[idx][..s.len()].copy_from_slice(s);
+                r.len[idx] = s.len() as u16;
+                r.fb[idx]  = fb;
+                r.count += 1;
+                true
+            }
+        }
+    };
+
+    if !queued {
+        serial_write_direct(s, fb);
+        return;
+    }
+    serial_drain();
+}
+
+/// Put queued lines on the wire. At most one core at a time; the rest have handed their line over.
+fn serial_drain() {
+    // Two passes: the second closes the window where a line is queued between the last pop and the
+    // release, which would otherwise sit until some later write happened to drain it.
+    for _ in 0..2 {
+        if SERIAL_DRAINING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // someone else has the wire; our line is queued and they will write it
+        }
+
+        let mut line = [0u8; SERIAL_LINE_MAX];
+        let mut lost = 0u32;
+        let mut wrote = 0usize;
+        while wrote < SERIAL_DRAIN_BUDGET {
+            let (n, fb) = match SERIAL_RING.try_lock() {
+                None => break, // contended; leave the rest for the next writer
+                Some(mut r) => {
+                    if r.dropped > 0 {
+                        lost = lost.saturating_add(r.dropped);
+                        r.dropped = 0;
+                    }
+                    if r.count == 0 { break; }
+                    let idx = r.head;
+                    let n = r.len[idx] as usize;
+                    line[..n].copy_from_slice(&r.buf[idx][..n]);
+                    let fb = r.fb[idx];
+                    r.head = (r.head + 1) % SERIAL_RING_LINES;
+                    r.count -= 1;
+                    (n, fb)
+                }
+            };
+            serial_write_direct(&line[..n], fb);
+            wrote += 1;
+        }
+
+        if lost > 0 {
+            serial_write_direct(b"serial: log lines lost to a full ring\r\n", false);
+        }
+
+        SERIAL_DRAINING.store(false, Ordering::Release);
+
+        let pending = match SERIAL_RING.try_lock() {
+            Some(r) => r.count > 0,
+            None => false,
+        };
+        if !pending { return; }
+    }
+}
+
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
     // Kernel log output. Mirrored to the TV only while booting: afterwards the display belongs to the
     // shell, and a log line landing mid-prompt is what made the prompt look absent.
-    if BOOT_LOG_TO_FB.load(Ordering::Acquire) { pl011_write(s); } else { pl011_write_no_fb(s); }
+    // QUEUED, so the line reaches the wire WHOLE. Four cores logging concurrently used to shred each
+    // other's lines byte by byte - and this is the path that did it, because `pl011_write_no_fb` takes
+    // no claim by design. The fb destination is decided HERE and carried with the line: by the time
+    // the drainer runs, `BOOT_LOG_TO_FB` may say something different.
+    serial_emit(s, BOOT_LOG_TO_FB.load(Ordering::Acquire));
 }
 /// The shell's console output. `to_fb` is the CONSOLE FOREGROUND gate: false means a full-screen app
 /// owns the display, so this text belongs on the serial console only and must NOT reach the TV.
@@ -1272,10 +1474,11 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     // the console is unclaimed), which is the same predicate the gate uses.
     if to_fb {
         CONSOLE_FG_RENEWED_US.store(timer::systimer_us(), Ordering::Relaxed);
-        pl011_write(s);
-    } else {
-        pl011_write_no_fb(s);
     }
+    // Same ring as the kernel log, which is the point: the two writers that used to interleave now
+    // take turns a whole line at a time. Renewing the claim stays HERE rather than in the drainer -
+    // it is the writer that did the drawing, and the lease is about the writer, not the wire.
+    serial_emit(s, to_fb);
 }
 pub fn set_console_echo(on: bool) {}
 

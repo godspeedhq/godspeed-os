@@ -439,6 +439,8 @@ fn panic(info: &PanicInfo) -> ! {
     // go straight to the UART. They can interleave; that is a fair price for output that exists.
     #[cfg(all(target_arch = "aarch64", feature = "pi4"))]
     crate::arch::imp::serial_enter_panic_mode();
+    #[cfg(target_arch = "arm")]
+    crate::arch::imp::serial_enter_panic_mode();
     kprintln!("KERNEL PANIC: {}", info);
     // FLUSH THE CONSOLE RING BEFORE HALTING. Console writes are queued and drained by the timer tick
     // (arm32), and after this function no tick will ever run again - so without an explicit flush the
