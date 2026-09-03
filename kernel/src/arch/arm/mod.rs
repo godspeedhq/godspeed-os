@@ -734,78 +734,62 @@ pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomi
 /// covers any line this console writes.
 const SERIAL_ACQUIRE_US: u32 = 40_000;
 
-/// Write to the serial console WITHOUT mirroring to the TV. Used when a full-screen app owns the
-/// display (`console_write_bytes_gated(.., false)`): the bytes still reach serial, which is the source
-/// of truth and where a captured log comes from, but they do not paint over the app's screen.
+/// Put a message on the wire NOW, under the claim, whole. The bottom of the stack: everything else
+/// either queues into the line ring or ends up here.
 ///
-/// Deliberately lock-free with respect to `SERIAL_BUSY`: it takes no lock and renders nothing, so it
-/// cannot corrupt the floor's shared cursor state - the hazard the lock exists to prevent. Interleaving on
-/// the serial line itself is the same risk any contended writer already has.
-pub(super) fn pl011_write_no_fb(s: &[u8]) {
-    // CLAIMED, because "renders nothing" was only half the question. The comment above is right that
-    // this cannot corrupt the boot floor's cursor state - and wrong that wire interleaving is therefore
-    // "the same risk any contended writer already has". This is the path every runtime kernel log line
-    // takes once the shell has the display, so it is not one contended writer among many: it is most of
-    // the traffic, and four cores writing it a byte at a time is where spliced lines come from.
-    //
-    // Pre-SMP there is nothing to claim against and LDREX/STREX is UNPREDICTABLE with the MMU off, so
-    // early boot keeps the bare loop.
-    if !SERIAL_SMP.load(Ordering::Relaxed) {
-        for &b in s { pl011_write_byte(b); }
-        return;
-    }
-    let held = claim_serial();
-    for &b in s { pl011_write_byte(b); }
-    release_serial(held);
-}
-
-pub(super) fn pl011_write(s: &[u8]) {
-    use core::sync::atomic::Ordering;
-    // Pre-SMP (or the boot core alone): no contention, and LDREX/STREX are unsafe before the MMU is on.
-    // Write lock-free.
+/// The claim is BOUNDED and a writer that times out writes anyway - which is the right trade for a
+/// path that must never deadlock, and also the reason this cannot be the whole answer. A bounded claim
+/// does not guarantee exclusivity; it guarantees progress. Two rounds of measurement on hardware said
+/// so plainly: adding the line ring left the splice rate at 0.36%, and adding the claim to the runtime
+/// path left it at 0.41%. Whoever times out writes into the middle of whoever holds it.
+///
+/// So exclusivity comes from having ONE writer at runtime - the ring's drainer - not from a lock that
+/// everyone politely waits on. This function is what that one writer calls, plus the fallbacks that
+/// genuinely cannot queue.
+pub(super) fn pl011_write_raw(s: &[u8], fb: bool) {
     if !SERIAL_SMP.load(Ordering::Relaxed) {
         for &b in s { pl011_write_byte(b); }
         // Mirror to the TV once the console is up (no-op before that). `mirror` tests a plain
         // `AtomicBool` BEFORE any exclusive access, which is load-bearing on this path: the first boot
-        // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon (see the
-        // note just above). A `mirror` that locked or CAS'd here hangs the Pi on the firmware's rainbow
-        // splash with no serial output at all - and QEMU, being permissive, does not reproduce it.
-        bootcon::mirror(s);
+        // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon. A `mirror`
+        // that locked or CAS'd here hangs the Pi on the firmware's rainbow splash with no serial output
+        // at all - and QEMU, being permissive, does not reproduce it.
+        if fb { bootcon::mirror(s); }
         return;
     }
-    // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
-    // guarantee the local monitor is cleared on exception entry/return, so a task that took an
-    // interrupt (or an SVC) mid-`ldrex`/`strex` sequence can leave the monitor "exclusive" to a foreign
-    // address - making EVERY subsequent `strex` here fail spuriously and forever (the shell's second
-    // console echo wedged exactly this way). An explicit `clrex` resets it so the acquire can succeed.
-    // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
-    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
-    // SMP is live: serialize across cores. Try to claim the UART (bounded), write, then release only if
-    // we claimed it - a fault-time / heavily-contended write is never lost or deadlocked.
-    let mut held = false;
-    let start = timer::systimer_us();
-    loop {
-        if SERIAL_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            held = true;
-            break;
-        }
-        // Give up waiting and write lock-free rather than block forever (never deadlock).
-        if timer::systimer_us().wrapping_sub(start) > SERIAL_ACQUIRE_US { break; }
-        core::hint::spin_loop();
-    }
-    for &b in s {
-        pl011_write_byte(b);
-    }
-    // Mirror to the TV ONLY as the lock HOLDER. The floor has shared cursor/scroll state and
-    // assumes a single writer at a time; a contended writer that could NOT claim SERIAL_BUSY (another core
-    // logging, or an ISR preempting the holder mid-render) must not also render, or two writers corrupt
-    // its position and the TV shows garbled/overlapping text. The contended write's bytes still went to
-    // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
-    // because the dominant console writer (the shell) holds the lock for its own output.
-    if held {
-        bootcon::mirror(s);
-        SERIAL_BUSY.store(false, Ordering::Release);
-    }
+    let held = claim_serial();
+    for &b in s { pl011_write_byte(b); }
+    // Mirror ONLY as the claim HOLDER. The boot floor has shared cursor/scroll state and assumes a
+    // single writer; a contended writer that could not claim must not also render, or two writers
+    // corrupt its position and the TV shows overlapping text. Its bytes still reached serial above,
+    // which is the source of truth.
+    if fb && held { bootcon::mirror(s); }
+    release_serial(held);
+}
+
+/// Kernel and console output, mirrored to the display. QUEUED at runtime.
+///
+/// Every caller of this - and there are 186 of them across `arch/arm/` - used to write the wire
+/// directly under a bounded claim, which is how a message got cut in half by a core that had waited
+/// 40 ms and given up. Now they hand the message to the ring and return, and one drainer puts it on
+/// the wire whole.
+///
+/// WHAT THIS STILL DOES NOT FIX, said plainly rather than discovered later: a message ASSEMBLED from
+/// several calls is several ring entries, and another core's line can land between them.
+/// `exceptions.rs` builds its fault report from about ten `pl011_write` fragments, so that report can
+/// still interleave. Those sites want to become one `kprintln!` each; this change is what makes that
+/// worth doing, because until now a single write was not atomic either.
+pub(super) fn pl011_write(s: &[u8]) {
+    if !SERIAL_SMP.load(Ordering::Relaxed) { pl011_write_raw(s, true); return; }
+    serial_emit(s, true);
+}
+
+/// Write to the serial console WITHOUT mirroring to the TV. Used when a full-screen app owns the
+/// display (`console_write_bytes_gated(.., false)`): the bytes still reach serial, which is the source
+/// of truth and where a captured log comes from, but they do not paint over the app's screen.
+pub(super) fn pl011_write_no_fb(s: &[u8]) {
+    if !SERIAL_SMP.load(Ordering::Relaxed) { pl011_write_raw(s, false); return; }
+    serial_emit(s, false);
 }
 
 /// Rust side of boot. Milestone 1: prove the toolchain, the load address, the HYP drop, and the UART
@@ -1403,55 +1387,122 @@ pub fn serial_enter_panic_mode() {
 /// Straight onto the wire, whole. `fb` also mirrors to the display, which needs the `SERIAL_BUSY`
 /// claim because the boot floor has shared cursor state and assumes one writer at a time.
 fn serial_write_direct(s: &[u8], fb: bool) {
-    if fb { pl011_write(s); } else { pl011_write_no_fb(s); }
+    // The RAW bottom, never `pl011_write`: those queue now, and a fallback that queued would recurse
+    // straight back into the ring it is the fallback for.
+    pl011_write_raw(s, fb);
 }
 
-/// Hand one whole line to the ring, then put queued lines on the wire if nobody else is.
+/// How long a writer will wait to get INTO the ring. Microseconds, not milliseconds - the hold is a
+/// memcpy of at most 512 bytes, which is about a microsecond on this core. This is nothing like the
+/// 40 ms `SERIAL_ACQUIRE_US` wire claim; that one waits for the UART, this one waits for a memcpy.
+const RING_ACQUIRE_US: u32 = 250;
+
+/// Messages that never reached the ring, and so were never written at all. REPORTED, never silent.
+static SERIAL_BYPASSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Hand one whole message to the ring. At runtime this NEVER writes the wire itself.
+///
+/// **THE RULE: a writer that cannot get into the ring does not write.** It is counted and the message
+/// is dropped.
+///
+/// That is the correction two hardware runs forced. Every earlier version had a "write it anyway"
+/// fallback on each failure path, which guarantees progress and destroys the only property that
+/// matters here. A bounded claim is not mutual exclusion: whoever times out writes into the middle of
+/// whoever holds it. The measurements were flat because of it - the line ring left the splice rate at
+/// 0.36%, adding a claim to the runtime path left it at 0.41%, and the log then named the mechanism
+/// directly: `kernel: supervisor died` is ONE `kprintln!`, one write, and it appears 92 times whole
+/// and twice cut in half. A single write cannot be cut by fragmentation. It can only be cut by a
+/// second writer, which is exactly what "write it anyway" creates.
+///
+/// This is also how Linux draws the line, and for the same reason. `printk` formats a record into a
+/// per-CPU buffer and commits it to the ring whole or not at all; consoles are drained by ONE owner
+/// (`console_lock`, or `nbcon`'s explicit ownership handover in 6.7+, which exists precisely because
+/// a spin cannot work in NMI). Linux will happily LOSE a record to ring overwrite. What it will not do
+/// is let a second agent write the device. The borrowed thing is that ordering of priorities, not any
+/// of its machinery (§26.14).
+///
+/// A dropped line is honest and counted. A spliced line is corruption that takes its neighbours with
+/// it - it destroyed three separate readings of the same run, and one was reported as fact before the
+/// arithmetic caught it. §26.7 ranks these: loud failure beats silent corruption.
 fn serial_emit(s: &[u8], fb: bool) {
+    // A halting machine may never drain a queue, so the last thing it says goes straight out. Splices
+    // are a fair price for output that exists.
     if SERIAL_PANIC_MODE.load(Ordering::Acquire) {
         serial_write_direct(s, fb);
         return;
     }
-    // Before SMP there is one writer and nothing to serialise, and the exclusive monitor the ring's
-    // lock needs is UNPREDICTABLE with the MMU off on this silicon (see `pl011_write`). Early boot
-    // keeps the path it has always had - the rainbow-screen lesson from the aarch64 port, which cost
-    // a boot to learn.
+    // Before SMP there is exactly one writer, so direct IS single-writer. The exclusive monitor the
+    // ring's lock needs is also UNPREDICTABLE with the MMU off on this silicon - routing early boot
+    // through the ring hung the aarch64 port before its first line, which cost a boot to learn.
     if !SERIAL_SMP.load(Ordering::Relaxed) {
         serial_write_direct(s, fb);
         return;
     }
 
-    let queued = match SERIAL_RING.try_lock() {
-        None => false, // contended for the microsecond of a memcpy - just write it
-        Some(mut r) => {
+    // Wait BRIEFLY for the ring - the holder is doing a memcpy, not talking to hardware.
+    // SAFETY: `clrex` clears the local exclusive monitor before the lock's compare-exchange; ARMv7
+    // does not clear it on exception entry/return, so a core interrupted mid-`ldrex`/`strex` would
+    // otherwise fail every later `strex` on this path forever.
+    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
+    let start = timer::systimer_us();
+    loop {
+        if let Some(mut r) = SERIAL_RING.try_lock() {
             if r.count == SERIAL_RING_LINES {
-                // The wire is slower than the system is talking. Count it and say so on the next
+                // The system is talking faster than 115200 can carry. Counted and reported on the next
                 // drain rather than pretending the line was written.
                 r.dropped = r.dropped.saturating_add(1);
-                true
-            } else if s.len() > SERIAL_LINE_MAX {
-                false // too long to queue whole; a half-queued line is worse than an interleaved one
             } else {
                 let idx = (r.head + r.count) % SERIAL_RING_LINES;
-                r.buf[idx][..s.len()].copy_from_slice(s);
-                r.len[idx] = s.len() as u16;
+                // TRUNCATED, not bypassed. An over-long message loses its tail and says so; the old
+                // code wrote it directly, which is the second writer this function exists to forbid.
+                let n = if s.len() > SERIAL_LINE_MAX { SERIAL_LINE_MAX } else { s.len() };
+                r.buf[idx][..n].copy_from_slice(&s[..n]);
+                r.len[idx] = n as u16;
                 r.fb[idx]  = fb;
                 r.count += 1;
-                true
             }
+            break;
         }
-    };
-
-    if !queued {
-        serial_write_direct(s, fb);
-        return;
+        if timer::systimer_us().wrapping_sub(start) > RING_ACQUIRE_US {
+            // Never written. Counted instead - see the rule above.
+            SERIAL_BYPASSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        core::hint::spin_loop();
     }
     serial_drain();
 }
 
-/// Said when the ring overflowed - never silently discarded (invariant 12). A const rather than an
-/// inline literal so the wire-writing loop stays free of escapes.
-const LOST_NOTE: &[u8] = b"serial: log lines lost to a full ring\r\n";
+/// Render the loss report into a caller-supplied buffer. Bounded, on the stack, no heap (§26.6.1);
+/// written by hand rather than through `log_fmt` because this runs INSIDE the drainer and must not
+/// re-enter the log path it is reporting on.
+fn fmt_lost(buf: &mut [u8], dropped: u32, bypassed: u32) -> usize {
+    let mut n = 0usize;
+    n = fmt_bytes(buf, n, b"serial: ");
+    n = fmt_u32(buf, n, dropped);
+    n = fmt_bytes(buf, n, b" line(s) dropped (ring full), ");
+    n = fmt_u32(buf, n, bypassed);
+    n = fmt_bytes(buf, n, b" bypassed (ring unreachable) - the log is INCOMPLETE by that many lines");
+    n = fmt_bytes(buf, n, &[13, 10]);
+    n
+}
+
+/// Append, stopping at the buffer's end rather than panicking on it.
+fn fmt_bytes(buf: &mut [u8], mut n: usize, src: &[u8]) -> usize {
+    for &b in src { if n < buf.len() { buf[n] = b; n += 1; } }
+    n
+}
+
+/// Decimal, no padding.
+fn fmt_u32(buf: &mut [u8], mut n: usize, v: u32) -> usize {
+    if v == 0 { if n < buf.len() { buf[n] = b'0'; n += 1; } return n; }
+    let mut d = [0u8; 10];
+    let mut i = 0;
+    let mut v = v;
+    while v > 0 { d[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+    while i > 0 { i -= 1; if n < buf.len() { buf[n] = d[i]; n += 1; } }
+    n
+}
 
 /// Put queued lines on the wire. At most one core at a time; the rest have handed their line over.
 fn serial_drain() {
@@ -1465,11 +1516,6 @@ fn serial_drain() {
             return; // someone else has the wire; our line is queued and they will write it
         }
 
-        // HELD ACROSS EVERY LINE THIS PASS WRITES. Without it the drainer emits a whole line one byte
-        // at a time through a path any other core may write into between bytes - which is exactly what
-        // the ring exists to prevent, reintroduced one layer down. Only the DRAINER waits here; every
-        // ordinary writer has already handed its line over and returned.
-        let held = claim_serial();
         let mut line = [0u8; SERIAL_LINE_MAX];
         let mut lost = 0u32;
         let mut wrote = 0usize;
@@ -1491,18 +1537,23 @@ fn serial_drain() {
                     (n, fb)
                 }
             };
-            // Raw byte loop, not `serial_write_direct`: the claim is already held for this whole
-            // pass, and re-entering a claiming writer would deadlock on a non-reentrant flag.
-            for &b in &line[..n] { pl011_write_byte(b); }
-            if fb { bootcon::mirror(&line[..n]); }
+            // ONE CLAIM PER LINE, not one across the pass. A line is the unit that has to be atomic,
+            // and holding the claim across four framebuffer renders is the aarch64 port's recorded
+            // failure #1 - the render is far more expensive than the wire write it is protecting.
+            pl011_write_raw(&line[..n], fb);
             wrote += 1;
         }
 
-        if lost > 0 {
-            for &b in LOST_NOTE { pl011_write_byte(b); }
+        // BOTH numbers, in band. A run whose log is being used as evidence needs to say how much of
+        // itself is missing - "0 dropped, 0 bypassed" is what makes a count over the log trustworthy,
+        // and any other figure says exactly how far to trust it.
+        let bypassed = SERIAL_BYPASSED.swap(0, Ordering::Relaxed);
+        if lost > 0 || bypassed > 0 {
+            let mut note = [0u8; 96];
+            let n = fmt_lost(&mut note, lost, bypassed);
+            pl011_write_raw(&note[..n], false);
         }
 
-        release_serial(held);
         SERIAL_DRAINING.store(false, Ordering::Release);
 
         let pending = match SERIAL_RING.try_lock() {
