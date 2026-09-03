@@ -2240,7 +2240,25 @@ pub fn kill_task_by_slot(slot: usize) {
                         "ipc::names: '{}' kept - dying endpoint {:?} (slot {}) is stale, the name belongs to {:?}",
                         task_name, ep_id, slot, current);
                 }
-                _ => {}
+                // EVERY clear, not only the anomalous ones. The anomaly detector above stayed silent
+                // through an outage in which `block-driver` was demonstrably alive and its name
+                // demonstrably did not resolve - so the mutation that removed it was, by the detector's
+                // reckoning, ORDINARY. That is precisely the case with no record.
+                //
+                // A name directory has three mutations - registered, cleared, evicted - and until all
+                // three are on the wire, "the name is gone" is a state with no history. One line per
+                // service death is the same order as the `kill_task` line beside it, and the transport
+                // now carries the volume without losing anything.
+                crate::ipc::names::UnregisterOutcome::Cleared => {
+                    crate::kprintln!("ipc::names: '{}' cleared by its own dying endpoint {:?} (slot {})",
+                        task_name, ep_id, slot);
+                }
+                crate::ipc::names::UnregisterOutcome::NotFound => {
+                    // Already gone before this death ran. Worth saying: it means something ELSE removed
+                    // it, and that something is what an outage would be looking for.
+                    crate::kprintln!("ipc::names: '{}' was ALREADY absent when endpoint {:?} (slot {}) died - something else removed it",
+                        task_name, ep_id, slot);
+                }
             }
 
             // Driver-death IRQ-route teardown (Item 2, driver-death quiesce), BEFORE freeing the id.

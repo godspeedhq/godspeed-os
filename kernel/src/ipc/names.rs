@@ -91,9 +91,13 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
         if entry.valid && entry.name_len == len
             && &entry.name[..len as usize] == bytes
         {
+            let was = entry.endpoint_id;
             entry.endpoint_id = endpoint_id;
             drop(names);
             report_evicted(evicted, name, endpoint_id);
+            // The third mutation. A name that changes which endpoint it points at is how a client
+            // silently starts talking to a different instance, and it had no record at all.
+            crate::kprintln!("ipc::names: '{}' re-pointed {:?} -> {:?}", name, was, endpoint_id);
             return;
         }
     }
@@ -107,6 +111,7 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
             entry.endpoint_id = endpoint_id;
             drop(names);
             report_evicted(evicted, name, endpoint_id);
+            crate::kprintln!("ipc::names: '{}' registered -> {:?}", name, endpoint_id);
             return;
         }
     }
