@@ -1414,7 +1414,18 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
             crate::capability::cap::ResourceId::from(ep_id));
         // Clear the name mapping while the id is still ours, THEN free the id (the same
         // load-bearing order as the kill path: free is the barrier against id reuse).
-        crate::ipc::names::unregister_endpoint(name, ep_id);
+        // Same report as the kill path (see `scheduler.rs`): a half-spawned instance must never take
+        // a LIVE instance's name with it. Rarer here - a partial spawn is a failure already - which is
+        // exactly why it would otherwise go unnoticed.
+        if crate::ipc::names::unregister_endpoint(name, ep_id)
+            == crate::ipc::names::UnregisterOutcome::Cleared
+        {
+            if let Some(other) = crate::task::scheduler::find_task_by_name_excluding(name, task_slot) {
+                crate::kprintln!(
+                    "ipc::names: '{}' UNREGISTERED by a FAILED spawn's endpoint {:?} while slot {} is STILL ALIVE under that name - the live instance is now unreachable by name",
+                    name, ep_id, other);
+            }
+        }
         crate::ipc::free_endpoint_id(ep_id);
     }
     scheduler::release_task_slot(task_slot);

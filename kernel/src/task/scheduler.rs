@@ -2006,10 +2006,27 @@ pub fn wake_by_slot(slot: usize, result: i64) {
 
 /// Find the slot of a live task by name. Returns `None` if not found or dead.
 pub fn find_task_by_name(name: &str) -> Option<usize> {
+    find_task_by_name_excluding(name, usize::MAX)
+}
+
+/// Find a live task named `name` in any slot but `exclude`.
+///
+/// The exclusion exists for ONE caller: the kill path, asking whether some OTHER instance still
+/// answers to the name it is about to unregister. `find_task_by_name` cannot serve there - it returns
+/// the FIRST match, the dying task's own slot may still read non-Dead at that point, and it may sit at
+/// a lower index than the duplicate being looked for, so the first match can be the caller itself and
+/// the duplicate go unseen.
+///
+/// Written as the general form with `find_task_by_name` delegating to it, rather than as a second
+/// function, DELIBERATELY: a separate copy would have needed its own `unsafe` block, and this file's
+/// unsafe count is a grandfathered floor (§18.5) that may fall but not rise. A diagnostic does not
+/// earn a constitutional amendment. Same single scan, same `unsafe`, one more parameter.
+pub fn find_task_by_name_excluding(name: &str, exclude: usize) -> Option<usize> {
     // SAFETY: read-only scan; caller holds no locks.
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASK_VALID[i].load(Ordering::Acquire)
+            if i != exclude
+                && TASK_VALID[i].load(Ordering::Acquire)
                 && task_name(i) == name
                 && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
             {
@@ -2195,7 +2212,36 @@ pub fn kill_task_by_slot(slot: usize) {
             // (fs/block-driver staying dead after a storm killed them while the supervisor was
             // mid-respawn, their death-notifications lost). Normal restarts are unaffected: the service
             // re-registers on respawn; clients briefly see a lookup miss and retry.
-            crate::ipc::names::unregister_endpoint(task_name, ep_id);
+            // WHAT IT DID, not just that it ran. The endpoint-id guard above is what makes a duplicate
+            // instance survivable, and until now nothing said whether it was working. On the Pi 2 a
+            // `block-driver` that was alive the whole time became unreachable by name after a storm,
+            // and the only way to tell whether the guard had been defeated was to infer it from the
+            // wreckage minutes later. Now the moment reports itself.
+            //
+            // Silent in a healthy run: a routine death clears its own entry with nothing else alive
+            // under that name, and says nothing.
+            let outcome = crate::ipc::names::unregister_endpoint(task_name, ep_id);
+            let live_twin = find_task_by_name_excluding(task_name, slot);
+            match outcome {
+                // THE BUG, caught in the act: the name has just stopped resolving while a live task
+                // still answers to it. Every client that reacquires by name now fails, and the service
+                // they are failing to reach is running perfectly - which is why the symptom always
+                // points at the wrong place.
+                crate::ipc::names::UnregisterOutcome::Cleared if live_twin.is_some() => {
+                    crate::kprintln!(
+                        "ipc::names: '{}' UNREGISTERED by dying endpoint {:?} (slot {}) while slot {} is STILL ALIVE under that name - the name now resolves to NOTHING and clients cannot reach the live instance",
+                        task_name, ep_id, slot, live_twin.unwrap());
+                }
+                // The guard doing its job: a stale duplicate died after a newer instance claimed the
+                // name. Reported because it means two instances existed, which is itself a defect
+                // worth counting even though this half of it is handled.
+                crate::ipc::names::UnregisterOutcome::KeptNewer(current) => {
+                    crate::kprintln!(
+                        "ipc::names: '{}' kept - dying endpoint {:?} (slot {}) is stale, the name belongs to {:?}",
+                        task_name, ep_id, slot, current);
+                }
+                _ => {}
+            }
 
             // Driver-death IRQ-route teardown (Item 2, driver-death quiesce), BEFORE freeing the id.
             // A driver that registered a hw_interrupt line left a route in IRQ_TABLE; the id is about to
