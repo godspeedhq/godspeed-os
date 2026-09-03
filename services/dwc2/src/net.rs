@@ -714,16 +714,33 @@ fn smsc_reinit_if_reset(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic
         smsc_read(ctx, m, d, t, SMSC_HW_CFG),
         smsc_read(ctx, m, d, t, SMSC_MAC_CR),
     ) else { return };
-    if hw != 0 || mac_cr != 0 {
+    // BMSR IS THE SHARPER TEST, and the hardware handed it over. The first version of this checked
+    // only `HW_CFG == 0 && MAC_CR == 0`, on the theory that a reset chip zeroes everything. The Pi 2
+    // ran that build, the NIC died in exactly the same way - BMSR 0x0000 on every poll, DHCP failing
+    // for twenty seconds - and the detector NEVER FIRED. So at least one of those two registers still
+    // held its configured value: the chip is not wholly reset, and the theory was wrong.
+    //
+    // BMSR 0x0000 cannot be true of a live PHY. Bit 0 (extended capability) is set on every conforming
+    // PHY and this one reads 0x782d when it works, so a SUCCESSFUL MDIO read returning zero says the
+    // PHY is not answering for itself whatever the MAC-side registers claim. A FAILED read is a
+    // different thing and is not this: `mii_read` returns None there, and None means "ask again".
+    let bmsr = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
+    let phy_dead = matches!(bmsr, Some(0));
+    let chip_dead = hw == 0 && mac_cr == 0;
+    if !phy_dead && !chip_dead {
         nic.stats.chip_reset_reported = false;   // healthy again - re-arm the report
         return;
     }
 
     if !nic.stats.chip_reset_reported {
         nic.stats.chip_reset_reported = true;
-        ctx.log("dwc2-svc: NIC registers all read ZERO (HW_CFG and MAC_CR both 0) - the chip has been \
-                 RESET since bring-up, so every value reported since is a fact about a dead chip, not \
-                 about the network. Re-initialising it");
+        // THE VALUES, not just the verdict. The previous version reported nothing when its predicate
+        // was false, so a run where the NIC was plainly dead produced a silent detector and no way to
+        // tell which term had failed to hold. An instrument that only speaks when it already agrees
+        // with you is not an instrument.
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: NIC is not answering for itself - HW_CFG={:#010x} MAC_CR={:#010x} BMSR={:#06x} (a live PHY never reads 0x0000). Every value reported since is a fact about a dead chip, not about the network. Re-initialising it",
+            hw, mac_cr, bmsr.unwrap_or(0xFFFF)));
     }
     nic.stats.chip_reinits = nic.stats.chip_reinits.saturating_add(1);
 
