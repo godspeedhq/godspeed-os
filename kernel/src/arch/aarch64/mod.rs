@@ -1722,9 +1722,15 @@ fn release_serial(claim: SerialClaim) {
 #[cfg(feature = "pi4")]
 const SERIAL_LINE_MAX: usize = 512;
 
-/// Lines the ring holds. 12 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
+/// Lines the ring holds. 128 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
+///
+/// Was 24, sized before the kernel had a name-directory trace. That trace is arch-NEUTRAL
+/// (`ipc/names.rs`) and adds roughly 1,100 lines to a three-minute chaos run, which on the arm32 port
+/// overflowed a 96-line ring three times over. Matching that port's 256 here rather than waiting to
+/// discover the same thing on this one: a full ring drops whole lines, loudly and counted, and a
+/// dropped line is a step missing from the history the trace exists to provide.
 #[cfg(feature = "pi4")]
-const SERIAL_RING_LINES: usize = 24;
+const SERIAL_RING_LINES: usize = 256;
 
 /// Lines one core puts on the wire before letting another take over.
 ///
