@@ -742,7 +742,21 @@ const SERIAL_ACQUIRE_US: u32 = 40_000;
 /// cannot corrupt the floor's shared cursor state - the hazard the lock exists to prevent. Interleaving on
 /// the serial line itself is the same risk any contended writer already has.
 pub(super) fn pl011_write_no_fb(s: &[u8]) {
+    // CLAIMED, because "renders nothing" was only half the question. The comment above is right that
+    // this cannot corrupt the boot floor's cursor state - and wrong that wire interleaving is therefore
+    // "the same risk any contended writer already has". This is the path every runtime kernel log line
+    // takes once the shell has the display, so it is not one contended writer among many: it is most of
+    // the traffic, and four cores writing it a byte at a time is where spliced lines come from.
+    //
+    // Pre-SMP there is nothing to claim against and LDREX/STREX is UNPREDICTABLE with the MMU off, so
+    // early boot keeps the bare loop.
+    if !SERIAL_SMP.load(Ordering::Relaxed) {
+        for &b in s { pl011_write_byte(b); }
+        return;
+    }
+    let held = claim_serial();
     for &b in s { pl011_write_byte(b); }
+    release_serial(held);
 }
 
 pub(super) fn pl011_write(s: &[u8]) {
@@ -1252,6 +1266,42 @@ pub fn gpio_op(op: u32, pin: u32) -> i64 {
     }
 }
 
+/// Claim the UART for one whole message, bounded. `true` if the claim was taken (and must be
+/// released); `false` if it timed out, in which case write anyway - interleaving beats deadlock, and
+/// beats silence.
+///
+/// Factored out of `pl011_write`, which had this inline. The line ring's drainer needs the SAME claim,
+/// and that is the fix to a bug in the ring's first version: it wrote through `pl011_write_no_fb`,
+/// which by design takes no claim, so the drainer put a whole line onto the wire a BYTE at a time with
+/// nothing stopping another core interleaving into it. The line ring made writers hand over whole
+/// lines and then handed them to a byte-level path that shredded them anyway - which is why the first
+/// version measured a splice rate identical to no ring at all (0.36% before, 0.36% after).
+fn claim_serial() -> bool {
+    // ARMv7 does NOT guarantee the local exclusive monitor is cleared on exception entry/return, so a
+    // core that took an interrupt mid-`ldrex`/`strex` can leave it reserved to a foreign address and
+    // every later `strex` here fails - forever. Same `clrex` `pl011_write` already does, for the same
+    // reason, on the same silicon.
+    // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
+    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
+    let start = timer::systimer_us();
+    loop {
+        if SERIAL_BUSY
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        if timer::systimer_us().wrapping_sub(start) > SERIAL_ACQUIRE_US { return false; }
+        core::hint::spin_loop();
+    }
+}
+
+/// Release a claim taken by `claim_serial`. A no-op when the claim timed out, so the caller can pass
+/// the flag straight back without branching.
+fn release_serial(held: bool) {
+    if held { SERIAL_BUSY.store(false, Ordering::Release); }
+}
+
 // ---------------------------------------------------------------------------
 // LINE-ATOMIC SERIAL OUTPUT.
 //
@@ -1399,6 +1449,10 @@ fn serial_emit(s: &[u8], fb: bool) {
     serial_drain();
 }
 
+/// Said when the ring overflowed - never silently discarded (invariant 12). A const rather than an
+/// inline literal so the wire-writing loop stays free of escapes.
+const LOST_NOTE: &[u8] = b"serial: log lines lost to a full ring\r\n";
+
 /// Put queued lines on the wire. At most one core at a time; the rest have handed their line over.
 fn serial_drain() {
     // Two passes: the second closes the window where a line is queued between the last pop and the
@@ -1411,6 +1465,11 @@ fn serial_drain() {
             return; // someone else has the wire; our line is queued and they will write it
         }
 
+        // HELD ACROSS EVERY LINE THIS PASS WRITES. Without it the drainer emits a whole line one byte
+        // at a time through a path any other core may write into between bytes - which is exactly what
+        // the ring exists to prevent, reintroduced one layer down. Only the DRAINER waits here; every
+        // ordinary writer has already handed its line over and returned.
+        let held = claim_serial();
         let mut line = [0u8; SERIAL_LINE_MAX];
         let mut lost = 0u32;
         let mut wrote = 0usize;
@@ -1432,14 +1491,18 @@ fn serial_drain() {
                     (n, fb)
                 }
             };
-            serial_write_direct(&line[..n], fb);
+            // Raw byte loop, not `serial_write_direct`: the claim is already held for this whole
+            // pass, and re-entering a claiming writer would deadlock on a non-reentrant flag.
+            for &b in &line[..n] { pl011_write_byte(b); }
+            if fb { bootcon::mirror(&line[..n]); }
             wrote += 1;
         }
 
         if lost > 0 {
-            serial_write_direct(b"serial: log lines lost to a full ring\r\n", false);
+            for &b in LOST_NOTE { pl011_write_byte(b); }
         }
 
+        release_serial(held);
         SERIAL_DRAINING.store(false, Ordering::Release);
 
         let pending = match SERIAL_RING.try_lock() {

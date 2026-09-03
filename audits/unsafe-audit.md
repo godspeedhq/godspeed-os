@@ -13,6 +13,22 @@ comment.
 
 ---
 
+## 2026-09-03 - arm32: one claim, factored out, so a whole line stays whole (feat/supervisor-owns-images)
+
+The line ring added earlier the same day did not reduce the splice rate at all - 0.36% of lines carried
+fragments of two or three messages before it, and 0.36% after. The ring was making writers hand over
+whole lines and then handing those lines to `pl011_write_no_fb`, which by design takes no claim, so the
+drainer put each line on the wire a BYTE at a time with nothing stopping another core writing into the
+gaps. Whole-line queueing on top of a byte-level free-for-all is not whole-line output.
+
+The claim `pl011_write` already had inline is now a function, taken by the drainer for its whole pass
+and by `pl011_write_no_fb` for its whole message. That moves one `unsafe` rather than adding a new
+kind: the `clrex` this layer already requires.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 51 -> 52 (+1) | `claim_serial`: a `clrex` before the claim's compare-exchange. ARMv7 does not guarantee the local exclusive monitor is cleared on exception entry or return, so a core interrupted mid-`ldrex`/`strex` can leave it reserved to a foreign address and every later `strex` fails - permanently, on that core. `pl011_write` carries the identical instruction directly above, for the identical reason, on the identical silicon; this is that requirement applied to the second acquisition site rather than a new one. `clrex` clears the local monitor and has no memory effect. |
+
 ## 2026-09-03 - the boot log now says which MACHINE it came from (feat/supervisor-owns-images)
 
 `GodspeedOS 0.12.0 x86_64` names an ARCH, and an arch is not a machine. Two of the four boards this
@@ -2399,7 +2415,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 51 | permitted |
+| arch/arm/mod.rs | 52 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
