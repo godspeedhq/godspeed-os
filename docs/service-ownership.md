@@ -945,6 +945,17 @@ IOMMU confinement bounds a driver's DMA, not its output. The service is safe Rus
 (mechanically enforced), so the realistic failure is a BUG, not a compromise, and no signature catches
 a bug.
 
+### The cost that grows with every step of D: IPC
+
+Each responsibility that leaves the kernel turns a syscall into an IPC round trip, and an IPC round
+trip costs roughly 5-10x a syscall - not from inefficiency, but because it is two privilege
+transitions and two context switches rather than one transition and a return.
+
+That is affordable for what D moves, and the reason is FREQUENCY rather than cost: `ask_bdf_for_class`
+runs about six times a boot. The test to apply before moving anything else is "does this become an IPC
+in a loop, or an IPC once at setup?" - and the measured numbers, the ranked efficiency backlog, and
+what is permanently off the table (zero-copy, per §2.5) are in `docs/ipc-efficiency.md`.
+
 ### The two costs still to accept before building
 
 **1. Config-space access for the reporter. PAID (2026-09-02).** One gated syscall, `PciCfgRead`, behind
