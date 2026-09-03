@@ -707,7 +707,7 @@ fn mii_read(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, reg: u32) -> Op
 ///
 /// Cheap: two control transfers, only on the periodic status poll, and only acted on when both come
 /// back zero. A chip that is genuinely working answers non-zero and this costs nothing else.
-fn smsc_reinit_if_reset(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) {
+pub fn health_check(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) {
     // A read that FAILED is not a register that is zero (`smsc_read_for_log`'s warning, applied). Only
     // a successful read of zero counts as evidence here; `None` means "ask again later".
     let (Some(hw), Some(mac_cr)) = (
@@ -1696,7 +1696,7 @@ pub fn serve(
             // link question and the transmit guard must never disagree about the same cable.
             // BEFORE the reads below, because those are what would otherwise report a reset chip's
             // zeros as measurements of the network.
-            smsc_reinit_if_reset(ctx, mmio, dma, t, nic);
+            health_check(ctx, mmio, dma, t, nic);
             let up = link_up(ctx, mmio, dma, t, nic);
             let now = ctx.read_tsc();
             link_observed(ctx, mmio, dma, t, nic, up, now);

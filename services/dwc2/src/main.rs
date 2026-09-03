@@ -911,6 +911,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     .map(|(d, _, _)| (d.busy_cbw, d.busy_data, d.busy_csw, d.commands))
                     .unwrap_or((0, 0, 0, 0));
                 let ms = ctx.duration_cycles(1).max(1);
+                // THE DRIVER CHECKS ITS OWN HARDWARE, on its own heartbeat.
+                //
+                // This check used to run only inside the OP_NET_INFO handler - so it happened only
+                // when a CLIENT asked. That makes recovery from a dead NIC depend on somebody else
+                // still being interested in it, and the failure mode it recovers from is exactly the
+                // one that makes clients give up. A driver owns its device; noticing that the device
+                // has stopped answering is its job, not `net-stack`'s.
+                if let Some((n, nt)) = nic.as_mut() {
+                    net::health_check(&ctx, &m, &d, nt, n);
+                }
                 let ns = nic.as_ref().map(|(n, _)| {
                     let s = &n.stats;
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts,
