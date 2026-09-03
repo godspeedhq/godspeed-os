@@ -4888,6 +4888,18 @@ pub fn run_peer_storm(image_path: &Path, persist_path: &str, smp: u32) {
     // proves the answer round-trips.
     let mut recovered = false;
     for attempt in 0..12 {
+        // RESYNC ON EVERY ATTEMPT, not once before the loop. Resyncing once left the test flapping:
+        // three consecutive clean runs, then a 5/2. The storm can leave the shell holding a partial
+        // line, and if the single resync lands while a command is still executing it clears nothing -
+        // after which all twelve attempts type into a line the shell will never accept, and the test
+        // reports a storage failure that is entirely this harness's doing.
+        //
+        // Doing it per attempt makes the recovery of the HARNESS retry alongside the recovery of the
+        // system, which is the only honest arrangement: an assertion may not fail for reasons that
+        // belong to the thing doing the asserting.
+        send(&mut write_half, b"\x1b\r");
+        thread::sleep(Duration::from_millis(400));
+        cursor = buf.lock().unwrap().len();
         if let Some(r) = run!(b"write /after.txt done\r", 10) {
             if r.contains("wrote /after.txt") { recovered = true; break; }
         }
@@ -5124,10 +5136,22 @@ pub fn run_adopt_storm(image_path: &Path, persist_path: &str, smp: u32) {
     // proves the answer round-trips.
     let mut recovered = false;
     for attempt in 0..12 {
+        // RESYNC ON EVERY ATTEMPT, not once before the loop. Resyncing once left the test flapping:
+        // three consecutive clean runs, then a 5/2. The storm can leave the shell holding a partial
+        // line, and if the single resync lands while a command is still executing it clears nothing -
+        // after which all twelve attempts type into a line the shell will never accept, and the test
+        // reports a storage failure that is entirely this harness's doing.
+        //
+        // Doing it per attempt makes the recovery of the HARNESS retry alongside the recovery of the
+        // system, which is the only honest arrangement: an assertion may not fail for reasons that
+        // belong to the thing doing the asserting.
+        send(&mut write_half, b"\x1b\r");
+        thread::sleep(Duration::from_millis(400));
+        cursor = buf.lock().unwrap().len();
         if let Some(r) = run!(b"write /after.txt done\r", 10) {
             if r.contains("wrote /after.txt") { recovered = true; break; }
         }
-        if attempt == 0 { println!("adopt-storm: storage not back yet - retrying"); }
+        if attempt == 0 { println!("peer-storm: storage not back yet - retrying"); }
         thread::sleep(Duration::from_secs(1));
     }
     check!(recovered, "storage WORKS AGAIN once the storm stops (a permanent loss is the bug)");

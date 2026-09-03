@@ -57,9 +57,14 @@ const PROGIF_EHCI: u8 = 0x20;
 // ---------------------------------------------------------------------------
 // THE GENERIC DEVICE TABLE (step D1) - what is on the bus, with NO opinion about it.
 //
-// Every static below this block names a device CLASS the kernel was taught: XHCI_FOUND, AHCI_ABAR,
+// Every static below this block names a device CLASS the kernel was taught: XHCI_FOUND, EHCI_BDF,
 // NIC_BDF. That is what forces a KERNEL REBUILD to add a driver for a device nobody taught it about,
 // and driver porting is the roadmap - so the kernel stops interpreting and starts reporting.
+//
+// The set is SHRINKING and this list is maintained with it: `AHCI_*` is gone (D3c), because
+// `block-driver` names the class code 0x010601 like any other device and nothing asked the kernel for
+// "the AHCI controller" any more. An example list that names a static which no longer exists is the
+// same defect as a counter nobody increments - it reads as fact and is not.
 //
 // A device is identified by its PCI CLASS CODE - the 24-bit (class, subclass, prog-if) triple that
 // is an INDUSTRY STANDARD: 0x0C0330 IS "xHCI", everywhere, forever. The kernel never has to be told
@@ -178,14 +183,6 @@ const CLASS_MASS_STORAGE: u8 = 0x01;
 const SUBCLASS_SATA: u8 = 0x06;
 const PROGIF_AHCI: u8 = 0x01;
 
-/// Discovered AHCI (SATA) controller - the `block-driver` gets its ABAR (BAR5)
-/// mapped + a DMA arena at spawn, exactly as the USB drivers do (§12,
-/// docs/ahci.md). First AHCI found wins. ABAR is a 32-bit MMIO BAR.
-pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
-pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
-pub static AHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF of the AHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
-pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
 // Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md): identify
 // what NIC hardware is present so we know whether QEMU's e1000 and the T630's chipset share a driver.
@@ -1147,23 +1144,6 @@ pub fn init() {
                         EHCI_FOUND.store(true, Ordering::Relaxed);
                     }
                 }
-                // AHCI (SATA) controller - the block driver's disk (docs/ahci.md).
-                if class == CLASS_MASS_STORAGE && subclass == SUBCLASS_SATA
-                    && progif == PROGIF_AHCI && !AHCI_FOUND.load(Ordering::Relaxed)
-                {
-                    // ABAR is BAR5 (offset 0x24), a 32-bit memory BAR.
-                    let bar5 = config_read32(bus as u8, dev, func, 0x24);
-                    let abar = (bar5 & 0xFFFF_FFF0) as u64;
-                    let irq = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
-                    AHCI_ABAR.store(abar, Ordering::Relaxed);
-                    AHCI_IRQ.store(irq, Ordering::Relaxed);
-                    AHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                    AHCI_FOUND.store(true, Ordering::Relaxed);
-                    crate::kprintln!(
-                        "pci: AHCI at {:02x}:{:02x}.{} vendor={:#06x} ABAR={:#x} IRQ={}",
-                        bus, dev, func, vendor, abar, irq
-                    );
-                }
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
                 if class == CLASS_NETWORK {
@@ -1273,8 +1253,6 @@ pub fn init() {
     for (label, want_found, want_bar, want_class, bar_ix) in [
         ("xHCI", XHCI_FOUND.load(Ordering::Relaxed), XHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_30u32, 0usize),
         ("EHCI", EHCI_FOUND.load(Ordering::Relaxed), EHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_20, 0),
-        // AHCI's registers are ABAR = BAR5, not BAR0. That difference is why the table records six.
-        ("AHCI", AHCI_FOUND.load(Ordering::Relaxed), AHCI_ABAR.load(Ordering::Relaxed),      0x01_06_01, 5),
         // Ethernet: class 0x02, subclass 0x00, prog-if 0x00. Both models we drive (e1000, RTL8168)
         // report the same triple - which is the point: the class code says "ethernet controller",
         // and WHICH ethernet controller is the driver's business, not the kernel's.

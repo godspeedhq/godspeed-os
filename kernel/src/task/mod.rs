@@ -201,7 +201,6 @@ pub static XHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 /// The arm32 DWC2's permanent DMA reservation, reused across respawns like every other class.
 pub static DWC2_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-pub static AHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 32 pages
 /// hold the control structures (command/event rings, DCBAA, ERST) and the six
@@ -442,7 +441,7 @@ enum HwClass {
     Pci { class_code: u32, bar_ix: u8, dma_pages: u32, confine: bool, bdf: u32 },
     // ---- The legacy per-class names, still populated by the scan and still the default path until
     // every caller names a class code. They go away with their last reader.
-    Ahci, Nic, Xhci, Ehci,
+    Nic, Xhci, Ehci,
 }
 
 /// PERMANENT per-device DMA reservations for PCI devices found by the scan (§12 DMA
@@ -469,7 +468,6 @@ impl HwClass {
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
             HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
-            HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
             HwClass::Nic  => pci::NIC_FOUND.load(Relaxed),
             // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
             // Always "present" because the kernel raises it itself - there is nothing to scan for.
@@ -524,7 +522,6 @@ impl HwClass {
             HwClass::Framebuffer => 0,
             HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
-            HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),
             HwClass::Nic if matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)
                 => pci::NIC_MMIO_BASE.load(Relaxed),
             _ => 0,
@@ -565,7 +562,6 @@ impl HwClass {
             HwClass::Dwc2 => &DWC2_DMA_PHYS,
             HwClass::Xhci => &XHCI_DMA_PHYS,
             HwClass::Ehci => &EHCI_DMA_PHYS,
-            HwClass::Ahci => &AHCI_DMA_PHYS,
             HwClass::Nic  => &NIC_DMA_PHYS,
             // None of these DMA, so none ever reaches here - `needs_dma()` gates every caller. They
             // return a real slot rather than panicking because an unreachable arm that aborts is a
@@ -642,7 +638,6 @@ impl HwClass {
             }
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
-            HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
             HwClass::Nic  => pci::NIC_BDF.load(Relaxed),
             HwClass::None => 0xFFFF,
         }
@@ -809,7 +804,6 @@ pub fn hw_class_is_pci(class: u32) -> bool { class & HW_PCI_FLAG != 0 }
 fn hw_class_of(class: u32) -> HwClass {
     if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0, 0); }
     match class {
-        1 => HwClass::Ahci,
         2 => HwClass::Nic,
         3 => HwClass::Xhci,
         4 => HwClass::Ehci,
@@ -852,7 +846,7 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         // the caller names the class and the kernel states the number - which is what lets the probe
         // that receives it stop being a kernel-known name.
         HwClass::TestIrq => &[33],
-        HwClass::Ahci | HwClass::Framebuffer | HwClass::None => &[],
+        HwClass::Framebuffer | HwClass::None => &[],
         // NO VECTOR YET, and this is the honest edge of step D1 rather than an oversight.
         //
         // The named classes above return a vector the KERNEL assigned and programmed into the

@@ -386,7 +386,6 @@ pub mod privbits {
 /// physical DMA reservation per device that a respawned driver must get back.
 pub mod hwclass {
     pub const NONE:        u32 = 0;
-    pub const AHCI:        u32 = 1;
     pub const NIC:         u32 = 2;
     pub const XHCI:        u32 = 3;
     pub const EHCI:        u32 = 4;

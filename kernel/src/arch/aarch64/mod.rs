@@ -2809,9 +2809,6 @@ pub mod pci {
     pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
     pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
-    pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
     pub static NIC_FOUND: AtomicBool = AtomicBool::new(false);
     pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
