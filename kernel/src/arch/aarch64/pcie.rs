@@ -550,22 +550,53 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         set_outbound_window(cpu_base, PCI_WIN_BUS_ADDR, cpu_size);
         cfg_write(0, 0, 0, 0x18, 0x0001_0100);
 
-        // Size BAR0 the standard way: write all-ones, read back the writable bits.
-        cfg_write(1, dev, 0, 0x10, 0xFFFF_FFFF);
-        let probe = cfg_read(1, dev, 0, 0x10);
-        if probe == 0 || probe == 0xFFFF_FFFF {
-            put_str(b"pcie: xHCI BAR0 did not size - skipping\r\n");
-            continue;
-        }
-        let len = (!(probe & !0xF)).wrapping_add(1);
-        if (len as u64) > cpu_size {
-            put_str(b"pcie: xHCI BAR0 is larger than the outbound window - skipping\r\n");
-            continue;
-        }
+        // ASSIGNMENT ONCE, RE-READ ALWAYS - the split step D requires, made structural here rather
+        // than left to the fact that this happens to run only at boot today.
+        //
+        // Sizing a BAR is DESTRUCTIVE: writing all-ones to read back the writable bits clobbers the
+        // address while it does so. Do that to a device a live driver is using and its window vanishes
+        // mid-transfer. That cannot happen today because `pcie::init` is called once, before any
+        // driver exists - but "safe because of who calls it" is a property of the caller, and step D
+        // moves callers around. Made safe by the code instead: a BAR that is ALREADY PROGRAMMED is
+        // kept and reported, never re-sized.
+        //
+        // The other half of the split needs no code at all, and it is worth recording why. Re-reading
+        // is what `hw-enumerator` does, and `PCI_CFG` grants exactly one operation - READ - with no
+        // write of any kind, permanently. A restarted enumerator therefore CANNOT reassign a BAR: the
+        // read-only rule is enforced by the capability, not by the enumerator's good behaviour. The
+        // only writer is here, and this is the branch that makes it idempotent.
+        // ZERO means "not sized", not "zero bytes". The already-programmed path deliberately does not
+        // measure the BAR, because measuring it is the destructive act being avoided; the field has no
+        // consumer, so an honest unknown beats a plausible invention.
+        let mut len: u32 = 0;
+        let existing = cfg_read(1, dev, 0, 0x10);
+        let already = existing != 0 && existing != 0xFFFF_FFFF && (existing & !0xF) != 0;
 
-        // Assign it at the base of the window. One device, so there is nothing to pack around it.
-        cfg_write(1, dev, 0, 0x10, PCI_WIN_BUS_ADDR as u32);
-        cfg_write(1, dev, 0, 0x14, 0);
+        if already {
+            // Keep what is there. Sizing would tell us how big it is, and cost the driver its window
+            // to find out - a question not worth that answer on a device already in service.
+            put_str(b"pcie: xHCI BAR0 already programmed at ");
+            put_hex((existing & !0xF) as u64);
+            put_str(b" - kept, not re-sized\r\n");
+        } else {
+            // Size BAR0 the standard way: write all-ones, read back the writable bits. Safe here
+            // BECAUSE the branch above proved nothing is using it.
+            cfg_write(1, dev, 0, 0x10, 0xFFFF_FFFF);
+            let probe = cfg_read(1, dev, 0, 0x10);
+            if probe == 0 || probe == 0xFFFF_FFFF {
+                put_str(b"pcie: xHCI BAR0 did not size - skipping\r\n");
+                continue;
+            }
+            len = (!(probe & !0xF)).wrapping_add(1);
+            if (len as u64) > cpu_size {
+                put_str(b"pcie: xHCI BAR0 is larger than the outbound window - skipping\r\n");
+                continue;
+            }
+
+            // Assign it at the base of the window. One device, so nothing to pack around it.
+            cfg_write(1, dev, 0, 0x10, PCI_WIN_BUS_ADDR as u32);
+            cfg_write(1, dev, 0, 0x14, 0);
+        }
 
         // **Open the bridge's memory window, or nothing downstream is reachable.**
         //

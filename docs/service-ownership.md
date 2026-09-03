@@ -841,10 +841,26 @@ responsibility: config reads, MSI programming and interrupt routing are all alre
 **Slice 3 (NOT BUILT): the supervisor passes the BDF in the spawn request.** The kernel then resolves
 MMIO and IRQ from that BDF instead of from `find_by_class`.
 
-**Slice 4 (NOT BUILT, and the fiddly one): the assignment / re-enumeration split.** Designed below and
-not yet implemented. A restarted `hw-enumerator` must never reassign a BAR out from under a live
-driver, so re-enumeration has to be read-only and idempotent by construction. This is the piece with
-real subtlety; the rest is plumbing.
+**Slice 4 (BUILT): the assignment / re-enumeration split - and half of it needed no code.**
+
+The half that did: BAR assignment on the Pi 4 was NOT idempotent. Sizing a BAR is destructive (write
+all-ones, read back the writable bits), and it was done unconditionally before assigning - so running
+it against a device a live driver is using would take that driver's window away mid-transfer. That was
+safe only because `pcie::init` is called once, at boot, before any driver exists. "Safe because of who
+calls it" is a property of the caller, and step D moves callers. Now the BAR is read first: already
+programmed means kept and reported, never re-sized.
+
+The half that did NOT: re-enumeration is `hw-enumerator`'s job, and `PCI_CFG` grants exactly one
+operation - READ - permanently, with no write of any kind. A restarted enumerator therefore CANNOT
+reassign a BAR. **The read-only rule is enforced by the capability rather than by the enumerator's
+good behaviour**, which is stronger than the design anticipated: it is not a rule someone must
+remember, it is an authority nobody holds. The only writer is the kernel, and that writer is now
+idempotent.
+
+NOT VERIFIED ON HARDWARE. QEMU's `raspi4b` has no root complex, so `pcie::init` returns before
+reaching this code and the path cannot be exercised there at all. The cold-boot behaviour is unchanged
+by construction (an unprogrammed BAR takes the same branch as before), but the already-programmed
+branch has never run.
 
 Only after 3 and 4 does the scan come out.
 
