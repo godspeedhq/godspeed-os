@@ -435,7 +435,11 @@ enum HwClass {
     ///               or `BAR_AUTO` for the first mapped MEMORY BAR
     ///   - `dma_pages` how much DMA arena it needs (a SIZE, bounded by the syscall)
     ///   - `confine` whether to put it behind the IOMMU (policy, §6.4)
-    Pci { class_code: u32, bar_ix: u8, dma_pages: u32, confine: bool },
+    ///   - `bdf`     WHICH device, when the caller knows (step D3). Zero means "not supplied" and
+    ///               the class is resolved against the kernel's own scan, as before. This is an
+    ///               IDENTIFIER, not an address: the kernel reads that device's registers to learn
+    ///               what it is worth, so naming it grants nothing a class name would not.
+    Pci { class_code: u32, bar_ix: u8, dma_pages: u32, confine: bool, bdf: u32 },
     // ---- The legacy per-class names, still populated by the scan and still the default path until
     // every caller names a class code. They go away with their last reader.
     Ahci, Nic, Xhci, Ehci,
@@ -599,6 +603,28 @@ impl HwClass {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
             HwClass::Framebuffer => 0xFFFF, // not a PCI device
             HwClass::TestIrq     => 0xFFFF, // not a device at all - a software-raised vector
+            // A SUPPLIED BDF WINS, because it is the caller saying WHICH device rather than the
+            // kernel guessing from a class. `find_by_class` returns the FIRST match, so on a machine
+            // with two devices of one class it picks by scan order - which is not a decision the
+            // kernel has any basis to make. Zero means "not supplied": fall back to the class.
+            HwClass::Pci { class_code, bdf, .. } if bdf != 0 => {
+                // Cross-check while both paths exist (step D3 is additive until the scan goes).
+                let by_class = crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf);
+                if by_class != 0xFFFF && by_class != bdf {
+                    crate::kprintln!(
+                        "task: BDF {:#06x} supplied for class {:#08x}, but the scan says {:#06x} - using the supplied one",
+                        bdf, class_code, by_class);
+                } else {
+                    // SAID OUT LOUD, because agreement and absence look identical otherwise. Without
+                    // this line a supplied BDF that matches the scan produces exactly the same log as
+                    // no BDF at all - so "no disagreement" would be evidence of nothing, and the
+                    // switch-over would be unverifiable at the very moment it starts mattering.
+                    crate::kprintln!(
+                        "task: device chosen by SUPPLIED BDF {:#06x} for class {:#08x} (scan agrees)",
+                        bdf, class_code);
+                }
+                bdf
+            }
             HwClass::Pci { class_code, .. } =>
                 crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf),
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
@@ -751,18 +777,24 @@ fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
 pub const BAR_AUTO: u8 = 7;
 
 /// Decode a `hw_flags` PCI descriptor: `bit31 | confine<<28 | bar_ix<<24 | class_code`.
-fn hw_pci_of(class: u32, dma_pages: u32) -> HwClass {
+fn hw_pci_of(class: u32, dma_pages: u32, bdf: u32) -> HwClass {
     HwClass::Pci {
         class_code: class & 0x00FF_FFFF,
         bar_ix:     ((class >> 24) & 0x7) as u8,
         dma_pages,
         confine:    class & HW_PCI_CONFINE != 0,
+        bdf,
     }
 }
 
+/// Does this `hw_flags` describe a PCI device? A BDF means nothing for the named non-bus kinds
+/// (`Dwc2` is soldered on, the framebuffer is a boot handoff, the test IRQ is software), so supplying
+/// one for those is a caller error worth refusing rather than ignoring.
+pub fn hw_class_is_pci(class: u32) -> bool { class & HW_PCI_FLAG != 0 }
+
 /// Resolve a spawn request's device class to the kernel's own scan results.
 fn hw_class_of(class: u32) -> HwClass {
-    if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0); }
+    if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0, 0); }
     match class {
         1 => HwClass::Ahci,
         2 => HwClass::Nic,
@@ -1237,6 +1269,11 @@ pub fn spawn_from_image(
     hw_class:          u32,
     // DMA arena size in pages, for a PCI descriptor. A size, not an address (see the syscall).
     dma_pages:         u32,
+    // WHICH device, when the caller knows it (step D3). An IDENTIFIER, not an address: the kernel
+    // reads that device's own registers to learn its BAR and IRQ, so naming it grants nothing that
+    // naming the class would not. Zero = not supplied, and the class is resolved against the
+    // kernel's own scan as before.
+    bdf:               u32,
     // Mint the name-wired peer caps with GRANT so the child may re-delegate them (§22 Test 5A).
     peers_grant:       bool,
 ) -> Result<Option<EndpointId>, SpawnError> {
@@ -1252,7 +1289,7 @@ pub fn spawn_from_image(
     let core_id = resolve_spawn_core(core_override, core_preferred)?;
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
-    let hw = if hw_class & HW_PCI_FLAG != 0 { hw_pci_of(hw_class, dma_pages) }
+    let hw = if hw_class & HW_PCI_FLAG != 0 { hw_pci_of(hw_class, dma_pages, bdf) }
              else { hw_class_of(hw_class) };
 
     // A PCI driver that asked for an interrupt gets a pool vector, allocated once per DEVICE and

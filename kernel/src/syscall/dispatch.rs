@@ -928,10 +928,32 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
                          req.dma_pages, MAX_DMA_PAGES);
         return -1;
     }
-    if req.mmio_base != 0 || req.mmio_len != 0 || req.bdf != 0 {
+    // ADDRESSES ARE STILL REFUSED. A caller may not name where a device lives - that is authority
+    // stated by a service, and the kernel would have to take its word for it.
+    if req.mmio_base != 0 || req.mmio_len != 0 {
         crate::kprintln!(
-            "task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS instead (mmio={:#x}+{:#x} dma_pages={} bdf={:#x})",
-            req.mmio_base, req.mmio_len, req.dma_pages, req.bdf);
+            "task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS or its BDF instead (mmio={:#x}+{:#x} dma_pages={})",
+            req.mmio_base, req.mmio_len, req.dma_pages);
+        return -1;
+    }
+    // A BDF IS NOT AN ADDRESS, and this is the line step D3 turns on.
+    //
+    // It used to be refused alongside `mmio_base`, which lumped two different kinds of value
+    // together. An address is authority: accept one and the kernel grants whatever the caller
+    // pointed at. A BDF is an IDENTIFIER - it names WHICH device, and the kernel then reads that
+    // device's own registers to learn what the name is worth (`bar_and_irq_from_bdf`). The caller
+    // cannot widen what it gets by lying, only misdirect itself to a different real device, and
+    // that is the supervisor's decision to make (§14) exactly as choosing the class was.
+    //
+    // "A service may identify a device; it may not thereby acquire authority over that device."
+    //
+    // Zero means "not supplied" and keeps the class path. That does collide with 00:00.0, the host
+    // bridge - which no driver binds, and which has no BAR worth granting, so the collision costs
+    // nothing real. Stated because a sentinel that overlaps a legal value is worth knowing about.
+    if req.bdf != 0 && !crate::task::hw_class_is_pci(req.hw_flags) {
+        crate::kprintln!(
+            "task: SpawnImage refused - a BDF only means something for a PCI device class (bdf={:#x} class={})",
+            req.bdf, req.hw_flags);
         return -1;
     }
     if !crate::task::hw_class_known(req.hw_flags) {
@@ -1061,6 +1083,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.probe_mode,
         req.hw_flags,
         req.dma_pages,
+        req.bdf,
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the

@@ -266,6 +266,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Answer questions about what was found. A reporter answers; it does not push.
     //   op 1        -> device count
     //   op 2 + idx  -> that device's facts
+    //   op 3 + class -> the BDF of the first device with that class code (0 = none)
     loop {
         let msg = ctx.recv();
         // The caller's one-shot reply cap. No cap means nobody is waiting for an answer, so there is
@@ -284,6 +285,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 b[12..16].copy_from_slice(&f.bars[0].to_le_bytes());
                 b[16] = f.irq_line;
                 Message::from_bytes(&b)
+            }
+            // op 3: which device IS this class? Three payload bytes carry the 24-bit class code.
+            //
+            // A single round trip, because the caller is the SUPERVISOR resolving a driver's device at
+            // SPAWN TIME - once per driver, on the path that starts the machine. Walking the list over
+            // IPC instead would be one exchange per device per spawn, and would put the reporter's
+            // record count on the boot path for no gain.
+            //
+            // FIRST match, and that is the reporter's only judgement: it reports bus order, and which
+            // of two identical devices a driver should drive is the supervisor's decision, not this
+            // service's. When that question arises the answer is a richer query here, not a policy.
+            (Some(3), _) if p.len() >= 4 => {
+                let want = u32::from_le_bytes([p[1], p[2], p[3], 0]);
+                let bdf = found.iter().take(n)
+                    .find(|f| f.class_code == want)
+                    .map_or(0u32, |f| f.bdf);
+                Message::from_bytes(&bdf.to_le_bytes())
             }
             // An unknown op is ANSWERED, not ignored: a caller blocked on a reply that never comes is
             // the hang nothing above the kernel may cause.

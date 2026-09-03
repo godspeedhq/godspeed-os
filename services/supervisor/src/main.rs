@@ -229,14 +229,16 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
     ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0, 0),
-    // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG - a 32-bit write to 0xCF8 and a
-    // 32-bit read of 0xCFC-0xCFF, and nothing else. The write side of the DATA port is deliberately
-    // absent: CF8 selects which register CFC reaches, so writing CFC would be writing any config
-    // register of any device on the bus.
+    // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
+    // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
+    // config space at all - that would be write access to every BAR and command register of every
+    // device on the bus, and there is no narrower form of it to grant, because the target is chosen
+    // by data rather than by the interface.
     //
-    // ONE holder, because the pair is stateful - two would silently read each other's device. If a
-    // second service ever needs config reads, that is a design decision about who enumerates, not a
-    // second grant.
+    // (An earlier version of this comment described a WRITE to 0xCF8 plus a READ of 0xCFC as two
+    // separate operations. That was the first design, and it was replaced: the pair is stateful, so
+    // split across two syscalls two callers read each other's device - and the KERNEL drives the same
+    // registers on its spawn and kill paths, so a split interface raced the kernel too.)
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, u32::MAX, &[],
@@ -441,6 +443,16 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     req.privileges   = privs;
     req.probe_mode   = mode;
     req.hw_flags     = hw;
+    // WHICH device this class means, when the reporter told us (step D3). An identifier, not an
+    // address: the kernel reads that device's registers to learn its BAR and IRQ, so this grants
+    // nothing naming the class would not - it only removes the kernel's need to GUESS which device a
+    // class refers to. Zero when unknown, which is the pre-D3 behaviour exactly.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        req.bdf = if hw & godspeed_sdk::service_context::hwclass::PCI != 0 {
+            ask_bdf_for_class(ctx, hw & 0x00FF_FFFF)
+        } else { 0 };
+    }
     // The DMA arena a PCI driver needs, in 4 KiB pages. A SIZE, not an address - the kernel still
     // decides WHERE the arena lives; this says only how big. Zero for a register-only driver.
     //
@@ -690,6 +702,36 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
         // `chaos spawn-storm` report the task-pool ceiling hit at spawn #1.
         Ok(None) => true,
         Err(()) => { ctx.log_fmt(format_args!("supervisor: spawn {} FAILED", name)); false }
+    }
+}
+
+/// Ask `hw-enumerator` which device carries this class code. Zero means "no answer" - the kernel
+/// then resolves the class against its own scan, exactly as before D3.
+///
+/// **ASKED AT SPAWN TIME, NOT CACHED, and that is deliberate.** A cached table would be a SNAPSHOT,
+/// and the thing it describes changes: `hw-enumerator` restarts like any service, and a driver
+/// respawned after it must get the bus as it is NOW rather than as it was at boot. "Assignment once,
+/// re-read always" is the rule the rest of D is built on, and a cache here would break it in the one
+/// place it matters most - the restart path.
+///
+/// It also owns no state, which is what a service may not do casually: an earlier version of this kept
+/// a `static mut` table of what the reporter said, which is `unsafe` in a service (§18.2, mechanically
+/// forbidden) and unowned global mutable state (§3.9, Commandment VI). Both, in one helper, to avoid
+/// one IPC round trip per driver spawn. The checker refused it, correctly.
+///
+/// Best effort: any failure returns 0 and the machine boots exactly as it did before.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
+    const OP_BY_CLASS: u8 = 3;
+    const ANSWER_SECS: i64 = 2;
+    let c = class_code.to_le_bytes();
+    let mut buf = [0u8; 16];
+    match ctx.request_with_reply_deadline_outcome_into(
+        "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
+    {
+        DeadlineOutcomeInto::Reply(n) if n >= 4 =>
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        _ => 0,
     }
 }
 
