@@ -45,12 +45,6 @@ fn main() {
         _         => &[],
     };
 
-    // `hw-enumerator` is x86-only for the same reason, one layer down: its authority is legacy PCI
-    // CF8/CFC PORT I/O, and ARM has no port I/O address space at all. Embedding it there would ship a
-    // service that comes up, is refused by the kernel on its first config read, says so, and idles -
-    // a service that cannot work on the machine it is on. A hardware enumerator for those ports would
-    // reach its devices another way (device tree, ECAM), which is a different implementation behind
-    // the same service contract.
     // Embedded where configuration space is REACHABLE: x86 through the CF8/CFC ports, aarch64
     // through the Pi 4's memory-mapped INDEX/DATA window. Not arm32 - the Pi 2 has no PCI at all,
     // so there is nothing there for it to read.

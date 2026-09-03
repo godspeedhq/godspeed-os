@@ -1561,15 +1561,17 @@ enum SerialClaim {
 /// is the 104-second-boot failure returning by a different route, and it is a far worse bug than a
 /// garbled log line.
 ///
-/// So the wait is sized to serialise the SHORT lines that make up most of the log, and to give up
-/// rather than queue behind a long flush. Splices therefore still occur, concentrated exactly where
-/// the writes are longest. That residual is real and is recorded in the audit rather than implied
-/// away.
+/// So the wait is sized to serialise SHORT lines and to give up rather than queue behind a long flush.
 ///
-/// THE ACTUAL FIX IS NOT A LONGER WAIT. It is not waiting: a bounded ring that accepts whole lines
-/// from any core and lets a single drainer write them, so no writer ever blocks on the UART and lines
-/// cannot interleave by construction. That is a larger change to the machine's only diagnostic path
-/// and wants its own careful pass; this constant is the honest interim.
+/// **THE RING IS WHAT ACTUALLY FIXED THE SPLICE, and it is built - this is no longer an interim.** An
+/// earlier revision of this comment ended "this constant is the honest interim" and said splices still
+/// occurred; both were true when written and neither is true now. Runtime writers queue whole lines and
+/// never wait (see `serial_emit`), and hardware measured ZERO splices across 100 chaos rounds on both
+/// the Pi 4 and two x86 boards.
+///
+/// What still uses this deadline is therefore narrow: `put_str`, the EARLY BOOT writer that is
+/// deliberately left off the ring, and the drainer, which is the one core already doing everyone's
+/// wire work. Neither is an ordinary runtime writer, and no ordinary runtime writer waits at all.
 #[cfg(feature = "pi4")]
 fn serial_claim_deadline_ticks() -> u64 {
     // 10 ms - about one short line's worth of UART time. `timer::frequency` reads CNTFRQ_EL0; a

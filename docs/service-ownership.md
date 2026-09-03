@@ -552,7 +552,15 @@ the same posture §6.4 already accepts for a DMA-capable driver on a board with 
 new CATEGORY of exposure; today's arrangement is not safer, only more implicit.
 
 With that, the kernel's bus responsibility goes to **zero**: no scan, no classification, no `HwClass`
-variant per device, none of the 21 per-class statics. All 1,017 lines of `pci.rs` leave the kernel.
+variant per device, none of the 21 per-class statics.
+
+**Not all of `pci.rs` leaves, and the earlier claim that it did was wrong in kind, not only in number.**
+Measured at `8f3c1a10`, the file is ~1,320 lines: roughly **870 go** (the bus walk, `find_by_class`, the
+BIOS handoffs, the per-class statics - semantics) and roughly **400 STAY** (`config_read32`,
+`config_write32`, `cfg_read_gated`, `bar_and_irq_from_bdf`, `program_msi`/`program_msix`,
+`set_bus_master`) because those are MECHANISM the kernel still owes: it performs every `PciCfgRead` on
+a service's behalf, it programs MSI, and interrupt routing is one of the six responsibilities by name
+(§4.3). The split is approximate - a few helpers could fall either side - but the shape is not.
 What it gains is a bounds check against a map it already has, and granting MMIO by `(phys, len)`
 instead of by class - mechanism, not policy.
 
@@ -743,8 +751,8 @@ back a plausible zero a caller would read as an empty machine.
 
 **What it does NOT do yet.** This is ADDITIVE. `kernel/src/arch/x86_64/pci.rs` still runs and still
 does the boot scan - nothing consumes the userspace results for anything load-bearing. Retiring those
-1,183 lines is the next step, and it wants the two walks agreeing on REAL HARDWARE first, not only in
-QEMU. That is the same discipline D1 followed: record, cross-check, and only then switch over.
+the SCAN is the next step - about 870 of the file's ~1,320 lines, the rest being mechanism that stays
+(see above) - and it wants the two walks agreeing on REAL HARDWARE first, not only in QEMU. That is the same discipline D1 followed: record, cross-check, and only then switch over.
 
 **THE WALKS NOW AGREE ON EVERY MACHINE (2026-09-03), and getting there took a hardware round trip.**
 
@@ -779,6 +787,66 @@ set, and the privilege MINT. Each list is correct on its own terms. Three of the
 the first attempt; the enforcement layer caught them, including a privilege that was checked and
 delegatable but never minted - which failed SILENTLY, because the SDK wrapper read any non-negative
 syscall return as success, so the service saw "success" and read zeros.
+
+### D3 (IN PROGRESS 2026-09-03): retiring the scan - two slices built, two to go
+
+The gate D3 waited on is open (the walks agree on every machine, see D2 above). What follows is the
+switch-over, and two of its four pieces are built and cross-checked. Both are deliberately
+NON-LOAD-BEARING: the kernel still resolves every driver's device from its own scan, and nothing here
+decides anything yet. That is the same discipline D1 and D2 followed - record, cross-check, and only
+then switch over.
+
+**Slice 1 (BUILT): the supervisor asks `hw-enumerator`, so the reporter has a client.**
+
+Its request/reply loop had been written before anything called it - the speculative-feature mistake
+(§26.2) - and dead code cannot be trusted to work on the day something depends on it. D3 depends on it:
+nothing can be retired until the supervisor OBTAINS the device list rather than the kernel scanning
+for it. The supervisor now queries it at boot and logs the result, giving the third leg of the
+cross-check:
+
+```
+kernel scan       8
+userspace walk    8
+supervisor (IPC)  8      identical, device for device (QEMU q35)
+```
+
+It is best-effort by construction - every failure path logs and returns rather than retrying, because
+a supervisor that blocks on a reporter cannot spawn the services the machine needs. The peer cap comes
+from `reacquire_by_name`, NOT the handle `ensure_mapped` holds: `acquire_send_grant_cap` returns a
+handle without recording it in the SDK's send-cap cache, and `request_with_reply` resolves peers
+through that cache, so a request on the map's handle finds no slot and fails instantly. Same trap as
+the silent `0 sectors` from `dwc2`.
+
+**Slice 2 (BUILT): the kernel derives BAR and IRQ from a BDF, and it agrees with the scan.**
+
+This is the answer to cost 2, and it rejects the binary that cost was framed as. `bar_and_irq_from_bdf`
+takes a bare BDF and reads that device's first memory BAR and its IRQ line straight from config space;
+the boot log cross-checks it against the scan on every device and reports
+`derive-from-BDF vs scan: AGREES on every device`.
+
+Why neither original arm was right:
+
+- a reported VECTOR is an authority-bearing value the kernel must TRUST, and a range check cannot
+  catch a wrong one. A NIC handed vector 1 receives the keyboard's interrupts - SEC-2's residual
+  arriving through a new door.
+- keeping the kernel's read means keeping the scan that FINDS the device, so nothing is retired and
+  the option is only "smaller" if its 870 lines are not counted.
+
+A reported BDF is neither: it is an IDENTIFIER, and the kernel answers the authority question itself
+by reading the device's own registers. Exactly the rule already settled for addresses - **a service may
+identify a device; it may not thereby acquire authority over that device.** And it grows no kernel
+responsibility: config reads, MSI programming and interrupt routing are all already the kernel's
+(§4.3). What leaves is the SCAN, which is semantics.
+
+**Slice 3 (NOT BUILT): the supervisor passes the BDF in the spawn request.** The kernel then resolves
+MMIO and IRQ from that BDF instead of from `find_by_class`.
+
+**Slice 4 (NOT BUILT, and the fiddly one): the assignment / re-enumeration split.** Designed below and
+not yet implemented. A restarted `hw-enumerator` must never reassign a BAR out from under a live
+driver, so re-enumeration has to be read-only and idempotent by construction. This is the piece with
+real subtlety; the rest is plumbing.
+
+Only after 3 and 4 does the scan come out.
 
 ### The service is a REPORTER, and must stay one
 
@@ -886,8 +954,8 @@ The original statement of the cost follows, because the trade it describes is wh
 Pi 4 ECAM is an MMIO window - no new mechanism. x86 uses
 I/O ports `0xCF8`/`0xCFC`, and userspace cannot execute `IN`/`OUT`, so this needs a port-I/O capability
 or a gated syscall: a NEW KERNEL AUTHORITY, and the pin grows again. Defensible - it is the mechanism
-that lets 1,017 lines leave ring 0, which is the same trade `FIRE_IRQ` made for 123 lines - but it is a
-real addition and belongs in the decision, not in the implementation.
+that lets the bus scan - about 870 lines - leave ring 0, which is the same trade `FIRE_IRQ` made for
+123 lines - but it is a real addition and belongs in the decision, not in the implementation.
 
 **2. The interrupt.** A vector is authority (`task::hw_irqs_for`), and the kernel currently states it
 rather than accepting it. Under D the device's IRQ line comes from config space, which the kernel no
