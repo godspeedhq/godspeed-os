@@ -13,6 +13,7 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
+use godspeed_sdk::service_context::DeadlineOutcomeInto;
 use godspeed_sdk::service_context::supcmd;
 
 // ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
@@ -692,6 +693,75 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
     }
 }
 
+/// Ask `hw-enumerator` for its device list and log what came back.
+///
+/// BEST EFFORT, AND IT MUST STAY THAT WAY. Boot does not depend on the answer, so every failure path
+/// here logs and returns rather than retrying into a hang - a supervisor that blocks on a reporter is
+/// a supervisor that cannot spawn the services the machine actually needs.
+///
+/// The peer cap comes from `reacquire_by_name`, NOT from the handle `ensure_mapped` already holds.
+/// `acquire_send_grant_cap` returns a handle without recording it in the SDK's send-cap cache, and
+/// `request_with_reply` resolves peers through that cache - so a request made on the strength of the
+/// map's handle finds no slot and fails INSTANTLY rather than talking to anyone. That exact trap cost
+/// a silent `0 sectors` from `dwc2` once already; the comment above `RECOVERY` records it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn probe_hw_enumerator(ctx: &ServiceContext) {
+    const OP_COUNT: u8 = 1;
+    const OP_DEVICE: u8 = 2;
+    const ANSWER_SECS: i64 = 2;
+    /// Devices to read back. The reporter's own table is 32; this is the log's bound, not its.
+    const MAX_REPORT: u32 = 32;
+
+    if !ctx.reacquire_by_name("hw-enumerator") {
+        ctx.log("supervisor: hw-enumerator not reachable by name - skipping the device probe");
+        return;
+    }
+
+    let mut buf = [0u8; 64];
+    let n = match ctx.request_with_reply_deadline_outcome_into(
+        "hw-enumerator", &[OP_COUNT], &mut buf, ANSWER_SECS)
+    {
+        DeadlineOutcomeInto::Reply(len) if len >= 4 =>
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        DeadlineOutcomeInto::Reply(len) => {
+            ctx.log_fmt(format_args!(
+                "supervisor: hw-enumerator answered the count with {} bytes, wanted 4", len));
+            return;
+        }
+        // Named, not collapsed: the reporter scans the bus at startup, so a probe issued while it is
+        // still walking times out rather than failing to send, and those want different readings.
+        other => {
+            ctx.log_fmt(format_args!(
+                "supervisor: hw-enumerator did not answer the device count ({:?}) - continuing", other));
+            return;
+        }
+    };
+
+    ctx.log_fmt(format_args!(
+        "supervisor: hw-enumerator reports {} device(s) over IPC", n));
+
+    for i in 0..n.min(MAX_REPORT) {
+        match ctx.request_with_reply_deadline_outcome_into(
+            "hw-enumerator", &[OP_DEVICE, i as u8], &mut buf, ANSWER_SECS)
+        {
+            DeadlineOutcomeInto::Reply(len) if len >= 17 => {
+                let bdf = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let class = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let bar0 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                ctx.log_fmt(format_args!(
+                    "supervisor:   {:02x}:{:02x}.{} class {:#08x} bar0 {:#x} irq {}",
+                    (bdf >> 8) & 0xFF, (bdf >> 3) & 0x1F, bdf & 0x7, class, bar0, buf[16]));
+            }
+            other => {
+                ctx.log_fmt(format_args!(
+                    "supervisor: hw-enumerator device {} unreadable ({:?}) - stopping the probe",
+                    i, other));
+                return;
+            }
+        }
+    }
+}
+
 /// Ensure `name` is running and recorded in the map (Path C / Phase 6 - unifies boot and recovery).
 ///
 /// On a **fresh boot** nothing is running yet, so this spawns (via `spawn_mapped`/`spawn_wired`). On a
@@ -1039,6 +1109,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // MANAGED warns about, and this service hit it on its first boot.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ensure_mapped(&ctx, &mut name_map, "hw-enumerator", 0xFFFF);
+    // ASK IT WHAT IT FOUND. This is the first CLIENT `hw-enumerator` has ever had: its request/reply
+    // loop was written before anything called it, which is the speculative-feature mistake (§26.2),
+    // and dead code cannot be trusted to work when something finally needs it.
+    //
+    // Non-load-bearing on purpose. Nothing here decides anything yet - the kernel still resolves
+    // every driver's device from its own scan. What this buys is the THIRD cross-check the D3
+    // switch-over depends on: the kernel's scan and the userspace walk already print their lists, and
+    // this proves the supervisor can actually OBTAIN that list over IPC, which is the step that has to
+    // work before any of it can be load-bearing. Record, cross-check, and only then switch over.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    probe_hw_enumerator(&ctx);
     // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
     // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a
     // peer that does not exist yet costs them their direct cap and forces a name-wire later.

@@ -841,6 +841,42 @@ materially bigger thing to trust, and the door through which "manager" walks bac
 assignment where it is (the boot path, once) and the reporter read-only is the better split, and the
 "assignment once, re-read always" problem below is exactly why.
 
+### Why there is no signature on any of this, and when that changes
+
+A reader who knows §16 ("Signature valid? No -> Reject") could take the absence of signature
+verification here for an oversight and go add one. It is not, and adding one now would be the §26.2
+speculative feature - so the reasoning is recorded rather than left to be re-derived.
+
+**Every service ships INSIDE the kernel image.** `hw-enumerator` is embedded in the supervisor
+(`include_bytes!`, 29 of them), the supervisor is embedded in the kernel, and no image is read from
+disk, filesystem or network by any path that exists today. One artifact.
+
+**For that case embedding is STRICTLY STRONGER than signing, not a substitute for it.** A signature
+proves "these bytes are the ones that were signed"; embedding makes them the same bytes as the kernel,
+so there is nothing left to prove. Signing the inner parts is also circular - the verifier lives in the
+image it would be verifying, so anyone able to alter a service's bytes can alter the check, or the
+kernel. And there is no load step, so none of the verify-then-use hazards a signature scheme has to be
+careful about exist here.
+
+What actually goes wrong with an embedded artifact is INCOHERENCE - a stale service embedded beside a
+fresh kernel - and that is already mechanically enforced by `embed_order_check.py` (the supervisor must
+be newer than every service it embeds) and `service_embed_check.py` (every managed service is embedded
+for real). Those catch the realistic failure; a signature would not even look at it.
+
+**THE TRIGGER, stated precisely, because the answer flips the moment it is crossed:** embedding
+suffices for exactly as long as every service ships in the kernel image. The day one arrives
+independently - an update, an image loaded from disk, anything over a wire - the artifact stops being
+one thing, and §16's verification becomes mandatory rather than optional. That is not hypothetical:
+§16 specifies it and it is spec-only today.
+
+**What a signature would NOT have bought either way**, and the reason it does not bear on D's residual:
+it covers the artifact at rest, not the process at runtime. `hw-enumerator` parses config space supplied
+by whatever hardware is plugged in; a device feeding it something that triggered a bug leaves the
+signature perfectly valid while the running service misbehaves. This is the same shape as SEC-2 -
+IOMMU confinement bounds a driver's DMA, not its output. The service is safe Rust with no `unsafe`
+(mechanically enforced), so the realistic failure is a BUG, not a compromise, and no signature catches
+a bug.
+
 ### The two costs still to accept before building
 
 **1. Config-space access for the reporter. PAID (2026-09-02).** One gated syscall, `PciCfgRead`, behind
