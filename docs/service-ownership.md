@@ -746,18 +746,24 @@ does the boot scan - nothing consumes the userspace results for anything load-be
 1,183 lines is the next step, and it wants the two walks agreeing on REAL HARDWARE first, not only in
 QEMU. That is the same discipline D1 followed: record, cross-check, and only then switch over.
 
-**THE WALKS DO NOT AGREE YET, and hardware is what said so (2026-09-03).** Four machines ran the pair:
+**THE WALKS NOW AGREE ON EVERY MACHINE (2026-09-03), and getting there took a hardware round trip.**
 
 | machine | kernel scan | userspace walk | verdict |
 |---|---|---|---|
 | QEMU q35 | 8 | 8 | identical, device for device |
 | Pi 4 | 1 endpoint | 2 (bridge + endpoint) | agrees; the extra is the bridge itself |
-| Wyse (Intel Gemini Lake) | **15** | **14** | ONE DEVICE MISSING |
+| Wyse (Intel Gemini Lake) | 15 | 15 | identical, device for device AND class for class |
 
-The Wyse gap is the `slots_on` limitation, and the claim attached to it - that no machine this runs on
-carries devices behind a bridge past slot 0 - was written from a sample of two and falsified by the
-third. Until that device is identified and reached, retiring the kernel scanner would LOSE hardware on
-a real board, so D3 is blocked on it rather than on effort.
+The Wyse first reported 15 against 14. My two guesses at the cause - the `slots_on` slot rule, or the
+`MAX_BUS` bound - were both wrong, and neither could be checked because the table printed only a COUNT.
+Printing it per device turned the question into a diff, and the diff named the device in one line:
+`00:0d.2`, a serial-bus controller on bus 0 with **no function 0 above it**. The walk broke out of the
+function loop on an absent function 0, under a comment asserting "no function 0 means no device here at
+all" - a rule PCI does not have and Intel chipsets routinely break.
+
+So the gate D3 was waiting on is OPEN: the two walks agree on every machine available, which is what
+"record, cross-check, and only then switch over" asked for. What remains for D3 is design, not data -
+see the assignment/re-enumeration split below, and cost 2, which is still unresolved.
 
 The Wyse also produced a false `NIC ... DISAGREES` on a machine whose networking was perfect: the
 cross-check compared `bar[0]` against a BAR_AUTO-resolved address, which asks whether BAR0 equals BAR2

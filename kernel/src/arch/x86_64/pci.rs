@@ -1237,13 +1237,19 @@ pub fn init() {
                 d.bar[bar_ix.min(5)]
             }
         };
+        // Name the index the way a reader thinks of it. Printing the sentinel put
+        // `BAR18446744073709551615` in the boot log - a number that means "auto" to this function and
+        // nothing at all to anyone reading it.
+        let bar_name: &str = if bar_ix == BAR_AUTO_IX { "AUTO" } else {
+            ["0", "1", "2", "3", "4", "5"][bar_ix.min(5)]
+        };
         match find_by_class(want_class) {
             Some(d) if want_found && bar_of(&d) == want_bar =>
-                crate::kprintln!("pci:   {} class {:#08x} AGREES (BAR{} {:#x} BDF {:#06x})",
-                                 label, want_class, bar_ix, bar_of(&d), d.bdf),
+                crate::kprintln!("pci:   {} class {:#08x} AGREES (BAR {} {:#x} BDF {:#06x})",
+                                 label, want_class, bar_name, bar_of(&d), d.bdf),
             Some(d) =>
-                crate::kprintln!("pci:   {} class {:#08x} DISAGREES - table BAR{} {:#x}, static {:#x} (found={})",
-                                 label, want_class, bar_ix, bar_of(&d), want_bar, want_found),
+                crate::kprintln!("pci:   {} class {:#08x} DISAGREES - table BAR {} {:#x}, static {:#x} (found={})",
+                                 label, want_class, bar_name, bar_of(&d), want_bar, want_found),
             None if !want_found =>
                 crate::kprintln!("pci:   {} class {:#08x} absent from both - agrees", label, want_class),
             None =>
