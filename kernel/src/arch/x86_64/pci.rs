@@ -280,6 +280,50 @@ pub(super) fn cfg_read_gated(sel: u32, offset: u16) -> Option<u32> {
     })
 }
 
+/// Read a device's first memory BAR and its IRQ line STRAIGHT FROM CONFIG SPACE, given only its BDF.
+///
+/// This is the primitive step D3 turns on. Under D the kernel stops scanning the bus and stops
+/// deciding which device is "the NIC" - that is semantics, and it belongs in `hw-enumerator` (§26.10).
+/// What it must NOT stop doing is deriving AUTHORITY from hardware: the address a driver's MMIO
+/// capability covers, and the vector its interrupt capability routes.
+///
+/// The distinction is the one already settled for addresses: **a service may identify a device; it may
+/// not thereby acquire authority over that device.** So the supervisor names a BDF - an identifier -
+/// and the kernel reads that device's own registers to learn what the BDF is worth. A reported BAR
+/// would be a value the kernel had to trust; a reported BDF is a question the kernel answers itself.
+///
+/// It needs no new mechanism. Config reads already exist here (the kernel performs every
+/// `PciCfgRead` on a service's behalf), MSI programming already exists (`program_msi`), and interrupt
+/// routing is one of the six kernel responsibilities by name (§4.3). What leaves under D3 is the
+/// SCAN - the bus walk and the class matching - not the register access.
+///
+/// "First memory BAR" is the BAR_AUTO rule the spawn path uses, and it is a rule rather than an index
+/// because WHICH BAR holds a device's registers is a property of the device: the e1000 uses BAR0, the
+/// RTL8168 puts I/O ports there and its registers in BAR2. I/O BARs are skipped (bit 0 set), and a
+/// 64-bit BAR (bits[2:1] = 10) takes its high half from the next slot.
+pub fn bar_and_irq_from_bdf(bdf: u32) -> (u64, u8) {
+    let bus  = ((bdf >> 8) & 0xFF) as u8;
+    let dev  = ((bdf >> 3) & 0x1F) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    let mut bi = 0usize;
+    let mut bar = 0u64;
+    while bi < 6 {
+        let lo = config_read32(bus, dev, func, 0x10 + (bi as u8) * 4);
+        if lo == 0 { bi += 1; continue; }
+        if lo & 0x1 != 0 { bi += 1; continue; }
+        if lo & 0x6 == 0x4 && bi + 1 < 6 {
+            let hi = config_read32(bus, dev, func, 0x10 + ((bi + 1) as u8) * 4);
+            bar = ((hi as u64) << 32) | ((lo & 0xFFFF_FFF0) as u64);
+        } else {
+            bar = (lo & 0xFFFF_FFF0) as u64;
+        }
+        break;
+    }
+    let irq = (config_read32(bus, dev, func, 0x3C) & 0xFF) as u8;
+    (bar, irq)
+}
+
 /// Write one 32-bit dword to PCI config space (mechanism #1). `offset` is
 /// dword-aligned (low two bits ignored).
 fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
@@ -1201,13 +1245,31 @@ pub fn init() {
     // more buses, or more functions. Retiring this scanner (the point of step D) is gated on the two
     // walks agreeing on real hardware, and an agreement that can only be checked by counting is not
     // one anybody can trust.
+    // Each line also CROSS-CHECKS the derive-from-BDF path against the scan that produced the entry.
+    //
+    // `bar_and_irq_from_bdf` is what D3 switches to: the supervisor will name a device and the kernel
+    // will read that device's registers rather than scan for it. Proving the two agree, on every
+    // device of every machine, is what "record, cross-check, and only then switch over" asks for -
+    // and it costs a few config reads per device, once, at boot.
+    let mut derive_ok = true;
     for i in 0..n {
         if let Some(d) = device_at(i as usize) {
-            crate::kprintln!("pci:   {:02x}:{:02x}.{} class {:#08x} bar0 {:#x}",
+            let scan_bar = d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0);
+            let (derived_bar, derived_irq) = bar_and_irq_from_bdf(d.bdf);
+            let agree = derived_bar == scan_bar && derived_irq == d.irq_line;
+            if !agree { derive_ok = false; }
+            crate::kprintln!("pci:   {:02x}:{:02x}.{} class {:#08x} bar {:#x} irq {}{}",
                              (d.bdf >> 8) & 0xFF, (d.bdf >> 3) & 0x1F, d.bdf & 0x7,
-                             d.class_code, d.bar[0]);
+                             d.class_code, scan_bar, d.irq_line,
+                             if agree { "" } else { " <- DERIVE-FROM-BDF DISAGREES" });
+            if !agree {
+                crate::kprintln!("pci:     scan says bar {:#x} irq {}, reading the BDF says bar {:#x} irq {}",
+                                 scan_bar, d.irq_line, derived_bar, derived_irq);
+            }
         }
     }
+    crate::kprintln!("pci: derive-from-BDF vs scan: {}",
+                     if derive_ok { "AGREES on every device" } else { "DISAGREES - see above" });
     for (label, want_found, want_bar, want_class, bar_ix) in [
         ("xHCI", XHCI_FOUND.load(Ordering::Relaxed), XHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_30u32, 0usize),
         ("EHCI", EHCI_FOUND.load(Ordering::Relaxed), EHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_20, 0),
