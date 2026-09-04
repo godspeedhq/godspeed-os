@@ -9,6 +9,10 @@
 - [Glossary](glossary.md)
 - [The Almanac](almanac.md)
 
+# The System
+
+- [The services, and how they reach each other](services.md)
+
 # The gsh Language
 
 - [The gsh scripting language](design/scripting.md)
