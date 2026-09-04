@@ -15,7 +15,7 @@ limit   = "64MiB"
 # (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
 # ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 ipc_receive = ["reply-server"]   # OWNS its endpoint - the address clients send requests to
-log_write   = true               # may write to the logger
+log_write   = true               # may write to `events`
 
 # NO `ipc_send` - and that is the point. A request/reply server has NO named peer to send to: it
 # replies over the REPLY capability the client embeds in each request (retrieved with

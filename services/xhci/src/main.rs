@@ -627,7 +627,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         // Drain our IPC endpoint while we idle here. This wait - NOT the 'poll loop - is where a driver
         // with no HID attached lives, and 'poll is the only other place we drain. Without this, a chaos
         // flood-storm (or any stray send) fills our 16-deep queue and it sits at 16/16 FOREVER, exactly
-        // the logger stub bug in another guise. try_recv is non-blocking, so the port poll is unaffected.
+        // `events` stub bug in another guise. try_recv is non-blocking, so the port poll is unaffected.
         {
             // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
             let mut drained = 0u32;
@@ -665,7 +665,7 @@ fn idle(ctx: &ServiceContext) -> ! {
     ctx.signal_input_ready();
     // DRAIN our IPC endpoint forever, never just yield: a registered driver that idles here without
     // recv'ing lets a flood-storm (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER -
-    // the logger stub bug, and the exact gap the flood-endpoint sweep missed for xhci's no-controller path.
+    // `events` stub bug, and the exact gap the flood-endpoint sweep missed for xhci's no-controller path.
     // We POLL (try_recv) rather than block on recv: a cross-core flood that must WAKE a deeply-blocked recv
     // on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven poll
     // drains every quantum with no wake needed (mirrors wait_for_port above + ehci idle_draining). Pinned by
@@ -3125,7 +3125,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // It was invisible until now because the cc 5 churn was re-enumerating at a similar rate anyway.
     // Fixing that (16243569) did not cause this loop; it uncovered it.
     //
-    // Third instance of one class in this driver: state whose lifetime is shorter than the events it
+    // Third instance of one class in this driver: state whose lifetime is shorter than `events` it
     // must remember (`eaten` re-zeroed per pass, PROBE_FAILS reset per re-enumeration, now this).
     // A latch that resets when the thing it latches happens is not a latch.
     // Consecutive CONNECTED reads per hub port, so an arrival needs CONFIRMING.

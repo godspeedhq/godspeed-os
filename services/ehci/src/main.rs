@@ -29,7 +29,7 @@ const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 
 /// Idle forever by DRAINING our IPC endpoint, never `ctx.park()`. A registered driver that parks
 /// never recv's, so a flood-storm (or any stray send) fills its 16-deep queue and it sits at 16/16
-/// FOREVER - the logger stub bug in another guise. recv() parks the task between messages, so the
+/// FOREVER - `events` stub bug in another guise. recv() parks the task between messages, so the
 /// core still idles; it just no longer clogs. Used at every dead end where ehci has nothing left to
 /// do (no controller MMIO, reset failed, or no high-speed device present at boot).
 fn idle_draining(ctx: &ServiceContext) -> ! {

@@ -140,14 +140,14 @@ CASES = [
      ["COMMANDMENTS.baseline.toml"], []),
 
     ("V-no-panic", "a service that can halt the machine",
-     lambda: edit("services/logger/src/main.rs", "#[no_mangle]",
+     lambda: edit("services/events/src/main.rs", "#[no_mangle]",
                   "fn boom() { let x: Option<u32> = None; let _ = x.unwrap(); }\n#[no_mangle]"),
-     ["services/logger/src/main.rs"], []),
+     ["services/events/src/main.rs"], []),
 
     ("VI-static-mut", "unowned global mutable state in a service",
-     lambda: edit("services/logger/src/main.rs", "#[no_mangle]",
+     lambda: edit("services/events/src/main.rs", "#[no_mangle]",
                   "static mut SNEAK: u32 = 0;\n#[no_mangle]"),
-     ["services/logger/src/main.rs"], []),
+     ["services/events/src/main.rs"], []),
 ]
 
 base = run()

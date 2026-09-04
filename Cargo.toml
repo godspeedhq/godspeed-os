@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "kernel",
     "services/supervisor",
-    "services/logger",
+    "services/events",
     "services/console",
     "services/time",
     "services/hw-enumerator",

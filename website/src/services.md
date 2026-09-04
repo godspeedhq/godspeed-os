@@ -57,7 +57,7 @@ Arrows point from the caller to the service it sends to.
              │         └──────┬───────┘         │  restarts what dies
              │                │                 │
      ┌───────▼──────┐  ┌──────▼──────┐   ┌──────▼──────┐
-     │   control    │  │    shell    │   │   logger    │
+     │   control    │  │    shell    │   │   events    │
      │ (COM2 ops)   │  │  (the user) │   │             │
      └──────────────┘  └──┬───┬───┬──┘   └─────────────┘
                           │   │   │
@@ -121,7 +121,7 @@ There is no `stdin` and no `fork`. A pipe `A | B` is the shell creating an endpo
 end to each side (Appendix D.3). A killed shell respawns as a fresh prompt - the in-flight command is
 lost, the session is not.
 
-**Peers:** `fs`, `block-driver`, `time`, `console`, `logger`, `supervisor`.
+**Peers:** `fs`, `block-driver`, `time`, `console`, `events`, `supervisor`.
 
 ### `fs` - the filesystem, and files as capabilities
 
@@ -139,7 +139,7 @@ A file **is** a capability (§7.10): unforgeable, non-escalating, revocable by g
 commits metadata through a crash-consistent redo journal, so its death is a restart rather than a
 reboot - which is what took it out of the trusted computing base.
 
-**Peers:** `block-driver`, `logger`.
+**Peers:** `block-driver`, `events`.
 
 ### `block-driver` - blocks, and nothing above them
 
@@ -212,14 +212,14 @@ cannot ask a service to report it (§11.4).
 
 **Peers:** `fs`, `net-stack`.
 
-### `logger` - a broker, not a store
+### `events` - a broker, not a store
 
 ```
-   any service ──▶ logger ──▶ serial + the kernel ring buffer
+   any service ──▶ events ──▶ serial + the kernel ring buffer
                        └────▶ the `trace` ring (IPC events, in-memory)
 ```
 
-Stateless on purpose. A logger that persisted would depend on `fs`, which would make observing a
+Stateless on purpose. An `events` that persisted would depend on `fs`, which would make observing a
 storage failure depend on storage.
 
 **Peers:** none.

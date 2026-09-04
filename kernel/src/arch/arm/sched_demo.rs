@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Neutral-scheduler PREEMPTION demo - the timer preempts non-yielding tasks on ARM.
 //!
-//! The `logger: ready` spawn (spawn.rs) entered ONE service directly, bypassing the scheduler. Full
+//! The `events: ready` spawn (spawn.rs) entered ONE service directly, bypassing the scheduler. Full
 //! operation needs the neutral `scheduler::run` itself, and - crucially - **preemption of tasks that
 //! do not cooperate**: a real service blocks on `recv`, it does not `yield`, so only the timer can
 //! take the core away from it. This demo commits three kernel tasks that **spin** (no yield), arms the

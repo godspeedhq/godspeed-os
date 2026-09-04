@@ -103,7 +103,7 @@ const IRQ_RX_ROUNDS: u32 = 8;
 fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // CONSOLE ONLY. The port-level detail is already logged beside every call site, and
     // logging here as well printed each notice TWICE in the serial capture - once from the
-    // logger and once from the console, which shares the same line.
+    // events and once from the console, which shares the same line.
     ctx.console_write("\r\n");
     ctx.console_writeln_fmt(args);
     // GIVE THE PROMPT BACK. The shell reads byte 10 as Enter, so this makes it redraw `gsh>`

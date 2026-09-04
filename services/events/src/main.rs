@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `logger` - the diagnostic sink (§11.4). Restartable.
+//! `events` - the diagnostic sink (§11.4). Restartable.
 //!
 //! Two jobs, both "somewhere to put diagnostic data that someone reads later":
 //!
@@ -25,13 +25,13 @@
 //! death-notification set, the restart counter). "The kernel gains nothing" was *almost* true, and the
 //! almost was the whole point.
 //!
-//! `logger` already exists in all three lists, is already managed and watched, and its entire purpose
+//! `events` already exists in all three lists, is already managed and watched, and its entire purpose
 //! is diagnostic data. Putting the ring here costs the kernel **exactly nothing**.
 //!
 //! It is worth being precise about one tension: `docs/logging.md` calls this service "a stateless
-//! broker, not a store", and that is about PERSISTENCE - a logger that writes through `fs` makes
+//! broker, not a store", and that is about PERSISTENCE - an `events` that writes through `fs` makes
 //! observing a storage failure depend on storage. A fixed in-memory ring is not persistence. It
-//! survives nothing: a restarted logger starts empty, and that is correct, because the ring is
+//! survives nothing: a restarted events starts empty, and that is correct, because the ring is
 //! history and nothing depends on it.
 //!
 //! # Bounded, and loud about loss (§26.6, invariant 12)
@@ -73,7 +73,7 @@ struct Ev {
 
 /// Answer a query over the reply cap the request carried, NON-BLOCKING (§8.9).
 ///
-/// A reader that has gone away must never block the logger: this service sits at the end of every
+/// A reader that has gone away must never block `events`: this service sits at the end of every
 /// emitter's `try_send`, so a blocking reply here would let one stalled reader stall the sink for the
 /// whole system. Dropped on failure - the caller retries, and a lost answer costs nothing.
 fn reply(ctx: &ServiceContext, out: &[u8]) {
@@ -84,7 +84,7 @@ fn reply(ctx: &ServiceContext, out: &[u8]) {
         // until the table is full. `block-driver`, `console` and `fs` all do this - this service was
         // the one that did not.
         //
-        // It was visible before it was fatal: `trace deps fs` drew `logger -> shell`, because a
+        // It was visible before it was fatal: `trace deps fs` drew `events -> shell`, because a
         // retained return address is indistinguishable from a wired peer (both SEND|GRANT to a live
         // task's endpoint). A leak that shows up as a wrong arrow in a diagram is a lucky leak.
         ctx.remove_cap(cap);
@@ -108,8 +108,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut at_s = ctx.epoch_secs_monotonic() as u32;
     let mut at_tsc = ctx.read_tsc();
 
-    ctx.trace_as("logger");
-    ctx.log("logger: ready (drains its endpoint; holds the IPC trace ring)");
+    ctx.trace_as("events");
+    ctx.log("events: ready (drains its endpoint; holds the IPC trace ring)");
 
     loop {
         let msg = ctx.recv();

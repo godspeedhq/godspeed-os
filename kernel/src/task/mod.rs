@@ -227,7 +227,7 @@ const EHCI_DMA_PAGES:      u64 = 16;
 /// Send peers a service may be wired with.
 ///
 /// RAISED 4 -> 6 (2026-08-29). The shell legitimately needs five (`fs`, `block-driver`, `time`,
-/// `console`, `logger`), and at four the fifth was dropped SILENTLY - the contract declared it, the
+/// `console`, `events`), and at four the fifth was dropped SILENTLY - the contract declared it, the
 /// service never got the cap, and the only symptom was a peer that behaved as though it did not exist.
 /// The cap itself is right (a fixed array, §26.6); the silence was the bug, and the loud reject below
 /// is the other half of this fix.
@@ -1552,7 +1552,7 @@ fn spawn_service_with_image(
     // actually start other services: init (spawns the trusted root), supervisor
     // (spawns services + probes), the shell (brokers spawn/kill/restart), and the
     // test-driver probes (property/stress/perf/chaos modes spawn victims; matched by
-    // ELF identity so no probe family is missed). logger, the drivers,
+    // ELF identity so no probe family is missed). events, the drivers,
     // ping, pong, and observe never spawn and no longer hold the authority to.
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
@@ -2343,12 +2343,12 @@ fn spawn_service_with_image(
 
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 /// The kernel's ONE direct spawn (Path C / Phase 5 - `init` is removed). The kernel boots the
-/// SUPERVISOR directly; the supervisor then spawns logger and all services. Uses `SUPERVISOR_ELF`
+/// SUPERVISOR directly; the supervisor then spawns events and all services. Uses `SUPERVISOR_ELF`
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
 /// owns the death-notification endpoint). A *boot-time* spawn failure is fatal (§6.2, §11.3); a later
 /// *runtime* death is recovered by the kernel respawning it (Phase 6 - see below).
-// C1-1: `arm_spawn_logger_neutral` and `arm_spawn_shell_neutral` USED TO LIVE HERE, and with them the
-// `arm-sched-spawn` / `arm-shell` / `arm-spawn-logger` / `pi4-sched-spawn` bring-up builds in which the
+// C1-1: `arm_spawn_events_neutral` and `arm_spawn_shell_neutral` USED TO LIVE HERE, and with them the
+// `arm-sched-spawn` / `arm-shell` / `arm-spawn-events` / `pi4-sched-spawn` bring-up builds in which the
 // kernel started a service directly. They were scaffolding from before the supervisor path worked, and
 // they were gated on ARCHITECTURE rather than on the features that called them, so every ARM and
 // AArch64 kernel carried the ability whether or not anything reached it.

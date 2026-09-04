@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! IPC trace emission - the client half of the trace ring that `logger` holds (`utilities/46_trace.md`).
+//! IPC trace emission - the client half of the trace ring that `events` holds (`utilities/46_trace.md`).
 //!
 //! # Why the instrumentation is HERE and not in the kernel
 //!
@@ -16,13 +16,13 @@
 //! # Cost when not tracing
 //!
 //! One `Relaxed` load, branch not taken. A service is tracing only if its contract granted it
-//! `ipc_send = ["logger"]` and the lazy resolution below found that cap - so tracing is AUTHORITY,
+//! `ipc_send = ["events"]` and the lazy resolution below found that cap - so tracing is AUTHORITY,
 //! visible in `caps <service>`, revocable, and absent by default (§3.1: no ambient anything).
 //!
 //! # Never blocks, never fails loudly
 //!
 //! Emission is `try_send` and the result is discarded. An observer must not be able to slow, block or
-//! break the thing it observes: a full logger queue costs the emitting service nothing and loses one
+//! break the thing it observes: a full events queue costs the emitting service nothing and loses one
 //! event, which the ring counts and `trace status` reports. That is the correct trade here, and the
 //! opposite of the one made on a correctness path.
 
@@ -44,9 +44,9 @@ pub const EV_LEN: usize = 4 + 4 + PEER_LEN + PEER_LEN + 1 + 1;
 
 /// The service that holds the ring. A call to THIS peer is never traced: the reader reaches the ring
 /// through it, so recording those calls would fill the ring with the reader's own questions.
-pub const SINK_NAME: &str = "logger";
+pub const SINK_NAME: &str = "events";
 
-/// Message opcodes understood by the ring in `logger` (byte 0 of the payload).
+/// Message opcodes understood by the ring in `events` (byte 0 of the payload).
 pub const TRACE_OP_EVENT: u8 = 1;
 /// Ask for the most recent events; byte 1 = how many are wanted.
 pub const TRACE_OP_DUMP: u8 = 2;
@@ -81,7 +81,7 @@ pub const KIND_ABORTED: u8 = 6;
 ///
 /// So the caller says who it is. The objection writes itself - a self-declared name is a claim, not a
 /// fact - and it does not survive contact with what the event already is: a service holding
-/// `ipc_send = ["logger"]` can already write any `peer` and any `outcome` it likes, because the whole
+/// `ipc_send = ["events"]` can already write any `peer` and any `outcome` it likes, because the whole
 /// event is its testimony. A `caller` field is exactly as trustworthy as the two fields beside it,
 /// which is to say as trustworthy as the service you granted trace authority to. It opens nothing.
 ///
@@ -180,7 +180,7 @@ pub fn caller_set() -> bool { CALLER.is_set() }
 /// Whether resolution has been attempted yet. Emission arms itself LAZILY, on the first call, because
 /// a service is handed a context and has no init hook to run in - so there is nowhere to arm it from.
 static RESOLVED: AtomicBool = AtomicBool::new(false);
-/// The cap slot for `logger`: `u32::MAX` means "resolved, and this service has no logger send cap", which
+/// The cap slot for `events`: `u32::MAX` means "resolved, and this service has no events send cap", which
 /// is the normal case and costs one relaxed load per call forever after.
 static TRACER_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Per-service event counter, so a reader can see gaps where events were dropped.
@@ -192,7 +192,7 @@ pub fn resolved() -> bool {
     RESOLVED.load(Ordering::Relaxed)
 }
 
-/// Record the outcome of resolution. `u32::MAX` means this service holds no `logger` send cap, which is
+/// Record the outcome of resolution. `u32::MAX` means this service holds no `events` send cap, which is
 /// remembered so the lookup happens exactly once per service lifetime.
 #[inline]
 pub fn set_sink_slot(slot: u32) {

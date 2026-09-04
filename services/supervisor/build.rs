@@ -18,7 +18,7 @@ fn main() {
 
     // The images this supervisor carries.
     const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure",
-        "ping", "time", "logger", "asker", "resource-server", "chaos", "control", "observe", "greet",
+        "ping", "time", "events", "asker", "resource-server", "chaos", "control", "observe", "greet",
         "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver"];
 
     // The USB host drivers exist only where their controller does, so they are embedded PER ARCH -

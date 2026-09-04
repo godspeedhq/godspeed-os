@@ -6,7 +6,7 @@
 //! (`task::spawn_supervisor`, Path C / Phase 5) - and the supervisor, a userspace service, reads its
 //! boot manifest and spawns everything else through the spawn syscall (which routes to the neutral
 //! `spawn_service_with_config`, proven on ARM in 4a). On the Pi 2 the supervisor spawns the services
-//! whose ARM ELFs exist (`logger`, `pong`, `ping`); the hardware services (xhci/ehci/nic/block/fs) are
+//! whose ARM ELFs exist (`events`, `pong`, `ping`); the hardware services (xhci/ehci/nic/block/fs) are
 //! empty placeholders here, so those spawns fail and are skipped (the supervisor ignores spawn errors),
 //! exactly the "system continues with the services that did start" behaviour §9.2/§11.3 specify. The
 //! kernel wires `ping`'s SEND cap to `pong` from the name directory at spawn, so ping->pong IPC runs -

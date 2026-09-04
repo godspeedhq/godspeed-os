@@ -23,7 +23,7 @@ ipc_receive = ["holder"]   # OWNS its endpoint. resource-server GRANTs the resou
                            # embedded cap on a message), and resource-server's REPLIES to holder's
                            # cap invocations land here too (the reply cap holder embeds per invoke is
                            # a SEND copy of THIS endpoint, derived at runtime, §8.5).
-log_write   = true         # may write to the logger (its read-OK / write-denied / revoked receipts)
+log_write   = true         # may write to `events` (its read-OK / write-denied / revoked receipts)
 
 # NOTE: holder declares NO `ipc_send`. It never name-addresses anyone: it USES a capability it was
 # GRANTED. A `resource_invoke` is routed by the KERNEL to the resource's owner (resource-server) by

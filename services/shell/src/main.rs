@@ -848,7 +848,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // `nic-driver,net-<tab>` finishes `net-stack` while the earlier listed targets are preserved verbatim.
     if "chaos".as_bytes() == cmd && prior == 1 && words.clone().next() == Some("max-carnage".as_bytes()) {
         const TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -868,7 +868,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
     if "kill".as_bytes() == cmd && prior == 0 {
         const KILL_TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
+            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -898,7 +898,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
     if "restart".as_bytes() == cmd && prior == 0 {
-        const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "logger", "xhci",
+        const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "events", "xhci",
             "ehci", "shell", "nic-driver", "net-stack", "ping", "pong", "version", "help"];
         return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
     }
@@ -4394,8 +4394,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "caps" => help_block(ctx, "caps", "show a service's capabilities (records when piped)", &[
             ("caps", "this shell's own capabilities", "caps"),
-            ("caps <service>", "capabilities held by <service>", "caps logger"),
-            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights contains send"),
+            ("caps <service>", "capabilities held by <service>", "caps events"),
+            ("caps [service] | <verb>", "piped: records resource/rights", "caps events | where rights contains send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
             ("spawn <svc>", "start the service <svc>", "spawn pong"),
@@ -4404,13 +4404,13 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "kill" => help_block(ctx, "kill", "stop a service (it self-heals - the supervisor respawns it)", &[
             ("kill <svc>", "kill one service; it recovers (only the kernel never dies)", "kill pong"),
             ("kill <svc>,<svc>,...", "kill several at once (comma-separated, NO spaces)", "kill ehci,xhci,fs"),
-            ("kill all-services", "nuke EVERY service - drivers, storage, net, logger, supervisor, and this shell last; each self-heals", "kill all-services"),
+            ("kill all-services", "nuke EVERY service - drivers, storage, net, events, supervisor, and this shell last; each self-heals", "kill all-services"),
             ("(per-service rules still apply)", "supervisor is killable + kernel-respawned; spawn/restart of it stay refused", "kill supervisor"),
         ], true),
         "restart" => help_block(ctx, "restart", "restart a service", &[
             ("restart <name>", "restart (re-placed per contract)", "restart pong"),
             ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
-            ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,logger"),
+            ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,events"),
         ], true),
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
@@ -4513,7 +4513,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "where" => help_block(ctx, "where", "keep records whose field matches (record-pipe stage)", &[
             ("<records> | where <col><op><val>", "ops: = != > < >= <=, and the word `contains`", "status | where mem>0"),
             ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
-            ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps logger | where rights contains send"),
+            ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps events | where rights contains send"),
         ], true),
         "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
             ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
@@ -5027,7 +5027,7 @@ const PIPE_ONLY_VERBS: &[&str] = &["where", "select", "to", "from", "sum", "min"
 /// demo/on-demand services. Purely descriptive (a lookup miss here means "unknown", not an error in
 /// anything) - keep roughly in sync with the supervisor's managed set + the shell's spawn targets.
 const KNOWN_SERVICES: &[&str] = &[
-    "supervisor", "block-driver", "fs", "logger", "shell", "xhci", "ehci", "nic-driver", "net-stack",
+    "supervisor", "block-driver", "fs", "events", "shell", "xhci", "ehci", "nic-driver", "net-stack",
     "ping", "pong", "greet", "roster", "chaos", "observe", "mem-pressure",
 ];
 
@@ -7101,10 +7101,10 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     }
 }
 
-/// Ask `logger` for its recent trace events (`utilities/46_trace.md` mechanism B).
+/// Ask `events` for its recent trace events (`utilities/46_trace.md` mechanism B).
 ///
 /// The ring lives in that service, not the kernel - so this is an ordinary request/reply to an
-/// ordinary service, and a logger that is dead or absent is answered with a sentence rather than a
+/// ordinary service, and an `events` that is dead or absent is answered with a sentence rather than a
 /// hang (Commandment VIII: a missing dependency RETURNS, loudly).
 /// Build the trace ring's events as a `Table`.
 ///
@@ -7124,13 +7124,13 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
     let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
-            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            ctx.console_writeln("trace: the `events` service did not answer in 3 attempts (it holds the ring)");
             return None;
         }
     };
     let b = reply.payload_bytes();
     if b.is_empty() {
-        ctx.console_writeln("trace: logger returned nothing");
+        ctx.console_writeln("trace: events returned nothing");
         return None;
     }
     let n = b[0] as usize;
@@ -7381,7 +7381,7 @@ fn build_deps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
         // EVERY send capability, and the GRANT bit REPORTED rather than used as a filter.
         //
         // This filtered `SEND|GRANT` out, because a reply capability carries GRANT (it is derived from
-        // the caller's self-grant) and counting those had `logger` "calling" the shell. But a peer the
+        // the caller's self-grant) and counting those had `events` "calling" the shell. But a peer the
         // SUPERVISOR provides at spawn carries GRANT too - it must, or the supervisor could not
         // re-delegate it - so the filter also deleted real wiring: `net-stack` showed no `nic-driver`
         // dependency at all, right after a ping that demonstrably used it.
@@ -7620,7 +7620,7 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     };
     if t.nrows() == 0 {
         ctx.console_writeln(if failures_only { "trace: no failure events recorded" }
-                            else { "trace: no events recorded (is any service granted ipc_send=[\"logger\"]?)" });
+                            else { "trace: no events recorded (is any service granted ipc_send=[\"events\"]?)" });
         return Ok(());
     }
     // PAGE when it does not fit, exactly as `help` does - a ring dump is routinely taller than the
@@ -7687,14 +7687,14 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
 /// (the same distinction `KIND_QUEUE_FULL` exists for). Bounded: three attempts, then it says so.
 fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     for _ in 0..3 {
-        if let Some(r) = ctx.request_with_reply("logger", &Message::from_bytes(req)) {
+        if let Some(r) = ctx.request_with_reply("events", &Message::from_bytes(req)) {
             return Some(r);
         }
         // REACQUIRE BETWEEN ATTEMPTS. A busy sink is transient and a yield is the right answer, but a
         // RESTARTED one never recovers by waiting: the cap is stale and every retry fails identically.
-        // After a chaos storm restarted `logger` forty times, this loop failed three times in a row
+        // After a chaos storm restarted `events` forty times, this loop failed three times in a row
         // and reported a live service as unreachable (14.3 - reacquire by name, then retry).
-        let _ = ctx.reacquire_by_name("logger");
+        let _ = ctx.reacquire_by_name("events");
         ctx.yield_cpu();
     }
     None
@@ -7977,13 +7977,13 @@ fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
-            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            ctx.console_writeln("trace: the `events` service did not answer in 3 attempts (it holds the ring)");
             return Err(ShellError::Unknown);
         }
     };
     let b = reply.payload_bytes();
     if b.len() < 24 {
-        ctx.console_writeln("trace: logger returned a short status");
+        ctx.console_writeln("trace: events returned a short status");
         return Err(ShellError::Unknown);
     }
     let cap = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
@@ -7992,7 +7992,7 @@ fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_writeln_fmt(format_args!(
         "trace: ring {} events; {} recorded; {} DROPPED (oldest overwritten before being read)",
         cap, total, dropped));
-    ctx.console_writeln("trace: the ring lives in the `logger` service - the kernel records nothing.");
+    ctx.console_writeln("trace: the ring lives in the `events` service - the kernel records nothing.");
     Ok(())
 }
 
@@ -9082,7 +9082,7 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // Directly-restartable services: their OWN death notifies the supervisor, which respawns them
 // immediately (the supervisor itself is kernel-respawned). chaos confirms recovery for these each
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
-// kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
+// kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/events are
 // directly-restartable so max-carnage can't leave them dead.)
 // `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is the expansion
 // of `kill all-services` and a hard refusal gate for `chaos kill-storm`. So the storm skipped them
@@ -9093,7 +9093,7 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // fourth time. It stays a literal for now because the shell cannot see the supervisor's list, but
 // the honest fix is to derive it from live tasks the way `chaos` derives its own exclusions - which
 // is exactly why chaos has no roster to drift.
-const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger",
+const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
                                        "nic-driver", "net-stack", "time", "control", "dwc2"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
@@ -9175,7 +9175,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> <n>  all-services = RANDOM storm, or aim/list; TARGET + ROUNDS required");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         ctx.console_writeln("  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
-        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
+        ctx.console_writeln("  svc: supervisor | block-driver | fs | events | xhci | ehci | shell | nic-driver | net-stack");
         return Ok(());
     }
     match tok[0] {
@@ -9191,12 +9191,12 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                 ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
                 ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
                 ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
-                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
+                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, events)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
                 ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
                 ctx.console_writeln("  yes            optional 4th word: skip the [y/N] confirm (the warning still prints)");
                 ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
-                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,logger 100");
+                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,events 100");
                 Ok(())
             } else {
                 // A run needs a TARGET (all-services / a service / a comma-list) AND a positive ROUNDS count.
@@ -9208,7 +9208,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                     ctx.console_writeln("  every run needs a target AND a rounds count - there is no uncapped default.");
                     ctx.console_writeln("  e.g. chaos max-carnage all-services 5000   (the firehose - a big N; q aborts early)");
                     ctx.console_writeln("       chaos max-carnage fs 50");
-                    ctx.console_writeln("       chaos max-carnage fs,logger 100");
+                    ctx.console_writeln("       chaos max-carnage fs,events 100");
                     ctx.console_writeln("  add 'yes' as a 4th word to skip the confirm (unattended runs):");
                     ctx.console_writeln("       chaos max-carnage all-services 100 yes");
                     return Ok(());
@@ -9223,14 +9223,14 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                         if slot_of(ctx, seg).is_none() {
                             ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}' in the list", seg));
                             ctx.console_writeln("  every comma-separated target must be a live service");
-                            ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                            ctx.console_writeln("  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                             return Ok(());
                         }
                     }
                 } else if target != "all-services" && slot_of(ctx, target).is_none() {
                     ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
                     ctx.console_writeln("  target: all-services, one service, or a comma-separated list");
-                    ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                    ctx.console_writeln("  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
                 // An optional 4th word skips the confirm: `chaos max-carnage all-services 100 yes`.
@@ -9581,7 +9581,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     /// on what else is runnable.
     ///
     /// That decided the verdict by accident. A service blocked in `recv` is woken by the send itself
-    /// and drains within a yield or two, so `logger` passed. A service that idles on a TIMER - `xhci`
+    /// and drains within a yield or two, so `events` passed. A service that idles on a TIMER - `xhci`
     /// with no controller sleeps between drains, and its 5 ms floors to one 10 ms tick - needs real
     /// time, and the check sampled long before it woke. It was reported as "did NOT drain, CLOGGED
     /// (still full) - flood-endpoint disease" when it was not clogged at all: the tool measured too
@@ -9592,7 +9592,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     const FLOOD_DRAIN_MS: u64 = 50;
 
     if ntok < 2 {
-        ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | logger | block-driver)");
+        ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | events | block-driver)");
         return Err(ShellError::Unknown);
     }
     let svc = tok[1];

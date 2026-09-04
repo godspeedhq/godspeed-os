@@ -4,7 +4,7 @@
 The kernel is `no_std` and cannot parse TOML at spawn, so it carries a compiled `service_config(name)`
 table (`kernel/src/task/mod.rs`) that is the ACTUAL source of a service's caps/placement/memory at
 spawn. The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
-contract that mis-stated the driver's authority; T1 found logger/supervisor memory + supervisor peers
+contract that mis-stated the driver's authority; T1 found events/supervisor memory + supervisor peers
 diverged too). Commandment III: what RUNS cannot differ from what is DECLARED.
 
 This check makes drift impossible for the services that HAVE a contract: it parses each `.toml` and the
@@ -256,7 +256,7 @@ def parse_supervisor_images(name: str):
     # unconditional declaration, and it is strictly more coverage than checking one arch and ignoring
     # the rest.
     # Bound the scan to THIS row's peer expression. `tail` is a fixed window of following text, so a
-    # blind union over it swallowed the NEXT row's peers - `logger` (no peers) read as `asker`'s
+    # blind union over it swallowed the NEXT row's peers - `events` (no peers) read as `asker`'s
     # `["reply-server"]` and failed a check it should pass. Match the expression shape instead:
     # either a plain `&[...]`, or a complete `if cfg!(..) { &[..] } [else if ..] [else { &[..] }]`.
     tail = m.group(4).lstrip()

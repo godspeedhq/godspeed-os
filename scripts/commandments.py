@@ -721,7 +721,7 @@ CHECKS = [
              dict(why="a second kernel-spawned service must be caught",
                   pins={"kernel_spawned_service": "supervisor",
                         "_spawn_src": 'spawn_service_with_config("supervisor", X); '
-                                      'spawn_service_with_config("logger", Y);'},
+                                      'spawn_service_with_config("events", Y);'},
                   expect=True),
              dict(why="the supervisor alone must pass - the tree is clean since C1-1",
                   pins={"kernel_spawned_service": "supervisor",

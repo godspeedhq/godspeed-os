@@ -11,7 +11,7 @@ first-class osdev target. Usage:
 
     python scripts/arm_build.py [--feature arm-supervisor] [--release]
 
-The default feature is arm-supervisor (the full stack: supervisor -> logger +
+The default feature is arm-supervisor (the full stack: supervisor -> events +
 ping/pong). The kernel spawns only the supervisor (C1-1), so there is no kernel-spawned
 bring-up build any more - the supervisor path IS the bring-up path.
 """
@@ -142,7 +142,7 @@ def main():
 
     # 1. Cross-compile every ARM-ported service to armv7 so build.rs can embed them.
     #    The Pi 2 is a bare-metal target (no QEMU control port), so the supervisor is built with its
-    #    `bare-metal` feature - the designated "usable OS, quiet gsh> prompt" spawn set (logger + shell,
+    #    `bare-metal` feature - the designated "usable OS, quiet gsh> prompt" spawn set (events + shell,
     #    no 178 harness probes, no ping/pong flood). ping/pong are spawnable on demand from the shell.
     #
     #    `--qemu` goes to `dwc2` and NOWHERE ELSE, because `dwc2` is the only crate that reads it:

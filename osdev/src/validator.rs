@@ -945,9 +945,9 @@ static BRUTAL_FUZZ_TESTS: &[TestSpec] = &[
                     "[placement]\ncore = 0",
                 ),
                 concat!(
-                    "name = \"logger\"\nversion = \"1.0.0\"\n\n",
+                    "name = \"events\"\nversion = \"1.0.0\"\n\n",
                     "[resources.memory]\nrequest = \"8MiB\"\nlimit = \"16MiB\"\n\n",
-                    "[capabilities]\nlog_write = true\nipc_receive = [\"logger\"]",
+                    "[capabilities]\nlog_write = true\nipc_receive = [\"events\"]",
                 ),
                 concat!(
                     "name = \"block-driver\"\nversion = \"0.3.0\"\n\n",
@@ -1246,7 +1246,7 @@ static TESTS: &[TestSpec] = &[
                 "smp: 4 cores ready",
                 // (no "init: ready" - init is removed; the kernel spawns the supervisor directly, Phase 5)
                 "supervisor: ready",
-                "logger: ready",
+                "events: ready",
             ],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 120, // 30 was too tight: supervisor spawns 178 probe services before logging "ready" (~90s on loaded TCG)

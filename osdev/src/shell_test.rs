@@ -530,7 +530,7 @@ pub fn run(image_path: &Path, smp: u32) {
         None => { println!("shell-test: FAIL - timed out after `trace -h`"); fail += 1; }
     }
 
-    // The event ring, which lives in `logger` - not the kernel, and not a service of its own.
+    // The event ring, which lives in `events` - not the kernel, and not a service of its own.
     // The shell itself holds the emit cap, so simply having run commands should have filled it.
     send(&mut write_half, b"trace status\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
@@ -713,12 +713,12 @@ pub fn run(image_path: &Path, smp: u32) {
     // Compact predicate: where col<op>val (no spaces, no quotes needed).
     send(&mut write_half, b"status | where name=shell\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("shell") && !r.contains("logger"), "status | where name=shell: filters rows"),
+        Some(r) => check!(r.contains("shell") && !r.contains("events"), "status | where name=shell: filters rows"),
         None    => { println!("shell-test: FAIL - status|where timeout"); fail += 1; }
     }
     send(&mut write_half, b"status | where name=shell | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"logger\""), "status | where … | to json: filtered JSON"),
+        Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"events\""), "status | where … | to json: filtered JSON"),
         None    => { println!("shell-test: FAIL - status|where|json timeout"); fail += 1; }
     }
     // select: project columns.
@@ -1062,18 +1062,18 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // -----------------------------------------------------------------------
     // Least privilege (H10) - a non-spawning service must NOT hold the spawn cap.
-    // `logger` never spawns, so after SPAWN was gated to {init, supervisor, shell,
-    // probes}, `caps logger` lists no spawn. This is the negative regression test
+    // `events` never spawns, so after SPAWN was gated to {init, supervisor, shell,
+    // probes}, `caps events` lists no spawn. This is the negative regression test
     // that locks the gate in: if a future change re-grants spawn universally, the
     // word "spawn" reappears here and this fails.
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"caps logger\r");
+    send(&mut write_half, b"caps events\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
-            check!(r.contains("caps for logger"), "caps logger: header");
-            check!(!r.contains("spawn"), "least-privilege: logger does NOT hold spawn");
+            check!(r.contains("caps for events"), "caps events: header");
+            check!(!r.contains("spawn"), "least-privilege: events does NOT hold spawn");
         }
-        None => { println!("shell-test: FAIL - timed out after caps logger"); fail += 2; }
+        None => { println!("shell-test: FAIL - timed out after caps events"); fail += 2; }
     }
 
     // caps as a record producer (docs/records.md): piped, it emits resource/rights rows.
@@ -1250,7 +1250,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
-    // chaos flood-storm = the DRAIN resilience axis, and it only applies to DRAIN-style services (logger +
+    // chaos flood-storm = the DRAIN resilience axis, and it only applies to DRAIN-style services (events +
     // the drivers' idle paths), pinned below. It does NOT apply to fs/shell, which are REPLY-style (recv ->
     // do work -> reply): flooding one with junk makes it try to PROCESS the junk - fs does a block read and
     // blocks on the no-disk block-driver (which can never reply) - so it clogs by design, not by bug. That is
@@ -1268,19 +1268,19 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // -----------------------------------------------------------------------
     // FLOOD-ENDPOINT DRAIN regression. The disease: a registered service that idles without recv'ing lets a
-    // flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER. It recurred in logger (a
+    // flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER. It recurred in events (a
     // park stub) and the USB drivers' idle paths - including xhci's NO-CONTROLLER idle, which the original
     // sweep missed and this very pin caught. In QEMU there is no USB controller, so xhci/ehci sit in exactly
     // that no-controller idle path. Each must DRAIN under flood and survive; a regression here means a
     // non-draining idle loop came back.
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"chaos flood-storm logger 5\r");
+    send(&mut write_half, b"chaos flood-storm events 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(r) => {
-            check!(r.contains("flood-storm logger") && r.contains("verdict: PASS"), "chaos: flood-storm logger - idle endpoint drains, PASS (was a park stub)");
-            check!(r.contains("survived: 5/5"), "chaos: flood-storm logger - survived all 5 (drained, not clogged)");
+            check!(r.contains("flood-storm events") && r.contains("verdict: PASS"), "chaos: flood-storm events - idle endpoint drains, PASS (was a park stub)");
+            check!(r.contains("survived: 5/5"), "chaos: flood-storm events - survived all 5 (drained, not clogged)");
         }
-        None => { println!("shell-test: FAIL - chaos flood-storm logger timed out (endpoint clogged / panic?)"); fail += 2; }
+        None => { println!("shell-test: FAIL - chaos flood-storm events timed out (endpoint clogged / panic?)"); fail += 2; }
     }
     send(&mut write_half, b"chaos flood-storm xhci 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
@@ -3402,19 +3402,19 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     }
     check!(answered, "the restarted shell answers commands (session recovered)");
 
-    // ── Directly-restartable driver/logger: kill `logger` over the control channel and confirm the
+    // ── Directly-restartable driver/events: kill `events` over the control channel and confirm the
     // supervisor respawns it on its OWN death (not only via a lucky supervisor respawn). This is the
-    // fix that keeps `chaos max-carnage` from leaving `xhci`/`ehci`/`logger` dead at the end of a run.
-    // logger is the hardware-independent stand-in for xhci/ehci (same death-notification + restart
+    // fix that keeps `chaos max-carnage` from leaving `xhci`/`ehci`/`events` dead at the end of a run.
+    // events is the hardware-independent stand-in for xhci/ehci (same death-notification + restart
     // arm); the actual USB keyboard recovery is verified on real hardware (QEMU has no USB keyboard).
-    println!("fs-restart: sending 'KILL logger' over the control channel …");
+    println!("fs-restart: sending 'KILL events' over the control channel …");
     match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
-        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL logger\n");
-            let restarted = collect_until(&buf, &mut cursor, b"supervisor: logger restarted", Duration::from_secs(20));
-            check!(restarted.is_some(), "supervisor respawned logger on its own death (directly restartable)");
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL events\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: events restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor respawned events on its own death (directly restartable)");
             drop(ctrl);
         }
-        None => { println!("fs-restart: FAIL - could not connect to control port (logger kill)"); fail += 1; }
+        None => { println!("fs-restart: FAIL - could not connect to control port (events kill)"); fail += 1; }
     }
 
     // No panic anywhere in the whole session.
@@ -4957,7 +4957,7 @@ pub fn run_peer_storm(image_path: &Path, persist_path: &str, smp: u32) {
 ///
 /// THE HYPOTHESIS UNDER TEST. When the supervisor dies, the kernel respawns it and it reconciles by
 /// ADOPTING the services still running - ten of them in a row on the hardware run that first showed
-/// this, with not one `name-map +` line among them. Only `logger`, which happened to be killed and
+/// this, with not one `name-map +` line among them. Only `events`, which happened to be killed and
 /// respawned, went through the path that registers a name. So the suspicion is: adoption records the
 /// service in the supervisor's PRIVATE map and never touches the kernel's name directory, and a name
 /// missing at that moment stays missing until that service is killed and respawned - which is exactly

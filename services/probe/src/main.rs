@@ -12,7 +12,7 @@
 //!   3 = NO_SEND_RIGHT   - try_send via recv-slot cap → CapInsufficientRights      (Test 3B)
 //!   4 = SEND_AFTER_KILL - kill probe-victim then try_send → EndpointDead          (Test 4A)
 //!   5 = FILL_AND_BLOCK  - fill 16-slot queue + blocking send; woken by KILL       (Test 4B)
-//!   6 = YIELD_LOGGER    - yield then log; proves preemption/yield path             (Test 8A)
+//!   6 = YIELD_EVENTS    - yield then log; proves preemption/yield path             (Test 8A)
 //!   7 = HOG             - tight loop; proves preemption via ping output            (Test 8B)
 //!   8 = CAP_FORGE       - try_send on slot 99 (out of range) → CapNotHeld         (Test 9B)
 //!   9 = GRANT_RECV      - recv then take_pending_cap; log pass                    (Test 5A)
@@ -154,7 +154,7 @@ const MODE_ECHO_SEND:       u32 = 2;
 const MODE_NO_SEND_RIGHT:   u32 = 3;
 const MODE_SEND_AFTER_KILL: u32 = 4;
 const MODE_FILL_AND_BLOCK:  u32 = 5;
-const MODE_YIELD_LOGGER:    u32 = 6;
+const MODE_YIELD_EVENTS:    u32 = 6;
 const MODE_HOG:             u32 = 7;
 const MODE_CAP_FORGE:       u32 = 8;
 const MODE_GRANT_RECV:      u32 = 9;
@@ -347,7 +347,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_NO_SEND_RIGHT   => mode_no_send_right(&ctx),
         MODE_SEND_AFTER_KILL => mode_send_after_kill(&ctx),
         MODE_FILL_AND_BLOCK  => mode_fill_and_block(&ctx),
-        MODE_YIELD_LOGGER    => mode_yield_logger(&ctx),
+        MODE_YIELD_EVENTS    => mode_yield_events(&ctx),
         MODE_HOG             => loop {},
         MODE_CAP_FORGE       => mode_cap_forge(&ctx),
         MODE_GRANT_RECV      => mode_grant_recv(&ctx),
@@ -572,7 +572,7 @@ fn mode_fill_and_block(ctx: &ServiceContext) -> ! {
     idle(ctx)
 }
 
-fn mode_yield_logger(ctx: &ServiceContext) -> ! {
+fn mode_yield_events(ctx: &ServiceContext) -> ! {
     for _ in 0u32..10 { ctx.yield_cpu(); }
     ctx.log("probe: 8A yielder ticked");
     idle(ctx)
@@ -1898,7 +1898,7 @@ fn mode_adv_a9(ctx: &ServiceContext) -> ! {
     // unknown one is refused outright. This asserts that directly: neither a live service's name nor
     // an invented one can be started as a probe.
     let mut refused = 0;
-    for victim in ["fs", "logger", "shell", "console", "supervisor", "not-a-real-probe"] {
+    for victim in ["fs", "events", "shell", "console", "supervisor", "not-a-real-probe"] {
         if table::probe(ctx, victim).is_err() { refused += 1; }
         else { ctx.log_fmt(format_args!("adv: A9 FAIL - started '{}' as a probe", victim)); }
     }
@@ -1993,9 +1993,9 @@ fn mode_adv_a12(ctx: &ServiceContext) -> ! {
 fn mode_adv_a13(ctx: &ServiceContext) -> ! {
     // A13 - AcquireSendCap is gated by ACQUIRE_ANY-or-declared-peer (§3.1). adv-a13 holds NO ACQUIRE_ANY
     // (excluded from the probe grant) and declares NO send-peers, so minting a SEND cap to ANY service
-    // must be DENIED (CapNotHeld -> acquire_send_cap returns None). `logger` is a real registered
+    // must be DENIED (CapNotHeld -> acquire_send_cap returns None). `events` is a real registered
     // service, so a `Some` here would mean the gate is open (ambient send authority).
-    if ctx.acquire_send_cap("logger").is_some() {
+    if ctx.acquire_send_cap("events").is_some() {
         ctx.log("adv: A13 FAIL - acquired a SEND cap to a non-peer without ACQUIRE_ANY (gate open)");
         idle(ctx);
     }

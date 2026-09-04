@@ -17,7 +17,7 @@ limit   = "64MiB"
 # records "pong" at spawn (and refreshes it on restart), so clients reacquire it by name through
 # the directory with no push from pong.
 ipc_receive = ["pong"]        # OWNS and receives on its own "pong" endpoint
-log_write   = true            # may write to the logger
+log_write   = true            # may write to `events`
 
 # No [placement] section: the supervisor ROUND-ROBINS pong across the ready cores - the right
 # default for almost every service. So pong may land on ANY core, and a DIFFERENT one after a

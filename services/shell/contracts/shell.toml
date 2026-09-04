@@ -20,7 +20,7 @@ limit   = "8MiB"
 # REBOOT - the same authority routed to the principal that can actually act on it (14.4).
 #
 # This is SIX peers, which is MAX_SEND_PEERS. A seventh needs that bound raised deliberately.
-ipc_send    = ["block-driver", "fs", "time", "console", "logger", "supervisor"]
+ipc_send    = ["block-driver", "fs", "time", "console", "events", "supervisor"]
 ipc_receive = ["shell"]
 log_write   = true
 

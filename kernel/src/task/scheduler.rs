@@ -170,7 +170,7 @@ fn next_restart_count(name: &str) -> u64 {
 
 /// Record that restartable service `name` died (and will be respawned): bump its per-name restart
 /// count. Called ONLY from the death path for the supervisor-managed/restartable set (`fs`,
-/// `block-driver`, `shell`, `xhci`, `ehci`, `logger`, `supervisor`). Transient utilities the shell
+/// `block-driver`, `shell`, `xhci`, `ehci`, `events`, `supervisor`). Transient utilities the shell
 /// re-invokes are never bumped, so they never show a restart. The respawn reads the new count via
 /// `next_restart_count`; the first death of a name records count 1.
 fn bump_name_restart(name: &str) {
@@ -2330,7 +2330,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
         // only view of recovery said nothing happened.
         if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console" | "supervisor"
+            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console" | "supervisor"
             | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
             // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
             // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
@@ -2343,7 +2343,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
         // it respawns the service IMMEDIATELY - its own death, not only a lucky supervisor respawn.
         // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
-        // `xhci` / `ehci` + `logger`. Without the drivers here, a `chaos max-carnage` that killed
+        // `xhci` / `ehci` + `events`. Without the drivers here, a `chaos max-carnage` that killed
         // them in its last rounds left them dead until the supervisor happened to be respawned (it
         // re-runs its boot sequence and re-spawns them) - so the keyboard could stay dead. Now their
         // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
@@ -2377,7 +2377,7 @@ pub fn kill_task_by_slot(slot: usize) {
         if task_name == "console" {
             crate::bootcon::reclaim_on_death();
         }
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console"
             | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
             // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
             // still come back - on the next reconcile sweep - which is exactly why the omission hides:

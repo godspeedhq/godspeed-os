@@ -19,7 +19,7 @@ ipc_send    = ["reply-server"]   # may SEND a request to reply-server (the peer 
 ipc_receive = ["asker"]          # OWNS its endpoint - where reply-server sends the reply back. The
                                  # reply cap asker embeds in each request is a SEND copy of THIS
                                  # endpoint's cap (derived at runtime, granted per request, §8.5).
-log_write   = true               # may write to the logger
+log_write   = true               # may write to `events`
 
 # No [placement] section: the supervisor ROUND-ROBINS asker across the ready cores - the right
 # default. (Omitting does NOT mean "core 0".) A request/reply round-trip works the same on any core;

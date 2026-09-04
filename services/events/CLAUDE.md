@@ -1,17 +1,17 @@
-# services/logger/
+# services/events/
 
 Structured log sink (§11.4). **Restartable.** Not a TCB member.
 
 ## Current behaviour (what the code actually does)
 
-The logger does two things, both "somewhere to put diagnostic data that someone reads later":
+`events` does two things, both "somewhere to put diagnostic data that someone reads later":
 
 1. **Drains its recv endpoint**, dropping any message it does not recognise.
 2. **Holds the IPC trace ring** (`utilities/46_trace.md` §8b) - a fixed 192-event history of
-   request/reply events emitted by services whose contract grants them `ipc_send = ["logger"]`, read
+   request/reply events emitted by services whose contract grants them `ipc_send = ["events"]`, read
    back by the `trace` utility (`trace ipc`, `trace failures`, `trace status`). Full = overwrite the
    oldest and **count** it; `trace status` reports the count, because a silent loss is the bug
-   (invariant 12). The ring is not persistence - a restarted logger starts empty, and that is correct,
+   (invariant 12). The ring is not persistence - a restarted events starts empty, and that is correct,
    because the ring is history and nothing depends on it. **The kernel records nothing**: the emitter
    knows its own peer's NAME and its own protocol's opcode, and the kernel is forbidden to know either
    (§4.4, §26.10), which is why the instrumentation lives in the SDK and the ring lives here.
@@ -22,29 +22,29 @@ the core still idles.
 
 **How services actually log today:** `ctx.log()` is a **syscall** that writes the kernel's 16 KiB ring
 buffer **and** the serial console **directly** - it does NOT send IPC to this service. So logging does
-not depend on the logger being up: when the logger is dead, `ctx.log()` still works (it never blocks on
-the logger and never returns `EndpointDead` from it), and a chaos storm that kills the logger loses no
-log output. The logger service exists to own its name + endpoint, to hold the
+not depend on `events` being up: when `events` is dead, `ctx.log()` still works (it never blocks on
+`events` and never returns `EndpointDead` from it), and a chaos storm that kills `events` loses no
+log output. The `events` service exists to own its name + endpoint, to hold the
 trace ring, and to be a restartable home for the richer sink described next.
 
 ## Future work (not yet implemented)
 
 The `src/main.rs` header lists what a real sink would add - none of it is wired yet:
-1. `ctx.drain_kernel_ring_buffer()` on startup - read bytes accumulated before the logger started.
+1. `ctx.drain_kernel_ring_buffer()` on startup - read bytes accumulated before `events` started.
 2. A recv loop that DECODES an IPC log protocol from services holding `log_write` (payload = service
    tag + level + text) instead of dropping.
 3. Formatted output to serial, and later appended to a log file via `fs`.
 
 ## Restartability
 
-Logger is stateless, so it restarts trivially: the supervisor respawns it on death (§6.2) and it prints
-`"logger: ready"` again. There is no state to reconstruct. (Once the drain-and-decode sink above lands,
+Events is stateless, so it restarts trivially: the supervisor respawns it on death (§6.2) and it prints
+`"events: ready"` again. There is no state to reconstruct. (Once the drain-and-decode sink above lands,
 a restart would re-drain the ring buffer for the outage window; today there is nothing to recover.)
 
 ## Supervisor retry (§11.3)
 
-The **supervisor** spawns the logger (init was removed, Phase 5) and retries once on failure; its output
-falls back to the kernel ring buffer meanwhile. Logger is not TCB, so its spawn failure does not cause a
+The **supervisor** spawns `events` (init was removed, Phase 5) and retries once on failure; its output
+falls back to the kernel ring buffer meanwhile. Events is not TCB, so its spawn failure does not cause a
 kernel panic.
 
 ## TODO: per-core kernel log buffers (post-v1 / post-BP2)
@@ -53,10 +53,10 @@ Current `kprintln!` uses a kernel-side `SpinLock` + synchronous UART write. Unde
 
 Proposed architecture:
 - **Kernel side**: static per-core ring buffers (e.g. 4 KiB each) in BSS. `kprintln!` writes to the calling core's own buffer (SPSC - no lock needed). If the buffer is full, increment a per-core `dropped_log_count` and discard.
-- **Drain**: new `ReadKernelLog(core_id)` syscall returns buffered bytes for that core. Logger polls all cores via this syscall and writes to UART.
+- **Drain**: new `ReadKernelLog(core_id)` syscall returns buffered bytes for that core. Events polls all cores via this syscall and writes to UART.
 - **Panic path**: keep a `panic_serial_direct()` that bypasses the buffer and writes raw to COM1 (the halting core retakes UART ownership).
 - **Ordering**: logs from different cores may appear out of order. Add a TSC timestamp per entry if post-hoc ordering is needed.
 
 Benefits: eliminates cross-core SpinLock contention on the kernel log path; UART is owned by a single writer; dropped-log counter makes buffer pressure visible.
 
-Work estimate: ~200-300 lines across `kernel/src/log.rs`, `kernel/src/syscall/dispatch.rs`, and `services/logger/src/main.rs`.
+Work estimate: ~200-300 lines across `kernel/src/log.rs`, `kernel/src/syscall/dispatch.rs`, and `services/events/src/main.rs`.

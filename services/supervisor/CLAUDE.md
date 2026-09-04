@@ -37,7 +37,7 @@ Introspection is reached through shell **commands**, not raw spawn: `observe` (l
 ## Spawn order in `service_main`
 
 The kernel spawns the supervisor **directly** (Path C / Phase 5 - init is removed). The supervisor
-spawns the **logger first** (moved from init), then pong/ping, then services it wires from its
+spawns the **events first** (moved from init), then pong/ping, then services it wires from its
 `name → cap` map. Names resolve via the kernel's directory (`ipc::names` + `AcquireSendCap`). The
 probe spawn loop takes
 18-120 s on Windows TCG; spawning pong/ping early ensures cross-core IPC between them is established
@@ -45,7 +45,7 @@ within ~10 s of boot.
 
 ```
 service_main():
-  1. spawn("logger")              ← moved here from init (Phase 5); not TCB, retry once
+  1. spawn("events")              ← moved here from init (Phase 5); not TCB, retry once
   2. spawn("pong") on core 1      ← pong must precede ping (SEND cap wired at spawn)
   3. spawn("ping") on core 0
   4. spawn probe / bare-metal services from the name→cap map (no kernel name resolution)

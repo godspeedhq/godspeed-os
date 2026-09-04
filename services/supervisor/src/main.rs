@@ -50,7 +50,7 @@ use godspeed_sdk::service_context::supcmd;
 ///
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
-/// retained return address burns a cap-table slot per request (the `logger` leak, §26.6).
+/// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
 fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
 
@@ -190,7 +190,7 @@ static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 /// no PCI bus at all, so the service would have nothing to read.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
-static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
+static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -243,7 +243,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, u32::MAX, &[],
      godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
-    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
+    ("events", EVENTS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -282,7 +282,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter.
     ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
                        | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
-     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "logger", "supervisor"],
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "events", "supervisor"],
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
@@ -290,7 +290,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::REBOOT
      | godspeed_sdk::service_context::privbits::GPIO
      | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
-    ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "logger"],
+    ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
     ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 1 }, &["nic-driver", "time"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT
@@ -432,7 +432,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
     // preference, which is what the contract declares. The DIFFERENCE between those two is carried
     // explicitly: an override is STRICT (reject if that core is not ready), a preference FALLS BACK
-    // to round-robin. Sending the preference as an override is what made `logger` and `xhci` fail to
+    // to round-robin. Sending the preference as an override is what made `events` and `xhci` fail to
     // spawn at all on a 2-core machine instead of landing on another core.
     let caller_chose = !(core == 0xFFFF || core == u32::MAX);
     req.core         = if caller_chose { core } else { table_core };
@@ -856,7 +856,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// the previous); nic-driver before net-stack.
 const MANAGED_N: usize = 13;
 const MANAGED: [&str; MANAGED_N] =
-    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "console", "nic-driver", "net-stack",
+    ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
      // clock the shell and net-stack now ask for; `control` owns the COM2 operator channel the test
      // harness drives. A service that is embedded and configured but never spawned is the C5-1 shape
@@ -1000,27 +1000,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut name_map = NameCapMap::new();
 
     // Path C / Phase 5: the kernel boots the supervisor directly (init is removed), so the
-    // supervisor now spawns the logger - moved here from init. logger is not TCB (§11.3): retry
+    // supervisor now spawns `events` - moved here from init. events is not TCB (§11.3): retry
     // once on failure and continue without it (its output falls back to the kernel ring buffer).
-    ctx.log("supervisor: spawning logger...");
-    if let Some(cap) = ctx.acquire_send_grant_cap("logger") {
-        // Supervisor RESPAWN: the logger is still alive (only the supervisor died). Adopt it - reacquire
+    ctx.log("supervisor: spawning events...");
+    if let Some(cap) = ctx.acquire_send_grant_cap("events") {
+        // Supervisor RESPAWN: `events` is still alive (only the supervisor died). Adopt it - reacquire
         // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
-        // rejects, which used to print a misleading "logger spawn failed" on every `kill supervisor`.
+        // rejects, which used to print a misleading "events spawn failed" on every `kill supervisor`.
         // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
-        record_name_quiet(&ctx, &mut name_map, "logger", cap);
-        ctx.log("supervisor: adopted running logger");
-    } else if !spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) {
-        // Through the image table: the supervisor carries logger's image now, and it does not route
+        record_name_quiet(&ctx, &mut name_map, "events", cap);
+        ctx.log("supervisor: adopted running events");
+    } else if !spawn_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
+        // Through the image table: the supervisor carries events's image now, and it does not route
         // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
         // nothing. Same shape as pong/ping.
-        ctx.log("supervisor: logger spawn failed, retrying");
-        let _ = spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF);
+        ctx.log("supervisor: events spawn failed, retrying");
+        let _ = spawn_mapped(&ctx, &mut name_map, "events", 0xFFFF);
     }
 
-    // The terminal (docs/console-service.md §9). Spawned right after the logger and before anything
+    // The terminal (docs/console-service.md §9). Spawned right after `events` and before anything
     // that produces console output, so the display changes hands once, early, rather than mid-boot.
-    // Like the logger it is not TCB: if it fails to spawn, console output still reaches serial (which
+    // Like `events` it is not TCB: if it fails to spawn, console output still reaches serial (which
     // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
     ctx.log("supervisor: spawning console...");
     if let Some(cap) = ctx.acquire_send_grant_cap("console") {
@@ -1372,7 +1372,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
     // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
     // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
-    // `ehci`, `logger`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
+    // `ehci`, `events`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
     // task can't respawn itself; the only death that is unrecoverable is the kernel's. Other
     // restart/kill commands still arrive via the
     // COM2 control channel (control::process_pending in the timer ISR).
@@ -1424,7 +1424,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if respawn_retry(&ctx, &mut name_map, "shell") { ctx.log("supervisor: shell restarted"); }
                 else { ctx.log("supervisor: shell restart FAILED"); }
             }
-            // The USB host drivers + logger are directly restartable now: their OWN death respawns
+            // The USB host drivers + events are directly restartable now: their OWN death respawns
             // them immediately (re-granting MMIO/DMA/IRQ caps + re-initialising the controller),
             // instead of waiting for a lucky supervisor respawn. This is what keeps a `chaos
             // max-carnage` that kills `xhci`/`ehci` in its last rounds from leaving the keyboard dead.
@@ -1448,10 +1448,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if respawn_retry(&ctx, &mut name_map, "dwc2") { ctx.log("supervisor: dwc2 restarted"); }
                 else { ctx.log("supervisor: dwc2 restart FAILED"); }
             }
-            "logger" => {
-                ctx.log("supervisor: logger died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "logger") { ctx.log("supervisor: logger restarted"); }
-                else { ctx.log("supervisor: logger restart FAILED"); }
+            "events" => {
+                ctx.log("supervisor: events died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "events") { ctx.log("supervisor: events restarted"); }
+                else { ctx.log("supervisor: events restart FAILED"); }
             }
             // counter (examples/counter, counter-test build): respawn it wired to `fs` - the fresh
             // instance reconstructs its count from /counter.dat (§14/§15). The "died/restarted" lines

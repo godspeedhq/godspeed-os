@@ -346,7 +346,7 @@ pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 /// PREFERRED core falls back to round-robin instead, so a machine with fewer cores still boots.
 ///
 /// Without this bit a moved service's table preference read as an override, and every service naming
-/// a core the machine does not have failed to spawn rather than degrading - `logger` and `xhci` (both
+/// a core the machine does not have failed to spawn rather than degrading - `events` and `xhci` (both
 /// core 2) simply vanished under `-smp 2`, which 11.3 requires to keep working.
 pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 /// Mint the child's name-wired peer caps WITH `GRANT`, so it can re-delegate them.
@@ -1126,11 +1126,11 @@ impl ServiceContext {
     ///
     /// The whole cost when this service is not tracing is the `enabled()` load and a not-taken
     /// branch. When it IS tracing, the send is `try_send` and its result is DISCARDED on purpose: an
-    /// observer must never be able to slow, block, or fail the thing it observes. A full logger queue
+    /// observer must never be able to slow, block, or fail the thing it observes. A full events queue
     /// loses one event, which the ring counts and `trace status` reports - a visible loss, not a
     /// silent one (invariant 12).
     ///
-    /// Recursion is cut at the source: `logger` itself holds no `logger` send cap, so the sink cannot trace
+    /// Recursion is cut at the source: `events` itself holds no `events` send cap, so the sink cannot trace
     /// its own sends, and no event can beget another.
     #[inline]
     /// Declare this service's own name for the trace ring, once, at startup.
@@ -1152,7 +1152,7 @@ impl ServiceContext {
     fn trace_emit(&self, peer: &str, op: u8, kind: u8) {
         // Arm lazily, ONCE. A service is handed a context with no init hook to run in, so there is
         // nowhere else to resolve from. A service whose contract does not grant `ipc_send =
-        // ["logger"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
+        // ["events"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
         // rest of its life, which is the cost the untraced majority pays.
         if !crate::trace::resolved() {
             crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
@@ -1162,7 +1162,7 @@ impl ServiceContext {
             return;
         }
         // Do NOT record a call to the SINK ITSELF. The `trace` utility reads the ring by asking
-        // `logger` for it, so tracing that call would fill the ring with the reader's own questions -
+        // `events` for it, so tracing that call would fill the ring with the reader's own questions -
         // each dump adding two more events, pushing out the traffic the reader came to see. An
         // instrument that mostly measures itself is not measuring anything. This hides nothing: every
         // OTHER peer is still recorded, and `trace status` still counts every event accepted.
@@ -1176,16 +1176,16 @@ impl ServiceContext {
         // draining the console and lost Enter keystrokes. Measured, not guessed: `osdev test files`
         // was 222/0 before, 213/9 with the clock read, 222/0 again without it.
         //
-        // The SINK stamps the event instead. `logger` has to wake to receive it either way, so the
+        // The SINK stamps the event instead. `events` has to wake to receive it either way, so the
         // cost lands on the service whose job this is rather than on every service that talks to
         // anyone - and the caller already used `try_send` and did not wait. An observer must not be
         // able to slow the thing it observes, and a millisecond of port I/O per IPC is exactly that.
         let ev = crate::trace::encode(peer, op, kind);
         if self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev)).is_err() {
-            // THE SINK RESTARTED - REACQUIRE IT. The slot is resolved once and cached, so a `logger`
+            // THE SINK RESTARTED - REACQUIRE IT. The slot is resolved once and cached, so a `events`
             // respawn left every emitter holding a stale generation FOREVER: tracing silently stopped,
             // `trace ipc` could not reach the ring, and each emission logged a kernel gen-mismatch.
-            // Seen on hardware after a chaos storm restarted `logger` forty times - cap generation 985
+            // Seen on hardware after a chaos storm restarted `events` forty times - cap generation 985
             // against a live record of 1025.
             //
             // This is the ordinary reacquire-by-name recovery every client owes a restartable peer
@@ -1843,7 +1843,7 @@ impl ServiceContext {
             // BLOCK for the reply, with a short timeout - do not spin. `try_recv` + `yield_cpu` kept this
             // task permanently RUNNABLE, so a core running a waiting command never reached the scheduler's
             // idle path at all. On ARM that path is where USB hot-plug is watched, so plugging or
-            // unplugging anything during a `ping` was noticed only once the ping ended: the events queued
+            // unplugging anything during a `ping` was noticed only once the ping ended: `events` queued
             // up and all arrived at the prompt. It also pegged the core at 100% for a task that is, in
             // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
             // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
@@ -3451,13 +3451,13 @@ impl ServiceContext {
         self.spawn_on(name, core)
     }
 
-    /// Drain the kernel ring buffer. Called by logger at startup (§11.4).
+    /// Drain the kernel ring buffer. Called by events at startup (§11.4).
     ///
     /// Phase 5: reads the ring buffer via kprintln output (already mirrored to
     /// serial); full drain syscall deferred to Phase 6.
     pub fn drain_kernel_ring_buffer(&self) {
         // Ring buffer is already mirrored to serial at all times (§11.4).
-        // Nothing additional needed until the logger has a dedicated drain syscall.
+        // Nothing additional needed until `events` has a dedicated drain syscall.
     }
 
     /// Receive a log message on this service's recv endpoint.
