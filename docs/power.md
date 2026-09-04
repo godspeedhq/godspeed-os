@@ -148,7 +148,7 @@ handler) onto tiny efficiency cores while the performance cores stay asleep.
 GodspeedOS is unusually well-shaped for the last one: it already separates *identity* from
 *location* and places services statically (§9.2). On a big.LITTLE / Apple-Silicon-style ARM target
 - exactly where the aarch64 port is headed (`docs/aarch64.md`) - the placement policy could route
-light services (USB, logger) onto efficiency cores *by class*, not just by core number. The
+light services (USB, events) onto efficiency cores *by class*, not just by core number. The
 architecture is already shaped for it; the hardware is not here yet.
 
 The honest ceiling: GodspeedOS runs on commodity hardware with firmware it cannot trust (the

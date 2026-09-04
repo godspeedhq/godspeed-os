@@ -45,9 +45,9 @@ USB keyboard → xhci driver → ctx.console_push (syscall 20)
 shell → ConsoleRead (syscall 17) → reads the ring
 ```
 
-**`logger`** is a stub: it logs "ready" and parks. All logging actually
+**`events`** is a stub: it logs "ready" and parks. All logging actually
 short-circuits through the kernel ring buffer to serial+fbcon; nothing goes *to*
-the logger service.
+the `events` service.
 
 ---
 
@@ -90,7 +90,7 @@ Stage it so each step is useful on its own.
 ### Stage 1 - separate the streams (clean TV, no new service yet)
 - Split output into **log** vs **console** at the API:
   - `ctx.log` / `kprintln` → **log stream** → serial (+ the kernel ring buffer,
-    later drained by the `logger`). **No longer mirrored to the framebuffer.**
+    later drained by the `events`). **No longer mirrored to the framebuffer.**
   - a **console** output path → the framebuffer (the interactive surface).
 - The shell's prompt/results and `observe`'s frames use the console path; all the
   `xhci:`/`spawn[...]`/kernel diagnostics use the log path.
@@ -108,8 +108,8 @@ Stage it so each step is useful on its own.
 - **Unlocks live `observe`:** it asks the console service for the foreground,
   repaints each tick, reads `q`, and releases - with no log lines smearing it.
 
-### Stage 3 - `logger` becomes real (optional, parallel)
-- Route `ctx.log` to the `logger` service (today a stub) so logs have a real home
+### Stage 3 - `events` becomes real (optional, parallel)
+- Route `ctx.log` to the `events` service (today a stub) so logs have a real home
   (a queryable buffer, `osdev logs <svc>`, later a file via `fs`). Independent of
   Stages 1-2; makes the log stream first-class.
 
@@ -164,7 +164,7 @@ console reader, paint via `console_write` + ANSI, poll `q`, release on exit" - w
 is **identical** whether the shell or a future console service brokers it. The shell
 is already the Appendix B.3 capability-broker and fits the kernel's waiter model.
 A dedicated console service is deferred until a real multi-consumer need pulls it
-into existence (a real `logger` consuming the log stream, multiple terminals,
+into existence (a real `events` consuming the log stream, multiple terminals,
 multiple foreground apps) - at which point it takes over *brokering* with **zero
 changes to the utilities** (§26.2: features pulled into existence; nothing built
 speculatively, nothing wasted).

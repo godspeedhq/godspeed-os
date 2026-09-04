@@ -341,7 +341,7 @@ for arg in $args {
     echo "arg: $arg"
 }
 
-for svc in logger fs registry {
+for svc in events fs registry {
     echo "checking $svc"
 }
 ```

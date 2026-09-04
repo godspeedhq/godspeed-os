@@ -149,7 +149,7 @@ These are the laws that bound every design choice. Any change that violates an i
   │  Application Services  (replaceable)             │
   ├──────────────────────────────────────────────────┤
   │  System Services                                 │
-  │  logger  ·  block-driver  ·  fs                  │
+  │  events  ·  block-driver  ·  fs                  │
   ├──────────────────────────────────────────────────┤
   │  Trusted Root  (trusted, restartable)            │
   │  supervisor   (init removed; registry retired)   │
@@ -230,7 +230,7 @@ os/
   services/
     supervisor/            # restart authority + name authority (TCB); spawned directly by the kernel
                            #   (init removed, Phase 5; registry service retired, Phase 4 - Path C §3.7)
-    logger/
+    events/
     console/               # the terminal: ANSI/CSI, grid, cursor, scroll (docs/console-service.md 9)
     block-driver/          # v1: trusted
     fs/                    # v1: trusted, depends on block-driver
@@ -688,10 +688,10 @@ The exact primitive is an implementation choice, not a spec choice.
 
 ```rust
 fn main(ctx: ServiceContext) -> Result<()> {
-    let logger    = ctx.capability("log_write")?;
+    let log       = ctx.capability("log_write")?;
     let pong_send = ctx.capability("ipc_send.pong")?;
 
-    logger.info("ping starting")?;
+    log.info("ping starting")?;
     pong_send.send(Message::text("hello"))?;
     Ok(())
 }
@@ -1026,7 +1026,7 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
     ── spawn supervisor on Core 0   (the kernel's ONE direct spawn - no init)
 
   supervisor (Core 0)
-    ── spawn logger on Core 0
+    ── spawn events on Core 0
     ── read boot manifest
     ── spawn services per placement policy (§9.2),
        wiring each from its name→cap map (no kernel name resolution)
@@ -1063,13 +1063,44 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 | Kernel BSP init   | Kernel panic, halt                     |
 | AP startup        | Kernel logs warning, continues with available cores; if zero APs come up, system runs as single-core |
 | supervisor spawn (by the kernel - the one direct spawn, no init) | Kernel panic, halt (TCB) - `"supervisor spawn failed"` |
-| logger spawn (by the supervisor) | Supervisor logs to kernel ring buffer, retry once |
+| events spawn (by the supervisor) | Supervisor logs to kernel ring buffer, retry once |
 | Application svc   | Supervisor logs, may retry per policy  |
 | Service contracted to unavailable core | Spawn rejected with `PlacementInvalid`; supervisor logs and skips; system runs without that service |
 
-### 11.4 Logging Before Logger Exists
+### 11.4 Logging Before Any Service Exists
 
-The kernel maintains a 16 KiB ring buffer (per-core view, single shared sink). Anything logged before the logger is up writes to the ring buffer and the serial console. When the logger starts, it drains the buffer.
+The kernel maintains a 16 KiB ring buffer (per-core view, single shared sink). Anything logged writes to the ring buffer and the serial console - **always**, not only before a service is up. `events` drains the accumulated buffer once, at its own startup.
+
+> **Amendment 2026-09-04 (`logger` -> `events`): the service is renamed, and this section's title was
+> wrong in a second way that matters more than the name.** The title read "Logging Before Logger
+> Exists", which implies logging is something the `logger` service does once it is up, and that the
+> kernel ring is a stand-in until then. **It is not, and never was.** `ctx.log()` is syscall 5, gated by
+> the `log_write` capability, writing the kernel ring and serial DIRECTLY - always, for every service,
+> for the life of the machine. No log line has ever been sent to that service; its contract declares
+> only `ipc_receive`, and its endpoint is drained with unrecognised messages dropped.
+>
+> The consequence is a property worth naming, because it is easy to destroy by tidying: **logging does
+> not depend on the service being up.** A chaos storm that kills it loses no log output, and `ctx.log()`
+> never blocks on it and never returns `EndpointDead` from it. So logs must NOT be re-pointed at
+> `events` as it grows - that would make observing a failure depend on a service that can fail, which
+> is the same argument §15 makes about storage, one layer up. Traces and metrics ride IPC to the
+> service; logs stay on the floor.
+>
+> **The rename itself** is the name catching up with the job. The service has held the 192-event IPC
+> trace ring since `trace` shipped, and has never held a log. `events` rather than `observability`:
+> `observe` already exists as the live view, house style is one short word, and a service named after a
+> property of a system becomes the dumping ground §4.4 and §26.2 exist to prevent. It is cheap because
+> the capability model works - `ctx.log()` resolves through `log_write_slot` and the trace path through
+> a single `SINK_NAME` constant, so no service names its own sink.
+>
+> **What is NOT renamed, deliberately:** `log_write`, `log_write_slot`, `ctx.log()`, syscall 5 and
+> `kernel/src/log.rs`. Those are this section's floor, which is a separate path the service was never
+> on. §22 Test 2's assertions are renamed `log_received` / `log_did_not_receive` for the same reason -
+> they check that a log reached the floor, which is what they always checked.
+>
+> No kernel responsibility is added or removed. The kernel was edited (hard-coded service-name lists in
+> `task/scheduler.rs` and `build.rs`), which is re-verification rather than growth. Design note and
+> evidence: `docs/observability.md` §1 and §9.
 
 Where the machine's only output device is a display, the floor also includes a **minimal framebuffer blit** (`kernel/src/bootcon`): plain ASCII, escape sequences discarded, no character grid, no cursor, no scrollback. It is not a terminal - the terminal is the `console` service (`docs/console-service.md` §9).
 
@@ -1262,7 +1293,7 @@ State belongs to services, not the kernel. Services that need to survive restart
 
 The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. `fs` gives itself **transactional metadata recovery** - every mutation commits through a crash-consistent redo-journal and `fs` recovers to a consistent state on mount (`docs/persistence.md` §6.8). With that, `block-driver` and `fs` are **restartable** and no longer in the TCB (§6.1 Phase D amendment, 2026-06-17); their death is a supervisor restart, not a reboot. **The recovery guarantee is backend-conditional - see the 2026-07-25 amendment in §6.1.**
 
-Stateless services (logger in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially - but they are demonstration services in `examples/`, not permanent architectural components.
+Stateless services (`events` in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially - but they are demonstration services in `examples/`, not permanent architectural components.
 
 ---
 
@@ -1672,12 +1703,12 @@ A test failing for the wrong reason (compile error, harness bug, missing cap not
 
 ```
 test bootstrap_steady_state_positive:
-    # Phase 5: no init - the kernel spawns the supervisor directly; the supervisor spawns logger.
-    image = build_kernel(boot_manifest=[supervisor, logger])
+    # Phase 5: no init - the kernel spawns the supervisor directly; the supervisor spawns events.
+    image = build_kernel(boot_manifest=[supervisor, events])
     qemu  = boot(image, smp=4)
 
     assert serial_contains("supervisor: ready", within=5s)
-    assert serial_contains("logger: ready",     within=5s)
+    assert serial_contains("events: ready",     within=5s)
     assert serial_contains("smp: 4 cores ready", within=5s)
     assert kernel_did_not_panic()
 ```
@@ -1688,7 +1719,7 @@ test bootstrap_steady_state_positive:
 test bootstrap_tcb_failure_panics:
     # Path C / Phase 5: init is removed, so the KERNEL spawns the supervisor directly. A corrupt
     # supervisor ELF fails that spawn → the kernel panics (no init abort, so no "reason:" prefix).
-    image = build_kernel(boot_manifest=[corrupt_binary("supervisor"), logger])
+    image = build_kernel(boot_manifest=[corrupt_binary("supervisor"), events])
     qemu = boot(image, smp=4)
 
     assert serial_contains("KERNEL PANIC", within=5s)
@@ -1709,7 +1740,7 @@ test bootstrap_tcb_failure_panics:
 test cap_enforcement_positive:
     s = spawn_test_service(contract="[capabilities] log_write = true")
     assert s.invoke(Log("hello")) == Ok
-    assert logger_received("hello")
+    assert log_received("hello")
 ```
 
 #### 2.B - Negative
@@ -1718,7 +1749,7 @@ test cap_enforcement_positive:
 test cap_enforcement_negative:
     s = spawn_test_service(contract="[capabilities] # no log_write")
     assert s.invoke(Log("hello")) == Err(CapNotHeld)
-    assert logger_did_not_receive("hello")
+    assert log_did_not_receive("hello")
     assert s.is_alive()
 ```
 
@@ -2511,6 +2542,10 @@ Constraint: this must not pollute kernel scope. The kernel publishes; the metric
 > policy, and deciding what to discard is a judgement (§26.10). A kernel-held endpoint to a
 > RESTARTABLE consumer is worse still - stale, with nobody above it to recover it (§14.3).
 >
+> *(Update 2026-09-04: that service is now called `events` - see the §11.4 amendment. The note is
+> left as written, including the old name, because it is dated; only this line is added, so a
+> reader is not sent looking for a service that no longer answers to it.)*
+>
 > Kernel STATE is already published by pull (`InspectKernel`, 24 queries, and `TaskStat`, gated by
 > INTROSPECT). Kernel EVENTS can ride the §11.4 shape: a bounded ring the kernel writes and a service
 > DRAINS - no endpoint, no consumer identity, no policy in the kernel. `docs/observability.md` has
@@ -2662,7 +2697,7 @@ Bash compatibility is explicitly **not on offer**. A shell language that resembl
 None of this is v1, v2, or v3 work. It is what becomes possible once:
 
 - The kernel and TCB are stable.
-- A real userspace exists (logger, fs, network).
+- A real userspace exists (`events`, fs, network).
 - A supervisor API for service-initiated spawn (with cap delegation) exists - currently `supervisor.spawn` is supervisor-internal.
 - The userspace community has formed enough to have opinions on what shell language to design.
 

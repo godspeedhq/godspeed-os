@@ -1,7 +1,9 @@
 # Observability: metrics, logs and traces, without a kernel endpoint
 
-**Status:** design note. Nothing here is built. Recorded because the question came up and the answer
-is already half-evidenced by work that shipped.
+**Status:** design note, now PARTLY BUILT. Section 9's rename shipped on 2026-09-04 (`logger` ->
+`events`, commit 7dc157b0), together with the section 1 correction that prompted it. Everything from
+section 10's phase 1 onward is still design. Recorded because the question came up and the answer was
+already half-evidenced by work that had shipped.
 
 **The question.** An observability service that serves metrics, logs and traces - does the kernel need
 an endpoint to expose that data on?
@@ -17,7 +19,7 @@ kernel growth** and is direct evidence against it.
 | stream | where it lives today | kernel involvement |
 |---|---|---|
 | **logs** | syscall 5, straight to the kernel's 16 KiB ring + serial. **Not the service** | the EXISTING 11.4 floor; no new growth |
-| **traces** | a 192-event ring INSIDE `logger`; instrumentation in the SDK | none |
+| **traces** | a 192-event ring INSIDE `events`; instrumentation in the SDK | none |
 | **metrics** | see below | pull only, already exists |
 
 The `trace` utility answers "what is stuck", "who can reach whom" and "what just happened", and the
@@ -27,16 +29,16 @@ control syscall, no new capability, and nothing on the IPC fast path.
 The design question that settled it was **"why can't the trace be a service?"** - and every objection
 to putting a ring in the kernel turned out to be an objection to it being in the kernel.
 
-### Correction 2026-09-04: logs never reach the `logger` service at all
+### Correction 2026-09-04: logs never reach the `events` service at all
 
-The logs row above used to read *"the `logger` SERVICE; every service sends to it"*, with no kernel
+The logs row above used to read *"the `events` SERVICE; every service sends to it"*, with no kernel
 involvement. **Both halves were wrong**, and the error survived a long time because it describes the
 arrangement the NAME implies - which is the same reason section 9 wants the name changed.
 
 What actually happens: `ctx.log()` is **syscall 5**, gated by the `log_write` capability slot, and it
 writes the kernel's 16 KiB ring buffer **and serial, directly**. The service's contract has no
 `log_write` at all; it declares only `ipc_receive`. Its endpoint is drained and unrecognised messages
-are dropped (`services/logger/CLAUDE.md`).
+are dropped (`services/events/CLAUDE.md`).
 
 ```
    TODAY - and the arrow that does NOT exist
@@ -53,27 +55,27 @@ are dropped (`services/logger/CLAUDE.md`).
                                             |   +--------------------------------+
                                             |                  |
                                             |                  |  drained ONCE,
-                                            v                  v  at logger start
+                                            v                  v  at events start
                                      +------------------------------+
-                                     |  logger  (-> `events`)       |
+                                     |  events  (-> `events`)       |
                                      |    192-event trace ring      |
                                      |    endpoint: drained,        |
                                      |    unrecognised = dropped    |
                                      +------------------------------+
 
-   There is no   ctx.log() ---> logger   arrow. There never was one.
+   There is no   ctx.log() ---> events   arrow. There never was one.
 ```
 
 **Three consequences, and the first is the one that matters most:**
 
-1. **Logging does not depend on the service being up.** When the logger is dead `ctx.log()` still
+1. **Logging does not depend on the service being up.** When `events` is dead `ctx.log()` still
    works: it never blocks on it and never returns `EndpointDead` from it, so a chaos storm that kills
-   the logger loses **no log output**. That is a property to protect, not an accident to tidy up.
+   `events` loses **no log output**. That is a property to protect, not an accident to tidy up.
 2. **So logs must NOT be re-pointed at `events` when it is built.** Routing them through the service
    would make observing a failure depend on that service being alive - the same argument as section
    9's "must never depend on storage", one layer further up. The instinct to "wire our existing
    services to `events`" is right for metrics, right for traces, and **wrong for logs.**
-3. **What genuinely wires to the service** is traces (`ipc_send = ["logger"]` in a contract, which is
+3. **What genuinely wires to the service** is traces (`ipc_send = ["events"]` in a contract, which is
    a real IPC path that exists today) and metrics (new). Logs stay on the syscall floor.
 
 This also sharpens section 9's tier table: the serial-and-kernel-ring floor is not a FALLBACK that
@@ -81,7 +83,7 @@ This also sharpens section 9's tier table: the serial-and-kernel-ring floor is n
 writing to serial unconditionally" is load-bearing rather than reassurance.
 
 **Two docs disagreed, and this one was wrong.** `docs/logging.md` has recorded the truth all along -
-*"nothing currently logs THROUGH the logger. `ctx.log()` is syscall 5"* - while this note asserted the
+*"nothing currently logs THROUGH `events`. `ctx.log()` is syscall 5"* - while this note asserted the
 opposite in its opening table. A reader who started here would have built the wrong model of the
 system and had no reason to doubt it. Both are now consistent; if the log path ever changes, it
 changes in both.
@@ -91,7 +93,7 @@ changes in both.
 ## 2. Metrics split in two, and only one half is a question
 
 **Service-level metrics** (a service counting its own work) are not a kernel matter at all. The
-service counts, and sends. This is the `logger` shape again.
+service counts, and sends. This is the `events` shape again.
 
 **Kernel-level metrics** (IPC volume, scheduler statistics, memory accounting, restart counts) are
 data only the kernel has - and it **already exposes them, by PULL**:
@@ -155,7 +157,7 @@ objections were decisive there:
 This is not hypothetical - it is how kernel logs already reach userspace (11.4):
 
 ```
-   kernel  --writes-->  [ bounded ring, overwrites when full ]  <--drains--  logger
+   kernel  --writes-->  [ bounded ring, overwrites when full ]  <--drains--  events
                           16 KiB, no policy, no endpoint,
                           no consumer identity, no cap
 ```
@@ -176,11 +178,11 @@ Checked rather than assumed, because it changes the answer:
 
 ```
    kprintln!  ->  [u8; 16 KiB] BYTE ring  ->  serial (always)
-                                          ->  drained ONCE, when `logger` starts
+                                          ->  drained ONCE, when `events` starts
 ```
 
 `kernel/src/log.rs` is a **byte ring of formatted, human-readable lines** - not typed records - and
-`drain_to_logger` has exactly one caller, the logger's startup. After that everything reaches serial
+`drain_to_events` has exactly one caller, `events`'s startup. After that everything reaches serial
 and the ring only matters again on the next boot.
 
 **So "kernel events ride the existing ring" would mean PARSING TEXT**, which is fragile and creates a
@@ -210,7 +212,7 @@ pulled into existence by a real need (26.2), not built ahead of one.
 
 During the `trace` work the `service_configs` pin **refused a new `tracer` service** - the kernel
 holds a config row per service, so adding one was a kernel change. That refusal is what forced the
-trace ring into `logger`, which turned out to be the better design anyway.
+trace ring into `events`, which turned out to be the better design anyway.
 
 After step C (`docs/service-ownership.md`) adding a service costs a crate, a contract and a line in
 the supervisor. **So an observability service becomes cheap precisely because of the catalogue work**,
@@ -229,7 +231,7 @@ and there is no longer any pressure to fold it into an existing service to dodge
    +-------------------+        |   holds:         |
                                 |    INTROSPECT    |
    +-------------------+        |    a log cap     |
-   |  logger (ring)  <-|--query-|    a trace cap   |
+   |  events (ring)  <-|--query-|    a trace cap   |
    +-------------------+        +------------------+
                                         |
                                         v
@@ -242,15 +244,21 @@ it knows, by the two mechanisms it already has, and forms no opinion about consu
 
 ---
 
-## 9. The service should be renamed: `logger` -> `events`
+## 9. The service WAS renamed: `logger` -> `events` (done 2026-09-04)
 
-**The name is already wrong.** `logger` holds the 192-event IPC TRACE ring; it stopped being a logger
-when `trace` shipped. So this is not a rename in anticipation of a new job - it is the name catching
-up with the job it already has.
+**The name was already wrong.** The service holds the 192-event IPC TRACE ring; it stopped being a
+logger when `trace` shipped. So this was not a rename in anticipation of a new job - it was the name
+catching up with the job it already had.
+
+**Shipped in commit 7dc157b0**, verified in QEMU: identity 24/0, shell 165/0, commandments 15 pass,
+redteam restored 0. Runtime evidence rather than a clean compile - `events: ready (drains its
+endpoint; holds the IPC trace ring)`, `trace: ring 192 events; 82 recorded; 0 DROPPED`, and zero
+occurrences of the old name anywhere in the serial log. The rest of this section is why, kept in
+place because the reasoning is what a future reader needs.
 
 **It is cheap, and the reason is the capability model working.** `ctx.log()` resolves through
 `log_write_slot` - a CAPABILITY, not a name - so essentially every call site in the system is already
-insulated from what the receiving service is called. Only ~46 literal `"logger"` occurrences exist in
+insulated from what the receiving service is called. Only ~46 literal `"events"` occurrences exist in
 code (the supervisor's image table and MANAGED list, contracts, the name directory, tests).
 
 **`events` rather than `observability`:**
@@ -266,7 +274,7 @@ code (the supervisor's image table and MANAGED list, contracts, the name directo
 ### The constraint that must survive the rename
 
 `docs/logging.md` makes a load-bearing argument that this service is a **stateless broker, not a
-store**: a persisting logger cycles through `fs`, and worse, **makes observing a storage failure
+store**: a persisting events cycles through `fs`, and worse, **makes observing a storage failure
 depend on storage.**
 
 Renaming it to `events` invites exactly the violation - "events implies history, history implies
@@ -363,11 +371,16 @@ So the watchman is watched by the two components that cannot die, and neither of
 one that can. This is not a gap to close - closing it (by persisting, or by having `events` guard
 itself) is precisely the violation section 9 opens by forbidding.
 
-### Timing
+### Timing - and what was actually done instead
 
-Do the rename **as part of** the observability work, not before it. Standalone it is 46 sites of
-churn with no behaviour change; bundled, the new name is justified by the new job and lands in one
-coherent commit.
+The advice here was to do the rename **as part of** the observability work rather than before it,
+since standalone it is churn with no behaviour change.
+
+**It shipped first anyway, and the reason is worth recording.** The section 1 correction changed what
+the rename MEANS: once it was established that logs never reached the service, the name was not merely
+imprecise, it was actively misleading about the system's structure - it implied an arrow that does not
+exist. That makes it a correctness fix to the codebase's own vocabulary, not cosmetic churn, and those
+land on their own so the diff stays reviewable. The measured cost was 56 sites, not 46.
 
 ---
 
@@ -379,7 +392,11 @@ shippable.
 
 ### Phase 0 - build the service against what already exists
 
-No kernel change at all. Rename `logger` -> `events` (section 9) and give it the observability job:
+**The rename half is DONE** (section 9). What remains here is giving the service the observability
+job. Note the correction to this phase's own headline: it is not "no kernel change at all" - the
+kernel carries hard-coded service-name lists (two in `scheduler.rs`, four in `build.rs`), so the
+rename edited the kernel. No new responsibility and no growth, but a kernel source edit and therefore
+real re-verification, which is the expensive part.
 
 ```
    InspectKernel (24 queries) --pull--+

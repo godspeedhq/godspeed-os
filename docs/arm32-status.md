@@ -15,7 +15,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **The real OS bootstrap:** the kernel makes its one direct spawn (the **supervisor**), which spawns
   services from its manifest through the neutral spawn path (per-task address spaces, PL0 user mode,
   banked-register trap frames, fault-survival: a PL0 fault kills just that task and the kernel continues).
-- **Services:** `supervisor`, `logger`, `console`, `shell`, `ping`, `pong`, the driver services
+- **Services:** `supervisor`, `events`, `console`, `shell`, `ping`, `pong`, the driver services
   (`dwc2`, `block-driver` + `fs`, `nic-driver` + `net-stack`, `time`, `control`) and the example services
   (`observe`, `chaos`, `mem-pressure`, `counter`, `greet`, `upper`, `roster`, `reply-server`, `asker`,
   `resource-server`, `holder`) - all cross-compiled to `armv7a-none-eabi` and embedded. The embedded set
@@ -109,7 +109,7 @@ python scripts/arm_run.py --release --usb          # boot in QEMU with an emulat
 `arm_build.py` cross-compiles the SDK + every arm-ported service to `armv7a-none-eabi`, builds the
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat
 `build/kernel7.img`. The supervisor is built with its `bare-metal` feature (the "usable OS, quiet gsh>"
-set: logger, `console` (the terminal), the driver services - `dwc2`, `block-driver` + `fs`,
+set: events, `console` (the terminal), the driver services - `dwc2`, `block-driver` + `fs`,
 `nic-driver` + `net-stack`, `time` - and the shell; no harness probes, `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
 `build/kernel7.img` **and `build/config-pi2.txt` (as `config.txt`)** to the SD card's FAT boot partition (a file copy, not a
 flash - `docs/multi-arch.md`); the **full procedure** (preparing the boot card *and* the storage USB
