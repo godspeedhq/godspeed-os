@@ -12,11 +12,11 @@ kernel growth** and is direct evidence against it.
 
 ---
 
-## 1. Two thirds of this is already answered, and it needed no kernel
+## 1. Two thirds of this is already answered, and it needed no NEW kernel
 
 | stream | where it lives today | kernel involvement |
 |---|---|---|
-| **logs** | the `logger` SERVICE; every service sends to it | none |
+| **logs** | syscall 5, straight to the kernel's 16 KiB ring + serial. **Not the service** | the EXISTING 11.4 floor; no new growth |
 | **traces** | a 192-event ring INSIDE `logger`; instrumentation in the SDK | none |
 | **metrics** | see below | pull only, already exists |
 
@@ -26,6 +26,65 @@ control syscall, no new capability, and nothing on the IPC fast path.
 
 The design question that settled it was **"why can't the trace be a service?"** - and every objection
 to putting a ring in the kernel turned out to be an objection to it being in the kernel.
+
+### Correction 2026-09-04: logs never reach the `logger` service at all
+
+The logs row above used to read *"the `logger` SERVICE; every service sends to it"*, with no kernel
+involvement. **Both halves were wrong**, and the error survived a long time because it describes the
+arrangement the NAME implies - which is the same reason section 9 wants the name changed.
+
+What actually happens: `ctx.log()` is **syscall 5**, gated by the `log_write` capability slot, and it
+writes the kernel's 16 KiB ring buffer **and serial, directly**. The service's contract has no
+`log_write` at all; it declares only `ipc_receive`. Its endpoint is drained and unrecognised messages
+are dropped (`services/logger/CLAUDE.md`).
+
+```
+   TODAY - and the arrow that does NOT exist
+
+   any service
+   +----------------------+      syscall 5 (Log), gated by log_write
+   |  ctx.log("ready")    |------------------------+
+   |                      |                        |
+   |  SDK trace record    |------ IPC ------+      |
+   +----------------------+                 |      v
+                                            |   +--------------------------------+
+                                            |   |  kernel: 16 KiB ring + serial  |
+                                            |   |  written UNCONDITIONALLY       |
+                                            |   +--------------------------------+
+                                            |                  |
+                                            |                  |  drained ONCE,
+                                            v                  v  at logger start
+                                     +------------------------------+
+                                     |  logger  (-> `events`)       |
+                                     |    192-event trace ring      |
+                                     |    endpoint: drained,        |
+                                     |    unrecognised = dropped    |
+                                     +------------------------------+
+
+   There is no   ctx.log() ---> logger   arrow. There never was one.
+```
+
+**Three consequences, and the first is the one that matters most:**
+
+1. **Logging does not depend on the service being up.** When the logger is dead `ctx.log()` still
+   works: it never blocks on it and never returns `EndpointDead` from it, so a chaos storm that kills
+   the logger loses **no log output**. That is a property to protect, not an accident to tidy up.
+2. **So logs must NOT be re-pointed at `events` when it is built.** Routing them through the service
+   would make observing a failure depend on that service being alive - the same argument as section
+   9's "must never depend on storage", one layer further up. The instinct to "wire our existing
+   services to `events`" is right for metrics, right for traces, and **wrong for logs.**
+3. **What genuinely wires to the service** is traces (`ipc_send = ["logger"]` in a contract, which is
+   a real IPC path that exists today) and metrics (new). Logs stay on the syscall floor.
+
+This also sharpens section 9's tier table: the serial-and-kernel-ring floor is not a FALLBACK that
+`events` degrades to, it is a **separate path `events` was never on**. That is why "the kernel keeps
+writing to serial unconditionally" is load-bearing rather than reassurance.
+
+**Two docs disagreed, and this one was wrong.** `docs/logging.md` has recorded the truth all along -
+*"nothing currently logs THROUGH the logger. `ctx.log()` is syscall 5"* - while this note asserted the
+opposite in its opening table. A reader who started here would have built the wrong model of the
+system and had no reason to doubt it. Both are now consistent; if the log path ever changes, it
+changes in both.
 
 ---
 
@@ -237,6 +296,72 @@ because of what sits beneath it:
 So `events` is a convenience layer over a floor that outlives it, not the system's only memory. That
 floor must not be weakened to make `events` look better: the kernel keeps writing to serial
 unconditionally, exactly as it does now.
+
+### The second constraint: self-observation must never take an IPC hop
+
+**Can `events` observe itself?** Three ways yes, one way never, and the shape that would look most
+natural to write is the one that turns recursion on.
+
+```
+   +---------------------------------------------------------------------+
+   |  `events`, observing itself                                          |
+   +---------------------------------------------------------------------+
+   |                                                                      |
+   |  its own logs     -- syscall 5 --> kernel ring + serial       OK     |
+   |                      leaves the building entirely; never              |
+   |                      touches its own endpoint, so no loop            |
+   |                                                                      |
+   |  its own metrics  -- local write --> its own table            OK     |
+   |                      no IPC hop, therefore no recursion              |
+   |                                                                      |
+   |  its own traces   ----------------> its own ring              NOISY  |
+   |                      it is the endpoint EVERYONE sends to, so        |
+   |                      tracing its own recvs costs one record per      |
+   |                      real event: self-noise at 1:1 with signal       |
+   |                                                                      |
+   |  its own DEATH    ------------------------------------------  NEVER  |
+   |                      structurally impossible                         |
+   +---------------------------------------------------------------------+
+```
+
+**The rule, stated before anyone codes it:**
+
+> A service reporting on ITSELF writes locally or uses the syscall floor. It must never do so by
+> sending itself a message.
+
+A self-emit that takes an IPC hop is the one construction that feeds the ring from the ring: the
+send is itself a traceable event, which produces a record, which is a send. Nothing else in the
+design has this property, and it is invisible until the ring is full of itself. Self-emit is a
+function call.
+
+The logs row above is the pattern to copy, and the 2026-09-04 correction in section 1 is why it
+already works: `ctx.log()` leaves for the kernel floor, so `events` logging about `events` never
+touches its own endpoint. It gets self-observation for free by not being clever.
+
+### Its own death is the one event it cannot report
+
+Worth stating as a property rather than discovering it during a storm. The single most useful thing
+`events` could tell you about `events` is the one thing it structurally cannot:
+
+```
+                        events dies
+                             |
+              +--------------+--------------+
+              v                             v
+      +----------------+        +---------------------------+
+      |  supervisor    |        |  kernel ring + serial     |
+      |  gets the      |        |  written unconditionally, |
+      |  death notif,  |        |  survives a panic that    |
+      |  respawns it   |        |  halts every core         |
+      +----------------+        +---------------------------+
+
+      Both sit BENEATH it. Neither routes through it. That is the
+      whole reason the floor is not allowed to move.
+```
+
+So the watchman is watched by the two components that cannot die, and neither of them depends on the
+one that can. This is not a gap to close - closing it (by persisting, or by having `events` guard
+itself) is precisely the violation section 9 opens by forbidding.
 
 ### Timing
 
