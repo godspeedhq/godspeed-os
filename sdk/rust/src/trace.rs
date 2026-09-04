@@ -65,6 +65,22 @@ pub const TRACE_OP_METRIC: u8 = 4;
 /// Ask for the metric table.
 pub const TRACE_OP_METRICS: u8 = 5;
 
+/// A LOG COPY: `[6][owner:12][utf-8 text]`, variable length.
+///
+/// **This is a copy, never the log itself.** `ctx.log()` performs its syscall FIRST and
+/// unconditionally - the kernel ring and serial are written whether or not `events` is alive, exists,
+/// or is reachable - and only then offers this duplicate so the line can be queried later. The
+/// distinction is the whole design: re-pointing logs AT the service would make observing a failure
+/// depend on a service that can fail, which is the storage argument in CLAUDE.md 15 one layer up.
+/// Adding a copy costs a `try_send` whose result is discarded and takes nothing away from the floor.
+///
+/// What this cannot carry, stated rather than discovered: lines written BEFORE `events` exists. Those
+/// live in the kernel's 16 KiB ring, which no syscall exposes to userspace, so `events log` begins at
+/// the moment `events` does. Boot output is serial's job, and always was.
+pub const TRACE_OP_LOG: u8 = 6;
+/// Ask for recent log lines; byte 1 = how many bytes are wanted (0 = as many as fit).
+pub const TRACE_OP_LOGS: u8 = 7;
+
 /// Bytes of a METRIC's name. Deliberately NOT `PEER_LEN`.
 ///
 /// `PEER_LEN` is 12 because the longest SERVICE name that matters is `block-driver`. A metric name is a
@@ -252,6 +268,19 @@ pub fn sink_slot() -> u32 {
 /// No clock read. The sink stamps the sample, for the reason recorded on `trace_emit`: a CMOS RTC read
 /// on every publish would put up to a millisecond of port I/O on the emitting service's path, and that
 /// once cost the shell its keystrokes. An observer must not be able to slow what it observes.
+/// Encode one log copy. Text is truncated to `max` bytes at a char boundary by the caller.
+pub fn encode_log(text: &[u8], out: &mut [u8; 1 + PEER_LEN + LOG_TEXT_MAX]) -> usize {
+    out[0] = TRACE_OP_LOG;
+    CALLER.read_into(&mut out[1..1 + PEER_LEN]);
+    let n = text.len().min(LOG_TEXT_MAX);
+    out[1 + PEER_LEN..1 + PEER_LEN + n].copy_from_slice(&text[..n]);
+    1 + PEER_LEN + n
+}
+
+/// Longest log text carried in one copy. A longer line still reaches serial in full - only the
+/// queryable copy is clipped - so the loss is bounded and the authoritative record is untouched.
+pub const LOG_TEXT_MAX: usize = 240;
+
 pub fn encode_metric(name: &str, value: u64) -> [u8; 1 + MET_LEN] {
     let mut b = [0u8; 1 + MET_LEN];
     b[0] = TRACE_OP_METRIC;

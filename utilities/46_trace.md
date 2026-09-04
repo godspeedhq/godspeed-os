@@ -118,7 +118,13 @@ the kernel.
 
 ## 5. Command surface
 
-As shipped - eight views, each named for WHAT IT SHOWS rather than what you give it:
+**The command is `events`; `trace` is the older name and still works.** The service holds three
+streams now - logs, IPC traces and metrics - and only one of them is a trace, so a reader named after
+the service is the discoverable one: someone wanting to see events types `events`. `trace` is kept
+because it is in muscle memory, throughout these docs, and in several hundred selfcheck assertions,
+and breaking that buys nothing. Every view below accepts either name.
+
+As shipped - nine views, each named for WHAT IT SHOWS rather than what you give it:
 
 ```text
   trace blocked                 what is stuck, everywhere
@@ -130,7 +136,41 @@ As shipped - eight views, each named for WHAT IT SHOWS rather than what you give
   trace failures                the same ring, only the failures
   trace status                  ring size, recorded, dropped
   trace metrics                 published samples: owner, metric, value, age
+  events log [n]                the last n log lines the sink has kept (default 20)
 ```
+
+### `events log` - what was printed, after it has scrolled away
+
+A framebuffer console has no scrollback. Before this, a line that scrolled past was gone unless you
+had serial attached, which on a Pi wired to a TV you often do not.
+
+```text
+gsh> events log 4
+fs: disk capacity = 0 sectors (0 MiB)
+fs: serving file API
+nic-driver: dwc2 answered op 0x01 while we asked 0x10 - not our reply (3 mismatched...)
+block-driver: capacity 0 - the USB host service replied 1 byte(s), not a capacity
+events: 13 line(s) logged, none overwritten. Lines printed BEFORE `events` started are on serial only.
+```
+
+**This is a COPY, and never the authoritative record.** `ctx.log()` performs its syscall first and
+unconditionally - the kernel's 16 KiB ring and serial are written whether or not `events` is alive,
+reachable, or has ever existed - and only then offers a duplicate for later querying. Re-pointing logs
+AT the service would make observing a failure depend on a service that can fail, which is CLAUDE.md
+§15's storage argument one layer up. Adding a copy takes nothing away from the floor.
+
+Three consequences, stated rather than left to be discovered:
+
+- **Nothing printed before `events` started is here.** Those lines are in the kernel ring, which no
+  syscall exposes to userspace. Boot output is serial's job and always was.
+- **The window is 8 KiB and wraps.** The footer says whether it has, so a truncated view never passes
+  for a complete one.
+- **A killed `events` loses the scrollback and no log output.** That is the design working: the tier
+  beneath it survives anything, including a panic that halts every core.
+
+It prints a screenful by default rather than everything it holds - about 3 KB on a booted machine is
+more than anyone reads. `events log 100` asks for more. It is TEXT, not records, so it refuses to
+start a pipe rather than yield something that is not a table.
 
 ### `trace metrics` - what services are counting
 

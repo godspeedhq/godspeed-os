@@ -786,7 +786,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio", "trace",
+    "wait", "watch", "whatis", "busiest", "random", "gpio", "trace", "events",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -797,7 +797,8 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "metrics", "status"]),
+    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "log", "metrics", "status"]),
+    ("events",  &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "log", "metrics", "status"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -1603,6 +1604,12 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "trace"   => cmd_trace(ctx, s["trace".len()..].trim()),
+        // `events` IS the reader; `trace` is the older name for the same views and keeps working.
+        // The service holds three streams now - logs, IPC traces and metrics - and only one of them
+        // is a trace, so a reader named after the service is the discoverable one. `trace` stays
+        // because it is in muscle memory, the docs and several hundred selfcheck assertions, and
+        // breaking that would be churn with nothing bought.
+        "events"  => cmd_trace(ctx, s["events".len()..].trim()),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
@@ -6341,7 +6348,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "trace")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "trace" | "events")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -6647,8 +6654,8 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             // `trace ipc` / `trace failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
             // is refused loudly rather than quietly yielding the wrong thing.
-            "trace"   => match split_first(arg).0 {
-                "ipc"      => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "trace" | "events" => match split_first(arg).0 {
+                "ipc" | "trace" => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "deps"     => match build_deps_table(ctx, split_first(arg).1.trim()) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "endpoints" => build_endpoints_table(ctx),
                 "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -7065,8 +7072,11 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
         // `trace <view> help` - the detail for one view, before the view itself runs.
         v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
         "blocked" => trace_blocked(ctx),
-        "ipc" => trace_events(ctx, false),
+        // `events trace` reads naturally once the command is `events`; `ipc` is the older name and
+        // is what the docs and the selfcheck use, so both resolve to the same view.
+        "ipc" | "trace" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
+        "log" => events_log(ctx, rest),
         "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
         "deps" => trace_deps(ctx, rest),
@@ -8026,6 +8036,80 @@ fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
         t.add_row(&[ov, nv, Value::Int(value), Value::Int(now.saturating_sub(at_s) as u64)]);
     }
     Some(t)
+}
+
+/// `events log` - the queryable tail of what services printed.
+///
+/// NOT the authoritative log, and the distinction matters when something has gone wrong. Every line
+/// here also went to serial and the kernel ring the moment it was written, by syscall, before `events`
+/// saw a copy - so serial is complete and this is a convenience. What this window CANNOT show is
+/// anything printed before `events` started (the kernel's 16 KiB ring is not exposed to userspace), or
+/// a line lost when the sink's queue was momentarily full.
+fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let req = [godspeed_sdk::trace::TRACE_OP_LOGS];
+    let reply = match trace_ask(ctx, &req) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("events: the `events` service did not answer in 3 attempts (it holds the log)");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.len() < 9 {
+        ctx.console_writeln("events: short log reply");
+        return Err(ShellError::Unknown);
+    }
+    let lines = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let wrapped = b[8] != 0;
+    let body = &b[9..];
+    if body.is_empty() {
+        ctx.console_writeln("events: no log lines held yet (a service logs, and the copy arrives here)");
+        return Ok(());
+    }
+    // ONE FRAME, for the reason every other multi-line view batches: a line written straight to the
+    // console is two syscalls against a 16-deep queue.
+    // A SCREENFUL BY DEFAULT, not the whole 8 KiB window. `events log` used to print everything it
+    // held - about 3 KB on a booted machine: more than anyone reads, and enough console traffic to
+    // slow a capture harness noticeably. `events log <n>` asks for more or fewer. The WINDOW is
+    // still whatever the sink holds; this bounds only what is DRAWN.
+    let want = arg.trim().parse::<usize>().unwrap_or(20).max(1);
+    let mut seen = 0usize;
+    let mut from = 0usize;
+    for i in (0..body.len()).rev() {
+        if body[i] == b'\n' {
+            seen += 1;
+            if seen > want {
+                from = i + 1;
+                break;
+            }
+        }
+    }
+    let body = &body[from..];
+
+    let mut f = FrameBuf::new();
+    let mut start = 0usize;
+    for i in 0..body.len() {
+        if body[i] == b'\n' {
+            f.put(ctx, &body[start..i]);
+            f.put(ctx, b"\r\n");
+            start = i + 1;
+        }
+    }
+    if start < body.len() {
+        f.put(ctx, &body[start..]);
+        f.put(ctx, b"\r\n");
+    }
+    f.flush(ctx);
+    if wrapped {
+        ctx.console_writeln_fmt(format_args!(
+            "events: {} line(s) logged; OLDER LINES OVERWRITTEN - this is an 8 KiB window, serial has the rest.",
+            lines));
+    } else {
+        ctx.console_writeln_fmt(format_args!(
+            "events: {} line(s) logged, none overwritten. Lines printed BEFORE `events` started are on serial only.",
+            lines));
+    }
+    Ok(())
 }
 
 fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {

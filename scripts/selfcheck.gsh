@@ -501,6 +501,31 @@ trace metrics | where owner contains events | assert contains ring.recorded
 # An unknown view is refused loudly here too.
 assert fails trace metricz
 
+# ===== events: the reader named after the service =====
+# `events` IS the reader; `trace` is the older name for the same views and both must keep working.
+# The service holds three streams now - logs, IPC traces and metrics - and only one of them is a
+# trace, so a reader named after the service is the discoverable one.
+assert ok events status
+assert ok events metrics
+# PIPED, NOT BARE. `events ipc` unpiped is the INTERACTIVE PAGED view and waits for a keypress - the
+# shell test drives it by sending `q`. A script has no one to press it, so a bare `assert ok events ipc`
+# hangs the whole suite until the harness times out, which is exactly what it did.
+events ipc | assert contains outcome
+# `events trace` reads naturally once the command is `events`, and resolves to the same view as `ipc`.
+events trace | assert contains outcome
+# The alias is a real record source, not just a printer: it filters exactly as `trace` does.
+events metrics | assert contains msgs.received
+events metrics | where owner contains events | assert contains ring.recorded
+# THE LOG. A queryable copy of what services printed - never the authoritative record, which went to
+# serial and the kernel ring by syscall before this service saw it. That ordering is the whole design:
+# a dead `events` loses scrollback and no log output.
+# BOUNDED: a screenful, not the whole window. The default used to be everything the sink held
+# - about 3 KB on a booted machine - which is more than anyone reads and enough console
+# traffic to slow a capture harness. `events log <n>` asks for more.
+assert ok events log 5
+# An unknown view under the new name is refused as loudly as under the old one.
+assert fails events nosuchview
+
 # Every view refuses an unknown subject LOUDLY rather than answering with nothing.
 assert fails trace chain nosuchsvc
 assert fails trace deps nosuchsvc

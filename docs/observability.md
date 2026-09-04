@@ -409,7 +409,16 @@ What a service now has, and the shape of each:
 | **traces** | automatic in the SDK; needs only `ipc_send = ["events"]` | one relaxed load when not tracing |
 | **metrics** | `ctx.metric(name, value)`, `try_send` and discard | nothing it can be blocked or slowed by |
 
-Read back with `trace metrics` (a record source, so it filters and formats like any other).
+Read back with `events metrics` (a record source, so it filters and formats like any other);
+`trace` remains as the older name for every view.
+
+**And logs became queryable without a kernel change**, which is worth recording because the obvious
+route needed one. `drain_kernel_ring_buffer()` is a no-op stub and no syscall exposes the kernel's
+16 KiB ring to userspace, so `events log` could not be built by draining it. What works instead:
+`ctx.log()` performs its syscall FIRST and unconditionally, then offers a best-effort COPY to
+`events`. That is not the re-pointing section 1 forbids - the floor still fires first and a dead
+sink still loses no log output - it is a duplicate kept for querying. The limitation that follows is
+stated in the view itself: lines printed before `events` exists are on serial only.
 
 **Two things this phase settled that the plan above did not anticipate.**
 

@@ -3159,6 +3159,30 @@ impl ServiceContext {
     }
 
     /// Log a string via the kernel ring buffer (syscall 5, requires log_write cap).
+    /// Offer a queryable COPY of one log line to `events`. Never the log itself.
+    ///
+    /// Called only AFTER `log`'s syscall has already written the kernel ring and serial, so the
+    /// authoritative record exists before this runs and does not depend on it in any way. A service
+    /// with no `events` cap does nothing here; `events` itself holds no cap to itself, so its own
+    /// logging cannot recurse into the sink.
+    ///
+    /// NO REACQUIRE ON FAILURE, deliberately, unlike `metric` and `trace_emit`. The cap slot is shared
+    /// between all three, and those two already refresh it after a sink restart - `count_recv`
+    /// publishes every 64 messages, so the slot heals on its own. Reacquiring from inside the LOGGING
+    /// path is the one place it could bite: a reacquire that itself wanted to report something would
+    /// re-enter here. Dropping a copy costs a line of queryable scrollback and nothing else, because
+    /// serial already has it.
+    #[inline]
+    fn log_copy(&self, text: &[u8]) {
+        let slot = crate::trace::sink_slot();
+        if slot == u32::MAX {
+            return;
+        }
+        let mut buf = [0u8; 1 + crate::trace::PEER_LEN + crate::trace::LOG_TEXT_MAX];
+        let n = crate::trace::encode_log(text, &mut buf);
+        let _ = self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&buf[..n]));
+    }
+
     pub fn log(&self, msg: &str) {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return; }
@@ -3202,6 +3226,7 @@ impl ServiceContext {
                 raw_syscall(5, slot as u64, bytes.as_ptr() as u64, end as u64);
                 raw_syscall(5, slot as u64, MARK.as_ptr() as u64, MARK.len() as u64);
             }
+            self.log_copy(&bytes[..end]);
             return;
         }
 
@@ -3209,6 +3234,7 @@ impl ServiceContext {
         unsafe {
             raw_syscall(5, slot as u64, bytes.as_ptr() as u64, len as u64);
         }
+        self.log_copy(bytes);
     }
 
     /// Write a string to the console WITHOUT a trailing newline (syscall 22,

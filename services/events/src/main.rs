@@ -44,7 +44,7 @@
 #![no_main]
 
 use godspeed_sdk::trace::{
-    EV_LEN, MET_LEN, MET_NAME_LEN, PEER_LEN, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_METRIC, TRACE_OP_METRICS,
+    EV_LEN, MET_LEN, MET_NAME_LEN, PEER_LEN, TRACE_OP_LOG, TRACE_OP_LOGS, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_METRIC, TRACE_OP_METRICS,
     TRACE_OP_STATUS,
 };
 use godspeed_sdk::{Message, ServiceContext};
@@ -66,6 +66,18 @@ const RING: usize = 192;
 /// line. When it is full the sink says so, loudly and once - a 65th metric that vanished silently
 /// would make every number here suspect, since nothing would tell you which ones were missing.
 const METRICS: usize = 64;
+
+/// Bytes of queryable log scrollback. A BYTE ring, not a line array, so one long line costs its own
+/// length instead of a whole fixed slot - `fs`'s durability warning is 280 bytes and the journal
+/// refusal 356, and both are lines the constitution leans on.
+///
+/// 8 KiB is deliberately modest. This is a CONVENIENCE over a floor that outlives it: every line here
+/// also went to serial and the kernel ring, unconditionally, before this service ever saw a copy. The
+/// value of more scrollback is bounded by that, whereas the cost of a bigger arena is paid always.
+const LOG_BYTES: usize = 8192;
+
+/// Most text returned by one `events log`, inside a single 4 KiB message.
+const LOG_REPLY_MAX: usize = 3072;
 
 /// Wire length of one metric in a DUMP reply: the emitted record plus the stamp the sink adds.
 const MET_OUT: usize = MET_LEN + 4;
@@ -130,6 +142,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut nmets = 0usize; // occupied slots
     let mut mets_full = 0u64; // samples refused because the table is full
     let mut mets_full_said = false; // the refusal is reported ONCE, not once per sample
+    let mut logbuf = [0u8; LOG_BYTES];
+    let mut loghead = 0usize; // write cursor
+    let mut logwrapped = false; // older lines have been overwritten
+    let mut loglines = 0u64; // lines accepted, ever
 
     // The event clock, CACHED. `epoch_secs_monotonic` is a CMOS RTC read on x86 - `wait_update_clear`
     // can spin ~1 ms before seven port-I/O reads - so calling it per event would cap this sink at
@@ -328,6 +344,71 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     out[o + MET_LEN..o + MET_LEN + 4].copy_from_slice(&e.at_s.to_le_bytes());
                 }
                 reply(&ctx, &out[..1 + n * MET_OUT]);
+            }
+            // A LOG COPY. The line already reached serial and the kernel ring via syscall 5 before
+            // this arrived - this is the queryable duplicate, and losing it costs scrollback and
+            // nothing else.
+            TRACE_OP_LOG if b.len() > 1 + PEER_LEN => {
+                let owner = &b[1..1 + PEER_LEN];
+                let text = &b[1 + PEER_LEN..];
+                let olen = owner.iter().position(|&c| c == 0).unwrap_or(PEER_LEN);
+                let mut push = |byte: u8, head: &mut usize, wrapped: &mut bool| {
+                    logbuf[*head] = byte;
+                    *head += 1;
+                    if *head == LOG_BYTES {
+                        *head = 0;
+                        *wrapped = true;
+                    }
+                };
+                // PREPEND THE OWNER ONLY IF THE LINE DOES NOT ALREADY SAY IT. Every service in this
+                // tree opens its log lines with its own name (`fs: serving file API`), which is the
+                // house convention - so stamping the owner unconditionally produced
+                // `block-driver block-driver: capacity 0`. The owner is still recorded for a line
+                // that does NOT name itself, which is the case this attribution exists for.
+                let says_own_name = text.len() > olen
+                    && &text[..olen] == &owner[..olen]
+                    && (text[olen] == b':' || text[olen] == b' ');
+                if !says_own_name {
+                    for &c in &owner[..olen] {
+                        push(c, &mut loghead, &mut logwrapped);
+                    }
+                    push(b' ', &mut loghead, &mut logwrapped);
+                }
+                for &c in text {
+                    // A newline inside the text would split one line into two on read-back, so it is
+                    // rendered as a space. The line is one line because one `ctx.log` call made it.
+                    push(if c == b'\n' { b' ' } else { c }, &mut loghead, &mut logwrapped);
+                }
+                push(b'\n', &mut loghead, &mut logwrapped);
+                loglines += 1;
+            }
+            // `events log` - the tail of the scrollback.
+            TRACE_OP_LOGS => {
+                let have = if logwrapped { LOG_BYTES } else { loghead };
+                let n = have.min(LOG_REPLY_MAX);
+                let mut out = [0u8; 17 + LOG_REPLY_MAX];
+                out[0..8].copy_from_slice(&loglines.to_le_bytes());
+                out[8] = logwrapped as u8;
+                let start = (loghead + LOG_BYTES - n) % LOG_BYTES;
+                for i in 0..n {
+                    out[9 + i] = logbuf[(start + i) % LOG_BYTES];
+                }
+                // DROP A PARTIAL FIRST LINE. Starting mid-sentence reads as corruption rather than as
+                // a window, and a reader cannot tell the two apart.
+                let mut skip = 0usize;
+                if n < have || logwrapped {
+                    while skip < n && out[9 + skip] != b'\n' {
+                        skip += 1;
+                    }
+                    if skip < n {
+                        skip += 1;
+                    }
+                }
+                let body = n - skip;
+                for i in 0..body {
+                    out[9 + i] = out[9 + skip + i];
+                }
+                reply(&ctx, &out[..9 + body]);
             }
             // Anything else is drained and dropped, which is the job this service already had: an
             // unconsumed endpoint fills at 16 and never empties.
