@@ -289,10 +289,13 @@ which the kernel's PCI scanner filled in. The kernel enumerates the bus for a fi
 classes it was taught about.
 
 ```
-   TODAY                                AFTER STEP D
-   ---------------------------          -----------------------------------
-   kernel                               kernel
-     PCI scan                             (no bus knowledge at all)
+   TODAY                                AFTER STEP D  [REVISED - see the
+   ---------------------------          2026-09-04 amendment at the end of
+   kernel                               this section: the kernel keeps a
+     PCI scan                           GENERIC TABLE, and loses only the
+                                        per-class interpretation.]
+                                      kernel
+                                        (no bus knowledge at all)
      XHCI_FOUND  = true
      XHCI_BAR    = 0x...                hw-enumerator
      AHCI_FOUND  = ...                    reads PCI config space
@@ -1250,6 +1253,114 @@ them instead.
 The ABI is the expensive, hard-to-change part. Design it once for where we are going, and D only
 swaps where the numbers come from. Get this wrong and we build a name-keyed hardware table at C and
 tear it out at D - the "build it twice" trap.
+
+
+### Amendment 2026-09-04: the kernel keeps the FACTS, userspace keeps the MEANING
+
+**What changed:** this section's end state said the kernel would have "no bus knowledge at all". That
+is now wrong, and the correction is not a retreat - it draws the line in a different and better place.
+The kernel keeps a **generic device table**: what is on the bus, with no opinion about any of it. What
+leaves is the **interpretation** - the per-class statics and the scan branches that decide "this is
+*the* xHCI".
+
+**The evidence that forced it.** D3a added one line to the kernel's fallback path, because a spawn that
+took it logged nothing at all and "the reporter always answers" was an inference drawn from silence.
+On the T630, `selfcheck + chaos + selfcheck + hotplug + selfcheck`:
+
+| | fallbacks | |
+|---|---:|---|
+| `0x010601` AHCI | 14 | |
+| `0x020000` NIC | 20 | |
+| `0x0c0330` xHCI | 17 | |
+| **total** | **51** | against 101 supplied |
+
+**Zero at boot. All 51 during chaos.** In steady state `hw-enumerator` answers every query and every
+driver gets a supplied BDF. During a kill storm the enumerator is itself being killed, the supervisor's
+2-second query times out (`SendFailed`, twice in that log), it supplies 0, and the kernel resolves the
+class from its own scan.
+
+So deleting the scan would have left every driver respawned during a storm with no device at all. They
+would have failed to spawn and stayed dead until the enumerator recovered - a silent, storm-only
+regression, which is the worst kind to ship. One line of logging bought that, and the reading it
+replaced ("every spawn logs SUPPLIED BDF, so the fallback is dead code") was mine and was wrong.
+
+**Why a fallback is the wrong frame anyway.** A fallback implies two sources of one fact, with a rule
+for choosing between them - and two sources of one fact is the thing §26.4 forbids. The cross-check has
+printed `derive-from-BDF vs scan: AGREES on every device` on four machines across dozens of boots,
+which is a proof of correctness and also a statement that two components are walking the same bus to
+produce the same answer.
+
+The naming precedent is the one to follow, and it is more precise than "keep a fallback". Path C kept a
+minimal `name -> endpoint` **directory** in the kernel and deliberately did **not** keep name
+**policy**: the supervisor decides who is called what, and the kernel can only answer "what endpoint is
+called X". The same line exists here and the kernel is currently on the wrong side of it.
+
+**Facts the kernel cannot give up.** It programs BARs, routes IRQs, sets bus-master, brings devices out
+of D3, and indexes the IOMMU device table by BDF. It reads configuration space whether or not anyone
+asks it to. Given that, a table of `(BDF, class code, BARs, IRQ)` with no opinion attached is nearly
+free - and D1 already built it.
+
+**Opinions the kernel must give up.** `pci::init` does not merely record. It has per-class branches
+deciding *this is the xHCI*, *this is the NIC*, taking the first match and applying per-device BAR
+rules. That is what forces a kernel rebuild to support a device nobody taught it about, and it is what
+step D is actually for.
+
+**And the reason the facts belong in the kernel rather than only in a service** is the one that decides
+it: `hw-enumerator` died 51 times during that run and took its answer with it each time. A userspace
+component holding the ONLY copy of a machine fact is a second truth that dies with its process, and
+hardware topology is the least appropriate thing to make mortal - it does not change when a service
+does. The kernel holds the irreducible record; a restarting service re-derives the picture from it and
+continues. That is §26.4's single-source rule applied to hardware, and it is the same argument that
+made the name directory unkillable.
+
+### What this leaves `hw-enumerator` doing
+
+Not "find the xHCI" - the kernel's table answers that, and it answers it when the enumerator is dead.
+Its honest job is the part that is genuinely policy and genuinely grows:
+
+- **which** device, when there is more than one of a class, and on what basis
+- quirks: this vendor's BAR lies, that one needs a settling delay
+- other discovery paths - ACPI, device tree, hot-plug - added without a kernel rebuild
+- describing hardware to humans and to tools
+
+**It does none of that today, and that should be said plainly.** By §26.2 - features are pulled into
+existence, not added because they may be useful later - the version now shipping is ahead of its
+requirement: it walks a bus the kernel has already walked and returns an answer the kernel already
+had. What it has genuinely earned is proving the userspace path works end to end, which was the point
+of D2/D3 and is not nothing. It stays, it stops being load-bearing for boot, and it is the place
+policy goes when there is some.
+
+### The revised end state
+
+```
+   BEFORE                               AFTER (revised)
+   ---------------------------          -----------------------------------
+   kernel                               kernel
+     PCI scan                             generic device table (D1): BDF,
+     XHCI_FOUND  = true                   class code, BARs, IRQ - facts, no
+     XHCI_BAR    = 0x...                  opinion, and the record a restarting
+     AHCI_FOUND  = ...                    service re-derives from
+     NIC_FOUND   = ...
+     per-class branches                 hw-enumerator
+        |                                 WHICH device, quirks, other buses,
+     "this is THE xHCI"                    reporting - policy, not discovery
+```
+
+Smaller kernel than today: the per-class statics and their scan branches go, which is what D3c already
+proved out on `AHCI`. Smaller `hw-enumerator` than today: it stops duplicating a walk and keeps the
+half that needs a service. One source of device facts, one place that decides what they mean, and no
+window in which a dying service takes the machine's topology with it.
+
+### Consequences for the remaining D3 steps
+
+- **D3d/D3e** delete `NIC_*`, `XHCI_*`, `EHCI_*` and their scan branches, exactly as D3c deleted
+  `AHCI_*`. The generic table stays.
+- **The supplied BDF stays authoritative when supplied** - it is the caller saying WHICH device, and
+  on a machine with two of a class the kernel has no basis to choose. Resolving from the table is what
+  happens when nothing said.
+- **`pci::init` is not deleted.** It is reduced to filling the generic table. The line that would have
+  read "the kernel no longer scans" reads "the kernel no longer interprets", and that is the honest
+  claim.
 
 ---
 
