@@ -182,6 +182,19 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 | Adversarial (A1-A10) | Capability isolation under direct attack | Active |
 | Chaos (C1-C7) | Graceful degradation under partial failures | Active |
 
+The layers above are categories - each generalises over many inputs. Below them sit **scenario tests**,
+which do the opposite: one situation, forced deliberately, because waiting for it is not practical.
+
+| Scenario | What it forces | Status |
+|----------|----------------|--------|
+| `peer-storm` | Kills `block-driver` every 60 ms for 20 s while the shell drives file I/O - the window where a service's peer is unreachable, manufactured rather than waited for. Every outage must END; a permanent one is the bug. | 7/7 ✅ |
+| `adopt-storm` | Storms the **supervisor** itself, so its reconciliation path runs over and over: 84 deaths and 462 service adoptions in one run, with the filesystem still working afterwards. | 7/7 ✅ |
+
+They exist because two failures could not be reproduced any other way: the hardware they appear on
+restarts services faster than a test can catch, and one of the two ARM ports cannot mount a disk under
+emulation at all. `peer-storm` found a real protocol desync on its first outing - `fs` and
+`block-driver` left permanently one reply out of phase - which no suite above had surfaced in months.
+
 ### Static analysis & unsafe audit
 
 Every `unsafe` block is inventoried in `audits/unsafe-audit.md` and enforced by
@@ -193,7 +206,7 @@ current tree; the boot-verified pass they were first taken from is
 
 | Check | Result |
 |-------|--------|
-| Unsafe confined to permitted layers (§18.1) | audit passes: 1024 lines across 68 files, no unaccounted additions |
+| Unsafe confined to permitted layers (§18.1) | audit passes: 1049 lines across 69 files, no unaccounted additions |
 | Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) | ✅ 0 |
 | Kernel build warnings | 104 → 57 (remaining are intentional unwired architecture) |
 | Hardware boot regression | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
@@ -224,6 +237,9 @@ cargo run -p osdev -- test identity
 
 # Run property tests
 cargo run -p osdev -- test property
+
+# Force a peer outage and watch the system recover from it
+cargo run -p osdev -- test peer-storm
 ```
 
 The build is pure Cargo plus the `osdev` CLI - identical on every platform. The full `osdev` CLI reference is in `CLAUDE.md §17` and `osdev/CLAUDE.md`.
