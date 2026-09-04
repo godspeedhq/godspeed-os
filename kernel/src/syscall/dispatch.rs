@@ -2111,7 +2111,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         18 => {
             use core::sync::atomic::Ordering::Relaxed;
             use crate::arch::imp::pci;
-            let x = pci::XHCI_FOUND.load(Relaxed) as i64;
+            let x = pci::xhci().is_some() as i64;
             let e = pci::EHCI_FOUND.load(Relaxed) as i64;
             // A NIC of the class counts, whatever chip it is. This used to require the vendor to be
             // one of two the kernel had been taught, so a third card reported "no NIC" on a machine

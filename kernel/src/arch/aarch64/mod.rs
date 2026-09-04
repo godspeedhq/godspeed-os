@@ -934,12 +934,10 @@ extern "C" fn boot_high() -> ! {
             // The BDF is the encoding `pci::clear_bus_master` and friends take on x86. Those are all
             // stubs here (there is no generic config-space accessor exposed at this layer), so it is
             // recorded for the log and for whoever wires the quiesce path, not acted on.
-            pci::XHCI_MMIO_BASE.store(dev.bar0, core::sync::atomic::Ordering::Relaxed);
-            pci::XHCI_BDF.store(
-                ((dev.bus as u32) << 8) | ((dev.dev as u32) << 3) | (dev.func as u32),
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            pci::XHCI_FOUND.store(true, core::sync::atomic::Ordering::Release);
+            // NOTHING TO RECORD HERE ANY MORE. This stored the VL805's BAR0, BDF and a
+            // "found" flag into three per-class statics; `pcie::init` has already put the same
+            // device in the generic table, and `pci::xhci()` is a lookup in that table (D3d). The
+            // statics were a second copy of a fact one line of enumeration already held.
 
             // The kernel does not drive USB. There is no longer a build in which it does.
             {
@@ -2810,15 +2808,28 @@ static GENET_PRESENT: core::sync::atomic::AtomicBool =
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
-    pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
     pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
     pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
-    /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
-    /// treat it as "this machine has no PCI ethernet controller", which is true.
+    /// The Pi 4 HAS PCIe and a real table - what it has no PCI ethernet controller. GENET is on the
+    /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
+    /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
+    /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
+    /// next looking for the table that does exist twenty lines below.)
+    /// The xHCI controller on this machine, from the generic table - `None` if there is none.
+    ///
+    /// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
+    /// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
+    /// was: "a general design would enumerate every controller + device and bind by class". This is that
+    /// design, and it is one line, because `find_by_class` already returns the first match - the pick the
+    /// array existed to make.
+    ///
+    /// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
+    /// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
+    /// answers only "is there one, and what is it" when nobody said.
+    pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
+
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 

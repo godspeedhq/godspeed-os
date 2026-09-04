@@ -466,7 +466,7 @@ impl HwClass {
             // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
             // mailbox call on the Pi) and the floor that brought it up is the one that knows.
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
-            HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
+            HwClass::Xhci => crate::arch::imp::pci::xhci().is_some(),
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
             // Present if the bus reports one. On a port with no PCI the arch stub answers None,
             // which is the same "no NIC here" this used to get from a static nothing ever set.
@@ -523,7 +523,7 @@ impl HwClass {
             // needs geometry as well as a window, and because its size is whatever the display turned
             // out to be.
             HwClass::Framebuffer => 0,
-            HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
+            HwClass::Xhci => crate::arch::imp::pci::xhci().map_or(0, |d| d.bar[0]),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
             // A DEVICE OF THE CLASS IS A DEVICE, whatever chip it turns out to be. This arm used to
             // read a per-class static AND require the vendor to be one of two the kernel had been
@@ -646,7 +646,7 @@ impl HwClass {
                     class_code, by_class);
                 by_class
             }
-            HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
+            HwClass::Xhci => crate::arch::imp::pci::xhci().map_or(0xFFFF, |d| d.bdf),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Nic  => crate::arch::imp::pci::nic().map_or(0xFFFF, |d| d.bdf),
             HwClass::None => 0xFFFF,
@@ -2174,8 +2174,12 @@ fn spawn_service_with_image(
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::arch::imp::pci;
                     if CONFINE_USB_DRIVERS && hw.iommu_confine() {
-                        crate::arch::imp::iommu::confine_device(
-                            pci::XHCI_BDF.load(Relaxed), phys, len);
+                        // THIS driver's device, not "the xHCI". This read `pci::XHCI_BDF`, so it
+                        // confined the xHCI controller whenever ANY driver asked to be confined -
+                        // harmless only because `xhci` is the sole one that does today, and the same
+                        // by-class assumption the kill path carried until D3b. `hw.bdf()` is the
+                        // device this spawn actually resolved.
+                        crate::arch::imp::iommu::confine_device(hw.bdf(), phys, len);
                     } else {
                         // `block-driver` (AHCI) stays in IOMMU passthrough, like ehci:
                         // the T630 BIOS hands the SATA controller over with a stale

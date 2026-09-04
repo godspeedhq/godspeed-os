@@ -810,7 +810,10 @@ pub fn drain_event_log() -> u32 {
         FAULT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
     }
 
-    let xhci_bdf = crate::arch::x86_64::pci::XHCI_BDF.load(Ordering::Relaxed);
+    // From the table, not a per-class static (D3d). Labelling a fault event by controller is
+    // reporting, not interpretation - the kernel is saying which device faulted, which it must
+    // know to report anything useful at all.
+    let xhci_bdf = crate::arch::x86_64::pci::xhci().map_or(0xFFFF, |d| d.bdf);
     let ehci_bdf = crate::arch::x86_64::pci::EHCI_BDF.load(Ordering::Relaxed);
 
     // SAFETY: mmio_va mapped in bringup; head/tail are valid registers.

@@ -173,21 +173,21 @@ pub fn first_memory_bar(d: &PciDevice) -> u64 {
 /// taught that "NIC" is a thing it should hold a variable for, and adding a driver for a class nobody
 /// taught it about meant adding four more. A lookup by class code needs teaching nothing: 0x020000 is
 /// the device's own claim about what it is, and the table records claims.
+/// The xHCI controller on this machine, from the generic table - `None` if there is none.
+///
+/// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
+/// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
+/// was: "a general design would enumerate every controller + device and bind by class". This is that
+/// design, and it is one line, because `find_by_class` already returns the first match - the pick the
+/// array existed to make.
+///
+/// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
+/// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
+/// answers only "is there one, and what is it" when nobody said.
+pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
+
 pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
 
-pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
-pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF (bus<<8 | dev<<3 | func) of the driver's xHCI - the index into the
-/// IOMMU device table for DMA confinement (H1). 0xFFFF if none found.
-pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-
-/// All discovered xHCI controllers (a system may have several; the boot drive
-/// and the keyboard often sit on different ones). Recorded during the scan.
-pub static XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
-pub static XHCI_BDFS: [AtomicU32; 4] = [const { AtomicU32::new(0xFFFF) }; 4];
 
 /// Discovered EHCI (USB 2.0) controller - the T630's back ports hang off it
 /// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
@@ -568,10 +568,8 @@ pub fn ehci_bios_handoff() {
 /// confinement) and the device that was leaning on firmware support breaks.
 /// Idempotent; no-op if no xHCI, no extended caps, or no Legacy Support cap.
 pub fn xhci_bios_handoff() {
-    if !XHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
-    let mmio = XHCI_MMIO_BASE.load(Ordering::Relaxed);
+    let Some(dev) = xhci() else { return };
+    let mmio = dev.bar[0];
     if mmio == 0 {
         return;
     }
@@ -950,15 +948,13 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     false
 }
 
-/// Program the picked xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
+/// Program the xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
 /// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
 /// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
 /// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
 pub fn program_xhci_msi() -> bool {
-    if !XHCI_FOUND.load(Ordering::Relaxed) {
-        return false;
-    }
-    let bdf = XHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = xhci() else { return false };
+    let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
     // Prefer plain MSI; fall back to MSI-X only when the device offers no MSI (what `qemu-xhci` does).
@@ -1142,13 +1138,6 @@ pub fn init() {
                     );
                     // Record every xHCI into the array.
                     if progif == PROGIF_XHCI {
-                        let n = XHCI_COUNT.load(Ordering::Relaxed) as usize;
-                        if n < 4 {
-                            XHCI_BASES[n].store(mmio_base, Ordering::Relaxed);
-                            XHCI_IRQS[n].store(irq, Ordering::Relaxed);
-                            XHCI_BDFS[n].store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                            XHCI_COUNT.store((n + 1) as u32, Ordering::Relaxed);
-                        }
                     }
                     // Record the first EHCI controller (T630 back ports, §12).
                     if progif == PROGIF_EHCI && !EHCI_FOUND.load(Ordering::Relaxed) {
@@ -1192,25 +1181,6 @@ pub fn init() {
             }
         }
     }
-    // Use the first xHCI for the driver. (Multiple xHCIs are recorded above; a
-    // general design would enumerate every controller + device and bind by class.)
-    let count = XHCI_COUNT.load(Ordering::Relaxed);
-    if count > 0 {
-        let pick = 0;
-        let base = XHCI_BASES[pick].load(Ordering::Relaxed);
-        let bdf = XHCI_BDFS[pick].load(Ordering::Relaxed);
-        XHCI_MMIO_BASE.store(base, Ordering::Relaxed);
-        XHCI_IRQ.store(XHCI_IRQS[pick].load(Ordering::Relaxed), Ordering::Relaxed);
-        XHCI_BDF.store(bdf, Ordering::Relaxed);
-        XHCI_FOUND.store(true, Ordering::Relaxed);
-        crate::kprintln!(
-            "pci: driver uses xHCI #{} of {} (MMIO={:#x} BDF={:02x}:{:02x}.{})",
-            pick, count, base, (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7
-        );
-    } else {
-        crate::kprintln!("pci: no xHCI controller found");
-    }
-
     // CROSS-CHECK: the generic table against the per-class statics it will replace.
     //
     // Two independent views of one truth must agree BEFORE anything is switched over to the new one.
@@ -1258,7 +1228,6 @@ pub fn init() {
     crate::kprintln!("pci: derive-from-BDF vs scan: {}",
                      if derive_ok { "AGREES on every device" } else { "DISAGREES - see above" });
     for (label, want_found, want_bar, want_class, bar_ix) in [
-        ("xHCI", XHCI_FOUND.load(Ordering::Relaxed), XHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_30u32, 0usize),
         ("EHCI", EHCI_FOUND.load(Ordering::Relaxed), EHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_20, 0),
         // Ethernet: class 0x02, subclass 0x00, prog-if 0x00. Both models we drive (e1000, RTL8168)
         // report the same triple - which is the point: the class code says "ethernet controller",
