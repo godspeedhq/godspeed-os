@@ -155,6 +155,26 @@ pub fn find_by_class(class_code: u32) -> Option<PciDevice> {
     })
 }
 
+/// The first memory BAR a device exposes - the `BAR_AUTO` rule, in one place.
+///
+/// WHICH BAR holds a device's registers is a property of the device, not of its class: the e1000 puts
+/// them in BAR0, the RTL8168 in BAR2 with I/O ports in BAR0. The scan stores 0 for an I/O BAR
+/// deliberately, so "the first non-zero BAR" is the register window on both without the kernel being
+/// told which card it is looking at.
+pub fn first_memory_bar(d: &PciDevice) -> u64 {
+    d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0)
+}
+
+/// The ethernet controller on this machine, from the generic table - `None` if there is none.
+///
+/// This replaces four per-class statics (`NIC_FOUND`, `NIC_MMIO_BASE`, `NIC_BDF`,
+/// `NIC_VENDOR_DEVICE`) that the boot scan filled in for the first device of class 0x020000 it saw.
+/// The facts are identical; where they LIVE is the point. A per-class static is the kernel having been
+/// taught that "NIC" is a thing it should hold a variable for, and adding a driver for a class nobody
+/// taught it about meant adding four more. A lookup by class code needs teaching nothing: 0x020000 is
+/// the device's own claim about what it is, and the table records claims.
+pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
+
 pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
@@ -189,12 +209,6 @@ const PROGIF_AHCI: u8 = 0x01;
 // The first NIC found is recorded for the future `nic-driver` to receive its MMIO BAR + IRQ at spawn,
 // exactly as `block-driver` gets the AHCI ABAR. No driver is bound yet - this is pure identification.
 const CLASS_NETWORK: u8 = 0x02;
-/// Discovered network controller. First NIC found wins. 0xFFFF BDF if none.
-pub static NIC_FOUND:         AtomicBool = AtomicBool::new(false);
-pub static NIC_MMIO_BASE:     AtomicU64  = AtomicU64::new(0);     // BAR0 register space
-pub static NIC_IRQ:           AtomicU8   = AtomicU8::new(0);
-pub static NIC_BDF:           AtomicU32  = AtomicU32::new(0xFFFF); // IOMMU device-table index (H1)
-pub static NIC_VENDOR_DEVICE: AtomicU32  = AtomicU32::new(0);     // config 0x00: vendor | device<<16
 
 /// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
 #[inline]
@@ -1174,13 +1188,6 @@ pub fn init() {
                         "pci: NIC (network ctrl, subclass {:#04x}) at {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} MMIO={:#x} IRQ={}",
                         subclass, bus, dev, func, vendor, device, mmio_base, irq
                     );
-                    if !NIC_FOUND.load(Ordering::Relaxed) {
-                        NIC_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
-                        NIC_IRQ.store(irq, Ordering::Relaxed);
-                        NIC_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                        NIC_VENDOR_DEVICE.store(vd, Ordering::Relaxed);
-                        NIC_FOUND.store(true, Ordering::Relaxed);
-                    }
                 }
             }
         }
@@ -1256,18 +1263,6 @@ pub fn init() {
         // Ethernet: class 0x02, subclass 0x00, prog-if 0x00. Both models we drive (e1000, RTL8168)
         // report the same triple - which is the point: the class code says "ethernet controller",
         // and WHICH ethernet controller is the driver's business, not the kernel's.
-        // BAR_AUTO_IX, not 0. The static path resolves the NIC's registers with the BAR_AUTO rule -
-        // the first NON-ZERO BAR - because the two cards this drives put them in different places:
-        // the e1000 in BAR0, the RTL8168 in BAR2 with I/O ports in BAR0. The scan stores 0 for an
-        // I/O BAR (it skips them deliberately), so comparing `bar[0]` against a BAR_AUTO result asks
-        // whether BAR0 equals BAR2 and answers no on every RTL8168 machine.
-        //
-        // That is what the Wyse reported: `NIC DISAGREES - table BAR0 0x0, static 0xa1104000` on a
-        // board whose networking was working perfectly - DNS resolving, ping at 0% loss. A
-        // cross-check exists to make the table's trustworthiness evidence rather than assumption;
-        // one that fails on a healthy machine destroys exactly the property it was written to
-        // establish, and teaches a reader to skip the line.
-        ("NIC",  NIC_FOUND.load(Ordering::Relaxed),  NIC_MMIO_BASE.load(Ordering::Relaxed),  0x02_00_00, BAR_AUTO_IX),
     ] {
         // Resolve the index the same way the spawn path does, so the two sides compare like with like.
         let bar_of = |d: &PciDevice| -> u64 {

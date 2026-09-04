@@ -893,10 +893,10 @@ extern "C" fn boot_high() -> ! {
             // second path also has to be kept working to be worth having, and this one was not being
             // exercised. The driver is deleted, so this is the only path and cannot rot.
             //
-            // `NIC_FOUND` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
+            // `soc_nic_present` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
             // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
             // can drive was found", which a probed-and-present GENET satisfies.
-            pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
+            GENET_PRESENT.store(true, core::sync::atomic::Ordering::Release);
             // Route GENET's interrupt to userspace. Registered LEVEL-triggered, which is what makes
             // `route::deliver` mask it before handing it over: GENET holds its line until the driver
             // clears `INTRL2_0`, and that register is in MMIO only the driver maps.
@@ -2800,6 +2800,13 @@ pub mod rtc {
 }
 
 // ---------------------------------------------------------------------------
+/// The Pi 4 has GENET on the SoC. Presence is what the boot probe found - the flag it used to
+/// set was `pci::NIC_FOUND`, which put a non-PCI device into a PCI variable and is exactly the
+/// conflation step D removes.
+pub fn soc_nic_present() -> bool { GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
+static GENET_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
@@ -2809,10 +2816,11 @@ pub mod pci {
     pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
     pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
+    /// treat it as "this machine has no PCI ethernet controller", which is true.
+    pub fn nic() -> Option<PciDevice> { None }
+    pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 
     // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
     /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.

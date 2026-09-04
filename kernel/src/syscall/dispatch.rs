@@ -2088,10 +2088,12 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         13 => crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32) as i64,
         // NIC vendor | device<<16 from the PCI scan (0 if no NIC). Task-neutral hardware info, ungated:
         // nic-driver reads it to know which chip it drives (e1000 vs RTL8168). Networking Phase 4.
-        14 => crate::arch::imp::pci::NIC_VENDOR_DEVICE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        14 => crate::arch::imp::pci::nic()
+            .map_or(0, |d| d.vendor as u32 | ((d.device as u32) << 16)) as i64,
         // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
         // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
-        15 => crate::arch::imp::pci::NIC_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        15 => crate::arch::imp::pci::nic()
+            .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)) as i64,
         // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
         // task-neutral timing (like the raw TSC, query 3): userspace turns a TSC delta into milliseconds
         // as `delta * 10 / this`. `ping` uses it for round-trip time. 0 if the TSC was not calibrated.
@@ -2111,10 +2113,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
             use crate::arch::imp::pci;
             let x = pci::XHCI_FOUND.load(Relaxed) as i64;
             let e = pci::EHCI_FOUND.load(Relaxed) as i64;
-            // Only a NIC nic-driver can actually drive counts - an unsupported NIC leaves it idling
-            // exactly like an absent one (matches the MMIO-grant gate).
-            let nic = (pci::NIC_FOUND.load(Relaxed)
-                && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)) as i64;
+            // A NIC of the class counts, whatever chip it is. This used to require the vendor to be
+            // one of two the kernel had been taught, so a third card reported "no NIC" on a machine
+            // that plainly had one - the kernel answering a question about the BUS with an opinion
+            // about DRIVERS. Whether it can be driven is the driver's business.
+            let nic = (pci::nic().is_some() || crate::arch::imp::soc_nic_present()) as i64;
             x | (e << 1) | (nic << 2)
         }
         // A hardware-random u32 (the SoC RNG on ARM, RDRAND on x86), or -1 if this build has no hardware

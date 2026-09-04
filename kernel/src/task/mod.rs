@@ -468,7 +468,10 @@ impl HwClass {
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
             HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
-            HwClass::Nic  => pci::NIC_FOUND.load(Relaxed),
+            // Present if the bus reports one. On a port with no PCI the arch stub answers None,
+            // which is the same "no NIC here" this used to get from a static nothing ever set.
+            HwClass::Nic  => crate::arch::imp::pci::nic().is_some()
+                             || crate::arch::imp::soc_nic_present(),
             // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
             // Always "present" because the kernel raises it itself - there is nothing to scan for.
             HwClass::TestIrq => true,
@@ -522,8 +525,15 @@ impl HwClass {
             HwClass::Framebuffer => 0,
             HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
-            HwClass::Nic if matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)
-                => pci::NIC_MMIO_BASE.load(Relaxed),
+            // A DEVICE OF THE CLASS IS A DEVICE, whatever chip it turns out to be. This arm used to
+            // read a per-class static AND require the vendor to be one of two the kernel had been
+            // taught (`0x100E_8086` e1000, `0x8168_10EC` RTL8168). That whitelist is precisely what
+            // step D removes: a third card would have enumerated, appeared in the table, been named
+            // by its own class code - and been handed no MMIO, because the kernel had not heard of
+            // it. Whether a driver can drive the chip it finds is the DRIVER's judgement, and it can
+            // read the vendor id for itself (InspectKernel query 14).
+            HwClass::Nic => crate::arch::imp::pci::nic()
+                .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)),
             _ => 0,
         }
     }
@@ -638,7 +648,7 @@ impl HwClass {
             }
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
-            HwClass::Nic  => pci::NIC_BDF.load(Relaxed),
+            HwClass::Nic  => crate::arch::imp::pci::nic().map_or(0xFFFF, |d| d.bdf),
             HwClass::None => 0xFFFF,
         }
     }

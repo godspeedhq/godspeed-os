@@ -1176,6 +1176,15 @@ pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
     pci::cfg_read_gated(sel, off)
 }
 
+/// Is there an ethernet controller SOLDERED TO THE SOC - one that is on no bus the kernel can walk?
+///
+/// The Pi 4's GENET is memory-mapped at a fixed address and appears in no PCI table, so "is there a
+/// NIC" cannot be answered by a bus scan on that port. This is deliberately NOT a second source for
+/// the same fact: `pci::nic()` answers "is there a PCI ethernet controller", this answers "is there an
+/// SoC one", and a machine has whichever it has. Merging them into one static was what put a
+/// non-PCI device's presence into a variable called `pci::NIC_FOUND`.
+pub fn soc_nic_present() -> bool { false }
+
 /// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
 ///
 /// **A log has to say which MACHINE it came from.** The boot banner reports the ARCH

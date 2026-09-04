@@ -373,6 +373,10 @@ pub mod rtc {
 }
 
 // ---------------------------------------------------------------------------
+/// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
+/// See the x86 original for why this is not a second source for `pci::nic()`.
+pub fn soc_nic_present() -> bool { false }
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
@@ -382,10 +386,11 @@ pub mod pci {
     pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
     pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
+    /// treat it as "this machine has no PCI ethernet controller", which is true.
+    pub fn nic() -> Option<PciDevice> { None }
+    pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}
