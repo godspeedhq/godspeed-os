@@ -865,10 +865,12 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         // device's MSI generically - which is real work, and squarely the kernel's (interrupt
         // routing is one of the six, §4.3), so it belongs here rather than in the caller.
         //
-        // Until it lands, a driver spawned by CLASS CODE gets MMIO, DMA and its BDF but no
-        // interrupt: it must poll. The four existing drivers keep their named classes and their
-        // vectors, so nothing regresses - but a new driver that needs an interrupt still waits on
-        // this. Stated rather than papered over (§26.7).
+        // IT LANDED. This paragraph used to end "until it lands, a driver spawned by CLASS CODE gets
+        // MMIO, DMA and its BDF but no interrupt: it must poll" - and the very next line already said
+        // it was resolved. Both sentences stood, and the first one reads as current to anyone who
+        // stops there. A comment that describes a limitation the code below it removed is the same
+        // defect as a counter nobody increments: it looks like fact.
+        //
         // Resolved at the SPAWN SITE instead, by `pci_msi_vector`: allocating a vector needs the
         // core the driver will run on (for the delivery destination), and this returns a 'static
         // slice which an allocated value cannot live in.
