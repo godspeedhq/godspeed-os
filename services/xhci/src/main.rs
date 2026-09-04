@@ -695,14 +695,26 @@ fn idle(ctx: &ServiceContext) -> ! {
 /// it is fully non-blocking - otherwise, while a key is held (no new transfer events),
 /// this would busy-spin millions of times before returning `None`, starving the
 /// typematic auto-repeat poll at the bottom of the loop.
-pub(crate) fn next_event(
+/// `next_event`, but also yielding the TRB POINTER the event refers to.
+///
+/// A Transfer Event's first eight bytes are the address of the TRB that completed. `next_event`
+/// discarded them, so a caller could only match an event by SLOT - and a slot is not a question. The
+/// hub's four downstream ports are probed one after another through the same endpoint, the same ring
+/// and the same data buffer, so a completion for port 2's probe is indistinguishable from port 3's
+/// once the pointer is thrown away. The reply is then read out of a buffer holding somebody else's
+/// answer.
+///
+/// That is what made a connected disk report DISCONNECTED twice in a row and get dropped: not a bad
+/// read, a MISATTRIBUTED one - which is also why the two-consecutive-reads guard never caught it. Two
+/// stale answers are as easy to get as one.
+pub(crate) fn next_event_at(
     dma: &Dma,
     mmio: &Mmio,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     max_tries: u32,
-) -> Option<(u32, u32, u32)> {
+) -> Option<(u32, u32, u32, u64)> {
     let mut tries = 0u32;
     while tries < max_tries {
         tries += 1;
@@ -714,6 +726,7 @@ pub(crate) fn next_event(
         let trb_type = (ctrl >> 10) & 0x3F;
         let completion = dma.read32(off + 8) >> 24;
         let slot_id = (ctrl >> 24) & 0xFF;
+        let ptr = (dma.read32(off) as u64) | ((dma.read32(off + 4) as u64) << 32);
         *ev_idx += 1;
         if *ev_idx == EVENT_RING_TRBS {
             *ev_idx = 0;
@@ -724,9 +737,22 @@ pub(crate) fn next_event(
             ir0 + 0x18,
             dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3),
         );
-        return Some((trb_type, completion, slot_id));
+        return Some((trb_type, completion, slot_id, ptr));
     }
     None
+}
+
+/// The three fields every other caller wants. Delegates, so there is ONE event-ring walk: two copies
+/// of a ring dequeue that must advance exactly once is a bug waiting for the second one to drift.
+pub(crate) fn next_event(
+    dma: &Dma,
+    mmio: &Mmio,
+    ir0: usize,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    max_tries: u32,
+) -> Option<(u32, u32, u32)> {
+    next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, max_tries).map(|(t, c, s, _)| (t, c, s))
 }
 
 /// Issue a command TRB and wait for its Command Completion Event, skipping any
@@ -953,6 +979,10 @@ fn hub_port_status(
     dma.write32(tr + 36, 0);
     dma.write32(tr + 40, 0);
     dma.write32(tr + 44, c | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    // THE ADDRESS OF THE TRB THAT WILL COMPLETE. IOC is on the status stage, so the Transfer Event
+    // this probe is waiting for carries exactly this pointer - and matching on it is what tells our
+    // answer apart from the previous port's. See `next_event_at`.
+    let want_trb = dma.phys_at(tr + 32);
     *cur += 3 * 0x10;
     mmio.write32(dboff + hub_slot as usize * 4, 1); // ring the hub's EP0 doorbell (DCI 1)
     for _ in 0..8 {
@@ -986,7 +1016,7 @@ fn hub_port_status(
         let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(PROBE_ANSWER_MS));
         let mut ev;
         loop {
-            ev = next_event(dma, mmio, ir0, ev_idx, ev_cycle, 4_096);
+            ev = next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, 4_096);
             if ev.is_some() || ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
                 break;
             }
@@ -1022,7 +1052,13 @@ fn hub_port_status(
             ctx.sleep(ctx.duration_cycles(1));
         }
         match ev {
-            Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
+            // SLOT AND TRB, not slot alone. A hub's four downstream ports are probed one after
+            // another through the same endpoint, the same ring and the same data buffer, so an event
+            // for the PREVIOUS port's probe matches on slot perfectly - and the buffer then holds
+            // that port's answer, read as this one's. A connected disk reported DISCONNECTED twice
+            // running and was dropped; the two-consecutive-reads guard could not help, because two
+            // misattributed answers are no harder to get than one.
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr)) if sid == hub_slot && ptr == want_trb => {
                 if cc == 1 || cc == 13 {
                     return Some(dma.read16(PROBE_BUF_OFF) & 1 != 0); // wPortStatus bit0 = connect
                 }
@@ -1074,10 +1110,15 @@ fn hub_port_status(
                 PROBE_FAILS.store(199, core::sync::atomic::Ordering::Relaxed);
                 return None;
             }
-            // A stray HID transfer event (a keystroke landing in this check window) - record its slot
-            // so the caller re-arms that endpoint (its in-flight TRB is now spent). The report itself
-            // is lost, a rare dropped keystroke, but the endpoint does not stall. Keep waiting for ours.
-            Some((TRB_TRANSFER_EVENT, cc, sid)) => {
+            // A transfer event that is NOT this probe's. Two kinds land here now:
+            //   - a stray HID transfer event (a keystroke landing in this check window), which is
+            //     what this arm was written for;
+            //   - a transfer event on our OWN hub slot whose TRB pointer is somebody else's probe -
+            //     the late answer to a port we already gave up on. It used to be accepted as this
+            //     port's answer, buffer and all, which is the misattribution being fixed.
+            // Both are handled the same way: record the slot so the caller re-arms that endpoint,
+            // and do not treat it as an answer to the question actually asked.
+            Some((TRB_TRANSFER_EVENT, cc, sid, _)) => {
                 eaten.put(sid, cc);
                 // ABANDON THE PROBE and let the caller deliver the keystroke NOW.
                 //
