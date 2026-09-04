@@ -124,10 +124,17 @@ CASES = [
                    '[kernel.arch_roles]\n"x86_64/nvme.rs" = "storage-driver"')),
      ["COMMANDMENTS.baseline.toml"], ["kernel/src/arch/x86_64/nvme.rs"]),
 
-    ("I-service-table", "a 219th service config in the kernel",
-     lambda: edit("kernel/src/task/mod.rs", '        "nic-driver" => Some(("nic-driver"',
+    # ANCHOR REPAIRED 2026-09-04. This probe was INERT from the step-D merge until now: it anchored
+    # on the `nic-driver` catalogue entry, and step D deleted the kernel's per-service
+    # catalogue (222 entries -> 1). A probe whose anchor is gone injects NOTHING, so the check it
+    # exists to exercise was never run - and it reported CAUGHT for a violation never introduced.
+    # v0.13.0 shipped with this guard testing nothing. Re-anchored on the ONE surviving entry,
+    # `supervisor`, the kernel's single direct spawn (11.1). If that is ever renamed or removed
+    # the probe reports ANCHOR? rather than silently passing - which is how this was caught.
+    ("I-service-table", "a 2nd service config in the kernel",
+     lambda: edit("kernel/src/task/mod.rs", '        "supervisor" => Some(("supervisor"',
                   '        "ghostsvc" => Some(("ghostsvc", ServiceConfig { }));\n'
-                  '        "nic-driver" => Some(("nic-driver"'),
+                  '        "supervisor" => Some(("supervisor"'),
      ["kernel/src/task/mod.rs"], []),
 
     ("integrity-baseline", "a pin stranded below a sub-table (the bug that hit 4x)",
