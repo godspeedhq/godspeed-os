@@ -95,11 +95,50 @@ module serves none of the six.
 
 ## Portability
 
-One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in `arch/<isa>/`. **x86-64 is the full runnable OS** - the `os.img` you flash, with 4 cores, the shell, storage, and networking. **32-bit ARM (Raspberry Pi 2) runs the OS too** - the same neutral kernel boots to an interactive `gsh>` shell on real Pi 2 hardware (4-core SMP, supervisor spawning services, `ping`->`pong` capability IPC); build + run it with `scripts/arm_build.py` / `scripts/arm_run.py` (see `docs/arm32-status.md`), the SD/USB drivers still in progress. The neutral kernel is *also* proven to compile and boot on **AArch64, RISC-V, and LoongArch** (they print to their UART), and **s390x** compiles clean (big-endian); 32-bit RISC-V compiles clean. Adding an ISA is bounded to `arch/<isa>/` and enforced by CI; it does not touch a single arch-neutral file.
+One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in
+`arch/<isa>/`. Adding an ISA is bounded to that directory and enforced by CI - it does not touch a
+single arch-neutral file.
 
-See **[docs/multi-arch.md](docs/multi-arch.md)** for the proof, and **[kernel/src/arch/CLAUDE.md](kernel/src/arch/CLAUDE.md)** for how to add one.
+| target | status |
+|---|---|
+| **x86-64** | **Full OS.** The `os.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
+| **AArch64** (Raspberry Pi 4) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4-core SMP, GENET gigabit ethernet, USB keyboard and mass storage through the VL805 xHCI over PCIe, journalled filesystem. |
+| **32-bit ARM** (Raspberry Pi 2) | **Full OS.** Same neutral kernel: 4-core SMP, USB keyboard, USB mass storage and USB ethernet - all three through the one DWC2 controller - plus the filesystem and the shell. |
+| RISC-V 64/32, LoongArch | Compile and boot to their UART. |
+| s390x | Compiles clean (big-endian). |
 
----
+All three full ports are validated the same way and to the same bar: `selfcheck` (400-odd assertions),
+then `chaos max-carnage` killing every service repeatedly, then `selfcheck` again, then a USB hotplug,
+then `selfcheck` once more - **zero failures, zero kernel panics, zero liveness wedges**.
+
+See **[docs/multi-arch.md](docs/multi-arch.md)** for the proof, **[docs/arm32-status.md](docs/arm32-status.md)**
+and **[docs/aarch64.md](docs/aarch64.md)** for the two Pi ports, and
+**[kernel/src/arch/CLAUDE.md](kernel/src/arch/CLAUDE.md)** for how to add an ISA.
+
+## Writing a device driver
+
+A driver is an ordinary service. **It needs no kernel source change** - you name the device by its
+industry-standard PCI class code, and the kernel supplies the rest:
+
+```
+   supervisor IMAGES[]:
+     ("my-driver", MY_ELF, ..., hwclass::pci_irq(0x0C_03_30, 0, true))
+                                              │      │  │
+                    the device's OWN claim ───┘      │  └─ confine it behind the IOMMU
+                    about what it is                 └──── which BAR holds its registers
+
+   the kernel then grants:  MMIO window · DMA arena · BDF · IOMMU domain · MSI vector
+```
+
+`0x0C0330` means "xHCI controller" everywhere, forever. The kernel records what is on the bus and holds
+no opinion about any of it - no per-class statics, no vendor whitelist, no branch that decides *this is
+the xHCI*. What it cannot do is decide *which* device you meant when there are two of a class; the
+supervisor names one, and that wins.
+
+The image still ships inside the build, so adding a driver means a rebuild and a reflash. That is not
+the expensive part: the cost of a kernel change is not compile time, it is that editing kernel source
+reopens *"is the kernel still correct?"*. Linking a new driver crate against unchanged, battle-tested
+kernel code reopens nothing.
 
 ## How it works
 
@@ -228,10 +267,17 @@ website/      documentation site (mdBook; renders this repo's docs)
 **Live at [godspeedhq.github.io/godspeed-os](https://godspeedhq.github.io/godspeed-os/)**, with the
 [SDK API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/) under `/api`.
 
+Two sections worth knowing about:
+[**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
+may *not* do, and diagrams of how they reach each other over endpoints - and
+[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 47 of them, each with
+its full specification.
+
 The docs in this repo also render as a browsable site built with
 [mdBook](https://rust-lang.github.io/mdBook/). The site is a
 **derived view**: every page is an `{{#include}}` of the real file, so it never duplicates or drifts
-from the source. A GitHub Action rebuilds and republishes it on every push to `main` that touches a
+from the source. Acronyms link to the glossary and carry a hover definition, injected at build time so
+the markdown stays plain. A GitHub Action rebuilds and republishes it on every push to `main` that touches a
 doc, so editing `CLAUDE.md` or a `docs/` file updates the site automatically.
 
 Preview or update it locally:
