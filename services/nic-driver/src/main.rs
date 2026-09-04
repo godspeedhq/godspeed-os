@@ -1050,6 +1050,12 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
+    // called - so a traced service says. Without it every event reads `?` in the caller column, and
+    // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
+    // ten unnamed services all collide into one row and their counters interleave. Observed as a
+    // single `msgs.received 1920` belonging to nobody.
+    ctx.trace_as("nic-driver");
     ctx.log("nic-driver: starting");
 
     // Pi 4, with the driver where it belongs: the GENET MAC is ours, reached through the register

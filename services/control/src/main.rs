@@ -103,6 +103,12 @@ fn execute(ctx: &ServiceContext, line: &str) {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
+    // called - so a traced service says. Without it every event reads `?` in the caller column, and
+    // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
+    // ten unnamed services all collide into one row and their counters interleave. Observed as a
+    // single `msgs.received 1920` belonging to nobody.
+    ctx.trace_as("control");
     ctx.log("control: serving the COM2 operator channel (C1-6: out of the kernel)");
     let mut buf = [0u8; LINE_MAX];
     let mut len = 0usize;

@@ -14,7 +14,11 @@ log_write   = true
 # `time` (clock slice 2): SNTP is a network fact this service fetches, and the `time` service decides
 # whether to believe it - plausibility, the floor, provenance. Declared here because a communication
 # path that exists in the kernel and not in the contract is what Commandment IV forbids.
-ipc_send    = ["nic-driver", "time"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send    = ["nic-driver", "time", "events"]
 ipc_receive = ["net-stack"]
 # net-stack mints a delegated SOCKET capability per open socket (§7.10, the same mechanism fs uses for
 # files). resource_mint is that authority; the kernel grants it from this declaration (service_hw, T1 B).

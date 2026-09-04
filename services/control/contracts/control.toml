@@ -23,5 +23,9 @@ request = "4MiB"
 limit   = "8MiB"
 
 [capabilities]
-ipc_send    = ["supervisor"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send    = ["supervisor", "events"]
 log_write   = true

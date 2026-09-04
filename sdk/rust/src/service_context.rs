@@ -854,6 +854,37 @@ impl ServiceContext {
     /// blocked in `call` with `ReplyDead`, and the supervisor restarts it. Loud, and recovered.
     ///
     /// A service that wants to HANDLE the error instead of dying should call `recv_result`.
+    /// Count one RECEIVED message, and publish the running total every 64.
+    ///
+    /// In the SDK rather than in each service, for the same reason trace emission is: it is the same
+    /// counter in every one of them, and ten hand-placed copies is ten chances to place it wrong. Every
+    /// receive path funnels here, and only a message that actually ARRIVED is counted - a polling
+    /// driver calling `try_recv` in a tight loop counts nothing until something comes.
+    ///
+    /// WHY THIS ONE IS WORTH HAVING EVERYWHERE. Paired with the `age_s` column, it answers the
+    /// question an operator actually has when something is wrong: not "how busy is this service" but
+    /// "is it doing ANYTHING". A `block-driver` whose count last moved forty seconds ago is a
+    /// different fault from one that is still receiving and failing, and nothing else in the system
+    /// distinguishes them.
+    ///
+    /// Costs a service with no `events` cap one relaxed add and a not-taken branch; `events` itself
+    /// holds no send cap to itself, so its own publish resolves to `u32::MAX` and returns - the same
+    /// cut that stops it tracing its own sends. No recursion is possible.
+    #[inline]
+    fn count_recv(&self) {
+        static SERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        const PUBLISH_EVERY: u64 = 64;
+        let n = SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        // THE FIRST MESSAGE PUBLISHES TOO, not just every 64th. Publishing only on the interval meant a
+        // service that had received fewer than 64 messages had NO ROW AT ALL - and a service with no row
+        // is indistinguishable from one that is dead, which is precisely the question this metric exists
+        // to answer. Observed: `block-driver`, `time`, `xhci`, `ehci` and `dwc2` all absent from a
+        // healthy machine. One extra send per service for the life of the machine.
+        if n == 1 || n % PUBLISH_EVERY == 0 {
+            self.metric("msgs.received", n);
+        }
+    }
+
     pub fn recv(&self) -> Message {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC {
@@ -864,7 +895,7 @@ impl ServiceContext {
             panic!("recv: no receive endpoint - this service has no ipc_receive in its contract");
         }
         match crate::ipc::recv(CapHandle(slot)) {
-            Ok(msg) => msg,
+            Ok(msg) => { self.count_recv(); msg }
             Err(e)  => panic!("recv failed: {:?} - endpoint is gone; dying so the supervisor restarts us", e),
         }
     }
@@ -877,7 +908,9 @@ impl ServiceContext {
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
         if slot == u32::MAX { return None; }
-        crate::ipc::try_recv(CapHandle(slot)).ok().flatten()
+        let m = crate::ipc::try_recv(CapHandle(slot)).ok().flatten();
+        if m.is_some() { self.count_recv(); }
+        m
     }
 
     /// Block on this service's recv endpoint until a message arrives or `timeout_cycles`
@@ -891,7 +924,9 @@ impl ServiceContext {
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
         if slot == u32::MAX { return None; }
-        crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten()
+        let m = crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten();
+        if m.is_some() { self.count_recv(); }
+        m
     }
 
     /// Re-open the kernel's IOAPIC gate for a level-triggered IRQ `vector` after this driver
@@ -1139,7 +1174,24 @@ impl ServiceContext {
     /// Costs nothing in trust: the whole event is already the emitter's testimony (see `crate::trace`).
     /// A service that never calls this still traces; its events read `?` in the caller column, which
     /// is the honest answer rather than a guess.
-    pub fn trace_as(&self, name: &str) { crate::trace::set_caller(name); }
+    pub fn trace_as(&self, name: &str) {
+        // A TRUNCATED SERVICE NAME IS REPORTED, not swallowed. `PEER_LEN` is 12 - sized for
+        // `block-driver` - and `hw-enumerator` is 13, so it appears everywhere as `hw-enumerato`.
+        // Readable, but it is still a name silently becoming a different name, and two services
+        // sharing a 12-byte prefix would merge into ONE metric row with their counters interleaving
+        // (the exact failure an unnamed service caused before every service declared itself).
+        //
+        // Widening `PEER_LEN` was the other option and was rejected on cost: the trace DUMP is bounded
+        // by one 4 KiB message, so a 16-byte field drops it from 110 events per screen to 95. Trading
+        // real scrollback in the tool for four characters of a name is the wrong way round. Say it
+        // once instead, so the fix - a shorter name - is the developer's to make.
+        if name.len() > crate::trace::PEER_LEN {
+            self.log_fmt(format_args!(
+                "sdk: service name '{}' exceeds {} bytes and is TRUNCATED in traces and metrics - shorten it, or two services could share one row",
+                name, crate::trace::PEER_LEN));
+        }
+        crate::trace::set_caller(name);
+    }
 
     /// Declare that requests to `peer` carry their opcode at byte `at` (default 0).
     ///

@@ -8015,7 +8015,13 @@ fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
         ]);
         let at_s = u32::from_le_bytes([b[o + MET_LEN], b[o + MET_LEN + 1], b[o + MET_LEN + 2], b[o + MET_LEN + 3]]);
         let trim = |x: &[u8]| -> usize { x.iter().position(|&c| c == 0).unwrap_or(x.len()) };
-        let ov = t.intern(&owner[..trim(owner)]);
+        // AN UNNAMED PUBLISHER READS `?`, NOT BLANK. A service that never called `trace_as` publishes
+        // under an empty owner, and since the key is (owner, name) EVERY such service collides into
+        // one row with their counters interleaving. `?` matches what the trace ring already shows for
+        // an undeclared caller, and the warning under the table names the consequence - a blank cell
+        // looks like a formatting quirk, which is how this went unnoticed until the numbers were wrong.
+        let ow = &owner[..trim(owner)];
+        let ov = if ow.is_empty() { t.intern(b"?") } else { t.intern(ow) };
         let nv = t.intern(&name[..trim(name)]);
         t.add_row(&[ov, nv, Value::Int(value), Value::Int(now.saturating_sub(at_s) as u64)]);
     }
@@ -8044,6 +8050,13 @@ fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
         lb.flush_into(ctx, &mut f);
     }
     f.flush(ctx);
+    let mut unnamed = false;
+    for r in 0..t.nrows() {
+        if t.cell_bytes(r, 0) == b"?" { unnamed = true; }
+    }
+    if unnamed {
+        ctx.console_writeln("trace: a `?` owner is a service that never called ctx.trace_as - EVERY such service shares that one row, so those numbers are merged and cannot be trusted apart.");
+    }
     ctx.console_writeln("trace: a metric is the LAST value its owner published - `events` keeps it after the owner dies, so check age_s.");
     Ok(())
 }

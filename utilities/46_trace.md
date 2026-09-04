@@ -166,6 +166,30 @@ A publisher chooses its own interval, and should not publish on every operation:
 measure. So a value can lag by up to one interval on a quiet machine, and the age shows the lag rather
 than implying there is none.
 
+**`msgs.received` comes free, from the SDK.** Every service that holds the cap publishes it without a
+line of its own code, because it is counted in the SDK's three receive paths - the same place trace
+emission lives, and for the same reason: it is the identical counter in every service, and ten
+hand-placed copies is ten chances to place it wrong.
+
+It publishes on the FIRST message as well as every 64th, which matters more than it sounds. Publishing
+only on the interval left any service under 64 messages with no row at all, and **no row is
+indistinguishable from dead** - which is the one question this metric exists to answer. Paired with
+`age_s` it separates the two faults nothing else in the system separates: a `block-driver` still
+receiving and failing, versus one whose count last moved forty seconds ago.
+
+**Attribution depends on `ctx.trace_as`, and silently failed without it.** A service that never
+declares its name publishes under a BLANK owner - and since the key is `(owner, metric)`, *every*
+undeclared service collides into one row with its counters interleaving. That is exactly how it was
+found: a single `msgs.received 1920` belonging to nobody, which turned out to be `console` plus nine
+others. Every internal service now declares itself, an undeclared one renders as `?` rather than
+blank, and the view warns underneath when a `?` row exists.
+
+One name is too long and is reported rather than hidden: `PEER_LEN` is 12 bytes (sized for
+`block-driver`) and `hw-enumerator` is 13, so it reads `hw-enumerato` and the SDK says so once at
+start-up. Widening the field was the alternative and was rejected on cost - the dump is bounded by one
+4 KiB message, so a 16-byte field drops this view from 110 events per screen to 95, and trading real
+scrollback for four characters of a name is the wrong way round.
+
 **It is a record source**, so it filters and formats like `trace ipc`:
 
 ```text

@@ -31,7 +31,11 @@ log_write = true
 # instead of the NET_DEVICE syscalls described below. The kernel grants the send cap only on arm; on x86
 # and aarch64 there is no such service and the grant is absent. That asymmetry is correct rather than
 # sloppy: a contract states what the service NEEDS, and the OS decides whether to grant it (§13.3).
-ipc_send  = ["dwc2"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send  = ["dwc2", "events"]
 # ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
 # so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE
 # capability BY NAME (frame syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated to

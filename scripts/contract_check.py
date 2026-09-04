@@ -280,7 +280,12 @@ def parse_supervisor_images(name: str):
         # the x86-intended core. Without it the shell's row raised a ValueError rather than reporting a
         # mismatch - a checker that CRASHES is worse than one that fails, since it reports nothing at all.
         "core":  _core_of(core_expr),
-        "send":  sorted(re.findall(r'"([^"]+)"', peers_raw)),
+        # DEDUPED, because the comment above says UNION and a union is a set. Concatenating the
+        # branches was indistinguishable from a union until a peer appeared in MORE THAN ONE branch -
+        # `events` is the first, since every port traces - and then `block-driver` read as
+        # ['dwc2','events','events','events','xhci'] and failed against a contract that was correct.
+        # The multiplicity carried no information: a peer granted twice is granted once.
+        "send":  sorted(set(re.findall(r'"([^"]+)"', peers_raw))),
     }
 
 

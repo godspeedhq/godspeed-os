@@ -483,6 +483,19 @@ trace metrics | assert contains metrics.held
 # ...and an ORDINARY service publishes over IPC, which is the path any new service would use. `fs` has
 # served this entire suite, so it is far past its 32-request publish interval.
 trace metrics | assert contains blk.outages
+# EVERY internal service is registered, not just the two that started with the cap. `msgs.received` is
+# counted in the SDK's receive paths, so a service gets it by existing rather than by remembering to
+# add it - which is the same reason trace emission lives there. It publishes on the FIRST message as
+# well as every 64th: a service under the interval would otherwise have NO ROW, and no row is
+# indistinguishable from dead, which is the one question this metric exists to answer.
+trace metrics | assert contains msgs.received
+# Named services, on every port: the terminal, storage, and the clock. Attribution is the point - an
+# undeclared service publishes under a BLANK owner, and since the key is (owner, name) every such
+# service collides into ONE row with the counters interleaving. Caught exactly that way: a single
+# `msgs.received 1920` belonging to nobody, which was `console` plus nine others.
+trace metrics | where owner contains console | assert contains msgs.received
+trace metrics | where owner contains block-driver | assert contains msgs.received
+trace metrics | where owner contains time | assert contains msgs.received
 # It is a record source like `trace ipc`, so it filters like one.
 trace metrics | where owner contains events | assert contains ring.recorded
 # An unknown view is refused loudly here too.
