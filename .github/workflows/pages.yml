@@ -18,6 +18,9 @@ on:
     paths:
       - 'website/**'
       - 'docs/**'
+      # The utility specs are the source of truth the site now {{#include}}s.
+      # Without this a corrected utility spec would never reach the published site.
+      - 'utilities/**'
       - 'sdk/**'
       - 'CLAUDE.md'
       - 'COMMANDMENTS.md'
