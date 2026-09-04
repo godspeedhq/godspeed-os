@@ -79,9 +79,7 @@ static mut TX_RING: [u8; TX_RING_LEN] = [0; TX_RING_LEN];
 /// occupancy is their difference, so neither needs clamping and the wrap is arithmetic, not a branch.
 static TX_HEAD: AtomicU32 = AtomicU32::new(0);
 static TX_TAIL: AtomicU32 = AtomicU32::new(0);
-/// Bytes dropped because the ring was full. Reported rather than silently swallowed (invariant 12) -
-/// losing console output is exactly the kind of thing that must not happen quietly.
-static TX_DROPPED: AtomicU32 = AtomicU32::new(0);
+
 /// Until the tick is running there is nobody to drain the ring, so writes must go out synchronously.
 /// Boot output therefore behaves exactly as it always has, which also keeps a panic before the first
 /// tick readable.
@@ -94,21 +92,58 @@ pub fn tx_ring_enable() {
 
 /// Queue one byte. False if the ring is full (the caller then blocks, so output is never lost
 /// silently - a dropped byte is counted and reported instead).
+/// How many drain-and-retry rounds a byte gets before it is discarded. Each round moves at most one
+/// FIFO-load (16 bytes) and never waits on the UART, so this is bounded work, not a spin: at 115200 a
+/// full 16-byte FIFO clears in ~1.4 ms and the tick keeps draining regardless. Four rounds is enough
+/// to ride out a burst without ever becoming a wait.
+const TX_MAKE_ROOM_TRIES: u32 = 4;
+
+/// Two producers were inside `tx_push` at once. COUNTED, because the ring's correctness depends on
+/// there being exactly one and that was previously only asserted in a comment.
+static TX_PRODUCER_COLLISIONS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TX_PRODUCER_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Bytes discarded because the byte ring stayed full. Genuinely dropped now - the old code wrote them
+/// straight to the FIFO instead, which is worse (see below).
+static TX_DISCARDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Reserve the next slot and store one byte. **Single producer.**
+///
+/// `head` is read, used, then stored back. That is a read-modify-write with no atomicity, so two cores
+/// inside this function both read the same `head`, both write the same slot, and both store `head + 1`:
+/// one byte overwrites the other and the stream is corrupted at an arbitrary character position -
+/// `kernel: supervisor died` arriving as `kernel: supervisor dieds`, or `min 2 us` as `min 2 u` with
+/// somebody else's line spliced in after the `u`.
+///
+/// The comment that used to sit here said the single-producer property was "serialised by the same
+/// best-effort serial flag that already orders every write to this UART". That flag is BOUNDED and a
+/// writer that times out proceeds anyway - so it never provided the property this code depends on, and
+/// the claim was the bug rather than the justification. It is true now for a different reason: at
+/// runtime the ring drainer is the only caller, and before SMP there is only one core.
+///
+/// `TX_PRODUCER_COLLISIONS` measures that rather than trusting it. It is reported with the other loss
+/// counters, so "the assumption holds" is a zero in the log instead of a sentence in a comment.
 fn tx_push(b: u8) -> bool {
+    let reentered = TX_PRODUCER_ACTIVE.swap(true, Ordering::Acquire);
+    if reentered { TX_PRODUCER_COLLISIONS.fetch_add(1, Ordering::Relaxed); }
+
     let head = TX_HEAD.load(Ordering::Relaxed);
     let tail = TX_TAIL.load(Ordering::Acquire);
-    if head.wrapping_sub(tail) as usize >= TX_RING_LEN {
-        return false;
-    }
-    // SAFETY: single logical producer region, serialised by the same best-effort serial flag that
-    // already orders every write to this UART. The index is masked into the array, so the write is
-    // always in bounds.
-    unsafe {
-        let p = core::ptr::addr_of_mut!(TX_RING) as *mut u8;
-        p.add((head as usize) & (TX_RING_LEN - 1)).write_volatile(b);
-    }
-    TX_HEAD.store(head.wrapping_add(1), Ordering::Release);
-    true
+    let ok = if head.wrapping_sub(tail) as usize >= TX_RING_LEN {
+        false
+    } else {
+        // SAFETY: single producer (measured by the collision counter above). The index is masked into
+        // the array, so the write is always in bounds.
+        unsafe {
+            let p = core::ptr::addr_of_mut!(TX_RING) as *mut u8;
+            p.add((head as usize) & (TX_RING_LEN - 1)).write_volatile(b);
+        }
+        TX_HEAD.store(head.wrapping_add(1), Ordering::Release);
+        true
+    };
+
+    if !reentered { TX_PRODUCER_ACTIVE.store(false, Ordering::Release); }
+    ok
 }
 
 /// Push as many queued bytes into the TX FIFO as it will take WITHOUT WAITING. Called from the timer
@@ -165,8 +200,13 @@ pub fn tx_ring_flush_blocking() {
 }
 
 /// Bytes lost to a full ring, for reporting.
+///
+/// Reads `TX_DISCARDED`, the counter the ring-full path actually increments. It used to read
+/// `TX_DROPPED`, which nothing incremented after the out-of-order fallback was removed - a statistic
+/// that would have read a confident zero forever while bytes were genuinely being lost. A counter
+/// nothing feeds is worse than no counter, because it looks like evidence.
 pub fn tx_dropped() -> u32 {
-    TX_DROPPED.load(Ordering::Relaxed)
+    TX_DISCARDED.load(Ordering::Relaxed)
 }
 const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
 /// Error flags the PL011 returns **in the data register itself**, alongside the byte: framing (8),
@@ -679,17 +719,33 @@ pub(super) fn pl011_write_byte(b: u8) {
             // stops the moment the TX FIFO is full, the FIFO is 16 bytes, and the tick is 100 Hz -
             // so one FIFO-load per tick, against a line that carries 11.5 KB/s. Under storm-volume
             // logging the ring filled, every writer fell back to the blocking path, and the machine
-            // went silent for ~15 s while the backlog trickled out. The ring made sustained output
-            // SEVEN TIMES SLOWER than the blocking writes it replaced.
+            // went silent for ~15 s while the backlog trickled out.
             //
             // This still never waits: it pushes only while the FIFO reports room and returns the
-            // instant it does not. The writer therefore keeps the hardware fed at its own pace
-            // without ever blocking on it, and the tick drain remains as the path that empties the
-            // ring when nobody is writing.
+            // instant it does not.
             tx_ring_drain();
             return;
         }
-        TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        // RING FULL. Make room by draining, then retry - and if it is STILL full, DISCARD the byte.
+        //
+        // What this replaces was the last stream-corrupting path on this UART, and it needed no second
+        // core to do it: the old code wrote the byte straight to PL011_DR while other bytes were still
+        // queued in the ring, so that byte JUMPED AHEAD of everything waiting and landed in the middle
+        // of whatever the tick drained next. A message could therefore interleave with ITSELF. Which is
+        // why `kernel: supervisor died` - one kprintln, one write, one producer - still came out as
+        // `kernel: supervisor dieds` after every writer above this layer had been made line-atomic.
+        //
+        // It is the same rule as `serial_emit`, one layer down: a writer that cannot get into the ring
+        // does not write. Order is the property the whole path exists to preserve, and a byte written
+        // out of order destroys a line just as thoroughly as a second writer does - it just does it
+        // without needing one. A discarded byte is counted and reported; an out-of-order byte is
+        // silent corruption (§26.7).
+        for _ in 0..TX_MAKE_ROOM_TRIES {
+            tx_ring_drain();
+            if tx_push(b) { return; }
+        }
+        TX_DISCARDED.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
     // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
@@ -734,64 +790,105 @@ pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomi
 /// covers any line this console writes.
 const SERIAL_ACQUIRE_US: u32 = 40_000;
 
-/// Write to the serial console WITHOUT mirroring to the TV. Used when a full-screen app owns the
-/// display (`console_write_bytes_gated(.., false)`): the bytes still reach serial, which is the source
-/// of truth and where a captured log comes from, but they do not paint over the app's screen.
+/// Write a whole message to the UART in order, waiting for the hardware rather than discarding.
+/// **Only the line-ring drainer calls this**, and that is what makes waiting correct here.
 ///
-/// Deliberately lock-free with respect to `SERIAL_BUSY`: it takes no lock and renders nothing, so it
-/// cannot corrupt the floor's shared cursor state - the hazard the lock exists to prevent. Interleaving on
-/// the serial line itself is the same risk any contended writer already has.
-pub(super) fn pl011_write_no_fb(s: &[u8]) {
-    for &b in s { pl011_write_byte(b); }
+/// The byte ring exists so an ORDINARY writer never waits on a 115200 line. That is still right, and
+/// it is why every runtime writer queues into the line ring and returns. But the drainer is not an
+/// ordinary writer: it is the single agent whose whole job is to put bytes on the wire, and there is
+/// nothing behind it to starve. Making IT discard was the mistake - it turned "the wire is slower than
+/// we are talking" into corrupted output, because a byte dropped from the middle of a line leaves a
+/// line that reads exactly like a spliced one.
+///
+/// The previous run measured that precisely: 0 lines dropped, 0 bypassed, 0 producer collisions - the
+/// whole structure above held - and ~95 BYTES discarded per drain, forty-nine times. The bytes were
+/// coming out of the middles of lines.
+///
+/// So the granularity of loss has to match the granularity of meaning. A LINE may be dropped, loudly
+/// and counted, because a missing line is visibly missing. Part of a line may not, because a line with
+/// a hole in it still looks like a line and lies to whoever reads it. §26.7: loud failure over silent
+/// corruption.
+///
+/// Waiting is bounded twice over: the FIFO poll gives up rather than hanging on a wedged UART, and the
+/// drainer writes at most `SERIAL_DRAIN_BUDGET` lines before handing on.
+fn pl011_write_blocking(s: &[u8]) {
+    // Order first: anything already queued by the boot path or a panic must reach the wire before this
+    // message, or writing directly here would be the very queue-jump this fixes.
+    for _ in 0..TX_MAKE_ROOM_TRIES { tx_ring_drain(); }
+    // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers in the Device-mapped
+    // peripheral window. Volatile MMIO: poll until the TX FIFO has room, then write one byte.
+    unsafe {
+        for &b in s {
+            // Bounded: a wedged or absent UART with a permanently full TX FIFO must never hang the
+            // output path (invariant 12 / §26.6). On a healthy UART the FIFO drains far faster.
+            let mut t: u32 = 0;
+            while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+                t += 1;
+                if t > 1_000_000 { break; } // give up on this byte rather than hang forever
+            }
+            PL011_DR.write_volatile(b as u32);
+        }
+    }
 }
 
-pub(super) fn pl011_write(s: &[u8]) {
-    use core::sync::atomic::Ordering;
-    // Pre-SMP (or the boot core alone): no contention, and LDREX/STREX are unsafe before the MMU is on.
-    // Write lock-free.
+/// Put a message on the wire NOW, under the claim, whole. The bottom of the stack: everything else
+/// either queues into the line ring or ends up here.
+///
+/// The claim is BOUNDED and a writer that times out writes anyway - which is the right trade for a
+/// path that must never deadlock, and also the reason this cannot be the whole answer. A bounded claim
+/// does not guarantee exclusivity; it guarantees progress. Two rounds of measurement on hardware said
+/// so plainly: adding the line ring left the splice rate at 0.36%, and adding the claim to the runtime
+/// path left it at 0.41%. Whoever times out writes into the middle of whoever holds it.
+///
+/// So exclusivity comes from having ONE writer at runtime - the ring's drainer - not from a lock that
+/// everyone politely waits on. This function is what that one writer calls, plus the fallbacks that
+/// genuinely cannot queue.
+pub(super) fn pl011_write_raw(s: &[u8], fb: bool) {
     if !SERIAL_SMP.load(Ordering::Relaxed) {
+        // Boot keeps the queueing byte path: there is one core, so nothing can interleave, and the
+        // ring is what stops early output from waiting on the wire a byte at a time.
         for &b in s { pl011_write_byte(b); }
         // Mirror to the TV once the console is up (no-op before that). `mirror` tests a plain
         // `AtomicBool` BEFORE any exclusive access, which is load-bearing on this path: the first boot
-        // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon (see the
-        // note just above). A `mirror` that locked or CAS'd here hangs the Pi on the firmware's rainbow
-        // splash with no serial output at all - and QEMU, being permissive, does not reproduce it.
-        bootcon::mirror(s);
+        // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon. A `mirror`
+        // that locked or CAS'd here hangs the Pi on the firmware's rainbow splash with no serial output
+        // at all - and QEMU, being permissive, does not reproduce it.
+        if fb { bootcon::mirror(s); }
         return;
     }
-    // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
-    // guarantee the local monitor is cleared on exception entry/return, so a task that took an
-    // interrupt (or an SVC) mid-`ldrex`/`strex` sequence can leave the monitor "exclusive" to a foreign
-    // address - making EVERY subsequent `strex` here fail spuriously and forever (the shell's second
-    // console echo wedged exactly this way). An explicit `clrex` resets it so the acquire can succeed.
-    // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
-    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
-    // SMP is live: serialize across cores. Try to claim the UART (bounded), write, then release only if
-    // we claimed it - a fault-time / heavily-contended write is never lost or deadlocked.
-    let mut held = false;
-    let start = timer::systimer_us();
-    loop {
-        if SERIAL_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            held = true;
-            break;
-        }
-        // Give up waiting and write lock-free rather than block forever (never deadlock).
-        if timer::systimer_us().wrapping_sub(start) > SERIAL_ACQUIRE_US { break; }
-        core::hint::spin_loop();
-    }
-    for &b in s {
-        pl011_write_byte(b);
-    }
-    // Mirror to the TV ONLY as the lock HOLDER. The floor has shared cursor/scroll state and
-    // assumes a single writer at a time; a contended writer that could NOT claim SERIAL_BUSY (another core
-    // logging, or an ISR preempting the holder mid-render) must not also render, or two writers corrupt
-    // its position and the TV shows garbled/overlapping text. The contended write's bytes still went to
-    // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
-    // because the dominant console writer (the shell) holds the lock for its own output.
-    if held {
-        bootcon::mirror(s);
-        SERIAL_BUSY.store(false, Ordering::Release);
-    }
+    let held = claim_serial();
+    pl011_write_blocking(s);
+    // Mirror ONLY as the claim HOLDER. The boot floor has shared cursor/scroll state and assumes a
+    // single writer; a contended writer that could not claim must not also render, or two writers
+    // corrupt its position and the TV shows overlapping text. Its bytes still reached serial above,
+    // which is the source of truth.
+    if fb && held { bootcon::mirror(s); }
+    release_serial(held);
+}
+
+/// Kernel and console output, mirrored to the display. QUEUED at runtime.
+///
+/// Every caller of this - and there are 186 of them across `arch/arm/` - used to write the wire
+/// directly under a bounded claim, which is how a message got cut in half by a core that had waited
+/// 40 ms and given up. Now they hand the message to the ring and return, and one drainer puts it on
+/// the wire whole.
+///
+/// WHAT THIS STILL DOES NOT FIX, said plainly rather than discovered later: a message ASSEMBLED from
+/// several calls is several ring entries, and another core's line can land between them.
+/// `exceptions.rs` builds its fault report from about ten `pl011_write` fragments, so that report can
+/// still interleave. Those sites want to become one `kprintln!` each; this change is what makes that
+/// worth doing, because until now a single write was not atomic either.
+pub(super) fn pl011_write(s: &[u8]) {
+    if !SERIAL_SMP.load(Ordering::Relaxed) { pl011_write_raw(s, true); return; }
+    serial_emit(s, true);
+}
+
+/// Write to the serial console WITHOUT mirroring to the TV. Used when a full-screen app owns the
+/// display (`console_write_bytes_gated(.., false)`): the bytes still reach serial, which is the source
+/// of truth and where a captured log comes from, but they do not paint over the app's screen.
+pub(super) fn pl011_write_no_fb(s: &[u8]) {
+    if !SERIAL_SMP.load(Ordering::Relaxed) { pl011_write_raw(s, false); return; }
+    serial_emit(s, false);
 }
 
 /// Rust side of boot. Milestone 1: prove the toolchain, the load address, the HYP drop, and the UART
@@ -861,6 +958,10 @@ extern "C" fn arm_boot_main() -> ! {
         bootcon::init(fb.base, fb.pitch, fb.width, fb.height);
         pl011_write(b"arm32: framebuffer console up - this line should appear on the TV\r\n");
     }
+    // Which image, which machine (see `crate::banner`). OUTSIDE the framebuffer check on purpose: a
+    // headless Pi is exactly the case whose log is read over the serial cable. This port does not
+    // reach `kernel_main`, so the call is here rather than there.
+    crate::banner();
     // Route the SD-card pins to the Arasan EMMC (and report what the firmware left them as). After
     // `mmu::enable` because it touches the Device-mapped peripheral window, unlike the mailbox calls
     // above which must run caches-off.
@@ -986,7 +1087,7 @@ pub fn ap_init(_core_id: u32) {}
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Switch to a new stack top - `sp` on ARM. `#[inline(always)]` for the same reason as x86: the
 /// caller's frame must not outlive the switch.
@@ -1248,12 +1349,356 @@ pub fn gpio_op(op: u32, pin: u32) -> i64 {
     }
 }
 
+/// Claim the UART for one whole message, bounded. `true` if the claim was taken (and must be
+/// released); `false` if it timed out, in which case write anyway - interleaving beats deadlock, and
+/// beats silence.
+///
+/// Factored out of `pl011_write`, which had this inline. The line ring's drainer needs the SAME claim,
+/// and that is the fix to a bug in the ring's first version: it wrote through `pl011_write_no_fb`,
+/// which by design takes no claim, so the drainer put a whole line onto the wire a BYTE at a time with
+/// nothing stopping another core interleaving into it. The line ring made writers hand over whole
+/// lines and then handed them to a byte-level path that shredded them anyway - which is why the first
+/// version measured a splice rate identical to no ring at all (0.36% before, 0.36% after).
+fn claim_serial() -> bool {
+    // ARMv7 does NOT guarantee the local exclusive monitor is cleared on exception entry/return, so a
+    // core that took an interrupt mid-`ldrex`/`strex` can leave it reserved to a foreign address and
+    // every later `strex` here fails - forever. Same `clrex` `pl011_write` already does, for the same
+    // reason, on the same silicon.
+    // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
+    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
+    let start = timer::systimer_us();
+    loop {
+        if SERIAL_BUSY
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        if timer::systimer_us().wrapping_sub(start) > SERIAL_ACQUIRE_US { return false; }
+        core::hint::spin_loop();
+    }
+}
+
+/// Release a claim taken by `claim_serial`. A no-op when the claim timed out, so the caller can pass
+/// the flag straight back without branching.
+fn release_serial(held: bool) {
+    if held { SERIAL_BUSY.store(false, Ordering::Release); }
+}
+
+// ---------------------------------------------------------------------------
+// LINE-ATOMIC SERIAL OUTPUT.
+//
+// Four cores wrote this UART a BYTE at a time with nothing serialising a line, so lines shredded each
+// other: `rvisor' spawned OK on ctask: 'time' spawned OKdwc2-svc: =7 'shell' freed 161 frames` is one
+// real line from one real run, carrying fragments of three messages and the whole of none.
+//
+// That is not cosmetic. A spliced line matches no pattern, so it is invisible to any count made over
+// the log - and counting task spawns against task kills is how a duplicate-instance bug is found. It
+// produced three wrong readings of the same Pi 2 run in a row, and one of them was reported as fact
+// before the arithmetic gave it away (52 spawns, 52 kills, and a filesystem demonstrably working
+// afterwards - so at least one spawn line had been destroyed outright). An instrument that silently
+// deletes evidence is worse than no instrument, because its output still looks like data.
+//
+// WHY THE EXISTING MACHINERY DID NOT COVER THIS, both parts of it:
+//
+//   - `SERIAL_BUSY` (the bounded claim in `pl011_write`) is only taken while `BOOT_LOG_TO_FB` is set,
+//     which stops at the shell's first prompt. Every runtime log line after that goes through
+//     `pl011_write_no_fb`, which by design takes no claim at all. So the lock existed and the traffic
+//     that splices never went near it.
+//   - `TX_RING` (the byte ring under `pl011_write_byte`) stops a writer WAITING on the FIFO, which is
+//     a different problem and a real fix. It cannot help here: two cores pushing bytes into it
+//     interleave in the ring exactly as they interleaved on the wire.
+//
+// This is the aarch64 design (`arch/aarch64/mod.rs`), ported, including the three attempts recorded
+// there that came before it: spinning for the claim cost 104-second boots; a bounded spin still
+// spliced at 10 ms and made chaos rounds 6x slower at 150 ms - waiting is never worth it, because an
+// interleaving core at least makes progress; and routing EVERY writer through the ring, early boot
+// included, hung the machine before its first line. So the ring serves the RUNTIME writers only, and
+// `pl011_write`'s pre-SMP path is left exactly as it is, because that is the code that boots.
+// ---------------------------------------------------------------------------
+
+/// Longest line the ring will take. Matches `log::SERIAL_STAGE`, the largest single flush the neutral
+/// log produces; anything longer goes straight to the wire rather than being truncated.
+const SERIAL_LINE_MAX: usize = 512;
+
+/// Lines the ring holds. 48 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
+///
+/// Sized from a measurement, not a guess. At 24 the hardware reported 44 lines dropped across a
+/// three-minute chaos run - and dropped them in three BURSTS of 5, 12 and 27, not at a steady rate.
+/// That distinction is the whole justification: a sustained overflow means the wire is simply slower
+/// than the system talks and a deeper ring only postpones the loss, while a bursty one means the ring
+/// is too small to ride out a storm the wire could otherwise catch up with. Three discrete reports in
+/// three minutes is the second case, and 27 is the burst to survive.
+///
+/// 96 cleared that burst and the run came back with zero lines lost. Then the name-directory trace
+/// added about 1,100 lines to a three-minute run and the bursts grew with it - 30, 31 and 26 lines
+/// beyond capacity - so 256 now, for 128 KiB of `.bss` on a board with a gigabyte.
+///
+/// Sizing the ring to the traffic is the right lever here and filtering the traffic is not, which is
+/// worth saying because the cheaper fix is obvious and wrong. Deciding which names are worth tracing
+/// is a judgement about what matters, and a judgement is policy (§26.10) - it does not belong in the
+/// kernel, and a diagnostic that quietly omits the case nobody predicted is how the last week went.
+///
+/// It does NOT make loss impossible, and is not meant to: a full ring still drops a whole line and
+/// still says so. What it buys is a log that is complete through a chaos run, which is the difference
+/// between a name's history being evidence and being a sequence that might be missing a step.
+const SERIAL_RING_LINES: usize = 256;
+
+/// Lines one core puts on the wire before letting another take over.
+///
+/// A WRITER BECOMES THE DRAINER, so this is work conscripted from whoever happened to log next. At a
+/// full ring over two passes that would be 48 lines - roughly a third of a second of wire time at
+/// 115200 - and a core vanishing for 340 ms to do everyone else's logging is not bounded behaviour in
+/// any useful sense (§26.6); it is the same "one core pays for everyone" shape that made the spin
+/// design unusable, relocated. Four is enough to keep the wire busy: the next writer picks up where
+/// this one stopped, and under any load worth draining there is always a next writer.
+const SERIAL_DRAIN_BUDGET: usize = 4;
+
+struct SerialRing {
+    buf: [[u8; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
+    len: [u16; SERIAL_RING_LINES],
+    /// Does this line belong on the TV as well as the wire? Carried PER LINE because the two runtime
+    /// writers disagree: kernel log output stops mirroring at the shell's first prompt, and console
+    /// output is gated on whether a full-screen app owns the display. The drainer must not have to
+    /// guess, and must not answer from whatever the flags happen to say by the time it runs.
+    fb:  [bool; SERIAL_RING_LINES],
+    head: usize,
+    count: usize,
+    /// Lines lost to a full ring. REPORTED on the next drain, never silently discarded (invariant 12).
+    dropped: u32,
+}
+
+impl SerialRing {
+    const fn new() -> Self {
+        SerialRing {
+            buf: [[0; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
+            len: [0; SERIAL_RING_LINES],
+            fb:  [false; SERIAL_RING_LINES],
+            head: 0,
+            count: 0,
+            dropped: 0,
+        }
+    }
+}
+
+/// The queue.
+///
+/// **Every acquisition is `try_lock`, never `lock`.** This path is reachable from ordinary code, from
+/// interrupt handlers, and from the panic path, and it must not be able to spin or to touch interrupt
+/// state. A failed try writes straight to the wire instead - so a same-core ISR that logs while the
+/// task it interrupted holds the lock DEGRADES to an interleaved line rather than deadlocking, and no
+/// caller can ever be parked here. The hold is a memcpy, so a failed try is rare.
+static SERIAL_RING: crate::smp::SpinLock<SerialRing> = crate::smp::SpinLock::new(SerialRing::new());
+
+/// Set while a core is putting queued lines on the wire. Not a lock anyone waits on: a core that finds
+/// it taken has already handed its line over and simply returns.
+static SERIAL_DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Once a panic starts the ring is bypassed entirely: a machine that is stopping may never drain a
+/// queue, and the last thing it says is the thing worth saying.
+static SERIAL_PANIC_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Stop queueing; write straight to the wire from here on. Called before the panic's first line.
+pub fn serial_enter_panic_mode() {
+    SERIAL_PANIC_MODE.store(true, Ordering::Release);
+}
+
+/// Straight onto the wire, whole. `fb` also mirrors to the display, which needs the `SERIAL_BUSY`
+/// claim because the boot floor has shared cursor state and assumes one writer at a time.
+fn serial_write_direct(s: &[u8], fb: bool) {
+    // The RAW bottom, never `pl011_write`: those queue now, and a fallback that queued would recurse
+    // straight back into the ring it is the fallback for.
+    pl011_write_raw(s, fb);
+}
+
+/// How long a writer will wait to get INTO the ring. Microseconds, not milliseconds - the hold is a
+/// memcpy of at most 512 bytes, which is about a microsecond on this core. This is nothing like the
+/// 40 ms `SERIAL_ACQUIRE_US` wire claim; that one waits for the UART, this one waits for a memcpy.
+const RING_ACQUIRE_US: u32 = 250;
+
+/// Messages that never reached the ring, and so were never written at all. REPORTED, never silent.
+static SERIAL_BYPASSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Hand one whole message to the ring. At runtime this NEVER writes the wire itself.
+///
+/// **THE RULE: a writer that cannot get into the ring does not write.** It is counted and the message
+/// is dropped.
+///
+/// That is the correction two hardware runs forced. Every earlier version had a "write it anyway"
+/// fallback on each failure path, which guarantees progress and destroys the only property that
+/// matters here. A bounded claim is not mutual exclusion: whoever times out writes into the middle of
+/// whoever holds it. The measurements were flat because of it - the line ring left the splice rate at
+/// 0.36%, adding a claim to the runtime path left it at 0.41%, and the log then named the mechanism
+/// directly: `kernel: supervisor died` is ONE `kprintln!`, one write, and it appears 92 times whole
+/// and twice cut in half. A single write cannot be cut by fragmentation. It can only be cut by a
+/// second writer, which is exactly what "write it anyway" creates.
+///
+/// This is also how Linux draws the line, and for the same reason. `printk` formats a record into a
+/// per-CPU buffer and commits it to the ring whole or not at all; consoles are drained by ONE owner
+/// (`console_lock`, or `nbcon`'s explicit ownership handover in 6.7+, which exists precisely because
+/// a spin cannot work in NMI). Linux will happily LOSE a record to ring overwrite. What it will not do
+/// is let a second agent write the device. The borrowed thing is that ordering of priorities, not any
+/// of its machinery (§26.14).
+///
+/// A dropped line is honest and counted. A spliced line is corruption that takes its neighbours with
+/// it - it destroyed three separate readings of the same run, and one was reported as fact before the
+/// arithmetic caught it. §26.7 ranks these: loud failure beats silent corruption.
+fn serial_emit(s: &[u8], fb: bool) {
+    // A halting machine may never drain a queue, so the last thing it says goes straight out. Splices
+    // are a fair price for output that exists.
+    if SERIAL_PANIC_MODE.load(Ordering::Acquire) {
+        serial_write_direct(s, fb);
+        return;
+    }
+    // Before SMP there is exactly one writer, so direct IS single-writer. The exclusive monitor the
+    // ring's lock needs is also UNPREDICTABLE with the MMU off on this silicon - routing early boot
+    // through the ring hung the aarch64 port before its first line, which cost a boot to learn.
+    if !SERIAL_SMP.load(Ordering::Relaxed) {
+        serial_write_direct(s, fb);
+        return;
+    }
+
+    // Wait BRIEFLY for the ring - the holder is doing a memcpy, not talking to hardware.
+    // SAFETY: `clrex` clears the local exclusive monitor before the lock's compare-exchange; ARMv7
+    // does not clear it on exception entry/return, so a core interrupted mid-`ldrex`/`strex` would
+    // otherwise fail every later `strex` on this path forever.
+    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
+    let start = timer::systimer_us();
+    loop {
+        if let Some(mut r) = SERIAL_RING.try_lock() {
+            if r.count == SERIAL_RING_LINES {
+                // The system is talking faster than 115200 can carry. Counted and reported on the next
+                // drain rather than pretending the line was written.
+                r.dropped = r.dropped.saturating_add(1);
+            } else {
+                let idx = (r.head + r.count) % SERIAL_RING_LINES;
+                // TRUNCATED, not bypassed. An over-long message loses its tail and says so; the old
+                // code wrote it directly, which is the second writer this function exists to forbid.
+                let n = if s.len() > SERIAL_LINE_MAX { SERIAL_LINE_MAX } else { s.len() };
+                r.buf[idx][..n].copy_from_slice(&s[..n]);
+                r.len[idx] = n as u16;
+                r.fb[idx]  = fb;
+                r.count += 1;
+            }
+            break;
+        }
+        if timer::systimer_us().wrapping_sub(start) > RING_ACQUIRE_US {
+            // Never written. Counted instead - see the rule above.
+            SERIAL_BYPASSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    serial_drain();
+}
+
+/// Render the loss report into a caller-supplied buffer. Bounded, on the stack, no heap (§26.6.1);
+/// written by hand rather than through `log_fmt` because this runs INSIDE the drainer and must not
+/// re-enter the log path it is reporting on.
+fn fmt_lost(buf: &mut [u8], dropped: u32, bypassed: u32, discarded: u32, collisions: u32) -> usize {
+    let mut n = 0usize;
+    n = fmt_bytes(buf, n, b"serial: ");
+    n = fmt_u32(buf, n, dropped);
+    n = fmt_bytes(buf, n, b" line(s) dropped, ");
+    n = fmt_u32(buf, n, bypassed);
+    n = fmt_bytes(buf, n, b" bypassed, ");
+    n = fmt_u32(buf, n, discarded);
+    n = fmt_bytes(buf, n, b" byte(s) discarded, ");
+    n = fmt_u32(buf, n, collisions);
+    n = fmt_bytes(buf, n, b" producer collision(s) - the log is INCOMPLETE by that much");
+    n = fmt_bytes(buf, n, &[13, 10]);
+    n
+}
+
+/// Append, stopping at the buffer's end rather than panicking on it.
+fn fmt_bytes(buf: &mut [u8], mut n: usize, src: &[u8]) -> usize {
+    for &b in src { if n < buf.len() { buf[n] = b; n += 1; } }
+    n
+}
+
+/// Decimal, no padding.
+fn fmt_u32(buf: &mut [u8], mut n: usize, v: u32) -> usize {
+    if v == 0 { if n < buf.len() { buf[n] = b'0'; n += 1; } return n; }
+    let mut d = [0u8; 10];
+    let mut i = 0;
+    let mut v = v;
+    while v > 0 { d[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+    while i > 0 { i -= 1; if n < buf.len() { buf[n] = d[i]; n += 1; } }
+    n
+}
+
+/// Put queued lines on the wire. At most one core at a time; the rest have handed their line over.
+fn serial_drain() {
+    // Two passes: the second closes the window where a line is queued between the last pop and the
+    // release, which would otherwise sit until some later write happened to drain it.
+    for _ in 0..2 {
+        if SERIAL_DRAINING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // someone else has the wire; our line is queued and they will write it
+        }
+
+        let mut line = [0u8; SERIAL_LINE_MAX];
+        let mut lost = 0u32;
+        let mut wrote = 0usize;
+        while wrote < SERIAL_DRAIN_BUDGET {
+            let (n, fb) = match SERIAL_RING.try_lock() {
+                None => break, // contended; leave the rest for the next writer
+                Some(mut r) => {
+                    if r.dropped > 0 {
+                        lost = lost.saturating_add(r.dropped);
+                        r.dropped = 0;
+                    }
+                    if r.count == 0 { break; }
+                    let idx = r.head;
+                    let n = r.len[idx] as usize;
+                    line[..n].copy_from_slice(&r.buf[idx][..n]);
+                    let fb = r.fb[idx];
+                    r.head = (r.head + 1) % SERIAL_RING_LINES;
+                    r.count -= 1;
+                    (n, fb)
+                }
+            };
+            // ONE CLAIM PER LINE, not one across the pass. A line is the unit that has to be atomic,
+            // and holding the claim across four framebuffer renders is the aarch64 port's recorded
+            // failure #1 - the render is far more expensive than the wire write it is protecting.
+            pl011_write_raw(&line[..n], fb);
+            wrote += 1;
+        }
+
+        // BOTH numbers, in band. A run whose log is being used as evidence needs to say how much of
+        // itself is missing - "0 dropped, 0 bypassed" is what makes a count over the log trustworthy,
+        // and any other figure says exactly how far to trust it.
+        let bypassed = SERIAL_BYPASSED.swap(0, Ordering::Relaxed);
+        let discarded = TX_DISCARDED.swap(0, Ordering::Relaxed);
+        let collisions = TX_PRODUCER_COLLISIONS.swap(0, Ordering::Relaxed);
+        if lost > 0 || bypassed > 0 || discarded > 0 || collisions > 0 {
+            let mut note = [0u8; 96];
+            let n = fmt_lost(&mut note, lost, bypassed, discarded, collisions);
+            pl011_write_raw(&note[..n], false);
+        }
+
+        SERIAL_DRAINING.store(false, Ordering::Release);
+
+        let pending = match SERIAL_RING.try_lock() {
+            Some(r) => r.count > 0,
+            None => false,
+        };
+        if !pending { return; }
+    }
+}
+
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
     // Kernel log output. Mirrored to the TV only while booting: afterwards the display belongs to the
     // shell, and a log line landing mid-prompt is what made the prompt look absent.
-    if BOOT_LOG_TO_FB.load(Ordering::Acquire) { pl011_write(s); } else { pl011_write_no_fb(s); }
+    // QUEUED, so the line reaches the wire WHOLE. Four cores logging concurrently used to shred each
+    // other's lines byte by byte - and this is the path that did it, because `pl011_write_no_fb` takes
+    // no claim by design. The fb destination is decided HERE and carried with the line: by the time
+    // the drainer runs, `BOOT_LOG_TO_FB` may say something different.
+    serial_emit(s, BOOT_LOG_TO_FB.load(Ordering::Acquire));
 }
 /// The shell's console output. `to_fb` is the CONSOLE FOREGROUND gate: false means a full-screen app
 /// owns the display, so this text belongs on the serial console only and must NOT reach the TV.
@@ -1268,10 +1713,11 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     // the console is unclaimed), which is the same predicate the gate uses.
     if to_fb {
         CONSOLE_FG_RENEWED_US.store(timer::systimer_us(), Ordering::Relaxed);
-        pl011_write(s);
-    } else {
-        pl011_write_no_fb(s);
     }
+    // Same ring as the kernel log, which is the point: the two writers that used to interleave now
+    // take turns a whole line at a time. Renewing the claim stays HERE rather than in the drainer -
+    // it is the writer that did the drawing, and the lease is about the writer, not the wire.
+    serial_emit(s, to_fb);
 }
 pub fn set_console_echo(on: bool) {}
 
@@ -1859,6 +2305,25 @@ pub mod syscall_entry {
         Some(unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len) })
     }
 
+    /// Copy `len` bytes from a USER range into kernel memory, bounded to ONE PAGE per call.
+    ///
+    /// The ELF loader uses this to move a service image out of the supervisor's address space a page at
+    /// a time, so the kernel never holds more than a page of an untrusted image at once (26.6 - the
+    /// bound is visible here rather than left to the caller's discipline). `read_user_bytes` cannot do
+    /// this: it is capped at one message and lands in a shared per-core scratch slot.
+    ///
+    /// Returns false if the range is not valid user memory or `len` exceeds a page.
+    pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool {
+        if len == 0 { return true; }
+        if len > crate::arch::imp::page_tables::PAGE_SIZE { return false; }
+        if !validate_user_ptr(src, len) { return false; }
+        if !user_range_accessible(src, len, false) { return false; }
+        // SAFETY: range-checked user VA, probed mapped-readable at PL0; the kernel shares the
+        // service page table while handling the syscall, so `src` is addressable and cannot fault.
+        unsafe { core::ptr::copy_nonoverlapping(src as usize as *const u8, dst, len); }
+        true
+    }
+
     /// Write `src` to user VA `dst`, after range-checking AND confirming every page is user-writable.
     /// Returns false if the range escapes user space or is not fully mapped writable.
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
@@ -1874,7 +2339,85 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// No unlocked-fault-write counter on this arch: the x86 fault handlers are the ones that bypass the
+/// serial lock (audits/kernel-audit.md Audit 10). Reports 0 rather than pretending to measure
+/// something - a zero it HAS earned, because nothing here writes unlocked.
+///
+/// Lives at the ARCH TOP LEVEL, not inside `mod pci`, because `syscall::dispatch` reaches it as
+/// `crate::arch::imp::serial_unlocked_emit_count` - which is where x86 defines it too.
+/// THE PI 2 HAS NO PCI AT ALL - no port I/O, and no root complex either; its peripherals hang off a
+/// memory-mapped bus and are reached through an MMIO grant. So this is not "unimplemented", it is
+/// absent by construction: the gated `PciCfgRead` syscall exists on every arch for one dispatch
+/// table, and on this one it can only REFUSE - which the caller is told, rather than being handed a
+/// plausible zero it would read as an empty bus.
+///
+/// Safe, and performs no I/O - there is none to perform.
+pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+
+/// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
+///
+/// **A log has to say which MACHINE it came from.** The boot banner reports the ARCH, and an arch name
+/// is not a board: this project runs two ARM boards whose behaviour has already diverged in ways that
+/// mattered (one has PCIe and an SMMU-less DMA posture, the other has no PCI at all), and reading a
+/// serial log while having to ASK which produced it is how a fact about one board becomes a claim
+/// about the port.
+///
+/// `MIDR` carries the implementer in bits [31:24] and the part number in [15:4]. Only the parts this
+/// project actually runs on are named; anything else prints its raw ids rather than a guess, because a
+/// wrong name is worse than a number a reader can look up.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let midr: u64;
+    // SAFETY: reading MIDR is a side-effect-free system-register read, available at this exception level.
+    unsafe { { let v: u32; core::arch::asm!("mrc p15, 0, {}, c0, c0, 0", out(reg) v, options(nomem, nostack)); midr = v as u64; } };
+    let implementer = ((midr >> 24) & 0xFF) as u32;
+    let part        = ((midr >> 4) & 0xFFF) as u32;
+
+    let name: &[u8] = match (implementer, part) {
+        (0x41, 0xD08) => b"ARM Cortex-A72",       // Raspberry Pi 4 (BCM2711)
+        (0x41, 0xC07) => b"ARM Cortex-A7",        // Raspberry Pi 2 (BCM2836)
+        (0x41, 0xD03) => b"ARM Cortex-A53",
+        (0x41, 0xD0B) => b"ARM Cortex-A76",
+        (0x42, _)     => b"Broadcom",
+        (0x41, _)     => b"ARM",
+        _             => b"",
+    };
+
+    let mut n = 0usize;
+    for &b in name { if n < buf.len() { buf[n] = b; n += 1; } }
+    // Always append the raw ids. A named part still benefits from them (two boards can share a core),
+    // and an unnamed one has nothing else to go on.
+    for &b in b" (impl 0x" { if n < buf.len() { buf[n] = b; n += 1; } }
+    n = push_hex(buf, n, implementer);
+    for &b in b" part 0x" { if n < buf.len() { buf[n] = b; n += 1; } }
+    n = push_hex(buf, n, part);
+    if n < buf.len() { buf[n] = b')'; n += 1; }
+    n
+}
+
+/// Lower-case hex, no padding - enough for the two small ids above.
+fn push_hex(buf: &mut [u8], mut n: usize, v: u32) -> usize {
+    let mut started = false;
+    for shift in (0..8).rev() {
+        let nib = ((v >> (shift * 4)) & 0xF) as u8;
+        if nib == 0 && !started && shift != 0 { continue; }
+        started = true;
+        let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        if n < buf.len() { buf[n] = c; n += 1; }
+    }
+    n
+}
+
+
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
 pub mod interrupts {
+    /// The MSI vector pool is x86-only (`arch/x86_64/interrupts.rs`, step D1b). Neither Pi has one:
+    /// a pool hands vectors to devices found on a PCI bus, and there is no PCI bus here to find them
+    /// on - `pci::find_by_class` returns `None`, so `task::pci_msi_vector` returns before it ever
+    /// consults these. LEN 0 states that plainly ("the pool holds nothing") rather than naming a
+    /// range of vectors this arch does not route.
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
 
@@ -2039,28 +2582,52 @@ pub mod rtc {
 }
 
 // ---------------------------------------------------------------------------
+/// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
+/// See the x86 original for why this is not a second source for `pci::nic()`.
+pub fn soc_nic_present() -> bool { false }
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
-    pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
-    pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
+    /// treat it as "this machine has no PCI ethernet controller", which is true.
+    pub fn ehci() -> Option<PciDevice> { None }
+    pub fn xhci() -> Option<PciDevice> { None }
+    pub fn nic() -> Option<PciDevice> { None }
+    pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
+
+    // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
+    /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
+    /// ARM32 HAS NO PCI AT ALL - the DWC2 is soldered to the BCM283x and there is no bus to walk.
+    /// So this is not "unimplemented", it is EMPTY BY CONSTRUCTION: no class code can ever match,
+    /// and every driver on this port names a non-PCI kind (`HwClass::Dwc2`). One slot, because the
+    /// array it sizes must exist and nothing will ever fill it.
+    pub const MAX_DEVICES: usize = 1;
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}
     pub fn set_power_d0(bdf: u32) {}
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
     pub fn program_xhci_msi() -> bool { false }
     pub fn program_ehci_msi() -> bool { false }
     pub fn route_ehci_intx() {}

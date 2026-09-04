@@ -12,7 +12,516 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapHandle};
+use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
+use godspeed_sdk::service_context::DeadlineOutcomeInto;
+use godspeed_sdk::service_context::supcmd;
+
+// ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
+// victim, and a second copy of these parameters would be a second truth (Commandment III).
+
+
+// ---------------------------------------------------------------------------------------------
+// The operator command channel (step C).
+//
+// The supervisor's endpoint now receives TWO kinds of message, told apart by the first byte:
+//
+//   death notice   "pong"                        <- kernel-generated; a service name, [a-z0-9-]
+//   command        0x01 'R' <core u32 LE> "pong" <- 0x01 cannot begin a name, so this is unambiguous
+//
+// Why a command channel exists at all: `control` used to do `kill` then `spawn` ITSELF, asking the
+// KERNEL to spawn by name. That only ever worked because the kernel held every service image. Once
+// an image lives here, only this service can respawn it - which is what 14.4 always said
+// (`supervisor.restart(name, placement_override)`); the code was going around it.
+// See `docs/service-ownership.md`.
+// ---------------------------------------------------------------------------------------------
+
+/// Restart: kill if alive, then spawn. `core` of `u32::MAX` means "re-evaluate placement" (9.2).
+
+/// Spawn: start a service that is not running. Same reason as RESTART - once an image lives here,
+/// the kernel has no row to spawn it from, so the shell's `spawn` must come through this channel.
+
+
+/// Reply status. One byte, so a caller can log the truth rather than assume success.
+
+
+
+
+/// Handle a command and answer it. Returns false if this was not a command at all.
+///
+/// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
+/// must never block the supervisor, which is the one service everything else depends on, and a
+/// retained return address burns a cap-table slot per request (the `logger` leak, §26.6).
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
+    if payload.first() != Some(&supcmd::MARKER) { return false; }
+
+    // The new service's endpoint cap, when the spawn produced one - returned to the caller below.
+    let mut spawned_cap: Option<CapHandle> = None;
+    let status = if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
+        let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        match core::str::from_utf8(&payload[6..]) {
+            // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
+            // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
+            // it is a spawn whose producer is given its downstream as a peer, which is precisely what
+            // the kernel's own `spawn_service_pipe` does.
+            Ok(spec) if !spec.is_empty() => {
+                let mut it = spec.split('\0');
+                let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
+                let mut peers: [&str; 6] = [""; 6];
+                let mut np = 0usize;
+                for pr in it { if !pr.is_empty() && np < peers.len() { peers[np] = pr; np += 1; } }
+                let restart = payload[1] == supcmd::RESTART;
+                ctx.log_fmt(format_args!("supervisor: {} {} core={}",
+                    if restart { "RESTART" } else { "SPAWN" },
+                    name, if core == u32::MAX { -1i64 } else { core as i64 }));
+                // RESTART kills first; a kill that finds nothing is NOT an error here, because
+                // restarting a service that already died is exactly the case the harness drives.
+                // SPAWN does not kill - starting something already running must fail, not replace it.
+                if restart { let _ = ctx.kill(name); }
+                let ok = if let Some(r) = probes::row(name) {
+                    // A TEST PROBE, asked for by a probe respawning its own victim. Its parameters
+                    // come from the shared table here rather than off the wire - the caller sends a
+                    // name, not a configuration, so a probe cannot ask to be something it is not.
+                    spawn_probe_row(ctx, r).is_ok()
+                } else if np > 0 {
+                    // Peers supplied. INSTALL them from the name-cap map where we have caps, rather
+                    // than name-wiring: a provided cap is what makes the child use a CAPABILITY
+                    // rather than resolve a name, which is the property Phase 0b exists to prove and
+                    // the shape every wired service already gets at boot.
+                    //
+                    // `spawn_wired` falls back to a name-wired spawn for any peer we have no cap for,
+                    // so a pipe whose downstream is not in the map still works.
+                    let mut have_caps = false;
+                    for p in &peers[..np] { if map.get(p).is_some() { have_caps = true; } }
+                    if have_caps {
+                        let ok = spawn_wired(ctx, map, name, &peers[..np]);
+                        if ok { spawned_cap = map.get(name).map(CapHandle); }
+                        ok
+                    } else {
+                        match spawn_by_image(ctx, name, core, &peers[..np], &[]) {
+                            Some(Ok(c))  => { spawned_cap = c; true }
+                            Some(Err(_)) => false,
+                            None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
+                        }
+                    }
+                } else if core == u32::MAX {
+                    // (the wired/mapped paths record the cap in the name map; read it back below)
+                    // No core given: the WIRED respawn, so a service with peers (fs -> block-driver)
+                    // gets them provided rather than only name-wired.
+                    respawn_retry(ctx, map, name)
+                } else {
+                    spawn_mapped(ctx, map, name, core)
+                };
+                if ok {
+                    // For the kernel-catalogue paths the cap was recorded in the name map by
+                    // `spawn_mapped`; read it back so every successful spawn answers the same way.
+                    if spawned_cap.is_none() { spawned_cap = map.get(name).map(CapHandle); }
+                    supcmd::OK
+                } else { supcmd::FAILED }
+            }
+            _ => supcmd::UNKNOWN,
+        }
+    } else {
+        supcmd::UNKNOWN
+    };
+
+    // The reply carries a SEND|GRANT cap to the new service, when there is one.
+    //
+    // This is FORCED by the capability rules, not a convenience. `spawn_with_caps` TRANSFERS a cap
+    // into a child, and a transfer requires GRANT (8.5); only a service's SPAWNER is handed
+    // SEND|GRANT to it, `acquire_send_cap` yields SEND alone, and rights never widen (7.3). So once
+    // the supervisor owns an image, NOTHING else can ever obtain a grantable cap to that service
+    // unless the supervisor hands one back. It owns what it spawns, so it is the right principal to
+    // delegate access to it.
+    //
+    // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
+    // dependents later). If the send fails the derived copy is reclaimed - an orphaned cap is a
+    // table slot leaked per request (26.6).
+    if let Some(reply_cap) = ctx.take_pending_cap() {
+        let msg = Message::from_bytes(&[status]);
+        let sent = match spawned_cap.and_then(|c| ctx.derive_cap(c)) {
+            Some(granted) => {
+                let r = ctx.send_with_cap_by_handle(reply_cap, granted, &msg);
+                if r.is_err() { ctx.remove_cap(granted); }
+                r.is_ok()
+            }
+            None => false,
+        };
+        // No cap to send, or sending it failed: still ANSWER, so the caller is never left waiting
+        // on a reply that is not coming (invariant 12). It gets the status alone.
+        if !sent { let _ = ctx.try_send_by_handle(reply_cap, &msg); }
+        ctx.remove_cap(reply_cap);
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------------------------
+// Images the SUPERVISOR carries (step C, docs/service-ownership.md)
+//
+// One entry today. Every service that moves here leaves a `service_config` row in the kernel, and
+// the `service_configs` pin shrinks by one - the pin is the score.
+//
+// The dispatch is in `spawn_by_image`, which every spawn path consults FIRST. That matters more than
+// it looks: a service the supervisor carries must be spawnable AND RESTARTABLE through this path,
+// because the kernel no longer has a row to spawn it from. Moving an image without routing the
+// restart is what broke identity 6A/6B/10A/10B the first time.
+// ---------------------------------------------------------------------------------------------
+
+/// The images carried here rather than by the kernel. Each one deleted a `service_config` row.
+static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
+static PING_ELF: &[u8] = include_bytes!(env!("SVC_PING_ELF"));
+static ASKER_ELF: &[u8] = include_bytes!(env!("SVC_ASKER_ELF"));
+static RESOURCE_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_RESOURCE_SERVER_ELF"));
+static CHAOS_ELF: &[u8] = include_bytes!(env!("SVC_CHAOS_ELF"));
+static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
+/// ONE binary, three names. `observe`, `observe-now` and `observe-live` are the same program - the
+/// NAME selects the mode, exactly as the kernel's three rows did (all three were
+/// `include_bytes!(env!("SVC_OBSERVE_ELF"))`). Worth stating, because a reader seeing three IMAGES
+/// rows would otherwise expect three crates.
+static OBSERVE_ELF: &[u8] = include_bytes!(env!("SVC_OBSERVE_ELF"));
+static GREET_ELF: &[u8] = include_bytes!(env!("SVC_GREET_ELF"));
+static COUNTER_ELF: &[u8] = include_bytes!(env!("SVC_COUNTER_ELF"));
+static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
+static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
+static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
+static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
+static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
+/// Hardware discovery in userspace (step D2). Where configuration space is reachable: x86 via the
+/// CF8/CFC ports, aarch64 via the Pi 4's memory-mapped INDEX/DATA window. Not arm32 - the Pi 2 has
+/// no PCI bus at all, so the service would have nothing to read.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
+static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
+static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
+static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
+static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
+static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
+static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
+
+static CONSOLE_ELF: &[u8] = include_bytes!(env!("SVC_CONSOLE_ELF"));
+static NIC_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_NIC_DRIVER_ELF"));
+// The USB host drivers exist only where their controller does (see `build.rs`, which embeds exactly
+// these): xhci+ehci on a PC, dwc2 on the Pi 2, xhci on the Pi 4.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
+#[cfg(target_arch = "x86_64")]
+static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
+#[cfg(target_arch = "arm")]
+static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
+
+/// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
+/// every service whose image the supervisor holds.
+///
+/// `hw class` names the DEVICE a driver drives (`hwclass::*`); the kernel resolves it to what its own
+/// bus scan found. A class rather than an address, because the kernel keeps a permanent physical DMA
+/// reservation per device that a respawned driver must be given back.
+///
+/// `mode` is the `probe_mode` selector. Named for probes, its first user, but general - `observe`,
+/// `observe-now` and `observe-live` are ONE binary that reads it to choose one-shot / live /
+/// foreground. Leaving it at 0 made `observe-now` run the LIVE LOOP: 100% CPU, flooding the console
+/// until the shell blocked on a send.
+///
+/// It carries everything the service's CONTRACT declares, deliberately. The contract is the source of
+/// truth (Commandment III) and `scripts/contract_check.py` reconciles it against wherever the config
+/// actually lives - so a service moving out of the kernel must not lose a field on the way, or the
+/// move would quietly weaken the check that keeps the two honest.
+///
+/// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
+const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
+    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0, 0),
+    // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
+    // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
+    // config space at all - that would be write access to every BAR and command register of every
+    // device on the bus, and there is no narrower form of it to grant, because the target is chosen
+    // by data rather than by the interface.
+    //
+    // (An earlier version of this comment described a WRITE to 0xCF8 plus a READ of 0xCFC as two
+    // separate operations. That was the first design, and it was replaced: the pair is stateful, so
+    // split across two syscalls two callers read each other's device - and the KERNEL drives the same
+    // registers on its spawn and kill paths, so a split interface raced the kernel too.)
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
+    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
+    ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
+    // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
+    // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
+    ("resource-server", RESOURCE_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["holder"],
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
+    // Four privileges, all delegated by the supervisor from its GRANT-only caps. `chaos` also needs
+    // CONSOLE_READ ('q' to abort a storm), which is a spawn FLAG rather than a privilege bit.
+    ("chaos", CHAOS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
+                       | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
+     8 * 1024 * 1024, 0, &["supervisor"],
+     godspeed_sdk::service_context::privbits::SPAWN
+     | godspeed_sdk::service_context::privbits::INTROSPECT
+     | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
+     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY, 0, 0),
+    // The COM2 operator channel. FIRE_IRQ is the one privilege only this service holds.
+    ("control", CONTROL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, u32::MAX, &["supervisor"],
+     godspeed_sdk::service_context::privbits::SPAWN
+     | godspeed_sdk::service_context::privbits::INTROSPECT
+     | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
+     | godspeed_sdk::service_context::privbits::FIRE_IRQ, 0, 0),
+    ("observe", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
+    ("observe-now", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 1, 0),
+    ("observe-live", OBSERVE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE, 8 * 1024 * 1024, 0, &[],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 2, 0),
+    // `greet` declares `pong` as a peer so the supervisor INSTALLS pong's cap from its name-cap map
+    // (spawn_wired), which is what `spawnwired` proves: the child reaches pong through a capability
+    // it was handed, not by resolving a name.
+    ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0, 0),
+    ("counter", COUNTER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
+    // The user's interface. GPIO and SET_CLOCK_FLOOR are ARM-only in effect but the bits are
+    // arch-neutral: the kernel refuses any the supervisor cannot delegate, and on x86 the underlying
+    // grant is simply never used. SET_CLOCK_FLOOR is the NARROW right (raise the clock floor), not
+    // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter.
+    ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
+                       | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "logger", "supervisor"],
+     godspeed_sdk::service_context::privbits::SPAWN
+     | godspeed_sdk::service_context::privbits::INTROSPECT
+     | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
+     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY
+     | godspeed_sdk::service_context::privbits::REBOOT
+     | godspeed_sdk::service_context::privbits::GPIO
+     | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
+    ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "logger"],
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
+    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 1 }, &["nic-driver", "time"],
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT
+     | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
+    // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
+    // and no IRQ line, which is why it is the right one to prove the path on.
+    // block-driver reaches the disk THROUGH A USB HOST-CONTROLLER SERVICE on both ARM targets:
+    // `xhci` on aarch64, `dwc2` on arm32. On x86 it drives AHCI directly and needs NO such peer.
+    //
+    // ALL THREE ARMS MATTER, and this row is why. Moving it out of the kernel flattened a
+    // three-way `#[cfg]` into a bare `&["xhci"]`, which is right only on aarch64. The Pi 2 then had
+    // a send cap to a service that does not exist there and none to `dwc2`, so
+    // `request_with_reply("dwc2", ..)` found no send slot and returned None INSTANTLY: 0 sectors, no
+    // disk, `ls` broken - while dwc2 had the stick enumerated and BOUND the whole time. The comment
+    // deleted along with the cfg had predicted precisely that ("every layer healthy in isolation,
+    // and the missing piece the edge between them"), which is the argument for carrying a warning
+    // WITH the thing it warns about.
+    ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
+     if cfg!(target_arch = "arm") { 2 } else { 1 },
+     if cfg!(target_arch = "arm") { &["dwc2"] } else if cfg!(target_arch = "aarch64") { &["xhci"] } else { &[] },
+     0, 0,
+     // NAMED BY THE BUS, not by the kernel (step D1). 0x010601 is the industry-standard PCI class
+     // code for an AHCI SATA controller - class 0x01 mass storage, subclass 0x06 SATA, prog-if 0x01
+     // AHCI - and BAR 5 is where the AHCI spec puts its registers (`ABAR`). The kernel holds no
+     // name for either fact: it looks the code up in the table its boot scan filled, and takes the
+     // BAR at the index this row gives.
+     //
+     // FIRST driver on the generic path, chosen because it is the strictest test available: it
+     // needs a NON-ZERO BAR INDEX (the bug the boot cross-check caught), a DMA arena, a PCI BDF for
+     // bus-master enable, and it already takes no interrupt - so nothing is lost while generic
+     // vector allocation is still outstanding. `files` (222 tests) exercises the whole path.
+     godspeed_sdk::service_context::hwclass::pci(0x01_06_01, 5, false)),
+    // The terminal (docs/console-service.md 9). Its "hardware" is the DISPLAY: the kernel maps the
+    // framebuffer into it and describes the PIXEL geometry only - character geometry belongs to the
+    // terminal, which is this service. Same class mechanism as a driver's BAR, and for the same
+    // reason: the supervisor may not name a physical address.
+    //
+    // Core 3 on ARM (not 0) is deliberate and hardware-earned: a full-screen repaint is millions of
+    // non-cacheable pixel stores in one un-preemptible stretch, and sharing a core with dwc2's
+    // 125 us split-transaction windows produced NYET storms and a six-second keyboard stall.
+    ("console", CONSOLE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 3 } else { 0 }, &[], 0, 0,
+     godspeed_sdk::service_context::hwclass::FRAMEBUFFER),
+    // The four INTERRUPT-DRIVEN drivers. None of them names a vector: the kernel derives it from the
+    // device class (`hw_irqs_for`), because routing a vector IS authority - on ARM, granting the USB
+    // vector is exactly what takes the controller away from whoever held it.
+    //
+    // CONSOLE_PUSH is what makes a USB keyboard a keyboard. Its absence was once the whole of "the
+    // keyboard does not work": correct transfers, valid HID reports, every push rejected. It also puts
+    // these drivers inside the SHELL'S trust perimeter, because keystrokes are commands (SEC-2) - so
+    // it is granted deliberately, and REBOOT is deliberately NOT.
+    //
+    // Cores 2 and 3: both USB drivers busy-poll their controllers at ~100% CPU, and co-locating them
+    // on core 1 saturated it - starving networking and garbling the keyboard itself on the T630.
+    // NET_DEVICE is aarch64-only in effect: the Pi 4's GENET sits behind the NetFrame syscalls, while
+    // arm32 reaches frames through the `dwc2` service over IPC. The bit is arch-neutral - the kernel
+    // refuses any privilege the supervisor cannot delegate - so it is set where it is used and the
+    // grant is simply never exercised elsewhere.
+    ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 1, if cfg!(target_arch = "arm") { &["dwc2"] } else { &[] },
+     if cfg!(target_arch = "aarch64") { godspeed_sdk::service_context::privbits::NET_DEVICE } else { 0 }, 0,
+     // x86: named by the bus. 0x020000 is class 0x02 network, subclass 0x00 ethernet - the class
+     // EVERY PCI ethernet controller reports, whoever made it.
+     //
+     // This is the case that shows what class-code addressing is FOR. `HwClass::Nic` granted MMIO
+     // only to two hard-coded vendor/device IDs (Intel 8086:100E and Realtek 10EC:8168), so a third
+     // NIC needed a KERNEL REBUILD to be driven at all - the exact thing step D exists to end. By
+     // the class, any ethernet controller is addressable and the kernel needs to know none of them.
+     //
+     // `BAR_AUTO` rather than an index, because the two supported NICs already disagree: the e1000
+     // puts its registers in BAR0 while the RTL8168 puts I/O ports there and its registers in BAR2.
+     // "The first mapped memory BAR" is what the old scan did and what both need.
+     //
+     // ARM keeps the kind: the NIC is not on a PCI bus on either Pi (LAN9514 over USB on the Pi 2,
+     // GENET on the Pi 4), so there is no class code to name and no table to find it in.
+     if cfg!(target_arch = "x86_64") {
+         godspeed_sdk::service_context::hwclass::pci(
+             0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
+     } else { godspeed_sdk::service_context::hwclass::NIC }),
+    ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
+    ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+];
+
+/// The USB host drivers, which exist only where their controller does - so the TABLE is per arch,
+/// rather than one table with rows that would name an image this build never embedded. Same split as
+/// `build.rs` and `scripts/service_embed_check.py`, and it must stay in step with both.
+#[cfg(target_arch = "x86_64")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 2, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     // Named by the bus, WITH an interrupt (step D1b). 0x0C0330 is the industry-standard class code
+     // for an xHCI USB controller - class 0x0C serial bus, subclass 0x03 USB, prog-if 0x30 xHCI -
+     // and its registers are in BAR0. `pci_irq` asks the kernel for a vector from its MSI pool; the
+     // caller never names one, because routing a vector is authority.
+     //
+     // This is the strictest driver to move: it is the only one that is IOMMU-CONFINED, it needs the
+     // largest DMA arena (292 pages for the 256-buffer scratchpad), and §22 Test 12 checks the whole
+     // chain end to end - confined to its arena, out-of-arena unmapped, and a keyboard actually
+     // enumerated THROUGH the confined domain.
+     godspeed_sdk::service_context::hwclass::pci_irq(0x0C_03_30, 0, true)),
+    ("ehci", EHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 3, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::EHCI),
+];
+#[cfg(target_arch = "aarch64")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 2, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::XHCI),
+];
+/// arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why `nic-driver`
+/// and `block-driver` both name it as a peer on that port.
+#[cfg(target_arch = "arm")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("dwc2", DWC2_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 0, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::DWC2),
+];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm")))]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[];
+
+/// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
+/// kernel catalogue", which is how the two coexist while services move across one at a time.
+fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
+                  installs: &[(&str, CapHandle)])
+    -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
+{
+    let &(_, image, flags, mem, table_core, table_peers, privs, mode, hw) =
+        IMAGES.iter().chain(USB_IMAGES.iter()).find(|(n, ..)| *n == name)?;
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(image, name);
+    // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
+    // preference, which is what the contract declares. The DIFFERENCE between those two is carried
+    // explicitly: an override is STRICT (reject if that core is not ready), a preference FALLS BACK
+    // to round-robin. Sending the preference as an override is what made `logger` and `xhci` fail to
+    // spawn at all on a 2-core machine instead of landing on another core.
+    let caller_chose = !(core == 0xFFFF || core == u32::MAX);
+    req.core         = if caller_chose { core } else { table_core };
+    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 };
+    req.memory_limit = mem;
+    // Privileges the supervisor asks the child be given. The kernel refuses any bit the SUPERVISOR
+    // does not itself hold, so this passes authority on rather than minting it.
+    req.privileges   = privs;
+    req.probe_mode   = mode;
+    req.hw_flags     = hw;
+    // WHICH device this class means, when the reporter told us (step D3). An identifier, not an
+    // address: the kernel reads that device's registers to learn its BAR and IRQ, so this grants
+    // nothing naming the class would not - it only removes the kernel's need to GUESS which device a
+    // class refers to. Zero when unknown, which is the pre-D3 behaviour exactly.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        req.bdf = if hw & godspeed_sdk::service_context::hwclass::PCI != 0 {
+            ask_bdf_for_class(ctx, hw & 0x00FF_FFFF)
+        } else { 0 };
+    }
+    // The DMA arena a PCI driver needs, in 4 KiB pages. A SIZE, not an address - the kernel still
+    // decides WHERE the arena lives; this says only how big. Zero for a register-only driver.
+    //
+    // Kept beside the table rather than as a tenth column: it applies to the handful of rows that
+    // name a PCI class code, and widening every row to carry a field that is 0 for twenty of them
+    // would be noise. Folds into the row if that stops being true.
+    req.dma_pages    = match name {
+        // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
+        "block-driver" => 16,
+        // 32 rings + a 256-buffer scratchpad + 4 - the size `XHCI_DMA_PAGES` held in the kernel.
+        "xhci" => 32 + 256 + 4,
+        // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
+        "nic-driver" => 16,
+        _ => 0,
+    };
+    // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
+    let use_peers = if peers.is_empty() { table_peers } else { peers };
+    // Caller-provided peer caps, when there are any. The kernel checks each holds GRANT, so passing
+    // them is non-escalating (7.3) - the supervisor could transfer them outright.
+    let mut ibuf = [0u8; 256];
+    if !installs.is_empty() && !req.set_installs(&mut ibuf, installs) { return Some(Err(godspeed_sdk::Error::InvalidArgument)); }
+    let mut buf = [0u8; 128];
+    Some(ctx.spawn_image(&mut req, &mut buf, use_peers))
+}
+
+#[path = "../../probe/src/table.rs"]
+mod probes;
+
+/// The test-probe image - 193 test modes in one binary (docs/probe-params-design.md).
+///
+/// NOT PRESENT IN A BARE-METAL BUILD, and that is the point of it living here rather than in the
+/// kernel. It used to be `include_bytes!` in `kernel/src/task/mod.rs` with no cfg at all, so every
+/// shipped kernel carried ~105 KiB of adversary - code that deliberately page-faults, hogs cores and
+/// brute-forces cap slots - reachable at runtime by any SPAWN holder, on a machine that has no test
+/// harness to run it. §4.4 says the kernel holds no developer tooling; this is how that becomes true
+/// rather than aspirational.
+#[cfg(not(feature = "bare-metal"))]
+static PROBE_ELF: &[u8] = include_bytes!(env!("SVC_PROBE_ELF"));
+
+/// Start one probe from its table row. The supervisor holds the image, so it spawns directly.
+///
+/// Everything that used to be keyed by NAME inside the kernel now travels in the request: the mode,
+/// the memory limit, the core, the peers, the PRIVILEGES (`probes::privileges_of`), the test-IRQ
+/// class (`hw_class_of`) and the grantable-peers flag (`peers_grant_of`). The kernel refuses any
+/// privilege the supervisor cannot itself delegate, so this passes authority on rather than minting.
+#[cfg(not(feature = "bare-metal"))]
+pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godspeed_sdk::Error> {
+    let (name, mode, recv, mem_mib, core, peers) = r;
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(PROBE_ELF, name);
+    req.flags = if recv { godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV } else { 0 };
+    if probes::peers_grant_of(name) { req.flags |= godspeed_sdk::service_context::SPAWN_FLAG_PEERS_GRANT; }
+    // A probe's core is a PREFERENCE, as a catalogue row's was: a machine with fewer cores must still
+    // run the suite rather than lose the probes that name a core it lacks.
+    req.core         = core.unwrap_or(u32::MAX);
+    req.memory_limit = if mem_mib == 0 { 64 * 1024 * 1024 } else { (mem_mib as u64) * 1024 * 1024 };
+    req.privileges   = probes::privileges_of(name);
+    req.probe_mode   = mode;
+    req.hw_flags     = probes::hw_class_of(name);
+    let mut buf = [0u8; 128];
+    ctx.spawn_image(&mut req, &mut buf, peers).map(|_| ())
+}
+
+/// Bare-metal carries no probe image, so there is nothing to start. Loud rather than silent: a probe
+/// that quietly did not run reads as a passing suite (invariant 12).
+#[cfg(feature = "bare-metal")]
+pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godspeed_sdk::Error> {
+    ctx.log_fmt(format_args!("supervisor: no probe image in a bare-metal build - '{}' not spawned", r.0));
+    Err(godspeed_sdk::Error::InvalidArgument)
+}
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 1 of moving naming out of the kernel (docs/naming-design.md).
@@ -21,8 +530,9 @@ use godspeed_sdk::{ServiceContext, CapHandle};
 // SEND|GRANT endpoint cap the kernel hands back from `spawn_returning_endpoint` (syscall 38,
 // Phase 0a). This proves the supervisor can hold a cap to everything it starts - the future
 // name authority. It is a SHADOW map for now: nothing reads it to wire dependents yet (that is
-// Phase 0b/3). Scoped to the real services; the 178 test probes are test infra (out of scope)
-// and keep using plain `ctx.spawn`.
+// Phase 0b/3). Scoped to the real services; the 193 test probes are test infra (out of scope)
+// and are spawned with their parameters from `probes.rs` - the table that used to be 193 rows of
+// the kernel service catalogue (docs/probe-params-design.md).
 // ───────────────────────────────────────────────────────────────────────────────
 const NAME_MAP_MAX:      usize = 16;  // bounded (§26.6) - real services, not the test probes
 const NAME_MAP_NAME_MAX: usize = 16;
@@ -93,11 +603,31 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
     if n == 0 {
         return spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide - plain name-wired spawn
     }
+    // A supervisor-held image goes down SpawnImage, carrying the same provided caps. Without this
+    // a wired service could not move at all: `fs` is spawned with `block-driver`'s cap PROVIDED
+    // rather than name-resolved, and the kernel has no row to spawn it from once its image is here.
+    if let Some(r) = spawn_by_image(ctx, name, 0xFFFF, &[], &installs[..n]) {
+        return match r {
+            Ok(Some(cap)) => {
+                record_name(ctx, map, name, cap);
+                ctx.log_fmt(format_args!(
+                    "supervisor: {} wired from the name-cap map ({} peer(s) provided; image supplied here)", name, n));
+                true
+            }
+            Ok(None) => true,
+            Err(_) => {
+                // Same recovery as the kernel path below: a provided cap went stale because its peer
+                // respawned, so retry fully name-wired rather than leaving the service dead.
+                ctx.log_fmt(format_args!(
+                    "supervisor: {} cached peer cap stale (peer restarted) - name-wiring instead", name));
+                spawn_mapped(ctx, map, name, 0xFFFF)
+            }
+        };
+    }
     match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
         Ok(Some(cap)) => {
-            // Free the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
-            if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
-            let _ = map.record(name, cap.0);
+            // Frees the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
+            record_name_quiet(ctx, map, name, cap);
             ctx.log_fmt(format_args!(
                 "supervisor: {} wired from the name-cap map ({} peer(s) provided; rest name-wired)", name, n));
             true
@@ -116,23 +646,161 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
     }
 }
 
+/// Record `name -> cap` in the map, replacing any previous entry, and REPORT the outcome.
+///
+/// Every path that records a name goes through here. Three call sites had grown their own copy of
+/// this, and they had already drifted: two logged the recording and one did not (so 22 Test 11's
+/// assertion depended on WHICH path ran), and two discarded `record`'s return value entirely - a full
+/// map would drop the name with nobody told, which is the silent failure invariant 12 forbids.
+///
+/// The line is the observable for a real property: the name is re-recorded, so the kernel directory
+/// resolves the NEW instance after a restart.
+fn record_name(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) {
+    if record_name_quiet(ctx, map, name, cap) {
+        ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
+    }
+}
+
+/// `record_name` for callers that announce the recording THEMSELVES (an adopt, a wired spawn), so the
+/// map operation stays silent on success and the caller's own line is the only one. Returns whether
+/// the name was recorded.
+///
+/// A FULL map is still reported HERE rather than left to the caller, because every one of these sites
+/// used to discard this and then print "adopted running X" - a line that was not true if the record
+/// had just been dropped. Announcing the outcome is optional; hiding a failure is not (invariant 12).
+fn record_name_quiet(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) -> bool {
+    if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
+    if map.record(name, cap.0) { return true; }
+    ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
+    false
+}
+
 /// Spawn `name` on `core` (0xFFFF = round-robin) AND record its endpoint cap in `map` (Phase 1).
 /// The spawn itself is identical to `ctx.spawn` - the new syscall just also hands back a cap.
 /// Returns true if the service spawned with an endpoint cap (used by the restart loop).
 fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
-    match ctx.spawn_returning_endpoint(name, core) {
-        Some(cap) => {
-            // On a restart, free the dead instance's cap before recording the new one, so a
-            // kill-storm can't leak the supervisor's cap table (the map already updates in place).
-            if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
-            if map.record(name, cap.0) {
-                ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
-            } else {
-                ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
+    // A supervisor-held image goes down the SpawnImage path; the kernel has no row for it.
+    if let Some(r) = spawn_by_image(ctx, name, core, &[], &[]) {
+        return match r {
+            Ok(Some(cap)) => { record_name(ctx, map, name, cap); true }
+            Ok(None) => true,            // spawned; no endpoint to record
+            Err(e) => {
+                ctx.log_fmt(format_args!("supervisor: spawn '{}' from image FAILED ({:?})", name, e));
+                false
             }
+        };
+    }
+    match ctx.spawn_returning_endpoint(name, core) {
+        Ok(Some(cap)) => {
+            // On a restart the dead instance's cap is freed before the new one is recorded, so a
+            // kill-storm can't leak the supervisor's cap table (`record_name` does both).
+            record_name(ctx, map, name, cap);
             true
         }
-        None => { ctx.log_fmt(format_args!("supervisor: spawn {} returned no endpoint cap", name)); false }
+        // SPAWNED, and this service simply has no recv endpoint (`mem-pressure`, `greet`, `roster`).
+        // That is a SUCCESS with nothing to record - not a failure. Reading it as one is what made
+        // `chaos spawn-storm` report the task-pool ceiling hit at spawn #1.
+        Ok(None) => true,
+        Err(()) => { ctx.log_fmt(format_args!("supervisor: spawn {} FAILED", name)); false }
+    }
+}
+
+/// Ask `hw-enumerator` which device carries this class code. Zero means "no answer" - the kernel
+/// then resolves the class against its own scan, exactly as before D3.
+///
+/// **ASKED AT SPAWN TIME, NOT CACHED, and that is deliberate.** A cached table would be a SNAPSHOT,
+/// and the thing it describes changes: `hw-enumerator` restarts like any service, and a driver
+/// respawned after it must get the bus as it is NOW rather than as it was at boot. "Assignment once,
+/// re-read always" is the rule the rest of D is built on, and a cache here would break it in the one
+/// place it matters most - the restart path.
+///
+/// It also owns no state, which is what a service may not do casually: an earlier version of this kept
+/// a `static mut` table of what the reporter said, which is `unsafe` in a service (§18.2, mechanically
+/// forbidden) and unowned global mutable state (§3.9, Commandment VI). Both, in one helper, to avoid
+/// one IPC round trip per driver spawn. The checker refused it, correctly.
+///
+/// Best effort: any failure returns 0 and the machine boots exactly as it did before.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
+    const OP_BY_CLASS: u8 = 3;
+    const ANSWER_SECS: i64 = 2;
+    let c = class_code.to_le_bytes();
+    let mut buf = [0u8; 16];
+    match ctx.request_with_reply_deadline_outcome_into(
+        "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
+    {
+        DeadlineOutcomeInto::Reply(n) if n >= 4 =>
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        _ => 0,
+    }
+}
+
+/// Ask `hw-enumerator` for its device list and log what came back.
+///
+/// BEST EFFORT, AND IT MUST STAY THAT WAY. Boot does not depend on the answer, so every failure path
+/// here logs and returns rather than retrying into a hang - a supervisor that blocks on a reporter is
+/// a supervisor that cannot spawn the services the machine actually needs.
+///
+/// The peer cap comes from `reacquire_by_name`, NOT from the handle `ensure_mapped` already holds.
+/// `acquire_send_grant_cap` returns a handle without recording it in the SDK's send-cap cache, and
+/// `request_with_reply` resolves peers through that cache - so a request made on the strength of the
+/// map's handle finds no slot and fails INSTANTLY rather than talking to anyone. That exact trap cost
+/// a silent `0 sectors` from `dwc2` once already; the comment above `RECOVERY` records it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn probe_hw_enumerator(ctx: &ServiceContext) {
+    const OP_COUNT: u8 = 1;
+    const OP_DEVICE: u8 = 2;
+    const ANSWER_SECS: i64 = 2;
+    /// Devices to read back. The reporter's own table is 32; this is the log's bound, not its.
+    const MAX_REPORT: u32 = 32;
+
+    if !ctx.reacquire_by_name("hw-enumerator") {
+        ctx.log("supervisor: hw-enumerator not reachable by name - skipping the device probe");
+        return;
+    }
+
+    let mut buf = [0u8; 64];
+    let n = match ctx.request_with_reply_deadline_outcome_into(
+        "hw-enumerator", &[OP_COUNT], &mut buf, ANSWER_SECS)
+    {
+        DeadlineOutcomeInto::Reply(len) if len >= 4 =>
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        DeadlineOutcomeInto::Reply(len) => {
+            ctx.log_fmt(format_args!(
+                "supervisor: hw-enumerator answered the count with {} bytes, wanted 4", len));
+            return;
+        }
+        // Named, not collapsed: the reporter scans the bus at startup, so a probe issued while it is
+        // still walking times out rather than failing to send, and those want different readings.
+        other => {
+            ctx.log_fmt(format_args!(
+                "supervisor: hw-enumerator did not answer the device count ({:?}) - continuing", other));
+            return;
+        }
+    };
+
+    ctx.log_fmt(format_args!(
+        "supervisor: hw-enumerator reports {} device(s) over IPC", n));
+
+    for i in 0..n.min(MAX_REPORT) {
+        match ctx.request_with_reply_deadline_outcome_into(
+            "hw-enumerator", &[OP_DEVICE, i as u8], &mut buf, ANSWER_SECS)
+        {
+            DeadlineOutcomeInto::Reply(len) if len >= 17 => {
+                let bdf = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let class = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let bar0 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                ctx.log_fmt(format_args!(
+                    "supervisor:   {:02x}:{:02x}.{} class {:#08x} bar0 {:#x} irq {}",
+                    (bdf >> 8) & 0xFF, (bdf >> 3) & 0x1F, bdf & 0x7, class, bar0, buf[16]));
+            }
+            other => {
+                ctx.log_fmt(format_args!(
+                    "supervisor: hw-enumerator device {} unreadable ({:?}) - stopping the probe",
+                    i, other));
+                return;
+            }
+        }
     }
 }
 
@@ -145,24 +813,40 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// kernel re-points death notifications to the respawned supervisor via the directory, so after this
 /// reconciliation the restart loop works exactly as on a fresh boot.
 ///
-/// Known v1 limitation: the kernel directory keeps a name even after the service dies, so a service
-/// that died *during* the supervisor's brief (~1 tick) downtime would be adopted as a stale cap
-/// rather than respawned. Narrow race; full liveness-aware reconciliation is a follow-up.
+/// ADOPTION IS GATED ON REAL LIVENESS, and that gate is not optional.
+///
+/// This used to adopt whenever `acquire_send_grant_cap` succeeded - but the kernel directory keeps a
+/// name after its service dies, so that call KEEPS SUCCEEDING for a dead endpoint. A service that died
+/// during the supervisor's own downtime was therefore "adopted" as a dead cap and never respawned, and
+/// the dead cap was recorded in the map and handed to its clients at their spawn. Those clients then
+/// could not send, and could not recover by reacquiring either, because the directory hands out the
+/// same dead entry. Permanent, and only cleared by restarting everything.
+///
+/// It was written down as a "narrow race ... follow-up". It is not narrow under load: one 100-round
+/// `chaos max-carnage` produced 61 block-driver respawns against 57 name records, and the four gaps
+/// took storage down for the rest of the run. `name_alive` is the same `task_stat` discipline
+/// `managed_alive` already uses, and its comment says exactly why a cap-acquire cannot serve here.
 fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
-    if let Some(cap) = ctx.acquire_send_grant_cap(name) {
-        let _ = map.record(name, cap.0);
-        ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
-        return true;
+    if name_alive(ctx, name) {
+        if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+            record_name_quiet(ctx, map, name, cap);
+            ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
+            return true;
+        }
     }
     spawn_mapped(ctx, map, name, core)
 }
 
 /// `ensure_mapped` for a service with peers - adopt if already running, else `spawn_wired`.
 fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) -> bool {
-    if let Some(cap) = ctx.acquire_send_grant_cap(name) {
-        let _ = map.record(name, cap.0);
-        ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
-        return true;
+    // Same liveness gate as `ensure_mapped` - see its header for why a successful cap-acquire is not
+    // evidence the service is alive.
+    if name_alive(ctx, name) {
+        if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+            record_name_quiet(ctx, map, name, cap);
+            ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
+            return true;
+        }
     }
     spawn_wired(ctx, map, name, peers)
 }
@@ -170,7 +854,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 12;
+const MANAGED_N: usize = 13;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -181,7 +865,11 @@ const MANAGED: [&str; MANAGED_N] =
      // listing it costs other ports nothing. It was in the kernel's death-notification set but in no
      // reconcile list at all - so a DROPPED notification left the Pi's storage, keyboard and network
      // down with no backstop to notice.
-     "time", "control", "dwc2"];
+     "time", "control", "dwc2",
+     // Hardware discovery in userspace (step D2). x86-only in practice - the image is embedded only
+     // there - and reconcile skips any name absent from the map, so listing it unconditionally costs
+     // the ARM ports nothing, exactly as `dwc2` above costs x86 nothing.
+     "hw-enumerator"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -320,11 +1008,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
         // rejects, which used to print a misleading "logger spawn failed" on every `kill supervisor`.
         // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
-        let _ = name_map.record("logger", cap.0);
+        record_name_quiet(&ctx, &mut name_map, "logger", cap);
         ctx.log("supervisor: adopted running logger");
-    } else if ctx.spawn("logger").is_err() {
+    } else if !spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) {
+        // Through the image table: the supervisor carries logger's image now, and it does not route
+        // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
+        // nothing. Same shape as pong/ping.
         ctx.log("supervisor: logger spawn failed, retrying");
-        let _ = ctx.spawn("logger");
+        let _ = spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF);
     }
 
     // The terminal (docs/console-service.md §9). Spawned right after the logger and before anything
@@ -333,9 +1024,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
     ctx.log("supervisor: spawning console...");
     if let Some(cap) = ctx.acquire_send_grant_cap("console") {
-        let _ = name_map.record("console", cap.0);
+        record_name_quiet(&ctx, &mut name_map, "console", cap);
         ctx.log("supervisor: adopted running console");
-    } else if ctx.spawn("console").is_err() {
+    } else if !spawn_mapped(&ctx, &mut name_map, "console", 0xFFFF) {
         ctx.log("supervisor: console spawn failed - display stays on the kernel boot floor");
     }
 
@@ -353,12 +1044,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
     {
         ctx.log("supervisor: spawning pong...");
-        if ctx.spawn_on("pong", 1).is_err() {
+        if !spawn_mapped(&ctx, &mut name_map, "pong", 1) {
             ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
-            let _ = ctx.spawn_on("pong", 0);
+            let _ = spawn_mapped(&ctx, &mut name_map, "pong", 0);
         }
+        // Through `spawn_mapped`, like pong: this service's image is carried HERE, so the kernel has
+        // no row to spawn it from. `ctx.spawn_on` would fall back to the kernel path - correctly, since
+        // the supervisor has no supervisor-peer to route through - and find nothing.
         ctx.log("supervisor: spawning ping...");
-        if ctx.spawn_on("ping", 0).is_err() {
+        if !spawn_mapped(&ctx, &mut name_map, "ping", 0) {
             ctx.log("supervisor: WARN: failed to spawn ping");
         }
         ctx.log("supervisor: pong+ping done");
@@ -374,28 +1068,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // --- Probe services (§22 Group A identity tests) ---
         // Recv-endpoint probes must come first so their endpoints are registered
         // before sender probes are spawned (caps are wired at spawn time).
-        let _ = ctx.spawn("probe-recv");    // Test 3A receiver
-        let _ = ctx.spawn("probe-victim");  // Test 4A kill target
-        let _ = ctx.spawn("probe-4b-recv"); // Test 4B kill target
-        let _ = ctx.spawn("probe-3b");      // Test 3B (has recv slot for wrong-right probe)
+        let _ = probes::probe(&ctx, "probe-recv");    // Test 3A receiver
+        let _ = probes::probe(&ctx, "probe-victim");  // Test 4A kill target
+        let _ = probes::probe(&ctx, "probe-4b-recv"); // Test 4B kill target
+        let _ = probes::probe(&ctx, "probe-3b");      // Test 3B (has recv slot for wrong-right probe)
         // Sender / active probes - need SEND caps to the services above.
-        let _ = ctx.spawn("probe-sender");  // Test 3A sender; SEND cap to probe-recv
-        let _ = ctx.spawn("probe-4a");      // Test 4A; SEND cap to probe-victim
-        let _ = ctx.spawn("probe-4b-send"); // Test 4B; SEND cap to probe-4b-recv
+        let _ = probes::probe(&ctx, "probe-sender");  // Test 3A sender; SEND cap to probe-recv
+        let _ = probes::probe(&ctx, "probe-4a");      // Test 4A; SEND cap to probe-victim
+        let _ = probes::probe(&ctx, "probe-4b-send"); // Test 4B; SEND cap to probe-4b-recv
         // Cap-transfer probes (Tests 5A and 5B) - receiver first so its endpoint
         // is registered before the senders' SEND|GRANT caps are wired.
-        let _ = ctx.spawn("probe-5a-recv"); // Test 5A/5B receiver
-        let _ = ctx.spawn("probe-5a-send"); // Test 5A sender (SEND|GRANT cap)
-        let _ = ctx.spawn("probe-5b-send"); // Test 5B negative (SEND-only cap)
+        let _ = probes::probe(&ctx, "probe-5a-recv"); // Test 5A/5B receiver
+        let _ = probes::probe(&ctx, "probe-5a-send"); // Test 5A sender (SEND|GRANT cap)
+        let _ = probes::probe(&ctx, "probe-5b-send"); // Test 5B negative (SEND-only cap)
         // Probes with no send peers.
-        let _ = ctx.spawn("probe-yielder"); // Test 8A
-        let _ = ctx.spawn("probe-hog");     // Test 8B (tight loop; preemption via ping)
-        let _ = ctx.spawn("probe-9b");      // Test 9B
+        let _ = probes::probe(&ctx, "probe-yielder"); // Test 8A
+        let _ = probes::probe(&ctx, "probe-hog");     // Test 8B (tight loop; preemption via ping)
+        let _ = probes::probe(&ctx, "probe-9b");      // Test 9B
         // Memory-limit probes - Tests 7A and 7B.
-        let _ = ctx.spawn("probe-7a");
-        let _ = ctx.spawn("probe-7b");
+        let _ = probes::probe(&ctx, "probe-7a");
+        let _ = probes::probe(&ctx, "probe-7b");
         // Interrupt-routing probe - Test IR1A (§12.2, §12.3).
-        let _ = ctx.spawn("probe-11a");
+        let _ = probes::probe(&ctx, "probe-11a");
     }
 
     // Property, fuzz, stress, perf, adversarial, chaos probes.
@@ -441,6 +1135,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // neither can delay the prompt the way a driver bring-up would.
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
+    // hw-enumerator: hardware discovery in userspace (step D2). Started here because it holds no
+    // device and blocks nothing - it reads PCI config space once, reports, then answers questions.
+    //
+    // x86 ONLY, and the cfg is load-bearing rather than tidiness. ARM has no port I/O address space,
+    // so the image is not embedded there - and asking to spawn a name the kernel has no image for
+    // does NOT quietly do nothing: the kernel embeds an empty placeholder and the spawn fails with
+    // `LoadFailed(TooSmall)`. An earlier version of this line was unconditional with a comment
+    // asserting it was "a no-op on ARM", which was simply untrue; `scripts/service_embed_check.py`
+    // refused the arm build and said so before any board booted.
+    //
+    // Spawned EXPLICITLY rather than left to the MANAGED list, because MANAGED is the watch and
+    // reconcile set - it says what to RESTART, not what to START. A service in MANAGED and nowhere
+    // else is embedded, configured, watched, and never runs; that is the shape the comment above
+    // MANAGED warns about, and this service hit it on its first boot.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    ensure_mapped(&ctx, &mut name_map, "hw-enumerator", 0xFFFF);
+    // ASK IT WHAT IT FOUND. This is the first CLIENT `hw-enumerator` has ever had: its request/reply
+    // loop was written before anything called it, which is the speculative-feature mistake (§26.2),
+    // and dead code cannot be trusted to work when something finally needs it.
+    //
+    // Non-load-bearing on purpose. Nothing here decides anything yet - the kernel still resolves
+    // every driver's device from its own scan. What this buys is the THIRD cross-check the D3
+    // switch-over depends on: the kernel's scan and the userspace walk already print their lists, and
+    // this proves the supervisor can actually OBTAIN that list over IPC, which is the step that has to
+    // work before any of it can be load-bearing. Record, cross-check, and only then switch over.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    probe_hw_enumerator(&ctx);
     // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
     // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a
     // peer that does not exist yet costs them their direct cap and forces a name-wire later.
@@ -459,6 +1180,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // failure being fixed.
     #[cfg(target_arch = "arm")]
     ensure_mapped(&ctx, &mut name_map, "dwc2", 0xFFFF);
+
+    // THE USB HOST COMES UP BEFORE THE DISK THAT LIVES ON IT - on aarch64 too, not just arm32.
+    //
+    // `block-driver` reaches the Pi 4's disk THROUGH the `xhci` service, exactly as it reaches the
+    // Pi 2's through `dwc2` above. But `xhci` was spawned ninety lines further down, so at boot
+    // block-driver asked a service that did not exist yet and its first capacity probe could not
+    // even resolve the name. The instrument said so on the first Pi 4 boot that carried it:
+    //
+    //   block-driver: 'xhci' did not answer, and the retry after reacquire COULD NOT REACQUIRE
+    //                 - the name does not resolve: no live instance
+    //   task: 'xhci' spawned OK on core 2        <- two lines LATER
+    //
+    // Not fatal - `fs` re-probes on every request and recovers - but it makes every boot start
+    // storage-less and recover, rather than simply working, and it is the same "did not ANSWER"
+    // state that a post-chaos Pi 2 got stuck in for 23 s. A dependency spawned after its dependent
+    // guarantees a failed first probe; ordering it correctly costs nothing.
+    //
+    // The later `xhci` site stays, and ADOPTS this instance rather than starting a second - which is
+    // what `ensure_mapped` is for, and why this is safe to say twice. x86 keeps its existing
+    // position: there `xhci` is a keyboard driver and the disk is AHCI, so it is not in this path.
+    #[cfg(target_arch = "aarch64")]
+    ensure_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
@@ -640,6 +1383,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
+        // A command, or a death notification? The first byte decides (see supcmd::MARKER).
+        if handle_command(&ctx, &mut name_map, msg.payload_bytes()) { continue; }
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
         // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
         // ALREADY respawned this service before its queued death notification reached us. If it is
@@ -773,37 +1518,37 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // Sender/controller before echo/recv so the sender's endpoint is registered
     // when the echo partner's SEND cap is wired at spawn time.
     // perf-b5-victim must be registered before perf-b5 starts cycling.
-    let _ = ctx.spawn("perf-b1");
-    let _ = ctx.spawn("perf-b1-echo");
-    let _ = ctx.spawn("perf-b2");
-    let _ = ctx.spawn("perf-b2-echo");
-    let _ = ctx.spawn("perf-b3");
-    let _ = ctx.spawn("perf-b4");
-    let _ = ctx.spawn("perf-b5-victim");
-    let _ = ctx.spawn("perf-b5");
-    let _ = ctx.spawn("perf-b7");
-    let _ = ctx.spawn("perf-b8");
-    let _ = ctx.spawn("perf-b9-recv");
-    let _ = ctx.spawn("perf-b9");
-    let _ = ctx.spawn("perf-b10");
+    let _ = probes::probe(&ctx, "perf-b1");
+    let _ = probes::probe(&ctx, "perf-b1-echo");
+    let _ = probes::probe(&ctx, "perf-b2");
+    let _ = probes::probe(&ctx, "perf-b2-echo");
+    let _ = probes::probe(&ctx, "perf-b3");
+    let _ = probes::probe(&ctx, "perf-b4");
+    let _ = probes::probe(&ctx, "perf-b5-victim");
+    let _ = probes::probe(&ctx, "perf-b5");
+    let _ = probes::probe(&ctx, "perf-b7");
+    let _ = probes::probe(&ctx, "perf-b8");
+    let _ = probes::probe(&ctx, "perf-b9-recv");
+    let _ = probes::probe(&ctx, "perf-b9");
+    let _ = probes::probe(&ctx, "perf-b10");
 }
 
 // perf-brutal-only: spawn only the brutal performance benchmark probe services.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), feature = "perf-brutal-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    let _ = ctx.spawn("perf-bp1");
-    let _ = ctx.spawn("perf-bp1-echo");
-    let _ = ctx.spawn("perf-bp2");
-    let _ = ctx.spawn("perf-bp2-echo");
-    let _ = ctx.spawn("perf-bp3");
-    let _ = ctx.spawn("perf-bp4");
-    let _ = ctx.spawn("perf-bp5-victim");
-    let _ = ctx.spawn("perf-bp5");
-    let _ = ctx.spawn("perf-bp7");
-    let _ = ctx.spawn("perf-bp8");
-    let _ = ctx.spawn("perf-bp9-recv");
-    let _ = ctx.spawn("perf-bp9");
-    let _ = ctx.spawn("perf-bp10");
+    let _ = probes::probe(&ctx, "perf-bp1");
+    let _ = probes::probe(&ctx, "perf-bp1-echo");
+    let _ = probes::probe(&ctx, "perf-bp2");
+    let _ = probes::probe(&ctx, "perf-bp2-echo");
+    let _ = probes::probe(&ctx, "perf-bp3");
+    let _ = probes::probe(&ctx, "perf-bp4");
+    let _ = probes::probe(&ctx, "perf-bp5-victim");
+    let _ = probes::probe(&ctx, "perf-bp5");
+    let _ = probes::probe(&ctx, "perf-bp7");
+    let _ = probes::probe(&ctx, "perf-bp8");
+    let _ = probes::probe(&ctx, "perf-bp9-recv");
+    let _ = probes::probe(&ctx, "perf-bp9");
+    let _ = probes::probe(&ctx, "perf-bp10");
 }
 
 // stress-only: spawn only the S1-S10 stress probe services.
@@ -813,24 +1558,24 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Receivers/victims must register before their controllers so endpoints
     // exist when sender SEND caps are wired at spawn time.
-    let _ = ctx.spawn("stress-s1-recv");
-    let _ = ctx.spawn("stress-s1");
-    let _ = ctx.spawn("stress-s2-victim");
-    let _ = ctx.spawn("stress-s2");
-    let _ = ctx.spawn("stress-s3-recv");    // core 1 - cross-core thrash receiver
-    let _ = ctx.spawn("stress-s3-send");    // core 0 - cross-core thrash sender
-    let _ = ctx.spawn("stress-s4-victim");
-    let _ = ctx.spawn("stress-s4");
-    let _ = ctx.spawn("stress-s5-victim");
-    let _ = ctx.spawn("stress-s5");
-    let _ = ctx.spawn("stress-s6");         // self-referential; endpoint registered at spawn
-    let _ = ctx.spawn("stress-s7");
-    let _ = ctx.spawn("stress-s8");
-    let _ = ctx.spawn("stress-s9-recv");    // core 2 - IPI storm receiver
-    let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
-    let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
-    let _ = ctx.spawn("stress-s10-victim"); // core 1 - cascading revocation target
-    let _ = ctx.spawn("stress-s10");        // core 0 - kills victim cross-core
+    let _ = probes::probe(&ctx, "stress-s1-recv");
+    let _ = probes::probe(&ctx, "stress-s1");
+    let _ = probes::probe(&ctx, "stress-s2-victim");
+    let _ = probes::probe(&ctx, "stress-s2");
+    let _ = probes::probe(&ctx, "stress-s3-recv");    // core 1 - cross-core thrash receiver
+    let _ = probes::probe(&ctx, "stress-s3-send");    // core 0 - cross-core thrash sender
+    let _ = probes::probe(&ctx, "stress-s4-victim");
+    let _ = probes::probe(&ctx, "stress-s4");
+    let _ = probes::probe(&ctx, "stress-s5-victim");
+    let _ = probes::probe(&ctx, "stress-s5");
+    let _ = probes::probe(&ctx, "stress-s6");         // self-referential; endpoint registered at spawn
+    let _ = probes::probe(&ctx, "stress-s7");
+    let _ = probes::probe(&ctx, "stress-s8");
+    let _ = probes::probe(&ctx, "stress-s9-recv");    // core 2 - IPI storm receiver
+    let _ = probes::probe(&ctx, "stress-s9-send-a"); // core 0 → core 2
+    let _ = probes::probe(&ctx, "stress-s9-send-b"); // core 1 → core 2
+    let _ = probes::probe(&ctx, "stress-s10-victim"); // core 1 - cascading revocation target
+    let _ = probes::probe(&ctx, "stress-s10");        // core 0 - kills victim cross-core
 }
 
 // chaos-only: spawn only the C2-C7 chaos probe services.
@@ -840,14 +1585,14 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // BC7/C7 victims must be registered before their controllers so endpoints
     // exist when the controller's SEND caps are wired at spawn time.
-    let _ = ctx.spawn("chaos-c2");          // non-TCB page fault, system continues
-    let _ = ctx.spawn("chaos-c2-monitor");  // witness - alive after c2 faults
-    let _ = ctx.spawn("chaos-c3");          // alloc-deny pressure cycles
-    let _ = ctx.spawn("chaos-c5");          // recursive yields (kernel stack depth)
-    let _ = ctx.spawn("chaos-c6-hog");      // tight-loop hog on core 3
-    let _ = ctx.spawn("chaos-c6-monitor");  // witness on core 0
-    let _ = ctx.spawn("chaos-c7-victim");   // passive recv target on core 2
-    let _ = ctx.spawn("chaos-c7");          // TLB shootdown controller on core 1
+    let _ = probes::probe(&ctx, "chaos-c2");          // non-TCB page fault, system continues
+    let _ = probes::probe(&ctx, "chaos-c2-monitor");  // witness - alive after c2 faults
+    let _ = probes::probe(&ctx, "chaos-c3");          // alloc-deny pressure cycles
+    let _ = probes::probe(&ctx, "chaos-c5");          // recursive yields (kernel stack depth)
+    let _ = probes::probe(&ctx, "chaos-c6-hog");      // tight-loop hog on core 3
+    let _ = probes::probe(&ctx, "chaos-c6-monitor");  // witness on core 0
+    let _ = probes::probe(&ctx, "chaos-c7-victim");   // passive recv target on core 2
+    let _ = probes::probe(&ctx, "chaos-c7");          // TLB shootdown controller on core 1
 }
 
 // adv-only: spawn only the A1-A10 adversarial probe services.
@@ -858,33 +1603,33 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // line within the first second, so it completes even when the CPU-heavy
     // attackers (A1's 10k-iteration loop, A2 brute-force) would otherwise starve
     // a TCG-throttled boot. Order is functionally irrelevant for it.
-    let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
-    let _ = ctx.spawn("adv-a12"); // reboot gated - denied without REBOOT cap (self-contained)
-    let _ = ctx.spawn("adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY (self-contained)
+    let _ = probes::probe(&ctx, "adv-a11"); // introspection gated - denied without INTROSPECT cap
+    let _ = probes::probe(&ctx, "adv-a12"); // reboot gated - denied without REBOOT cap (self-contained)
+    let _ = probes::probe(&ctx, "adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY (self-contained)
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
-    let _ = ctx.spawn("adv-a1");
-    let _ = ctx.spawn("adv-a2");
-    let _ = ctx.spawn("adv-a3");
-    let _ = ctx.spawn("adv-a4");
-    let _ = ctx.spawn("adv-a5-victim"); // passive - killed by adv-a5
-    let _ = ctx.spawn("adv-a5");
-    let _ = ctx.spawn("adv-a6");
-    let _ = ctx.spawn("adv-a7-recv");   // passive recv - registered before sender
-    let _ = ctx.spawn("adv-a7");
-    let _ = ctx.spawn("adv-a8");        // tight-loop attacker
-    let _ = ctx.spawn("adv-a8-witness");
-    let _ = ctx.spawn("adv-a9");
-    let _ = ctx.spawn("adv-a10");
+    let _ = probes::probe(&ctx, "adv-a1");
+    let _ = probes::probe(&ctx, "adv-a2");
+    let _ = probes::probe(&ctx, "adv-a3");
+    let _ = probes::probe(&ctx, "adv-a4");
+    let _ = probes::probe(&ctx, "adv-a5-victim"); // passive - killed by adv-a5
+    let _ = probes::probe(&ctx, "adv-a5");
+    let _ = probes::probe(&ctx, "adv-a6");
+    let _ = probes::probe(&ctx, "adv-a7-recv");   // passive recv - registered before sender
+    let _ = probes::probe(&ctx, "adv-a7");
+    let _ = probes::probe(&ctx, "adv-a8");        // tight-loop attacker
+    let _ = probes::probe(&ctx, "adv-a8-witness");
+    let _ = probes::probe(&ctx, "adv-a9");
+    let _ = probes::probe(&ctx, "adv-a10");
     // A14 (kernel-audit C1/C2 regression): two ring-3 faulters (#GP, #DE) that must be KILLED by the
     // kernel, and a monitor that witnesses the system surviving both. Self-contained, no peers.
-    let _ = ctx.spawn("adv-fault-gp");
-    let _ = ctx.spawn("adv-fault-de");
-    let _ = ctx.spawn("adv-fault-mon");
+    let _ = probes::probe(&ctx, "adv-fault-gp");
+    let _ = probes::probe(&ctx, "adv-fault-de");
+    let _ = probes::probe(&ctx, "adv-fault-mon");
     // A15 (kernel-audit V1 regression): a bad user pointer to a syscall must kill the CALLER, not halt
     // the machine. A faulter (bad ptr to `log`) + a monitor that witnesses the system surviving.
-    let _ = ctx.spawn("adv-fault-usercopy");
-    let _ = ctx.spawn("adv-fault-usercopy-mon");
+    let _ = probes::probe(&ctx, "adv-fault-usercopy");
+    let _ = probes::probe(&ctx, "adv-fault-usercopy-mon");
 }
 
 // fuzz-only: spawn only the §22 fuzz probe services (F1/F2/F5/F6/F7/F8 + brutal
@@ -897,26 +1642,26 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 #[cfg(all(not(feature = "bare-metal"), not(feature = "idle-only"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), not(feature = "chaos-only"), feature = "fuzz-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Regular fuzz probes (Milestone 10 Phase 1).
-    let _ = ctx.spawn("fuzz-f1");
-    let _ = ctx.spawn("fuzz-f2");
-    let _ = ctx.spawn("fuzz-f5-recv");
-    let _ = ctx.spawn("fuzz-f5");
-    let _ = ctx.spawn("fuzz-f6-recv");
-    let _ = ctx.spawn("fuzz-f6");
-    let _ = ctx.spawn("fuzz-f7-victim");
-    let _ = ctx.spawn("fuzz-f7");
-    let _ = ctx.spawn("fuzz-f8");
+    let _ = probes::probe(&ctx, "fuzz-f1");
+    let _ = probes::probe(&ctx, "fuzz-f2");
+    let _ = probes::probe(&ctx, "fuzz-f5-recv");
+    let _ = probes::probe(&ctx, "fuzz-f5");
+    let _ = probes::probe(&ctx, "fuzz-f6-recv");
+    let _ = probes::probe(&ctx, "fuzz-f6");
+    let _ = probes::probe(&ctx, "fuzz-f7-victim");
+    let _ = probes::probe(&ctx, "fuzz-f7");
+    let _ = probes::probe(&ctx, "fuzz-f8");
     // Brutal fuzz probes (Milestone 17) - heavier iteration counts; run fast on
     // real silicon (no TCG throttling). Recv/victim partners first.
-    let _ = ctx.spawn("fuzz-bf5-recv");
-    let _ = ctx.spawn("fuzz-bf5");
-    let _ = ctx.spawn("fuzz-bf6-recv");
-    let _ = ctx.spawn("fuzz-bf6");
-    let _ = ctx.spawn("fuzz-bf7-victim");
-    let _ = ctx.spawn("fuzz-bf7");
-    let _ = ctx.spawn("fuzz-bf1");
-    let _ = ctx.spawn("fuzz-bf2");
-    let _ = ctx.spawn("fuzz-bf8");
+    let _ = probes::probe(&ctx, "fuzz-bf5-recv");
+    let _ = probes::probe(&ctx, "fuzz-bf5");
+    let _ = probes::probe(&ctx, "fuzz-bf6-recv");
+    let _ = probes::probe(&ctx, "fuzz-bf6");
+    let _ = probes::probe(&ctx, "fuzz-bf7-victim");
+    let _ = probes::probe(&ctx, "fuzz-bf7");
+    let _ = probes::probe(&ctx, "fuzz-bf1");
+    let _ = probes::probe(&ctx, "fuzz-bf2");
+    let _ = probes::probe(&ctx, "fuzz-bf8");
 }
 
 // b2-only: spawn only the regular B2 cross-core IPC probe pair (isolation build).
@@ -924,16 +1669,16 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 // and B6 restart cycles so the blocking round-trip can complete on Goldmont+.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), not(feature = "chaos-only"), feature = "b2-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    let _ = ctx.spawn("perf-b2");      // B2 sender (core 0) - registers endpoint first
-    let _ = ctx.spawn("perf-b2-echo"); // B2 echo  (core 1) - wires SEND cap to perf-b2
+    let _ = probes::probe(&ctx, "perf-b2");      // B2 sender (core 0) - registers endpoint first
+    let _ = probes::probe(&ctx, "perf-b2-echo"); // B2 echo  (core 1) - wires SEND cap to perf-b2
 }
 
 // bp2-only: spawn only the brutal BP2 cross-core IPC probe pair (isolation build).
 // Brutal equivalent of b2-only - higher iteration count, same isolation rationale.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), not(feature = "adv-only"), not(feature = "chaos-only"), not(feature = "b2-only"), feature = "bp2-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    let _ = ctx.spawn("perf-bp2");      // BP2 sender (core 0) - registers endpoint first
-    let _ = ctx.spawn("perf-bp2-echo"); // BP2 echo  (core 1) - wires SEND cap to perf-bp2
+    let _ = probes::probe(&ctx, "perf-bp2");      // BP2 sender (core 0) - registers endpoint first
+    let _ = probes::probe(&ctx, "perf-bp2-echo"); // BP2 echo  (core 1) - wires SEND cap to perf-bp2
 }
 
 // perf-iso: isolate ONE brutal perf probe (+ its partners) - no ping/pong, no
@@ -943,28 +1688,28 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
 // (victim before perf-bp5; recv before perf-bp9) so endpoints/caps are wired.
 #[cfg(feature = "perf-iso")]
 fn spawn_extended_probes(ctx: &ServiceContext) {
-    #[cfg(feature = "iso-bp3")]  { let _ = ctx.spawn("perf-bp3"); }
-    #[cfg(feature = "iso-bp5")]  { let _ = ctx.spawn("perf-bp5-victim"); let _ = ctx.spawn("perf-bp5"); }
-    #[cfg(feature = "iso-bp7")]  { let _ = ctx.spawn("perf-bp7"); }
-    #[cfg(feature = "iso-bp9")]  { let _ = ctx.spawn("perf-bp9-recv"); let _ = ctx.spawn("perf-bp9"); }
-    #[cfg(feature = "iso-bp10")] { let _ = ctx.spawn("perf-bp10"); }
+    #[cfg(feature = "iso-bp3")]  { let _ = probes::probe(&ctx, "perf-bp3"); }
+    #[cfg(feature = "iso-bp5")]  { let _ = probes::probe(&ctx, "perf-bp5-victim"); let _ = probes::probe(&ctx, "perf-bp5"); }
+    #[cfg(feature = "iso-bp7")]  { let _ = probes::probe(&ctx, "perf-bp7"); }
+    #[cfg(feature = "iso-bp9")]  { let _ = probes::probe(&ctx, "perf-bp9-recv"); let _ = probes::probe(&ctx, "perf-bp9"); }
+    #[cfg(feature = "iso-bp10")] { let _ = probes::probe(&ctx, "perf-bp10"); }
     // Cross-core STRESS isolation (recv/partners first so endpoints are registered).
-    #[cfg(feature = "iso-s3")]   { let _ = ctx.spawn("stress-s3-recv"); let _ = ctx.spawn("stress-s3-send"); }
+    #[cfg(feature = "iso-s3")]   { let _ = probes::probe(&ctx, "stress-s3-recv"); let _ = probes::probe(&ctx, "stress-s3-send"); }
     // iso-s5: victim first so its endpoint exists when stress-s5's caps are wired.
-    #[cfg(feature = "iso-s5")]   { let _ = ctx.spawn("stress-s5-victim"); let _ = ctx.spawn("stress-s5"); }
+    #[cfg(feature = "iso-s5")]   { let _ = probes::probe(&ctx, "stress-s5-victim"); let _ = probes::probe(&ctx, "stress-s5"); }
     // iso-c7: victim (core 2) first so its endpoint exists when chaos-c7's (core 1)
     // SEND cap is wired; controller then drives 30 cross-core kill/respawn cycles.
-    #[cfg(feature = "iso-c7")]   { let _ = ctx.spawn("chaos-c7-victim"); let _ = ctx.spawn("chaos-c7"); }
+    #[cfg(feature = "iso-c7")]   { let _ = probes::probe(&ctx, "chaos-c7-victim"); let _ = probes::probe(&ctx, "chaos-c7"); }
     // iso-xsend: receiver (core 2) first so its endpoint exists when xsend's (core 1)
     // SEND cap is wired; sender then times bare cross-core try_sends to a LIVE receiver.
-    #[cfg(feature = "iso-xsend")] { let _ = ctx.spawn("xsend-recv"); let _ = ctx.spawn("xsend"); }
+    #[cfg(feature = "iso-xsend")] { let _ = probes::probe(&ctx, "xsend-recv"); let _ = probes::probe(&ctx, "xsend"); }
     // iso-xlife: both victims first so they exist when the controller's first kill
     // fires; controller (core 1) then times kill/spawn of near (core 1) and far (core 2).
-    #[cfg(feature = "iso-xlife")] { let _ = ctx.spawn("xlife-near"); let _ = ctx.spawn("xlife-far"); let _ = ctx.spawn("xlife"); }
+    #[cfg(feature = "iso-xlife")] { let _ = probes::probe(&ctx, "xlife-near"); let _ = probes::probe(&ctx, "xlife-far"); let _ = probes::probe(&ctx, "xlife"); }
     #[cfg(feature = "iso-s9")]   {
-        let _ = ctx.spawn("stress-s9-recv");
-        let _ = ctx.spawn("stress-s9-send-a");
-        let _ = ctx.spawn("stress-s9-send-b");
+        let _ = probes::probe(&ctx, "stress-s9-recv");
+        let _ = probes::probe(&ctx, "stress-s9-send-a");
+        let _ = probes::probe(&ctx, "stress-s9-send-b");
     }
     let _ = ctx; // used by every sub-feature arm; silences the no-arm case
 }
@@ -977,19 +1722,19 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // supervisor's spawn calls land while the system is still lightly loaded.
     // Victims/passive services must be registered before their attackers so
     // their endpoints exist when the attacker's SEND caps are wired at spawn.
-    let _ = ctx.spawn("adv-ba1");
-    let _ = ctx.spawn("adv-ba2");
-    let _ = ctx.spawn("adv-ba3");
-    let _ = ctx.spawn("adv-ba4");
-    let _ = ctx.spawn("adv-ba5-victim"); // registered before adv-ba5
-    let _ = ctx.spawn("adv-ba5");
-    let _ = ctx.spawn("adv-ba6");        // recv endpoint registered so self-fill works
-    let _ = ctx.spawn("adv-ba7-recv");   // passive recv registered before sender
-    let _ = ctx.spawn("adv-ba7");
-    let _ = ctx.spawn("adv-ba8");        // tight-loop hog
-    let _ = ctx.spawn("adv-ba8-witness");
-    let _ = ctx.spawn("adv-ba9");
-    let _ = ctx.spawn("adv-ba10");
+    let _ = probes::probe(&ctx, "adv-ba1");
+    let _ = probes::probe(&ctx, "adv-ba2");
+    let _ = probes::probe(&ctx, "adv-ba3");
+    let _ = probes::probe(&ctx, "adv-ba4");
+    let _ = probes::probe(&ctx, "adv-ba5-victim"); // registered before adv-ba5
+    let _ = probes::probe(&ctx, "adv-ba5");
+    let _ = probes::probe(&ctx, "adv-ba6");        // recv endpoint registered so self-fill works
+    let _ = probes::probe(&ctx, "adv-ba7-recv");   // passive recv registered before sender
+    let _ = probes::probe(&ctx, "adv-ba7");
+    let _ = probes::probe(&ctx, "adv-ba8");        // tight-loop hog
+    let _ = probes::probe(&ctx, "adv-ba8-witness");
+    let _ = probes::probe(&ctx, "adv-ba9");
+    let _ = probes::probe(&ctx, "adv-ba10");
 
     // --- Brutal chaos-test probes - Milestone 21 ---
     // Spawned EARLY before property/stress kill-respawn loops start.
@@ -997,217 +1742,217 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     // fault concurrently before the monitor starts counting yields.
     // BC7: victim registered before controller so its endpoint exists when
     // the controller's SEND cap is wired at spawn time.
-    let _ = ctx.spawn("chaos-bc2-a");
-    let _ = ctx.spawn("chaos-bc2-b");
-    let _ = ctx.spawn("chaos-bc2-c");
-    let _ = ctx.spawn("chaos-bc2-d");
-    let _ = ctx.spawn("chaos-bc2-e");
-    let _ = ctx.spawn("chaos-bc2-monitor");
-    let _ = ctx.spawn("chaos-bc3");
-    let _ = ctx.spawn("chaos-bc5");
-    let _ = ctx.spawn("chaos-bc6-hog-a"); // hog on core 2
-    let _ = ctx.spawn("chaos-bc6-hog-b"); // hog on core 3
-    let _ = ctx.spawn("chaos-bc6-monitor"); // witness on core 0
-    let _ = ctx.spawn("chaos-bc7-victim"); // passive target on core 2
-    let _ = ctx.spawn("chaos-bc7");        // controller on core 1
+    let _ = probes::probe(&ctx, "chaos-bc2-a");
+    let _ = probes::probe(&ctx, "chaos-bc2-b");
+    let _ = probes::probe(&ctx, "chaos-bc2-c");
+    let _ = probes::probe(&ctx, "chaos-bc2-d");
+    let _ = probes::probe(&ctx, "chaos-bc2-e");
+    let _ = probes::probe(&ctx, "chaos-bc2-monitor");
+    let _ = probes::probe(&ctx, "chaos-bc3");
+    let _ = probes::probe(&ctx, "chaos-bc5");
+    let _ = probes::probe(&ctx, "chaos-bc6-hog-a"); // hog on core 2
+    let _ = probes::probe(&ctx, "chaos-bc6-hog-b"); // hog on core 3
+    let _ = probes::probe(&ctx, "chaos-bc6-monitor"); // witness on core 0
+    let _ = probes::probe(&ctx, "chaos-bc7-victim"); // passive target on core 2
+    let _ = probes::probe(&ctx, "chaos-bc7");        // controller on core 1
 
     // Property-test probes - Milestone 9 Phase 1.
     // prop-p9-victim must register its endpoint before prop-p9 is spawned
     // (SEND caps to prop-p9-victim are wired at prop-p9 spawn time).
-    let _ = ctx.spawn("prop-p9-victim");
-    let _ = ctx.spawn("prop-p9");
-    let _ = ctx.spawn("prop-p1");
-    let _ = ctx.spawn("prop-p10");
+    let _ = probes::probe(&ctx, "prop-p9-victim");
+    let _ = probes::probe(&ctx, "prop-p9");
+    let _ = probes::probe(&ctx, "prop-p1");
+    let _ = probes::probe(&ctx, "prop-p10");
     // Property-test probes - Milestone 9 Phase 2.
     // P3 and P6 are spawned BEFORE the kill/respawn controllers (P2, P8) so they
     // are already running by the time P2 and P8 begin their kill/respawn loops.
     // P2 and P8 each do rapid kill/respawn cycles that compete for kernel resources;
     // spawning the self-contained probes first prevents CPU starvation of P3/P6.
-    let _ = ctx.spawn("prop-p3");        // P3: self-referential cap bounce (no victims)
-    let _ = ctx.spawn("prop-p6");        // P6: self-referential queue depth test (no victims)
+    let _ = probes::probe(&ctx, "prop-p3");        // P3: self-referential cap bounce (no victims)
+    let _ = probes::probe(&ctx, "prop-p6");        // P6: self-referential queue depth test (no victims)
     // Kill/respawn victims must be registered before their controller probes start.
-    let _ = ctx.spawn("prop-p2-victim"); // P2: kill/respawn generation target
-    let _ = ctx.spawn("prop-p2");        // P2 controller - starts cycling immediately
-    let _ = ctx.spawn("prop-p8-victim"); // P8: kill/respawn generation target
-    let _ = ctx.spawn("prop-p8");        // P8 controller - starts cycling immediately
+    let _ = probes::probe(&ctx, "prop-p2-victim"); // P2: kill/respawn generation target
+    let _ = probes::probe(&ctx, "prop-p2");        // P2 controller - starts cycling immediately
+    let _ = probes::probe(&ctx, "prop-p8-victim"); // P8: kill/respawn generation target
+    let _ = probes::probe(&ctx, "prop-p8");        // P8 controller - starts cycling immediately
 
     // Property-test probes - Milestone 9 Phase 3.
     // P4 has no victim. P5 and P7 victims must be registered before their
     // controllers so endpoints exist when the controllers start cycling.
-    let _ = ctx.spawn("prop-p4");
-    let _ = ctx.spawn("prop-p5-victim");
-    let _ = ctx.spawn("prop-p5");
-    let _ = ctx.spawn("prop-p7-victim");
-    let _ = ctx.spawn("prop-p7");
+    let _ = probes::probe(&ctx, "prop-p4");
+    let _ = probes::probe(&ctx, "prop-p5-victim");
+    let _ = probes::probe(&ctx, "prop-p5");
+    let _ = probes::probe(&ctx, "prop-p7-victim");
+    let _ = probes::probe(&ctx, "prop-p7");
 
     // --- Brutal property test probes - Milestone 16 ---
     // Victims before controllers within each pair.
     // Self-referential probes (BP3, BP6) can go in any order.
-    let _ = ctx.spawn("prop-bp1");
-    let _ = ctx.spawn("prop-bp2-victim");
-    let _ = ctx.spawn("prop-bp2");
-    let _ = ctx.spawn("prop-bp3");       // self-referential
-    let _ = ctx.spawn("prop-bp4");
-    let _ = ctx.spawn("prop-bp5-victim");
-    let _ = ctx.spawn("prop-bp5");
-    let _ = ctx.spawn("prop-bp6");       // self-referential
-    let _ = ctx.spawn("prop-bp7-victim");
-    let _ = ctx.spawn("prop-bp7");
-    let _ = ctx.spawn("prop-bp8-victim");
-    let _ = ctx.spawn("prop-bp8");
-    let _ = ctx.spawn("prop-bp9-victim");
-    let _ = ctx.spawn("prop-bp9");
-    let _ = ctx.spawn("prop-bp10");
+    let _ = probes::probe(&ctx, "prop-bp1");
+    let _ = probes::probe(&ctx, "prop-bp2-victim");
+    let _ = probes::probe(&ctx, "prop-bp2");
+    let _ = probes::probe(&ctx, "prop-bp3");       // self-referential
+    let _ = probes::probe(&ctx, "prop-bp4");
+    let _ = probes::probe(&ctx, "prop-bp5-victim");
+    let _ = probes::probe(&ctx, "prop-bp5");
+    let _ = probes::probe(&ctx, "prop-bp6");       // self-referential
+    let _ = probes::probe(&ctx, "prop-bp7-victim");
+    let _ = probes::probe(&ctx, "prop-bp7");
+    let _ = probes::probe(&ctx, "prop-bp8-victim");
+    let _ = probes::probe(&ctx, "prop-bp8");
+    let _ = probes::probe(&ctx, "prop-bp9-victim");
+    let _ = probes::probe(&ctx, "prop-bp9");
+    let _ = probes::probe(&ctx, "prop-bp10");
 
     // --- Fuzz-test probes - Milestone 10 Phase 1 ---
     // Recv-endpoint victims/targets must be spawned before their controllers.
-    let _ = ctx.spawn("fuzz-f1");
-    let _ = ctx.spawn("fuzz-f2");
-    let _ = ctx.spawn("fuzz-f5-recv");
-    let _ = ctx.spawn("fuzz-f5");
-    let _ = ctx.spawn("fuzz-f6-recv");
-    let _ = ctx.spawn("fuzz-f6");
-    let _ = ctx.spawn("fuzz-f7-victim");
-    let _ = ctx.spawn("fuzz-f7");
-    let _ = ctx.spawn("fuzz-f8");
+    let _ = probes::probe(&ctx, "fuzz-f1");
+    let _ = probes::probe(&ctx, "fuzz-f2");
+    let _ = probes::probe(&ctx, "fuzz-f5-recv");
+    let _ = probes::probe(&ctx, "fuzz-f5");
+    let _ = probes::probe(&ctx, "fuzz-f6-recv");
+    let _ = probes::probe(&ctx, "fuzz-f6");
+    let _ = probes::probe(&ctx, "fuzz-f7-victim");
+    let _ = probes::probe(&ctx, "fuzz-f7");
+    let _ = probes::probe(&ctx, "fuzz-f8");
 
     // --- Brutal fuzz test probes - Milestone 17 ---
     // Recv-endpoint victims must be spawned before controllers so their
     // endpoints are registered when the controllers' SEND caps are wired.
-    let _ = ctx.spawn("fuzz-bf5-recv");
-    let _ = ctx.spawn("fuzz-bf5");
-    let _ = ctx.spawn("fuzz-bf6-recv");
-    let _ = ctx.spawn("fuzz-bf6");
-    let _ = ctx.spawn("fuzz-bf7-victim");
-    let _ = ctx.spawn("fuzz-bf7");
-    let _ = ctx.spawn("fuzz-bf1");
-    let _ = ctx.spawn("fuzz-bf2");
-    let _ = ctx.spawn("fuzz-bf8");
+    let _ = probes::probe(&ctx, "fuzz-bf5-recv");
+    let _ = probes::probe(&ctx, "fuzz-bf5");
+    let _ = probes::probe(&ctx, "fuzz-bf6-recv");
+    let _ = probes::probe(&ctx, "fuzz-bf6");
+    let _ = probes::probe(&ctx, "fuzz-bf7-victim");
+    let _ = probes::probe(&ctx, "fuzz-bf7");
+    let _ = probes::probe(&ctx, "fuzz-bf1");
+    let _ = probes::probe(&ctx, "fuzz-bf2");
+    let _ = probes::probe(&ctx, "fuzz-bf8");
 
     // --- Stress-test probes - Milestone 11 Phase 1 ---
     // Recv-endpoint victims must be spawned before their controllers so their
     // endpoints are registered before the controllers' SEND caps are wired.
-    let _ = ctx.spawn("stress-s1-recv");
-    let _ = ctx.spawn("stress-s1");
-    let _ = ctx.spawn("stress-s2-victim");
-    let _ = ctx.spawn("stress-s2");
-    let _ = ctx.spawn("stress-s3-recv");   // core 1 - cross-core thrash receiver
-    let _ = ctx.spawn("stress-s3-send");   // core 0 - cross-core thrash sender
-    let _ = ctx.spawn("stress-s4-victim");
-    let _ = ctx.spawn("stress-s4");
-    let _ = ctx.spawn("stress-s7");
-    let _ = ctx.spawn("stress-s10-victim"); // core 1 - cascading revocation target
-    let _ = ctx.spawn("stress-s10");        // core 0 - kills victim cross-core
+    let _ = probes::probe(&ctx, "stress-s1-recv");
+    let _ = probes::probe(&ctx, "stress-s1");
+    let _ = probes::probe(&ctx, "stress-s2-victim");
+    let _ = probes::probe(&ctx, "stress-s2");
+    let _ = probes::probe(&ctx, "stress-s3-recv");   // core 1 - cross-core thrash receiver
+    let _ = probes::probe(&ctx, "stress-s3-send");   // core 0 - cross-core thrash sender
+    let _ = probes::probe(&ctx, "stress-s4-victim");
+    let _ = probes::probe(&ctx, "stress-s4");
+    let _ = probes::probe(&ctx, "stress-s7");
+    let _ = probes::probe(&ctx, "stress-s10-victim"); // core 1 - cascading revocation target
+    let _ = probes::probe(&ctx, "stress-s10");        // core 0 - kills victim cross-core
     // Stress Phase 2 - S5, S6, S8, S9.
     // s5-victim must register before s5 starts cycling.
     // s9-recv must register before s9-send-a/b are wired with SEND caps.
-    let _ = ctx.spawn("stress-s5-victim");
-    let _ = ctx.spawn("stress-s5");
-    let _ = ctx.spawn("stress-s6");        // self-referential; endpoint registered at spawn time
-    let _ = ctx.spawn("stress-s8");
-    let _ = ctx.spawn("stress-s9-recv");   // core 2 - concurrent IPI storm receiver
-    let _ = ctx.spawn("stress-s9-send-a"); // core 0 → core 2
-    let _ = ctx.spawn("stress-s9-send-b"); // core 1 → core 2
+    let _ = probes::probe(&ctx, "stress-s5-victim");
+    let _ = probes::probe(&ctx, "stress-s5");
+    let _ = probes::probe(&ctx, "stress-s6");        // self-referential; endpoint registered at spawn time
+    let _ = probes::probe(&ctx, "stress-s8");
+    let _ = probes::probe(&ctx, "stress-s9-recv");   // core 2 - concurrent IPI storm receiver
+    let _ = probes::probe(&ctx, "stress-s9-send-a"); // core 0 → core 2
+    let _ = probes::probe(&ctx, "stress-s9-send-b"); // core 1 → core 2
 
     // --- Brutal stress-test probes - Milestone 18 ---
     // Ordering: recv-endpoint victims before their controllers.
-    let _ = ctx.spawn("stress-bs1-recv");   // passive saturation target
-    let _ = ctx.spawn("stress-bs1");        // 50k try_send
-    let _ = ctx.spawn("stress-bs2-victim"); // passive restart victim
-    let _ = ctx.spawn("stress-bs2");        // 200 kill/respawn cycles
-    let _ = ctx.spawn("stress-bs3-recv");   // core 1 - cross-core thrash receiver
-    let _ = ctx.spawn("stress-bs3-send");   // core 0 - 2000 blocking sends
-    let _ = ctx.spawn("stress-bs4-victim"); // passive churn victim
-    let _ = ctx.spawn("stress-bs4");        // 50 churn cycles; 2 cap slots
-    let _ = ctx.spawn("stress-bs5-victim"); // passive generation victim
-    let _ = ctx.spawn("stress-bs5");        // 5000 kill/respawn; generation monotonic
-    let _ = ctx.spawn("stress-bs6");        // self-referential; 20000 self-ping rounds
-    let _ = ctx.spawn("stress-bs7");        // 500 alloc passes
-    let _ = ctx.spawn("stress-bs8");        // 3000 yields
-    let _ = ctx.spawn("stress-bs9-recv");   // core 2 - IPI storm receiver
-    let _ = ctx.spawn("stress-bs9-send-a"); // core 0 → core 2; 2500 sends
-    let _ = ctx.spawn("stress-bs9-send-b"); // core 1 → core 2; 2500 sends
-    let _ = ctx.spawn("stress-bs10-victim"); // core 1 - cascading revocation victim
-    let _ = ctx.spawn("stress-bs10");        // core 0; 50 cycles; 3 cap slots
+    let _ = probes::probe(&ctx, "stress-bs1-recv");   // passive saturation target
+    let _ = probes::probe(&ctx, "stress-bs1");        // 50k try_send
+    let _ = probes::probe(&ctx, "stress-bs2-victim"); // passive restart victim
+    let _ = probes::probe(&ctx, "stress-bs2");        // 200 kill/respawn cycles
+    let _ = probes::probe(&ctx, "stress-bs3-recv");   // core 1 - cross-core thrash receiver
+    let _ = probes::probe(&ctx, "stress-bs3-send");   // core 0 - 2000 blocking sends
+    let _ = probes::probe(&ctx, "stress-bs4-victim"); // passive churn victim
+    let _ = probes::probe(&ctx, "stress-bs4");        // 50 churn cycles; 2 cap slots
+    let _ = probes::probe(&ctx, "stress-bs5-victim"); // passive generation victim
+    let _ = probes::probe(&ctx, "stress-bs5");        // 5000 kill/respawn; generation monotonic
+    let _ = probes::probe(&ctx, "stress-bs6");        // self-referential; 20000 self-ping rounds
+    let _ = probes::probe(&ctx, "stress-bs7");        // 500 alloc passes
+    let _ = probes::probe(&ctx, "stress-bs8");        // 3000 yields
+    let _ = probes::probe(&ctx, "stress-bs9-recv");   // core 2 - IPI storm receiver
+    let _ = probes::probe(&ctx, "stress-bs9-send-a"); // core 0 → core 2; 2500 sends
+    let _ = probes::probe(&ctx, "stress-bs9-send-b"); // core 1 → core 2; 2500 sends
+    let _ = probes::probe(&ctx, "stress-bs10-victim"); // core 1 - cascading revocation victim
+    let _ = probes::probe(&ctx, "stress-bs10");        // core 0; 50 cycles; 3 cap slots
 
     // --- Chaos-test probes - Milestone 14 ---
     // c7-victim must be registered on core 2 before chaos-c7 is spawned on core 1
     // so its endpoint exists when chaos-c7's SEND cap is wired at spawn time.
-    let _ = ctx.spawn("chaos-c2");
-    let _ = ctx.spawn("chaos-c2-monitor");
-    let _ = ctx.spawn("chaos-c3");
-    let _ = ctx.spawn("chaos-c5");
-    let _ = ctx.spawn("chaos-c6-hog");
-    let _ = ctx.spawn("chaos-c6-monitor");
-    let _ = ctx.spawn("chaos-c7-victim"); // passive recv target - spawned before controller
-    let _ = ctx.spawn("chaos-c7");
+    let _ = probes::probe(&ctx, "chaos-c2");
+    let _ = probes::probe(&ctx, "chaos-c2-monitor");
+    let _ = probes::probe(&ctx, "chaos-c3");
+    let _ = probes::probe(&ctx, "chaos-c5");
+    let _ = probes::probe(&ctx, "chaos-c6-hog");
+    let _ = probes::probe(&ctx, "chaos-c6-monitor");
+    let _ = probes::probe(&ctx, "chaos-c7-victim"); // passive recv target - spawned before controller
+    let _ = probes::probe(&ctx, "chaos-c7");
 
     // --- Adversarial-test probes - Milestone 13 ---
     // Passive/victim services must be spawned before their attackers so their
     // endpoints are registered when the attackers' SEND caps are wired.
-    let _ = ctx.spawn("adv-a1");
-    let _ = ctx.spawn("adv-a2");
-    let _ = ctx.spawn("adv-a3");
-    let _ = ctx.spawn("adv-a4");
-    let _ = ctx.spawn("adv-a5-victim"); // passive - killed by adv-a5
-    let _ = ctx.spawn("adv-a5");
-    let _ = ctx.spawn("adv-a6");
-    let _ = ctx.spawn("adv-a7-recv");   // passive - recv target before sender wired
-    let _ = ctx.spawn("adv-a7");
-    let _ = ctx.spawn("adv-a8");
-    let _ = ctx.spawn("adv-a8-witness");
-    let _ = ctx.spawn("adv-a9");
-    let _ = ctx.spawn("adv-a10");
-    let _ = ctx.spawn("adv-a11"); // introspection gated - denied without INTROSPECT cap
-    let _ = ctx.spawn("adv-a12"); // reboot gated - denied without REBOOT cap
-    let _ = ctx.spawn("adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY
+    let _ = probes::probe(&ctx, "adv-a1");
+    let _ = probes::probe(&ctx, "adv-a2");
+    let _ = probes::probe(&ctx, "adv-a3");
+    let _ = probes::probe(&ctx, "adv-a4");
+    let _ = probes::probe(&ctx, "adv-a5-victim"); // passive - killed by adv-a5
+    let _ = probes::probe(&ctx, "adv-a5");
+    let _ = probes::probe(&ctx, "adv-a6");
+    let _ = probes::probe(&ctx, "adv-a7-recv");   // passive - recv target before sender wired
+    let _ = probes::probe(&ctx, "adv-a7");
+    let _ = probes::probe(&ctx, "adv-a8");
+    let _ = probes::probe(&ctx, "adv-a8-witness");
+    let _ = probes::probe(&ctx, "adv-a9");
+    let _ = probes::probe(&ctx, "adv-a10");
+    let _ = probes::probe(&ctx, "adv-a11"); // introspection gated - denied without INTROSPECT cap
+    let _ = probes::probe(&ctx, "adv-a12"); // reboot gated - denied without REBOOT cap
+    let _ = probes::probe(&ctx, "adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY
 
     // --- Brutal performance-benchmark probes - Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.
     // bp5-victim before bp5; bp9-recv before bp9.
-    let _ = ctx.spawn("perf-bp1");         // BP1 sender (core 0) - registers endpoint first
-    let _ = ctx.spawn("perf-bp1-echo");    // BP1 echo (core 0)
-    let _ = ctx.spawn("perf-bp2");         // BP2 sender (core 0)
-    let _ = ctx.spawn("perf-bp2-echo");    // BP2 echo (core 1)
-    let _ = ctx.spawn("perf-bp3");
-    let _ = ctx.spawn("perf-bp4");
-    let _ = ctx.spawn("perf-bp5-victim");  // spawned before perf-bp5 so it exists to be killed
-    let _ = ctx.spawn("perf-bp5");
-    let _ = ctx.spawn("perf-bp7");
-    let _ = ctx.spawn("perf-bp8");
-    let _ = ctx.spawn("perf-bp9-recv");    // recv registered before sender is wired
-    let _ = ctx.spawn("perf-bp9");
-    let _ = ctx.spawn("perf-bp10");
+    let _ = probes::probe(&ctx, "perf-bp1");         // BP1 sender (core 0) - registers endpoint first
+    let _ = probes::probe(&ctx, "perf-bp1-echo");    // BP1 echo (core 0)
+    let _ = probes::probe(&ctx, "perf-bp2");         // BP2 sender (core 0)
+    let _ = probes::probe(&ctx, "perf-bp2-echo");    // BP2 echo (core 1)
+    let _ = probes::probe(&ctx, "perf-bp3");
+    let _ = probes::probe(&ctx, "perf-bp4");
+    let _ = probes::probe(&ctx, "perf-bp5-victim");  // spawned before perf-bp5 so it exists to be killed
+    let _ = probes::probe(&ctx, "perf-bp5");
+    let _ = probes::probe(&ctx, "perf-bp7");
+    let _ = probes::probe(&ctx, "perf-bp8");
+    let _ = probes::probe(&ctx, "perf-bp9-recv");    // recv registered before sender is wired
+    let _ = probes::probe(&ctx, "perf-bp9");
+    let _ = probes::probe(&ctx, "perf-bp10");
 
     // --- Performance-benchmark probes - Milestone 12 ---
     // Spawn sender/controller probes BEFORE their echo/recv partners so the
     // sender's endpoint is registered when the echo partner wires its SEND cap.
     // perf-b5-victim must be registered before perf-b5 starts cycling.
-    let _ = ctx.spawn("perf-b1");         // B1 sender (core 0) - registers endpoint first
-    let _ = ctx.spawn("perf-b1-echo");    // B1 echo (core 0)   - wires SEND cap to perf-b1
-    let _ = ctx.spawn("perf-b2");         // B2 sender (core 0) - registers endpoint first
-    let _ = ctx.spawn("perf-b2-echo");    // B2 echo  (core 1)  - wires SEND cap to perf-b2
-    let _ = ctx.spawn("perf-b3");
-    let _ = ctx.spawn("perf-b4");
-    let _ = ctx.spawn("perf-b5-victim");  // spawned before perf-b5 so it exists to be killed
-    let _ = ctx.spawn("perf-b5");
-    let _ = ctx.spawn("perf-b7");
-    let _ = ctx.spawn("perf-b8");
-    let _ = ctx.spawn("perf-b9-recv");    // recv partner registered before sender is wired
-    let _ = ctx.spawn("perf-b9");
-    let _ = ctx.spawn("perf-b10");
+    let _ = probes::probe(&ctx, "perf-b1");         // B1 sender (core 0) - registers endpoint first
+    let _ = probes::probe(&ctx, "perf-b1-echo");    // B1 echo (core 0)   - wires SEND cap to perf-b1
+    let _ = probes::probe(&ctx, "perf-b2");         // B2 sender (core 0) - registers endpoint first
+    let _ = probes::probe(&ctx, "perf-b2-echo");    // B2 echo  (core 1)  - wires SEND cap to perf-b2
+    let _ = probes::probe(&ctx, "perf-b3");
+    let _ = probes::probe(&ctx, "perf-b4");
+    let _ = probes::probe(&ctx, "perf-b5-victim");  // spawned before perf-b5 so it exists to be killed
+    let _ = probes::probe(&ctx, "perf-b5");
+    let _ = probes::probe(&ctx, "perf-b7");
+    let _ = probes::probe(&ctx, "perf-b8");
+    let _ = probes::probe(&ctx, "perf-b9-recv");    // recv partner registered before sender is wired
+    let _ = probes::probe(&ctx, "perf-b9");
+    let _ = probes::probe(&ctx, "perf-b10");
 
     // --- Brutal identity test probes - Milestone 15 ---
     // T12 chain: spawn C and B (recv-endpoint) before A (sender), so their
     // endpoints are registered when A's SEND cap to B is wired at spawn time.
-    let _ = ctx.spawn("brutal-id-12-c"); // chain endpoint: registered first
-    let _ = ctx.spawn("brutal-id-12-b"); // chain middle: registered before 12-a's SEND cap
-    let _ = ctx.spawn("brutal-id-12-a"); // chain source: acquires cap to 12-c, sends to 12-b
+    let _ = probes::probe(&ctx, "brutal-id-12-c"); // chain endpoint: registered first
+    let _ = probes::probe(&ctx, "brutal-id-12-b"); // chain middle: registered before 12-a's SEND cap
+    let _ = probes::probe(&ctx, "brutal-id-12-a"); // chain source: acquires cap to 12-c, sends to 12-b
     // T13 cross-core blocked send: recv must exist before sender's SEND cap is wired.
     // Kill runs independently on core 1 and yields before killing.
-    let _ = ctx.spawn("brutal-id-13-recv"); // passive target on core 2
-    let _ = ctx.spawn("brutal-id-13-kill"); // kills recv after brief delay on core 1
-    let _ = ctx.spawn("brutal-id-13-send"); // fills queue then blocks on core 0
+    let _ = probes::probe(&ctx, "brutal-id-13-recv"); // passive target on core 2
+    let _ = probes::probe(&ctx, "brutal-id-13-kill"); // kills recv after brief delay on core 1
+    let _ = probes::probe(&ctx, "brutal-id-13-send"); // fills queue then blocks on core 0
     // T11 self-referential queue: brutal-id-11 sends to itself; any spawn order.
-    let _ = ctx.spawn("brutal-id-11");
+    let _ = probes::probe(&ctx, "brutal-id-11");
 }

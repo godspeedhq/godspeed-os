@@ -556,7 +556,7 @@ static ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "A9", name: "direct_spawn_bypasses_supervisor", spec_ref: "§22 Adversarial A9",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: A9 pass"],
+            expect:       &["adv: A9 pass", "adv: A9b pass", "adv: A9c pass"],
             fail_on:      &["KERNEL PANIC", "adv: A9 FAIL"],
             timeout_secs: 30,
         },
@@ -1181,7 +1181,19 @@ static BRUTAL_STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: BS5 pass (5000/5000)"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS5 FAIL"],
-            timeout_secs: 720, // 6× S5's 120s - extra margin for concurrent kill/respawn pressure
+            // MEASURED, not guessed: 5000 cycles cost ~1210 s, and the per-500-cycle cost is FLAT
+            // (~121 s per block across all ten blocks) - so no leak and no degradation over 5000
+            // respawns, which is the property this test exists to check. 3000 s is ~2.5x observed,
+            // and is the budget actually CONFIRMED by two passing runs - 2400 s was computed but never
+            // run, and a budget nothing has passed at is a guess wearing a measurement's clothes.
+            //
+            // It was 720 s, with a comment claiming "6x S5's 120s" - stale twice over. S5's budget
+            // had since become 400 s, and more importantly the WORK changed: step C routed service
+            // spawn through the SUPERVISOR, so a respawn is now a round-trip through its 16-deep
+            // queue under ~200-task load rather than a direct kernel syscall. BS5 is the only test
+            // that does 5000 of them, so it is the only one that change re-priced. The system is
+            // fine; the number was measuring an architecture that no longer exists.
+            timeout_secs: 3000,
         },
     },
     TestSpec {
@@ -2371,6 +2383,72 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
 
 /// Poll `path` until all `expect` substrings appear, any `fail_on` substring
 /// appears, or `deadline` passes.
+/// Does `content` hold `expect` with foreign bytes SPLICED into it?
+///
+/// The kernel's serial writer takes `SERIAL_LOCK` best-effort: it spins for a bounded number of
+/// iterations and then writes ANYWAY, because an unbounded spin here wedged a core with IF=0 once
+/// (`audits/kernel-audit.md` Audit 10). Under output pressure two messages therefore interleave, and
+/// a log line arrives with another writer's bytes inside it:
+///
+/// ```text
+/// adv: A6 pass - cap table filled then rejected without pa403nic
+/// adv: A10 pass [ - kernel addrs as0x syscall args
+/// ```
+///
+/// Both are the expected line, corrupted. Reporting that as "lines not seen" sends the reader
+/// looking for a kernel bug that is not there - it cost two wrong diagnoses before the serial was
+/// read by hand. Worse, a splice landing AFTER the matched substring produces a false PASS, so the
+/// oracle is unreliable in both directions and a green run deserves the same suspicion.
+///
+/// The test is a subsequence within a bounded window: every byte of `expect`, in order, inside a
+/// span no longer than `expect.len()` plus a slack for the interleaved bytes. That is loose enough
+/// to catch a real splice and tight enough not to fire on unrelated text.
+fn spliced_match(content: &str, expect: &str) -> bool {
+    let need: Vec<char> = expect.chars().collect();
+    if need.len() < 8 { return false; }
+
+    // The discriminator is the number of GAPS, not the length of the match.
+    //
+    // A splice interleaves two whole streams, so every byte of both survives and the expected line
+    // is present as a subsequence broken by a FEW CONTIGUOUS runs of foreign bytes - one per time
+    // the other writer got in. The A9c case is the shape:
+    //
+    //   GS.base + `ad` + ?=0xffff8 + `v: A9c ` + 000 + `pass`
+    //
+    // "adv: A9c pass" with two insertions totalling 12 characters. Unrelated prose that merely
+    // happens to contain the right letters in order needs MANY gaps to do it, which is what
+    // separates the two. Counting gaps lets short needles be judged safely, where the earlier
+    // length threshold simply refused - and refused on exactly the line that recurs, because A9c is
+    // deliberately short to narrow its own splice window.
+    const MAX_GAPS: usize = 4;
+    const MAX_INSERTED: usize = 64;
+
+    let hay: Vec<char> = content.chars().collect();
+    for start in 0..hay.len() {
+        if hay[start] != need[0] { continue; }
+        let mut n = 0usize;
+        let mut gaps = 0usize;
+        let mut inserted = 0usize;
+        let mut in_gap = false;
+        let mut i = start;
+        while i < hay.len() && n < need.len() {
+            if hay[i] == need[n] {
+                n += 1;
+                in_gap = false;
+            } else {
+                if !in_gap { gaps += 1; in_gap = true; }
+                inserted += 1;
+                if gaps > MAX_GAPS || inserted > MAX_INSERTED { break; }
+            }
+            i += 1;
+        }
+        if n == need.len() && gaps > 0 && gaps <= MAX_GAPS && inserted <= MAX_INSERTED {
+            return true;
+        }
+    }
+    false
+}
+
 fn poll_serial(
     path:     &Path,
     expect:   &[&str],
@@ -2423,17 +2501,35 @@ fn poll_serial(
             // final check so we don't report a false timeout.
             std::thread::sleep(Duration::from_millis(600));
             let content = std::fs::read_to_string(path).unwrap_or_default();
-            let missing: Vec<String> = expect.iter()
+            let missing: Vec<&&str> = expect.iter()
                 .filter(|e| !content.contains(**e))
-                .map(|e| format!("\"{e}\""))
                 .collect();
             if missing.is_empty() {
                 return TestOutcome::Pass;
             }
-            return TestOutcome::Fail(format!(
-                "timeout - lines not seen: {}",
-                missing.join(", ")
-            ));
+            // Name a SPLICED line as spliced. Otherwise a corrupted-but-present line reads as a
+            // missing one, and the reader goes hunting for a kernel bug that is not there.
+            let spliced: Vec<String> = missing.iter()
+                .filter(|e| spliced_match(&content, e))
+                .map(|e| format!("\"{e}\""))
+                .collect();
+            let absent: Vec<String> = missing.iter()
+                .filter(|e| !spliced_match(&content, e))
+                .map(|e| format!("\"{e}\""))
+                .collect();
+            if absent.is_empty() {
+                return TestOutcome::Fail(format!(
+                    "SERIAL SPLICE, not a property failure: {} was PRINTED but corrupted mid-write by a concurrent writer (audits/kernel-audit.md Audit 10). Serial: {}",
+                    spliced.join(", "), path.display()
+                ));
+            }
+            let mut msg = format!("timeout - lines not seen: {}", absent.join(", "));
+            if !spliced.is_empty() {
+                msg.push_str(&format!(
+                    " (and SPLICED, printed but corrupted: {} - audits/kernel-audit.md Audit 10)",
+                    spliced.join(", ")));
+            }
+            return TestOutcome::Fail(msg);
         }
 
         std::thread::sleep(Duration::from_millis(200));
@@ -2900,7 +2996,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA3", name: "alloc_edge_cycles_5x", spec_ref: "§22 Brutal Adv BA3",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA3 pass \u{2014} 5\u{d7} alloc edge cycles rejected without panic"],
+            expect:       &["adv: BA3 pass - 5\u{d7} alloc edge cycles rejected without panic"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2908,7 +3004,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA4", name: "recv_cap_as_send_5x", spec_ref: "§22 Brutal Adv BA4",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA4 pass \u{2014} 5\u{d7} RECV-cap-as-SEND rejected; non-SEND caps rejected"],
+            expect:       &["adv: BA4 pass - 5\u{d7} RECV-cap-as-SEND rejected; non-SEND caps rejected"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2924,7 +3020,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA6", name: "cap_table_fill_5x", spec_ref: "§22 Brutal Adv BA6",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA6 pass \u{2014} 5\u{d7} cap-table fill returned None without panic"],
+            expect:       &["adv: BA6 pass - 5x fill-to-exhaustion + drain, each cycle real, no panic"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },

@@ -1460,6 +1460,14 @@ pub(super) unsafe fn init_idt() {
             IdtEntry::new(super::interrupts::xhci_msi_isr_stub as *const () as u64);
         idt[super::interrupts::EHCI_MSI_VECTOR as usize] =
             IdtEntry::new(super::interrupts::ehci_msi_isr_stub as *const () as u64);
+        // The MSI vector POOL (step D1b): eight anonymous vectors handed out to devices the kernel
+        // has no name for. Installed unconditionally and harmless until one is allocated - an
+        // unrouted vector is discarded by `route::deliver`, exactly as the two named ones are before
+        // their driver spawns.
+        for i in 0..super::interrupts::MSI_POOL_LEN {
+            idt[super::interrupts::MSI_POOL_BASE as usize + i] =
+                IdtEntry::new(super::interrupts::msi_pool_stub(i));
+        }
         idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
@@ -1699,6 +1707,13 @@ unsafe extern "C" fn pf_stub() -> ! {
 #[no_mangle]
 unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64, saved_cs: u64) -> ! {
     // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in gpf_stub for ring-3).
+    // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
+    // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
+    // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
+    // lock unconditionally also bypassed it when ANOTHER core was mid-line, and the two lines then
+    // interleaved byte by byte. This waits BRIEFLY for that case and writes unlocked otherwise, so
+    // the unavoidable case is unchanged and the avoidable one stops corrupting the log.
+    let __fault_lock = crate::arch::x86_64::serial_fault_lock_acquire();
     unsafe {
         if saved_cs & 3 != 0 {
             serial_puts_nolck(b"USER GPF (killing task): error_code=");
@@ -1712,6 +1727,7 @@ unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64, saved_cs: u64)
         serial_hex64_nolck(saved_cs);
         serial_puts_nolck(b"\n");
     }
+    crate::arch::x86_64::serial_fault_lock_release(__fault_lock);
     // Ring-3 #GP: the service misbehaved, not the kernel - kill it and reschedule (kill_current does
     // not return for a ring-3 fault). Only a ring-0 #GP (or a defensive fall-through) halts all cores.
     if saved_cs & 3 != 0 {
@@ -1777,6 +1793,13 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
     // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
     // Use different prefixes so monitors can distinguish: USER PF and USER-COPY PF are
     // graceful (offending task killed, system continues); KERNEL PF is a fatal crash.
+    // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
+    // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
+    // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
+    // lock unconditionally also bypassed it when ANOTHER core was mid-line, and the two lines then
+    // interleaved byte by byte. This waits BRIEFLY for that case and writes unlocked otherwise, so
+    // the unavoidable case is unchanged and the avoidable one stops corrupting the log.
+    let __fault_lock = crate::arch::x86_64::serial_fault_lock_acquire();
     unsafe {
         if error_code & (1 << 2) != 0 {
             serial_puts_nolck(b"USER PF: fault_addr=");
@@ -1800,6 +1823,7 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
         serial_hex64_nolck(kgs_base);
         serial_puts_nolck(b"\n");
     }
+    crate::arch::x86_64::serial_fault_lock_release(__fault_lock);
     // Ring-3 #PF (error_code bit 2 = U/S set): the service touched unmapped memory, not the kernel -
     // kill it and reschedule (§10.3; kill_current does not return for a ring-3 fault). A user-copy
     // fault (CPL0 fault on a user pointer the kernel was copying for a syscall, V1) likewise kills the
@@ -1871,6 +1895,13 @@ unsafe extern "C" fn exception_halt() -> ! {
 unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) {
     // Identify the likely frame layout by finding the CS slot.
     // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x28 (user).
+    // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
+    // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
+    // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
+    // lock unconditionally also bypassed it when ANOTHER core was mid-line, and the two lines then
+    // interleaved byte by byte. This waits BRIEFLY for that case and writes unlocked otherwise, so
+    // the unavoidable case is unchanged and the avoidable one stops corrupting the log.
+    let __fault_lock = crate::arch::x86_64::serial_fault_lock_acquire();
     unsafe {
         serial_puts_nolck(b"\nEXCEPTION: [");
         serial_hex64_nolck(w0);
@@ -1894,6 +1925,7 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
         }
         serial_puts_nolck(b"\n");
     }
+    crate::arch::x86_64::serial_fault_lock_release(__fault_lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,6 +2028,13 @@ unsafe extern "C" fn exc_stub_ec() -> ! {
 #[no_mangle]
 unsafe extern "C" fn exc_dispatch(w0: u64, w1: u64, w2: u64, w3: u64, cs: u64) -> ! {
     // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in the stub for ring-3).
+    // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
+    // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
+    // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
+    // lock unconditionally also bypassed it when ANOTHER core was mid-line, and the two lines then
+    // interleaved byte by byte. This waits BRIEFLY for that case and writes unlocked otherwise, so
+    // the unavoidable case is unchanged and the avoidable one stops corrupting the log.
+    let __fault_lock = crate::arch::x86_64::serial_fault_lock_acquire();
     unsafe {
         if cs & 3 != 0 {
             serial_puts_nolck(b"\nUSER EXCEPTION (killing task): [");
@@ -2013,6 +2052,7 @@ unsafe extern "C" fn exc_dispatch(w0: u64, w1: u64, w2: u64, w3: u64, cs: u64) -
         serial_hex64_nolck(cs);
         serial_puts_nolck(b"\n");
     }
+    crate::arch::x86_64::serial_fault_lock_release(__fault_lock);
     if cs & 3 != 0 {
         crate::task::kill_current(); // ring-3: task dies, reschedule (does not return for a ring-3 fault)
     }

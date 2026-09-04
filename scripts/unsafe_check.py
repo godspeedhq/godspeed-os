@@ -2,9 +2,9 @@
 """Verify every unsafe usage in kernel/src/ is accounted for in audits/unsafe-audit.md.
 
 Rules enforced:
-  - A file not in the audit that gains unsafe lines          → FAIL
-  - A file whose unsafe count exceeds its audited baseline   → FAIL
-  - A file whose unsafe count dropped below its baseline     → INFO
+  - A file not in the audit that gains unsafe lines          -> FAIL
+  - A file whose unsafe count exceeds its audited baseline   -> FAIL
+  - A file whose unsafe count dropped below its baseline     -> INFO
     (safe to update the audit to lock in the reduction)
 
 Every FAIL means either a new unsafe block was added without a SAFETY comment
@@ -110,12 +110,12 @@ def main() -> int:
             )
         elif actual > audit[rel]:
             failures.append(
-                f"  FAIL  {rel}: unsafe count grew {audit[rel]} → {actual} - "
+                f"  FAIL  {rel}: unsafe count grew {audit[rel]} -> {actual} - "
                 f"add // SAFETY: comment(s) and update audits/unsafe-audit.md"
             )
         elif actual < audit[rel]:
             infos.append(
-                f"  INFO  {rel}: unsafe count shrank {audit[rel]} → {actual} "
+                f"  INFO  {rel}: unsafe count shrank {audit[rel]} -> {actual} "
                 f"(update audit to lock in the reduction)"
             )
 

@@ -1626,3 +1626,220 @@ all-interrupt count.
 
 The message also said `last running task slot 224` when 224 is `IDLE == MAX_TASKS`, the sentinel for
 "no task at all" - sending a reader to hunt a task that does not exist. It now says `IDLE (no task)`.
+
+---
+
+## Audit 10 - the serial write can splice one log line into another (2026-09-01, `feat/supervisor-owns-images`)
+
+**Status: FOUND, NOT FIXED. Pre-existing, not caused by the vector-pool work that found it.**
+
+### The evidence
+
+`osdev test adv` fails intermittently, and the failing test MOVES between runs: four runs of the same
+binary gave `{}`, `{A10}`, `{A3, A9}`, and `{}`. A test whose result changes without the code
+changing is worth chasing, because it makes every other result in that suite worth less.
+
+The harness saves each test's serial (`build/tests/6_ADVERSARIAL/<id>-<name>.log`), and the failing
+A10 run holds the answer directly. Expected:
+
+```
+adv: A10 pass - kernel addrs as syscall args
+```
+
+Actually on the wire:
+
+```
+adv: A10 pass [ - kernel addrs as0x syscall args
+```
+
+Another writer's bytes (`[`, `0x` - the shape of a `kprintln!`) are spliced INTO the middle of the
+line, twice. The test did not fail because the property under test broke; it failed because the
+kernel corrupted the sentence saying so.
+
+### CORRECTION (2026-09-01): the mechanism below is WRONG. The real cause is the FAULT path.
+
+The section that follows blamed `SERIAL_LOCK`'s best-effort give-up, reasoning that two line-atomic
+writers could only interleave if one gave up. The reasoning was sound and the conclusion was wrong,
+because it assumed both writers go through `log::write_fmt`. One does not.
+
+**The four fault handlers write to COM1 with no lock at all.** `pf_handler`, `gpf_handler`,
+`exc_dispatch` and `exception_halt_handler` emit through `serial_puts_nolck` / `serial_hex64_nolck`,
+and the comment above them says why:
+
+> Use lock-free serial to avoid a deadlock if LOG_LOCK is already held by the kprintln that was
+> interrupted (interrupt gate: IF=0).
+
+That reasoning is CORRECT, for the case it names. A page fault can interrupt a `kprintln` **on its own
+core** that holds the lock; waiting for it would self-deadlock, and the fault would go unreported.
+
+The defect is that the remedy is **over-broad**. It bypasses the lock unconditionally - including when
+another core holds it, or when nobody does. Those are exactly the cases where waiting was both safe
+and cheap, and they are what produced every splice observed. The `adv` suite makes the collision
+routine: the adversarial build deliberately faults probes (A14/A15/C2) while other services log, so a
+PF diagnostic and a service log line race constantly. Hence `adv: A9c pass` zipped through
+`per_core_ursp=... GS.base=...`.
+
+Everything else the section below records - the evidence, the decomposition, the false-PASS analysis -
+stands. Only the attributed cause was wrong. It is corrected in place rather than rewritten, because
+how a wrong mechanism survived a page of careful reasoning is the more useful record: BOTH writers
+looked line-atomic, and the one that was not never appeared in the paths I read.
+
+### THE FIX (2026-09-01)
+
+The unavoidable case stays unavoidable; the avoidable one stops corrupting the log.
+
+`SERIAL_LOCK` now records its OWNER (`SERIAL_LOCK_OWNER`, `core_id + 1`), which lets the fault path
+tell the two situations apart:
+
+- **This core already owns it** - we interrupted our own `kprintln`. Return immediately and write
+  unlocked, exactly as before. Spinning could not help and would only delay the fault report.
+- **Anyone else, or nobody** - spin BRIEFLY (`SERIAL_FAULT_SPIN_CAP`, 50k, two orders below the
+  ordinary cap because a fault handler must not dawdle) and take the lock if it comes free. No splice.
+- **Contended past the budget** - write unlocked, as before, and count it.
+
+Each of the four handlers brackets its emit block with `serial_fault_lock_acquire` /
+`serial_fault_lock_release`. The release is placed inside the handler and **before any divergence** -
+`kill_current()` and `halt_all_cores()` both come after it - so the lock can never be stranded, which
+would silence all logging. That property is checked, not assumed.
+
+The residual is REPORTED rather than left silent: `InspectKernel` query 26 returns how many
+diagnostics were written unlocked. 0 means every diagnostic that boot was emitted cleanly. It is
+ungated - a kernel-health counter that discloses no task state.
+
+### HARDWARE-CONFIRMED (2026-09-01, T630), and what is left
+
+The T630 ran 8 selfchecks (all 0 fails) and 4 chaos runs of 100 rounds, with the keyboard moved from
+EHCI to xHCI mid-session. 0 kernel panics, 0 liveness wedges.
+
+**The class this fix targets is gone.** The canary is the chaos report line - peak concurrent logging,
+and the line that came out unreadable on both the Pi 4 and the T630 before:
+
+```
+before:  total: 100 bouods, 58E kClls, 4=7 0looded, 100 6emcpressuxe, 100 spawns. k rnel:xhci...
+after:   total: 100 rounds, 622 kills, 519 flooded, 100 mem-pressure, 100 spawns. kernel: alive
+```
+
+Intact all four times. Mid-token corruption measured across the whole log: **0 in 55,457 lines**,
+against 2 in 27,485 lines before - twice the output, none of the damage. In QEMU, `osdev test adv`
+went to 15/0 on three consecutive runs, the best that suite has ever been (15/0, 14/1, 13/2, 15/0,
+14/1 beforehand).
+
+**RESIDUAL, RECORDED NOT FIXED: line-boundary joins from the CONSOLE path.**
+
+About 2,980 lines in that same log (~5%) carry a short fragment glued to their START, e.g.
+
+```
+[15:17:14.025] seehci: SPLIT device (hub port 4): VID=0x046d PID=0xc30a
+```
+
+where `se` belongs to another message. This is a DIFFERENT mechanism and predates this fix:
+`console_write_byte` takes `SERIAL_LOCK` **per byte**, so console output (shell echo, a service's
+chaos report) interleaves with log lines at byte granularity. The commit that fixed the fault path
+added a function and removed or modified NOTHING in `serial_write_byte` or
+`serial_write_bytes_lockfree` - the diff shows additions only - so this class cannot have come from it.
+
+**Why it is left, and why that is not the same judgement as before.** These joins prepend or append
+fragments; they do NOT corrupt line interiors. That is measurable, not assumed: the mid-token count is
+0 while these number in the thousands. It is also exactly why `adv` reaches 15/0 - a substring match
+still finds its expected text contiguous. The fault-path splice could split a line THROUGH the matched
+text, which is what produced false failures AND the false PASS on A6. So the class that made the test
+suite lie is closed; what remains makes logs untidy.
+
+Fixing it means batching console output into whole lines before taking the lock, which is a real change
+to the INTERACTIVE path (keystroke echo is inherently per-byte) for a cosmetic gain. Recorded here so
+the next reader knows it is a known residual with a known cause and a known cost, rather than
+rediscovering it as a mystery (§26.7).
+
+### The mechanism (AS ORIGINALLY WRITTEN - see the correction above)
+
+Both writers are already line-atomic by design. `kprintln!` and the service `log` syscall share
+`log::write_fmt`, whose `LogSink` stages up to 512 bytes and emits them through ONE call to
+`serial_write_bytes_lockfree` - a single `SERIAL_LOCK` hold per message. That was itself a fix for
+this class of problem, and it is not what is failing.
+
+What splices is the lock's **best-effort give-up**. Both `serial_write_byte` and
+`serial_write_bytes_lockfree` spin for at most `SERIAL_LOCK_SPIN_CAP` (5,000,000) and then **write
+anyway**:
+
+```rust
+let mut got = false;
+while t < SERIAL_LOCK_SPIN_CAP { ...try acquire...; t += 1; }
+// proceeds whether or not `got`
+```
+
+That give-up is deliberate and correct in intent: an unbounded spin here wedged a core with IF=0
+once already (`bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md`), so the cap must stay. But the
+consequence has never been stated: **when the cap is exhausted the kernel silently interleaves two
+messages**, and a UART is slow enough for that to be reachable - a 45-byte line is 45 bounded THRE
+polls with the lock held, which another core under load can outlast.
+
+It correlates with host load, which fits: every failing run tonight had other work running on the
+machine, and both runs with the host to itself were clean.
+
+### It also causes FALSE PASSES, which is worse
+
+A later run made the severity clearer. In one `osdev test adv` run, three separate splices landed:
+
+```
+adv: A6 pass - cap table filled then rejected without pa403nic     <- `403` inside "panic"
+adv: A10 pass [ - kernel addrs as0x syscall args                   <- `[` and `0x` mid-line
+<clobbered>A10 pass -                                              <- the "adv: " prefix destroyed
+```
+
+A6 **PASSED**. The harness matches a substring, and that splice landed after the end of the matched
+prefix, so a corrupted line satisfied the check. A10 failed only because its splice happened to hit
+the matched part.
+
+So the failure mode is not "a test sometimes fails". It is **the oracle is unreliable in both
+directions**: which way a given splice resolves depends only on where in the line it lands. A green
+suite is therefore weaker evidence than it looks, and that is the part worth acting on.
+
+### The clearest single instance, because it decomposes exactly
+
+```
+000000000000000 per_core_ursp=0x000000007ffffff8 GS.basead?=0xffff8v: A9c 000pass
+```
+
+That is two whole lines zipped together, and every byte of both survives:
+
+```
+GS.base | ad | ?=0xffff8 | v: A9c  | 000 | pass
+kernel  | svc| kernel    | svc     | ker | svc
+```
+
+`adv: A9c pass` is present with two insertions totalling twelve characters. Nothing was lost - the
+writers simply alternated. That is what a bounded-spin give-up produces, and it is why the corrupted
+line is close to the length of the original rather than mangled beyond recognition.
+
+It is also why the harness can now RECOGNISE one: a splice leaves the expected line as a subsequence
+broken by a FEW CONTIGUOUS runs of foreign bytes, where unrelated text containing the same letters
+needs many. Counting gaps (at most 4 insertions, at most 64 characters) separates them cleanly - it
+catches all four splices observed here and rejects prose that merely contains the letters in order.
+The first attempt used a length threshold instead and refused to judge anything under 24 characters,
+which excluded `adv: A9c pass` - the line that recurs most, and short ON PURPOSE precisely to narrow
+its own splice window.
+
+### Why it matters beyond a flaky test
+
+A spliced log line is a SILENT failure of the one instrument every other diagnosis depends on
+(invariant 12, §26.7). Tonight it produced two wrong conclusions before the serial was read: first
+that A9 might be a regression from the `IMAGE_SPAWN` gate, then that the log path was atomic and so
+splicing could not be the cause. Both were reasoning; the serial file settled it in one line.
+
+### What is NOT the fix
+
+Removing the cap. That reinstates a known core wedge, and §25 is explicit that a fix which needs a
+violation is the wrong fix.
+
+### Options, for a decision rather than a drive-by change
+
+1. **Count the give-ups and expose the count** (`InspectKernel`). No change to the byte stream and no
+   new kernel responsibility - it makes an existing silent event visible, which is what invariant 12
+   asks. A corrupted log becomes explainable instead of mysterious, and the harness could report it.
+2. **Raise the cap.** Reduces frequency, does not remove the case, and the number wants justifying
+   against the wedge it exists to prevent.
+3. **Leave it and record it here.** What is happening now.
+
+Recorded rather than papered over (§26.7): the fix touches the most safety-critical output path in
+the system, on a defect that predates this branch, so it is written down for a decision rather than
+changed unprompted alongside unrelated work.

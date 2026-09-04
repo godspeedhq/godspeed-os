@@ -8,6 +8,13 @@
 # Its authority is named here rather than implied by ring 0: SERVICE_CONTROL to kill, SPAWN to restart,
 # FIRE_IRQ to inject a test interrupt, INTROSPECT to read the byte. All four are kernel by-name grants
 # (finding C4-1), so this file understates them - stated plainly rather than left to be discovered.
+#
+# RESTART is FORWARDED to the supervisor rather than performed here (step C,
+# docs/service-ownership.md). This service used to kill and then ask the KERNEL to spawn by name,
+# which only worked because the kernel held every service image; restart authority is the
+# supervisor's (14.4), and once an image lives there it is the only thing that can respawn it. The
+# `ipc_send` below is that request path - not new authority, since SERVICE_CONTROL and SPAWN already
+# let this service kill and start things directly, but the same authority routed correctly.
 name    = "control"
 version = "0.1.0"
 
@@ -16,4 +23,5 @@ request = "4MiB"
 limit   = "8MiB"
 
 [capabilities]
+ipc_send    = ["supervisor"]
 log_write   = true

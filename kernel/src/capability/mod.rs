@@ -119,6 +119,42 @@ pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);
 /// gated syscall is a smaller, more visible surface than an ungated command interpreter.
 pub const FIRE_IRQ_RESOURCE: ResourceId = ResourceId(14);
 
+/// Start a task from a CALLER-SUPPLIED IMAGE (`SpawnImage`, syscall 52). Held ONLY by the supervisor.
+///
+/// Distinct from `SPAWN`, and that distinction is the whole point. `SPAWN` means "start a service the
+/// system already knows"; this means "start ARBITRARY BYTES, under a name you choose". They were the
+/// same capability until now, so every SPAWN holder - the shell, `chaos`, `control`, every probe -
+/// could introduce new code under a real service's name in the window while that service is dead, and
+/// clients reacquiring by name (§14.3) would wire themselves to it.
+///
+/// That widening arrived with step C (`docs/service-ownership.md`): before it, the kernel held every
+/// image and a spawner could only ask for one the kernel already had. Once images moved to the
+/// supervisor, `SpawnImage` had to accept bytes from userspace - and it was gated by the capability
+/// the shell happens to hold for entirely unrelated reasons.
+///
+/// NOT DELEGATABLE, deliberately: it is absent from `SUPERVISOR_DELEGATABLE`, so the supervisor cannot
+/// pass it on even to a service it trusts. A delegatable version would re-open the hole one grant
+/// later, and nothing else has a reason for it - the only two callers in the tree are the supervisor's
+/// own `spawn_by_image` and `spawn_probe_row`. Everything else asks the supervisor over IPC.
+///
+/// This does not make a compromised supervisor safe - it is the trusted root and always could do this.
+/// It stops the authority leaking to the twelve services that merely wanted to start something.
+pub const IMAGE_SPAWN_RESOURCE: ResourceId = ResourceId(15);
+
+/// Authority to read PCI configuration space through the legacy CF8/CFC port pair (step D2).
+///
+/// Held by ONE service - `hw-enumerator` - and READ-ONLY, permanently. CF8 selects which config
+/// register CFC reaches, so CFC WRITE authority is effectively write access across the whole of PCI
+/// configuration space: every BAR, every command register, every device. There is no narrower form
+/// of it at port granularity, because the target is chosen by data rather than by the interface. So
+/// the write side is not granted, and if a future need requires configuration-space mutation a
+/// different mechanism must be designed rather than this one widened (docs/service-ownership.md, D2).
+///
+/// The kernel enforces WHICH PORTS this permits and nothing else. It does not know that 0xCF8 means
+/// PCI configuration, how to walk a bus, or what a class code identifies - that is hardware SEMANTICS
+/// and it lives in the service (§26.10).
+pub const PCI_CFG_RESOURCE: ResourceId = ResourceId(16);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -136,5 +172,7 @@ pub fn init() {
     table::register_resource(GPIO_DEVICE_RESOURCE);
     table::register_resource(USB_DISK_RESOURCE);
     table::register_resource(SET_CLOCK_RESOURCE);
+    table::register_resource(IMAGE_SPAWN_RESOURCE);
+    table::register_resource(PCI_CFG_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

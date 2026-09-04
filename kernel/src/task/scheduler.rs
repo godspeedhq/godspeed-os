@@ -22,6 +22,7 @@ use crate::ipc::message::Message;
 use crate::ipc::routing;
 use crate::smp::percpu::{num_cores, PerCore, PerCoreMut};
 use crate::smp::SpinLock;
+use crate::smp::names::NameTable;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +42,69 @@ static mut TASK_CAP:   [MaybeUninit<CapTable>; MAX_TASKS] =
 /// and `block_and_reschedule` (CAS) are race-free (§8.4 lost-wakeup fix).
 static TASK_STATE: [AtomicU8; MAX_TASKS] =
     [const { AtomicU8::new(TaskState::Dead as u8) }; MAX_TASKS];
-static mut TASK_NAME:  [&str; MAX_TASKS]       = [""; MAX_TASKS];
+/// Per-task NAME, owned rather than borrowed.
+///
+/// This was `[&'static str; MAX_TASKS]`, which quietly required every task name to be a string
+/// literal compiled into the kernel - and that is why the kernel holds a `service_config` row per
+/// service: a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
+/// the task it is spawning, which is the whole point of moving the service catalogue out of ring 0
+/// (`docs/probe-params-design.md`).
+///
+/// Bounded and flat (26.6): a fixed 32 bytes per slot, no heap, no interner, no lifetimes. 32 is what
+/// `TaskStat` already exposes to userspace, so the two representations now agree instead of one being
+/// converted into the other.
+const TASK_NAME_MAX: usize = 32;
+
+/// Per-task NAME, OWNED rather than borrowed.
+///
+/// This was `[&'static str; MAX_TASKS]`, which quietly required every task name to be a string
+/// literal compiled into the kernel - and that is why the kernel held a `service_config` row per
+/// service: a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
+/// the task it is spawning (`docs/probe-params-design.md`).
+///
+/// The interior mutability that needs lives in `smp::names::NameTable`, a permitted layer (18.1),
+/// so this file grows no `unsafe` (18.5). 32 bytes is what `TaskStatRaw` already exposes to
+/// userspace, so the two representations agree instead of one being converted into the other.
+static TASK_NAMES: NameTable<MAX_TASKS, TASK_NAME_MAX> = NameTable::new();
+
+/// This slot's name, or `""` for a slot that has none.
+pub fn task_name(slot: usize) -> &'static str { TASK_NAMES.get(slot) }
+
+/// Per-task DECLARED SEND-PEERS, recorded at spawn.
+///
+/// The kernel authorises `AcquireSendCap` for a name a service DECLARED as a peer, so a service can
+/// reacquire a peer that restarted (14.2/14.3) without holding the broad ACQUIRE_ANY. That check used
+/// to read `service_config` - the kernel catalogue - which silently answers "declares nothing" for a
+/// service whose config has moved to the supervisor (step C). The effect was a supervisor-owned
+/// service being permanently unable to reacquire a restarted peer: `ping` looping
+/// "reacquire failed, retrying next tick" forever after `pong` moved core.
+///
+/// So the kernel records what it was ACTUALLY wired with, which is the honest source anyway - the
+/// wiring, not a declaration it has to look up somewhere. Bounded and flat (26.6): one row per
+/// (task, peer) slot, reusing the audited `NameTable` primitive so this adds no `unsafe`.
+static TASK_PEERS: crate::smp::names::AtomicNameSet<
+    { MAX_TASKS * crate::task::MAX_SEND_PEERS },
+    { crate::task::PEER_NAME_BYTES }> = crate::smp::names::AtomicNameSet::new();
+
+/// Record this task's declared send-peers. Called from the spawn path, with the slot reserved.
+///
+/// SAFE, deliberately: `AtomicNameSet` stores every byte atomically, so this needs no `unsafe` and
+/// `task/scheduler.rs` stays at its 18.5 grandfathered floor.
+pub fn set_task_peers(slot: usize, peers: &[&str]) {
+    if slot >= MAX_TASKS { return; }
+    for i in 0..crate::task::MAX_SEND_PEERS {
+        TASK_PEERS.set(slot * crate::task::MAX_SEND_PEERS + i,
+                       peers.get(i).copied().unwrap_or(""));
+    }
+}
+
+/// Did this task declare `peer` as a send-peer at spawn?
+pub fn task_declares_peer(slot: usize, peer: &str) -> bool {
+    if slot >= MAX_TASKS || peer.is_empty() { return false; }
+    (0..crate::task::MAX_SEND_PEERS)
+        .any(|i| TASK_PEERS.matches(slot * crate::task::MAX_SEND_PEERS + i, peer))
+}
+
 static TASK_VALID: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Which core each task is pinned to (set at enqueue time; immutable after).
 static mut TASK_CORE:  [u32; MAX_TASKS]        = [0u32; MAX_TASKS];
@@ -66,7 +129,8 @@ static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
 const NAME_RESTART_MAX: usize = 64;
 
 struct NameRestart {
-    name:  &'static str,
+    name:  [u8; TASK_NAME_MAX],
+    len:   u8,
     count: u64,
 }
 
@@ -78,7 +142,7 @@ struct NameRestartTable {
 impl NameRestartTable {
     const fn new() -> Self {
         Self {
-            entries: [const { NameRestart { name: "", count: 0 } }; NAME_RESTART_MAX],
+            entries: [const { NameRestart { name: [0u8; TASK_NAME_MAX], len: 0, count: 0 } }; NAME_RESTART_MAX],
             len:     0,
         }
     }
@@ -91,13 +155,13 @@ static NAME_RESTART: SpinLock<NameRestartTable> = SpinLock::new(NameRestartTable
 /// bumped - reads 0. READ-ONLY: the increment happens at death and only for the restartable set, so
 /// re-running a transient command (observe-*, greet, ...) is NOT a restart ("RESTARTS = it blew up,
 /// not it was legitimately closed").
-fn next_restart_count(name: &'static str) -> u64 {
+fn next_restart_count(name: &str) -> u64 {
     if name.is_empty() {
         return 0;
     }
     let tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
-        if tbl.entries[i].name == name {
+        if &tbl.entries[i].name[..tbl.entries[i].len as usize] == name.as_bytes() {
             return tbl.entries[i].count;
         }
     }
@@ -109,20 +173,24 @@ fn next_restart_count(name: &'static str) -> u64 {
 /// `block-driver`, `shell`, `xhci`, `ehci`, `logger`, `supervisor`). Transient utilities the shell
 /// re-invokes are never bumped, so they never show a restart. The respawn reads the new count via
 /// `next_restart_count`; the first death of a name records count 1.
-fn bump_name_restart(name: &'static str) {
+fn bump_name_restart(name: &str) {
     if name.is_empty() {
         return;
     }
     let mut tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
-        if tbl.entries[i].name == name {
+        if &tbl.entries[i].name[..tbl.entries[i].len as usize] == name.as_bytes() {
             tbl.entries[i].count = tbl.entries[i].count.saturating_add(1);
             return;
         }
     }
     if tbl.len < NAME_RESTART_MAX {
         let len = tbl.len;
-        tbl.entries[len] = NameRestart { name, count: 1 };
+        let b = name.as_bytes();
+        let n = b.len().min(TASK_NAME_MAX);
+        let mut nb = [0u8; TASK_NAME_MAX];
+        nb[..n].copy_from_slice(&b[..n]);
+        tbl.entries[len] = NameRestart { name: nb, len: n as u8, count: 1 };
         tbl.len = len + 1;
     } else {
         crate::kprintln!(
@@ -269,6 +337,30 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // Set by handle_recv when it delivers a kernel-badged (file-cap-invoke) message; read+cleared
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// The PCI BDF this task's driver was given at spawn, or `0xFFFF` for a task that drives no device.
+///
+/// **The kill path used to look this up by NAME.** It carried a `match task_name { "xhci" => …,
+/// "ehci" => …, "nic-driver" => …, _ => AHCI_BDF }` so it could quiesce the right controller when a
+/// driver died - which is the kernel holding a table of which service drives which device, the exact
+/// knowledge step D exists to remove. It also could not be right for a fifth driver: anything not in
+/// that list fell through to the AHCI arm and quiesced the disk controller on the death of a service
+/// that had nothing to do with it.
+///
+/// The spawn already resolved a BDF for this task. Remembering it costs one word per slot and makes
+/// the kill path work for any driver, named or not, without the kernel knowing what any of them is.
+static TASK_HW_BDF: [core::sync::atomic::AtomicU32; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0xFFFF) }; MAX_TASKS];
+
+/// Record the device a spawning task was given. `0xFFFF` means none.
+pub fn set_task_hw_bdf(slot: usize, bdf: u32) {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].store(bdf, Ordering::Relaxed); }
+}
+
+/// The device this task was given at spawn, or `0xFFFF`.
+pub fn task_hw_bdf(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
+}
 
 /// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
 /// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
@@ -613,7 +705,7 @@ pub fn release_task_slot(slot: usize) {
 /// * IF=0 (syscall context).
 pub unsafe fn commit_task(
     slot:             usize,
-    name:             &'static str,
+    name:             &str,
     ctx:              TaskContext,
     is_user:          bool,
     kernel_stack_top: u64,
@@ -622,7 +714,7 @@ pub unsafe fn commit_task(
     // SAFETY: slot is reserved; IF=0 prevents concurrent modification.
     unsafe {
         TASK_CTX[slot].write(ctx);
-        TASK_NAME[slot]             = name;
+        TASK_NAMES.set(slot, name);
         TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
@@ -647,7 +739,7 @@ pub unsafe fn commit_task(
 /// to avoid a 1 536-byte `CapTable` on the kernel stack.
 #[allow(dead_code)]
 pub fn enqueue(
-    name:             &'static str,
+    name:             &str,
     ctx:              TaskContext,
     caps:             CapTable,
     core_id:          u32,
@@ -662,7 +754,7 @@ pub fn enqueue(
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
-                TASK_NAME[i]             = name;
+                TASK_NAMES.set(i, name);
                 TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
@@ -963,11 +1055,11 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             core:        TASK_CORE[slot],
             mem_used:    TASK_ALLOC_BYTES[slot],
             mem_limit:   TASK_LIMIT_BYTES[slot],
-            name:        TASK_NAME[slot],
+            name:        task_name(slot),
             // DERIVED, not stored (Commandment III): the restart lineage's one truth is NAME_RESTART
             // (the per-name counter). A live instance's count IS its name's count - so we recompute it
             // here rather than cache a per-slot copy that could drift from the source.
-            restart_count: next_restart_count(TASK_NAME[slot]),
+            restart_count: next_restart_count(task_name(slot)),
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
@@ -1938,11 +2030,28 @@ pub fn wake_by_slot(slot: usize, result: i64) {
 
 /// Find the slot of a live task by name. Returns `None` if not found or dead.
 pub fn find_task_by_name(name: &str) -> Option<usize> {
+    find_task_by_name_excluding(name, usize::MAX)
+}
+
+/// Find a live task named `name` in any slot but `exclude`.
+///
+/// The exclusion exists for ONE caller: the kill path, asking whether some OTHER instance still
+/// answers to the name it is about to unregister. `find_task_by_name` cannot serve there - it returns
+/// the FIRST match, the dying task's own slot may still read non-Dead at that point, and it may sit at
+/// a lower index than the duplicate being looked for, so the first match can be the caller itself and
+/// the duplicate go unseen.
+///
+/// Written as the general form with `find_task_by_name` delegating to it, rather than as a second
+/// function, DELIBERATELY: a separate copy would have needed its own `unsafe` block, and this file's
+/// unsafe count is a grandfathered floor (§18.5) that may fall but not rise. A diagnostic does not
+/// earn a constitutional amendment. Same single scan, same `unsafe`, one more parameter.
+pub fn find_task_by_name_excluding(name: &str, exclude: usize) -> Option<usize> {
     // SAFETY: read-only scan; caller holds no locks.
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASK_VALID[i].load(Ordering::Acquire)
-                && TASK_NAME[i] == name
+            if i != exclude
+                && TASK_VALID[i].load(Ordering::Acquire)
+                && task_name(i) == name
                 && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
             {
                 return Some(i);
@@ -2037,7 +2146,7 @@ pub fn kill_task_by_slot(slot: usize) {
     unsafe {
 
         // Capture identity before any slot state changes.
-        let task_name = TASK_NAME[slot];
+        let task_name = crate::task::scheduler::task_name(slot);
         let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
         // If this task was itself blocked in a synchronous CALL, drop its outstanding-call record so
@@ -2127,7 +2236,54 @@ pub fn kill_task_by_slot(slot: usize) {
             // (fs/block-driver staying dead after a storm killed them while the supervisor was
             // mid-respawn, their death-notifications lost). Normal restarts are unaffected: the service
             // re-registers on respawn; clients briefly see a lookup miss and retry.
-            crate::ipc::names::unregister_endpoint(task_name, ep_id);
+            // WHAT IT DID, not just that it ran. The endpoint-id guard above is what makes a duplicate
+            // instance survivable, and until now nothing said whether it was working. On the Pi 2 a
+            // `block-driver` that was alive the whole time became unreachable by name after a storm,
+            // and the only way to tell whether the guard had been defeated was to infer it from the
+            // wreckage minutes later. Now the moment reports itself.
+            //
+            // Silent in a healthy run: a routine death clears its own entry with nothing else alive
+            // under that name, and says nothing.
+            let outcome = crate::ipc::names::unregister_endpoint(task_name, ep_id);
+            let live_twin = find_task_by_name_excluding(task_name, slot);
+            match outcome {
+                // THE BUG, caught in the act: the name has just stopped resolving while a live task
+                // still answers to it. Every client that reacquires by name now fails, and the service
+                // they are failing to reach is running perfectly - which is why the symptom always
+                // points at the wrong place.
+                crate::ipc::names::UnregisterOutcome::Cleared if live_twin.is_some() => {
+                    crate::kprintln!(
+                        "ipc::names: '{}' UNREGISTERED by dying endpoint {:?} (slot {}) while slot {} is STILL ALIVE under that name - the name now resolves to NOTHING and clients cannot reach the live instance",
+                        task_name, ep_id, slot, live_twin.unwrap());
+                }
+                // The guard doing its job: a stale duplicate died after a newer instance claimed the
+                // name. Reported because it means two instances existed, which is itself a defect
+                // worth counting even though this half of it is handled.
+                crate::ipc::names::UnregisterOutcome::KeptNewer(current) => {
+                    crate::kprintln!(
+                        "ipc::names: '{}' kept - dying endpoint {:?} (slot {}) is stale, the name belongs to {:?}",
+                        task_name, ep_id, slot, current);
+                }
+                // EVERY clear, not only the anomalous ones. The anomaly detector above stayed silent
+                // through an outage in which `block-driver` was demonstrably alive and its name
+                // demonstrably did not resolve - so the mutation that removed it was, by the detector's
+                // reckoning, ORDINARY. That is precisely the case with no record.
+                //
+                // A name directory has three mutations - registered, cleared, evicted - and until all
+                // three are on the wire, "the name is gone" is a state with no history. One line per
+                // service death is the same order as the `kill_task` line beside it, and the transport
+                // now carries the volume without losing anything.
+                crate::ipc::names::UnregisterOutcome::Cleared => {
+                    crate::name_trace!("ipc::names: '{}' cleared by its own dying endpoint {:?} (slot {})",
+                        task_name, ep_id, slot);
+                }
+                crate::ipc::names::UnregisterOutcome::NotFound => {
+                    // Already gone before this death ran. Worth saying: it means something ELSE removed
+                    // it, and that something is what an outage would be looking for.
+                    crate::kprintln!("ipc::names: '{}' was ALREADY absent when endpoint {:?} (slot {}) died - something else removed it",
+                        task_name, ep_id, slot);
+                }
+            }
 
             // Driver-death IRQ-route teardown (Item 2, driver-death quiesce), BEFORE freeing the id.
             // A driver that registered a hw_interrupt line left a route in IRQ_TABLE; the id is about to
@@ -2175,7 +2331,10 @@ pub fn kill_task_by_slot(slot: usize) {
         // only view of recovery said nothing happened.
         if matches!(task_name,
             "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console" | "supervisor"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control")
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
+            // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
+            // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
+            | "hw-enumerator")
         {
             bump_name_restart(task_name);
         }
@@ -2219,7 +2378,11 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::bootcon::reclaim_on_death();
         }
         if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
+            // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
+            // still come back - on the next reconcile sweep - which is exactly why the omission hides:
+            // not dead forever, just dead for a while, and nothing says so.
+            | "hw-enumerator") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
@@ -2259,12 +2422,11 @@ pub fn kill_task_by_slot(slot: usize) {
         {
             use core::sync::atomic::Ordering::Relaxed;
             use crate::arch::imp::pci;
-            let bdf = match task_name {
-                "xhci"       => pci::XHCI_BDF.load(Relaxed),
-                "ehci"       => pci::EHCI_BDF.load(Relaxed),
-                "nic-driver" => pci::NIC_BDF.load(Relaxed),
-                _            => pci::AHCI_BDF.load(Relaxed), // block-driver
-            };
+            // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which
+            // service drives which controller. See `TASK_HW_BDF`. A task that drives nothing reports
+            // 0xFFFF and the quiesce below is skipped, which is also the fix for the old default arm
+            // quiescing the DISK on the death of any service it did not recognise.
+            let bdf = task_hw_bdf(slot);
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
             // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI

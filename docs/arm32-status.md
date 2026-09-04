@@ -111,7 +111,7 @@ kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and ob
 `build/kernel7.img`. The supervisor is built with its `bare-metal` feature (the "usable OS, quiet gsh>"
 set: logger, `console` (the terminal), the driver services - `dwc2`, `block-driver` + `fs`,
 `nic-driver` + `net-stack`, `time` - and the shell; no harness probes, `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
-`build/kernel7.img` **and `build/config.txt`** to the SD card's FAT boot partition (a file copy, not a
+`build/kernel7.img` **and `build/config-pi2.txt` (as `config.txt`)** to the SD card's FAT boot partition (a file copy, not a
 flash - `docs/multi-arch.md`); the **full procedure** (preparing the boot card *and* the storage USB
 stick, with the disk-identification safety and the durability caveat) is **`docs/pi2-deploy.md`**.
 Serial console is **115200 8N1** on the PL011. Prereqs: the same Rust nightly + `cargo` as x86, plus

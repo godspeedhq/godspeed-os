@@ -201,6 +201,36 @@ static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 // not by Rust's type system. The function cannot be `unsafe fn` because Limine
 // requires a specific extern "C" signature.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Which image, and which MACHINE - the first thing every boot log says about itself.
+///
+/// It used to be printed by `bootcon::init`, where it was the genuinely first line - but
+/// `bootcon::init` only runs on a machine that HAS a framebuffer, so a headless boot printed no
+/// identity at all. An identity line missing from exactly the logs read over a serial cable is the
+/// wrong way round. So it lives here instead, and each boot path calls it once serial is up and the
+/// framebuffer floor (if the machine has one) is already mirroring: `kernel_main` on x86, and the two
+/// ARM `*_boot_main`s, which bring the machine up themselves and never reach `kernel_main`. Three call
+/// sites because there are three boot paths - not because the line is conditional on anything.
+///
+/// The CPU line exists because an ARCH is not a MACHINE. Four boards run this system and two of them
+/// report `x86_64`: an AMD GX-420GI and an Intel Gemini Lake, which have already diverged in ways that
+/// mattered (the AMD box needs IOMMU passthrough for a firmware DMA quirk; the Intel one has a device
+/// with no function 0). Having to ASK which machine produced a serial log is how a fact about one
+/// board becomes a claim about the port - the exact mistake this project has made before.
+fn banner() {
+    crate::kprintln!("GodspeedOS {} {} ({}) - kernel", env!("CARGO_PKG_VERSION"),
+                     env!("GODSPEED_TARGET_ARCH"), env!("GODSPEED_GIT_SHA"));
+    // Bounded, on the stack, no heap (§26.6.1). 64 covers the x86 brand string (48 bytes) with room
+    // for the ARM form; anything longer is truncated rather than allowed to grow a buffer.
+    let mut cpu = [0u8; 64];
+    let n = arch::imp::cpu_identity(&mut cpu);
+    match core::str::from_utf8(&cpu[..n]) {
+        // A CPU that names itself in something other than ASCII is not a case worth code; say the
+        // read produced nothing usable rather than printing mojibake or, worse, nothing at all.
+        Ok(name) if !name.is_empty() => crate::kprintln!("cpu: {}", name),
+        _ => crate::kprintln!("cpu: unidentified"),
+    }
+}
+
 pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // Switch from Limine's tiny boot stack to our own 512 KiB stack before
     // any locals are allocated.  boot_info_ptr is in RDI (a register) so it
@@ -219,6 +249,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     let boot_info = unsafe { &*boot_info_ptr };
 
     arch::imp::init(boot_info);
+
+    banner();
 
     // Record the boot wall-clock time (RTC is raw port I/O - available immediately). `uptime`
     // reads it via InspectKernel query 12 and reports now − boot. Captured here, as early as
@@ -358,12 +390,19 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
         );
         log_idle_tick_config();
 
-        // Interrupt-driven USB (§12): program the xHCI's MSI now that the APs are up, so it
-        // targets the xHCI driver's core (core 1) - a keypress then wakes that core straight
-        // out of its idle `hlt`, no cross-core wake. (The EHCI was programmed earlier, before
-        // the firmware handoff, routed to the BSP; see above.) The interrupter stays OFF until
-        // the userspace driver enables it, so nothing fires yet.
-        arch::imp::pci::program_xhci_msi();
+        // The xHCI's MSI used to be programmed HERE, with the kernel's own `XHCI_MSI_VECTOR`
+        // constant. It is not any more: the driver names its device by PCI class code and asks for
+        // an interrupt, so the kernel allocates a pool vector and programs it AT SPAWN
+        // (`task::pci_msi_vector`, step D1b) - which happens after this point, and overwrote
+        // whatever was set here.
+        //
+        // The write is deleted rather than left as a harmless duplicate, because it is not
+        // harmless: a dead write to a device register that a later write always replaces would
+        // keep working if the pool path were ever removed, hiding the regression instead of
+        // failing loudly (invariant 12). One writer, at the point the vector is decided.
+        //
+        // The EHCI is still on the named path (it names `HwClass::Ehci`) and is programmed earlier,
+        // before the firmware handoff, routed to the BSP; see above.
 
         task::scheduler::run(0)
     }
@@ -393,6 +432,15 @@ fn panic(info: &PanicInfo) -> ! {
     // and then simply never called here - the guarantee was in the constitution and absent from the
     // code, and the first real panic on hardware showed a black screen and said nothing.
     bootcon::reclaim_for_panic();
+    // STOP QUEUEING SERIAL OUTPUT. Runtime log lines are handed to a ring and put on the wire by
+    // whichever core finds it free - which is what keeps four cores from shredding each other's lines
+    // without any of them waiting. A panic halts every core, so a queued line may never be drained by
+    // anyone: the last thing the machine says would be the thing that never arrives. From here writes
+    // go straight to the UART. They can interleave; that is a fair price for output that exists.
+    #[cfg(all(target_arch = "aarch64", feature = "pi4"))]
+    crate::arch::imp::serial_enter_panic_mode();
+    #[cfg(target_arch = "arm")]
+    crate::arch::imp::serial_enter_panic_mode();
     kprintln!("KERNEL PANIC: {}", info);
     // FLUSH THE CONSOLE RING BEFORE HALTING. Console writes are queued and drained by the timer tick
     // (arm32), and after this function no tick will ever run again - so without an explicit flush the

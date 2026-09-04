@@ -53,6 +53,21 @@ def parse_toml(path: Path) -> dict:
     if m:
         send = [s.strip().strip('"') for s in m.group(1).split(",") if s.strip()]
 
+    # A driver may name its device by PCI CLASS CODE (step D1) instead of by a kernel-taught name.
+    # Normalised to the same shape so one comparison covers both forms while both exist.
+    m = re.search(r'hw_pci_class\s*=\s*"([0-9a-fA-F]+)"', text)
+    if m:
+        bar = re.search(r'hw_pci_bar\s*=\s*(?:(\d+)|"(auto)")', text)
+        # An interrupt is authority, so whether the driver gets one is part of what is reconciled:
+        # a contract that stopped declaring `hw_pci_irq` while the spawn row still asked for a vector
+        # would be a driver holding authority its contract does not admit to.
+        irq = re.search(r'hw_pci_irq\s*=\s*true', text)
+        return_pci = "pci:%s:%s:%s" % (m.group(1).lower().lstrip("0") or "0",
+                                       (bar.group(1) or bar.group(2)) if bar else "0",
+                                       "irq" if irq else "noirq")
+    else:
+        return_pci = None
+
     hw_device = None
     m = re.search(r'hw_device\s*=\s*"(\w+)"', text)
     if m:
@@ -61,7 +76,7 @@ def parse_toml(path: Path) -> dict:
     resource_mint = bool(re.search(r'resource_mint\s*=\s*true', text))
 
     return {"limit": limit, "core": core, "send": send,
-            "hw_device": hw_device, "resource_mint": resource_mint}
+            "hw_device": return_pci or hw_device, "resource_mint": resource_mint}
 
 
 def parse_service_hw(source: str) -> dict:
@@ -139,6 +154,136 @@ def parse_kernel(name: str, source: str) -> dict | None:
     return {"limit": limit, "core": core, "send": send}
 
 
+
+# Step C (docs/service-ownership.md): a service's config moves from the kernel's `service_config` to
+# the SUPERVISOR's `IMAGES` table as its image moves. The contract is still the source of truth; this
+# reconciles it against wherever the config actually LIVES, so a service moving out of the kernel does
+# not quietly escape the check. The table deliberately carries the same fields the kernel row did.
+SUPERVISOR_MAIN = SERVICES / "supervisor" / "src" / "main.rs"
+
+def _core_of(expr: str):
+    """A `preferred_core` expression as an int, or None for `u32::MAX` (no preference)."""
+    if "u32::MAX" in expr:
+        return None
+    m = re.search(r'if cfg!\([^)]*\)\s*\{\s*\d+\s*\}\s*else\s*\{\s*(\d+)\s*\}', expr)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)', expr)
+    return int(m.group(1)) if m else None
+
+def _supervisor_row(name: str):
+    """The text of the supervisor's `IMAGES` row for `name`, or None.
+
+    Split on row boundaries rather than matching a regex across one: a row spans several lines once it
+    carries privileges, and a single-line pattern silently matches nothing - which is how a check stops
+    checking without anyone noticing.
+    """
+    try:
+        src = SUPERVISOR_MAIN.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    needle = '"' + name + '"' + ","
+    for row in src.split('\n' + "    ("):
+        if row.startswith(needle) and "_ELF" in row:
+            return row
+    return None
+
+
+def _supervisor_grants_resource_mint(name: str) -> bool:
+    """Does the supervisor's IMAGES row for `name` request the RESOURCE_MINT privilege?
+
+    RESOURCE_MINT follows the config out of the kernel (step C): a moved service carries it as a
+    privilege BIT in the supervisor's table rather than as `service_hw`'s second element.
+    """
+    row = _supervisor_row(name)
+    return row is not None and "privbits::RESOURCE_MINT" in row
+
+
+def _supervisor_hw_device(name: str):
+    """The device CLASS the supervisor's IMAGES row asks for, as the .toml spells it, or None.
+
+    A moved driver names its hardware by class ordinal (`hwclass::AHCI`) because the kernel resolves
+    the actual MMIO/DMA/BDF from its own PCI scan - the supervisor may not name addresses. The .toml
+    still says `hw_device = "ahci"`, so the check reconciles the two by name, and a driver that moves
+    house does not thereby escape having its contract checked.
+    """
+    row = _supervisor_row(name)
+    if row is None:
+        return None
+    # The PCI form: `hwclass::pci(0x01_06_01, 5, false)` - normalised to "pci:<class>:<bar>" so it
+    # compares against the contract's `hw_pci_class` / `hw_pci_bar` without either side needing a
+    # table of names. A checker that had to know that 0x010601 means "ahci" would be the very
+    # kernel-side device knowledge step D1 removes, one layer up.
+    # The BAR is either a literal index or the symbolic `BAR_AUTO` ("the first mapped memory BAR",
+    # which is what lets one driver cover devices that disagree about where their registers live).
+    m = re.search(r"hwclass::pci(_irq)?\(\s*0x([0-9a-fA-F_]+)\s*,\s*"
+                  r"(?:(\d+)|(?:[\w:]*BAR_AUTO))", row)
+    if m:
+        return "pci:%s:%s:%s" % (m.group(2).replace("_", "").lower().lstrip("0") or "0",
+                                 m.group(3) if m.group(3) is not None else "auto",
+                                 "irq" if m.group(1) else "noirq")
+
+    m = re.search(r"hwclass::(\w+)", row)
+    if not m or m.group(1) == "NONE":
+        return None
+    return m.group(1).lower()
+
+
+def parse_supervisor_images(name: str):
+    """The supervisor's IMAGES row for `name`, in the same shape `parse_kernel` returns, or None."""
+    try:
+        src = SUPERVISOR_MAIN.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # ("name", NAME_ELF, flags, mem, core, &[peers])
+    # Tolerant of columns being APPENDED to the tuple (privileges was added after peers): match up to
+    # the peer list and ignore whatever follows. A parser that silently stops matching when a table
+    # grows is the failure this check exists to prevent - it did fail loudly, which is why this is here.
+    m = re.search(r'\(\s*"' + re.escape(name) + r'"\s*,\s*[A-Z0-9_]+_ELF\s*,\s*([^,]+),\s*([^,]+),'
+                  r'\s*([^,]+),\s*(.{0,200})', src, re.DOTALL)
+    if not m:
+        return None
+    mem_expr, core_expr = m.group(2).strip(), m.group(3).strip()
+    # The peer list is either a plain `&[...]` or an ARCH-CONDITIONAL one, which can be three-way:
+    #   `if cfg!(arm) { &["dwc2"] } else if cfg!(aarch64) { &["xhci"] } else { &[] }`
+    # Compare against the UNION of the branches, because a TOML contract has no notion of an arch and
+    # the honest thing for it to state is every peer this service may send to on the ports it runs on.
+    #
+    # Taking one branch was tried and is wrong: on the host it read the arm arm, so `block-driver`'s
+    # contract could only ever agree with ONE of its three ports and the other two went unchecked.
+    # The union costs a little precision - a contract satisfied by the union does not prove each
+    # branch is individually right - but that is the same trade the contract already documents for an
+    # unconditional declaration, and it is strictly more coverage than checking one arch and ignoring
+    # the rest.
+    # Bound the scan to THIS row's peer expression. `tail` is a fixed window of following text, so a
+    # blind union over it swallowed the NEXT row's peers - `logger` (no peers) read as `asker`'s
+    # `["reply-server"]` and failed a check it should pass. Match the expression shape instead:
+    # either a plain `&[...]`, or a complete `if cfg!(..) { &[..] } [else if ..] [else { &[..] }]`.
+    tail = m.group(4).lstrip()
+    chain = re.match(
+        r'if\s+cfg!\([^)]*\)\s*\{[^}]*\}'
+        r'(?:\s*else\s+if\s+cfg!\([^)]*\)\s*\{[^}]*\})*'
+        r'(?:\s*else\s*\{[^}]*\})?', tail)
+    scope = chain.group(0) if chain else (re.match(r'&\[[^\]]*\]', tail).group(0)
+                                          if re.match(r'&\[[^\]]*\]', tail) else None)
+    if scope is None:
+        return None
+    lists = re.findall(r'&\[([^\]]*)\]', scope)
+    if not lists:
+        return None
+    peers_raw = ",".join(lists)
+    lm  = re.search(r'(\d+)\s*\*\s*1024\s*\*\s*1024', mem_expr)
+    return {
+        "limit": int(lm.group(1)) * 1024 * 1024 if lm else None,
+        # Same arch-conditional handling as `parse_kernel`: `if cfg!(target_arch = "arm") { 1 } else
+        # { 0 }` takes the ELSE (x86) branch, because this check runs on the host and the .toml states
+        # the x86-intended core. Without it the shell's row raised a ValueError rather than reporting a
+        # mismatch - a checker that CRASHES is worse than one that fails, since it reports nothing at all.
+        "core":  _core_of(core_expr),
+        "send":  sorted(re.findall(r'"([^"]+)"', peers_raw)),
+    }
+
+
 def main() -> int:
     source = KERNEL_CFG.read_text(encoding="utf-8")
     kernel_hw = parse_service_hw(source)
@@ -153,7 +298,11 @@ def main() -> int:
         t = parse_toml(toml_path)
         k = parse_kernel(name, source)
         if k is None:
-            failures.append(f"  FAIL  {name}: no `service_config` arm found in kernel/src/task/mod.rs")
+            # Not in the kernel: it may have moved to the supervisor (step C). Reconcile there.
+            k = parse_supervisor_images(name)
+        if k is None:
+            failures.append(f"  FAIL  {name}: no config found - neither a `service_config` arm in "
+                            f"kernel/src/task/mod.rs nor an `IMAGES` row in services/supervisor")
             continue
 
         if t["limit"] != k["limit"]:
@@ -167,9 +316,22 @@ def main() -> int:
                 f"  FAIL  {name}: ipc_send {t['send']} (.toml) != send_peers {k['send']} (kernel)")
 
         khw, kmint = kernel_hw.get(name, (None, False))
+        # RESOURCE_MINT follows the config out of the kernel (step C): a moved service carries it as a
+        # privilege BIT in the supervisor's IMAGES row, not as `service_hw`'s second element. Same rule
+        # as the rest of this check - reconcile against wherever the config actually lives, so moving a
+        # service does not quietly escape it.
+        if not kmint and _supervisor_grants_resource_mint(name):
+            kmint = True
+        # Name the file the value was actually read from. A message that says "kernel service_hw" for
+        # a value that came from the supervisor sends the reader to the wrong file to fix it.
+        hw_src = "kernel service_hw"
+        if khw is None:
+            moved = _supervisor_hw_device(name)
+            if moved is not None:
+                khw, hw_src = moved, "supervisor IMAGES hwclass"
         if t["hw_device"] != khw:
             failures.append(
-                f"  FAIL  {name}: hw_device {t['hw_device']!r} (.toml) != {khw!r} (kernel service_hw)")
+                f"  FAIL  {name}: hw_device {t['hw_device']!r} (.toml) != {khw!r} ({hw_src})")
         if t["resource_mint"] != kmint:
             failures.append(
                 f"  FAIL  {name}: resource_mint {t['resource_mint']} (.toml) != {kmint} (kernel service_hw)")

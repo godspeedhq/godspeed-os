@@ -71,6 +71,80 @@
 #![no_std]
 #![no_main]
 
+// The probe parameter table - shared by source with the `supervisor`, the other spawner.
+mod table;
+
+/// Start one probe from its table row - the PROBE's half of `table::probe`.
+///
+/// A probe respawning its own victim (a restart test has to) does not hold the probe IMAGE: it moved
+/// to the supervisor, which is the spawn authority anyway. So it ASKS.
+///
+/// ONE-WAY, and that is forced rather than chosen. Every driver probe in the table is `recv = false`
+/// - none of them has an endpoint - so a request/reply has nowhere for the reply to land. Routing
+/// this through `spawn_via_supervisor` therefore failed on the FIRST respawn, not under load, which
+/// is what §22 P5/P7 and the stress restart storms caught.
+///
+/// So the confirmation waits on TRUTH instead of on a reply (Commandment VIII): every victim in the
+/// table has a recv endpoint, so it REGISTERS ITS NAME when it starts, and the name resolving again
+/// is the spawn having happened. The kill that preceded it unregistered that name, so this cannot
+/// see the previous instance.
+///
+/// The bound is a poll COUNT, not a duration, and that is a real limitation (a count means a
+/// different wall time on every machine). It is bounded and LOUD either way - a victim that never
+/// appears returns Err and says so, rather than a test hanging or, worse, quietly proceeding without
+/// its subject.
+pub fn spawn_probe_row(ctx: &ServiceContext, r: table::Row) -> Result<(), godspeed_sdk::Error> {
+    let (name, _mode, _recv, _mem, core, peers) = r;
+    let mut buf = [0u8; godspeed_sdk::service_context::supcmd::MAX];
+    let n = godspeed_sdk::service_context::supcmd::encode(
+        &mut buf, godspeed_sdk::service_context::supcmd::SPAWN,
+        core.unwrap_or(u32::MAX), name, peers)
+        .ok_or(godspeed_sdk::Error::InvalidArgument)?;
+    let msg = Message::from_bytes(&buf[..n]);
+
+    // TRY_SEND, NEVER A BLOCKING SEND (§8.9). Every probe respawn in the suite now funnels through
+    // the supervisor's one 16-deep queue - `stress-bs5` alone asks for 5,000 - so that queue is full
+    // for long stretches. A blocking send there does not slow a probe down, it removes it: `chaos-c7`
+    // sent one request behind thousands and was never heard from again, silent until the harness
+    // timed the whole test out. Retrying around a full queue lets a starved caller interleave.
+    //
+    // The supervisor is restartable (§6.2), so a cached cap to it goes stale on every respawn:
+    // reacquire by name and retry, exactly as `spawn_via_supervisor` does.
+    let mut sent = false;
+    for attempt in 0..20_000 {
+        match ctx.try_send("supervisor", &msg) {
+            Ok(())  => { sent = true; break; }
+            Err(_) => {
+                // Distinguish "queue full, wait" from "peer gone, reacquire": a stale cap never
+                // drains, so retrying it forever would hang exactly as the blocking send did.
+                if attempt % 256 == 255 { let _ = ctx.reacquire_by_name("supervisor"); }
+                ctx.yield_cpu();
+            }
+        }
+    }
+    if !sent {
+        ctx.log_fmt(format_args!("probe: cannot reach the supervisor to spawn '{}'", name));
+        return Err(godspeed_sdk::Error::InvalidArgument);
+    }
+
+    // Poll in BATCHES. Checking on every yield meant two syscalls (mint a cap, drop it) per
+    // iteration - up to 40,000 per respawn, and `stress-bs5` does 5,000 respawns. That churn is not
+    // free: it showed up as a rising rate of GARBLED SERIAL LINES, because more cross-core syscall
+    // traffic means more chance of interleaving mid-`kprintln`, and a test whose pass string arrives
+    // as "adv:? A7 pas" fails on a system that behaved correctly.
+    for _ in 0..1_000 {
+        if let Some(c) = ctx.acquire_send_grant_cap(name) {
+            // Reclaim it: this is a liveness probe, not a peer we intend to keep, and a cap left
+            // behind on every respawn would fill the table over a 100k-cycle restart storm (§26.6).
+            ctx.remove_cap(c);
+            return Ok(());
+        }
+        for _ in 0..32 { ctx.yield_cpu(); }
+    }
+    ctx.log_fmt(format_args!("probe: '{}' never registered after a spawn request", name));
+    Err(godspeed_sdk::Error::InvalidArgument)
+}
+
 use godspeed_sdk::{adversarial, service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
@@ -666,7 +740,7 @@ fn mode_prop_p2(ctx: &ServiceContext) -> ! {
     for _iter in 0..3u32 {
         for _cycle in 0..2u32 {
             let _ = ctx.kill("prop-p2-victim");
-            let _ = ctx.spawn("prop-p2-victim");
+            let _ = table::probe(ctx, "prop-p2-victim");
             let gen = ctx.inspect_endpoint_generation("prop-p2-victim");
             if gen <= prev_gen {
                 ctx.log("prop: P2 FAIL - generation not strictly monotonic after kill/respawn");
@@ -798,7 +872,7 @@ fn mode_prop_p8(ctx: &ServiceContext) -> ! {
         let n_cycles = 1 + (xorshift64(&mut rng) % 2) as u32;
         for _cycle in 0..n_cycles {
             let _ = ctx.kill("prop-p8-victim");
-            let _ = ctx.spawn("prop-p8-victim");
+            let _ = table::probe(ctx, "prop-p8-victim");
             let gen = ctx.inspect_endpoint_generation("prop-p8-victim");
             if gen <= prev_gen {
                 ctx.log("prop: P8 FAIL - generation not monotonic after restart");
@@ -874,7 +948,7 @@ fn mode_prop_p5(ctx: &ServiceContext) -> ! {
     // the absolute count unreliable. Spawn success is the authoritative P5 signal.
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p5-victim");
-        match ctx.spawn("prop-p5-victim") {
+        match table::probe(ctx, "prop-p5-victim") {
             // SAY WHAT FAILED, not what we assume failed. This read "routing table overflow;
             // orphan detected" without ever looking at the error, and that guess has now cost a
             // bisect: routing DOES reuse dead slots (`try_register` accepts an entry whose liveness
@@ -909,7 +983,7 @@ fn mode_prop_p7(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p7-victim");
-        let _ = ctx.spawn("prop-p7-victim");
+        let _ = table::probe(ctx, "prop-p7-victim");
         let gen = ctx.inspect_endpoint_generation("prop-p7-victim");
         if gen <= prev_gen {
             ctx.log("prop: P7 FAIL - generation not monotonic across kill/respawn (TLB lifecycle broken)");
@@ -1076,7 +1150,7 @@ fn mode_fuzz_f7(ctx: &ServiceContext) -> ! {
         let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
         let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
 
-        let _ = ctx.spawn("fuzz-f7-victim");
+        let _ = table::probe(ctx, "fuzz-f7-victim");
         // stale cap still has old generation → still EndpointDead after respawn.
         if let Some(h) = stale {
             let _ = ctx.try_send_by_handle(h, &msg);
@@ -1145,7 +1219,7 @@ fn mode_stress_s2(ctx: &ServiceContext) -> ! {
     }
     for _ in 0..50u32 {
         let _ = ctx.kill("stress-s2-victim");
-        match ctx.spawn("stress-s2-victim") {
+        match table::probe(ctx, "stress-s2-victim") {
             Err(_) => {
                 ctx.log("stress: S2 FAIL - spawn failed (kstack pool exhausted?)");
                 idle(ctx);
@@ -1238,7 +1312,7 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
     // must hold for every respawn regardless of which endpoint id or slot the instance lands on.
     let mut prev_gen = 0u64;
     for _ in 0..10u32 {
-        let _ = ctx.spawn("stress-s4-victim");
+        let _ = table::probe(ctx, "stress-s4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-s4-victim");
         if gen <= prev_gen {
             ctx.log("stress: S4 FAIL - generation not monotonic under churn");
@@ -1304,7 +1378,7 @@ fn mode_stress_s5(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for _ in 0..500u32 {
         let _ = ctx.kill("stress-s5-victim");
-        let _ = ctx.spawn("stress-s5-victim");
+        let _ = table::probe(ctx, "stress-s5-victim");
         let gen = ctx.inspect_endpoint_generation("stress-s5-victim");
         if gen <= prev_gen {
             ctx.log("stress: S5 FAIL - generation not strictly monotonic after kill/respawn");
@@ -1573,7 +1647,7 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
     let mut total_spawn: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
-        let _ = ctx.spawn("perf-b5-victim");
+        let _ = table::probe(ctx, "perf-b5-victim");
         let t1 = ctx.read_tsc();
         total_spawn += t1.wrapping_sub(t0);
         let _ = ctx.kill("perf-b5-victim");
@@ -1583,12 +1657,12 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
     ctx.log("perf: B5 done");
 
     // B6: kill+spawn (restart) cost.
-    let _ = ctx.spawn("perf-b5-victim"); // ensure alive before cycling
+    let _ = table::probe(ctx, "perf-b5-victim"); // ensure alive before cycling
     let mut total_restart: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
         let _ = ctx.kill("perf-b5-victim");
-        let _ = ctx.spawn("perf-b5-victim");
+        let _ = table::probe(ctx, "perf-b5-victim");
         let t1 = ctx.read_tsc();
         total_restart += t1.wrapping_sub(t0);
     }
@@ -1809,6 +1883,49 @@ fn mode_adv_a9(ctx: &ServiceContext) -> ! {
     match ctx.spawn("nonexistent-does-not-exist") {
         Err(_) => ctx.log("adv: A9 pass - spawn of unknown service returned Err"),
         Ok(()) => ctx.log("adv: A9 FAIL - unexpected spawn success for unknown service"),
+    }
+
+    // A9b - NAME SQUATTING, now structurally impossible rather than merely refused.
+    //
+    // The parameterised probe path used to let a SPAWN holder choose the NAME of the task it started
+    // while the KERNEL supplied the probe image, so a caller could bind ANY name to that binary. That
+    // mattered because the kernel name directory is the recovery anchor clients reacquire through
+    // (§14.3): a probe registered as `fs` collects `fs`'s clients while the real `fs` is dead, and a
+    // liveness check passes in exactly that window.
+    //
+    // Moving the image to the supervisor removed the free parameter. A name no longer CARRIES an
+    // image - it SELECTS a table row - so a real service's name simply is not a probe name, and an
+    // unknown one is refused outright. This asserts that directly: neither a live service's name nor
+    // an invented one can be started as a probe.
+    let mut refused = 0;
+    for victim in ["fs", "logger", "shell", "console", "supervisor", "not-a-real-probe"] {
+        if table::probe(ctx, victim).is_err() { refused += 1; }
+        else { ctx.log_fmt(format_args!("adv: A9 FAIL - started '{}' as a probe", victim)); }
+    }
+    if refused == 6 {
+        ctx.log("adv: A9b pass - 6 non-probe names refused; a name selects a row, not an image");
+    }
+
+    // A9c - SPAWN IS NOT PERMISSION TO SUPPLY THE CODE.
+    //
+    // This probe HOLDS a spawn cap - `privileges_of` grants every probe SPAWN, and the A9 case above
+    // relies on it - so the syscall is authorised and only the second, distinct authority can refuse
+    // it. `SpawnImage` starts ARBITRARY BYTES under a name the caller chooses, which is a different
+    // power from starting a service the system already knows, and until IMAGE_SPAWN existed they were
+    // the same capability: the shell, `chaos`, `control` and every probe could introduce new code
+    // under a real service's name while that service was dead, and clients reacquiring by name (§14.3)
+    // would wire themselves to it.
+    //
+    // The image here is deliberately NOT a valid ELF. The refusal must come from the CAPABILITY, before
+    // the kernel looks at a byte of it - if this ever starts failing for "bad image" instead, the gate
+    // has moved and the test has stopped testing the gate.
+    let junk = [0u8; 64];
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(&junk, "adv-a9-image-attack");
+    let mut peers_buf = [0u8; 8];
+    match ctx.spawn_image(&mut req, &mut peers_buf, &[]) {
+        Err(_) => ctx.log("adv: A9c pass"),   // short ON PURPOSE: the adversarial build faults probes while others
+                                    // log, and a long line is a wider window to be shredded mid-write.
+        Ok(_)  => ctx.log("adv: A9 FAIL - started a caller-supplied image while holding only SPAWN"),
     }
     idle(ctx)
 }
@@ -2184,7 +2301,7 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
         let _ = ctx.kill("chaos-c7-victim");
         let t2 = ctx.read_tsc();
         // Respawn on core 2 → new page table mapping → another TLB shootdown on core 2.
-        let _ = ctx.spawn("chaos-c7-victim");
+        let _ = table::probe(ctx, "chaos-c7-victim");
         let t3 = ctx.read_tsc();
         // Brief yield to allow the new victim to be scheduled and its pages faulted in.
         for _ in 0..50u32 { ctx.yield_cpu(); }
@@ -2304,12 +2421,12 @@ fn mode_xlife(ctx: &ServiceContext) -> ! {
         let a = ctx.read_tsc();
         let _ = ctx.kill("xlife-near");
         let b = ctx.read_tsc();
-        let _ = ctx.spawn("xlife-near");
+        let _ = table::probe(ctx, "xlife-near");
         let c = ctx.read_tsc();
         // cross-core: kill + respawn xlife-far (core 2).
         let _ = ctx.kill("xlife-far");
         let d = ctx.read_tsc();
-        let _ = ctx.spawn("xlife-far");
+        let _ = table::probe(ctx, "xlife-far");
         let e = ctx.read_tsc();
 
         k_near = k_near.wrapping_add(b.wrapping_sub(a));
@@ -2353,7 +2470,7 @@ fn mode_prop_bp2(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for cycle in 0..20u32 {
         let _ = ctx.kill("prop-bp2-victim");
-        let _ = ctx.spawn("prop-bp2-victim");
+        let _ = table::probe(ctx, "prop-bp2-victim");
         let gen = ctx.inspect_endpoint_generation("prop-bp2-victim");
         if gen <= prev_gen {
             ctx.log_fmt(format_args!("prop: BP2 FAIL - generation not monotonic at cycle {}", cycle));
@@ -2432,7 +2549,7 @@ fn mode_prop_bp5(ctx: &ServiceContext) -> ! {
     // live count to fluctuate independently of BP5's own cycles.
     for _ in 0..150u32 {
         let _ = ctx.kill("prop-bp5-victim");
-        match ctx.spawn("prop-bp5-victim") {
+        match table::probe(ctx, "prop-bp5-victim") {
             Err(_) => {
                 ctx.log("prop: BP5 FAIL - spawn failed (routing table overflow; orphan detected)");
                 idle(ctx);
@@ -2493,16 +2610,23 @@ fn mode_prop_bp7(ctx: &ServiceContext) -> ! {
     // BP7 - TLB shootdown leaves no stale mappings - 150 cycles (§10.5).
     // Proxy: 150 kill/respawn cycles; generation monotonicity confirms the full
     // kill/shootdown lifecycle completed correctly each time.
+    //
+    // The generation is read AFTER the respawn, for the reason P7 records above: unregister-on-death
+    // (§14.2, the self-heal) clears the dead service's name while the id is still ours, so a by-name
+    // read in the dead window returns 0 - correctly. This loop used to read between the kill and the
+    // respawn, so it failed on its FIRST iteration (0 <= 0) and had done since unregister-on-death
+    // landed; P7 was updated then and BP7 was not. The assertion it was meant to make is intact and
+    // is now actually made: 150 cycles, each generation strictly greater than the last (§7.5).
     let mut prev_gen: u64 = 0;
     for _ in 0..150u32 {
         let _ = ctx.kill("prop-bp7-victim");
+        let _ = table::probe(ctx, "prop-bp7-victim");
         let gen = ctx.inspect_endpoint_generation("prop-bp7-victim");
         if gen <= prev_gen {
-            ctx.log("prop: BP7 FAIL - generation not monotonic after kill (TLB lifecycle broken)");
+            ctx.log("prop: BP7 FAIL - generation not monotonic across kill/respawn (TLB lifecycle broken)");
             idle(ctx);
         }
         prev_gen = gen;
-        let _ = ctx.spawn("prop-bp7-victim");
     }
     ctx.log("prop: BP7 pass (150/150)");
     idle(ctx)
@@ -2516,7 +2640,7 @@ fn mode_prop_bp8(ctx: &ServiceContext) -> ! {
         let n_cycles = 1 + (xorshift64(&mut rng) % 2) as u32;
         for _cycle in 0..n_cycles {
             let _ = ctx.kill("prop-bp8-victim");
-            let _ = ctx.spawn("prop-bp8-victim");
+            let _ = table::probe(ctx, "prop-bp8-victim");
             let gen = ctx.inspect_endpoint_generation("prop-bp8-victim");
             if gen <= prev_gen {
                 ctx.log("prop: BP8 FAIL - generation not monotonic after restart");
@@ -2550,7 +2674,7 @@ fn mode_prop_bp9(ctx: &ServiceContext) -> ! {
             ctx.log_fmt(format_args!("prop: BP9 FAIL - not all 3 slots EndpointDead after kill at cycle {}", cycle));
             idle(ctx);
         }
-        let _ = ctx.spawn("prop-bp9-victim");
+        let _ = table::probe(ctx, "prop-bp9-victim");
         // Stale caps must NOT auto-update to the new instance's generation.
         let still0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
         let still1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
@@ -2678,7 +2802,7 @@ fn mode_fuzz_bf7(ctx: &ServiceContext) -> ! {
         let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
         let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
 
-        let _ = ctx.spawn("fuzz-bf7-victim");
+        let _ = table::probe(ctx, "fuzz-bf7-victim");
         if let Some(h) = stale {
             let _ = ctx.try_send_by_handle(h, &msg);
         }
@@ -2740,7 +2864,7 @@ fn mode_stress_bs2(ctx: &ServiceContext) -> ! {
     }
     for _ in 0..200u32 {
         let _ = ctx.kill("stress-bs2-victim");
-        match ctx.spawn("stress-bs2-victim") {
+        match table::probe(ctx, "stress-bs2-victim") {
             Err(_) => {
                 ctx.log("stress: BS2 FAIL - spawn failed (kstack pool exhausted?)");
                 idle(ctx);
@@ -2815,7 +2939,7 @@ fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
     // generations at all. BS5 below already asks in this order.
     let mut prev_gen = 0u64;
     for _ in 0..50u32 {
-        let _ = ctx.spawn("stress-bs4-victim");
+        let _ = table::probe(ctx, "stress-bs4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-bs4-victim");
         if gen <= prev_gen {
             ctx.log("stress: BS4 FAIL - generation not monotonic under churn");
@@ -2840,9 +2964,15 @@ fn mode_stress_bs5(ctx: &ServiceContext) -> ! {
     // BS5 - Generation integrity, 5× S5 (§22 Brutal Stress BS5).
     // 5000 kill/respawn cycles; endpoint generation must be strictly monotonic.
     let mut prev_gen: u64 = 0;
-    for _ in 0..5_000u32 {
+    for i in 0..5_000u32 {
+        // Progress, every 500 cycles. A test that runs for minutes and logs NOTHING until it
+        // finishes cannot say whether a timeout means "slow" or "stuck" - and those are different
+        // bugs with different fixes. This one timed out twice with no way to tell which it was.
+        if i % 500 == 0 {
+            ctx.log_fmt(format_args!("stress: BS5 progress {}/5000", i));
+        }
         let _ = ctx.kill("stress-bs5-victim");
-        let _ = ctx.spawn("stress-bs5-victim");
+        let _ = table::probe(ctx, "stress-bs5-victim");
         let gen = ctx.inspect_endpoint_generation("stress-bs5-victim");
         if gen <= prev_gen {
             ctx.log("stress: BS5 FAIL - generation not strictly monotonic after kill/respawn");
@@ -2992,7 +3122,7 @@ fn mode_stress_bs10(ctx: &ServiceContext) -> ! {
     }
 
     for _ in 0..50u32 {
-        let _ = ctx.spawn("stress-bs10-victim");
+        let _ = table::probe(ctx, "stress-bs10-victim");
         let _ = ctx.kill("stress-bs10-victim");
         if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS10 FAIL - cap A not stale during cycle");
@@ -3265,7 +3395,7 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
     let mut total_spawn: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
-        let _ = ctx.spawn("perf-bp5-victim");
+        let _ = table::probe(ctx, "perf-bp5-victim");
         let t1 = ctx.read_tsc();
         total_spawn += t1.wrapping_sub(t0);
         let _ = ctx.kill("perf-bp5-victim");
@@ -3275,12 +3405,12 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
     ctx.log("perf: BP5 done");
 
     // BP6: kill+spawn (restart) cost.
-    let _ = ctx.spawn("perf-bp5-victim");
+    let _ = table::probe(ctx, "perf-bp5-victim");
     let mut total_restart: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
         let _ = ctx.kill("perf-bp5-victim");
-        let _ = ctx.spawn("perf-bp5-victim");
+        let _ = table::probe(ctx, "perf-bp5-victim");
         let t1 = ctx.read_tsc();
         total_restart += t1.wrapping_sub(t0);
     }
@@ -3425,7 +3555,7 @@ fn mode_chaos_bc7(ctx: &ServiceContext) -> ! {
     for i in 0..15u32 {
         let _ = ctx.try_send("chaos-bc7-victim", &msg);
         let _ = ctx.kill("chaos-bc7-victim");
-        let _ = ctx.spawn("chaos-bc7-victim");
+        let _ = table::probe(ctx, "chaos-bc7-victim");
         for _ in 0..10u32 { ctx.yield_cpu(); }
         if i % 5 == 4 {
             ctx.log_fmt(format_args!("chaos: BC7 iter {}/15", i + 1));

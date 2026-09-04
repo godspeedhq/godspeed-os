@@ -4,6 +4,34 @@
 /// `osdev build` compiles the service crates BEFORE the kernel so these
 /// paths exist by the time the kernel's `include_bytes!` macros run.
 fn main() {
+    // Stamp the short git SHA into the KERNEL, so the very first boot line identifies the image.
+    //
+    // The shell already stamps one for its `version` command, but that only speaks when a script or an
+    // operator asks. A chaos-only run, or a boot that dies before the shell, produces a log that cannot
+    // say which build made it - and a hardware result nobody can attribute is worth much less than it
+    // looks. That happened: a NIC fault was instrumented, the next run came back clean, and the log was
+    // equally consistent with "the instrument shipped" and "the old image was still on the stick".
+    //
+    // Best-effort: no git, or a tarball build, reports "unknown". `.git/logs/HEAD` is appended on every
+    // commit and checkout, so watching it refreshes the stamp when HEAD moves.
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GODSPEED_GIT_SHA={}", sha);
+    // The same source builds for several ISAs, so a serial log must say which one it came from -
+    // exactly the reason the shell's `version` reports it (utilities/0_conventions.md rule 7).
+    println!("cargo:rustc-env=GODSPEED_TARGET_ARCH={}",
+             std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".into()));
+    if std::path::Path::new(".git/logs/HEAD").exists() {
+        println!("cargo:rerun-if-changed=.git/logs/HEAD");
+    }
+
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace = std::path::Path::new(&manifest).parent().unwrap();
 
@@ -170,14 +198,14 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     let aarch64_built: &[&str] = if aarch64_demo {
         &["logger", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
         &["logger", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace

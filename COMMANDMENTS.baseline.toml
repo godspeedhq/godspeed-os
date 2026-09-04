@@ -63,6 +63,17 @@ features = [
     "iommu-fault-test",
     "memmap-clamp-test",
     "mmio-map-fault-test",
+# The ROUTINE half of the kernel's name-directory trace - every register, every clear. Admitted as a
+# feature rather than left in because it is ~1,200-2,000 lines per chaos run on every port, and both
+# ARM ports needed a deeper serial ring to carry it without dropping lines. It earned its keep: it
+# caught the `block-driver` "no disk" latch on a Pi 4 by putting the name's clear and its re-register
+# 440 ms either side of the failure, which is what showed the name was never the problem.
+#
+# It gates OUTPUT ONLY - no control flow, no responsibility. The four ANOMALY reports (a live
+# instance's name cleared, a stale entry kept, a name already absent, an eviction) are deliberately
+# NOT behind it: they are silent in a healthy run, so they cost nothing to leave in, and they are the
+# half that says something is wrong rather than merely what happened.
+    "name-trace",
     "pi4",
     "pi4-demo-services",
     "pi4-sched-demo",
@@ -79,236 +90,22 @@ features = [
 # The kernel holds a `service_config` for each of these - memory limit, placement core, capabilities,
 # send peers, embedded ELF. Loading a task is mechanism and belongs to the kernel; a CATALOGUE of what
 # every service is allowed is policy, and policy belongs to the supervisor (§26.10). §4.4 also forbids
-# "developer tooling" in the kernel, and roughly 190 of these are test probes.
+# "developer tooling" in the kernel, which is what the 193 test-probe rows were.
 #
 # The target is ONE entry - `supervisor`, which the kernel must bootstrap because nothing is beneath it,
 # exactly as with `kernel_spawned_service`. Every other service's policy belongs to the supervisor, with
-# its image handed to the Spawn syscall rather than compiled into ring 0. 218 is the distance from that.
+# its image handed to the Spawn syscall rather than compiled into ring 0.
+#
+# It was 221. No running total is written here: the list below IS the count, and a number in a comment
+# is a second copy of it, free to drift and needing a hand-edit every time the list shrinks (the same
+# reason the responsibility count is not in this file). What history records instead are the two moves
+# that cannot be read off the list - the 193 test probes (docs/probe-params-design.md) and the service
+# images (docs/service-ownership.md).
 #
 # Listed in full, without splitting "real" services from test ones: any rule for that split is a
 # judgment encoded as a pattern, and the next service named outside the pattern slips through.
 service_configs = [
-    "adv-a1",
-    "adv-a10",
-    "adv-a11",
-    "adv-a12",
-    "adv-a13",
-    "adv-a2",
-    "adv-a3",
-    "adv-a4",
-    "adv-a5",
-    "adv-a5-victim",
-    "adv-a6",
-    "adv-a7",
-    "adv-a7-recv",
-    "adv-a8",
-    "adv-a8-witness",
-    "adv-a9",
-    "adv-ba1",
-    "adv-ba10",
-    "adv-ba2",
-    "adv-ba3",
-    "adv-ba4",
-    "adv-ba5",
-    "adv-ba5-victim",
-    "adv-ba6",
-    "adv-ba7",
-    "adv-ba7-recv",
-    "adv-ba8",
-    "adv-ba8-witness",
-    "adv-ba9",
-    "adv-fault-de",
-    "adv-fault-gp",
-    "adv-fault-mon",
-    "adv-fault-usercopy",
-    "adv-fault-usercopy-mon",
-    "asker",
-    "block-driver",
-    "brutal-id-11",
-    "brutal-id-12-a",
-    "brutal-id-12-b",
-    "brutal-id-12-c",
-    "brutal-id-13-kill",
-    "brutal-id-13-recv",
-    "brutal-id-13-send",
-    "chaos",
-    "chaos-bc2-a",
-    "chaos-bc2-b",
-    "chaos-bc2-c",
-    "chaos-bc2-d",
-    "chaos-bc2-e",
-    "chaos-bc2-monitor",
-    "chaos-bc3",
-    "chaos-bc5",
-    "chaos-bc6-hog-a",
-    "chaos-bc6-hog-b",
-    "chaos-bc6-monitor",
-    "chaos-bc7",
-    "chaos-bc7-victim",
-    "chaos-c2",
-    "chaos-c2-monitor",
-    "chaos-c3",
-    "chaos-c5",
-    "chaos-c6-hog",
-    "chaos-c6-monitor",
-    "chaos-c7",
-    "chaos-c7-victim",
-    "console",
-    "control",
-    "counter",
-    "dwc2",
-    "ehci",
-    "fs",
-    "fuzz-bf1",
-    "fuzz-bf2",
-    "fuzz-bf5",
-    "fuzz-bf5-recv",
-    "fuzz-bf6",
-    "fuzz-bf6-recv",
-    "fuzz-bf7",
-    "fuzz-bf7-victim",
-    "fuzz-bf8",
-    "fuzz-f1",
-    "fuzz-f2",
-    "fuzz-f5",
-    "fuzz-f5-recv",
-    "fuzz-f6",
-    "fuzz-f6-recv",
-    "fuzz-f7",
-    "fuzz-f7-victim",
-    "fuzz-f8",
-    "greet",
-    "holder",
-    "logger",
-    "mem-pressure",
-    "net-stack",
-    "nic-driver",
-    "observe",
-    "observe-live",
-    "observe-now",
-    "perf-b1",
-    "perf-b1-echo",
-    "perf-b10",
-    "perf-b2",
-    "perf-b2-echo",
-    "perf-b3",
-    "perf-b4",
-    "perf-b5",
-    "perf-b5-victim",
-    "perf-b7",
-    "perf-b8",
-    "perf-b9",
-    "perf-b9-recv",
-    "perf-bp1",
-    "perf-bp1-echo",
-    "perf-bp10",
-    "perf-bp2",
-    "perf-bp2-echo",
-    "perf-bp3",
-    "perf-bp4",
-    "perf-bp5",
-    "perf-bp5-victim",
-    "perf-bp7",
-    "perf-bp8",
-    "perf-bp9",
-    "perf-bp9-recv",
-    "ping",
-    "pong",
-    "probe-11a",
-    "probe-3b",
-    "probe-4a",
-    "probe-4b-recv",
-    "probe-4b-send",
-    "probe-5a-recv",
-    "probe-5a-send",
-    "probe-5b-send",
-    "probe-7a",
-    "probe-7b",
-    "probe-9b",
-    "probe-hog",
-    "probe-recv",
-    "probe-sender",
-    "probe-victim",
-    "probe-yielder",
-    "prop-bp1",
-    "prop-bp10",
-    "prop-bp2",
-    "prop-bp2-victim",
-    "prop-bp3",
-    "prop-bp4",
-    "prop-bp5",
-    "prop-bp5-victim",
-    "prop-bp6",
-    "prop-bp7",
-    "prop-bp7-victim",
-    "prop-bp8",
-    "prop-bp8-victim",
-    "prop-bp9",
-    "prop-bp9-victim",
-    "prop-p1",
-    "prop-p10",
-    "prop-p2",
-    "prop-p2-victim",
-    "prop-p3",
-    "prop-p4",
-    "prop-p5",
-    "prop-p5-victim",
-    "prop-p6",
-    "prop-p7",
-    "prop-p7-victim",
-    "prop-p8",
-    "prop-p8-victim",
-    "prop-p9",
-    "prop-p9-victim",
-    "reply-server",
-    "resource-server",
-    "roster",
-    "shell",
-    "stress-bs1",
-    "stress-bs1-recv",
-    "stress-bs10",
-    "stress-bs10-victim",
-    "stress-bs2",
-    "stress-bs2-victim",
-    "stress-bs3-recv",
-    "stress-bs3-send",
-    "stress-bs4",
-    "stress-bs4-victim",
-    "stress-bs5",
-    "stress-bs5-victim",
-    "stress-bs6",
-    "stress-bs7",
-    "stress-bs8",
-    "stress-bs9-recv",
-    "stress-bs9-send-a",
-    "stress-bs9-send-b",
-    "stress-s1",
-    "stress-s1-recv",
-    "stress-s10",
-    "stress-s10-victim",
-    "stress-s2",
-    "stress-s2-victim",
-    "stress-s3-recv",
-    "stress-s3-send",
-    "stress-s4",
-    "stress-s4-victim",
-    "stress-s5",
-    "stress-s5-victim",
-    "stress-s6",
-    "stress-s7",
-    "stress-s8",
-    "stress-s9-recv",
-    "stress-s9-send-a",
-    "stress-s9-send-b",
-    "supervisor",
-    "time",
-    "upper",
-    "xhci",
-    "xlife",
-    "xlife-far",
-    "xlife-near",
-    "xsend",
-    "xsend-recv"
+    "supervisor"
 ]
 
 # Commandment II - NO SERVICE ESCAPES CHAOS.
@@ -374,7 +171,20 @@ service_configs = [
 #
 # Neither query changes what the kernel DOES. Both are read-only, both are INTROSPECT-gated by falling
 # outside the ungated list, and the system behaves identically whether anything reads them or not.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25]
+#
+# 26 (added 2026-09-01) reports how many FAULT diagnostics were written without the serial lock, and
+# so may appear spliced into another log line (audits/kernel-audit.md Audit 10). It exists because the
+# splice cannot be eliminated outright: when a page fault interrupts a `kprintln` on its OWN core, the
+# handler cannot wait for a lock that core already holds, and writing unlocked is the only way to
+# report the fault at all. That residual is real, so it is COUNTED rather than left silent - a
+# corrupted line becomes explainable instead of mysterious, which is the whole reason the splice cost
+# two wrong diagnoses before it was understood (invariant 12, §26.7).
+#
+# Read-only, INTROSPECT-gated like the rest, and it changes nothing the kernel DOES. It counts an
+# event the kernel was already having; it does not create one. It was briefly written as UNGATED on
+# the reasoning that a health counter discloses no task state - which this pin caught, correctly. The
+# ungated set is a deliberate list, not a judgement call to be made per query at the call site.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the
@@ -464,6 +274,45 @@ GPIO_DEVICE        = 11
 USB_DISK           = 12
 SET_CLOCK          = 13
 FIRE_IRQ           = 14
+# IMAGE_SPAWN - start a task from a CALLER-SUPPLIED image (`SpawnImage`, syscall 52).
+#
+# The checker's question is "why isn't this a service?", and for a CAPABILITY the answer is that it
+# cannot be one: enforcing capabilities IS the kernel's job (§4.3, the C in MISCIS). A capability
+# checked in userspace is not a capability.
+#
+# It adds NO new kernel responsibility. The kernel already gated this syscall - it simply gated it
+# with `SPAWN`, and those turned out to be two different powers wearing one name: "start a service
+# the system knows" and "start ARBITRARY BYTES under a name you choose". The second did not exist
+# before step C moved the images out of the kernel; afterwards `SpawnImage` had to accept bytes from
+# userspace and was guarded by the capability the SHELL holds for unrelated reasons - as do `chaos`,
+# `control` and every probe. Splitting them is the kernel distinguishing two things it was already
+# doing, not taking on a third.
+#
+# The trade, stated plainly: this pin GROWS BY ONE, and what it buys is that twelve services lose the
+# power to introduce new code under a real service's name while that service is dead - the window in
+# which a client reacquiring by name (§14.3) would wire itself to the impostor. Deliberately NOT
+# delegatable (absent from SUPERVISOR_DELEGATABLE), so it cannot be handed on one grant later.
+# Pinned by §22 Adversarial A9c: a probe that HOLDS a spawn cap is refused.
+IMAGE_SPAWN        = 15
+# PCI_CFG - read one PCI configuration register (step D2).
+#
+# "Why isn't this a service?" - the SEMANTICS are: `hw-enumerator` owns them. This authority exists
+# because reaching configuration space needs a privileged instruction or a kernel-only mapping that
+# no ring-3 code has, so the kernel must perform the access on a holder's behalf. It is the smallest
+# authority that makes userspace enumeration possible at all.
+#
+# PERMANENTLY READ-ONLY. Configuration space holds every BAR and every command register, and the
+# target is chosen by data rather than by the interface, so write authority here is write authority
+# over every device on the bus and there is no narrower form of it to grant. The capability is minted
+# with READ alone - not READ|WRITE - so no unexercisable right sits around waiting for a later change
+# to find a use for it.
+#
+# SAFE FOR MULTIPLE HOLDERS, because the operation is atomic. The underlying hardware is a stateful
+# index/data pair on both ports, and were selecting and reading two separate operations, two holders
+# would silently read each other's device - a wrong answer with nothing anywhere to say so, which is
+# worse than a refused one. The kernel itself drives that pair on its spawn and kill paths, so this
+# was never hypothetical: a split interface raced the kernel, not just other services.
+PCI_CFG            = 16
 
 
 [kernel.arch_roles]
@@ -574,11 +423,43 @@ NetFrameTx               = 42
 NetFrameRx               = 43
 NetInfo                  = 44
 FireIrq                  = 51
+# What the kernel learns is a selector and a register offset - two opaque numbers. It does not learn
+# what they name: not that a bus/device/function encoding sits inside the selector, not how to walk a
+# bus, not what a class code identifies. That knowledge is hardware semantics and lives in the
+# `hw-enumerator` service, which is the whole point of step D2.
+#
+# ONE SYSCALL, NOT A SELECT/READ PAIR, and the count is the smaller half of why. Configuration space
+# is reached on both ports through a stateful index/data register pair: latch a selector, then read
+# the data. Split across two syscalls, two callers interleave and each reads whichever register the
+# OTHER selected - and the KERNEL uses that same pair on its spawn and kill paths (`program_msi`,
+# `set_bus_master`), so a split pair races the kernel's own accesses and can land a kernel WRITE on a
+# device a service selected. A lock cannot close that: the kernel would have to hold it across two
+# syscalls and wait for a service to issue the second, which nothing above the kernel may make it do.
+# Atomic under one lock, the window does not exist.
+#
+# The authority is narrow and permanently READ-ONLY: one configuration register read, and no write of
+# any kind. Configuration space holds every BAR and every command register, and the target is chosen
+# by data rather than by the interface, so there is no narrower form of write authority to grant -
+# which is exactly why none is. Widening this to allow writes (destructive BAR sizing is the obvious
+# temptation) requires a different mechanism designed on its own terms, never this one relaxed.
+PciCfgRead               = 53
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47
 UsbDiskWrite             = 48
 UsbDiskFlush             = 49
+# Step C (docs/service-ownership.md). The pin asks "why isn't this a service?" - and here the honest
+# answer is that it CANNOT be: loading an ELF into a fresh address space is memory isolation, which is
+# the kernel's own job (4.3, MISCIS). Nothing above the kernel can map a page.
+#
+# It does not ADD a kernel responsibility, it REMOVES one. `Spawn` requires the kernel to hold a
+# catalogue of every service - image, memory limit, placement, peers, privileges - which is policy
+# living in ring 0 (26.10). `SpawnImage` takes all of that from the CALLER, so the catalogue can go:
+# the pin above it (`service_configs`) is what shrinks, from 29 entries towards 1.
+#
+# The request is versioned and fetched ONCE, and fields the kernel does not yet honour are REFUSED
+# rather than ignored (invariant 12).
+SpawnImage               = 52
 
 # ------------------------------------------------------------------------------------------------
 # Recorded exemptions.

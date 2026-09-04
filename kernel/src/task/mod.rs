@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -201,7 +201,6 @@ pub static XHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 /// The arm32 DWC2's permanent DMA reservation, reused across respawns like every other class.
 pub static DWC2_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-pub static AHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 32 pages
 /// hold the control structures (command/event rings, DCBAA, ERST) and the six
@@ -303,6 +302,23 @@ struct ServiceContextData {
     reply_recv_slot:    u32,
     /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
     reply_grant_slot:   u32,
+    /// The interrupt VECTOR(s) this service was granted, so a driver can learn which one it got.
+    ///
+    /// The kernel used to hand every driver a vector it could also hardcode: `XHCI_MSI_VECTOR` was a
+    /// kernel constant, so both sides knew 0x28 statically and a driver comparing against its own copy
+    /// was correct. The MSI pool (step D1b) makes the vector ALLOCATED AT SPAWN, and that quietly
+    /// invalidated the hardcoded copy: the kernel began routing 0x30 while `services/xhci` still tested
+    /// for 0x28, so it classified every real interrupt as an unknown message and reported `0 MSI, 7799
+    /// msg` on hardware. Nothing broke - the interrupt still WOKE the driver - but the one instrument
+    /// that says whether interrupts work had started reporting the opposite.
+    ///
+    /// The design gap was this field's absence, not the stale constant. A driver already learns its
+    /// MMIO window and DMA arena from the kernel (`ctx.mmio()`, `ctx.dma_region()`) precisely because
+    /// it may not name them; its vector is the same kind of fact and now travels the same way. A
+    /// caller still cannot ASK for a particular vector - that is authority (§12.3) - it can only be
+    /// told which one it was given.
+    irq_count:          u32,      // 0 = no interrupt granted
+    irqs:               [u8; 4],  // the granted vectors; only the first `irq_count` are meaningful
 }
 
 // The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
@@ -312,7 +328,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 320;   // 256 + 2 x SendPeerEntry(32) after MAX_SEND_PEERS 4 -> 6
+const SERVICE_CONTEXT_DATA_SIZE: usize = 328;   // 320 + irq_count(4) + irqs[4] - the granted vector (D1b)
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -369,13 +385,6 @@ const SUPERVISOR_ELF: &[u8] = b"\xDE\xAD"; // invalid ELF, triggers LoadFailed
 #[cfg(not(feature = "test-bad-supervisor"))]
 const SUPERVISOR_ELF: &[u8] = include_bytes!(env!("SVC_SUPERVISOR_ELF"));
 
-/// The one shared probe ELF. Every probe/test-driver service uses this exact
-/// reference, so the spawn path can identify "is a probe" by pointer identity
-/// (`elf_bytes` == `PROBE_ELF`) - used to mint the service_control cap for the
-/// test drivers without enumerating every probe name. A single const guarantees
-/// the pointer compares equal; separate `include_bytes!` sites would not.
-const PROBE_ELF: &[u8] = include_bytes!(env!("SVC_PROBE_ELF"));
-
 struct ServiceConfig {
     elf:               &'static [u8],
     has_recv_endpoint: bool,
@@ -404,7 +413,45 @@ struct ServiceConfig {
 /// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
 /// different irreducible fact from the authorization); only the driver's *class* is declared here.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2, Framebuffer }
+enum HwClass {
+    None,
+    // ---- NON-PCI kinds. These are SoC or boot facts, not bus facts: nothing enumerates them, so
+    // they stay named. `Dwc2` is soldered to the BCM283x, the framebuffer is a Limine/mailbox
+    // handoff, and the test IRQ is software. A name is the only way to refer to them.
+    Dwc2,
+    Framebuffer,
+    TestIrq,
+    /// ---- ANY PCI DEVICE, named by what the BUS says it is rather than by what the kernel was
+    /// taught (step D1).
+    ///
+    /// `class_code` is the industry-standard 24-bit (class, subclass, prog-if) triple, so a driver
+    /// for a device this kernel has never heard of needs NO kernel change: the supervisor puts the
+    /// code in the spawn request and the scan table answers it.
+    ///
+    /// The other three fields are the facts a class name used to imply, now stated by the caller
+    /// because they belong to the DRIVER, not to the bus:
+    ///   - `bar_ix`  which BAR holds the registers (xHCI 0, AHCI 5 - an INDEX, never an address),
+    ///               or `BAR_AUTO` for the first mapped MEMORY BAR
+    ///   - `dma_pages` how much DMA arena it needs (a SIZE, bounded by the syscall)
+    ///   - `confine` whether to put it behind the IOMMU (policy, §6.4)
+    ///   - `bdf`     WHICH device, when the caller knows (step D3). Zero means "not supplied" and
+    ///               the class is resolved against the kernel's own scan, as before. This is an
+    ///               IDENTIFIER, not an address: the kernel reads that device's registers to learn
+    ///               what it is worth, so naming it grants nothing a class name would not.
+    Pci { class_code: u32, bar_ix: u8, dma_pages: u32, confine: bool, bdf: u32 },
+    // ---- The legacy per-class names, still populated by the scan and still the default path until
+    // every caller names a class code. They go away with their last reader.
+    Nic, Xhci, Ehci,
+}
+
+/// PERMANENT per-device DMA reservations for PCI devices found by the scan (§12 DMA
+/// permanent-reserve), indexed by the device's slot in the table.
+///
+/// A restarted driver must be handed back the SAME physical arena - that is what makes a respawn
+/// transparent to a controller that is still DMAing into it. Keyed by device index rather than by
+/// class name, which is the whole point: a device the kernel cannot name still gets a reservation.
+static PCI_DMA_PHYS: [portable_atomic::AtomicU64; crate::arch::imp::pci::MAX_DEVICES] =
+    [const { portable_atomic::AtomicU64::new(0) }; crate::arch::imp::pci::MAX_DEVICES];
 
 impl HwClass {
     /// Did the PCI scan find this class of controller?
@@ -419,10 +466,18 @@ impl HwClass {
             // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
             // mailbox call on the Pi) and the floor that brought it up is the one that knows.
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
-            HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
-            HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
-            HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
-            HwClass::Nic  => pci::NIC_FOUND.load(Relaxed),
+            HwClass::Xhci => crate::arch::imp::pci::xhci().is_some(),
+            HwClass::Ehci => crate::arch::imp::pci::ehci().is_some(),
+            // Present if the bus reports one. On a port with no PCI the arch stub answers None,
+            // which is the same "no NIC here" this used to get from a static nothing ever set.
+            HwClass::Nic  => crate::arch::imp::pci::nic().is_some()
+                             || crate::arch::imp::soc_nic_present(),
+            // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
+            // Always "present" because the kernel raises it itself - there is nothing to scan for.
+            HwClass::TestIrq => true,
+            // Present iff the scan met a device claiming this class code.
+            HwClass::Pci { class_code, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code).is_some(),
             HwClass::None => false,
         }
     }
@@ -448,45 +503,104 @@ impl HwClass {
             // `Mmio` wrapper. The DWC2's address therefore belongs there, not here. Returning 0 is
             // how this class says "not on a bus" rather than "not present" - `found()` above is the
             // one that answers presence.
+            // The BAR the DRIVER named, from the device the BUS reported. Never an address the
+            // caller supplied - the index picks which of the six the scan already read.
+            // `BAR_AUTO` asks for the first mapped memory BAR instead of a numbered one. This is
+            // what lets ONE driver cover devices that put their registers in different places: the
+            // e1000 uses BAR0, while the RTL8168 on the Wyse puts I/O ports there and its registers
+            // in BAR2. Both are "the first memory BAR". Still not an address - a rule the kernel
+            // evaluates over its own scan, exactly as an index is.
+            HwClass::Pci { class_code, bar_ix: BAR_AUTO, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code)
+                    .and_then(|d| d.bar.iter().copied().find(|&b| b != 0))
+                    .unwrap_or(0),
+            HwClass::Pci { class_code, bar_ix, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code)
+                    .map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
             HwClass::Dwc2 => 0,
             // ZERO for the same reason as the DWC2: not on a bus, so not a BAR. The framebuffer has its
             // own grant path (the `HwClass::Framebuffer` branch in the spawn MMIO block) because it
             // needs geometry as well as a window, and because its size is whatever the display turned
             // out to be.
             HwClass::Framebuffer => 0,
-            HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
-            HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
-            HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),
-            HwClass::Nic if matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)
-                => pci::NIC_MMIO_BASE.load(Relaxed),
+            HwClass::Xhci => crate::arch::imp::pci::xhci().map_or(0, |d| d.bar[0]),
+            HwClass::Ehci => crate::arch::imp::pci::ehci().map_or(0, |d| d.bar[0]),
+            // A DEVICE OF THE CLASS IS A DEVICE, whatever chip it turns out to be. This arm used to
+            // read a per-class static AND require the vendor to be one of two the kernel had been
+            // taught (`0x100E_8086` e1000, `0x8168_10EC` RTL8168). That whitelist is precisely what
+            // step D removes: a third card would have enumerated, appeared in the table, been named
+            // by its own class code - and been handed no MMIO, because the kernel had not heard of
+            // it. Whether a driver can drive the chip it finds is the DRIVER's judgement, and it can
+            // read the vendor id for itself (InspectKernel query 14).
+            HwClass::Nic => crate::arch::imp::pci::nic()
+                .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)),
             _ => 0,
         }
     }
     /// A discovered DMA-capable controller needs a physically-contiguous DMA arena.
     fn needs_dma(self) -> bool {
         // The framebuffer is not a DMA master - the display scans it, this service only writes it - so
-        // it gets a window and no arena. Everything else that is `found()` DMAs.
-        self != HwClass::None && self != HwClass::Framebuffer && self.found()
+        // it gets a window and no arena. The test interrupt is not a device at all: it only needs a
+        // vector routed to an endpoint. Everything else that is `found()` DMAs.
+        //
+        // TestIrq was caught here rather than reasoned out: `found()` is `true` for it (the kernel
+        // raises the vector itself), so it fell through and `probe-11a` was handed a 64 KiB arena
+        // whose permanent physical reservation is the one `dma_phys_slot` gives unclassified
+        // callers - `XHCI_DMA_PHYS`, the REAL xHCI driver's. A test probe aliasing a driver's DMA
+        // region, on a machine that has both. Every suite passed while it did.
+        // A PCI device DMAs iff the caller asked for an arena. Zero pages = a register-only
+        // driver, which is a legitimate shape (block-driver's AHCI needs one, a serial card does not).
+        if let HwClass::Pci { dma_pages, .. } = self {
+            return dma_pages > 0 && self.found();
+        }
+        self != HwClass::None && self != HwClass::Framebuffer && self != HwClass::TestIrq
+            && self.found()
     }
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
-    fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
+    fn dma_pages(self) -> u64 {
+        match self {
+            // The CALLER states it: how much DMA a driver needs is the driver's fact, and the
+            // xHCI-needs-more special case was the last per-class size in the kernel.
+            HwClass::Pci { dma_pages, .. } => dma_pages as u64,
+            HwClass::Xhci => XHCI_DMA_PAGES,
+            _ => EHCI_DMA_PAGES,
+        }
+    }
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
     fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
             HwClass::Dwc2 => &DWC2_DMA_PHYS,
             HwClass::Xhci => &XHCI_DMA_PHYS,
             HwClass::Ehci => &EHCI_DMA_PHYS,
-            HwClass::Ahci => &AHCI_DMA_PHYS,
             HwClass::Nic  => &NIC_DMA_PHYS,
-            // Neither DMAs, so neither ever reaches here - `needs_dma()` gates every caller. They
+            // None of these DMA, so none ever reaches here - `needs_dma()` gates every caller. They
             // return a real slot rather than panicking because an unreachable arm that aborts is a
-            // crash waiting for a refactor, and a wrong-but-unused reservation is not.
-            HwClass::None | HwClass::Framebuffer => &XHCI_DMA_PHYS,
+            // crash waiting for a refactor, and a wrong-but-unused reservation is not. It must STAY
+            // unused: this hands back the xHCI driver's own reservation, so a class that reached here
+            // by accident would alias it (TestIrq did, until `needs_dma` was corrected).
+            // Per DEVICE, not per class - a device the kernel cannot name still needs its arena
+            // handed back on restart. `index` is the scan slot, stable for the boot.
+            HwClass::Pci { class_code, .. } =>
+                match crate::arch::imp::pci::find_by_class(class_code) {
+                    Some(d) if d.index < crate::arch::imp::pci::MAX_DEVICES => &PCI_DMA_PHYS[d.index],
+                    // Unreachable: `needs_dma()` gates every caller and is false when the device is
+                    // absent. Returns a real slot rather than panicking, as the arms below do.
+                    _ => &PCI_DMA_PHYS[0],
+                },
+            HwClass::None | HwClass::Framebuffer | HwClass::TestIrq => &XHCI_DMA_PHYS,
         }
     }
     /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
     /// keep a stale firmware DMA pointer that confinement would fault, so they stay in passthrough).
-    fn iommu_confine(self) -> bool { self == HwClass::Xhci }
+    fn iommu_confine(self) -> bool {
+        match self {
+            // Policy, so the caller states it (§6.4). `ehci` and `block-driver` keep a stale
+            // firmware DMA pointer that confinement would fault, which is why this was never
+            // "confine every driver" in the first place.
+            HwClass::Pci { confine, .. } => confine,
+            _ => self == HwClass::Xhci,
+        }
+    }
     /// The device's PCI BDF (bus/device/function) for the bus-master + D0 enable, or 0xFFFF if none.
     fn bdf(self) -> u32 {
         use crate::arch::imp::pci;
@@ -494,10 +608,47 @@ impl HwClass {
         match self {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
             HwClass::Framebuffer => 0xFFFF, // not a PCI device
-            HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
-            HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
-            HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
-            HwClass::Nic  => pci::NIC_BDF.load(Relaxed),
+            HwClass::TestIrq     => 0xFFFF, // not a device at all - a software-raised vector
+            // A SUPPLIED BDF WINS, because it is the caller saying WHICH device rather than the
+            // kernel guessing from a class. `find_by_class` returns the FIRST match, so on a machine
+            // with two devices of one class it picks by scan order - which is not a decision the
+            // kernel has any basis to make. Zero means "not supplied": fall back to the class.
+            HwClass::Pci { class_code, bdf, .. } if bdf != 0 => {
+                // Cross-check while both paths exist (step D3 is additive until the scan goes).
+                let by_class = crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf);
+                if by_class != 0xFFFF && by_class != bdf {
+                    crate::kprintln!(
+                        "task: BDF {:#06x} supplied for class {:#08x}, but the scan says {:#06x} - using the supplied one",
+                        bdf, class_code, by_class);
+                } else {
+                    // SAID OUT LOUD, because agreement and absence look identical otherwise. Without
+                    // this line a supplied BDF that matches the scan produces exactly the same log as
+                    // no BDF at all - so "no disagreement" would be evidence of nothing, and the
+                    // switch-over would be unverifiable at the very moment it starts mattering.
+                    crate::kprintln!(
+                        "task: device chosen by SUPPLIED BDF {:#06x} for class {:#08x} (scan agrees)",
+                        bdf, class_code);
+                }
+                bdf
+            }
+            // NO BDF SUPPLIED - the kernel falls back to its own scan, and SAYS SO.
+            //
+            // This is the last thing standing between here and D3's actual goal, and until now it was
+            // silent. Every driver spawn on all four machines logged "chosen by SUPPLIED BDF", but a
+            // spawn that took THIS path logged nothing at all, so "the reporter always answers" was an
+            // inference from an absence rather than a fact - which is the exact shape of mistake this
+            // work keeps uncovering. One line converts it into evidence: if no hardware run ever
+            // prints it, the fallback is dead code and the scan can go with it.
+            HwClass::Pci { class_code, .. } => {
+                let by_class = crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf);
+                crate::kprintln!(
+                    "task: NO BDF supplied for class {:#08x} - fell back to the kernel's own scan, which says {:#06x}",
+                    class_code, by_class);
+                by_class
+            }
+            HwClass::Xhci => crate::arch::imp::pci::xhci().map_or(0xFFFF, |d| d.bdf),
+            HwClass::Ehci => crate::arch::imp::pci::ehci().map_or(0xFFFF, |d| d.bdf),
+            HwClass::Nic  => crate::arch::imp::pci::nic().map_or(0xFFFF, |d| d.bdf),
             HwClass::None => 0xFFFF,
         }
     }
@@ -519,15 +670,221 @@ pub const EHCI_CORE: u32 = 3;
 /// M7 / T1 Phase B). For the services that ship a `.toml`, `scripts/contract_check.py` reconciles this
 /// against the contract's `hw_device` / `resource_mint`, so the kernel and the contract cannot diverge
 /// (Commandment III). `xhci` / `ehci` / `resource-server` have no contract and are declared here only.
+/// Is this a device class this kernel understands? 0 = none.
+///
+/// An UNKNOWN class is refused rather than treated as none: a spawner asking for a device this kernel
+/// cannot grant must hear so, not receive a driver with no MMIO window that enumerates nothing and
+/// reports no error (invariant 12).
+pub fn hw_class_known(class: u32) -> bool {
+    // Bit 31 = "this is a PCI CLASS CODE, not one of the kernel's named kinds". Any class code is
+    // acceptable BY DESIGN - that is the whole of step D1. The kernel does not have a list of the
+    // ones it knows, because having one is what forced a kernel rebuild per driver.
+    if class & HW_PCI_FLAG != 0 { return true; }
+    class <= 7
+}
+
+/// `hw_flags` bit 31: the low bits describe a PCI device rather than a named kind.
+pub const HW_PCI_FLAG: u32 = 1 << 31;
+/// `hw_flags` bit 28: put this device behind the IOMMU (§6.4).
+pub const HW_PCI_CONFINE: u32 = 1 << 28;
+/// `hw_flags` bit 29: this driver wants an INTERRUPT - allocate a vector from the MSI pool and
+/// program the device's MSI with it (step D1b).
+pub const HW_PCI_IRQ: u32 = 1 << 29;
+
+/// The MSI vector allocated to each PCI device, indexed by its slot in the scan table. 0 = none yet.
+///
+/// Per DEVICE, not per spawn, and that is what makes a restart work: the vector is written into the
+/// device's own MSI register, so a respawned driver must be given the SAME one back - allocating a
+/// fresh vector each time would both exhaust the pool after eight restarts and leave the controller
+/// raising an interrupt nobody routes. Same reasoning as the permanent DMA reservation beside it.
+static PCI_MSI_VEC: [core::sync::atomic::AtomicU8; crate::arch::imp::pci::MAX_DEVICES] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; crate::arch::imp::pci::MAX_DEVICES];
+
+/// Next free slot in the MSI pool. Monotonic: a vector is never returned, because the device it was
+/// written into keeps using it for the life of the boot.
+static MSI_POOL_NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The vector this PCI device should raise, allocating and programming one on first use.
+///
+/// Returns 0 when there is nothing to route: no such device, the pool is exhausted, or the device
+/// refused MSI. Every one of those is reported - a driver silently left without interrupts presents
+/// later as a device that never responds, which is the diagnosis this saves (invariant 12).
+fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
+    use core::sync::atomic::Ordering;
+    let Some(d) = crate::arch::imp::pci::find_by_class(class_code) else { return 0 };
+    if d.index >= crate::arch::imp::pci::MAX_DEVICES { return 0; }
+
+    // Deliver to the core the driver is pinned to, so a device event wakes that core directly out
+    // of its idle halt rather than via a cross-core IPI - the same reasoning the named vectors use.
+    // Recomputed on a restart because the respawn may land on a DIFFERENT core than the instance
+    // that died (§9.2: placement is re-evaluated from scratch, the previous core is not remembered),
+    // and an interrupt still aimed at the old core would be delivered where nobody is waiting.
+    let dest = crate::arch::imp::pci::msi_dest_lapic(core_id);
+
+    // A RESTART: same device, so the same vector - allocating a fresh one would both drain the pool
+    // after eight restarts and leave the controller raising an interrupt nobody routes.
+    //
+    // But it is REPROGRAMMED rather than just handed back. Returning early without writing assumes
+    // the device's MSI configuration survived the driver's death, and that is an assumption about
+    // every driver that will ever use this pool, not a guarantee. It happens to hold for xHCI (MSI
+    // lives in PCI config space; `HCRST` resets the operational registers, not config space) - but a
+    // driver whose reset path is heavier, or a device that loses config on a function-level reset,
+    // would come back with no MSI programmed at all. The failure would be silent and awful to
+    // diagnose: the driver restarts, reports ready, and the keyboard never types again.
+    //
+    // The write is idempotent and costs a few config-space accesses once per spawn, so paying it
+    // unconditionally is strictly cheaper than the class of bug it forecloses. The destination is
+    // re-derived above, so this also FIXES the case where the respawn moved cores.
+    let existing = PCI_MSI_VEC[d.index].load(Ordering::Relaxed);
+    if existing != 0 {
+        if !crate::arch::imp::pci::program_msi(d.bdf, existing, dest)
+            && !crate::arch::imp::pci::program_msix(d.bdf, existing, dest)
+        {
+            // It took this vector once and will not take it now. Loud, because the driver is about
+            // to run believing it has interrupts (invariant 12).
+            crate::kprintln!(
+                "pci-msi: BDF {:#06x} REFUSED its own vector {:#04x} on restart - no interrupt",
+                d.bdf, existing);
+            return 0;
+        }
+        crate::kprintln!("pci-msi: class {:#08x} BDF {:#06x} -> vector {:#04x} (restart, same vector)",
+                         class_code, d.bdf, existing);
+        return existing;
+    }
+
+    // The slot is consumed only once the device is actually PROGRAMMED. Reserving first and
+    // programming after would let a device that accepts neither MSI nor MSI-X burn a slot on every
+    // spawn attempt, so eight restarts of one such device would exhaust the pool for every other
+    // device - a bounded resource drained by a path that never used it (§26.6).
+    //
+    // The CAS makes that safe without ASSUMING spawns are serialised. If another core took the slot
+    // in between we retry with the next one and reprogram, so the last write to the device is
+    // always the vector we end up holding.
+    loop {
+        let slot = MSI_POOL_NEXT.load(Ordering::Acquire) as usize;
+        if slot >= crate::arch::imp::interrupts::MSI_POOL_LEN {
+            crate::kprintln!(
+                "pci-msi: pool exhausted ({} vectors) - class {:#08x} gets NO interrupt and must poll",
+                crate::arch::imp::interrupts::MSI_POOL_LEN, class_code);
+            return 0;
+        }
+        let vector = crate::arch::imp::interrupts::MSI_POOL_BASE + slot as u8;
+
+        if !crate::arch::imp::pci::program_msi(d.bdf, vector, dest)
+            && !crate::arch::imp::pci::program_msix(d.bdf, vector, dest)
+        {
+            crate::kprintln!(
+                "pci-msi: BDF {:#06x} (class {:#08x}) accepted neither MSI nor MSI-X - no interrupt, must poll",
+                d.bdf, class_code);
+            return 0;   // no slot consumed
+        }
+
+        if MSI_POOL_NEXT.compare_exchange(
+                slot as u32, slot as u32 + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            continue;   // lost the slot to another core; take the next one and reprogram
+        }
+        PCI_MSI_VEC[d.index].store(vector, Ordering::Relaxed);
+        crate::kprintln!("pci-msi: class {:#08x} BDF {:#06x} -> vector {:#04x} (pool slot {})",
+                         class_code, d.bdf, vector, slot);
+        return vector;
+    }
+}
+
+/// `bar_ix` value meaning "the first mapped MEMORY BAR" rather than a numbered one (see
+/// `hw_mmio_of`). 7 is free because the field is 3 bits and only 0..5 are real BARs.
+pub const BAR_AUTO: u8 = 7;
+
+/// Decode a `hw_flags` PCI descriptor: `bit31 | confine<<28 | bar_ix<<24 | class_code`.
+fn hw_pci_of(class: u32, dma_pages: u32, bdf: u32) -> HwClass {
+    HwClass::Pci {
+        class_code: class & 0x00FF_FFFF,
+        bar_ix:     ((class >> 24) & 0x7) as u8,
+        dma_pages,
+        confine:    class & HW_PCI_CONFINE != 0,
+        bdf,
+    }
+}
+
+/// Does this `hw_flags` describe a PCI device? A BDF means nothing for the named non-bus kinds
+/// (`Dwc2` is soldered on, the framebuffer is a boot handoff, the test IRQ is software), so supplying
+/// one for those is a caller error worth refusing rather than ignoring.
+pub fn hw_class_is_pci(class: u32) -> bool { class & HW_PCI_FLAG != 0 }
+
+/// Resolve a spawn request's device class to the kernel's own scan results.
+fn hw_class_of(class: u32) -> HwClass {
+    if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0, 0); }
+    match class {
+        2 => HwClass::Nic,
+        3 => HwClass::Xhci,
+        4 => HwClass::Ehci,
+        5 => HwClass::Dwc2,
+        6 => HwClass::Framebuffer,
+        7 => HwClass::TestIrq,
+        _ => HwClass::None,
+    }
+}
+
+/// The interrupt vector(s) a device CLASS is served by, as THIS kernel routes them.
+///
+/// An IRQ vector is AUTHORITY, not a setting. Routing a vector to a task is what makes that task
+/// receive the device's interrupts - on ARM, granting the USB vector is precisely what takes the
+/// controller away from whoever held it. So a spawner able to NAME a vector could hand a service
+/// another device's interrupts, which is the ambient authority 3.1 forbids.
+///
+/// The supervisor therefore names a device CLASS and the kernel supplies the vector IT assigned, by
+/// the same rule and for the same reason as the MMIO window and the DMA arena (`SpawnImage` refuses
+/// those outright). The vector is a property of the device and of this kernel's own routing, so it
+/// is the kernel's to state - exactly the 26.14 question: a property of the device, not of the
+/// caller's design.
+fn hw_irqs_for(class: HwClass) -> &'static [u8] {
+    match class {
+        HwClass::Xhci => &[crate::arch::imp::interrupts::XHCI_MSI_VECTOR],
+        HwClass::Ehci => &[crate::arch::imp::interrupts::EHCI_MSI_VECTOR],
+        // The DWC2 is the ARM board's USB host; on any other arch there is no such controller.
+        #[cfg(target_arch = "arm")]
+        HwClass::Dwc2 => &[crate::arch::imp::irq::USB_VECTOR],
+        #[cfg(not(target_arch = "arm"))]
+        HwClass::Dwc2 => &[],
+        // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a PCIe
+        // NIC with no such route, so the grant is arch-gated rather than unconditional.
+        #[cfg(target_arch = "aarch64")]
+        HwClass::Nic  => &[0x2A],
+        #[cfg(not(target_arch = "aarch64"))]
+        HwClass::Nic  => &[],
+        // The SOFTWARE test interrupt (§22 IR1): `control` raises vector 33 with FireIrq and the
+        // kernel must route it to the registered driver's endpoint. It is a vector like any other -
+        // the caller names the class and the kernel states the number - which is what lets the probe
+        // that receives it stop being a kernel-known name.
+        HwClass::TestIrq => &[33],
+        HwClass::Framebuffer | HwClass::None => &[],
+        // NO VECTOR YET, and this is the honest edge of step D1 rather than an oversight.
+        //
+        // The named classes above return a vector the KERNEL assigned and programmed into the
+        // device's MSI/MSI-X at boot (`pci: MSI-X enabled on 00:04.0 vector=0x28`). Doing that for a
+        // device the kernel cannot name means allocating a vector from a pool and programming that
+        // device's MSI generically - which is real work, and squarely the kernel's (interrupt
+        // routing is one of the six, §4.3), so it belongs here rather than in the caller.
+        //
+        // Until it lands, a driver spawned by CLASS CODE gets MMIO, DMA and its BDF but no
+        // interrupt: it must poll. The four existing drivers keep their named classes and their
+        // vectors, so nothing regresses - but a new driver that needs an interrupt still waits on
+        // this. Stated rather than papered over (§26.7).
+        // Resolved at the SPAWN SITE instead, by `pci_msi_vector`: allocating a vector needs the
+        // core the driver will run on (for the delivery destination), and this returns a 'static
+        // slice which an allocated value cannot live in.
+        HwClass::Pci { .. } => &[],
+    }
+}
+
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
-        "dwc2"                                 => (HwClass::Dwc2, false),
-        "console"                              => (HwClass::Framebuffer, false),
-        "xhci"                                 => (HwClass::Xhci, false),
-        "ehci"                                 => (HwClass::Ehci, false),
-        "block-driver"                         => (HwClass::Ahci, false),
-        "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
-        "fs" | "net-stack" | "resource-server" => (HwClass::None, true),
+        // EVERY driver has moved to the supervisor (step C). Each names its device CLASS in the
+        // spawn request - Ahci, Framebuffer, Xhci, Ehci, Dwc2, Nic - and the kernel resolves that
+        // against its OWN bus scan, so the caller never names an address or an interrupt vector.
+        // Nothing is left to look up by name here.
+        // `resource-server`, `fs` and `net-stack` all moved to the supervisor (step C): their
+        // RESOURCE_MINT arrives in the spawn request, checked against what the SUPERVISOR may
+        // delegate, instead of being granted here by name. Nothing is left in this arm.
         _                                      => (HwClass::None, false),
     }
 }
@@ -539,6 +896,119 @@ fn service_hw(name: &str) -> (HwClass, bool) {
 /// authority; IV honor contracts declaratively): the spawn path reads these booleans, never a re-derived
 /// `name ==` check. `is_probe` (the caller's ELF is `PROBE_ELF`) covers the whole test-probe family by
 /// identity, so no probe is missed by name.
+/// Bit positions for `SpawnRequest::privileges`. One bit per field of `Privileges` below, in
+/// declaration order, so the wire form and the struct cannot drift apart silently.
+///
+/// A caller may only request bits it HOLDS ITSELF (`privileges_caller_lacks`), which is what keeps
+/// this from being ambient authority (3.1): a spawner passes on what it has, it does not mint.
+pub mod privbits {
+    pub const SPAWN:           u32 = 1 << 0;
+    pub const CONSOLE_PUSH:    u32 = 1 << 1;
+    pub const INTROSPECT:      u32 = 1 << 2;
+    pub const SERVICE_CONTROL: u32 = 1 << 3;
+    pub const FIRE_IRQ:        u32 = 1 << 4;
+    pub const REBOOT:          u32 = 1 << 5;
+    pub const ACQUIRE_ANY:     u32 = 1 << 6;
+    pub const RESOURCE_MINT:   u32 = 1 << 7;
+    /// ARM-only in practice (`cfg!(target_arch = "arm")`), but the BIT is arch-neutral: the kernel
+    /// still refuses it unless the caller may delegate it, and the supervisor's table simply does not
+    /// set it elsewhere.
+    pub const GPIO:            u32 = 1 << 8;
+    /// SET_CLOCK with READ, not WRITE. The narrow right: raise the persisted clock FLOOR, which only
+    /// constrains which clock values are acceptable - where WRITE would let the holder step every
+    /// task's view of the time of day. Granting plain SET_CLOCK instead would hand over exactly the
+    /// authority that split was built to withhold, and would fail anyway (a WRITE cap does not satisfy
+    /// a READ check).
+    pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
+    /// SET_CLOCK with WRITE: SET the wall clock (net-stack, from SNTP, on RTC-less ARM). Distinct
+    /// from SET_CLOCK_FLOOR above, which is the same resource with READ - see the note there for why
+    /// the split exists and must not be collapsed.
+    pub const SET_CLOCK:       u32 = 1 << 10;
+    /// NET_DEVICE: move ethernet frames through the in-kernel network device (`NetFrame*`/`NetInfo`,
+    /// syscalls 42-44). Held by `nic-driver` on aarch64, where the Pi 4's GENET sits behind those
+    /// syscalls; on arm32 the USB-net device moved into the `dwc2` SERVICE, so the driver reaches
+    /// frames over IPC and needs nothing here.
+    ///
+    /// It gets a bit because `nic-driver`'s image moved to the supervisor, and a moved service must
+    /// still be able to receive an authority it genuinely uses. Without one the driver would come up,
+    /// look healthy, and have every frame call denied - a dead network with no error at spawn, which
+    /// is the failure shape this whole mechanism exists to prevent.
+    pub const NET_DEVICE:      u32 = 1 << 11;
+    /// PCI_CFG: read PCI configuration space through the legacy CF8/CFC ports (step D2).
+    ///
+    /// READ-ONLY, permanently, and the kernel enforces WHICH PORTS rather than what they mean. CF8
+    /// selects which register CFC reaches, so a CFC write would be a write to any config register of
+    /// any device on the bus; there is no narrower form of that at port granularity, so it is not on
+    /// offer. Held by ONE service (`hw-enumerator`), because the pair is stateful - two holders do
+    /// not merely race, they silently read each other's device.
+    pub const PCI_CFG:         u32 = 1 << 12;
+    /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
+    /// quietly ask for a privilege this kernel would ignore.
+    pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
+                         | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
+                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE | PCI_CFG;
+}
+
+/// Which requested privilege the CALLING task does not itself hold, if any.
+///
+/// `None` means every requested bit is one the caller could already exercise, so passing it to a
+/// child grants nothing new - the same non-escalation argument as an installed cap (7.3).
+pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
+    use crate::capability::*;
+    if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
+    let checks: [(u32, ResourceId, &'static str); 13] = [
+        (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
+        (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
+        (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
+        (privbits::SERVICE_CONTROL, SERVICE_CONTROL_RESOURCE, "SERVICE_CONTROL"),
+        (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE,        "FIRE_IRQ"),
+        (privbits::REBOOT,          REBOOT_RESOURCE,          "REBOOT"),
+        (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE,     "ACQUIRE_ANY"),
+        (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE,   "RESOURCE_MINT"),
+        (privbits::GPIO,            GPIO_DEVICE_RESOURCE,     "GPIO"),
+        (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE,       "SET_CLOCK_FLOOR"),
+        (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE,       "SET_CLOCK"),
+        (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE,      "NET_DEVICE"),
+        (privbits::PCI_CFG,         PCI_CFG_RESOURCE,         "PCI_CFG"),
+    ];
+    for (bit, res, label) in checks {
+        // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
+        // conflating them would force the supervisor to hold every privilege it might ever pass on -
+        // a maximally-privileged supervisor that could mint resources, reboot the machine and inject
+        // keystrokes, purely so it could delegate those things. With GRANT-only caps it can pass them
+        // on and never use them, which is strictly less authority than the alternative.
+        if requested & bit != 0 && !scheduler::current_task_holds_resource(res, Rights::GRANT) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Privileges the SUPERVISOR may DELEGATE to a service it spawns, without being able to use them.
+///
+/// Minted GRANT-only: `resource_mint` (and every other privileged syscall) checks for WRITE, so the
+/// supervisor cannot exercise any of these - it can only pass them to a child. That is the whole
+/// point: a spawner needs the right to DELEGATE authority, not the authority itself.
+///
+/// This is not new reach. The supervisor could already start `fs`, which holds RESOURCE_MINT by name;
+/// being able to name the privilege changes which BINARY receives it, not whether the privilege can
+/// be obtained at all - and step 2's signing is what re-anchors "which binary" (docs/service-ownership.md).
+const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
+    (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE),
+    (privbits::INTROSPECT,      INTROSPECT_RESOURCE),
+    (privbits::SERVICE_CONTROL, SERVICE_CONTROL_RESOURCE),
+    (privbits::SPAWN,           SPAWN_RESOURCE),
+    (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE),
+    (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE),
+    (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE),
+    (privbits::REBOOT,          REBOOT_RESOURCE),
+    (privbits::GPIO,            GPIO_DEVICE_RESOURCE),
+    (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE),
+    (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE),
+    (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE),
+    (privbits::PCI_CFG,         PCI_CFG_RESOURCE),
+];
+
 struct Privileges {
     spawn:           bool, // SPAWN: create tasks (supervisor, the shell, chaos' spawn-burst, probes)
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
@@ -548,17 +1018,25 @@ struct Privileges {
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
+    pci_cfg:         bool, // PCI_CFG: read PCI config space via CF8/CFC (hw-enumerator, step D2)
     usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
     set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
     set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
+    /// IMAGE_SPAWN: start a task from a CALLER-SUPPLIED image (`SpawnImage`). The supervisor alone -
+    /// see `IMAGE_SPAWN_RESOURCE` for why this is not the same authority as `spawn`, and why it is
+    /// deliberately absent from `SUPERVISOR_DELEGATABLE`.
+    image_spawn:     bool,
 }
 
-fn service_privileges(name: &str, is_probe: bool) -> Privileges {
+fn service_privileges(name: &str) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos" | "control"),
+        spawn: matches!(name, "supervisor"),
+        // The supervisor is the only principal that HOLDS images, and the only caller of
+        // `SpawnImage` in the tree. Everything else asks it over IPC (`supcmd::SPAWN`).
+        image_spawn: matches!(name, "supervisor"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -571,25 +1049,32 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // driver and is why the grant is enumerated here by name rather than implied by holding a
         // USB controller.
         console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
-        // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
-        // chaos does victim selection; the prop-/stress- probes query victim generations.
-        introspect: matches!(name, "shell" | "supervisor" | "chaos" | "control")
-            || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
+        // THE PREFIX HOLE IS CLOSED. This used to read
+        //     `matches!(name, "supervisor") || name.starts_with("prop-") || name.starts_with("stress-")`
+        // and was recorded here as a known one (26.7): probe names are caller-supplied, so a service
+        // holding a spawn cap could obtain INTROSPECT BY CHOOSING A STRING. The fix named in that note
+        // - "carry a privilege word like `SpawnImage` does, checked against what the CALLER may
+        // delegate" - is what moving the probe image did. The prop-/stress- drivers get INTROSPECT
+        // from `probes::privileges_of` in the supervisor's request now, and adv-a11 still gets none,
+        // so the test whose subject is a probe WITHOUT the cap keeps its subject.
+        //
+        // Only the supervisor is left, because only the supervisor is still spawned by name.
+        introspect: matches!(name, "supervisor"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos" | "control"),
+        service_control: matches!(name, "supervisor"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
         // FIRE_IRQ: only the control service. It exists so the COM2 command interpreter could leave
         // the kernel; naming the authority is what made that possible (C1-6).
-        fire_irq: matches!(name, "control"),
-        reboot: matches!(name, "shell"),
+        fire_irq: false, // `control` carries FIRE_IRQ in its spawn request now (step C)
+        reboot: false, // the shell carries REBOOT in its spawn request now (step C)
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
-        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
+        acquire_any: matches!(name, "supervisor"),
         // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
         // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
         // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
@@ -605,6 +1090,11 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // nic-driver reaches frames over IPC and the syscalls have nothing behind them. Keeping the
         // grant would be authority it cannot use - the exact over-grant the audits keep finding.
         net_device: cfg!(target_arch = "aarch64") && matches!(name, "nic-driver"),
+        // No service in the KERNEL's catalogue holds PCI_CFG. `hw-enumerator` is a moved service -
+        // the supervisor owns its image and requests this privilege in the spawn request, which the
+        // kernel grants only because the supervisor itself holds a GRANT cap for it. That is step C's
+        // shape and the reason this reads `false` rather than naming a service (§7.4).
+        pci_cfg: false,
         // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
         // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
         // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
@@ -619,10 +1109,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         //
         // (The original note here claimed the stack is in-kernel on BOTH ARM ports. That was true when
         // it was written and stopped being true when the aarch64 driver was deleted.)
-        usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "block-driver"),
+        // Nothing holds USB_DISK any more. It named `block-driver` alone, and `block-driver`'s image
+        // moved to the supervisor - so this arm could not fire even if the authority were still
+        // wanted, and it is not: the driver reaches its stick through the `dwc2` / `xhci` service over
+        // IPC on both ARM ports. Left as `false` rather than deleted along with the resource and its
+        // three syscalls, which is a separate change (audit SEC-37).
+        usb_disk: false,
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
-        gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
+        gpio: false, // delegated in the spawn request (step C)
         //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
         //   by net-stack, which runs the SNTP exchange (the RTC-less ARM port has no other time source).
         //   READ = raise the persisted clock FLOOR only, held by the shell, which reads the last-known time
@@ -633,16 +1127,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
         // answer, and is refused at the last step - the clock stays at the boot epoch while the log
         // says the time was fetched.
-        set_clock:       cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "net-stack"),
+        set_clock:       false, // net-stack carries SET_CLOCK in its spawn request now (step C)
         // aarch64 joins arm: the Pi 4 has no RTC either, so the floor the shell persists to
         // /clock.last is what carries a network sync across a power cycle. READ, not WRITE - raising
         // the floor only constrains which clock values are acceptable, where WRITE would let the shell
         // step every task's view of the time of day. The narrower right already existed here; granting
         // the shell plain `set_clock` instead would have handed it exactly the authority this split was
         // built to withhold, and would have failed anyway - a WRITE cap does not satisfy a READ check.
-        set_clock_floor: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "shell"),
+        set_clock_floor: false, // delegated in the spawn request (step C)
     }
 }
 
@@ -650,13 +1142,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
 /// cap to it (`AcquireSendCap`) is contract-authorized recovery (§14.2), not ambient authority (§3.1).
 /// The caller's name comes from the existing `task_stat` snapshot and its declared peers from the
 /// static `service_config`, so this adds no new per-task kernel state and no new `unsafe`.
+/// Did the calling task declare `peer` as a send-peer at spawn?
+///
+/// Reads what the task was ACTUALLY WIRED WITH, recorded by the spawn path, rather than looking the
+/// service up in the kernel catalogue. The catalogue answer is wrong for any service whose config has
+/// moved to the supervisor (step C): it says "declares nothing", which denied a supervisor-owned
+/// service the reacquire it needs after a peer restarts (14.3) - `ping` could never re-find `pong`.
 pub fn current_task_declares_peer(peer: &str) -> bool {
-    let slot = scheduler::current_task_slot();
-    let name = scheduler::task_stat(slot).name;
-    match service_config(name) {
-        Some((_, cfg)) => cfg.send_peers.iter().any(|p| *p == peer),
-        None           => false,
-    }
+    scheduler::task_declares_peer(scheduler::current_task_slot(), peer)
 }
 
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
@@ -672,3035 +1165,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // The terminal (docs/console-service.md 9). Holds the framebuffer grant (`service_hw`) and
-        // renders every console byte the kernel `try_send`s to its endpoint.
-        //
-        // ARM: core 3, and NOT core 0. I put it on core 0 first, reasoning that a console write is what
-        // the user is waiting to see so it should sit with the shell - and that was wrong twice over.
-        // The shell is on core 1, and core 0 is deliberately left to `dwc2` ALONE (see the note on
-        // net-stack below, and the logger's, which was moved off core 0 for exactly this).
-        //
-        // It matters more here than it did for the logger. A full-screen repaint is millions of
-        // non-cacheable pixel stores in one un-preemptible stretch, and dwc2's split transactions have
-        // to hit 125 us microframe windows. Sharing a core with it produced NYET storms and two
-        // "keyboard TT wedged" stalls, one of them six seconds long, on the first boot that had a
-        // terminal to starve it.
-        //
-        // Core 3 rather than 2 because the logger and block-driver are on 2; the terminal is the one
-        // service whose latency the user watches directly, so it gets the idle core.
-        "console" => Some(("console", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_CONSOLE_ELF")),
-            has_recv_endpoint: true, // the console byte stream AND geometry requests arrive here
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    if cfg!(target_arch = "arm") { 3 } else { 0 },
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024, // matches console.toml
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "logger" => Some(("logger", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
-            //
-            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
-            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
-            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
-            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
-            // line holds its core, un-preemptible, for about 9 ms.
-            //
-            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
-            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
-            // of the fix; it needs no console rework and it uses the cores this board has.
-            // OFF CORE 0 ON EVERY ARCH. ARM moved it first, for the reason above; x86 has now been
-            // shown to need the same thing for a different one. Every trace event WAKES this service,
-            // and while it sat on core 0 it preempted the shell twice per fs request: `osdev test
-            // files` went 222/0 -> 213/9 with tracing on, tab completion and `find` timing out, and
-            // straight back to 222/0 with nothing changed but this number. A diagnostic sink does not
-            // belong on the interactive core.
-            //
-            // Safe on a machine with fewer cores: an unavailable preferred core falls back to
-            // round-robin (`resolve_placement`), it does NOT fail the spawn - so a 1-core or 2-core
-            // box still gets its logger.
-            preferred_core:    2,
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
-                                                 // contract is the source of truth (audit T1 reconcile)
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // time (services/time): the wall clock, moved out of the kernel (finding C1-6). §4.3 names six
-        // kernel responsibilities and timekeeping is not among them. The kernel keeps only the register
-        // read - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
-        // what the read MEANS: conversion, the plausibility window, provenance and the floor.
-        //
-        // It needs no hardware grant: it reads the RTC through the introspection query that already
-        // exists and serves the result over IPC.
-        // control (services/control): the COM2 operator channel, moved out of the kernel (C1-6). The
-        // kernel keeps the byte read (query 21, transport); this owns the interpretation.
-        "control" => Some(("control", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_CONTROL_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,   // matches control.toml
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "time" => Some(("time", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_TIME_ELF")),
-            has_recv_endpoint: true,
-            // `fs`, so the clock can own its own FLOOR - read /clock.last at start-up and persist
-            // it when the clock is set. That duty used to sit in the SHELL, which polled `time` on the
-            // INPUT PATH waiting for a network clock, so on a machine that never syncs the prompt was
-            // unresponsive for the first thirty seconds of every boot. The clock's owner is the right
-            // place for the clock's state (§3.8: state belongs to the service that owns it).
-            //
-            // One direction only: `time` may ask `fs`. It must never call `net-stack`, which calls
-            // `time` to set the clock after SNTP - two single-threaded services calling each other is a
-            // deadlock, so the network stays a PUSH toward this service and never a pull from it.
-            send_peers:        &["fs", "net-stack"],   // fs = the clock floor; net-stack = the one-way "sync now" nudge
-            send_peers_grant:  false,
-            probe_mode:        0,
-            // UNPINNED (§9.2: name a core only with a real reason). The clock has no interrupt to be
-            // local to and no peer to be co-resident with, so round-robin places it. Contracted
-            // placement is deployment-coupled by design; inventing one here would be noise the
-            // supervisor is then obliged to honour.
-            preferred_core:    u32::MAX,
-            memory_limit:      8 * 1024 * 1024,   // matches time.toml
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // mem-pressure: a spawn-on-demand memory-pressure victim for `chaos mem-pressure` (allocs 4 MiB
-        // chunks up to this limit, then AllocDenied; killed to reclaim). Not in any auto-spawn set.
-        "mem-pressure" => Some(("mem-pressure", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_MEM_PRESSURE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      32 * 1024 * 1024, // ~8 chunks then AllocDenied; a clear free-frames swing
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // chaos: the spawn-on-demand system-stress orchestrator for `chaos max-carnage`. It kills +
-        // floods other services and is the one program a run never kills (it excludes ITSELF). Holds
-        // SERVICE_CONTROL (kill), INTROSPECT (task_stat victim selection), ACQUIRE_ANY (flood), SPAWN
-        // (mem-pressure spawn-burst), CONSOLE_READ (q-poll + the foreground claim, syscall 40), LOG_WRITE
-        // (the TUI, via ConsoleWrite). Excluded from auto-spawn; the shell spawns it by name on demand.
-        "chaos" => Some(("chaos", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_CHAOS_ELF")),
-            has_recv_endpoint: true,  // recv the round count from the shell launcher at startup
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  true,
-        })),
-        "ping" => Some(("ping", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PING_ELF")),
-            has_recv_endpoint: true,
-            // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
-            // name via the kernel directory on EndpointDead.
-            send_peers:        &["pong"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "pong" => Some(("pong", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PONG_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // greet / upper - capability-mediated pipe demo (Appendix D.3).
-        // `upper` recvs and uppercases each line. `greet` has NO static send
-        // authority (send_peers empty) - the shell delegates it a SEND cap to
-        // upper's endpoint at spawn, which becomes its send_peers[0]. Authority
-        // is granted at composition time, not held by contract.
-        // ----------------------------------------------------------------
-        "upper" => Some(("upper", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_UPPER_ELF")),
-            has_recv_endpoint: true,
-            // A pipe SINK is recorded in the kernel name-directory at spawn; the shell resolves its
-            // endpoint by name at runtime (`builtin | service`, `acquire_send_grant_cap`) - no
-            // contracted cap.
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "greet" => Some(("greet", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_GREET_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[], // delegated at runtime by the shell, not contracted
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // roster - record-producing pipe demo (docs/records.md): emits a typed Table as JSON
-        // through the shell-delegated SEND cap. Same zero-ambient-authority shape as greet.
-        "roster" => Some(("roster", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_ROSTER_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[], // delegated at runtime by the shell, not contracted
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // xhci - USB host-controller driver (§12). Receives its controller's
-        // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
-        // userspace driver. has_recv_endpoint for future interrupt delivery.
-        // `dwc2` - the arm32 userspace USB host driver (Phase 2 skeleton).
-        //
-        // Granting `hw_irqs = [0x29]` is what makes `arm_irq_dispatch` route the USB interrupt HERE
-        // instead of to the in-kernel stack: the dispatcher picks by registration, so spawning this
-        // service is what takes the controller away from the kernel. Deliberate, and the whole point
-        // of the phase - but it means USB is expected to be degraded while a skeleton holds the
-        // vector. See docs/arm32-usb-userspace.md.
-        //
-        // Core 0: the DWC2 interrupt is routed to core 0 by `route_usb_irq_to_core0`, and a driver
-        // that receives its interrupt on one core while running on another pays a cross-core wake for
-        // every single one. The Pi 4 learned this the expensive way - `xhci`'s MSI destination had
-        // drifted to a core the driver did not run on, and co-locating them was what took it from
-        // 100% CPU to 0%.
-        "dwc2" => Some(("dwc2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_DWC2_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[0x29],
-            has_console_read:  false,
-        })),
-        "xhci" => Some(("xhci", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_XHCI_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            // Core 2: the USB drivers busy-poll their controllers at ~100% CPU, so co-locating both
-            // on core 1 (with nic-driver + net-stack + fs + block-driver) SATURATED it - starving the
-            // networking (net-stack's frame requests to nic-driver timed out) and the keyboard itself
-            // (input garbled then died on the T630). Spreading the two busy-pollers onto the idle cores
-            // (xhci=2, ehci=3) leaves core 1 for the request-driven services. Falls back to round-robin
-            // if core 2 is not ready.
-            preferred_core:    XHCI_CORE,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
-            // endpoint (§12). The kernel programmed the controller's MSI-X to this vector at
-            // boot; the driver enables the controller's interrupter and drains the events.
-            hw_irqs:           &[0x28],
-            has_console_read:  false,
-        })),
-        // `ehci` - userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
-        // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). Busy-polls on core 1
-        // (alongside xHCI) - the model that worked flawlessly. The EHCI's legacy INTx can't drive
-        // a block-and-wake loop on this hardware (deliver() fired zero times once the driver
-        // blocked across many T630 flashes), and the CPU-reduction attempts introduced quirks, so
-        // both USB drivers are back on plain busy-poll. Core 1 runs hot; reclaiming that idle is
-        // deferred (revisit later).
-        "ehci" => Some(("ehci", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_EHCI_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    EHCI_CORE,   // core 3: the other busy-poller, off the saturated core 1 (see xhci)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
-            // driver's recv endpoint (§12). The driver enables USBINTR + acks + unmasks.
-            hw_irqs:           &[0x29],
-            has_console_read:  false,
-        })),
-        // `block-driver` - userspace ATA PIO disk driver (persistence, v2; §6.3,
-        // docs/persistence.md). The kernel grants its ATA port window by name in
-        // the spawn path (6a-pio); no MMIO, no DMA, no IRQ wired yet (polled).
-        // Phase 1 reads sector 0 and logs it. Pinned to core 1, off the shell/TCB.
-        "block-driver" => Some(("block-driver", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
-            has_recv_endpoint: true, // serves block read/write requests from fs (§4)
-            // With the USB stack in userspace, block-driver reaches the disk by IPC to the `xhci`
-            // SERVICE - so it needs a SEND cap to that name. Without one, `request_with_reply("xhci",
-            // ..)` finds no send slot and returns None INSTANTLY. That is exactly what the Pi 4
-            // showed: the service sat in its poll loop with the disk bound, never receiving a single
-            // message, while block-driver burned its whole 20 s wait failing to address it. Every
-            // layer looked healthy in isolation, because the missing piece was the EDGE between them.
-            //
-            // block-driver reaches the disk THROUGH a USB host-controller SERVICE on both ARM
-            // targets now: `xhci` on aarch64, `dwc2` on arm32. The arm32 arm used to be empty, with a
-            // comment saying "the USB stack is still in the kernel... so there is no such peer" -
-            // true when it was written and false since the driver moved out.
-            //
-            // The paragraph above is the reason this edge cannot be left to be noticed later: without
-            // the SEND cap, `request_with_reply` finds no send slot and returns None INSTANTLY, so
-            // the driver sits in its poll loop with the disk bound and never receives a message while
-            // block-driver reports no storage. Every layer healthy in isolation, and the missing
-            // piece the edge between them.
-            #[cfg(target_arch = "aarch64")]
-            send_peers:        &["xhci"],
-            #[cfg(target_arch = "arm")]
-            send_peers:        &["dwc2"],
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
-            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
-            send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
-            // Both were wrong, and hardware refuted each in turn.
-            //
-            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
-            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
-            //      `arch/arm`, and `usb_disk_*` are inert stubs).
-            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
-            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
-            //      because of cores; with that fixed they came up correctly on all four.
-            //
-            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
-            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
-            // scheduler's cross-core wake does nothing and the target core does not notice a message
-            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
-            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
-            // into three cross-core hops and made every command visibly slow. The giveaway was that a
-            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
-            // chain again.
-            //
-            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
-            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
-            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
-            //
-            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
-            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
-            // microframe-timed: a start-split and its complete-split must land in specific 125 us
-            // windows. Preempted between them, the transaction translator is left holding a
-            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
-            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
-            // couple of minutes, which the operator experiences as the keyboard pausing.
-            //
-            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
-            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
-            // core 0 because that is where its interrupt is routed.
-            //
-            // (Superseded rationale kept below so the next reader sees what was believed and why.)
-            //
-            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
-            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
-            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
-            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
-            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
-            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
-            // 0 was fine.
-            //
-            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
-            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
-            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
-            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
-            //
-            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
-            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
-            // unpins these three, and it unpins them everywhere at once.
-            // arm32: core 2. Off core 0 for the same reason as the networking pair (see nic-driver),
-            // and off core 1 so a burst of disk I/O and a burst of frames do not queue behind
-            // each other on one core.
-            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 1 },
-            probe_mode:        0,
-            memory_limit:      16 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `nic-driver` - userspace NIC driver (networking, v2; docs/networking.md, Phase 1).
-        // The kernel maps the Intel e1000's BAR0 by name at spawn (gated on the discovered NIC
-        // actually being an e1000), like the USB/AHCI controllers. Phase 1 step 2 is reset +
-        // read the MAC; TX/RX rings, the RX IRQ, and the frame interface to net-stack follow.
-        "nic-driver" => Some(("nic-driver", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_NIC_DRIVER_ELF")),
-            has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
-            // ARM32: the USB-net device is behind the `dwc2` SERVICE, so nic-driver needs a send cap
-            // to it - the same edge `block-driver` got in slice 3c. Without it `request_with_reply`
-            // finds no send slot and returns None INSTANTLY, which looks like a dead cable rather
-            // than a missing grant: every layer healthy in isolation, the edge between them absent.
-            #[cfg(target_arch = "arm")]
-            send_peers:        &["dwc2"],
-            #[cfg(not(target_arch = "arm"))]
-            send_peers:        &[],
-            send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
-            // Both were wrong, and hardware refuted each in turn.
-            //
-            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
-            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
-            //      `arch/arm`, and `usb_disk_*` are inert stubs).
-            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
-            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
-            //      because of cores; with that fixed they came up correctly on all four.
-            //
-            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
-            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
-            // scheduler's cross-core wake does nothing and the target core does not notice a message
-            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
-            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
-            // into three cross-core hops and made every command visibly slow. The giveaway was that a
-            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
-            // chain again.
-            //
-            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
-            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
-            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
-            //
-            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
-            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
-            // microframe-timed: a start-split and its complete-split must land in specific 125 us
-            // windows. Preempted between them, the transaction translator is left holding a
-            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
-            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
-            // couple of minutes, which the operator experiences as the keyboard pausing.
-            //
-            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
-            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
-            // core 0 because that is where its interrupt is routed.
-            //
-            // (Superseded rationale kept below so the next reader sees what was believed and why.)
-            //
-            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
-            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
-            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
-            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
-            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
-            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
-            // 0 was fine.
-            //
-            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
-            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
-            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
-            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
-            //
-            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
-            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
-            // unpins these three, and it unpins them everywhere at once.
-            // arm32: core 1, and NOT unpinned.
-            //
-            // Unpinning these three was meant to "give the timing-critical USB driver a quieter core
-            // 0" (75c18457). It did the opposite: unpinned means ROUND-ROBIN, and round-robin put
-            // `net-stack` straight back onto core 0 alongside `dwc2` - observed on hardware as
-            // "'dwc2' spawned OK on core 0 / 'net-stack' spawned OK on core 0".
-            //
-            // That is the worst possible pairing. `net-stack` waits for replies by POLLING
-            // (`drain_scan` -> try_recv + yield_cpu), and the scheduler quantum is 10 ms, so it can
-            // hold core 0 for 10 ms at a stretch. `dwc2`'s split transactions have to hit 125 us
-            // windows - eighty times finer. So the service waiting for a DHCP or ARP reply was
-            // starving the driver that had to deliver it: a spin that defeats itself.
-            //
-            // Pinned, and pinned TOGETHER with net-stack, which is what the contract used to say
-            // before the audit deleted it ("co-located with nic-driver - the two exchange frames
-            // constantly"). Same-core request/reply is safe now that the SDK waits poll rather than
-            // block. Core 0 is left to `dwc2` alone, which is what the unpin was for.
-            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
-            probe_mode:        0,
-            memory_limit:      16 * 1024 * 1024,
-            // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
-            // PCIe NIC with no such route, so the grant is arch-gated rather than unconditional.
-            #[cfg(target_arch = "aarch64")]
-            hw_irqs:           &[0x2A],
-            #[cfg(not(target_arch = "aarch64"))]
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // net-stack (services/net-stack): the model-AGNOSTIC half of networking (docs/networking.md).
-        // Owns its endpoint (nic-driver replies frames there via the per-request reply cap) and sends
-        // to nic-driver (the frame interface). Spawned AFTER nic-driver so its send-peer cap wires from
-        // the kernel name table at spawn. Core 1. No hardware - it speaks ARP/IP over raw frames.
-        "net-stack" => Some(("net-stack", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_NET_STACK_ELF")),
-            has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
-            // `time` (clock slice 2): SNTP is a network fact this service fetches; whether to BELIEVE it
-            // is the clock's policy, so the reading is handed over rather than written to a syscall.
-            send_peers:        &["nic-driver", "time"],    // the frame interface; reacquired by name on death
-            send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
-            // Both were wrong, and hardware refuted each in turn.
-            //
-            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
-            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
-            //      `arch/arm`, and `usb_disk_*` are inert stubs).
-            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
-            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
-            //      because of cores; with that fixed they came up correctly on all four.
-            //
-            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
-            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
-            // scheduler's cross-core wake does nothing and the target core does not notice a message
-            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
-            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
-            // into three cross-core hops and made every command visibly slow. The giveaway was that a
-            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
-            // chain again.
-            //
-            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
-            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
-            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
-            //
-            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
-            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
-            // microframe-timed: a start-split and its complete-split must land in specific 125 us
-            // windows. Preempted between them, the transaction translator is left holding a
-            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
-            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
-            // couple of minutes, which the operator experiences as the keyboard pausing.
-            //
-            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
-            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
-            // core 0 because that is where its interrupt is routed.
-            //
-            // (Superseded rationale kept below so the next reader sees what was believed and why.)
-            //
-            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
-            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
-            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
-            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
-            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
-            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
-            // 0 was fine.
-            //
-            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
-            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
-            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
-            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
-            //
-            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
-            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
-            // unpins these three, and it unpins them everywhere at once.
-            // arm32: core 1, co-located with nic-driver and OFF core 0 - see the note there.
-            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
-            probe_mode:        0,
-            memory_limit:      16 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `fs` - userspace filesystem (persistence, v2; §15, docs/persistence.md).
-        // Phase 1: mounts by reading the superblock (LBA 0) from `block-driver`
-        // over IPC and validating its magic. Spawned AFTER block-driver (its
-        // send-peer cap wires from the kernel name table at spawn). Core 1.
-        "fs" => Some(("fs", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_FS_ELF")),
-            has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            // "logger" is the EMIT cap: holding it is what makes this service traced, and its absence
-            // is what makes an untraced service cost one relaxed load (`sdk::trace`). Authority, visible
-            // in `caps fs`, revocable - not a global switch (3.1).
-            send_peers:        &["block-driver", "logger"],
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        0,
-            memory_limit:      32 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // counter (examples/counter): a STATEFUL service that survives its OWN restart by
-        // persisting its running count to `fs` and reconstructing it on spawn (§14 restart, §15
-        // persistence). Owns its endpoint (fs replies there via the per-request reply cap) and sends
-        // to `fs` (read/write /counter.dat). Spawned only in the counter-test build (`osdev test
-        // counter`); idle/absent everywhere else. Restartable: its death notifies the supervisor,
-        // which respawns it (scheduler death-notification set + supervisor restart loop).
-        "counter" => Some(("counter", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_COUNTER_ELF")),
-            has_recv_endpoint: true,            // fs reply target (request_with_reply embeds a reply cap)
-            send_peers:        &["fs"],         // file-API ops to fs; reacquired by name on EndpointDead
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // reply-server (examples/reply-server): the request/reply (RPC) SERVER. Owns its endpoint
-        // (clients send requests here) and has NO named send peer - it replies only over the reply
-        // capability each request embeds (§7.10/§8.5). Spawned only in the reply-test build (`osdev
-        // test reply-server`); idle/absent everywhere else - standalone it just blocks on recv().
-        "reply-server" => Some(("reply-server", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_REPLY_SERVER_ELF")),
-            has_recv_endpoint: true,            // clients send requests here; replies via embedded cap
-            send_peers:        &[],             // no named peer: it answers over the client's reply cap
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // asker (examples/asker): the request/reply CLIENT that exercises reply-server. Owns its
-        // endpoint (reply-server replies there via the embedded reply cap) and sends to `reply-server`.
-        // Spawned only in the reply-test build (`osdev test reply-server`); idle/absent elsewhere.
-        "asker" => Some(("asker", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_ASKER_ELF")),
-            has_recv_endpoint: true,            // reply target (request_with_reply blocks on this endpoint)
-            send_peers:        &["reply-server"], // sends requests to reply-server; reacquired by name on EndpointDead
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // resource-server (examples/resource-server): the delegated-resource-capability OWNER (§7.10).
-        // Owns its endpoint (a cap holder's `resource_invoke` is routed here, badged) and SENDs to
-        // `holder` to GRANT it the minted resource cap. Holds RESOURCE_MINT (granted by name below,
-        // like fs). Spawned only in the resource-test build (`osdev test resource-server`); idle/absent
-        // everywhere else - standalone, without the mint grant, it just idles (graceful degrade, §7.10).
-        "resource-server" => Some(("resource-server", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_RESOURCE_SERVER_ELF")),
-            has_recv_endpoint: true,            // resource_invoke is routed here, badged with (rid, right)
-            send_peers:        &["holder"],     // sends the GRANT (the resource cap) to holder
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // holder (examples/holder): the delegated-resource-capability CLIENT. Owns its endpoint (the
-        // GRANT lands here, and resource-server's replies to its cap invocations come back here). It
-        // declares NO send-peer: it acts only through the granted cap (the kernel routes a
-        // resource_invoke to the owner). Spawned only in the resource-test build; idle/absent elsewhere.
-        "holder" => Some(("holder", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_HOLDER_ELF")),
-            has_recv_endpoint: true,            // grant target + reply target for its resource_invokes
-            send_peers:        &[],             // names no one; uses the granted cap, routed by the kernel
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Probe services - §22 Group A identity tests.
-        // All use the same probe ELF; probe_mode selects the test behaviour.
-        // Spawn ordering in supervisor: recv-endpoint services first, then
-        // senders that need SEND caps wired to them.
-        // ----------------------------------------------------------------
-        "probe-recv" => Some(("probe-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        1, // MODE_ECHO_RECV - Test 3A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-victim" => Some(("probe-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0, // MODE_PASSIVE - killed by probe-4a in Test 4A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-4b-recv" => Some(("probe-4b-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0, // MODE_PASSIVE - killed by harness in Test 4B
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-3b" => Some(("probe-3b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        3, // MODE_NO_SEND_RIGHT - Test 3B
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-sender" => Some(("probe-sender", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["probe-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        2, // MODE_ECHO_SEND - Test 3A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-4a" => Some(("probe-4a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["probe-victim"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        4, // MODE_SEND_AFTER_KILL - Test 4A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-4b-send" => Some(("probe-4b-send", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["probe-4b-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        5, // MODE_FILL_AND_BLOCK - Test 4B
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-yielder" => Some(("probe-yielder", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        6, // MODE_YIELD_LOGGER - Test 8A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-hog" => Some(("probe-hog", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        7, // MODE_HOG - Test 8B (preemption proven via ping)
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-9b" => Some(("probe-9b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        8, // MODE_CAP_FORGE - Test 9B
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Cap-transfer probes - §22 Tests 5A and 5B.
-        // probe-5a-recv must be spawned before probe-5a-send and probe-5b-send
-        // so its endpoint is registered before sender caps are wired.
-        // ----------------------------------------------------------------
-        "probe-5a-recv" => Some(("probe-5a-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        9, // MODE_GRANT_RECV - Test 5A receiver
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-5a-send" => Some(("probe-5a-send", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["probe-5a-recv"],
-            send_peers_grant:  true,  // mints SEND|GRANT cap to probe-5a-recv
-            preferred_core:    0,
-            probe_mode:        10, // MODE_GRANT_SEND - Test 5A sender
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-5b-send" => Some(("probe-5b-send", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["probe-5a-recv"],
-            send_peers_grant:  false, // SEND only - no GRANT right; should return CapNotGrantable
-            preferred_core:    0,
-            probe_mode:        11, // MODE_NO_GRANT_SEND - Test 5B negative
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Memory-limit probes - §22 Tests 7A and 7B.
-        // ----------------------------------------------------------------
-        "probe-7a" => Some(("probe-7a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        12, // MODE_ALLOC_OK - Test 7A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "probe-7b" => Some(("probe-7b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        13, // MODE_ALLOC_LIMIT - Test 7B
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Interrupt-routing probe - §22 Tests IR1A (§12.2, §12.3).
-        // hw_irqs registers IRQ 33 to probe-11a's recv endpoint at spawn.
-        // ----------------------------------------------------------------
-        "probe-11a" => Some(("probe-11a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX, // round-robin
-            probe_mode:        160, // MODE_IRQ_RECV - Test IR1A
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[33],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Property-test probes - Milestone 9 Phase 1.
-        // prop-p9-victim must be listed (and spawned) before prop-p9 so its
-        // endpoint is in the name directory when prop-p9's SEND caps are wired.
-        // ----------------------------------------------------------------
-        "prop-p9-victim" => Some(("prop-p9-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,  // MODE_PASSIVE - killed by prop-p9
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p1" => Some(("prop-p1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        20, // MODE_PROP_P1
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p9" => Some(("prop-p9", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            // Three SEND caps to the same endpoint - proves all cap slots are
-            // invalidated on endpoint death, not just the first (§7.5).
-            send_peers:        &["prop-p9-victim", "prop-p9-victim", "prop-p9-victim"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        21, // MODE_PROP_P9
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p10" => Some(("prop-p10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        22, // MODE_PROP_P10
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Property-test probes - Milestone 9 Phase 2.
-        // ----------------------------------------------------------------
-        // P2: generation monotonic. prop-p2-victim must be listed before prop-p2.
-        // prop-p2 pinned to Core 3 - away from P8 (Core 1) and P6 (Core 2).
-        "prop-p2-victim" => Some(("prop-p2-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p2
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p2" => Some(("prop-p2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    3,
-            probe_mode:        23, // MODE_PROP_P2
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // P3: cap rights non-widening. Self-referential: sends cap to own endpoint.
-        "prop-p3" => Some(("prop-p3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        24, // MODE_PROP_P3
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // P6: queue invariants. Self-referential: sends to own endpoint.
-        // Pinned to Core 2 - away from the P2 (Core 3) and P8 (Core 1) kill/spawn
-        // controllers whose long spawn syscalls would starve P6 of CPU time.
-        "prop-p6" => Some(("prop-p6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["prop-p6"],
-            send_peers_grant:  false,
-            preferred_core:    2,
-            probe_mode:        25, // MODE_PROP_P6
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // P8: name resolves to higher generation + liveness. prop-p8-victim before prop-p8.
-        // Pinned to Core 1 so P8's kill/spawn loop doesn't share a core with P6 (Core 2)
-        // or P2 (Core 3).
-        "prop-p8-victim" => Some(("prop-p8-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p8
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p8" => Some(("prop-p8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        26, // MODE_PROP_P8
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Property-test probes - Milestone 9 Phase 3.
-        // ----------------------------------------------------------------
-        // P4: memory accounting. No victim needed.
-        "prop-p4" => Some(("prop-p4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        27, // MODE_PROP_P4
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // P5: endpoint ownership. Victim must be listed before controller.
-        "prop-p5-victim" => Some(("prop-p5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p5" => Some(("prop-p5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        28, // MODE_PROP_P5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // P7: TLB shootdown proxy. Victim must be listed before controller.
-        "prop-p7-victim" => Some(("prop-p7-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,  // MODE_PASSIVE - killed/respawned by prop-p7
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-p7" => Some(("prop-p7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        29, // MODE_PROP_P7
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal property test probes - Milestone 16.
-        // 10 escalated-iteration variants of P1-P10, each with its own victim
-        // where the original property needed one.  Victims before controllers.
-        // ----------------------------------------------------------------
-        // BP1: cap unforgeability at 100k iterations.
-        "prop-bp1" => Some(("prop-bp1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        104,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP2: generation monotonic over 20 kill/respawn cycles.
-        "prop-bp2-victim" => Some(("prop-bp2-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-bp2" => Some(("prop-bp2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        105,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP3: cap rights never widen - 10k iterations (self-referential, like P3).
-        "prop-bp3" => Some(("prop-bp3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        106,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP4: alloc accounting exact - 2k iterations.
-        "prop-bp4" => Some(("prop-bp4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        107,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP5: endpoint ownership - 150 kill/respawn cycles.
-        "prop-bp5-victim" => Some(("prop-bp5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-bp5" => Some(("prop-bp5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        108,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP6: queue invariants - 2k iterations (self-referential, like P6).
-        "prop-bp6" => Some(("prop-bp6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["prop-bp6"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        109,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP7: TLB shootdown proxy - 150 kill/respawn cycles.
-        "prop-bp7-victim" => Some(("prop-bp7-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-bp7" => Some(("prop-bp7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        110,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP8: restart + higher-generation liveness - 20 iterations.
-        "prop-bp8-victim" => Some(("prop-bp8-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-bp8" => Some(("prop-bp8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        111,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP9: generation invalidates ALL 3 slots, over 10 kill/respawn cycles.
-        "prop-bp9-victim" => Some(("prop-bp9-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "prop-bp9" => Some(("prop-bp9", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["prop-bp9-victim", "prop-bp9-victim", "prop-bp9-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        112,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP10: every send returns a defined outcome - 100k iterations.
-        "prop-bp10" => Some(("prop-bp10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        113,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Fuzz-test probes - Milestone 10.
-        // Recv-endpoint victims must be listed before their fuzz controllers.
-        // ----------------------------------------------------------------
-        "fuzz-f1" => Some(("fuzz-f1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        30, // FUZZ_F1: random syscall args
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-f2" => Some(("fuzz-f2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        31, // FUZZ_F2: random syscall numbers
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // F5: IPC message body fuzzing - recv target first.
-        "fuzz-f5-recv" => Some(("fuzz-f5-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - soaks up random messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-f5" => Some(("fuzz-f5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["fuzz-f5-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        32, // FUZZ_F5: random IPC message bodies
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // F6: embedded cap fuzzing - recv target first.
-        "fuzz-f6-recv" => Some(("fuzz-f6-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - receives (or rejects) cap-embedded messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-f6" => Some(("fuzz-f6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["fuzz-f6-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        33, // FUZZ_F6: random embedded cap slot indices
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // F7: stale cap / generation fuzzing - victim first.
-        "fuzz-f7-victim" => Some(("fuzz-f7-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - killed/respawned by fuzz-f7
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-f7" => Some(("fuzz-f7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["fuzz-f7-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        34, // FUZZ_F7: stale-cap sends after kill
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // F8: memory request size fuzzing - no peers needed.
-        "fuzz-f8" => Some(("fuzz-f8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        35, // FUZZ_F8: edge-case + random memory request sizes
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal fuzz test probes - Milestone 17.
-        // Victims/recv-endpoints before controllers.
-        // ----------------------------------------------------------------
-        "fuzz-bf5-recv" => Some(("fuzz-bf5-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // passive recv sink
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf5" => Some(("fuzz-bf5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["fuzz-bf5-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        116, // FUZZ_BF5: random IPC bodies - 5k sends
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf6-recv" => Some(("fuzz-bf6-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // passive recv sink
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf6" => Some(("fuzz-bf6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["fuzz-bf6-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        117, // FUZZ_BF6: random cap slots - 5k SendWithCap
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf7-victim" => Some(("fuzz-bf7-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // passive recv - killed/respawned by fuzz-bf7
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf7" => Some(("fuzz-bf7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["fuzz-bf7-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        118, // FUZZ_BF7: stale cap - 200 kill/respawn cycles
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf1" => Some(("fuzz-bf1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        114, // FUZZ_BF1: syscall args - 500 × 10 calls
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf2" => Some(("fuzz-bf2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        115, // FUZZ_BF2: syscall numbers - 200k random
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "fuzz-bf8" => Some(("fuzz-bf8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        119, // FUZZ_BF8: memory sizes - 10 edge + 5k random
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Stress-test probes - Milestone 11 Phase 1.
-        // Recv-endpoint victims must be listed before their controllers.
-        // ----------------------------------------------------------------
-        // S1: IPC saturation. Receiver is passive (never drains).
-        "stress-s1-recv" => Some(("stress-s1-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - queue fills; stress-s1 measures saturation
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s1" => Some(("stress-s1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-s1-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        40, // STRESS_S1: 10,000 try_send under saturation
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S2: Restart storm. Victim killed/respawned 50 times.
-        "stress-s2-victim" => Some(("stress-s2-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - killed/respawned by stress-s2
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s2" => Some(("stress-s2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-s2-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        41, // STRESS_S2: 50 kill/respawn cycles; kstack-leak check
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S3: Cross-core thrash. Receiver pinned to core 1, sender to core 0.
-        // Cross-core try_send diagnostic (osdev image --mode iso-xsend): sender on
-        // core 1 → receiver on core 2, mirroring C7's controller→victim direction.
-        "xsend-recv" => Some(("xsend-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // receiver on core 2 (C7's victim core)
-            probe_mode:        201, // XSEND_RECV: drain forever
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "xsend" => Some(("xsend", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["xsend-recv"],
-            send_peers_grant:  false,
-            preferred_core:    1, // sender on core 1 (C7's controller core)
-            probe_mode:        200, // XSEND: time cross-core try_send to xsend-recv
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // Cross-core task-lifecycle diagnostic (osdev image --mode iso-xlife):
-        // controller on core 1 kills/respawns a same-core victim (xlife-near, core 1)
-        // and a cross-core victim (xlife-far, core 2) to attribute C7's ~1.04 s respawn.
-        "xlife" => Some(("xlife", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1, // controller on core 1 (C7's controller core)
-            probe_mode:        202, // XLIFE: time kill/spawn of near+far victims
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "xlife-near" => Some(("xlife-near", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1, // same core as the controller
-            probe_mode:        203, // XLIFE_VICTIM: idle until killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "xlife-far" => Some(("xlife-far", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // cross-core from the controller (C7's victim core)
-            probe_mode:        203, // XLIFE_VICTIM: idle until killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s3-recv" => Some(("stress-s3-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: sender on 0, receiver on 1
-            probe_mode:        43, // STRESS_S3_RECV: drain 500 cross-core messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s3-send" => Some(("stress-s3-send", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-s3-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0, // cross-core: sender on 0, receiver on 1
-            probe_mode:        42, // STRESS_S3_SEND: 500 blocking sends to core 1
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S4: Cap table churn. Victim killed/respawned 50×; 2 cap slots verified dead each kill.
-        "stress-s4-victim" => Some(("stress-s4-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - killed/respawned by stress-s4
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s4" => Some(("stress-s4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            // Two SEND caps to the same endpoint - both must die on one kill (§7.5).
-            send_peers:        &["stress-s4-victim", "stress-s4-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        44, // STRESS_S4: 50 kill/respawn cycles; 2-cap dead check
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S7: Memory pressure. Single probe; no peers needed.
-        "stress-s7" => Some(("stress-s7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        45, // STRESS_S7: 100 alloc-to-limit passes
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S10: Cascading revocation. Victim on core 1; coordinator on core 0 (cross-core kill).
-        "stress-s10-victim" => Some(("stress-s10-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: coordinator on 0 kills victim on 1
-            probe_mode:        0, // PASSIVE - killed by stress-s10
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s10" => Some(("stress-s10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            // Three SEND caps to the same endpoint - all must die on one kill (§7.5, §8.6).
-            send_peers:        &["stress-s10-victim", "stress-s10-victim", "stress-s10-victim"],
-            send_peers_grant:  false,
-            preferred_core:    0, // cross-core: coordinator on 0, victim on 1
-            probe_mode:        46, // STRESS_S10: kill victim; verify 3 caps all EndpointDead
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S5: Generation counter integrity (1000 kill/respawn cycles)
-        "stress-s5-victim" => Some(("stress-s5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - killed by stress-s5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s5" => Some(("stress-s5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        47, // STRESS_S5: 1000 kill/respawn; generation strictly monotonic
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S6: Long-running IPC self-ping stability (5000 rounds)
-        "stress-s6" => Some(("stress-s6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["stress-s6"], // self-referential: same endpoint for send+recv
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        48, // STRESS_S6: 5000 self-ping rounds
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S8: Idle scheduler heartbeat (600 yield cycles)
-        "stress-s8" => Some(("stress-s8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        49, // STRESS_S8: 600 yields, proves scheduler returns from idle
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // S9: Cross-core IPI storm - receiver on core 2; two senders on cores 0 and 1
-        "stress-s9-recv" => Some(("stress-s9-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // core 2 - distinct from s3/s10 cross-core pairs on cores 0-1
-            probe_mode:        51, // STRESS_S9_RECV: drain 1000 messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s9-send-a" => Some(("stress-s9-send-a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-s9-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0, // cross-core: 0 → 2
-            probe_mode:        50, // STRESS_S9_SEND: 500 blocking sends to s9-recv
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-s9-send-b" => Some(("stress-s9-send-b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-s9-recv"],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: 1 → 2
-            probe_mode:        50, // STRESS_S9_SEND: 500 blocking sends to s9-recv
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal stress-test probes - Milestone 18.
-        // Ordering: recv-endpoint victims before controllers; receivers before senders.
-        // ----------------------------------------------------------------
-        // BS1: IPC saturation, 5× S1.
-        "stress-bs1-recv" => Some(("stress-bs1-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - queue fills; bs1 measures saturation
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs1" => Some(("stress-bs1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs1-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        120, // STRESS_BS1: 50k try_send
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS2: restart storm, 4× S2.
-        "stress-bs2-victim" => Some(("stress-bs2-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs2" => Some(("stress-bs2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs2-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        121, // STRESS_BS2: 200 kill/respawn cycles
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS3: cross-core thrash, 4× S3. Receiver on core 1, sender on core 0.
-        "stress-bs3-recv" => Some(("stress-bs3-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        123, // STRESS_BS3_RECV: drain 2000 cross-core messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs3-send" => Some(("stress-bs3-send", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs3-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        122, // STRESS_BS3_SEND: 2000 blocking sends
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS4: cap table churn, 5× S4. Victim before controller; 2 send_peers slots.
-        "stress-bs4-victim" => Some(("stress-bs4-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs4" => Some(("stress-bs4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs4-victim", "stress-bs4-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        124, // STRESS_BS4: 50 churn cycles; 2 cap slots
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS5: generation integrity, 5× S5. Victim before controller.
-        "stress-bs5-victim" => Some(("stress-bs5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs5" => Some(("stress-bs5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        125, // STRESS_BS5: 5000 kill/respawn; generation monotonic
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS6: self-ping stability, 4× S6. Self-referential send_peers.
-        "stress-bs6" => Some(("stress-bs6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["stress-bs6"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        126, // STRESS_BS6: 20000 self-ping rounds
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS7: memory pressure, 5× S7.
-        "stress-bs7" => Some(("stress-bs7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        127, // STRESS_BS7: 500 alloc passes
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS8: scheduler heartbeat, 5× S8.
-        "stress-bs8" => Some(("stress-bs8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        128, // STRESS_BS8: 3000 yields
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS9: IPI storm, 5× S9. Receiver on core 2; two senders on cores 0, 1.
-        "stress-bs9-recv" => Some(("stress-bs9-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2,
-            probe_mode:        130, // STRESS_BS9_RECV: drain 5000 msgs
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs9-send-a" => Some(("stress-bs9-send-a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs9-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        129, // STRESS_BS9_SEND: 2500 sends
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs9-send-b" => Some(("stress-bs9-send-b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs9-recv"],
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        129, // STRESS_BS9_SEND: 2500 sends
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BS10: cascading revocation, 50 cycles. Victim on core 1; controller on core 0.
-        "stress-bs10-victim" => Some(("stress-bs10-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        0, // PASSIVE
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "stress-bs10" => Some(("stress-bs10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["stress-bs10-victim", "stress-bs10-victim", "stress-bs10-victim"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        131, // STRESS_BS10: 50 kill/respawn cycles; 3 cap slots
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Performance-benchmark probes - Milestone 12.
-        // Sender services are spawned before their echo/recv partners so
-        // their endpoints are registered when echo partners wire SEND caps.
-        // ----------------------------------------------------------------
-        // B1: same-core IPC roundtrip. Sender acquires cap dynamically.
-        "perf-b1" => Some(("perf-b1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        60, // PERF_B1: same-core roundtrip sender
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-b1-echo" => Some(("perf-b1-echo", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["perf-b1"],
-            send_peers_grant:  false,
-            preferred_core:    0, // same core as perf-b1
-            probe_mode:        61, // PERF_B1_ECHO: echo messages back
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B2: cross-core IPC roundtrip. Sender on core 0, echo on core 1.
-        "perf-b2" => Some(("perf-b2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        62, // PERF_B2: cross-core roundtrip sender
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-b2-echo" => Some(("perf-b2-echo", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["perf-b2"],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: sender on 0, echo on 1
-            probe_mode:        63, // PERF_B2_ECHO: echo messages back
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B3: yield floor. No peers needed.
-        "perf-b3" => Some(("perf-b3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        64, // PERF_B3: syscall yield floor
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B4: cap validation throughput. Needs recv endpoint to have a cap to query.
-        "perf-b4" => Some(("perf-b4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        65, // PERF_B4: cap + generation check throughput
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B5/B6: spawn and restart cost. Victim spawned first so perf-b5 can kill/respawn it.
-        "perf-b5-victim" => Some(("perf-b5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - killed/respawned by perf-b5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-b5" => Some(("perf-b5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        66, // PERF_B5: spawn + restart cost (covers B5 and B6)
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B7: cap table insert/remove throughput. Self-referential (acquires SEND cap to self).
-        "perf-b7" => Some(("perf-b7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        67, // PERF_B7: cap insert/remove throughput
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B8: allocator throughput. No peers needed.
-        "perf-b8" => Some(("perf-b8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        68, // PERF_B8: alloc-4kib throughput
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B9: 4 KiB message copy. Both on core 0 to isolate copy from cross-core routing.
-        // Recv partner must be registered before sender's SEND cap is wired.
-        "perf-b9-recv" => Some(("perf-b9-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        70, // PERF_B9_RECV: drain large messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-b9" => Some(("perf-b9", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["perf-b9-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        69, // PERF_B9: 4 KiB message sender
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // B10: scheduler pick-next cost. No peers needed.
-        "perf-b10" => Some(("perf-b10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        71, // PERF_B10: scheduler pick-next cost
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal performance-benchmark probes - Milestone 19 (5× iteration counts).
-        // Sender/controller spawned before echo/recv so endpoints register first.
-        // ----------------------------------------------------------------
-        "perf-bp1" => Some(("perf-bp1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        132, // PERF_BP1: same-core roundtrip sender, 1000 samples
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-bp1-echo" => Some(("perf-bp1-echo", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["perf-bp1"],
-            send_peers_grant:  false,
-            preferred_core:    0, // same core as perf-bp1
-            probe_mode:        133, // PERF_BP1_ECHO
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP2: cross-core roundtrip. Sender on core 0, echo on core 1.
-        "perf-bp2" => Some(("perf-bp2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        134, // PERF_BP2: cross-core roundtrip sender, 1000 samples
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-bp2-echo" => Some(("perf-bp2-echo", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["perf-bp2"],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: sender on 0, echo on 1
-            probe_mode:        135, // PERF_BP2_ECHO
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP3: yield floor. No peers.
-        "perf-bp3" => Some(("perf-bp3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        136, // PERF_BP3: yield floor, 5000 yields
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP4: cap validation. Needs recv endpoint to have a cap to query.
-        "perf-bp4" => Some(("perf-bp4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        137, // PERF_BP4: cap + generation check, 50000 checks
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP5/BP6: spawn and restart cost. Victim spawned first.
-        "perf-bp5-victim" => Some(("perf-bp5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // PASSIVE - killed/respawned by perf-bp5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-bp5" => Some(("perf-bp5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        138, // PERF_BP5: spawn + restart cost, 50 cycles
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP7: cap table insert/remove. Self-referential.
-        "perf-bp7" => Some(("perf-bp7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        139, // PERF_BP7: cap insert/remove, 5000 cycles
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP8: allocator throughput. No peers.
-        "perf-bp8" => Some(("perf-bp8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        140, // PERF_BP8: alloc-4kib throughput
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP9: 4 KiB message copy. Both on core 0 to isolate copy from routing overhead.
-        "perf-bp9-recv" => Some(("perf-bp9-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        142, // PERF_BP9_RECV: drain 4 KiB messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "perf-bp9" => Some(("perf-bp9", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["perf-bp9-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        141, // PERF_BP9: 4 KiB message sender, 1000 sends
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BP10: scheduler pick-next cost. No peers.
-        "perf-bp10" => Some(("perf-bp10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        143, // PERF_BP10: scheduler pick-next, 5000 yields
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Adversarial-test probes - Milestone 13.
-        // Victim/passive services must be listed before their attackers so
-        // their endpoints are registered when the attacker's SEND caps are wired.
-        // ----------------------------------------------------------------
-        // A1: random cap slots → always Err. No caps needed.
-        "adv-a1" => Some(("adv-a1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        80, // ADV_A1: random slot → Err (cap unforgeability)
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A2: brute-force slot range → defined errors. No caps needed.
-        "adv-a2" => Some(("adv-a2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        81, // ADV_A2: slots 0..=127 + u32::MAX → defined errors
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A3: alloc beyond 4 MiB limit → AllocDenied. Tight memory_limit.
-        "adv-a3" => Some(("adv-a3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        82, // ADV_A3: alloc edge cases under 4 MiB cap
-            memory_limit:      4 * 1024 * 1024, // 4 MiB - tight limit for the test
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A4: RECV cap used as SEND target → CapInsufficientRights. Has recv endpoint.
-        "adv-a4" => Some(("adv-a4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        83, // ADV_A4: RECV cap → try_send → CapInsufficientRights
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A5: TOCTOU - victim must be registered before attacker's SEND cap is wired.
-        "adv-a5-victim" => Some(("adv-a5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE - killed by adv-a5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-a5" => Some(("adv-a5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["adv-a5-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        84, // ADV_A5: kill victim then try_send → EndpointDead
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A6: fill own cap table. Has recv endpoint so it can be acquired via name.
-        "adv-a6" => Some(("adv-a6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        85, // ADV_A6: acquire_send_cap loop until table full
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A7: timing probe - passive recv target must be registered before sender.
-        "adv-a7-recv" => Some(("adv-a7-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE - absorbs timing probe messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-a7" => Some(("adv-a7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["adv-a7-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        86, // ADV_A7: 100 timing sends to passive partner
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A8: tight-loop hog + witness. Both round-robin so preemption is tested.
-        "adv-a8" => Some(("adv-a8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        87, // ADV_A8: tight loop attempting monopoly
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-a8-witness" => Some(("adv-a8-witness", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        88, // ADV_A8_WITNESS: 1000 yields then log pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A9: spawn non-existent service → Err. No caps needed beyond spawn (always present).
-        "adv-a9" => Some(("adv-a9", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        89, // ADV_A9: spawn unknown service → Err
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A10: kernel addresses as syscall buffer args → rejected. No caps needed.
-        "adv-a10" => Some(("adv-a10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        90, // ADV_A10: kernel-addr syscall args → rejected
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A11: introspection gated - TaskStat denied without INTROSPECT cap (§3.1).
-        // Name matches no introspect grant, so adv-a11 holds no introspect cap.
-        "adv-a11" => Some(("adv-a11", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        161, // ADV_A11: gated query denied without INTROSPECT
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A12: reboot gated - Reboot/18 denied without the REBOOT cap (§3.1).
-        // Name matches no reboot grant (only the shell gets it now - SEC-2), so adv-a12 holds none.
-        "adv-a12" => Some(("adv-a12", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        162, // ADV_A12: reboot denied without REBOOT cap
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A13: AcquireSendCap gated (§3.1). adv-a13 holds NO ACQUIRE_ANY (excluded from the grant
-        // above) and declares NO send-peers, so acquiring a SEND cap to any service must be DENIED.
-        "adv-a13" => Some(("adv-a13", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        163, // ADV_A13: AcquireSendCap denied without ACQUIRE_ANY / declared peer
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Chaos-test probes - Milestone 14.
-        // Victim/passive services must be listed before their controllers so
-        // their endpoints are registered when the controllers' SEND caps are wired.
-        // ----------------------------------------------------------------
-        // C2: null-deref → page fault → killed. Monitor on separate round-robin core.
-        "chaos-c2" => Some(("chaos-c2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        91, // CHAOS_C2: null-deref → page fault → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-c2-monitor" => Some(("chaos-c2-monitor", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        92, // CHAOS_C2_MON: 1,000 yields then log pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A14 (kernel-audit C1/C2 regression): a ring-3 CPU exception must KILL the task, not halt the
-        // kernel. Two faulters (#GP, #DE) + a monitor that witnesses the system continuing.
-        "adv-fault-gp" => Some(("adv-fault-gp", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        210, // ADV_FAULT_GP: non-canonical read → #GP → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-fault-de" => Some(("adv-fault-de", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        211, // ADV_FAULT_DE: div-by-zero → #DE → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-fault-mon" => Some(("adv-fault-mon", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        212, // ADV_FAULT_MON: yields then logs the A14 pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // A15 (kernel-audit V1 regression): a bad user pointer to a syscall must kill the CALLER, not
-        // halt the machine. A faulter (bad ptr to `log`) + a monitor that witnesses the system surviving.
-        "adv-fault-usercopy" => Some(("adv-fault-usercopy", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        213, // ADV_FAULT_UC: bad user pointer to log → killed via USER-COPY PF
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-fault-usercopy-mon" => Some(("adv-fault-usercopy-mon", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        214, // ADV_FAULT_UC_MON: yields then logs the A15 pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // C3: alloc saturation. Tight 4 MiB limit so impossible requests are denied quickly.
-        "chaos-c3" => Some(("chaos-c3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        93, // CHAOS_C3: 500 alloc-deny cycles without panic
-            memory_limit:      4 * 1024 * 1024, // 4 MiB - tight limit for the test
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // C5: kernel stack depth probe. No peers needed.
-        "chaos-c5" => Some(("chaos-c5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        94, // CHAOS_C5: 100-level recursive yield_cpu() depth probe
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // C6: hog on core 3 (simulates timer-starved core) + monitor on core 0.
-        "chaos-c6-hog" => Some(("chaos-c6-hog", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    3, // core 3 - simulates one starved core
-            probe_mode:        7, // MODE_HOG: tight loop (reused)
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-c6-monitor" => Some(("chaos-c6-monitor", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0, // core 0 - cross-core witness: proves core 0 alive
-            probe_mode:        95, // CHAOS_C6_MON: 200 yields then log pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // C7: cross-core kill/respawn TLB-shootdown stress.
-        // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
-        "chaos-c7-victim" => Some(("chaos-c7-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // cross-core: controller on 1 kills victim on 2
-            probe_mode:        0, // MODE_PASSIVE - killed/respawned by chaos-c7
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-c7" => Some(("chaos-c7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["chaos-c7-victim"],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: controller on 1, victim on 2
-            probe_mode:        96, // CHAOS_C7: 30 cross-core kill/respawn TLB shootdowns
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal identity test probes - Milestone 15.
-        // T11: self-referential queue boundary exactness.
-        // T12: cap delegation chain A→B→C.
-        // T13: cross-core blocked send wakes with EndpointDead.
-        // T-SMP: SMP escalation (smp=2, 8, 16 - run via osdev test identity-brutal).
-        // ----------------------------------------------------------------
-        "brutal-id-11" => Some(("brutal-id-11", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["brutal-id-11"], // self-referential send peer
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        97,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "brutal-id-12-a" => Some(("brutal-id-12-a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["brutal-id-12-b"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        98,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "brutal-id-12-b" => Some(("brutal-id-12-b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &["brutal-id-12-c"], // B forwards to C
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        99,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "brutal-id-12-c" => Some(("brutal-id-12-c", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        100,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "brutal-id-13-recv" => Some(("brutal-id-13-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // cross-core target: sender on 0, killer on 1, recv on 2
-            probe_mode:        101,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "brutal-id-13-send" => Some(("brutal-id-13-send", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["brutal-id-13-recv"],
-            send_peers_grant:  false,
-            preferred_core:    0, // fills queue then blocks - must be on different core than recv
-            probe_mode:        102,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "brutal-id-13-kill" => Some(("brutal-id-13-kill", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    1, // yields then kills recv on core 2
-            probe_mode:        103,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal adversarial test probes - Milestone 20.
-        // Victim/passive services must be listed before their attackers so
-        // their endpoints are registered when the attacker's SEND caps are wired.
-        // ----------------------------------------------------------------
-        // BA1: 50k random cap forgery attempts (5× A1). No caps needed.
-        "adv-ba1" => Some(("adv-ba1", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        144, // MODE_ADV_BA1: 50k random slot → Err
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA2: extended brute-force slots 0..=511 + 4 extreme values.
-        "adv-ba2" => Some(("adv-ba2", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        145, // MODE_ADV_BA2: 512 + extreme slot sweep
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA3: 5× alloc edge-case cycles. Tight 4 MiB limit so impossible requests fail fast.
-        "adv-ba3" => Some(("adv-ba3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        146, // MODE_ADV_BA3: 5× alloc edge cycles
-            memory_limit:      4 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA4: RECV cap used as SEND target × 5. Needs own recv endpoint.
-        "adv-ba4" => Some(("adv-ba4", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        147, // MODE_ADV_BA4: RECV-cap-as-SEND → CapInsufficientRights
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA5: 5 TOCTOU kill+send cycles. Victim registered before attacker.
-        "adv-ba5-victim" => Some(("adv-ba5-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE - killed/re-killed by adv-ba5
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-ba5" => Some(("adv-ba5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["adv-ba5-victim"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        148, // MODE_ADV_BA5: 5× kill+try_send → EndpointDead
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA6: fill own cap table × 5 cycles. Needs recv endpoint so acquire_send_cap("adv-ba6") works.
-        "adv-ba6" => Some(("adv-ba6", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        149, // MODE_ADV_BA6: 5× cap-table fill → None without panic
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA7: 500 timing samples (5× A7). Passive recv registered before sender.
-        "adv-ba7-recv" => Some(("adv-ba7-recv", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_PASSIVE - absorbs timing probe messages
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-ba7" => Some(("adv-ba7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["adv-ba7-recv"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        150, // MODE_ADV_BA7: 500 timing sends to passive partner
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA8: tight-loop hog + witness (5× A8). Pinned to core 3 to avoid
-        // starving IPC/yield probes on cores 0-2 under QEMU TCG.
-        "adv-ba8" => Some(("adv-ba8", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    3,
-            probe_mode:        151, // MODE_ADV_BA8: tight loop hog
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "adv-ba8-witness" => Some(("adv-ba8-witness", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    3,
-            probe_mode:        152, // MODE_ADV_BA8_WITNESS: 5000 yields alongside hog
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA9: 5 direct-spawn bypass attempts with bogus names → Err.
-        "adv-ba9" => Some(("adv-ba9", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        153, // MODE_ADV_BA9: spawn unknown → Err
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BA10: 20 kernel-space address patterns as syscall args (5× A10). No caps needed.
-        "adv-ba10" => Some(("adv-ba10", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        154, // MODE_ADV_BA10: kernel addr syscall args → rejected
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // Brutal chaos-test services - Milestone 21.
-        // BC2: 5 simultaneous null-deref faulters + 1 monitor proving system survival.
-        // ----------------------------------------------------------------
-        "chaos-bc2-a" => Some(("chaos-bc2-a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc2-b" => Some(("chaos-bc2-b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc2-c" => Some(("chaos-bc2-c", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc2-d" => Some(("chaos-bc2-d", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc2-e" => Some(("chaos-bc2-e", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        91, // MODE_CHAOS_C2: null-deref → page fault → killed
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc2-monitor" => Some(("chaos-bc2-monitor", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        155, // MODE_CHAOS_BC2_MON: 500 yields then log pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BC3: 2,500 alloc-deny cycles. Tight 4 MiB limit so impossible requests fail fast.
-        "chaos-bc3" => Some(("chaos-bc3", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        156, // MODE_CHAOS_BC3: 2,500 alloc-deny cycles
-            memory_limit:      4 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BC5: 500-level recursive yield_cpu() stack depth probe.
-        "chaos-bc5" => Some(("chaos-bc5", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        157, // MODE_CHAOS_BC5: 500-level recursive yield
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BC6: 2 hogs on cores 2+3, monitor on core 0 runs 1,000 yields.
-        "chaos-bc6-hog-a" => Some(("chaos-bc6-hog-a", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // tight-loop hog on core 2
-            probe_mode:        7, // MODE_HOG: tight loop (reused)
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc6-hog-b" => Some(("chaos-bc6-hog-b", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    3, // tight-loop hog on core 3
-            probe_mode:        7, // MODE_HOG: tight loop (reused)
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc6-monitor" => Some(("chaos-bc6-monitor", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0, // core 0 - cross-core witness
-            probe_mode:        158, // MODE_CHAOS_BC6_MON: 1,000 yields then log pass
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // BC7: 150 cross-core kill/respawn TLB-shootdown cycles.
-        // Victim on core 2 must be registered before controller on core 1 gets SEND cap.
-        "chaos-bc7-victim" => Some(("chaos-bc7-victim", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    2, // cross-core: controller on 1 kills victim on 2
-            probe_mode:        0, // MODE_PASSIVE - killed/respawned by chaos-bc7
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "chaos-bc7" => Some(("chaos-bc7", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,
-            send_peers:        &["chaos-bc7-victim"],
-            send_peers_grant:  false,
-            preferred_core:    1, // cross-core: controller on 1, victim on 2
-            probe_mode:        159, // MODE_CHAOS_BC7: 150 cross-core kill/respawn cycles
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "observe" => Some(("observe", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_LIVE
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `observe now` - one-shot static metrics frame (probe_mode 1 = MODE_NOW).
-        // Same ELF as `observe`; the shell brokers a kill-then-spawn of this.
-        "observe-now" => Some(("observe-now", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        1, // MODE_NOW
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `observe` (live) - full-screen foreground view (probe_mode 2 = MODE_LIVE).
-        // Same ELF as `observe`; the shell spawns it, pauses its own read loop, and
-        // resumes when it parks (the shell-brokered foreground handoff). Holds
-        // CONSOLE_READ so it can poll for `q` (non-blocking) and toggle echo while
-        // it owns the screen.
-        "observe-live" => Some(("observe-live", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        2, // MODE_LIVE
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  true,
-        })),
-        "shell" => Some(("shell", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_SHELL_ELF")),
-            // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
-            // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
-            // only a narrow SEND to fs - fs enforces all disk authority. `fs` must be spawned
-            // before the shell so this cap resolves (supervisor order). The shell resolves a pipe
-            // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`) -
-            // no contracted peer.
-            has_recv_endpoint: true,
-            // `block-driver` as well as `fs`, so `drives` can ask the DEVICE about the device.
-            //
-            // "Is there a disk and how big" is block-driver's fact; "is it mounted, what label, how
-            // free" is fs's. Routing both through `fs` made it answer a hardware question from its
-            // own mount state - which is how `drives` reported 15 GB for an unplugged stick. Each
-            // fact now comes from its owner (Commandment III).
-            //
-            // It also gives a useful answer when `fs` is dead: "disk present, filesystem
-            // unavailable" instead of nothing at all (§26.7).
-            // `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
-            // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
-            // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
-            // the terminal owns (docs/console-service.md 9.7).
-            send_peers:        &["fs", "block-driver", "time", "console", "logger"],
-            send_peers_grant:  false,
-            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
-            //
-            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
-            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
-            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
-            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
-            // line holds its core, un-preemptible, for about 9 ms.
-            //
-            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
-            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
-            // of the fix; it needs no console rework and it uses the cores this board has.
-            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 0 },
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  true,
-        })),
+        // The probe entry is GONE with the rest: the supervisor holds the test image and supplies
+        // every parameter, privilege and authority in the spawn request. `supervisor` is the only
+        // service the kernel still bootstraps, because nothing is beneath it.
         _ => None,
     }
 }
@@ -3771,15 +1238,107 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
         pipe_peers[np] = p;
         np += 1;
     }
-    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
         cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
-        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None);
+        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
     result.map(|_| ())
 }
 
+/// Spawn a task from an image the CALLER supplied (step C, `SpawnImage`).
+///
+/// This is the path that ends the kernel's service catalogue. It takes no `ServiceConfig` and looks
+/// nothing up by name: the image, the name, the placement, the memory ceiling, the mailbox and the
+/// peer list all arrive from the spawner, and the kernel's job is to enforce, not to decide
+/// (`docs/service-ownership.md`).
+///
+/// What it still refuses, and why the refusal is not a leftover: a caller may not claim a name the
+/// kernel's own catalogue still uses. While ANY name-keyed policy remains, letting a caller pick
+/// such a name would let it inherit that policy for arbitrary code - the same squatting hole
+/// `spawn_probe` closes, and for the same reason (the kernel name directory is the recovery anchor).
+/// When the catalogue reaches its single `supervisor` entry this check narrows to that one name,
+/// which must never be claimable by anything.
+pub fn spawn_from_image(
+    name:              &str,
+    image:             crate::loader::ImageSource,
+    // A STRICT placement: reject with `PlacementInvalid` if that core is not ready (§9.2).
+    core_override:     Option<u32>,
+    // The service's PREFERRED core (`u32::MAX` = none): used only when there is no override, and
+    // falls back to round-robin if that core is not ready, so a machine with fewer cores still boots.
+    core_preferred:    u32,
+    memory_limit:      u64,
+    has_recv_endpoint: bool,
+    has_console_read:  bool,
+    peers:             &[&str],
+    // Caller-provided peer caps, GRANT-validated by the syscall. `None` = name-wire the peers
+    // instead, which is the path a service with no provided caps takes.
+    installs:          Option<&[InstallCap]>,
+    // Privilege bits the spawner asks the child be given. Already checked against the CALLER's own
+    // holdings by the syscall, so this cannot escalate (3.1, 7.3).
+    privileges:        u32,
+    // The service's mode selector (see `SpawnRequest::probe_mode`).
+    mode:              u32,
+    // The device class this service drives (0 = none). Its IRQ lines are DERIVED from the class by
+    // `hw_irqs_for` rather than named by the caller - see that function for why a vector is
+    // authority. `SpawnImage` refuses a request that tries to name one.
+    hw_class:          u32,
+    // DMA arena size in pages, for a PCI descriptor. A size, not an address (see the syscall).
+    dma_pages:         u32,
+    // WHICH device, when the caller knows it (step D3). An IDENTIFIER, not an address: the kernel
+    // reads that device's own registers to learn its BAR and IRQ, so naming it grants nothing that
+    // naming the class would not. Zero = not supplied, and the class is resolved against the
+    // kernel's own scan as before.
+    bdf:               u32,
+    // Mint the name-wired peer caps with GRANT so the child may re-delegate them (§22 Test 5A).
+    peers_grant:       bool,
+) -> Result<Option<EndpointId>, SpawnError> {
+    if service_config(name).is_some() {
+        crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
+        return Err(SpawnError::NotFound);
+    }
+    if scheduler::find_task_by_name(name).is_some() {
+        crate::kprintln!("task: spawn '{}' rejected: already running", name);
+        return Err(SpawnError::AlreadyRunning);
+    }
+
+    let core_id = resolve_spawn_core(core_override, core_preferred)?;
+    let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
+
+    let hw = if hw_class & HW_PCI_FLAG != 0 { hw_pci_of(hw_class, dma_pages, bdf) }
+             else { hw_class_of(hw_class) };
+
+    // A PCI driver that asked for an interrupt gets a pool vector, allocated once per DEVICE and
+    // programmed into its MSI. Held in a local so it can be passed as a slice - `hw_irqs_for`
+    // returns 'static and cannot carry an allocated value.
+    let pci_irq: [u8; 1] = match hw {
+        HwClass::Pci { class_code, .. } if hw_class & HW_PCI_IRQ != 0 =>
+            [pci_msi_vector(class_code, core_id)],
+        _ => [0],
+    };
+    let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };
+    let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
+                                          peers_grant, mem, irqs, has_console_read,
+                                          Some(privileges), Some(hw), installs);
+    if let Err(ref e) = result {
+        crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
+    }
+    result
+}
+
+/// Spawn the one service the kernel still bootstraps, from the one row it still holds.
+///
+/// This used to start 221 services. What remains is `supervisor`, because nothing is beneath it -
+/// every other image, parameter and privilege now belongs to the supervisor and arrives in a
+/// `SpawnImage` request (`docs/service-ownership.md`).
+///
+/// The last two things to leave were AUTHORITY rather than settings, and are worth recording because
+/// the split they forced is now resolved: a probe's IRQ route and its grantable peer caps were kept
+/// keyed by name here, on the rule "the kernel decides what a service may DO, the caller says what it
+/// IS". Both now travel in the request without weakening that rule - the IRQ as a device CLASS whose
+/// vector the kernel still chooses (`hw_irqs_for`), the grant as a flag checked like any privilege.
+/// The caller still cannot assert an authority; it can only name one the kernel already understood.
 pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<Option<EndpointId>, SpawnError> {
     let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
 
@@ -3797,10 +1356,10 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
 
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
 
-    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None);
+                              cfg.has_console_read, None, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -3820,10 +1379,10 @@ pub fn spawn_service_by_name_with_installs(
         return Err(SpawnError::AlreadyRunning);
     }
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
-    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, Some(installs));
+                              cfg.has_console_read, None, None, Some(installs));
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' (with installs) failed: {:?}", name, e);
     }
@@ -3872,7 +1431,18 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
             crate::capability::cap::ResourceId::from(ep_id));
         // Clear the name mapping while the id is still ours, THEN free the id (the same
         // load-bearing order as the kill path: free is the barrier against id reuse).
-        crate::ipc::names::unregister_endpoint(name, ep_id);
+        // Same report as the kill path (see `scheduler.rs`): a half-spawned instance must never take
+        // a LIVE instance's name with it. Rarer here - a partial spawn is a failure already - which is
+        // exactly why it would otherwise go unnoticed.
+        if crate::ipc::names::unregister_endpoint(name, ep_id)
+            == crate::ipc::names::UnregisterOutcome::Cleared
+        {
+            if let Some(other) = crate::task::scheduler::find_task_by_name_excluding(name, task_slot) {
+                crate::kprintln!(
+                    "ipc::names: '{}' UNREGISTERED by a FAILED spawn's endpoint {:?} while slot {} is STILL ALIVE under that name - the live instance is now unreachable by name",
+                    name, ep_id, other);
+            }
+        }
         crate::ipc::free_endpoint_id(ep_id);
     }
     scheduler::release_task_slot(task_slot);
@@ -3882,9 +1452,13 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
 /// `EndpointId` (`None` if it has no endpoint) - the caller (via the spawn syscall) can mint a
 /// cap to it. This is the Phase-0 seam for moving naming out of the kernel (`docs/naming-design.md`):
 /// a spawner can collect a cap to every service it starts without the kernel resolving names.
-fn spawn_service_with_config(
-    name:              &'static str,
-    elf_bytes:         &[u8],
+fn spawn_service_with_image(
+    // NOT `&'static str`. A caller-supplied name is what lets a spawner name what it spawns; the
+    // task owns its bytes now (`scheduler::set_task_name`), so nothing here needs the literal.
+    name:              &str,
+    // Where the image lives: kernel rodata (the catalogue path, until it is gone) or the CALLER's
+    // address space (`SpawnImage`). See `loader::ImageSource` for the double-fetch discipline.
+    image:             crate::loader::ImageSource,
     core_id:           u32,
     has_recv_endpoint: bool,
     send_peers:        &[&str],
@@ -3893,6 +1467,13 @@ fn spawn_service_with_config(
     memory_limit:      u64,
     hw_irqs:           &[u8],
     has_console_read:  bool,
+    // `Some(bits)` = the SPAWNER named these privileges (SpawnImage, already checked against what the
+    // caller itself holds). `None` = resolve them from the kernel's by-name table, which is the
+    // catalogue path and goes away with the catalogue.
+    priv_override:     Option<u32>,
+    // `Some(class)` = the SPAWNER named the device this service drives. `None` = resolve it by name
+    // from `service_hw`, the catalogue path, which goes away with the catalogue.
+    hw_override:       Option<HwClass>,
     // Phase 0b (docs/naming-design.md): if `Some`, wire the child's send-peers from these
     // caller-supplied `(label, cap)` entries instead of resolving `send_peers` against the kernel
     // name table. The kernel installs each cap and records `label → slot` in the child's send-peer
@@ -3903,14 +1484,23 @@ fn spawn_service_with_config(
     // The declared hardware class + mint authority for this service (audit M7 / T1 Phase B). Every
     // MMIO / DMA / IOMMU / bus-master / RESOURCE_MINT grant below is driven off these, not a `name ==`
     // check - one declaration (`service_hw`), reconciled against the .toml for contracted services.
-    let (hw, resource_mint) = service_hw(name);
+    let (hw_by_name, resource_mint_by_name) = service_hw(name);
+    let hw = hw_override.unwrap_or(hw_by_name);
+    // RESOURCE_MINT is NOT a field of `Privileges` - it is a separate flag out of `service_hw`, so a
+    // spawner-supplied privilege set has to be threaded to it explicitly. Missing this meant a moved
+    // service spawned fine and then idled with "no RESOURCE_MINT cap", which the dedicated
+    // `osdev test resource-server` caught and identity/shell/files could not: none of them exercise it.
+    let resource_mint = match priv_override {
+        Some(bits) => bits & privbits::RESOURCE_MINT != 0,
+        None       => resource_mint_by_name,
+    };
 
     // DIAG step markers (gated by SPAWN_TRACE; off by default - see its doc).
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
 
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va, mapped_bytes: elf_mapped_bytes } =
-        crate::loader::load(elf_bytes)?;
+        crate::loader::load_from(&image)?;
 
     if SPAWN_TRACE { crate::kprintln!("spawn[stack]: '{}'", name); }
 
@@ -3965,11 +1555,48 @@ fn spawn_service_with_config(
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
     // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
-    // All six non-hardware authorities below come from the ONE `service_privileges` table (audit U15),
-    // not a re-derived `name ==` check per grant. `is_probe` covers the whole test-probe family by ELF
-    // identity so no probe is missed by name.
-    let is_probe = core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr());
-    let privs = service_privileges(name, is_probe);
+    // The non-hardware authorities come from the ONE `service_privileges` table (audit U15), not a
+    // re-derived `name ==` check per grant.
+    //
+    // `is_probe` is GONE with the probe image. It compared the spawning ELF against the kernel's own
+    // `PROBE_ELF` rodata to give the whole test-probe family its privileges by identity rather than
+    // by name - which only worked while the kernel HELD that image. The probes' privileges now
+    // travel in the spawn request like every other service's (`probes::privileges_of`), checked
+    // against what the supervisor may delegate, which is what the `prop-`/`stress-` prefix hole
+    // recorded below always needed.
+    let privs = match priv_override {
+        // The spawner named them. Every bit was checked against the CALLER's own holdings before we
+        // got here, so this cannot escalate - it can only pass on what the spawner already has.
+        Some(bits) => Privileges {
+            spawn:           bits & privbits::SPAWN           != 0,
+            console_push:    bits & privbits::CONSOLE_PUSH    != 0,
+            introspect:      bits & privbits::INTROSPECT      != 0,
+            service_control: bits & privbits::SERVICE_CONTROL != 0,
+            fire_irq:        bits & privbits::FIRE_IRQ        != 0,
+            reboot:          bits & privbits::REBOOT          != 0,
+            acquire_any:     bits & privbits::ACQUIRE_ANY     != 0,
+            gpio:            bits & privbits::GPIO            != 0,
+            set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
+            set_clock:       bits & privbits::SET_CLOCK       != 0,
+            net_device:      bits & privbits::NET_DEVICE      != 0,
+            pci_cfg:         bits & privbits::PCI_CFG         != 0,
+            // NO BIT, and none is coming. A spawner cannot pass on the authority to spawn arbitrary
+            // images: that is exactly the widening this capability exists to close, and a wire bit
+            // for it would re-open the hole one grant later.
+            image_spawn:     false,
+            // USB_DISK has NO bit, and that is the finding rather than an omission. It gated
+            // `block-driver`'s reach to a USB stick through the in-kernel Bulk-Only stack - and on
+            // BOTH ARM ports that stack is gone: the driver now asks the `dwc2` / `xhci` SERVICE over
+            // IPC (`xhciblk`), which calls no `usb_disk_*` syscall at all. So the authority is
+            // vestigial, and moving `block-driver` to the supervisor dropped it rather than
+            // preserving it. That is the narrowing audit SEC-37 asked for, reached as a consequence
+            // of the move: whole-device read/write reach is no longer handed to a service that
+            // stopped using it. Deleting the syscalls themselves is a separate change with its own
+            // test, so the resource still exists and simply has no holder.
+            usb_disk:        false,
+        },
+        None => service_privileges(name),
+    };
 
     let mut spawn_slot_u32 = u32::MAX;
     if privs.spawn {
@@ -4147,6 +1774,16 @@ fn spawn_service_with_config(
     // is never spawned, so the grant never fires.
     // `net-stack` mints SOCKET capabilities (a socket is a delegated resource cap, §7.10, the same
     // mechanism `fs` uses for files) - so it needs the same minting authority.
+    // The supervisor gets a GRANT-ONLY cap for every delegatable privilege, so it can pass authority
+    // to a service it spawns without being able to exercise any of it (see SUPERVISOR_DELEGATABLE).
+    if name == "supervisor" {
+        for (_, res) in SUPERVISOR_DELEGATABLE {
+            let d = mint_cap(*res, Rights::GRANT);
+            caps.insert(d)
+                .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+        }
+    }
+
     if resource_mint {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
@@ -4185,6 +1822,28 @@ fn spawn_service_with_config(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
+    // PCI_CFG: `hw-enumerator` reads PCI configuration space (step D2). ONE syscall performs a
+    // complete read - latch the selector, fetch the register - and there is no write of any kind.
+    //
+    // The kernel learns two opaque numbers, a selector and an offset. It does not learn what they
+    // name, which is the whole point: bus walking and class codes are hardware semantics that belong
+    // in the service (§26.10). What the kernel DOES enforce is admissibility - a well-formed cycle,
+    // and on a board whose bridge aborts reads past its subordinate bus, only a bus it forwards.
+    // That is not interpretation, it is the kernel refusing to perform an access that could halt the
+    // machine on an argument a service chose.
+    //
+    // READ-ONLY, permanently. Config space holds every BAR and command register, and the target is
+    // chosen by data rather than by the interface, so write authority here is write authority over
+    // every device on the bus and there is no narrower form of it to mint.
+    if privs.pci_cfg {
+        // READ alone. There is no longer any write operation behind this capability, so granting
+        // WRITE would be authority nobody can exercise - and a right that is minted but unused is
+        // the kind of thing a later change quietly finds a use for (§7.3, grant the least).
+        let pc_cap = mint_cap(PCI_CFG_RESOURCE, Rights::READ);
+        caps.insert(pc_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
     // USB_DISK: the ARM `block-driver` reads/writes a USB stick through the in-kernel Bulk-Only stack
     // (UsbDisk*, syscalls 46-48). Minted here; WHO holds it is in `service_privileges`.
     if privs.usb_disk {
@@ -4198,6 +1857,14 @@ fn spawn_service_with_config(
     if privs.gpio {
         let g_cap = mint_cap(GPIO_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(g_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // IMAGE_SPAWN: the supervisor starts services from images IT holds (`SpawnImage`, syscall 52).
+    // Minted here; WHO holds it is in `service_privileges` - and it is exactly one principal.
+    if privs.image_spawn {
+        let is_cap = mint_cap(IMAGE_SPAWN_RESOURCE, Rights::WRITE);
+        caps.insert(is_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
@@ -4507,8 +2174,12 @@ fn spawn_service_with_config(
                     use core::sync::atomic::Ordering::Relaxed;
                     use crate::arch::imp::pci;
                     if CONFINE_USB_DRIVERS && hw.iommu_confine() {
-                        crate::arch::imp::iommu::confine_device(
-                            pci::XHCI_BDF.load(Relaxed), phys, len);
+                        // THIS driver's device, not "the xHCI". This read `pci::XHCI_BDF`, so it
+                        // confined the xHCI controller whenever ANY driver asked to be confined -
+                        // harmless only because `xhci` is the sole one that does today, and the same
+                        // by-class assumption the kill path carried until D3b. `hw.bdf()` is the
+                        // device this spawn actually resolved.
+                        crate::arch::imp::iommu::confine_device(hw.bdf(), phys, len);
                     } else {
                         // `block-driver` (AHCI) stays in IOMMU passthrough, like ehci:
                         // the T630 BIOS hands the SATA controller over with a stale
@@ -4527,6 +2198,9 @@ fn spawn_service_with_config(
                     // it only once at boot - so a RESPAWN must re-enable it or the new instance's DMA silently
                     // never starts. Idempotent (no-op if already set). Per-driver BDF.
                     let bdf = hw.bdf();
+                    // REMEMBERED, so the kill path can quiesce this exact controller without the
+                    // kernel keeping a name->device table (see `scheduler::TASK_HW_BDF`).
+                    scheduler::set_task_hw_bdf(task_slot, bdf);
                     pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }
@@ -4579,10 +2253,40 @@ fn spawn_service_with_config(
             data.fb_height          = fb_grant.map_or(0, |g| g.height);
             data.fb_bpp             = fb_grant.map_or(0, |g| g.bpp);
             data.fb_shifts          = fb_grant.map_or(0, |g| g.shifts);
+            // The granted interrupt vector(s). Written here beside the MMIO and DMA grants because it
+            // is the same kind of fact: something the kernel CHOSE for this driver, which the driver
+            // must be able to read and may not name. Truncated to the field, loudly - a driver told
+            // about fewer vectors than it was routed would misclassify the rest.
+            data.irq_count = core::cmp::min(hw_irqs.len(), data.irqs.len()) as u32;
+            if hw_irqs.len() > data.irqs.len() {
+                crate::kprintln!(
+                    "task: '{}' routed {} IRQs but the context carries {} - the rest are ROUTED but not reported",
+                    name, hw_irqs.len(), data.irqs.len());
+            }
+            for (i, &v) in hw_irqs.iter().take(data.irqs.len()).enumerate() {
+                data.irqs[i] = v;
+            }
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
                 data.send_peers[i].name     = peer_data[i].2;
+            }
+
+            // Record the same peer NAMES kernel-side. `AcquireSendCap` authorises a reacquire for a
+            // name the task declared (14.3 recovery, without the broad ACQUIRE_ANY), and that check
+            // used to read the kernel CATALOGUE - which answers "declares nothing" for a service whose
+            // config lives in the supervisor. Recording the actual wiring here is both the fix and the
+            // honester source: what the task was wired with, not what a table says it should have been.
+            {
+                let mut names: [&str; MAX_SEND_PEERS] = [""; MAX_SEND_PEERS];
+                let mut nn = 0usize;
+                for i in 0..peer_count {
+                    let l = peer_data[i].1 as usize;
+                    if let Ok(nm) = core::str::from_utf8(&peer_data[i].2[..l.min(PEER_NAME_BYTES)]) {
+                        names[nn] = nm; nn += 1;
+                    }
+                }
+                scheduler::set_task_peers(task_slot, &names[..nn]);
             }
         }
         let ctx_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::NO_EXEC;
@@ -4651,7 +2355,7 @@ fn spawn_service_with_config(
 // supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
 // step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
-    match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
+    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
@@ -4665,8 +2369,15 @@ pub fn spawn_supervisor() {
 // The supervisor is no longer the non-restartable trusted root: when it dies, the KERNEL respawns it
 // (the kernel is the one thing that cannot die - the last-resort recovery anchor of Path C, §3.7).
 // The death path (`kill_task`) only FLAGS the respawn - running it inline is unsafe (we are mid-
-// teardown of the dying supervisor). `control::process_pending` (Core 0 control tick, already a
-// spawn-safe deferred point that respawns services for RESTART) polls the flag and does the respawn.
+// teardown of the dying supervisor). `scheduler::run` on CORE 0 polls the flag at its loop top,
+// where IF=1, and does the respawn (`poll_supervisor_respawn`, below).
+//
+// NOT the timer ISR, and not `control::process_pending` - which does not exist any more, and could
+// not have done this anyway. A ~22 ms spawn issuing all-core TLB shootdowns wedges the box at IF=0,
+// because core 0 cannot ACK other cores' IPIs while stuck in it. `poll_supervisor_respawn` carries
+// the full argument; this note was still naming the old caller after that one was corrected on
+// 2026-08-14, which is how a fix applied at ONE site leaves the same false statement standing forty
+// lines above the comment that warns about it.
 //
 // **No bound on the number of respawns - deliberately.** A cap that panicked after N respawns would
 // re-introduce the very reboot Phase 6 eliminates (just deferred from 1 death to N), and would hand
@@ -4745,8 +2456,9 @@ pub fn poll_supervisor_respawn() {
     // directly; on a transient failure, log LOUD (§26.7) and RE-ARM PENDING so the next Core-0 tick
     // retries. The supervisor's footprint is constant and just-reclaimed, so a retry succeeds the moment
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
-    match spawn_service_with_config(
-        "supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None,
+    match spawn_service_with_image(
+        "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
+        64 * 1024 * 1024, &[], false, None, None, None,
     ) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {

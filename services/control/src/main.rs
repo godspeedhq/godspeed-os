@@ -20,7 +20,8 @@
 //! holds every authority - so writing them down is a reduction even though the syscall and capability
 //! pins grew by one each to make it possible.
 
-use godspeed_sdk::ServiceContext;
+use godspeed_sdk::{ServiceContext, ipc::Message};
+use godspeed_sdk::service_context::supcmd;
 
 /// Kernel introspection query that pops one byte from COM2, or -1 when the port is empty.
 const Q_COM2_BYTE: u64 = 21;
@@ -46,16 +47,42 @@ fn execute(ctx: &ServiceContext, line: &str) {
             Some(name) => {
                 let core: Option<u32> = parts.next().and_then(|s| s.parse().ok());
                 ctx.log_fmt(format_args!("control: RESTART {} core={:?}", name, core));
-                // Kill first, then spawn. A kill that finds nothing is not an error here: RESTART of a
-                // service that already died is exactly the case the harness uses.
-                let _ = ctx.kill(name);
-                let spawned = match core {
-                    Some(c) => ctx.spawn_on(name, c),
-                    None => ctx.spawn(name),
+                // ASK THE SUPERVISOR. This used to kill and then spawn here, which meant asking the
+                // KERNEL to spawn by name - and that only ever worked because the kernel held every
+                // service image. Restart authority is the supervisor's (14.4), and once an image
+                // lives there it is the only thing that CAN respawn it
+                // (`docs/service-ownership.md`).
+                //
+                // Bounded (26.6): a deadline, not an open wait. A supervisor that is mid-respawn of
+                // itself must never hang the operator channel - the harness would read a hang as a
+                // dead machine.
+                let mut buf = [0u8; supcmd::MAX];
+                let n = match supcmd::encode(&mut buf, supcmd::RESTART,
+                                             core.unwrap_or(u32::MAX), name, &[]) {
+                    Some(n) => n,
+                    None    => { ctx.log("control: RESTART name too long"); return; }
                 };
-                match spawned {
-                    Ok(()) => ctx.log_fmt(format_args!("control: {} restarted", name)),
-                    Err(e) => ctx.log_fmt(format_args!("control: restart failed: {:?}", e)),
+                // The supervisor is restartable, so a cached cap to it goes stale on every respawn.
+                // Reacquire and retry ONCE on `Err` (the send failed - the peer is gone), never on
+                // `Ok(None)` (the deadline passed and the request may have landed).
+                let msg = Message::from_bytes(&buf[..n]);
+                let mut answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
+                if answer.is_err() && ctx.reacquire_by_name("supervisor") {
+                    answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
+                }
+                // A spawn reply may carry a cap; control does not want it, so reclaim it (26.6).
+                if let Some(c) = ctx.take_pending_cap() { ctx.remove_cap(c); }
+                match answer {
+                    Ok(Some(reply)) => match reply.payload_bytes().first() {
+                        Some(&supcmd::OK) => ctx.log_fmt(format_args!("control: {} restarted", name)),
+                        Some(&supcmd::UNKNOWN) =>
+                            ctx.log_fmt(format_args!("control: restart failed: supervisor did not understand the request for {}", name)),
+                        _ => ctx.log_fmt(format_args!("control: restart failed: supervisor could not restart {}", name)),
+                    },
+                    Ok(None) => ctx.log_fmt(format_args!(
+                        "control: restart failed: supervisor did not answer within 10s ({})", name)),
+                    Err(e)   => ctx.log_fmt(format_args!(
+                        "control: restart failed: supervisor unreachable ({:?}) - {}", e, name)),
                 }
             }
             None => ctx.log("control: RESTART missing name"),

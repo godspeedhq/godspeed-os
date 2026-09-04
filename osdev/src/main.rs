@@ -390,10 +390,25 @@ fn commandment_check() {
 pub fn cmd_build() {
     commandment_check();
     clean_supervisor();
-    // Services must be compiled before the kernel - kernel/build.rs embeds
-    // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
+    // Services must be compiled before the kernel - kernel/build.rs embeds the service ELF bytes via
+    // include_bytes!(env!("SVC_*_ELF")).
+    //
+    // And the SUPERVISOR must be compiled after the services IT embeds, for the same reason one layer
+    // down. It used to sit FIRST in this list, so every image this path wrote carried a supervisor
+    // holding the PREVIOUS build of all 22 services beside a current kernel - silently, because a
+    // stale file is not a missing one. That is the exact bug `scripts/embed_order_check.py` was
+    // written for on the Pi ports; it was here too, on the default path that `osdev run` and the
+    // property/fuzz/chaos/stress suites all use.
+    //
+    // It hid because it only bites when cargo actually REWRITES a service binary - an unchanged
+    // service keeps its old mtime and the supervisor stays newer by luck. Intermittent, which is why
+    // it survived: it was found by the embed-order gate refusing to write a property image, not by
+    // anything failing.
+    //
+    // `cmd_build_bare_metal` had this right already (a `non_supervisor` list, supervisor built after).
     let service_crates = [
-        "supervisor", "logger", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder",
+        "logger", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder",
+        "supervisor",   // LAST: it embeds every name above it
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")
@@ -465,7 +480,7 @@ fn identity_kernel_feature_args() -> Vec<String> {
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -510,7 +525,7 @@ pub fn cmd_build_bare_metal() {
 /// (plain `bare-metal`) so its per-tick disk writes are test-only.
 pub fn cmd_build_counter() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -555,7 +570,7 @@ pub fn cmd_build_counter() {
 /// round-trip. Kept out of the daily-driver image (plain `bare-metal`) so the per-tick RPC is test-only.
 pub fn cmd_build_reply() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -601,7 +616,7 @@ pub fn cmd_build_reply() {
 /// Kept out of the daily-driver image (plain `bare-metal`) so the per-boot mint/grant is test-only.
 pub fn cmd_build_resource() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -645,7 +660,7 @@ pub fn cmd_build_resource() {
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -689,7 +704,7 @@ pub fn cmd_build_idle() {
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -737,7 +752,7 @@ pub fn cmd_build_identity() {
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -780,7 +795,7 @@ pub fn cmd_build_perf() {
 /// internally - no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -826,7 +841,7 @@ pub fn cmd_build_stress() {
 /// "fuzz: F* pass" line and never "KERNEL PANIC".
 pub fn cmd_build_fuzz() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -868,7 +883,7 @@ pub fn cmd_build_fuzz() {
 /// hardware chaos run (C2-C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -911,7 +926,7 @@ pub fn cmd_build_chaos() {
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -956,7 +971,7 @@ pub fn cmd_build_b2_only() {
 /// probes - for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -998,7 +1013,7 @@ pub fn cmd_build_perf_iso(feature: &str) {
 
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -1041,7 +1056,7 @@ pub fn cmd_build_bp2_only() {
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -1083,7 +1098,7 @@ pub fn cmd_build_adv() {
 /// benchmark suite (BP1-BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
@@ -1312,6 +1327,8 @@ fn cmd_test(suite: &str) {
         "fs-journal"   => run_fs_journal_test(),
         "fs-djournal"  => run_fs_djournal_test(),
         "fs-restart"   => run_fs_restart_test(),
+        "peer-storm"   => run_peer_storm_test(),
+        "adopt-storm"  => run_adopt_storm_test(),
         "counter"      => run_counter_test(),
         "reply-server" => run_reply_server_test(),
         "reply-dead"   => run_reply_dead_test(),
@@ -1360,7 +1377,7 @@ fn cmd_shell(smp: u32) {
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
-    let non_supervisor = ["logger", "console", "control", "time", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
@@ -1495,7 +1512,7 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         let _ = std::process::Command::new("cargo")
             .args(["clean", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none"]).status();
     }
-    let non_supervisor = ["logger", "console", "control", "time", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["logger", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {
@@ -2406,6 +2423,48 @@ fn run_fmt_demo_test() {
 /// §22 Test 13 (Phase D): fs survives its own restart. Bare-metal shell + AHCI disk; the
 /// harness writes a file, KILLs fs over the control channel, and reads it back after the
 /// supervisor respawns fs and the shell reacquires it by name.
+/// The FORCED-WINDOW test (`osdev test peer-storm`). Kill `block-driver` on a fixed cadence over the
+/// control channel while the shell drives file I/O, so `fs` spends most of the run unable to resolve
+/// its peer - the state a hardware outage sits in, manufactured instead of waited for.
+///
+/// It exists because the hardware failure cannot be reproduced under emulation. arm32 QEMU never
+/// enumerates a USB stick, so `block-driver` reports 0 sectors and `fs` issues no block I/O at all;
+/// x86 respawns faster than a guest can miss. This does not reproduce the CAUSE - a forced window is
+/// not evidence about the race that opens one - it reproduces the CONSEQUENCE, which is the half
+/// nobody has been able to watch: what `fs` does once the peer is gone, and whether it comes back.
+/// Does an ADOPTED service keep its name? (`osdev test adopt-storm`) - storms the SUPERVISOR so
+/// adoption happens repeatedly on purpose, then asks whether the filesystem still works. See
+/// `shell_test::run_adopt_storm` for the hypothesis and why it has never been tested.
+fn run_adopt_storm_test() {
+    println!("
+=== adopt-storm: does an adopted service keep its name? ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_adopt_storm.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_adopt_storm(&image_path, persist, 4);
+}
+
+fn run_peer_storm_test() {
+    println!("
+=== peer-storm: fs against a block-driver that keeps dying (forced window) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_peer_storm.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_peer_storm(&image_path, persist, 4);
+}
+
 fn run_fs_restart_test() {
     println!("\n=== fs: restartable - survives its own restart (Phase D, §22 Test 13) ===");
     cmd_build_bare_metal();

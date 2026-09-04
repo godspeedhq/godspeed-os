@@ -120,6 +120,21 @@ pub fn take_fixup() -> Option<u64> {
 /// Returns a slice of the copy, or `None` if the pointer failed validation or faulted. The `'static`
 /// lifetime reflects the buffer's storage, not an unlimited borrow: it is valid until this core's next
 /// user copy, and callers consume it within the syscall that produced it.
+/// Copy `len` bytes from a USER range into kernel memory, bounded to ONE PAGE per call.
+///
+/// The ELF loader uses this to move a service image out of the supervisor's address space a page at
+/// a time, so the kernel never holds more than a page of an untrusted image at once (26.6 - the
+/// bound is visible here rather than left to the caller's discipline). `read_user_bytes` cannot do
+/// this: it is capped at one message and lands in a shared per-core scratch slot.
+///
+/// Returns false if the range is not valid user memory or `len` exceeds a page.
+pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool {
+    if len == 0 { return true; }
+    if len > crate::arch::imp::page_tables::PAGE_SIZE { return false; }
+    if !validate_user_ptr(src, len) { return false; }
+    copy_from_user(dst, src, len)
+}
+
 pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if !validate_user_ptr(ptr, len) {
         return None;

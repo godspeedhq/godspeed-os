@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Hardware DISCOVERY in userspace (step D2, docs/service-ownership.md).
+#
+# §4.3 names six kernel responsibilities and bus enumeration is not among them. The kernel keeps only
+# the PORT OPERATION - `in`/`out` are privileged instructions no service can execute - and this service
+# owns what the operation MEANS: that 0xCF8 selects a PCI configuration register, how to walk a bus,
+# what a class code identifies, where a device's BARs are.
+#
+#   kernel:         "Given a valid capability, I permit this operation."
+#   hw-enumerator:  "I know what this operation means."
+#
+# It is a REPORTER, not a manager. It discovers what is present and where its resources are. It does
+# not own devices, drive them, pick drivers, or make lifecycle policy - and it must not grow into
+# doing so. That growth is the failure mode this design guards against by name.
+name    = "hw-enumerator"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["hw-enumerator"]
+log_write   = true
+
+# PCI configuration READ. One gated syscall performs a complete read - select the register and fetch
+# it, indivisibly - and there is no write of any kind.
+#
+# READ-ONLY IS PERMANENT, and that asymmetry is the design. Configuration space is where every BAR and
+# every command register lives, so write authority over it is write authority over every device on the
+# bus. There is no narrower form to grant, because the target is chosen by data rather than by the
+# interface. Enumeration is inherently read-only, so it takes the read half and only that.
+#
+# If discovery ever needs configuration-space mutation - destructive BAR sizing is the obvious case -
+# this capability MUST NOT simply be widened. A different mechanism has to be designed and justified
+# on its own terms.
+#
+# ATOMIC, so multiple holders are safe. The underlying hardware is a stateful index/data pair, and
+# were selecting and reading two separate operations, two holders would silently read each other's
+# device - a wrong answer with nothing anywhere to say so, which is worse than a refused one
+# (invariant 12). The kernel itself uses that pair on the spawn and kill paths, so this is not a
+# hypothetical about future services.
+#
+# PLATFORM-INDEPENDENT AUTHORITY, platform-specific meaning. x86 reaches config space through the
+# CF8/CFC ports; the Pi 4 through a memory-mapped window on its root complex. The capability is the
+# same either way because the OPERATION is the same; what differs is the selector encoding, and that
+# lives in the service. The Pi 2 has no PCI at all, so there the kernel can only refuse - which it
+# says, rather than handing back a plausible zero that would read as an empty machine.
+pci_cfg = true

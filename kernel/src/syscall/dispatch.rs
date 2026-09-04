@@ -82,6 +82,17 @@ pub enum SyscallNumber {
     UsbDiskRead            = 47,
     UsbDiskWrite           = 48,
     UsbDiskFlush           = 49,
+    /// Spawn a task from an image the CALLER supplies, described by a `SpawnRequest` in its own
+    /// memory (step C, `docs/service-ownership.md`). The kernel stops holding a catalogue of what
+    /// each service IS; it loads what it is handed, and enforces what the request may ask for.
+    SpawnImage             = 52,
+    /// One complete PCI configuration read: select and fetch, indivisibly. Gated by `PCI_CFG`.
+    ///
+    /// ONE syscall rather than a select/read pair, because the pair is stateful: split, two callers
+    /// (or a caller and the KERNEL, which uses the same registers on the spawn and kill paths) read
+    /// whichever register the other selected. Atomic here, that window does not exist - and a caller
+    /// can no longer WRITE anything at all, which is strictly less authority than the pair carried.
+    PciCfgRead             = 53,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -124,6 +135,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Log            as u64 => handle_log(arg0, arg1, arg2),
         n if n == SyscallNumber::AllocMem       as u64 => handle_alloc_mem(arg0),
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
+        n if n == SyscallNumber::SpawnImage     as u64 => handle_spawn_image(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnReturningEndpoint as u64 => handle_spawn_returning_endpoint(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnWithCaps as u64 => handle_spawn_with_caps(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
@@ -152,6 +164,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ResourceInvoke as u64 => handle_resource_invoke(arg0, arg1, arg2),
         n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
         n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
+        n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
         _ => -1, // Unknown syscall.
     }
 }
@@ -671,6 +684,26 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 }
 
 // ---------------------------------------------------------------------------
+/// `AcquireSendCap` (10) failure codes, DISTINCT because the two failures want opposite responses and
+/// the caller could not tell them apart.
+///
+/// Both used to be a bare `-1`. The kernel logged which one it was, but the CALLER could not know, so
+/// every service that failed to reacquire a peer had to print a message naming both possibilities and
+/// committing to neither - "either the name is not registered right now, or this service has no free
+/// cap slot left". On the Pi 2 that ambiguity cost a whole debugging pass: a `block-driver` that was
+/// alive the entire time read identically to one whose reader had run out of cap slots.
+///
+/// They are genuinely different failures. A name that is not registered is TRANSIENT - the peer is
+/// mid-restart and the next attempt succeeds. A full cap table is PERMANENT - the service can never
+/// hold another cap and will not recover until it is restarted (§26.7: a failed recovery must stay as
+/// visible as the original failure). A caller that can distinguish them can retry the first quietly
+/// and report the second as terminal, which is exactly what it should do.
+///
+/// Outside the `cap_err_to_i64` range (-2..-7) and clear of `ReplyDead` (-12) so no existing decoder
+/// mistakes one for the other. `-1` stays "malformed request" (name empty, too long, unreadable).
+const ACQUIRE_NAME_NOT_REGISTERED: i64 = -20;
+const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
+
 // Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
 // ---------------------------------------------------------------------------
 
@@ -682,6 +715,417 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 /// core_id encoding:
 ///   - 0x0000 = core 0, 0x0001 = core 1, …
 ///   - 0xFFFF = let the kernel choose (preferred_core from service_config).
+/// Probe parameters ride in the UPPER 32 bits of `arg0`, which `Spawn` never used:
+/// `[55..48] flags  [47..32] probe mode  [31..16] core  [15..0] spawn cap slot`.
+/// No new syscall and no change in arity - see `docs/probe-params-design.md`.
+const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
+const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
+const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
+
+/// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
+/// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
+/// well under half of this.
+const SPAWN_PAYLOAD_MAX: usize = 128;
+
+
+// ---------------------------------------------------------------------------------------------
+// SpawnImage (52) - the caller supplies the image
+// ---------------------------------------------------------------------------------------------
+
+/// What a spawner tells the kernel about the task it wants started.
+///
+/// Fixed layout, fetched ONCE (see `handle_spawn_image`), and VERSIONED so a mismatch is a loud
+/// refusal rather than a misparse. Every field is here because step C or step D needs it, even where
+/// the kernel does not honour it yet: the ABI is the expensive thing to change, so it is shaped for
+/// the end state now and the interim is a REFUSAL, never a silent ignore
+/// (`docs/service-ownership.md`, "design C's spawn ABI for the end state").
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SpawnRequest {
+    /// Must equal `SPAWN_REQUEST_VERSION`. A spawner built against a different kernel is refused.
+    version:      u32,
+    /// bit0 has_recv_endpoint, bit1 has_console_read.
+    flags:        u32,
+    image_ptr:    u64,
+    image_len:    u64,
+    name_ptr:     u64,
+    name_len:     u32,
+    /// `u32::MAX` = let the kernel round-robin (9.2).
+    core:         u32,
+    memory_limit: u64,
+    /// Privilege bitmask (SPAWN, CONSOLE_PUSH, INTROSPECT, SERVICE_CONTROL, RESOURCE_MINT, REBOOT,
+    /// ACQUIRE_ANY, ...). NOT honoured yet - must be 0.
+    privileges:   u32,
+    /// The DEVICE CLASS this service drives (`task::hw_class_of`), or 0 for none.
+    ///
+    /// A CLASS rather than raw MMIO/DMA addresses, and that is not a shortcut: the kernel keeps a
+    /// PERMANENT PHYSICAL DMA RESERVATION PER DEVICE, reused across restarts so a respawned driver
+    /// gets the same arena its controller may still be pointing at. That is per-device kernel state,
+    /// so the request has to identify the DEVICE - an address cannot express it. The kernel resolves
+    /// the class to what its own bus scan found; moving the SCAN is step D.
+    hw_flags:     u32,
+    /// Device MMIO window to grant. NOT honoured yet - must be 0.
+    mmio_base:    u64,
+    mmio_len:     u64,
+    /// DMA arena size in pages, PCI BDF, and IRQ lines. NOT honoured yet - must be 0.
+    dma_pages:    u32,
+    bdf:          u32,
+    irq_count:    u32,
+    irqs:         [u8; 4],
+    /// NUL-separated peer names, resolved through the kernel name directory exactly as a contract's
+    /// `send_peers` are: the caller supplies the LIST, never the authority.
+    peers_ptr:    u64,
+    peers_len:    u32,
+    /// Caller-provided caps to install into the child, as `[label_len][label][slot_lo][slot_hi]`
+    /// repeated - the SAME encoding `SpawnWithCaps` already uses, deliberately, so there is one wire
+    /// format for this and not two.
+    installs_ptr:   u64,
+    installs_count: u32,
+    /// The service's MODE. Named `probe_mode` in `ServiceConfig` because probes were its first user,
+    /// but it is a general mode selector: `observe` reads it to choose one-shot / live / foreground,
+    /// and picks the LIVE LOOP when it is 0. Omitting it made `observe-now` spin at 100% CPU flooding
+    /// the console until the shell blocked on a send - a service that moved, spawned, ran, and did
+    /// the WRONG THING.
+    probe_mode:     u32,
+}
+
+/// Wire size of a `SpawnRequest`, in bytes. Every field at a fixed little-endian offset:
+///
+/// ```text
+///   0 version u32     36 core         u32     72 dma_pages u32
+///   4 flags   u32     40 memory_limit u64     76 bdf       u32
+///   8 image_ptr u64   48 privileges   u32     80 irq_count u32
+///  16 image_len u64   52 hw_flags     u32     84 irqs      [u8;4]
+///  24 name_ptr  u64   56 mmio_base    u64     88 peers_ptr u64
+///  32 name_len  u32   64 mmio_len     u64     96 peers_len u32
+///                                            100 reserved  u32
+///                                            104 installs_ptr   u64
+///                                            112 installs_count u32
+///                                            116 reserved       u32
+///                                            120 probe_mode     u32
+///                                            124 reserved       u32
+/// ```
+///
+/// These are exactly the offsets a `repr(C)` layout of the SDK's matching struct produces on both
+/// 32- and 64-bit targets (every `u64` lands 8-aligned), so the two agree by construction - but the
+/// KERNEL's copy is the definition, and it reads each field at a stated offset rather than trusting
+/// that agreement.
+const SPAWN_REQUEST_BYTES: usize = 128;
+
+impl SpawnRequest {
+    /// Decode the request from its wire bytes.
+    ///
+    /// EXPLICIT rather than a `repr(C)` reinterpret, deliberately. Casting the buffer to a struct
+    /// would make the ABI depend on two separate crates agreeing about padding and alignment, and it
+    /// would need `unsafe` in `syscall/`, which is one of 18.5's grandfathered floors - growable only
+    /// by amendment. Reading each field at a stated offset costs a few lines, needs no `unsafe`, and
+    /// makes the wire format something you can read off the source instead of infer from a layout.
+    fn decode(b: &[u8]) -> Self {
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| u64::from_le_bytes([
+            b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]]);
+        Self {
+            version:      u32_at(0),
+            flags:        u32_at(4),
+            image_ptr:    u64_at(8),
+            image_len:    u64_at(16),
+            name_ptr:     u64_at(24),
+            name_len:     u32_at(32),
+            core:         u32_at(36),
+            memory_limit: u64_at(40),
+            privileges:   u32_at(48),
+            hw_flags:     u32_at(52),
+            mmio_base:    u64_at(56),
+            mmio_len:     u64_at(64),
+            dma_pages:    u32_at(72),
+            bdf:          u32_at(76),
+            irq_count:    u32_at(80),
+            irqs:         [b[84], b[85], b[86], b[87]],
+            peers_ptr:    u64_at(88),
+            peers_len:    u32_at(96),
+            installs_ptr:   u64_at(104),
+            installs_count: u32_at(112),
+            probe_mode:     u32_at(120),
+        }
+    }
+}
+
+/// Bumped to 2 when `installs` was added. The version field exists for exactly this: a spawner
+/// built against a different kernel is REFUSED loudly rather than misparsing a shorter struct.
+const SPAWN_REQUEST_VERSION:  u32 = 3;
+const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
+const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
+/// `core` is a STRICT placement (a restart's `--core N`), not a table's PREFERRED core. See §9.2 and
+/// the SDK constant of the same name for why conflating the two stops a machine booting.
+const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
+/// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
+const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+/// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
+/// largest real request (xHCI's scratchpad, 1168 KiB) and far below anything that could starve the
+/// frame allocator.
+const MAX_DMA_PAGES: u32 = 2048;
+
+fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
+    // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
+    // supply the authority to start it.
+    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot as usize, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    // AND `IMAGE_SPAWN` ON TOP OF IT - a SECOND, distinct authority, because these are two different
+    // powers that were sharing one capability.
+    //
+    // `SPAWN` means "start a service the system already knows". This syscall means "start ARBITRARY
+    // BYTES, under a name you choose", which is a power that did not exist before step C moved the
+    // images out of the kernel (`docs/service-ownership.md`): while the kernel held every image, a
+    // spawner could only ask for one the kernel already had. Afterwards this had to accept bytes from
+    // userspace, and it was gated by the capability the SHELL happens to hold for unrelated reasons -
+    // as do `chaos`, `control` and every probe. Any of them could have introduced new code under a
+    // real service's name in the window while that service was dead, and clients reacquiring by name
+    // (§14.3) would have wired themselves to it.
+    //
+    // Checked against the caller's own table rather than a slot it passes, exactly as
+    // `privileges_caller_lacks` checks a delegated privilege: the authority is a property of the
+    // caller, not of an argument it chooses.
+    if !scheduler::current_task_holds_resource(
+        crate::capability::IMAGE_SPAWN_RESOURCE, Rights::WRITE)
+    {
+        crate::kprintln!("task: SpawnImage refused - caller holds SPAWN but not IMAGE_SPAWN (starting arbitrary bytes is the supervisor's authority alone; ask it via supcmd::SPAWN)");
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+
+    if req_len as usize != SPAWN_REQUEST_BYTES {
+        crate::kprintln!("task: SpawnImage refused - request is {} bytes (kernel expects {})",
+            req_len, SPAWN_REQUEST_BYTES);
+        return -1;
+    }
+    // ONE fetch. Every decision below is taken from this copy, so the caller cannot rewrite a field
+    // between its validation and its use - the same double-fetch discipline the loader applies to
+    // the ELF header window.
+    let raw = match read_user_bytes(req_ptr, req_len as usize) {
+        Some(b) => b,
+        None => {
+            crate::kprintln!("task: SpawnImage refused - request buffer {:#x} not readable", req_ptr);
+            return -1;
+        }
+    };
+    let req = SpawnRequest::decode(raw);
+
+    if req.version != SPAWN_REQUEST_VERSION {
+        crate::kprintln!("task: SpawnImage refused - request version {} (kernel speaks {})",
+            req.version, SPAWN_REQUEST_VERSION);
+        return -1;
+    }
+
+    // NOT-YET-HONOURED FIELDS ARE REFUSED, NOT IGNORED (invariant 12). A spawner asking for an MMIO
+    // window or a privilege this kernel does not yet grant must hear so, rather than receive a task
+    // that silently lacks what it needs and fails later somewhere unrelated.
+    // `hw_flags` (the device class) is honoured below. The RAW address fields are still refused, and
+    // refusing rather than ignoring is the rule (invariant 12): a spawner asking for an MMIO window
+    // this kernel will not grant must hear so, not receive a task that silently lacks it and fails
+    // somewhere unrelated. They stay refused because the kernel resolves addresses from the class -
+    // see the field comment - and will keep doing so until the bus scan itself moves (step D).
+    // An INTERRUPT VECTOR is authority exactly as a physical address is (`task::hw_irqs_for`), and
+    // it was the one hardware field still passed through from the caller - so a spawner could name a
+    // vector it had no claim to while being refused the addresses beside it. Refused now: the kernel
+    // derives a driver's vectors from the device class it names.
+    if req.irq_count != 0 {
+        crate::kprintln!(
+            "task: SpawnImage refused - interrupt vectors are not honoured; name the device CLASS instead (irq_count={})",
+            req.irq_count);
+        return -1;
+    }
+    // `dma_pages` is now HONOURED for a PCI descriptor: a SIZE is not an address, so a caller
+    // naming one cannot reach memory it was not granted - the arena is still allocated by the
+    // kernel, wherever the kernel decides. Bounded, because an unbounded size is a denial of
+    // service (§26.6). The ADDRESS fields stay refused.
+    if req.dma_pages > MAX_DMA_PAGES {
+        crate::kprintln!("task: SpawnImage refused - dma_pages {} exceeds the cap of {}",
+                         req.dma_pages, MAX_DMA_PAGES);
+        return -1;
+    }
+    // ADDRESSES ARE STILL REFUSED. A caller may not name where a device lives - that is authority
+    // stated by a service, and the kernel would have to take its word for it.
+    if req.mmio_base != 0 || req.mmio_len != 0 {
+        crate::kprintln!(
+            "task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS or its BDF instead (mmio={:#x}+{:#x} dma_pages={})",
+            req.mmio_base, req.mmio_len, req.dma_pages);
+        return -1;
+    }
+    // A BDF IS NOT AN ADDRESS, and this is the line step D3 turns on.
+    //
+    // It used to be refused alongside `mmio_base`, which lumped two different kinds of value
+    // together. An address is authority: accept one and the kernel grants whatever the caller
+    // pointed at. A BDF is an IDENTIFIER - it names WHICH device, and the kernel then reads that
+    // device's own registers to learn what the name is worth (`bar_and_irq_from_bdf`). The caller
+    // cannot widen what it gets by lying, only misdirect itself to a different real device, and
+    // that is the supervisor's decision to make (§14) exactly as choosing the class was.
+    //
+    // "A service may identify a device; it may not thereby acquire authority over that device."
+    //
+    // Zero means "not supplied" and keeps the class path. That does collide with 00:00.0, the host
+    // bridge - which no driver binds, and which has no BAR worth granting, so the collision costs
+    // nothing real. Stated because a sentinel that overlaps a legal value is worth knowing about.
+    if req.bdf != 0 && !crate::task::hw_class_is_pci(req.hw_flags) {
+        crate::kprintln!(
+            "task: SpawnImage refused - a BDF only means something for a PCI device class (bdf={:#x} class={})",
+            req.bdf, req.hw_flags);
+        return -1;
+    }
+    if !crate::task::hw_class_known(req.hw_flags) {
+        crate::kprintln!("task: SpawnImage refused - unknown device class {}", req.hw_flags);
+        return -1;
+    }
+
+    // A CALLER MAY NOT GRANT ITSELF AUTHORITY IT DOES NOT HOLD.
+    //
+    // This is the whole security content of the privileges field, and it is the same rule
+    // `SpawnWithCaps` applies to an installed cap (8.5, 7.3): a spawner may hand a child only what it
+    // could already hand it. So each requested privilege is checked against the CALLER's own holdings
+    // - the supervisor holds SPAWN and SERVICE_CONTROL and may therefore pass them on; it does not
+    // hold REBOOT, so it cannot mint one for a child no matter what it asks for.
+    //
+    // Without this the field would be exactly the ambient authority 3.1 forbids: "ask and receive".
+    if req.privileges != 0 {
+        if let Some(missing) = crate::task::privileges_caller_lacks(req.privileges) {
+            crate::kprintln!(
+                "task: SpawnImage refused - caller asked to grant '{}' which it does not hold itself",
+                missing);
+            return -1;
+        }
+    }
+
+    let name_len = req.name_len as usize;
+    if name_len == 0 || name_len > 64 {
+        crate::kprintln!("task: SpawnImage refused - name length {} (must be 1..=64)", name_len);
+        return -1;
+    }
+    let name_bytes = match read_user_bytes(req.name_ptr, name_len) { Some(b) => b, None => return -1 };
+    let mut name_buf = [0u8; 64];
+    name_buf[..name_len].copy_from_slice(name_bytes);
+    let name = match core::str::from_utf8(&name_buf[..name_len]) { Ok(s) => s, Err(_) => return -1 };
+
+    // Peers: the same NUL-separated form and the same bound as the probe path.
+    let mut peer_buf = [0u8; SPAWN_PAYLOAD_MAX];
+    let mut peers: [&str; crate::task::MAX_SEND_PEERS] = [""; crate::task::MAX_SEND_PEERS];
+    let mut np = 0usize;
+    let plen = req.peers_len as usize;
+    if plen > 0 {
+        if plen > SPAWN_PAYLOAD_MAX {
+            crate::kprintln!("task: SpawnImage refused - peer payload {} bytes (max {})",
+                plen, SPAWN_PAYLOAD_MAX);
+            return -1;
+        }
+        let pb = match read_user_bytes(req.peers_ptr, plen) { Some(b) => b, None => return -1 };
+        peer_buf[..plen].copy_from_slice(pb);
+        let ps = match core::str::from_utf8(&peer_buf[..plen]) { Ok(s) => s, Err(_) => return -1 };
+        for part in ps.split('\0') {
+            if part.is_empty() { continue; }
+            if np >= crate::task::MAX_SEND_PEERS {
+                crate::kprintln!("task: SpawnImage refused - more than {} peers",
+                    crate::task::MAX_SEND_PEERS);
+                return -1;
+            }
+            peers[np] = part;
+            np += 1;
+        }
+    }
+
+    if req.image_len == 0 || req.image_len > u32::MAX as u64 {
+        crate::kprintln!("task: SpawnImage refused - image length {}", req.image_len);
+        return -1;
+    }
+    // STRICT placement vs a PREFERENCE (9.2) - see `SPAWN_FLAG_CORE_STRICT`. A caller's explicit
+    // `--core N` must be honoured or rejected; a table's preferred core must fall back to
+    // round-robin so a machine with fewer ready cores still comes up (11.3).
+    let strict = req.flags & SPAWN_FLAG_CORE_STRICT != 0;
+    let core_override  = if req.core == u32::MAX || !strict { None } else { Some(req.core) };
+    let core_preferred = if req.core == u32::MAX || strict  { u32::MAX } else { req.core };
+
+    // Caller-provided caps for the child's peers. Same encoding and the SAME AUTHORITY RULE as
+    // `SpawnWithCaps`: the caller must already hold each cap WITH GRANT, so copying it into the child
+    // is non-escalating (7.3) - it could have transferred the whole cap anyway. Every step is bounds
+    // checked because the descriptor is untrusted.
+    use crate::task::{InstallCap, PEER_NAME_BYTES};
+    let mut installs = [InstallCap { name: [0u8; PEER_NAME_BYTES], name_len: 0, cap };
+                        crate::task::MAX_SEND_PEERS];
+    let ni = req.installs_count as usize;
+    if ni > crate::task::MAX_SEND_PEERS {
+        crate::kprintln!("task: SpawnImage refused - {} installs (max {})",
+            ni, crate::task::MAX_SEND_PEERS);
+        return -1;
+    }
+    if ni > 0 {
+        // Each entry is at least 1 + 1 + 2 bytes; the buffer is read once, like every other input.
+        let ilen = ni * (2 + PEER_NAME_BYTES + 2);
+        let ibuf = match read_user_bytes(req.installs_ptr, ilen.min(512)) {
+            Some(b) => b,
+            None    => return -1,
+        };
+        let mut p = 0usize;
+        for entry in installs.iter_mut().take(ni) {
+            if p >= ibuf.len() { return -1; }
+            let label_len = ibuf[p] as usize;
+            p += 1;
+            if label_len == 0 || label_len > PEER_NAME_BYTES || p + label_len + 2 > ibuf.len() {
+                return -1;
+            }
+            let mut nm = [0u8; PEER_NAME_BYTES];
+            nm[..label_len].copy_from_slice(&ibuf[p..p + label_len]);
+            p += label_len;
+            let slot = (ibuf[p] as usize) | ((ibuf[p + 1] as usize) << 8);
+            p += 2;
+            let held = match scheduler::current_task_lookup_cap(slot, Rights::GRANT) {
+                Ok(c)  => c,
+                Err(e) => return cap_err_to_i64(e),
+            };
+            entry.name     = nm;
+            entry.name_len = label_len as u8;
+            entry.cap      = held;
+        }
+    }
+
+    match crate::task::spawn_from_image(
+        name,
+        crate::loader::ImageSource::User { base: req.image_ptr, len: req.image_len as usize },
+        core_override,
+        core_preferred,
+        req.memory_limit,
+        req.flags & SPAWN_FLAG_REQ_RECV    != 0,
+        req.flags & SPAWN_FLAG_REQ_CONSOLE != 0,
+        &peers[..np],
+        if ni > 0 { Some(&installs[..ni]) } else { None },
+        req.privileges,
+        req.probe_mode,
+        req.hw_flags,
+        req.dma_pages,
+        req.bdf,
+        req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
+    ) {
+        // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
+        // spawner has to be able to record `name -> cap` for the service it just started, or it
+        // cannot wire dependents to it and cannot re-wire them after a restart.
+        //
+        // Returned as SLOT + 1, so 0 unambiguously means "spawned, but this service has no recv
+        // endpoint". `SpawnReturningEndpoint` returns the bare slot and therefore cannot tell slot 0
+        // from no-endpoint; not repeating that here.
+        Ok(Some(ep_id)) => {
+            let rid    = crate::capability::cap::ResourceId::from(ep_id);
+            let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
+            match scheduler::current_task_insert_cap(ep_cap) {
+                Ok(slot) => slot as i64 + 1,
+                Err(e)   => cap_err_to_i64(e),
+            }
+        }
+        Ok(None) => 0,
+        Err(_)   => -1,
+    }
+}
+
 fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -697,17 +1141,21 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     }
 
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
-    let name_bytes = match read_user_bytes(name_ptr, len) {
+    if len == 0 || len > SPAWN_PAYLOAD_MAX { return -1; }
+    let payload = match read_user_bytes(name_ptr, len) {
         Some(b) => b,
         None    => return -1,
     };
-    let name = match core::str::from_utf8(name_bytes) {
+    let payload = match core::str::from_utf8(payload) {
         Ok(s)  => s,
         Err(_) => return -1,
     };
 
-    match crate::task::spawn_service_by_name(name, core_override) {
+    // THE PROBE PATH IS GONE. `Spawn` used to carry a test probe's parameters packed into the
+    // unused upper bits of `arg0` - the kernel supplying the image and looking its two authorities up
+    // by name. The image moved to the supervisor, so there is nothing here to spawn: a probe is now
+    // an ordinary `SpawnImage`, and a probe that needs a victim asks the supervisor for one.
+    match crate::task::spawn_service_by_name(payload, core_override) {
         Ok(_)  => 0,
         Err(_) => -1,
     }
@@ -756,11 +1204,19 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
             let rid    = crate::capability::cap::ResourceId::from(ep_id);
             let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
             match scheduler::current_task_insert_cap(ep_cap) {
-                Ok(slot) => slot as i64,
+                Ok(slot) => slot as i64 + 1,
                 Err(e)   => cap_err_to_i64(e),
             }
         }
-        Ok(None) => -1, // spawned, but no recv endpoint - nothing to hand back
+        // SLOT + 1 above, so 0 can mean "spawned, but this service has no recv endpoint" without
+        // colliding with slot 0. It used to return -1 here, which is what a FAILED spawn returns -
+        // so a caller could not tell a service that started and has no endpoint (`mem-pressure`,
+        // `greet`, `roster`) from one that did not start at all.
+        //
+        // That was latent while only the shell's `spawncap` used this: it only ever spawned services
+        // that HAVE endpoints. Routing the supervisor's spawns through it surfaced the ambiguity as
+        // "chaos spawn-storm hit the ceiling at spawn #1" - a successful spawn read as a refusal.
+        Ok(None) => 0,
         Err(_)   => -1,
     }
 }
@@ -958,6 +1414,45 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 /// Reacquire a fresh SEND cap to a named service (§14.2). **Gated (§3.1, see the in-body comment):**
 /// the caller must hold `ACQUIRE_ANY` (operator/test) or declare `name` as a contract send-peer
 /// (recovery). `arg2=1` also requests the GRANT right (cap-transfer tests, P3).
+/// Has this name already been reported as absent from the directory? Records it if not.
+///
+/// Bounded and heap-free (§26.6.1): a fixed table of names already warned about. When it fills, no new
+/// names are reported - a deliberate ceiling, because the alternative is an unbounded log on a serial
+/// wire that is already the system's bottleneck. Sixteen distinct names is more than the whole managed
+/// roster, so filling it means something is acquiring names nobody declared.
+///
+/// **THIS IS NOT A SERVICE CATALOGUE, and the distinction matters because the kernel is under standing
+/// orders to shrink one.** `I-service-table` pins the kernel's per-service POLICY - memory limits,
+/// placement, what a named service may hold - and records 218 entries as debt against a target of one.
+/// Nothing here is policy: this table changes no service's behaviour, grants nothing, is consulted by
+/// no decision, and its entire effect is to suppress a duplicate LOG LINE. It is a dedup cache for
+/// diagnostics that happens to be keyed by a string the caller supplied.
+///
+/// The alternative considered was a name-free counter - log the first N refusals of any name - which
+/// stores nothing about userspace at all. It was rejected because it answers a worse question: the
+/// failure this exists to make visible is one NAME failing repeatedly (293 lines for a single peer in
+/// one chaos run), and a total cap reports the first few of a boot and then goes silent for everything
+/// after, including the name that is actually broken.
+fn warn_once_for(name: &str) -> bool {
+    const MAX_NAMES: usize = 16;
+    const NAME_MAX: usize = 32;
+    static SEEN: crate::smp::SpinLock<([[u8; NAME_MAX]; MAX_NAMES], [u8; MAX_NAMES], usize)> =
+        crate::smp::SpinLock::new(([[0; NAME_MAX]; MAX_NAMES], [0; MAX_NAMES], 0));
+    let b = name.as_bytes();
+    if b.len() > NAME_MAX { return true; } // too long to remember; report it every time rather than never
+    let mut g = SEEN.lock();
+    let n = g.2;
+    for i in 0..n {
+        if g.1[i] as usize == b.len() && g.0[i][..b.len()] == *b { return false; }
+    }
+    if n == MAX_NAMES { return false; }
+    let len = b.len();
+    g.0[n][..len].copy_from_slice(b);
+    g.1[n] = len as u8;
+    g.2 = n + 1;
+    true
+}
+
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -983,7 +1478,28 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 
     let ep_id = match crate::ipc::names::lookup(name) {
         Some(id) => id,
-        None     => return -1, // service not registered
+        None     => {
+            // SAID, not swallowed - but ONCE PER NAME, because saying it every time was worse than
+            // not saying it.
+            //
+            // This and the cap-table refusal below both returned a bare -1, so a service that could
+            // not reacquire a peer had no way to learn WHY, and reported the peer as unresponsive. On
+            // hardware that sent the reader after a `block-driver` which was alive the whole time with
+            // an empty queue (invariant 12).
+            //
+            // Unconditional, it then produced 394 lines in one chaos run - 2.5% of the log, 293 of
+            // them for a single name - on a wire already carrying 73% of its capacity. This refusal is
+            // TRANSIENT and EXPECTED: peers are acquired before they are spawned at boot, and again
+            // while one is mid-restart. The caller retries and recovers. The FIRST occurrence of a
+            // name is the diagnostic; the next three hundred are the instrument competing with the
+            // thing it is measuring. The cap-table refusal below is NOT rate-limited: it is rare,
+            // permanent, and the one that actually strands a service.
+            if warn_once_for(name) {
+                crate::kprintln!(
+                    "acquire: '{}' is not in the name directory - nothing to acquire (further occurrences for this name are not logged)", name);
+            }
+            return ACQUIRE_NAME_NOT_REGISTERED;
+        }
     };
 
     let resource_id = crate::capability::cap::ResourceId::from(ep_id);
@@ -1002,7 +1518,15 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 
     match scheduler::current_task_insert_cap(cap) {
         Ok(slot) => slot as i64,
-        Err(_)   => -1, // cap table full
+        Err(_)   => {
+            // The caller's own table is full - the peer is fine. This is the failure that makes a
+            // transient outage PERMANENT: once a service cannot hold one more cap it can never
+            // reacquire anything again, so it stays broken until it is restarted. Naming it is the
+            // difference between diagnosing that in one boot and chasing the peer for several.
+            crate::kprintln!(
+                "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold                  the cap. This service will not recover until it is restarted.", name);
+            ACQUIRE_CAP_TABLE_FULL
+        }
     }
 }
 
@@ -1564,10 +2088,12 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         13 => crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32) as i64,
         // NIC vendor | device<<16 from the PCI scan (0 if no NIC). Task-neutral hardware info, ungated:
         // nic-driver reads it to know which chip it drives (e1000 vs RTL8168). Networking Phase 4.
-        14 => crate::arch::imp::pci::NIC_VENDOR_DEVICE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        14 => crate::arch::imp::pci::nic()
+            .map_or(0, |d| d.vendor as u32 | ((d.device as u32) << 16)) as i64,
         // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
         // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
-        15 => crate::arch::imp::pci::NIC_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        15 => crate::arch::imp::pci::nic()
+            .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)) as i64,
         // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
         // task-neutral timing (like the raw TSC, query 3): userspace turns a TSC delta into milliseconds
         // as `delta * 10 / this`. `ping` uses it for round-trip time. 0 if the TSC was not calibrated.
@@ -1585,12 +2111,13 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         18 => {
             use core::sync::atomic::Ordering::Relaxed;
             use crate::arch::imp::pci;
-            let x = pci::XHCI_FOUND.load(Relaxed) as i64;
-            let e = pci::EHCI_FOUND.load(Relaxed) as i64;
-            // Only a NIC nic-driver can actually drive counts - an unsupported NIC leaves it idling
-            // exactly like an absent one (matches the MMIO-grant gate).
-            let nic = (pci::NIC_FOUND.load(Relaxed)
-                && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)) as i64;
+            let x = pci::xhci().is_some() as i64;
+            let e = pci::ehci().is_some() as i64;
+            // A NIC of the class counts, whatever chip it is. This used to require the vendor to be
+            // one of two the kernel had been taught, so a third card reported "no NIC" on a machine
+            // that plainly had one - the kernel answering a question about the BUS with an opinion
+            // about DRIVERS. Whether it can be driven is the driver's business.
+            let nic = (pci::nic().is_some() || crate::arch::imp::soc_nic_present()) as i64;
             x | (e << 1) | (nic << 2)
         }
         // A hardware-random u32 (the SoC RNG on ARM, RDRAND on x86), or -1 if this build has no hardware
@@ -1648,6 +2175,14 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // both disclose another task's state.
         24 => scheduler::task_stat(arg1 as usize).endpoint as i64,
         25 => crate::ipc::routing::call_await_endpoint(arg1 as usize) as i64,
+        // 26: fault diagnostics written WITHOUT the serial lock, and so possibly spliced into another
+        // line (audits/kernel-audit.md Audit 10). A residual, not a defect count: when a fault
+        // interrupts a `kprintln` on its own core the handler cannot wait for the lock it already
+        // holds, and writing unlocked is the only way to report the fault at all. This says how often
+        // that happened, so a corrupted line in the log is explainable rather than mysterious - the
+        // whole reason the splice cost two wrong diagnoses before it was understood. 0 means every
+        // diagnostic this boot was emitted cleanly.
+        26 => crate::arch::imp::serial_unlocked_emit_count() as i64,
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
@@ -2060,6 +2595,45 @@ fn handle_reboot() -> i64 {
 const NET_FRAME_MAX: usize = 1600;
 
 /// NetFrameTx (42): transmit a raw ethernet frame via the in-kernel USB-net device. `arg0` = frame ptr,
+// ---------------------------------------------------------------------------
+// PORT I/O (step D2) - the mechanism a userspace hardware enumerator needs.
+//
+// The kernel knows how to PERFORM an authorised port operation. It does not know what the operation
+// MEANS - that 0xCF8 selects a PCI configuration register, how to walk a bus, what a class code
+// identifies, or how to read a BAR. That knowledge is hardware semantics and lives in the service
+// (§26.10, docs/service-ownership.md D2). This is the whole of the kernel's involvement.
+// ---------------------------------------------------------------------------
+
+/// PciCfgRead (53): `arg0` = configuration selector, `arg1` = register offset. Gated by
+/// `PCI_CFG_RESOURCE` + READ.
+///
+/// Returns the 32-bit value read (as a positive i64 - a full u32 always widens non-negative, so
+/// 0xFFFFFFFF is data and not an error), `CapNotHeld` without the capability, or `-1` for an access
+/// the arch will not admit.
+///
+/// A REFUSAL IS LOUD (invariant 12) but not fatal to the caller: an enumerator walking a bus is
+/// told where its authority ends and stops there, rather than being handed a plausible zero it would
+/// report as an empty machine.
+fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
+        crate::kprintln!("pci-cfg: read sel {:#010x} refused - caller does not hold PCI_CFG",
+                         sel as u32);
+        return CapError::CapNotHeld as i64;
+    }
+    // The access, its lock and its admissibility check live in `arch` beside the registers they
+    // guard, so the check and the I/O cannot drift apart and this file needs no `unsafe`
+    // (§18.5 - its floor may only shrink).
+    match crate::arch::imp::pci_cfg_read32(sel as u32, offset as u16) {
+        Some(v) => v as i64,
+        None => {
+            crate::kprintln!(
+                "pci-cfg: read sel {:#010x} off {:#06x} refused - outside what this machine admits",
+                sel as u32, offset as u16);
+            -1
+        }
+    }
+}
+
 /// `arg1` = length. Gated by NET_DEVICE (validated by holdings - the args fill the ABI, no slot to pass).
 /// Returns 0 on success, -1 on error. On non-ARM arches `net_frame_tx` is a stub returning false.
 fn handle_net_frame_tx(ptr: u64, len: u64) -> i64 {

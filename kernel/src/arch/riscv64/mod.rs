@@ -101,6 +101,16 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
 
+/// Who made this CPU - see the x86 implementation for what this is for. RISC-V reports its vendor in
+/// `mvendorid`, which is an M-mode CSR: this port runs under OpenSBI in S-mode and cannot read it, so
+/// the ISA is all that can be said honestly here.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let name = b"RISC-V";
+    let n = name.len().min(buf.len());
+    buf[..n].copy_from_slice(&name[..n]);
+    n
+}
+
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.
@@ -288,6 +298,7 @@ pub mod syscall_entry {
     pub fn init_percore_arenas(n: usize) {}
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
+    pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
     pub fn read_cycle_counter() -> u64 { 0 }                 // CNTPCT_EL0
 }
@@ -362,22 +373,20 @@ pub mod rtc {
 }
 
 // ---------------------------------------------------------------------------
+/// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
+/// See the x86 original for why this is not a second source for `pci::nic()`.
+pub fn soc_nic_present() -> bool { false }
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
-    pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
-    pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
+    /// treat it as "this machine has no PCI ethernet controller", which is true.
+    pub fn ehci() -> Option<PciDevice> { None }
+    pub fn xhci() -> Option<PciDevice> { None }
+    pub fn nic() -> Option<PciDevice> { None }
+    pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}

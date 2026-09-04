@@ -9,8 +9,77 @@ use crate::capability::{CapError, CapHandle};
 use crate::ipc::{IpcError, Message};
 use crate::syscall::raw_syscall;
 
+/// Why a `reacquire_cap_detail` failed. The two real cases want OPPOSITE responses, which is the
+/// entire reason this type exists rather than a `bool`.
+///
+/// `NameNotRegistered` is **transient and expected**: peers are acquired before they are spawned at
+/// boot, and again while one is mid-restart. Retry; it heals. `CapTableFull` is **permanent**: this
+/// service cannot hold another capability, so it can never reacquire anything again and will not
+/// recover until it is restarted - a failed recovery, which §26.7 says must stay exactly as visible as
+/// the original failure.
+///
+/// Collapsed into one value (as `reacquire_cap` still does, for callers that only retry) a service can
+/// only print both and commit to neither. That ambiguity cost a full debugging pass on the Pi 2: a
+/// `block-driver` that was alive the whole time produced the same line as a reader out of cap slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireFailure {
+    /// The name does not resolve right now - no live instance is registered under it. Transient.
+    NameNotRegistered,
+    /// The name resolved, but this service's own capability table is full. Terminal until restart.
+    CapTableFull,
+    /// The request itself was refused (name empty, too long, or not a declared peer).
+    Refused,
+}
+
+impl AcquireFailure {
+    /// Decode the kernel's negative return. Codes are fixed at the syscall boundary
+    /// (`kernel/src/syscall/dispatch.rs`); an UNRECOGNISED negative maps to `Refused` rather than
+    /// being guessed at, so a future code cannot silently masquerade as one of the two named cases.
+    fn from_code(ret: i64) -> Self {
+        match ret {
+            -20 => AcquireFailure::NameNotRegistered,
+            -21 => AcquireFailure::CapTableFull,
+            _   => AcquireFailure::Refused,
+        }
+    }
+
+    /// One clause naming the cause, for a caller assembling a log line.
+    pub fn reason(self) -> &'static str {
+        match self {
+            AcquireFailure::NameNotRegistered =>
+                "the name does not resolve - no live instance is registered under it",
+            AcquireFailure::CapTableFull =>
+                "this service's capability table is FULL - it cannot hold another cap and will not recover until restarted",
+            AcquireFailure::Refused =>
+                "the kernel refused the request (name empty, too long, or not a declared peer)",
+        }
+    }
+}
+
 /// Outcome of an abortable request/reply ([`ServiceContext::request_with_reply_abortable`]): the reply
 /// arrived, the user pressed `q`/`Q`/ESC to abort the wait, or the deadline expired with no reply.
+/// Outcome of [`ServiceContext::request_with_reply_deadline_outcome_into`] - the buffer-writing twin
+/// of [`DeadlineOutcome`].
+///
+/// It exists because the `_into` form collapsed all four outcomes into `Option<usize>`, and the two
+/// that matter are OPPOSITES. `SendFailed` means the request never left, so nothing can arrive late
+/// and retrying after a reacquire is safe. `Timeout` means it DID leave, so a late reply is still
+/// coming and re-sending desyncs the protocol - every later reply is matched to the wrong request.
+/// A caller handed `None` cannot tell those apart, so it must either never retry (and stay broken
+/// after a peer restarts) or always retry (and desync). `fs` had the first of those.
+#[derive(Debug)]
+pub enum DeadlineOutcomeInto {
+    /// A reply arrived; the payload is in the caller's buffer, this many bytes of it.
+    Reply(usize),
+    /// The send never left: the peer's cap is stale or its name does not currently resolve. Nothing
+    /// is in flight. Reacquire by name and retry ONCE - this is the only safe retry.
+    SendFailed,
+    /// The peer's queue was full. The request did not leave either, but the peer is alive and busy.
+    QueueFull,
+    /// The request was delivered and no reply came in time. Do NOT re-send.
+    Timeout,
+}
+
 pub enum ReqOutcome {
     Reply(Message),
     Aborted,
@@ -226,6 +295,239 @@ mod datetime_tests {
 // ---------------------------------------------------------------------------
 
 const SERVICE_CTX_ADDR:    u64   = 0x3ff000;
+/// What a spawner tells the kernel about a task it wants started from an image IT supplies
+/// (`SpawnImage`, syscall 52). Layout must match the kernel's `SpawnRequest` exactly.
+///
+/// Shaped for the end state, not for what the kernel honours today: the hardware and privilege
+/// fields are here because step D needs them, and a request that sets one is REFUSED loudly rather
+/// than silently ignored (`docs/service-ownership.md`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpawnRequest {
+    pub version:      u32,
+    pub flags:        u32,
+    pub image_ptr:    u64,
+    pub image_len:    u64,
+    pub name_ptr:     u64,
+    pub name_len:     u32,
+    pub core:         u32,
+    pub memory_limit: u64,
+    pub privileges:   u32,
+    pub hw_flags:     u32,
+    pub mmio_base:    u64,
+    pub mmio_len:     u64,
+    pub dma_pages:    u32,
+    pub bdf:          u32,
+    pub irq_count:    u32,
+    pub irqs:         [u8; 4],
+    pub peers_ptr:      u64,
+    pub peers_len:      u32,
+    pub _pad:           u32,
+    /// Caller-provided caps to install into the child: `[label_len][label][slot_lo][slot_hi]`
+    /// repeated. The same encoding `SpawnWithCaps` uses - one wire format, not two.
+    pub installs_ptr:   u64,
+    pub installs_count: u32,
+    pub _pad2:          u32,
+    /// Mode selector. Named for probes, its first user, but general: `observe` reads it to choose
+    /// one-shot / live / foreground, and takes the LIVE LOOP at 0.
+    pub probe_mode:     u32,
+    pub _pad3:          u32,
+}
+
+/// 2 since `installs` was added. A spawner built against a different kernel is refused loudly.
+pub const SPAWN_REQUEST_VERSION:  u32 = 3;
+pub const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
+pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
+/// `core` is a STRICT placement, not a preference.
+///
+/// The two are different rules (9.2) and the kernel has always had both: an explicitly-requested core
+/// (a restart's `--core N`) is REJECTED with `PlacementInvalid` when that core is not ready, because
+/// silently placing the service elsewhere would defeat the point of asking. A catalogue row's
+/// PREFERRED core falls back to round-robin instead, so a machine with fewer cores still boots.
+///
+/// Without this bit a moved service's table preference read as an override, and every service naming
+/// a core the machine does not have failed to spawn rather than degrading - `logger` and `xhci` (both
+/// core 2) simply vanished under `-smp 2`, which 11.3 requires to keep working.
+pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
+/// Mint the child's name-wired peer caps WITH `GRANT`, so it can re-delegate them.
+///
+/// AUTHORITY, not a setting: handing out a re-delegatable capability is itself a grant (§7.4), which
+/// is why the kernel used to keep this keyed by name for the one probe that needs it (§22 Test 5A).
+/// As a request bit it is checked the same way every privilege is - the spawner may ask for it only
+/// because it could transfer such a cap itself.
+pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+
+/// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
+/// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
+pub mod privbits {
+    pub const SPAWN:           u32 = 1 << 0;
+    pub const CONSOLE_PUSH:    u32 = 1 << 1;
+    pub const INTROSPECT:      u32 = 1 << 2;
+    pub const SERVICE_CONTROL: u32 = 1 << 3;
+    pub const FIRE_IRQ:        u32 = 1 << 4;
+    pub const REBOOT:          u32 = 1 << 5;
+    pub const ACQUIRE_ANY:     u32 = 1 << 6;
+    pub const RESOURCE_MINT:   u32 = 1 << 7;
+    /// ARM-only in practice; the bit is arch-neutral.
+    pub const GPIO:            u32 = 1 << 8;
+    /// SET_CLOCK with READ (raise the clock FLOOR), not WRITE (step the clock).
+    pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
+    /// SET_CLOCK with WRITE (set the wall clock). Distinct from SET_CLOCK_FLOOR, the READ right.
+    pub const SET_CLOCK:       u32 = 1 << 10;
+    /// NET_DEVICE: move ethernet frames through the in-kernel network device (aarch64's GENET).
+    pub const NET_DEVICE:      u32 = 1 << 11;
+    /// Read PCI configuration space through the legacy CF8/CFC ports (step D2). READ-ONLY and held
+    /// by ONE service - see `docs/service-ownership.md` D2 for why the write side is not on offer.
+    pub const PCI_CFG:         u32 = 1 << 12;
+}
+
+/// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
+/// what its own bus scan found - a CLASS rather than an address, because the kernel keeps a permanent
+/// physical DMA reservation per device that a respawned driver must get back.
+pub mod hwclass {
+    pub const NONE:        u32 = 0;
+    pub const NIC:         u32 = 2;
+    pub const XHCI:        u32 = 3;
+    pub const EHCI:        u32 = 4;
+    pub const DWC2:        u32 = 5;
+    pub const FRAMEBUFFER: u32 = 6;
+    /// Not a device: the software-raised test interrupt (§22 IR1). A class, so that the probe which
+    /// receives it names a CLASS like any driver and the kernel states the vector.
+    pub const TEST_IRQ:    u32 = 7;
+
+    /// Bit 31: the value is a PCI CLASS CODE, not one of the named kinds above.
+    pub const PCI:         u32 = 1 << 31;
+    /// Bit 28: place this device behind the IOMMU (§6.4).
+    pub const PCI_CONFINE: u32 = 1 << 28;
+    /// Bit 29: this driver wants an INTERRUPT. The kernel allocates a vector from its MSI pool and
+    /// programs the device with it - the caller never names a vector, because routing one is
+    /// authority (`task::hw_irqs_for`).
+    pub const PCI_IRQ:     u32 = 1 << 29;
+
+    /// Describe a PCI device by what the BUS says it is: the industry-standard 24-bit
+    /// (class, subclass, prog-if) triple, plus which BAR holds its registers.
+    ///
+    /// This is what lets a driver be added with NO KERNEL CHANGE. `0x0C0330` is xHCI on every
+    /// machine ever built, so the kernel needs no name for it - it looks the code up in the table
+    /// its boot scan already filled. The BAR index is the one extra fact, because devices differ
+    /// (xHCI 0, AHCI 5), and an INDEX is not an address, so it is safe to accept from a caller.
+    pub const fn pci(class_code: u32, bar_ix: u32, confine: bool) -> u32 {
+        PCI | (if confine { PCI_CONFINE } else { 0 }) | ((bar_ix & 0x7) << 24) | (class_code & 0x00FF_FFFF)
+    }
+
+    /// BAR index meaning "the first mapped MEMORY BAR" rather than a numbered one.
+    ///
+    /// Use this when one driver covers devices that put their registers in different BARs - the
+    /// e1000 uses BAR0 where the RTL8168 puts I/O ports there and its registers in BAR2. Both are
+    /// "the first memory BAR", and neither driver should have to know which it got.
+    pub const BAR_AUTO: u32 = 7;
+
+    /// `pci`, for a driver that needs an INTERRUPT as well.
+    pub const fn pci_irq(class_code: u32, bar_ix: u32, confine: bool) -> u32 {
+        pci(class_code, bar_ix, confine) | PCI_IRQ
+    }
+}
+
+impl SpawnRequest {
+    /// A request with everything the kernel does not yet honour left at zero.
+    pub fn new(image: &[u8], name: &str) -> Self {
+        Self {
+            version: SPAWN_REQUEST_VERSION, flags: 0,
+            image_ptr: image.as_ptr() as u64, image_len: image.len() as u64,
+            name_ptr: name.as_ptr() as u64, name_len: name.len() as u32,
+            core: u32::MAX, memory_limit: 0,
+            privileges: 0, hw_flags: 0, mmio_base: 0, mmio_len: 0,
+            dma_pages: 0, bdf: 0, irq_count: 0, irqs: [0; 4],
+            peers_ptr: 0, peers_len: 0, _pad: 0,
+            installs_ptr: 0, installs_count: 0, _pad2: 0,
+            probe_mode: 0, _pad3: 0,
+        }
+    }
+
+    /// Encode `(label, cap)` pairs into `buf` and point this request at them.
+    ///
+    /// The caller must hold each cap WITH GRANT: the kernel checks it, and that check is what makes
+    /// installing them non-escalating (7.3) - a caller that can GRANT a cap could transfer it anyway.
+    pub fn set_installs(&mut self, buf: &mut [u8], pairs: &[(&str, CapHandle)]) -> bool {
+        let mut n = 0usize;
+        for (label, cap) in pairs {
+            let lb = label.as_bytes();
+            if lb.is_empty() || lb.len() > 32 { return false; }
+            if n + 1 + lb.len() + 2 > buf.len() { return false; }
+            buf[n] = lb.len() as u8; n += 1;
+            buf[n..n + lb.len()].copy_from_slice(lb); n += lb.len();
+            buf[n] = (cap.0 & 0xFF) as u8; buf[n + 1] = ((cap.0 >> 8) & 0xFF) as u8; n += 2;
+        }
+        self.installs_ptr   = if n > 0 { buf.as_ptr() as u64 } else { 0 };
+        self.installs_count = pairs.len() as u32;
+        true
+    }
+}
+
+/// The supervisor's command channel wire format.
+///
+/// ONE definition. This lived in three services at once (`supervisor`, `control`, `shell`) - three
+/// copies of a protocol, which is the second-truth problem this project rejects everywhere else
+/// (26.4, Commandment III). A drifted copy would not fail loudly; it would send a byte the supervisor
+/// reads as a different opcode.
+///
+/// The supervisor's endpoint receives two kinds of message, told apart by the first byte:
+///
+/// ```text
+///   death notice   "pong"                        <- kernel-generated; a name, [a-z0-9-]
+///   command        0x01 op <core u32 LE> name    <- 0x01 cannot begin a name
+///                                    name may be followed by NUL-separated PEER names
+/// ```
+///
+/// Choosing an impossible first byte means the kernel's death-notification format does not change at
+/// all: the two are unambiguous without the kernel learning anything about commands.
+pub mod supcmd {
+    /// First byte of a command. Not a legal first byte of a service name.
+    pub const MARKER:  u8 = 0x01;
+    /// Kill if alive, then spawn.
+    pub const RESTART: u8 = b'R';
+    /// Spawn a service that is not running.
+    pub const SPAWN:   u8 = b'S';
+
+    /// Reply status, one byte, so a caller can log the truth rather than assume success.
+    pub const OK:      u8 = 0;
+    pub const FAILED:  u8 = 1;
+    pub const UNKNOWN: u8 = 2;
+
+    /// Longest command payload: opcode + core + a name and its peers.
+    pub const MAX: usize = 128;
+
+    /// Build `MARKER op <core> name[\0peer]*` into `buf`, returning its length.
+    pub fn encode(buf: &mut [u8; MAX], op: u8, core: u32, name: &str, peers: &[&str]) -> Option<usize> {
+        if name.is_empty() { return None; }
+        buf[0] = MARKER;
+        buf[1] = op;
+        buf[2..6].copy_from_slice(&core.to_le_bytes());
+        let mut n = 6usize;
+        let mut put = |b: &[u8], buf: &mut [u8; MAX], n: &mut usize| -> bool {
+            if *n + b.len() > MAX { return false; }
+            buf[*n..*n + b.len()].copy_from_slice(b);
+            *n += b.len();
+            true
+        };
+        if !put(name.as_bytes(), buf, &mut n) { return None; }
+        for p in peers {
+            if !put(&[0u8], buf, &mut n) || !put(p.as_bytes(), buf, &mut n) { return None; }
+        }
+        Some(n)
+    }
+}
+
+
+/// Probe parameters ride in the upper 32 bits of `Spawn`'s `arg0`, which were unused:
+/// `[55..48] flags  [47..32] mode  [31..16] core  [15..0] spawn cap slot`.
+pub const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
+pub const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
+pub const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
+
+/// Upper bound on a spawn name payload (`name` + NUL-separated peers). Matches the kernel's limit.
+pub const SPAWN_PAYLOAD_MAX: usize = 128;
+
 const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
 /// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
 const MAX_SEND_PEERS:      usize = 6;
@@ -283,6 +585,23 @@ struct ServiceContextData {
     reply_recv_slot:    u32,
     /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
     reply_grant_slot:   u32,
+    /// The interrupt VECTOR(s) this service was granted, so a driver can learn which one it got.
+    ///
+    /// The kernel used to hand every driver a vector it could also hardcode: `XHCI_MSI_VECTOR` was a
+    /// kernel constant, so both sides knew 0x28 statically and a driver comparing against its own copy
+    /// was correct. The MSI pool (step D1b) makes the vector ALLOCATED AT SPAWN, and that quietly
+    /// invalidated the hardcoded copy: the kernel began routing 0x30 while `services/xhci` still tested
+    /// for 0x28, so it classified every real interrupt as an unknown message and reported `0 MSI, 7799
+    /// msg` on hardware. Nothing broke - the interrupt still WOKE the driver - but the one instrument
+    /// that says whether interrupts work had started reporting the opposite.
+    ///
+    /// The design gap was this field's absence, not the stale constant. A driver already learns its
+    /// MMIO window and DMA arena from the kernel (`ctx.mmio()`, `ctx.dma_region()`) precisely because
+    /// it may not name them; its vector is the same kind of fact and now travels the same way. A
+    /// caller still cannot ASK for a particular vector - that is authority (§12.3) - it can only be
+    /// told which one it was given.
+    irq_count:          u32,      // 0 = no interrupt granted
+    irqs:               [u8; 4],  // the granted vectors; only the first `irq_count` are meaningful
 }
 
 // The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
@@ -292,7 +611,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 320;   // 256 + 2 x SendPeerEntry(32) after MAX_SEND_PEERS 4 -> 6
+const SERVICE_CONTEXT_DATA_SIZE: usize = 328;   // 320 + irq_count(4) + irqs[4] - the granted vector (D1b)
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -645,15 +964,25 @@ impl ServiceContext {
     /// per-service dynamic cap cache so subsequent `try_send` calls use the
     /// new slot without going to the kernel again.
     pub fn reacquire_cap(&self, peer: &str) -> Result<CapHandle, CapError> {
+        self.reacquire_cap_detail(peer).map_err(|_| CapError::CapNotHeld)
+    }
+
+    /// `reacquire_cap`, but saying WHICH failure - see [`AcquireFailure`].
+    ///
+    /// Use this wherever the answer changes what the caller does or prints. The plain
+    /// `reacquire_cap`/`reacquire_by_name` collapse every failure to one value, which is fine for a
+    /// caller that only retries, and wrong for one that reports: a message naming two possible causes
+    /// and committing to neither is a message that sends the reader to the wrong service (§26.7).
+    pub fn reacquire_cap_detail(&self, peer: &str) -> Result<CapHandle, AcquireFailure> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return Err(CapError::CapNotHeld); }
+        if len == 0 || len > PEER_NAME_BYTES { return Err(AcquireFailure::Refused); }
 
         // SAFETY: syscall(10) = AcquireSendCap; peer bytes are in user space.
         let ret = unsafe {
             raw_syscall(10, bytes.as_ptr() as u64, len as u64, 0)
         };
-        if ret < 0 { return Err(CapError::CapNotHeld); }
+        if ret < 0 { return Err(AcquireFailure::from_code(ret)); }
         let new_slot = ret as u32;
 
         // Update the dynamic cache. Reuse this peer's EXISTING entry if it has one (and reclaim its
@@ -723,6 +1052,56 @@ impl ServiceContext {
         if d.reply_recv_slot == u32::MAX || d.reply_grant_slot == u32::MAX { return None; }
         Some((crate::capability::CapHandle(d.reply_recv_slot),
               crate::capability::CapHandle(d.reply_grant_slot)))
+    }
+
+    /// Discard replies left over from requests this service already gave up on. Returns how many.
+    ///
+    /// **A DETECTED DESYNC HAS TO BE REPAIRABLE, and this is the repair.** `fs` tags every block
+    /// request and checks the tag on the reply, so a stale reply is always DETECTED - and detection
+    /// was all there was. The mismatched reply was discarded and the request failed, which leaves this
+    /// service's own reply still queued for the NEXT request to find. Every subsequent request then
+    /// receives its predecessor's reply, discards it, fails, and queues another: permanently one reply
+    /// out of phase, alternating forever, with the volume mounted and every operation failing.
+    ///
+    /// Observed 133 times in one `osdev test peer-storm` run, still alternating after the storm had
+    /// stopped. The code that discarded expected the queue to drain on its own - "the caller retries
+    /// at its own level, by which point the queue has drained" - and it never does, because each
+    /// retry consumes exactly one stale reply and contributes exactly one more.
+    ///
+    /// WHY DRAINING IS SAFE HERE, which is the whole reason this is in the SDK rather than hand-rolled
+    /// at a call site: it drains the dedicated REPLY MAILBOX, an endpoint that carries nothing but
+    /// replies to calls this service made. A caller that is synchronous - one outstanding request at a
+    /// time, which is what `request_with_reply*` enforces - can have nothing legitimate waiting there
+    /// at the moment it is about to issue a new request. Anything present is a reply it stopped
+    /// waiting for.
+    ///
+    /// **It refuses to drain the SHARED endpoint**, and that refusal is load-bearing. A service
+    /// without a reply mailbox awaits replies on the endpoint its CLIENTS send to, so draining there
+    /// would silently eat client requests - the precise hazard the `CallDeadline` amendment (§8.2)
+    /// exists to describe. No mailbox, no drain, and the caller keeps the behaviour it had.
+    ///
+    /// SO THIS REPAIR IS CONDITIONAL, and the condition is not theoretical. A reply mailbox is an
+    /// OPTIONAL endpoint (`routing::try_register_optional`): it is refused when the routing table is
+    /// near full, and a bare-metal T630 refuses three times during `selfcheck`. A service refused one
+    /// falls back to its shared endpoint and silently loses this repair - which is correct, because
+    /// the alternative is eating client traffic, but it means "the desync is fixed" holds only where
+    /// the mailbox was granted.
+    ///
+    /// Measured rather than assumed: an arm32 Pi 2 run logged ZERO refusals, so `fs` had its mailbox
+    /// and the repair was live on that port. `routing: reply endpoint refused` in a log is how you
+    /// know a machine is in the other case.
+    pub fn drain_stale_replies(&self) -> usize {
+        let Some((recv, _)) = self.reply_mailbox() else { return 0 };
+        let mut n = 0usize;
+        // Bounded by the endpoint's own depth (§8.5): a queue that cannot hold more than 16 cannot
+        // yield more than 16, so this terminates without needing to trust the peer.
+        for _ in 0..16 {
+            match crate::ipc::try_recv(recv) {
+                Ok(Some(_)) => n += 1,
+                _ => break,
+            }
+        }
+        n
     }
 
     pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
@@ -1140,6 +1519,64 @@ impl ServiceContext {
             Ok(Some(len)) => Ok(Some(crate::ipc::Message::from_bytes(&buf[..len]))),
             Ok(None)      => { self.remove_cap(reply_cap); Ok(None) }
             Err(e)        => { self.remove_cap(reply_cap); Err(e) }
+        }
+    }
+
+    /// Bounded request/reply into a caller buffer, reporting WHICH failure happened.
+    ///
+    /// Same work as [`Self::request_with_reply_deadline_into`], same stack shape - the caller supplies
+    /// the buffer so no reply-sized frame appears here - but it does not throw the reason away. See
+    /// [`DeadlineOutcomeInto`] for why the distinction is not a nicety: the two common failures want
+    /// opposite responses, and a caller given `None` has to guess wrong in one direction or the other.
+    pub fn request_with_reply_deadline_outcome_into(
+        &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
+    ) -> DeadlineOutcomeInto {
+        let op = req.get(crate::trace::op_offset(peer)).copied().unwrap_or(0);
+        let out = self.request_with_reply_deadline_outcome_into_inner(peer, req, buf, max_secs);
+        self.trace_out(peer, op, match &out {
+            DeadlineOutcomeInto::Reply(_)   => crate::trace::KIND_REPLY,
+            DeadlineOutcomeInto::SendFailed => crate::trace::KIND_PEER_LOST,
+            DeadlineOutcomeInto::QueueFull  => crate::trace::KIND_QUEUE_FULL,
+            DeadlineOutcomeInto::Timeout    => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    fn request_with_reply_deadline_outcome_into_inner(
+        &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
+    ) -> DeadlineOutcomeInto {
+        // Each of these is a DISTINCT reason the request never left, and every one of them used to be
+        // an anonymous `None`: no such peer wired or resolvable, no endpoint of our own to be replied
+        // to, and - the one that made this permanent rather than transient - NO FREE CAP SLOT to derive
+        // a reply cap into. A service whose table has filled reports "peer did not answer", which sends
+        // the reader looking at the peer.
+        let target = match self.find_send_slot(peer) {
+            Some(s) => CapHandle(s),
+            None => return DeadlineOutcomeInto::SendFailed,
+        };
+        let (recv, grant) = match self.reply_mailbox() {
+            Some((r, g)) => (r, g),
+            None => match (self.recv_handle(), self.self_grant_handle()) {
+                (Some(r), Some(g)) => (r, g),
+                _ => return DeadlineOutcomeInto::SendFailed,
+            },
+        };
+        let reply_cap = match self.derive_cap(grant) {
+            Some(c) => c,
+            None => return DeadlineOutcomeInto::SendFailed,
+        };
+        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
+        // The kernel consumes the reply cap on a delivered call; on any other outcome it is ours to
+        // reclaim, or the slot leaks one per failed request (§8.5, the three checks).
+        match out {
+            Ok(Some(n)) => DeadlineOutcomeInto::Reply(n),
+            Ok(None) => { self.remove_cap(reply_cap); DeadlineOutcomeInto::Timeout }
+            Err(crate::ipc::IpcError::QueueFull) => {
+                self.remove_cap(reply_cap);
+                DeadlineOutcomeInto::QueueFull
+            }
+            Err(_) => { self.remove_cap(reply_cap); DeadlineOutcomeInto::SendFailed }
         }
     }
 
@@ -2487,6 +2924,59 @@ impl ServiceContext {
     }
 
 
+    /// The interrupt vector the kernel granted this service, if any.
+    ///
+    /// A driver must NOT hardcode this. It used to be safe to: every vector was a kernel constant, so
+    /// both sides knew the number statically. The MSI pool allocates one at spawn instead, and a
+    /// driver holding a stale copy does not fail loudly - it keeps working (the interrupt still wakes
+    /// it) while reporting every interrupt as an unknown message. That is exactly what `services/xhci`
+    /// did on the T630: `0 MSI, 7799 msg`.
+    ///
+    /// Use it to recognise an interrupt notification: the kernel's wake payload is the vector number.
+    ///
+    /// ```ignore
+    /// let irq = ctx.irq_vector();
+    /// let is_irq = irq.is_some_and(|v| msg.payload_bytes() == [v]);
+    /// ```
+    ///
+    /// `None` means no interrupt was granted - a non-driver service, or a driver whose device offered
+    /// neither MSI nor MSI-X. A driver that needs interrupts should say so rather than poll silently.
+    pub fn irq_vector(&self) -> Option<u8> {
+        let d = Self::ctx();
+        if d.irq_count == 0 { None } else { Some(d.irqs[0]) }
+    }
+
+    /// Every interrupt vector granted to this service (at most four).
+    ///
+    /// [`Self::irq_vector`] is the common case; this is for a driver routed more than one line.
+    pub fn irq_vectors(&self) -> &'static [u8] {
+        let d = Self::ctx();
+        let n = core::cmp::min(d.irq_count as usize, d.irqs.len());
+        &d.irqs[..n]
+    }
+
+    /// Read one 32-bit PCI configuration register. Requires the `PCI_CFG` privilege.
+    ///
+    /// `sel` is a bus/device/function selector in the platform's own encoding, which is the CALLER'S
+    /// knowledge - the kernel performs the access and enforces which registers may be reached, but
+    /// never interprets what the selector names. `offset` is the register within that function.
+    ///
+    /// ONE call, not a select-then-read pair, because the underlying hardware register pair is
+    /// stateful: split across two calls, two callers would each read whichever register the other
+    /// selected, and the KERNEL uses the same pair on its spawn and kill paths. Atomic here, that
+    /// window does not exist - and this interface cannot write anything at all.
+    ///
+    /// `None` if the capability is missing, or the access is one this machine will not admit (a bus
+    /// its bridge does not forward, say - reading past it is an abort on some hardware rather than a
+    /// harmless all-ones). Both are reported by the kernel too (invariant 12), so a caller need not
+    /// guess which it was. Note the distinction from `Some(0xFFFF_FFFF)`, which is a SUCCESSFUL read
+    /// of an absent device - the bus floats high, and that is data, not an error.
+    pub fn pci_cfg_read(&self, sel: u32, offset: u16) -> Option<u32> {
+        // SAFETY: a plain syscall; the kernel validates the capability and the access before any I/O.
+        let r = unsafe { crate::syscall::raw_syscall(53, sel as u64, offset as u64, 0) };
+        if r < 0 { None } else { Some(r as u32) }
+    }
+
     /// Allocate `size` bytes of read/write memory within this task's budget.
     ///
     /// Returns the virtual address of the mapping on success, or `AllocError`
@@ -2730,7 +3220,60 @@ impl ServiceContext {
     }
 
     /// Spawn a service by name on `core` (0xFFFF = kernel round-robin).
+    ///
+    /// **Asks the SUPERVISOR when this service can reach it**, and the kernel otherwise.
+    ///
+    /// Step C moves service images out of the kernel (`docs/service-ownership.md`), and a service the
+    /// kernel does not hold cannot be spawned by name through the kernel. Seven separate callers did
+    /// exactly that - control's RESTART, the supervisor's own respawn, the shell's `spawn`, the
+    /// shell's PIPES, `spawncap`, `spawnwired`, and `chaos` - and each was found by a regression
+    /// rather than by reading. Routing HERE fixes all of them at once, including the ones not yet
+    /// found.
+    ///
+    /// The condition is exactly right by construction: the SUPERVISOR has no supervisor-peer, so it
+    /// keeps the kernel path it must have; a service with no such peer keeps the old behaviour and
+    /// can still spawn anything the kernel still owns.
     pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
+        if self.find_send_slot("supervisor").is_some() {
+            return self.spawn_via_supervisor(name, core, &[]).map(|_| ());
+        }
+        self.spawn_on_kernel(name, core)
+    }
+
+    /// Ask the supervisor to spawn `name`, returning the `SEND|GRANT` cap it hands back (`None` if
+    /// the service has no recv endpoint, or the cap could not be taken).
+    ///
+    /// The supervisor is RESTARTABLE (6.2), so a cached cap to it goes stale on every respawn. This
+    /// reacquires by name and retries ONCE on `Err` - the send itself failed, so the peer is gone -
+    /// and never on `Ok(None)`, where the deadline passed and the request may well have landed
+    /// (retrying a possibly-delivered spawn would start the service twice).
+    pub fn spawn_via_supervisor(&self, name: &str, core: u32, peers: &[&str])
+        -> Result<Option<CapHandle>, crate::Error>
+    {
+        let mut buf = [0u8; supcmd::MAX];
+        let n = supcmd::encode(&mut buf, supcmd::SPAWN, core, name, peers)
+            .ok_or(crate::Error::InvalidArgument)?;
+        let msg = crate::ipc::Message::from_bytes(&buf[..n]);
+        for attempt in 0..2 {
+            match self.request_with_reply_call_err("supervisor", &msg, 2) {
+                Ok(Some(reply)) => {
+                    let ok = reply.payload_bytes().first() == Some(&supcmd::OK);
+                    let cap = self.take_pending_cap();
+                    if ok { return Ok(cap); }
+                    // Answered "no". Reclaim any cap that rode along, or it leaks a table slot.
+                    if let Some(c) = cap { self.remove_cap(c); }
+                    return Err(crate::Error::InvalidArgument);
+                }
+                Ok(None) => return Err(crate::Error::InvalidArgument),
+                Err(_) if attempt == 0 => { let _ = self.reacquire_by_name("supervisor"); }
+                Err(_) => return Err(crate::Error::InvalidArgument),
+            }
+        }
+        Err(crate::Error::InvalidArgument)
+    }
+
+    /// The kernel spawn-by-name path, unrouted. What `spawn_on` used to be.
+    pub fn spawn_on_kernel(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC {
             return Err(crate::Error::InvalidArgument);
@@ -2748,22 +3291,74 @@ impl ServiceContext {
         if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }
 
+    /// Spawn a task from an image THIS service supplies (`SpawnImage`, syscall 52).
+    ///
+    /// The kernel loads what it is handed instead of looking a name up in its own catalogue - the
+    /// step that ends that catalogue (`docs/service-ownership.md`). Requires the SPAWN capability,
+    /// exactly as `spawn` does: supplying the image is not authority to start it.
+    ///
+    /// `peers` are NUL-joined into a caller-owned buffer; each name still resolves through the
+    /// kernel name directory, so this grants nothing a contract's `send_peers` would not.
+    /// Returns a `SEND|GRANT` cap to the new service's recv endpoint, or `None` if it has none -
+    /// the spawner needs it to record `name -> cap` and re-wire dependents after a restart.
+    pub fn spawn_image(&self, req: &mut SpawnRequest, peers_buf: &mut [u8], peers: &[&str])
+        -> Result<Option<CapHandle>, crate::Error>
+    {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return Err(crate::Error::InvalidArgument); }
+        let slot = data.spawn_slot;
+        if slot == u32::MAX { return Err(crate::Error::Cap(CapError::CapNotHeld)); }
+
+        let mut n = 0usize;
+        for (i, p) in peers.iter().enumerate() {
+            if i > 0 {
+                if n >= peers_buf.len() { return Err(crate::Error::InvalidArgument); }
+                peers_buf[n] = 0; n += 1;
+            }
+            let b = p.as_bytes();
+            if n + b.len() > peers_buf.len() { return Err(crate::Error::InvalidArgument); }
+            peers_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        req.peers_ptr = if n > 0 { peers_buf.as_ptr() as u64 } else { 0 };
+        req.peers_len = n as u32;
+
+        // SAFETY: syscall(52) = SpawnImage; `req` is a live, fully initialised SpawnRequest whose
+        // layout matches the kernel's, and the kernel copies it once before reading any field.
+        let ret = unsafe {
+            raw_syscall(52, req as *const SpawnRequest as u64,
+                        core::mem::size_of::<SpawnRequest>() as u64, slot as u64)
+        };
+        // slot + 1, so 0 means "spawned, no recv endpoint" without colliding with slot 0.
+        if ret < 0 { Err(crate::Error::InvalidArgument) }
+        else if ret == 0 { Ok(None) }
+        else { Ok(Some(CapHandle(ret as u32 - 1))) }
+    }
+
+
     /// Spawn `name` on `core` (0xFFFF = round-robin) and receive a `SEND|GRANT` cap to its recv
     /// endpoint. This is the Phase-0 seam for moving naming out of the kernel
     /// (`docs/naming-design.md`): a spawner (the supervisor) collects a cap to every service it
     /// starts - a userspace `name → cap` map - instead of the kernel resolving names. Requires the
     /// SPAWN cap. `None` if the cap is not held, the spawn failed, or the service has no recv
     /// endpoint to hand back. The old name-wiring path is unchanged; this is purely additive.
-    pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Option<CapHandle> {
+    /// `Err(())` the spawn failed. `Ok(None)` it spawned but has no recv endpoint. `Ok(Some(cap))`
+    /// it spawned and here is a `SEND|GRANT` cap to its endpoint.
+    ///
+    /// The three-way answer is the point. This returned a bare `Option` and the kernel a bare slot,
+    /// so "no endpoint" and "failed" were the same value - and a caller that spawns a service without
+    /// an endpoint (`mem-pressure`, `greet`, `roster`) read success as failure.
+    pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Result<Option<CapHandle>, ()> {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        if data.magic != SERVICE_CTX_MAGIC { return Err(()); }
         let slot = data.spawn_slot;
-        if slot == u32::MAX { return None; }
+        if slot == u32::MAX { return Err(()); }
         let bytes  = name.as_bytes();
         let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
         // SAFETY: syscall(38) = SpawnReturningEndpoint; slot from the kernel-written page; bytes valid.
         let ret = unsafe { raw_syscall(38, packed, bytes.as_ptr() as u64, bytes.len() as u64) };
-        if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
+        // slot + 1, so 0 is "spawned, no recv endpoint" and never a real slot.
+        if ret < 0 { Err(()) } else if ret == 0 { Ok(None) } else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }
 
     /// Spawn `name` on `core` (0xFFFF = round-robin), wiring its send-peers from caller-supplied

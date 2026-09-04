@@ -7,10 +7,23 @@ limit   = "16MiB"
 
 [capabilities]
 # nic-driver declares its device CLASS (a NIC); the kernel resolves the runtime-discovered BAR by the
-# PCI scan and grants MMIO/DMA/bus-master ONLY for a NIC it can drive - an Intel e1000 or a Realtek
-# RTL8168 (kernel `service_hw` / `HwClass::Nic`, audit T1 Phase B; reconciled by contract_check.py).
-# Reach the BAR via ctx.mmio().
-hw_device = "nic"
+# PCI scan and grants MMIO/DMA/bus-master. Reach the BAR via ctx.mmio().
+#
+# On x86 the device is named by its PCI CLASS CODE. 0x020000 is class 0x02 network, subclass 0x00
+# ethernet - the class EVERY PCI ethernet controller reports, whoever made it. This USED to read
+# `hw_device = "nic"`, and the kernel granted MMIO only to two hard-coded vendor/device IDs (Intel
+# 8086:100E and Realtek 10EC:8168), so driving a third NIC needed a KERNEL REBUILD. By the class it
+# needs none, which is the whole point of step D (docs/service-ownership.md §5).
+#
+# `hw_pci_bar = "auto"` means THE FIRST MAPPED MEMORY BAR rather than a number, because the two NICs
+# already disagree: the e1000 puts its registers in BAR0 while the RTL8168 puts I/O ports there and
+# its registers in BAR2. That is what the old scan did, and neither driver should have to know which
+# it got. Still not an address - a rule the kernel evaluates over its own scan.
+#
+# ARM ignores all of this: there is no PCI bus on either Pi, so there is no class code to name and
+# nothing to find it in. See the ARM NOTE below.
+hw_pci_class = "020000"
+hw_pci_bar = "auto"
 log_write = true
 # ARM32 (Pi 2) ONLY, and declared here because a communication path that exists in the kernel but not
 # in the contract is exactly what Commandment IV forbids. The USB stack moved out of the kernel into the

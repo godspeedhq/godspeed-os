@@ -204,6 +204,7 @@ fn cfg_read(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
         return rd(off as u64 & 0xFFF);
     }
     let idx = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
+    let _g = CFG_LOCK.lock();
     wr(EXT_CFG_INDEX, idx);
     rd(EXT_CFG_DATA + (off as u64 & 0xFFF))
 }
@@ -216,6 +217,7 @@ fn cfg_write(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
         return;
     }
     let idx = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
+    let _g = CFG_LOCK.lock();
     wr(EXT_CFG_INDEX, idx);
     wr(EXT_CFG_DATA + (off as u64 & 0xFFF), val);
 }
@@ -242,6 +244,10 @@ pub fn init(ram_bytes: u64) -> Option<Device> {
         put_str(b"pcie: no root complex at 0xFD500000 (this machine has none) - no USB this boot\r\n");
         return None;
     }
+
+    // The probe answered, so the registers are safe to touch - including for a capability holder
+    // going through `cfg_read_gated`.
+    RC_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 
     put_str(b"pcie: bringing up the BCM2711 root complex\r\n");
 
@@ -393,6 +399,75 @@ fn report_routing() {
     put_str(b"\r\n");
 }
 
+/// Serializes config access. INDEX/DATA is ONE global register pair - an access is "latch the
+/// selector, then read the data" - so two of them interleaved read each other's device. The kernel's
+/// own walk is single-threaded at boot, but `cfg_read_gated` below lets a SERVICE issue config reads
+/// on another core at any time, so the pair is now genuinely shared and must be serialized. This is
+/// the aarch64 twin of x86's `PCI_CONFIG_LOCK`, which carries the same reasoning.
+static CFG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
+/// Is there a root complex on this machine at all?
+///
+/// Set only once `init` has PROBED for one and found it. Until then - and forever on a board that has
+/// none - `cfg_read_gated` must refuse, because a config access here is not a harmless read of an
+/// absent device: it is an external abort from the interconnect, which at EL1 halts the machine.
+/// `init` already guards its own first touch with `probe_read32` for exactly that reason; a capability
+/// holder reaching the same registers needs the same guard, or a service can wedge a core with one
+/// syscall on any board without PCIe. Observed under QEMU raspi4b, which emulates no root complex:
+/// the enumerator's first read stalled its core until the liveness watchdog panicked.
+static RC_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The highest bus number the bridge is programmed to forward (see the `0x18` write in `init`:
+/// primary 0, secondary 1, subordinate 1).
+const SUBORDINATE_BUS: u32 = 1;
+
+/// One complete config read for a capability holder: select and fetch, indivisibly.
+///
+/// ATOMIC BY CONSTRUCTION, and that is the point. Exposing "write the selector" and "read the data"
+/// as two separate operations would let a caller be descheduled between them - or two callers
+/// interleave - and each would then read whichever device the OTHER selected. That is a wrong answer
+/// with nothing anywhere to say so, which is worse than a refused one (invariant 12). One operation
+/// under one lock removes the window entirely, and the caller cannot leave the selector anywhere.
+///
+/// REFUSES A BUS THE BRIDGE DOES NOT FORWARD, and this is not a nicety. A config read past the
+/// subordinate bus is an unsupported request on this root complex: it raises an SError and stalls the
+/// interconnect rather than reading back all-ones the way a PC's host bridge does. A service must not
+/// be able to halt the machine with an argument, so admissibility is checked HERE - the kernel
+/// programmed the bus range and is the only thing that knows it. What the kernel does NOT do is
+/// interpret the selector any further: `sel` is the caller's encoding, not a device it vouches for.
+///
+/// Bus 0 is the bridge's own config header, which answers from the root-complex register block rather
+/// than through the window. Masked to that header (`0..0xFFF`), so this cannot reach the control
+/// registers further up the block - EXT_CFG_INDEX at 0x9000 or the reset control at 0x9210 - which is
+/// exactly why the kernel mediates instead of granting an MMIO page.
+pub(super) fn cfg_read_gated(sel: u32, off: u16) -> Option<u32> {
+    // NO ROOT COMPLEX, NO ACCESS. Touching these registers on a board that has none is an external
+    // abort that halts the machine, not a read that returns all-ones - so this is refused before the
+    // bus check, and a caller is told rather than taking the core down with it.
+    if !RC_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let bus = (sel >> 20) & 0xFF;
+    if bus > SUBORDINATE_BUS {
+        return None;
+    }
+    let o = (off as u64) & 0xFFF;
+    if bus == 0 {
+        // Bus 0 carries exactly one device: the root complex bridge itself. Its header answers from
+        // the register block directly, which has no device/function selector to apply - so without
+        // this check every slot on bus 0 would read back the BRIDGE and a caller would report 32 of
+        // them. Absent is the truth for every slot but the first.
+        if sel & 0x000F_F000 != 0 {
+            return Some(0xFFFF_FFFF);
+        }
+        let _g = CFG_LOCK.lock();
+        return Some(rd(o));
+    }
+    let _g = CFG_LOCK.lock();
+    wr(EXT_CFG_INDEX, sel);
+    Some(rd(EXT_CFG_DATA + o))
+}
+
 /// Walk bus 1 looking for a VIA xHCI controller, and give it a BAR inside the window.
 fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
     // A Gen2 x1 link to a single soldered-down controller: one device, function 0. Walking all 32
@@ -415,6 +490,26 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         put_str(b" class ");
         put_hex(class as u64);
         put_str(b"\r\n");
+
+        // RECORD IT, whatever it is, BEFORE the per-class filter below (step D1). The order is the
+        // whole point: a table built from what the BUS reported - not from what this kernel happens
+        // to care about - is one that can serve a driver for a device the kernel has no name for.
+        //
+        // BARs are read raw here. On this board the firmware does NOT assign them; the code below
+        // assigns BAR0 for the controller it drives, and re-records afterwards with the assigned
+        // value. A device nobody drives therefore shows 0, which is the truth about it rather than a
+        // guess - and `hw_mmio_of` grants nothing for a 0 BAR, so a driver gets no mapping and says
+        // so instead of being pointed somewhere plausible (§26.7).
+        {
+            let mut bars = [0u64; 6];
+            for (i, b) in bars.iter_mut().enumerate() {
+                let raw = cfg_read(1, dev, 0, 0x10 + (i as u16) * 4);
+                if raw & 0x1 == 0 { *b = (raw & !0xF) as u64; }   // memory BAR; I/O BARs are not usable here
+            }
+            let irq_line = (cfg_read(1, dev, 0, 0x3C) & 0xFF) as u8;
+            let bdf = ((1u32) << 8) | ((dev as u32) << 3);        // bus 1, func 0 - same encoding as x86's make_bdf
+            crate::arch::aarch64::pci::record_device(bdf, class, bars, irq_line, vendor, device);
+        }
 
         // Class 0x0C0330 is "serial bus / USB / xHCI". Checking the CLASS rather than the device id is
         // what makes this work on a board that ships a VL806 instead of a VL805.
@@ -455,22 +550,53 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         set_outbound_window(cpu_base, PCI_WIN_BUS_ADDR, cpu_size);
         cfg_write(0, 0, 0, 0x18, 0x0001_0100);
 
-        // Size BAR0 the standard way: write all-ones, read back the writable bits.
-        cfg_write(1, dev, 0, 0x10, 0xFFFF_FFFF);
-        let probe = cfg_read(1, dev, 0, 0x10);
-        if probe == 0 || probe == 0xFFFF_FFFF {
-            put_str(b"pcie: xHCI BAR0 did not size - skipping\r\n");
-            continue;
-        }
-        let len = (!(probe & !0xF)).wrapping_add(1);
-        if (len as u64) > cpu_size {
-            put_str(b"pcie: xHCI BAR0 is larger than the outbound window - skipping\r\n");
-            continue;
-        }
+        // ASSIGNMENT ONCE, RE-READ ALWAYS - the split step D requires, made structural here rather
+        // than left to the fact that this happens to run only at boot today.
+        //
+        // Sizing a BAR is DESTRUCTIVE: writing all-ones to read back the writable bits clobbers the
+        // address while it does so. Do that to a device a live driver is using and its window vanishes
+        // mid-transfer. That cannot happen today because `pcie::init` is called once, before any
+        // driver exists - but "safe because of who calls it" is a property of the caller, and step D
+        // moves callers around. Made safe by the code instead: a BAR that is ALREADY PROGRAMMED is
+        // kept and reported, never re-sized.
+        //
+        // The other half of the split needs no code at all, and it is worth recording why. Re-reading
+        // is what `hw-enumerator` does, and `PCI_CFG` grants exactly one operation - READ - with no
+        // write of any kind, permanently. A restarted enumerator therefore CANNOT reassign a BAR: the
+        // read-only rule is enforced by the capability, not by the enumerator's good behaviour. The
+        // only writer is here, and this is the branch that makes it idempotent.
+        // ZERO means "not sized", not "zero bytes". The already-programmed path deliberately does not
+        // measure the BAR, because measuring it is the destructive act being avoided; the field has no
+        // consumer, so an honest unknown beats a plausible invention.
+        let mut len: u32 = 0;
+        let existing = cfg_read(1, dev, 0, 0x10);
+        let already = existing != 0 && existing != 0xFFFF_FFFF && (existing & !0xF) != 0;
 
-        // Assign it at the base of the window. One device, so there is nothing to pack around it.
-        cfg_write(1, dev, 0, 0x10, PCI_WIN_BUS_ADDR as u32);
-        cfg_write(1, dev, 0, 0x14, 0);
+        if already {
+            // Keep what is there. Sizing would tell us how big it is, and cost the driver its window
+            // to find out - a question not worth that answer on a device already in service.
+            put_str(b"pcie: xHCI BAR0 already programmed at ");
+            put_hex((existing & !0xF) as u64);
+            put_str(b" - kept, not re-sized\r\n");
+        } else {
+            // Size BAR0 the standard way: write all-ones, read back the writable bits. Safe here
+            // BECAUSE the branch above proved nothing is using it.
+            cfg_write(1, dev, 0, 0x10, 0xFFFF_FFFF);
+            let probe = cfg_read(1, dev, 0, 0x10);
+            if probe == 0 || probe == 0xFFFF_FFFF {
+                put_str(b"pcie: xHCI BAR0 did not size - skipping\r\n");
+                continue;
+            }
+            len = (!(probe & !0xF)).wrapping_add(1);
+            if (len as u64) > cpu_size {
+                put_str(b"pcie: xHCI BAR0 is larger than the outbound window - skipping\r\n");
+                continue;
+            }
+
+            // Assign it at the base of the window. One device, so nothing to pack around it.
+            cfg_write(1, dev, 0, 0x10, PCI_WIN_BUS_ADDR as u32);
+            cfg_write(1, dev, 0, 0x14, 0);
+        }
 
         // **Open the bridge's memory window, or nothing downstream is reachable.**
         //
@@ -587,6 +713,39 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         put_str(b", device cmd ");
         put_hex((cfg_read(1, dev, 0, 0x04) & 0xFFFF) as u64);
         put_str(b"\r\n");
+
+        // Re-record with the BAR this code just ASSIGNED. The first record above captured the raw
+        // config space, where BAR0 reads 0 because the firmware on this board assigns nothing - so
+        // without this the table would hold a truthful-but-useless 0 for the one device we drive.
+        //
+        // `cpu_base` (not the bus address) because that is what a driver needs to map, and it is what
+        // the x86 table stores for every device: one meaning for the field on both ports.
+        {
+            let bdf = ((1u32) << 8) | ((dev as u32) << 3);
+            let mut bars = [0u64; 6];
+            bars[0] = cpu_base;
+            let irq_line = (cfg_read(1, dev, 0, 0x3C) & 0xFF) as u8;
+            crate::arch::aarch64::pci::record_device(bdf, 0x0C_0330, bars, irq_line, vendor, device);
+        }
+
+        // CROSS-CHECK, printed rather than asserted. The generic table and the `Device` returned here
+        // are two independent views of one truth, and they must agree before anything is switched over
+        // to the table. This is not ceremony: the identical check on x86 caught the AHCI BAR at once -
+        // the table recorded BAR0 while AHCI's registers are in BAR5, and the log said so on the first
+        // boot rather than in a driver that mapped the wrong window.
+        //
+        // It PRINTS because this port cannot be tested in QEMU (no VL805 emulation), so the first real
+        // evidence arrives from a Pi 4 boot log. A mismatch here is the thing to look for.
+        if let Some(d) = crate::arch::aarch64::pci::find_by_class(0x0C_0330) {
+            let agree = d.bar[0] == cpu_base && d.vendor == vendor && d.device == device;
+            crate::kprintln!(
+                "pcie: device table - {} device(s); xHCI class 0x0c0330 {} (BAR0 {:#x} vs assigned {:#x}, BDF {:#06x})",
+                crate::arch::aarch64::pci::DEVICE_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                if agree { "AGREES" } else { "DISAGREES - do not trust the table" },
+                d.bar[0], cpu_base, d.bdf);
+        } else {
+            crate::kprintln!("pcie: device table has NO 0x0c0330 entry though one was just driven - table is wrong");
+        }
 
         return Some(Device {
             bus: 1,

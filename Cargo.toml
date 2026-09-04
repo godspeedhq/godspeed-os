@@ -6,6 +6,7 @@ members = [
     "services/logger",
     "services/console",
     "services/time",
+    "services/hw-enumerator",
     "services/control",
     "services/mem-pressure",
     "services/chaos",

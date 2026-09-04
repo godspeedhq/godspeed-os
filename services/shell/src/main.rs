@@ -3490,6 +3490,17 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
     let mut soff = [0u16; RUN_MAX_CMDS];
     let mut slng = [0u16; RUN_MAX_CMDS];
     let mut nrec = 0usize;
+    // FAILURES ARE RECORDED FOR THE WHOLE RUN, not just the capped prefix. The arrays above stop at
+    // 256 statements; the self-check suite is now ~392, so a failure past the cap was COUNTED in
+    // "failed N" and had no line anywhere - the operator is told a test failed and cannot find out
+    // which. That is the silent failure invariant 12 forbids, and it cost a Pi 2 debugging round:
+    // `run: ran 392, failed 1` with `match FAIL` over the saved report returning nothing at all.
+    //
+    // Separate and much smaller, because failures are rare while passes are not: 32 spans is 128
+    // bytes, against 1.9 KiB to raise the cap to 640 - and raising the cap only moves the cliff.
+    let mut fail_off = [0u16; RUN_MAX_FAILS];
+    let mut fail_len = [0u16; RUN_MAX_FAILS];
+    let mut nfail_rec = 0usize;
     let b = src;
     let ft = prescan_fns(ctx, b); // index `fn` definitions so a call may precede its definition (§7)
     let sdepth = depth + 1; // statements/conditions run one level deeper (a nested `run` is refused)
@@ -3883,7 +3894,14 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         if nrec < RUN_MAX_CMDS { verdict[nrec] = last.is_ok(); soff[nrec] = stmt_off as u16; slng[nrec] = stmt.len() as u16; }
         nrec += 1;
         ran += 1;
-        if last.is_err() { failed += 1; }
+        if last.is_err() {
+            failed += 1;
+            if nfail_rec < RUN_MAX_FAILS {
+                fail_off[nfail_rec] = stmt_off as u16;
+                fail_len[nfail_rec] = stmt.len() as u16;
+                nfail_rec += 1;
+            }
+        }
         if stop { break; }
     }
     // Script exit (normal end OR `fail`): run any remaining defers - LIFO, across all scopes (§5).
@@ -3898,6 +3916,26 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         for j in 0..shown {
             out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
             out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
+        }
+        // Say so when the per-statement detail above is only a prefix, rather than letting a reader
+        // assume a clean tail (§26.7).
+        if nrec > RUN_MAX_CMDS {
+            out.line_fmt(ctx, format_args!(
+                "--- (per-statement detail covers the first {} of {} statements) ---",
+                RUN_MAX_CMDS, nrec));
+        }
+        // Every failure, wherever it happened. This is the part that must never be capped away.
+        if failed > 0 {
+            out.line(ctx, "--- failures ---");
+            for j in 0..nfail_rec.min(RUN_MAX_FAILS) {
+                out.put(ctx, "FAIL  ");
+                out.line(ctx, str_of(&b[fail_off[j] as usize..fail_off[j] as usize + fail_len[j] as usize]));
+            }
+            if failed as usize > nfail_rec {
+                out.line_fmt(ctx, format_args!(
+                    "FAIL  ... and {} more (only the first {} are listed)",
+                    failed as usize - nfail_rec, RUN_MAX_FAILS));
+            }
         }
         out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     }
@@ -3971,8 +4009,17 @@ fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
 }
 
 /// Cap on per-command summary lines `run` records (the verdict array). Commands past this still
-/// run and count in the totals; only their individual PASS/FAIL line is omitted.
+/// run and count in the totals; only their individual PASS line is omitted - a FAILURE past the cap
+/// is still named, in the `--- failures ---` block (see `RUN_MAX_FAILS`).
 const RUN_MAX_CMDS: usize = 256;
+
+/// Cap on FAILING statements recorded across the WHOLE run, independent of `RUN_MAX_CMDS`.
+///
+/// A failure that is counted but cannot be named is the silent failure invariant 12 forbids, and
+/// with a 392-statement suite against a 256-statement verdict array that is exactly what happened.
+/// Failures are rare, so this array is small and always covers the full run; passes are many, so
+/// their detail stays capped. Overflowing THIS is reported too, with the count.
+const RUN_MAX_FAILS: usize = 32;
 
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image - no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
@@ -6366,16 +6413,39 @@ fn build_caps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
 }
 
 /// Write a capability's resource name into `buf`, returning its length. Stable kernel
-/// resources by id (matching `cmd_caps`), everything else as `endpoint#N`.
+/// resources by id, everything else as `endpoint#N`. `cmd_caps` CALLS this rather than keeping a
+/// copy of the table, so the piped and console views of `caps` cannot disagree.
 fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
     let mut p = 0usize;
+    // EVERY well-known resource is named, and the reason is that the fallback below LIES about the
+    // ones that are not. Ten of these (7-16) used to fall through to `endpoint#N`, so `caps` reported
+    // a service that can reboot the machine as holding "endpoint#8" - authority hidden behind a label
+    // that names the wrong kind of thing entirely. A reviewer must be able to read off what a service
+    // can do (§26.9), and that is the whole job of this command.
+    //
+    // The names match the vocabulary a contract uses (`pci_cfg = true`), so what a service DECLARES
+    // and what it is observed to HOLD read the same and can be compared directly.
+    //
+    // Ids 1-16 are the kernel's fixed set (`capability::*_RESOURCE`); anything above is a real
+    // endpoint, and only those reach the fallback. Adding a resource without adding it here puts it
+    // straight back into the lie, so keep the two in step.
     match id {
-        1 => write_bytes(buf, &mut p, b"log_write"),
-        2 => write_bytes(buf, &mut p, b"spawn"),
-        3 => write_bytes(buf, &mut p, b"console_read"),
-        4 => write_bytes(buf, &mut p, b"console_push"),
-        5 => write_bytes(buf, &mut p, b"introspect"),
-        6 => write_bytes(buf, &mut p, b"service_control"),
+        1  => write_bytes(buf, &mut p, b"log_write"),
+        2  => write_bytes(buf, &mut p, b"spawn"),
+        3  => write_bytes(buf, &mut p, b"console_read"),
+        4  => write_bytes(buf, &mut p, b"console_push"),
+        5  => write_bytes(buf, &mut p, b"introspect"),
+        6  => write_bytes(buf, &mut p, b"service_control"),
+        7  => write_bytes(buf, &mut p, b"resource_mint"),
+        8  => write_bytes(buf, &mut p, b"reboot"),
+        9  => write_bytes(buf, &mut p, b"acquire_any"),
+        10 => write_bytes(buf, &mut p, b"net_device"),
+        11 => write_bytes(buf, &mut p, b"gpio_device"),
+        12 => write_bytes(buf, &mut p, b"usb_disk"),
+        13 => write_bytes(buf, &mut p, b"set_clock"),
+        14 => write_bytes(buf, &mut p, b"fire_irq"),
+        15 => write_bytes(buf, &mut p, b"image_spawn"),
+        16 => write_bytes(buf, &mut p, b"pci_cfg"),
         other => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, other as u32); }
     }
     p
@@ -8094,27 +8164,20 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln("  (none)");
         return Ok(());
     }
-    // Legend: left column is the resource the cap targets, right column the rights
-    // it grants (§7.4). log_write/spawn/console_read/console_push/introspect are
-    // kernel resources; endpoint#N is an IPC endpoint.
+    // Legend: left column is the resource the cap targets, right column the rights it grants (§7.4).
+    // A named row is one of the kernel's fixed resources; `endpoint#N` is an IPC endpoint.
     ctx.console_writeln("  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke)");
     for cap in caps.iter().take(n) {
         let mut buf = [b' '; 64];
         let mut pos = 0usize;
         write_bytes(&mut buf, &mut pos, b"  ");
-        // Resource name (stable kernel resources by id; others by number).
-        match cap.resource_id {
-            1 => write_bytes(&mut buf, &mut pos, b"log_write"),
-            2 => write_bytes(&mut buf, &mut pos, b"spawn"),
-            3 => write_bytes(&mut buf, &mut pos, b"console_read"),
-            4 => write_bytes(&mut buf, &mut pos, b"console_push"),
-            5 => write_bytes(&mut buf, &mut pos, b"introspect"),
-            6 => write_bytes(&mut buf, &mut pos, b"service_control"),
-            id => {
-                write_bytes(&mut buf, &mut pos, b"endpoint#");
-                write_u32(&mut buf, &mut pos, id as u32);
-            }
-        }
+        // ONE naming table, shared with the record producer - this used to hold a SECOND, hand-copied
+        // match on the same ids, and the two drifted exactly as a duplicated table does. Naming all
+        // sixteen resources fixed the piped view while this one kept printing `endpoint#8` for
+        // `reboot`, so `caps` in a pipe and `caps` on the console disagreed about what a service can
+        // do - and the console one, the one a person actually reads, was the liar. A second source of
+        // truth cannot be kept in sync by intention (§26.4); it has to not exist.
+        pos += cap_resource_name(cap.resource_id, &mut buf[pos..]);
         while pos < 18 { buf[pos] = b' '; pos += 1; }
         // Rights spelled out (§7.4) so no decoding is needed.
         let r = cap.rights;
@@ -8388,6 +8451,10 @@ fn spawn_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         report(ctx, "already running: ", name);
         return Err(ShellError::Unknown);
     }
+    // ASK THE SUPERVISOR, not the kernel. Once a service's image lives in the supervisor the kernel
+    // has no row to spawn it from, and asking by name returns NotFound (step C,
+    // `docs/service-ownership.md`). The guards above are unchanged, so `Denied` for a core service
+    // and `Unknown` for an already-running one still come from here, not from the answer.
     match ctx.spawn(name) {
         Ok(())  => { report(ctx, "spawned: ", name); Ok(()) }
         Err(_)  => { report(ctx, "spawn failed (unknown service?): ", name); Err(ShellError::Unknown) }
@@ -8404,8 +8471,13 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
     }
-    match ctx.spawn_returning_endpoint(name, 0xFFFF) {
-        Some(h) => {
+    // Through the SUPERVISOR, which is where a grantable cap to a spawned service comes from now:
+    // only a service's spawner holds one (8.5, 7.3). This used to call `SpawnReturningEndpoint`
+    // directly, whose remaining life is the shrinking kernel catalogue - and which the supervisor
+    // already exercises on every boot for every service still in it, proven by wired services
+    // working. The property asserted is unchanged: the returned cap ROUTES.
+    match ctx.spawn_via_supervisor(name, 0xFFFF, &[]).map_err(|_| ()) {
+        Ok(Some(h)) => {
             let r = ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01]));
             ctx.remove_cap(h);   // reclaim the probe endpoint cap (no leak)
             match r {
@@ -8413,7 +8485,12 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
                 Err(_)  => { ctx.console_writeln_fmt(format_args!("spawncap: {} - cap acquired but send failed", name)); Err(ShellError::Unknown) }
             }
         },
-        None => {
+        Ok(None) => {
+            ctx.console_writeln_fmt(format_args!(
+                "spawncap: {} - spawned, but it has no recv endpoint to hand back", name));
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
             ctx.console_writeln_fmt(format_args!(
                 "spawncap: could not acquire endpoint cap for {} (cap not held / spawn failed / no endpoint)", name));
             Err(ShellError::Unknown)
@@ -8428,13 +8505,22 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// child uses it - the seam by which the supervisor (not the kernel) owns naming. Removed / folded
 /// into the supervisor in a later phase.
 fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
-    let pong = match ctx.spawn_returning_endpoint("pong", 0xFFFF) {
-        Some(h) => h,
-        None => { ctx.console_writeln("spawnwired: could not spawn pong / acquire its endpoint cap"); return Err(ShellError::Unknown); }
-    };
-    match ctx.spawn_with_caps("greet", 0xFFFF, &[("pong", pong)]) {
+    // A SEND|GRANT cap, because `spawn_with_caps` TRANSFERS it into the child (8.5) - and only a
+    // service's SPAWNER holds one. `pong`'s image belongs to the supervisor, so the supervisor is
+    // the spawner and the supervisor returns the cap. `acquire_send_cap` cannot serve here: it
+    // yields SEND alone and rights never widen (7.3).
+    // Ask the SUPERVISOR to spawn `greet` wired to `pong`. It installs pong's cap from its name-cap
+    // map, so greet reaches pong through a CAPABILITY IT WAS HANDED rather than by resolving a name -
+    // which is the property this diagnostic exists to prove, unchanged.
+    //
+    // The INSTALLER is now the supervisor rather than the shell. That is not a weakening: only a
+    // service's spawner holds a grantable cap to it (8.5, 7.3), and `pong`'s spawner is the
+    // supervisor. It is also the shape every wired service gets at boot, so the diagnostic now
+    // exercises the real path instead of a shell-only one.
+    let _ = ctx.spawn_via_supervisor("pong", 0xFFFF, &[]);   // may already be running
+    match ctx.spawn_via_supervisor("greet", 0xFFFF, &["pong"]) {
         Ok(_)  => { ctx.console_writeln("spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
-        Err(_) => { ctx.console_writeln("spawnwired: spawn_with_caps(greet) failed"); Err(ShellError::Unknown) }
+        Err(_) => { ctx.console_writeln("spawnwired: supervisor could not spawn greet wired to pong"); Err(ShellError::Unknown) }
     }
 }
 
@@ -8458,7 +8544,9 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
         }
     }
     // Wire the service to send its output to the SHELL's own endpoint.
-    if ctx.spawn_pipe(svc, "shell").is_err() {
+    // Through the SUPERVISOR, which owns some of these images now and the kernel the rest. A pipe
+    // stage is a spawn wired to send to the shell's own endpoint.
+    if ctx.spawn_via_supervisor(svc, 0xFFFF, &["shell"]).is_err() {
         ctx.console_writeln_fmt(format_args!("pipe: failed to spawn '{}'", svc));
         return false;
     }
@@ -9392,6 +9480,16 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
         else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
         else { i += 1; }
     }
+    // Say so when the request is REDUCED. It used to clamp silently: `chaos kill-storm nic-driver 120`
+    // ran 100 and only said "100 rounds" in a later line, so an operator who asked for 120 got 100 and
+    // could only find out by re-reading the report. A bounded mechanism is right (§26.6 - the per-round
+    // results live in fixed stack arrays, sized by this constant, no heap); silently delivering less
+    // than was asked for is not (invariant 12). The cap is stated WITH ITS REASON, because "why 100?"
+    // is the operator's next question and the answer is the array beside it.
+    if rounds > CHAOS_MAX_ROUNDS {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: {} rounds requested, running {} - CHAOS_MAX_ROUNDS, the size of the fixed per-round result arrays (no heap, CLAUDE.md 26.6.1)", rounds, CHAOS_MAX_ROUNDS));
+    }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
     if slot_of(ctx, svc).is_none() {
         ctx.console_writeln_fmt(format_args!("chaos: '{}' is not running", svc));
@@ -9501,6 +9599,16 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
     let mut i = 2;
     while i < ntok { if let Some(n) = parse_u32(tok[i]) { rounds = n; } i += 1; }
+    // Say so when the request is REDUCED. It used to clamp silently: `chaos kill-storm nic-driver 120`
+    // ran 100 and only said "100 rounds" in a later line, so an operator who asked for 120 got 100 and
+    // could only find out by re-reading the report. A bounded mechanism is right (§26.6 - the per-round
+    // results live in fixed stack arrays, sized by this constant, no heap); silently delivering less
+    // than was asked for is not (invariant 12). The cap is stated WITH ITS REASON, because "why 100?"
+    // is the operator's next question and the answer is the array beside it.
+    if rounds > CHAOS_MAX_ROUNDS {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: {} rounds requested, running {} - CHAOS_MAX_ROUNDS, the size of the fixed per-round result arrays (no heap, CLAUDE.md 26.6.1)", rounds, CHAOS_MAX_ROUNDS));
+    }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
 
     if slot_of(ctx, svc).is_none() {
@@ -9629,6 +9737,16 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
     let mut i = 1;
     while i < ntok { if let Some(n) = parse_u32(tok[i]) { rounds = n; } i += 1; }
+    // Say so when the request is REDUCED. It used to clamp silently: `chaos kill-storm nic-driver 120`
+    // ran 100 and only said "100 rounds" in a later line, so an operator who asked for 120 got 100 and
+    // could only find out by re-reading the report. A bounded mechanism is right (§26.6 - the per-round
+    // results live in fixed stack arrays, sized by this constant, no heap); silently delivering less
+    // than was asked for is not (invariant 12). The cap is stated WITH ITS REASON, because "why 100?"
+    // is the operator's next question and the answer is the array beside it.
+    if rounds > CHAOS_MAX_ROUNDS {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: {} rounds requested, running {} - CHAOS_MAX_ROUNDS, the size of the fixed per-round result arrays (no heap, CLAUDE.md 26.6.1)", rounds, CHAOS_MAX_ROUNDS));
+    }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
 
     let total    = ctx.inspect_kernel_total_frames();

@@ -6,6 +6,38 @@
 //! rebinding and at spawn time to wire up send-peer SEND caps.
 
 use crate::ipc::endpoint::EndpointId;
+
+/// Print a ROUTINE name-directory mutation. Compiled out unless the `name-trace` feature is on.
+///
+/// **The split is between narration and alarm, and only the narration is gated.**
+///
+/// The routine lines - a name registered, a name cleared by its own dying endpoint - are the HISTORY
+/// of the directory, and they were built to answer one question: a service was alive and its name did
+/// not resolve, and nothing said what had removed it. They answered it. The `block-driver` latch was
+/// caught in the act on a Pi 4 because this trace put the clear and the re-register on either side of
+/// the failure, 440 ms apart, and made it obvious the name had come back and something else had given
+/// up on it.
+///
+/// That hunt is closed, and the cost is not small: roughly 1,200-2,000 lines per chaos run on every
+/// port, about eleven seconds of wire time at 115200 on x86, and enough volume that both ARM ports
+/// needed a deeper serial ring to carry it without dropping lines. A diagnostic on a hot path is a
+/// feature with a price (§26.2), and one whose question has been answered should stop charging it.
+///
+/// What is NOT gated, and must never be: the four ANOMALY reports - a live instance's name cleared, a
+/// stale entry kept, a name already absent when its owner died, an eviction. Those are silent in a
+/// healthy run by construction, so they cost nothing to leave in, and they are the ones that say a
+/// thing has gone wrong rather than merely what happened. Gating an alarm to save the noise of the
+/// narration would be trading the only part worth keeping.
+///
+/// Turn it back on with `--features name-trace` when a name is behaving oddly again.
+#[macro_export]
+macro_rules! name_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "name-trace")]
+        { $crate::kprintln!($($arg)*); }
+    };
+}
+
 use crate::smp::SpinLock;
 
 const MAX_ENTRIES: usize = 128;
@@ -91,9 +123,13 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
         if entry.valid && entry.name_len == len
             && &entry.name[..len as usize] == bytes
         {
+            let was = entry.endpoint_id;
             entry.endpoint_id = endpoint_id;
             drop(names);
             report_evicted(evicted, name, endpoint_id);
+            // The third mutation. A name that changes which endpoint it points at is how a client
+            // silently starts talking to a different instance, and it had no record at all.
+            crate::name_trace!("ipc::names: '{}' re-pointed {:?} -> {:?}", name, was, endpoint_id);
             return;
         }
     }
@@ -107,6 +143,7 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
             entry.endpoint_id = endpoint_id;
             drop(names);
             report_evicted(evicted, name, endpoint_id);
+            crate::name_trace!("ipc::names: '{}' registered -> {:?}", name, endpoint_id);
             return;
         }
     }
@@ -130,6 +167,32 @@ pub fn unregister(name: &str) {
     }
 }
 
+/// What `unregister_endpoint` actually did. Returned rather than logged, because this module does its
+/// logging with the table lock RELEASED and because only the CALLER knows whether the outcome is
+/// interesting: the caller is the kill path, and it can see whether another live task still answers to
+/// this name (`scheduler::live_task_named_other_than`).
+///
+/// The distinction exists to catch ONE bug, and it is silent in a healthy run. Two instances of one
+/// service can be alive at once (a supervisor respawn racing a death notification), and when the older
+/// one dies its unregister must be a no-op - the newer instance has already claimed the name. That is
+/// what the endpoint-id guard is for. If it ever CLEARS while a live task of the same name remains, the
+/// guard has been defeated (an endpoint id reused, a kill path run twice, a respawn that never
+/// registered), and the consequence is a live service that no client can find by name: `fs` reporting
+/// storage unavailable against a `block-driver` that is running perfectly.
+///
+/// That is a failure whose symptom points at the wrong service, so it is worth naming at the exact
+/// moment it happens rather than inferring it from the wreckage several minutes later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnregisterOutcome {
+    /// The entry matched this endpoint and was removed.
+    Cleared,
+    /// The name is registered to a DIFFERENT endpoint - a newer instance already claimed it. No-op,
+    /// which is the guard doing its job.
+    KeptNewer(EndpointId),
+    /// No entry for this name at all.
+    NotFound,
+}
+
 /// Remove the entry for `name` **only if** it still maps to `endpoint_id` - the dying instance.
 ///
 /// Called from the task-kill path (§14.2) so a service's name stops resolving to a DEAD endpoint:
@@ -139,20 +202,25 @@ pub fn unregister(name: &str) {
 /// is being respawned (so their death-notifications are lost). The `endpoint_id` guard is the
 /// respawn-race safety: if a fresh instance has *already* re-registered the name to a new endpoint,
 /// this is a no-op - we must never unregister the live one.
-pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) {
+pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) -> UnregisterOutcome {
     let bytes = name.as_bytes();
-    if bytes.len() > NAME_MAX { return; }
+    if bytes.len() > NAME_MAX { return UnregisterOutcome::NotFound; }
     let len = bytes.len() as u8;
     let mut names = NAMES.lock_irq();
     for entry in names.iter_mut() {
         if entry.valid && entry.name_len == len
             && &entry.name[..len as usize] == bytes
-            && entry.endpoint_id == endpoint_id
         {
-            entry.valid = false;
-            return;
+            // The name is present. Whether it is OURS is the whole question, and the answer is
+            // reported either way so the caller can tell a working guard from a defeated one.
+            if entry.endpoint_id == endpoint_id {
+                entry.valid = false;
+                return UnregisterOutcome::Cleared;
+            }
+            return UnregisterOutcome::KeptNewer(entry.endpoint_id);
         }
     }
+    UnregisterOutcome::NotFound
 }
 
 /// Look up an endpoint ID by service name.

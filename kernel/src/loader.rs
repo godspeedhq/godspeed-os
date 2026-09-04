@@ -141,9 +141,75 @@ impl From<MapError> for LoadError {
 ///
 /// # Safety
 /// Must be called after `memory::init` and `page_tables::set_hhdm_offset`.
+/// Where an ELF image lives while the loader reads it.
+///
+/// Until step C the kernel held every service binary in its own rodata, so `&[u8]` was the only
+/// answer. Now a spawner can hand the kernel an image out of ITS OWN address space, and the loader
+/// has to read from user memory - safely, and without ever staging a whole untrusted image in the
+/// kernel (`docs/service-ownership.md`).
+///
+/// ## The double-fetch, and why the header is copied first
+///
+/// A user image is MUTABLE BY ITS OWNER while the kernel reads it. If the loader validated the
+/// program headers in place and then acted on them, the supplier could let validation pass and
+/// rewrite the offsets before the segment copy - landing bytes at an address the kernel already
+/// approved a different value for. That is a classic double-fetch and it would be a hole straight
+/// through the loader's bounds checks.
+///
+/// So the header window is fetched ONCE into a bounded kernel buffer, and every decision - segment
+/// count, offsets, sizes, entry point - is taken from that immutable copy. Segment CONTENT is then
+/// streamed page by page and never interpreted: the kernel copies it into the new address space and
+/// forms no opinion about it, so a byte that changes mid-copy can only corrupt the image its owner
+/// supplied.
+pub enum ImageSource<'a> {
+    /// A kernel-embedded image (rodata). Immutable, so the double-fetch above cannot arise.
+    Kernel(&'a [u8]),
+    /// A range in the CALLING task's address space.
+    User { base: u64, len: usize },
+}
+
+/// Bytes of the image fetched up-front and validated from: the ELF header plus every program header.
+/// One page is far more than any real binary needs (an ELF64 header is 64 bytes and a program header
+/// 56, so this holds 72 of them), and an image whose program headers sit beyond it is REFUSED rather
+/// than read in place - bounded, and loud (26.6, invariant 12).
+const HEADER_WINDOW: usize = 4096;
+
+impl<'a> ImageSource<'a> {
+    fn len(&self) -> usize {
+        match *self { ImageSource::Kernel(b) => b.len(), ImageSource::User { len, .. } => len }
+    }
+
+    /// Copy `[off, off+dst.len())` of the image into `dst`. False if out of range or unreadable.
+    /// Bounded to one page per call by the arch seam, which is why the header window is one page.
+    fn read_into(&self, off: usize, dst: &mut [u8]) -> bool {
+        let end = match off.checked_add(dst.len()) { Some(e) => e, None => return false };
+        if end > self.len() { return false; }
+        match *self {
+            ImageSource::Kernel(b) => { dst.copy_from_slice(&b[off..end]); true }
+            ImageSource::User { base, .. } =>
+                crate::arch::imp::copy_user_to_kernel(base + off as u64, dst.as_mut_ptr(), dst.len()),
+        }
+    }
+
+}
+
+/// Load a kernel-embedded image. Thin wrapper kept so the existing call sites and the loader's own
+/// unit tests read unchanged; everything goes through `load_from` below.
 pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
+    load_from(&ImageSource::Kernel(bytes))
+}
+
+pub fn load_from(src: &ImageSource) -> Result<LoadedElf, LoadError> {
+    // ONE fetch of the header window, and every decision below is taken from this immutable copy.
+    // See `ImageSource` for why: a user-supplied image can be rewritten by its owner between a check
+    // and its use, so validating in place would be a double-fetch straight through these bounds.
+    let mut hdr = [0u8; HEADER_WINDOW];
+    let window  = src.len().min(HEADER_WINDOW);
+    if !src.read_into(0, &mut hdr[..window]) { return Err(LoadError::TooSmall); }
+    let bytes: &[u8] = &hdr[..window];
+
     // Need e_ident (magic + class + data) before we know the header size.
-    if bytes.len() < 16 { return Err(LoadError::TooSmall); }
+    if src.len() < 16 || bytes.len() < 16 { return Err(LoadError::TooSmall); }
     if bytes[..4] != ELF_MAGIC        { return Err(LoadError::BadMagic);     }
     // Class and data must match this build's arch. On x86 a 32-bit ELF still fails here (NotElf64),
     // preserving the fuzz-test semantics; on ARM a 64-bit ELF fails the same way.
@@ -174,6 +240,8 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             .checked_add(i.checked_mul(ph_step).ok_or(LoadError::BadProgramHeader)?)
             .ok_or(LoadError::BadProgramHeader)?;
 
+        // Against the WINDOW, not the file: a program header beyond the fetched window is refused
+        // rather than read in place, which is what keeps every offset below immutable.
         if off.checked_add(phdr_size(class))
                .ok_or(LoadError::BadProgramHeader)? > bytes.len()
         {
@@ -193,7 +261,8 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
         if p_filesz > p_memsz {
             return Err(LoadError::BadProgramHeader);
         }
-        if p_offset.checked_add(p_filesz).ok_or(LoadError::SegmentOutOfBounds)? > bytes.len() {
+        // Against the whole IMAGE - this one is a real file-extent check, not a window check.
+        if p_offset.checked_add(p_filesz).ok_or(LoadError::SegmentOutOfBounds)? > src.len() {
             return Err(LoadError::SegmentOutOfBounds);
         }
 
@@ -220,12 +289,21 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             let frame = alloc_frame().ok_or(LoadError::FrameAllocFailed)?;
             let phys  = frame.phys_addr().0;
 
-            // SAFETY: phys from allocator; HHDM is set up before load() is called.
-            unsafe {
-                let dst = (get_hhdm_offset() + phys) as *mut u8;
-                // Zero first - this covers BSS (memsz > filesz) for free.
-                core::ptr::write_bytes(dst, 0, PAGE_SIZE);
-            }
+            // ONE unsafe for the whole destination page: turn the freshly allocated frame into a
+            // safe slice through the HHDM, and do the zeroing and the copy below as safe writes.
+            // This is what lets the image copy be a safe `read_into` rather than a second raw
+            // `copy_nonoverlapping` - the loader ends up with FEWER unsafe lines than before, not
+            // more, while gaining the ability to read from user memory (18.5: new unsafe belongs in
+            // a permitted layer, and the only new raw access here is the arch seam's).
+            //
+            // SAFETY: `phys` comes from the frame allocator and is exclusively ours until it is
+            // mapped below; the HHDM is established before `load()` is ever called, so the whole
+            // page is addressable and writable through it.
+            let page: &mut [u8] = unsafe {
+                core::slice::from_raw_parts_mut((get_hhdm_offset() + phys) as *mut u8, PAGE_SIZE)
+            };
+            // Zero first - this covers BSS (memsz > filesz) for free.
+            page.fill(0);
 
             // Copy file bytes for the overlap of this page with the file data range.
             let page_end   = va + PAGE_SIZE as u64;
@@ -237,15 +315,12 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
                 let src_off  = p_offset + (copy_start - p_vaddr) as usize;
                 let dst_off  = (copy_start - va) as usize;
 
-                // SAFETY: src_off + copy_len ≤ bytes.len() (validated above);
-                // dst within the just-zeroed frame.
-                unsafe {
-                    let dst = (get_hhdm_offset() + phys) as *mut u8;
-                    core::ptr::copy_nonoverlapping(
-                        bytes.as_ptr().add(src_off),
-                        dst.add(dst_off),
-                        copy_len,
-                    );
+                // `copy_len` is at most one page - it is the overlap of ONE destination page with
+                // the segment's file range - so this never approaches the arch seam's page bound.
+                // A user image whose page went away mid-load fails LOUDLY (invariant 12) rather than
+                // leaving a partly-filled mapping that would run as garbage.
+                if !src.read_into(src_off, &mut page[dst_off..dst_off + copy_len]) {
+                    return Err(LoadError::SegmentOutOfBounds);
                 }
             }
 

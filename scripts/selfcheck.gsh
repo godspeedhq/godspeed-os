@@ -4,7 +4,8 @@
 # the file-command tests). Passes iff the summary says "failed 0".
 #
 # Covers every shell utility's main functions + negative cases, EXCEPT:
-#   - observe : it is a live full-screen view (only `observe now` is a snapshot; tested).
+#   - observe : the live full-screen view. `observe now` IS covered below, but only in its PIPED
+#               form - see that section for what that does and does not reach.
 #   - drives  : flashing/relabel/reset touch disks and prompt y/N - not scriptable.
 # Re-runnable: everything is created under /sc, removed at the START of the run, and deleted again at
 # the end. Cleaning only at the end is not re-runnable - it assumes the previous run REACHED its end.
@@ -29,6 +30,14 @@
 # #  is a `run <file>`-time feature, shown (not run) near the bottom.       #
 # ##########################################################################
 
+# WHICH BUILD IS THIS? First line of the run, before any test, because a serial log that cannot
+# identify its own image is worth less than it looks. A clean run proves nothing if nobody can say
+# WHICH build produced it - and a diagnostic that only speaks on FAILURE cannot prove it was even
+# present. That happened: a NIC fault was instrumented, the next hardware run came back clean, and
+# the log was equally consistent with "the fix shipped and the bug is rare" and "the old image was
+# still on the stick". `version` prints the git SHA stamped in at build time, so every log from here
+# answers that in its own first line.
+version
 echo ''
 echo '#################### gsh LANGUAGE TOUR ####################'
 if ls /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
@@ -93,10 +102,24 @@ for i in range 1 5 {                     # range A B -> 1 2 3 4
     hits = $hits + 1                     # reassigned each pass: a fixed slot, no arena growth
 }
 echo hits-$hits | assert contains hits-4
-write /sc_fl.txt oneline                 # for line in (producer): iterate a producer's output lines
 let mut nlines = 0
-for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
-if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
+# for line in (producer): iterate a producer's output lines.
+#
+# GUARDED ON THE WRITE, because `fail` STOPS THE RUN and this line needs storage. On a machine with
+# no disk (a Pi 2 with no USB stick) the write failed, the loop saw nothing, and the whole suite
+# aborted HERE - at section 6 of 31, reporting "ran 48, failed 4" as though that were the suite.
+# Twenty-five sections that have nothing to do with storage never executed, and the count read like a
+# small run rather than a truncated one.
+#
+# The guard is on the WRITE rather than on `nlines`, deliberately: skipping whenever the loop came
+# back empty would also swallow a genuinely broken `for line` on a machine that HAS a disk, which is
+# the bug this test exists to catch. Write succeeded -> run the real test, `fail` included.
+if write /sc_fl.txt oneline {
+    for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
+    if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
+} else {
+    echo 'SKIP for-line: no writable storage on this machine'
+}
 delete /sc_fl.txt
 
 echo ''
@@ -299,6 +322,108 @@ caps shell | where resource=spawn | assert contains spawn
 caps shell | select resource | assert contains introspect
 assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
+
+# ===== observe now: the metrics snapshot =====
+echo ''
+echo '===== observe now: the one-shot metrics frame (piped record form) ====='
+# WHAT THIS REACHES, stated plainly because it is less than the command name suggests. `observe now`
+# has TWO renderers, and piping picks the other one:
+#   unpiped -> the `observe-now` SERVICE prints a formatted, column-aligned frame to the console
+#   piped   -> the SHELL builds a record table (`build_observe_table`) with an extra `ticks` column
+# `assert` needs a pipe, so everything here exercises the SHELL's record path. The service's
+# console frame cannot be captured from inside the shell at all; it is asserted by the host harness
+# in `osdev/src/shell_test.rs`, which reads raw serial and so can see it - including the column
+# alignment, which is where a long service name broke the table and no test noticed.
+#
+# That split is worth knowing rather than glossing: a green line here does NOT mean the frame a
+# person looks at is right. It means the introspection path behind it works.
+#
+# CONSEQUENCE, recorded because it is a real hole and not a technicality (§26.7): the harness that
+# checks the frame runs only under QEMU, so ON HARDWARE nothing checks the table's alignment at all.
+# A board-specific rendering problem would pass this suite. It cannot be closed by writing a better
+# test here - `assert` needs a pipe and a pipe changes the renderer - so it is written down instead.
+assert ok observe now
+# The gated introspection path answers: the table is built from `task_stat`, so a service that is
+# actually running has to appear in it.
+observe now | assert contains supervisor
+observe now | assert contains shell
+# `ticks` is the column that distinguishes this from `status` (cumulative cpu-time). If it is absent
+# the record form has silently degraded into a second `status`.
+observe now | assert contains ticks
+# The record verbs compose over it like any other producer (docs/records.md).
+observe now | where name contains shell | assert contains shell
+observe now | select name state | assert lacks ticks
+observe now | to json | assert contains name
+
+# ===== hw-enumerator: hardware discovery in USERSPACE (step D2) =====
+echo ''
+echo '===== hw-enumerator: userspace PCI discovery + its narrow authority ====='
+# NOT EVERY MACHINE HAS PCI. This service exists on x86 and on the Pi 4; the Pi 2's peripherals hang
+# off a memory-mapped bus with no PCI at all, so there is nothing here to enumerate and no service to
+# ask. Probe for it and SKIP OUT LOUD, the same way the clock check does above - a silent skip is a
+# test that has quietly stopped testing, and asserting it unconditionally would fail the Pi 2 for
+# lacking hardware rather than for anything being wrong.
+# The probe has to survive BOTH machines, and getting it wrong is quiet rather than loud - which is
+# why it is written this way and not the obvious way.
+#
+# `for line in (status | where ...)` is the shape that reads best and it does NOT work: gsh refuses to
+# capture a PIPELINE (bounded stack - it says so). The refusal made the loop body never run, `hwe`
+# stayed 0, and the suite cheerfully printed SKIP on a machine that HAS the service. A probe that
+# fails safe-looking is worse than one that fails loudly, so it is staged through a file the way the
+# error message and every other capture in this suite do it.
+#
+# `count` is what makes the answer unambiguous: it counts DATA rows, not the header, so a match is 1
+# and no match is 0. Reading the raw table instead would see a header row either way and always say
+# "present". Root is used for the staging file because `/sc` is not created until much later in this
+# script, and writing into a missing parent fails.
+status | where name contains hw-enumerator | count | write /hwe.txt
+let mut hwe = 0
+for line in (read /hwe.txt) { if $line > 0 { hwe = 1 } }
+delete /hwe.txt
+if $hwe > 0 {
+    # It is alive, and it is where the supervisor put it.
+    status | where name contains hw-enumerator | assert contains hw-enumerator
+    # It survived to serve: a service that logged its scan and then died would still be "in the
+    # table" for a moment, so assert the state the supervisor keeps it in.
+    status | where name contains hw-enumerator | assert lacks Dead
+    # The kernel directory resolves it by name - the property that makes it reacquirable (§14.3).
+    trace endpoints | assert contains hw-enumerator
+
+    # THE AUTHORITY, which is the part actually worth pinning. `pci_cfg` is a hardware capability
+    # granted to a userspace service, so its SHAPE is a security claim and not an implementation
+    # detail: one configuration READ and nothing else. `caps` names the resource rather than printing
+    # it as an anonymous id, so the claim is readable here at all.
+    caps hw-enumerator | assert contains pci_cfg
+    caps hw-enumerator | where resource=pci_cfg | assert contains read
+    # THE REGRESSION GUARD. Config space holds every BAR and every command register, so write
+    # authority over it is write authority over every device on the bus - there is no narrower form,
+    # because the target is chosen by data rather than by the interface. It was minted READ|WRITE
+    # once, before the write operation was removed. If anyone re-adds that right, this line fails and
+    # says why, which is the whole point of writing it down as a test rather than as a comment.
+    caps hw-enumerator | where resource=pci_cfg | assert lacks write
+    # And it holds no authority it has no business holding: discovery does not spawn, kill, or reboot.
+    caps hw-enumerator | assert lacks service_control
+    caps hw-enumerator | assert lacks reboot
+    caps hw-enumerator | assert lacks image_spawn
+} else {
+    echo 'SKIP  hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
+}
+
+# `caps` must NAME a well-known resource, never print it as an anonymous number.
+#
+# THIS ASSERTS A PIPED `caps`, and for a while that was not the same thing as the `caps` a person
+# reads. There were TWO copies of the naming table - one in the record producer, one in the console
+# renderer - so naming all sixteen resources fixed the piped view while the console view kept
+# printing `endpoint#8` for `reboot`. The piped test passed the whole time. The console output cannot
+# be captured (piping is what switches renderers), so no assertion can ever guard it directly; the
+# only real fix was to delete the duplicate so both views read from ONE table. This line therefore
+# guards the naming for both, and that is only true while that remains a single table (§26.4). Ten of the sixteen
+# used to fall through to an `endpoint#N` fallback, which reported (for instance) the shell's authority
+# to reboot the machine as "endpoint#8" - a label naming the wrong KIND of thing, so a reader could not
+# tell real authority from an ordinary IPC endpoint. Authority has to be readable (§26.9). The shell
+# holds `reboot`, so it is the honest witness for this on every machine.
+caps shell | assert contains reboot
+caps shell | assert lacks endpoint#8
 
 # ===== lifecycle guardrails + supervisor recovery (safe, deterministic) =====
 echo ''

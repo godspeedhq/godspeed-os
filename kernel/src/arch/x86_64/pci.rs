@@ -10,7 +10,7 @@
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
@@ -54,54 +54,162 @@ const PROGIF_EHCI: u8 = 0x20;
 /// Discovered-xHCI record. Written once by `init` on the BSP during boot,
 /// read later when minting the driver's caps. Plain atomics: single writer at
 /// boot, no concurrent access.
-pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
-pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF (bus<<8 | dev<<3 | func) of the driver's xHCI - the index into the
-/// IOMMU device table for DMA confinement (H1). 0xFFFF if none found.
-pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
+// ---------------------------------------------------------------------------
+// THE GENERIC DEVICE TABLE (step D1) - what is on the bus, with NO opinion about it.
+//
+// Every static below this block names a device CLASS the kernel was taught: XHCI_FOUND, EHCI_BDF,
+// NIC_BDF. That is what forces a KERNEL REBUILD to add a driver for a device nobody taught it about,
+// and driver porting is the roadmap - so the kernel stops interpreting and starts reporting.
+//
+// The set is SHRINKING and this list is maintained with it: `AHCI_*` is gone (D3c), because
+// `block-driver` names the class code 0x010601 like any other device and nothing asked the kernel for
+// "the AHCI controller" any more. An example list that names a static which no longer exists is the
+// same defect as a counter nobody increments - it reads as fact and is not.
+//
+// A device is identified by its PCI CLASS CODE - the 24-bit (class, subclass, prog-if) triple that
+// is an INDUSTRY STANDARD: 0x0C0330 IS "xHCI", everywhere, forever. The kernel never has to be told
+// what that means, which is exactly the property the per-class statics lack.
+//
+// Bounded and flat (§26.6): a fixed array, no heap, filled once during the boot scan. 32 is well
+// above what any board here presents (the Wyse, the busiest, enumerates 16).
+pub const MAX_DEVICES: usize = 32;
 
-/// All discovered xHCI controllers (a system may have several; the boot drive
-/// and the keyboard often sit on different ones). Recorded during the scan.
-pub static XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static XHCI_BASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-pub static XHCI_IRQS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
-pub static XHCI_BDFS: [AtomicU32; 4] = [const { AtomicU32::new(0xFFFF) }; 4];
+/// One device as the bus reports it. No interpretation: the class code is the device's own claim
+/// about what it is, and the BAR/BDF are read straight from config space.
+#[derive(Clone, Copy)]
+pub struct PciDevice {
+    /// Slot in the scan table. Stable for the life of the boot, which is what makes it usable as the
+    /// index of a PERMANENT per-device DMA reservation (§12) - the thing a class name used to key.
+    pub index: usize,
+    /// (bus << 8) | (dev << 3) | func - the same packing `*_BDF` uses.
+    pub bdf: u32,
+    /// (class << 16) | (subclass << 8) | prog_if.
+    pub class_code: u32,
+    /// ALL SIX BARs, 64-bit-combined and masked. 0 = absent, or the high half of a 64-bit pair.
+    ///
+    /// Six, not one, because WHICH BAR holds a device's registers is a property of the DEVICE:
+    /// xHCI and the NICs use BAR0, AHCI uses BAR5 (ABAR). Recording only BAR0 was the first version
+    /// of this table, and the boot-time cross-check below caught it at once - AHCI read back 0
+    /// against a static that said 0xfebd9000. The kernel still knows nothing about which is which:
+    /// the driver's own row names the index, and an index is not an address.
+    pub bar: [u64; 6],
+    /// The interrupt LINE from config space (0x3C). Not the vector we route - see `hw_irqs_for`.
+    pub irq_line: u8,
+    pub vendor: u16,
+    pub device: u16,
+}
 
-/// Discovered EHCI (USB 2.0) controller - the T630's back ports hang off it
-/// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
-/// the `xhci` driver gets the xHCI BAR. First EHCI found wins.
-pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF of the EHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
-pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
+static DEV_BDF:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0xFFFF) }; MAX_DEVICES];
+static DEV_CLASS: [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+/// Flattened [device][bar] - DEV_BARS[d * 6 + b].
+static DEV_BARS:  [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+static DEV_IRQ:   [AtomicU8;  MAX_DEVICES] = [const { AtomicU8::new(0) }; MAX_DEVICES];
+static DEV_VEN:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Record one device during the scan. Loud when full rather than silently dropping the tail: a
+/// device that is present but unreported reads later as "no such hardware" (invariant 12).
+fn record_device(bdf: u32, class_code: u32, bars: [u64; 6], irq_line: u8, vendor: u16, device: u16) {
+    let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+    if n >= MAX_DEVICES {
+        crate::kprintln!("pci: device table full ({}) - {:#06x} class {:#08x} NOT recorded",
+                         MAX_DEVICES, bdf, class_code);
+        return;
+    }
+    DEV_BDF[n].store(bdf, Ordering::Relaxed);
+    DEV_CLASS[n].store(class_code, Ordering::Relaxed);
+    for (i, b) in bars.iter().enumerate() { DEV_BARS[n * 6 + i].store(*b, Ordering::Relaxed); }
+    DEV_IRQ[n].store(irq_line, Ordering::Relaxed);
+    DEV_VEN[n].store(((vendor as u32) << 16) | device as u32, Ordering::Relaxed);
+    DEVICE_COUNT.store(n as u32 + 1, Ordering::Relaxed);
+}
+
+/// The `n`th device the scan found, or `None`.
+pub fn device_at(n: usize) -> Option<PciDevice> {
+    if n >= DEVICE_COUNT.load(Ordering::Relaxed) as usize { return None; }
+    let vd = DEV_VEN[n].load(Ordering::Relaxed);
+    let mut bar = [0u64; 6];
+    for (i, b) in bar.iter_mut().enumerate() { *b = DEV_BARS[n * 6 + i].load(Ordering::Relaxed); }
+    Some(PciDevice {
+        index:      n,
+        bdf:        DEV_BDF[n].load(Ordering::Relaxed),
+        class_code: DEV_CLASS[n].load(Ordering::Relaxed),
+        bar,
+        irq_line:   DEV_IRQ[n].load(Ordering::Relaxed),
+        vendor:     (vd >> 16) as u16,
+        device:     vd as u16,
+    })
+}
+
+/// The FIRST device whose class code matches, or `None`.
+///
+/// First rather than best: a machine with two devices of one class (the Wyse has several USB
+/// controllers) gets its lowest-numbered one, which is the same device the per-class statics chose.
+/// A driver that must have a SPECIFIC instance names a BDF, not a class - that is what `device_at`
+/// and the table are for.
+pub fn find_by_class(class_code: u32) -> Option<PciDevice> {
+    let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+    (0..n.min(MAX_DEVICES)).find_map(|i| match device_at(i) {
+        Some(d) if d.class_code == class_code => Some(d),
+        _ => None,
+    })
+}
+
+/// The first memory BAR a device exposes - the `BAR_AUTO` rule, in one place.
+///
+/// WHICH BAR holds a device's registers is a property of the device, not of its class: the e1000 puts
+/// them in BAR0, the RTL8168 in BAR2 with I/O ports in BAR0. The scan stores 0 for an I/O BAR
+/// deliberately, so "the first non-zero BAR" is the register window on both without the kernel being
+/// told which card it is looking at.
+pub fn first_memory_bar(d: &PciDevice) -> u64 {
+    d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0)
+}
+
+/// The ethernet controller on this machine, from the generic table - `None` if there is none.
+///
+/// This replaces four per-class statics (`NIC_FOUND`, `NIC_MMIO_BASE`, `NIC_BDF`,
+/// `NIC_VENDOR_DEVICE`) that the boot scan filled in for the first device of class 0x020000 it saw.
+/// The facts are identical; where they LIVE is the point. A per-class static is the kernel having been
+/// taught that "NIC" is a thing it should hold a variable for, and adding a driver for a class nobody
+/// taught it about meant adding four more. A lookup by class code needs teaching nothing: 0x020000 is
+/// the device's own claim about what it is, and the table records claims.
+/// The xHCI controller on this machine, from the generic table - `None` if there is none.
+///
+/// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
+/// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
+/// was: "a general design would enumerate every controller + device and bind by class". This is that
+/// design, and it is one line, because `find_by_class` already returns the first match - the pick the
+/// array existed to make.
+///
+/// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
+/// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
+/// answers only "is there one, and what is it" when nobody said.
+/// The EHCI controller on this machine, from the generic table - `None` if there is none.
+///
+/// Replaces `EHCI_FOUND`/`EHCI_MMIO_BASE`/`EHCI_IRQ`/`EHCI_BDF`. This one has more kernel-side callers
+/// than the others - BIOS handoff, an FLR probe, MSI programming and INTx routing - and every one of
+/// them is legitimate kernel work that needs to know WHICH device. That is the distinction the
+/// 2026-09-04 amendment draws: the kernel keeps the facts it needs to program hardware, and gives up
+/// being TAUGHT that "EHCI" is a thing to hold four variables for. 0x0C0320 is the device's own claim.
+pub fn ehci() -> Option<PciDevice> { find_by_class(0x0C_03_20) }
+
+pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
+
+pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
+
+
 
 // AHCI is PCI class 0x01 (mass storage), subclass 0x06 (SATA), progif 0x01 (AHCI).
 const CLASS_MASS_STORAGE: u8 = 0x01;
 const SUBCLASS_SATA: u8 = 0x06;
 const PROGIF_AHCI: u8 = 0x01;
 
-/// Discovered AHCI (SATA) controller - the `block-driver` gets its ABAR (BAR5)
-/// mapped + a DMA arena at spawn, exactly as the USB drivers do (§12,
-/// docs/ahci.md). First AHCI found wins. ABAR is a 32-bit MMIO BAR.
-pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
-pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
-pub static AHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF of the AHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
-pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
 // Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md): identify
 // what NIC hardware is present so we know whether QEMU's e1000 and the T630's chipset share a driver.
 // The first NIC found is recorded for the future `nic-driver` to receive its MMIO BAR + IRQ at spawn,
 // exactly as `block-driver` gets the AHCI ABAR. No driver is bound yet - this is pure identification.
 const CLASS_NETWORK: u8 = 0x02;
-/// Discovered network controller. First NIC found wins. 0xFFFF BDF if none.
-pub static NIC_FOUND:         AtomicBool = AtomicBool::new(false);
-pub static NIC_MMIO_BASE:     AtomicU64  = AtomicU64::new(0);     // BAR0 register space
-pub static NIC_IRQ:           AtomicU8   = AtomicU8::new(0);
-pub static NIC_BDF:           AtomicU32  = AtomicU32::new(0xFFFF); // IOMMU device-table index (H1)
-pub static NIC_VENDOR_DEVICE: AtomicU32  = AtomicU32::new(0);     // config 0x00: vendor | device<<16
 
 /// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
 #[inline]
@@ -151,6 +259,81 @@ fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
         outl(CONFIG_ADDRESS, addr);
         inl(CONFIG_DATA)
     }
+}
+
+/// One complete config read for a holder of `PCI_CFG` - select and fetch, indivisibly.
+///
+/// ATOMIC BY CONSTRUCTION, and that is the point. Exposing "write the address port" and "read the
+/// data port" as two separate operations would let a caller be descheduled between them, or two
+/// callers interleave - and each would then read whichever register the OTHER selected. Worse, the
+/// KERNEL uses this same pair at runtime (`program_msi`, `set_bus_master` on the spawn and kill
+/// paths), so a split pair races the kernel's own accesses and can land a kernel WRITE on a device
+/// the service selected. `PCI_CONFIG_LOCK` above already exists to stop exactly that between cores;
+/// a two-syscall interface simply could not be held inside it, because the caller might never issue
+/// the second half and the kernel would wait on a service (which nothing above the kernel may make
+/// it do). One operation under one lock removes the window entirely.
+///
+/// The address is FORCED WELL-FORMED - enable bit set, reserved bits 30:24 cleared, offset
+/// dword-aligned - so a caller cannot ask for a malformed configuration cycle. What the kernel does
+/// NOT do is interpret the selector any further: which bus, device and function `sel` names is the
+/// caller's knowledge, not a device the kernel vouches for.
+///
+/// `offset` is folded into the address the way mechanism #1 requires; the data port is read whole.
+pub(super) fn cfg_read_gated(sel: u32, offset: u16) -> Option<u32> {
+    let addr = 0x8000_0000u32 | (sel & 0x00FF_FF00) | ((offset as u32) & 0xFC);
+    // Lock held across the address+data pair - see `PCI_CONFIG_LOCK`.
+    let _g = PCI_CONFIG_LOCK.lock();
+    // SAFETY: mechanism #1 on the two fixed configuration ports, exactly as `config_read32` above.
+    // The address is masked well-formed immediately above, so no other port and no malformed cycle
+    // is reachable through here. A config read has no effect on memory and cannot fault.
+    Some(unsafe {
+        outl(CONFIG_ADDRESS, addr);
+        inl(CONFIG_DATA)
+    })
+}
+
+/// Read a device's first memory BAR and its IRQ line STRAIGHT FROM CONFIG SPACE, given only its BDF.
+///
+/// This is the primitive step D3 turns on. Under D the kernel stops scanning the bus and stops
+/// deciding which device is "the NIC" - that is semantics, and it belongs in `hw-enumerator` (§26.10).
+/// What it must NOT stop doing is deriving AUTHORITY from hardware: the address a driver's MMIO
+/// capability covers, and the vector its interrupt capability routes.
+///
+/// The distinction is the one already settled for addresses: **a service may identify a device; it may
+/// not thereby acquire authority over that device.** So the supervisor names a BDF - an identifier -
+/// and the kernel reads that device's own registers to learn what the BDF is worth. A reported BAR
+/// would be a value the kernel had to trust; a reported BDF is a question the kernel answers itself.
+///
+/// It needs no new mechanism. Config reads already exist here (the kernel performs every
+/// `PciCfgRead` on a service's behalf), MSI programming already exists (`program_msi`), and interrupt
+/// routing is one of the six kernel responsibilities by name (§4.3). What leaves under D3 is the
+/// SCAN - the bus walk and the class matching - not the register access.
+///
+/// "First memory BAR" is the BAR_AUTO rule the spawn path uses, and it is a rule rather than an index
+/// because WHICH BAR holds a device's registers is a property of the device: the e1000 uses BAR0, the
+/// RTL8168 puts I/O ports there and its registers in BAR2. I/O BARs are skipped (bit 0 set), and a
+/// 64-bit BAR (bits[2:1] = 10) takes its high half from the next slot.
+pub fn bar_and_irq_from_bdf(bdf: u32) -> (u64, u8) {
+    let bus  = ((bdf >> 8) & 0xFF) as u8;
+    let dev  = ((bdf >> 3) & 0x1F) as u8;
+    let func = (bdf & 0x7) as u8;
+
+    let mut bi = 0usize;
+    let mut bar = 0u64;
+    while bi < 6 {
+        let lo = config_read32(bus, dev, func, 0x10 + (bi as u8) * 4);
+        if lo == 0 { bi += 1; continue; }
+        if lo & 0x1 != 0 { bi += 1; continue; }
+        if lo & 0x6 == 0x4 && bi + 1 < 6 {
+            let hi = config_read32(bus, dev, func, 0x10 + ((bi + 1) as u8) * 4);
+            bar = ((hi as u64) << 32) | ((lo & 0xFFFF_FFF0) as u64);
+        } else {
+            bar = (lo & 0xFFFF_FFF0) as u64;
+        }
+        break;
+    }
+    let irq = (config_read32(bus, dev, func, 0x3C) & 0xFF) as u8;
+    (bar, irq)
 }
 
 /// Write one 32-bit dword to PCI config space (mechanism #1). `offset` is
@@ -290,11 +473,9 @@ pub fn set_power_d0(bdf: u32) {
 /// handed off. Re-enable when EHCI confinement is revisited.
 #[allow(dead_code)]
 pub fn ehci_bios_handoff() {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
-    let mmio = EHCI_MMIO_BASE.load(Ordering::Relaxed);
-    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = ehci() else { return };
+    let mmio = dev.bar[0];
+    let bdf = dev.bdf;
     if mmio == 0 || bdf == 0xFFFF {
         return;
     }
@@ -386,10 +567,8 @@ pub fn ehci_bios_handoff() {
 /// confinement) and the device that was leaning on firmware support breaks.
 /// Idempotent; no-op if no xHCI, no extended caps, or no Legacy Support cap.
 pub fn xhci_bios_handoff() {
-    if !XHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
-    let mmio = XHCI_MMIO_BASE.load(Ordering::Relaxed);
+    let Some(dev) = xhci() else { return };
+    let mmio = dev.bar[0];
     if mmio == 0 {
         return;
     }
@@ -485,10 +664,8 @@ pub fn xhci_bios_handoff() {
 /// machine does not scrub the controller's stale firmware-era internal DMA state.
 /// Detection only - does not perform the reset. No-op if no EHCI.
 pub fn ehci_flr_probe() {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
-    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = ehci() else { return };
+    let bdf = dev.bdf;
     if bdf == 0xFFFF {
         return;
     }
@@ -768,15 +945,13 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     false
 }
 
-/// Program the picked xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
+/// Program the xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
 /// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
 /// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
 /// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
 pub fn program_xhci_msi() -> bool {
-    if !XHCI_FOUND.load(Ordering::Relaxed) {
-        return false;
-    }
-    let bdf = XHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = xhci() else { return false };
+    let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
     // Prefer plain MSI; fall back to MSI-X only when the device offers no MSI (what `qemu-xhci` does).
@@ -792,6 +967,10 @@ pub fn program_xhci_msi() -> bool {
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
 /// ready (single-core), where the driver runs on the BSP anyway. Previously hardcoded core 1, which had
 /// drifted away from the drivers' actual cores (2/3) - the co-location is now real (docs/power.md).
+/// The LAPIC id an allocated pool vector should be delivered to. Same rule as the named USB
+/// vectors: the core the owning driver is pinned to, so a device event wakes that core directly.
+pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
+
 fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
     if crate::smp::core::is_ready(driver_core) {
         crate::smp::core::core_lapic_id(driver_core) as u8
@@ -806,10 +985,8 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 /// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
 /// boot which interrupt path the running machine's EHCI needs.
 pub fn program_ehci_msi() -> bool {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return false;
-    }
-    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = ehci() else { return false };
+    let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::EHCI_CORE);
     // MSI first, MSI-X only as a fallback - see `msi_ordering`.
@@ -834,9 +1011,7 @@ pub fn program_ehci_msi() -> bool {
 /// matches the hardware delivers. Each is registered as a level route so dispatch masks - and the
 /// driver unmasks - the whole set together. No-op if no EHCI. Call after `ioapic::init()`.
 pub fn route_ehci_intx() {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
+    let Some(dev_pci) = ehci() else { return };
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     // Deliver to the BSP (core 0) - a legacy PCI INTx pin routes through the IOAPIC only to the
     // BSP on this hardware (unlike an MSI, which can target any core). The EHCI driver is pinned
@@ -845,13 +1020,13 @@ pub fn route_ehci_intx() {
     // idle, halted AP doesn't service promptly). Verified on the T630: INTx delivers to the BSP;
     // routing it to an AP's LAPIC id silently dropped it.
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
-    let legacy = EHCI_IRQ.load(Ordering::Relaxed);
+    let legacy = dev_pci.irq_line;
 
     // Legacy INTx only asserts the device's INTx# pin when PCI Command bit 10 (Interrupt
     // Disable) is CLEAR. If firmware left it set (common after MSI-style init elsewhere), even
     // a correct IOAPIC route delivers nothing. Clear it (and keep bus-master for the EHCI's DMA).
     {
-        let bdf = EHCI_BDF.load(Ordering::Relaxed);
+        let bdf = dev_pci.bdf;
         let bus = ((bdf >> 8) & 0xFF) as u8;
         let dev = ((bdf >> 3) & 0x1F) as u8;
         let func = (bdf & 0x07) as u8;
@@ -896,6 +1071,40 @@ pub fn init() {
                 let class = (class_reg >> 24) as u8;
                 let subclass = (class_reg >> 16) as u8;
                 let progif = (class_reg >> 8) as u8;
+
+                // RECORD IT, whatever it is, BEFORE any per-class branch below cares what it is.
+                // This is the whole of step D1 on the scan side: the table is what the kernel knows,
+                // and it knows nothing about what any of it MEANS. The per-class statics below are
+                // now a derived view of this table and go away with the last reader.
+                {
+                    let device_id = ((config_read32(bus as u8, dev, func, 0x00) >> 16) & 0xFFFF) as u16;
+                    // All six BARs (0x10..0x24). A 64-bit memory BAR (bits[2:1] = 10) consumes
+                    // the NEXT slot as its high half, which is then left 0 rather than read as a
+                    // BAR of its own - reading it as one would invent a window out of an address.
+                    let mut bars = [0u64; 6];
+                    let mut bi = 0usize;
+                    while bi < 6 {
+                        let off = 0x10u8 + (bi as u8) * 4;
+                        let lo = config_read32(bus as u8, dev, func, off);
+                        if lo & 0x1 != 0 { bi += 1; continue; }   // I/O-space BAR, not memory
+                        if lo & 0x6 == 0x4 && bi + 1 < 6 {
+                            let hi = config_read32(bus as u8, dev, func, off + 4);
+                            bars[bi] = ((hi as u64) << 32) | ((lo & 0xFFFF_FFF0) as u64);
+                            bi += 2;
+                        } else {
+                            bars[bi] = (lo & 0xFFFF_FFF0) as u64;
+                            bi += 1;
+                        }
+                    }
+                    record_device(
+                        ((bus as u32) << 8) | ((dev as u32) << 3) | func as u32,
+                        ((class as u32) << 16) | ((subclass as u32) << 8) | progif as u32,
+                        bars,
+                        (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8,
+                        vendor,
+                        device_id,
+                    );
+                }
                 // Log EVERY USB host controller (subclass 0x03), of any kind, so
                 // we can see the full USB topology - devices may live on a second
                 // xHCI or an EHCI/OHCI the boot-port controller doesn't cover.
@@ -922,38 +1131,8 @@ pub fn init() {
                     );
                     // Record every xHCI into the array.
                     if progif == PROGIF_XHCI {
-                        let n = XHCI_COUNT.load(Ordering::Relaxed) as usize;
-                        if n < 4 {
-                            XHCI_BASES[n].store(mmio_base, Ordering::Relaxed);
-                            XHCI_IRQS[n].store(irq, Ordering::Relaxed);
-                            XHCI_BDFS[n].store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                            XHCI_COUNT.store((n + 1) as u32, Ordering::Relaxed);
-                        }
                     }
                     // Record the first EHCI controller (T630 back ports, §12).
-                    if progif == PROGIF_EHCI && !EHCI_FOUND.load(Ordering::Relaxed) {
-                        EHCI_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
-                        EHCI_IRQ.store(irq, Ordering::Relaxed);
-                        EHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                        EHCI_FOUND.store(true, Ordering::Relaxed);
-                    }
-                }
-                // AHCI (SATA) controller - the block driver's disk (docs/ahci.md).
-                if class == CLASS_MASS_STORAGE && subclass == SUBCLASS_SATA
-                    && progif == PROGIF_AHCI && !AHCI_FOUND.load(Ordering::Relaxed)
-                {
-                    // ABAR is BAR5 (offset 0x24), a 32-bit memory BAR.
-                    let bar5 = config_read32(bus as u8, dev, func, 0x24);
-                    let abar = (bar5 & 0xFFFF_FFF0) as u64;
-                    let irq = (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8;
-                    AHCI_ABAR.store(abar, Ordering::Relaxed);
-                    AHCI_IRQ.store(irq, Ordering::Relaxed);
-                    AHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                    AHCI_FOUND.store(true, Ordering::Relaxed);
-                    crate::kprintln!(
-                        "pci: AHCI at {:02x}:{:02x}.{} vendor={:#06x} ABAR={:#x} IRQ={}",
-                        bus, dev, func, vendor, abar, irq
-                    );
                 }
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
@@ -985,33 +1164,60 @@ pub fn init() {
                         "pci: NIC (network ctrl, subclass {:#04x}) at {:02x}:{:02x}.{} vendor={:#06x} device={:#06x} MMIO={:#x} IRQ={}",
                         subclass, bus, dev, func, vendor, device, mmio_base, irq
                     );
-                    if !NIC_FOUND.load(Ordering::Relaxed) {
-                        NIC_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
-                        NIC_IRQ.store(irq, Ordering::Relaxed);
-                        NIC_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                        NIC_VENDOR_DEVICE.store(vd, Ordering::Relaxed);
-                        NIC_FOUND.store(true, Ordering::Relaxed);
-                    }
                 }
             }
         }
     }
-    // Use the first xHCI for the driver. (Multiple xHCIs are recorded above; a
-    // general design would enumerate every controller + device and bind by class.)
-    let count = XHCI_COUNT.load(Ordering::Relaxed);
-    if count > 0 {
-        let pick = 0;
-        let base = XHCI_BASES[pick].load(Ordering::Relaxed);
-        let bdf = XHCI_BDFS[pick].load(Ordering::Relaxed);
-        XHCI_MMIO_BASE.store(base, Ordering::Relaxed);
-        XHCI_IRQ.store(XHCI_IRQS[pick].load(Ordering::Relaxed), Ordering::Relaxed);
-        XHCI_BDF.store(bdf, Ordering::Relaxed);
-        XHCI_FOUND.store(true, Ordering::Relaxed);
-        crate::kprintln!(
-            "pci: driver uses xHCI #{} of {} (MMIO={:#x} BDF={:02x}:{:02x}.{})",
-            pick, count, base, (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7
-        );
-    } else {
-        crate::kprintln!("pci: no xHCI controller found");
+    // CROSS-CHECK: the generic table against the per-class statics it will replace.
+    //
+    // Two independent views of one truth must agree BEFORE anything is switched over to the new one.
+    // Printed once at boot, so the agreement is evidence in the log rather than an assumption in a
+    // commit message - and the day they disagree, the log says which device and which fact.
+    let n = DEVICE_COUNT.load(Ordering::Relaxed);
+    crate::kprintln!("pci: device table - {} device(s) recorded (generic, no class knowledge)", n);
+
+    // ONE LINE PER DEVICE, in the same shape `hw-enumerator` prints, so the two walks can be DIFFED
+    // rather than compared by count.
+    //
+    // The count alone is what a hardware run actually gave: the Wyse reported 15 here against the
+    // userspace walk's 14, which says a device is missing without saying WHICH - and "which" is the
+    // whole question, because the answer decides whether the userspace walk needs to probe more slots,
+    // more buses, or more functions. Retiring this scanner (the point of step D) is gated on the two
+    // walks agreeing on real hardware, and an agreement that can only be checked by counting is not
+    // one anybody can trust.
+    // Each line also CROSS-CHECKS the derive-from-BDF path against the scan that produced the entry.
+    //
+    // `bar_and_irq_from_bdf` is what D3 switches to: the supervisor will name a device and the kernel
+    // will read that device's registers rather than scan for it. Proving the two agree, on every
+    // device of every machine, is what "record, cross-check, and only then switch over" asks for -
+    // and it costs a few config reads per device, once, at boot.
+    let mut derive_ok = true;
+    for i in 0..n {
+        if let Some(d) = device_at(i as usize) {
+            let scan_bar = d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0);
+            let (derived_bar, derived_irq) = bar_and_irq_from_bdf(d.bdf);
+            let agree = derived_bar == scan_bar && derived_irq == d.irq_line;
+            if !agree { derive_ok = false; }
+            crate::kprintln!("pci:   {:02x}:{:02x}.{} class {:#08x} bar {:#x} irq {}{}",
+                             (d.bdf >> 8) & 0xFF, (d.bdf >> 3) & 0x1F, d.bdf & 0x7,
+                             d.class_code, scan_bar, d.irq_line,
+                             if agree { "" } else { " <- DERIVE-FROM-BDF DISAGREES" });
+            if !agree {
+                crate::kprintln!("pci:     scan says bar {:#x} irq {}, reading the BDF says bar {:#x} irq {}",
+                                 scan_bar, d.irq_line, derived_bar, derived_irq);
+            }
+        }
     }
+    crate::kprintln!("pci: derive-from-BDF vs scan: {}",
+                     if derive_ok { "AGREES on every device" } else { "DISAGREES - see above" });
+    // THE STATIC-VS-TABLE CROSS-CHECK IS GONE, because there are no statics left to check.
+    //
+    // It compared four per-class statics - xHCI, EHCI, AHCI, NIC - against the generic table that was
+    // going to replace them, and printed AGREES on every machine on every boot for weeks. That is
+    // what made deleting them a mechanical step rather than a leap: by the time each one went, its
+    // replacement had already been proven equal to it on four machines, in the log, repeatedly.
+    //
+    // What remains above is the OTHER cross-check and it stays: the scan's recorded table against a
+    // fresh read of config space by BDF. Those are still two independent views of one truth, and the
+    // day they disagree the log says which device and which fact.
 }

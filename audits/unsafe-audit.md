@@ -13,6 +13,70 @@ comment.
 
 ---
 
+## 2026-09-03 - arm32: the drainer waits for the wire rather than dropping bytes out of a line
+
+Measurement, not reasoning, produced this one. With the line ring and the single-writer rule in place
+the hardware reported `0 line(s) dropped, 0 bypassed, 0 producer collision(s)` - the whole structure
+above the byte layer held - and **95 bytes discarded per drain, forty-nine times**. The bytes were
+coming out of the MIDDLE of lines, which reads exactly like the splicing the structure was built to
+stop.
+
+So the granularity of loss has to match the granularity of meaning. A line may be dropped, loudly and
+counted, because a missing line is visibly missing. Part of a line may not, because a line with a hole
+in it still looks like a line and lies to whoever reads it.
+
+The byte ring stays where it belongs - stopping an ORDINARY writer from waiting on a 115200 line - and
+the drainer, which is the single agent whose job is the wire and has nothing behind it to starve, now
+waits instead.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 52 -> 53 (+1) | `pl011_write_blocking`: the volatile MMIO loop that polls `PL011_FR.TXFF` and writes `PL011_DR`. Identical to the loop it replaces inside `pl011_write_byte` - same registers, same Device-mapped window, same bounded poll that gives up rather than hanging on a wedged UART - lifted into its own function so the drainer can use it without the discard path attached. One block moved and specialised, not a new kind of access. |
+
+## 2026-09-03 - arm32: one claim, factored out, so a whole line stays whole (feat/supervisor-owns-images)
+
+The line ring added earlier the same day did not reduce the splice rate at all - 0.36% of lines carried
+fragments of two or three messages before it, and 0.36% after. The ring was making writers hand over
+whole lines and then handing those lines to `pl011_write_no_fb`, which by design takes no claim, so the
+drainer put each line on the wire a BYTE at a time with nothing stopping another core writing into the
+gaps. Whole-line queueing on top of a byte-level free-for-all is not whole-line output.
+
+The claim `pl011_write` already had inline is now a function, taken by the drainer for its whole pass
+and by `pl011_write_no_fb` for its whole message. That moves one `unsafe` rather than adding a new
+kind: the `clrex` this layer already requires.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 51 -> 52 (+1) | `claim_serial`: a `clrex` before the claim's compare-exchange. ARMv7 does not guarantee the local exclusive monitor is cleared on exception entry or return, so a core interrupted mid-`ldrex`/`strex` can leave it reserved to a foreign address and every later `strex` fails - permanently, on that core. `pl011_write` carries the identical instruction directly above, for the identical reason, on the identical silicon; this is that requirement applied to the second acquisition site rather than a new one. `clrex` clears the local monitor and has no memory effect. |
+
+## 2026-09-03 - the boot log now says which MACHINE it came from (feat/supervisor-owns-images)
+
+`GodspeedOS 0.12.0 x86_64` names an ARCH, and an arch is not a machine. Two of the four boards this
+system runs on report `x86_64` - an AMD GX-420GI and an Intel Gemini Lake - and they have already
+diverged in ways that mattered: the AMD box needs IOMMU passthrough for a firmware DMA quirk, the Intel
+one has a device with no function 0 and a NIC behind a bridge. Reading a serial log while having to ASK
+which board produced it is how a fact about one machine becomes a claim about the port, which is a
+mistake this project has made before and paid for.
+
+So the banner gained a `cpu:` line, and moved. It used to be printed by `bootcon::init`, which only
+runs on a machine that HAS a framebuffer - so a headless boot printed no identity at all, which is the
+wrong way round for a line whose whole job is to identify a serial log. It is now printed by neutral
+`kernel_main` right after `arch::imp::init`, where serial is up on every arch and the framebuffer
+floor, if the machine has one, is already mirroring. Unconditional, every arch, every machine.
+
+The buffer is a fixed 64-byte stack array (§26.6.1); a longer name is truncated, never grown.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/mod.rs` | 37 -> 40 (+3) | `cpu_identity`: three `__cpuid` calls - leaf `0x80000000` to ask the highest extended leaf supported, leaves `0x80000002`-`4` for the 48-byte brand string, and leaf 0 for the 12-byte vendor id when the brand string is unavailable. CPUID is unprivileged, side-effect-free, and present on every x86_64 CPU; the extended leaves are read only after the leaf-`0x80000000` guard says they exist, which is the documented way to ask. Writes nothing, reads no memory. |
+| `arch/aarch64/mod.rs` | 69 -> 70 (+1) | `cpu_identity`: one `mrs midr_el1`. A side-effect-free system-register read valid at EL1, carrying the implementer in bits [31:24] and the part in [15:4]. Touches no memory. |
+| `arch/arm/mod.rs` | 50 -> 51 (+1) | `cpu_identity`: the ARMv7 form of the same read, `mrc p15, 0, <Rd>, c0, c0, 0`. Same register, same guarantees. |
+
+Only the parts actually run on are NAMED (Cortex-A72 for the Pi 4, Cortex-A7 for the Pi 2); anything
+else prints its raw implementer and part ids rather than a guess, because a confidently wrong name in a
+log is worse than a number the reader can look up. The x86 side prefers the brand string over the
+vendor id for the same reason - it names the part, not just who made it.
+
 ## 2026-08-04 - Pi 4 milestone 22: the display (feat/pi4-aarch64)
 
 The Pi has no bootloader-supplied framebuffer descriptor the way x86 does with Limine, so the ARM asks
@@ -2164,7 +2228,19 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 |------|--------|-----|
 | `arch/x86_64/page_tables.rs` | 41 → 46 (+5) | CR3 read/write + `invlpg` primitives (the MMU-base + TLB seam). |
 | `arch/x86_64/mod.rs` | 33 → 35 (+2) | `switch_to_boot_stack` (the boot stack-pointer seam; `#[inline(always)]`). |
+| `arch/aarch64/mod.rs` | 68 -> 69 (+1) | `claim_serial` reads MPIDR_EL1 (via `boot::get_lapic_id`) to identify the core holding the UART, so a write that re-enters on the SAME core - an ISR logging mid-line, or a panic raised inside a write - is recognised as nested rather than waiting on a claim it already holds.
+
+A side-effect-free system-register read, valid at any point including early boot, which is what makes it safe to take on EVERY log line here. The x86 equivalent is not: core identity there costs an APIC MMIO read with a boot-ordering precondition, and putting it on the serial path was a fix worse than the bug it addressed. Same intent, different cost, different answer. |
+| `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
+
+This block replaces FOUR that an earlier revision of the same feature added (`pci_cfg_out32` / `pci_cfg_in32` in both `arch/x86_64/mod.rs` and `arch/aarch64/mod.rs`, +2 each). Those exposed SELECT and READ as separate operations, which was wrong on its own terms: the index/data pair is stateful, and the kernel drives it too on its spawn and kill paths, so a split interface let a service and the kernel interleave and each act on the other's selected register. A lock could not close that, because holding one across two syscalls means the kernel waiting on a service. Folding them into one atomic operation removed the race AND three of the four unsafe lines, and the aarch64 access moved into `pcie.rs` beside the registers it drives rather than reaching in through an exported pointer helper. Both `mod.rs` files return to their pre-branch counts. |
 | `arch/x86_64/interrupts.rs` | 21 → 22 (+1) | `local_irq_save` (the irq-save half; `local_irq_restore` calls `enable_interrupts`). |
+
+
+Placed here DELIBERATELY. The first version put the `unsafe` in `syscall/dispatch.rs` and grew that file 2 -> 4 - and dispatch.rs is a §18.5 GRANDFATHERED FLOOR, which may decrease freely but may increase only by an amendment with a written rationale. §18.5 says new `unsafe` a feature needs must first try to live in a permitted layer, so it moved to `arch/` and dispatch.rs is back at its floor with no amendment required - the worked example that section describes, hit for real.
+
+The port ALLOWLIST moved with it, which is the better placement independently: the check now sits beside the instruction it guards, so the two cannot drift apart, and the wrappers are SAFE by construction rather than by a contract a caller could get wrong. |
+| `arch/x86_64/interrupts.rs` | 22 → 26 (+4) | The MSI VECTOR POOL (step D1b): `macro_rules! msi_pool_vector` generates eight identical naked ISR stubs, so the four lines are written ONCE in the macro body and expanded eight times - `#[unsafe(naked)]`, `pub unsafe extern "C" fn` (the stub), `unsafe extern "C" fn` (its handler), and the `unsafe { dispatch_irq(vec) }` inside it. Same shape as `xhci_msi_isr_stub` beside it, which has run on four machines; the macro means the shape is written once instead of eight times, which is why the count grew by 4 and not 32. Permitted layer (`arch/`, §18.1); each carries a `// SAFETY:` and the asm resolves its handler with `sym` rather than a `#[no_mangle]` name nothing checks. |
 | `memory/allocator.rs` | 44 → 43 (-1) | CR3-read asm replaced by `arch::imp::read_page_table_base`. |
 | `smp/ipi.rs` | 25 → 23 (-2) | CR3 reload + `invlpg` + rflags save/restore replaced by `arch::imp` primitives. |
 | `smp/spinlock.rs` | 9 → 5 (-4) | irq-save/restore asm replaced by `arch::imp::local_irq_save/restore` (no-op stub in the host lib). |
@@ -2324,7 +2400,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 68 | permitted |
+| arch/aarch64/mod.rs | 70 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |
@@ -2359,7 +2435,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 49 | permitted |
+| arch/arm/mod.rs | 53 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
@@ -2368,14 +2444,14 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/boot.rs | 107 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 2 | permitted |
-| arch/x86_64/interrupts.rs | 22 | permitted |
+| arch/x86_64/interrupts.rs | 26 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 37 | permitted |
+| arch/x86_64/mod.rs | 40 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
-| arch/x86_64/pci.rs | 20 | permitted |
+| arch/x86_64/pci.rs | 21 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 15 | permitted |
+| arch/x86_64/syscall_entry.rs | 16 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 46 | permitted |
 | memory/frame.rs | 1 | permitted |
@@ -2385,9 +2461,10 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 8 | permitted |
 | smp/placement.rs | 1 | permitted |
+| smp/names.rs | 4 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
-| loader.rs | 2 | grandfathered |
+| loader.rs | 1 | grandfathered |
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
@@ -3030,6 +3107,84 @@ no neutral file gained any `unsafe`. `arch/arm/mod.rs` and `arch/riscv32/mod.rs`
 the current stub sizes; they may grow as a real port fills the arch surface, each increase
 carrying its own `// SAFETY:` and an audit bump.
 
+
+## `copy_user_to_kernel` (2026-08-30) - the loader can read an image out of USER memory; `loader.rs` 2 -> 1
+
+Step C hands the kernel a service image from the SUPERVISOR's address space instead of its own rodata
+(`docs/service-ownership.md`). `read_user_bytes` cannot carry it: it is capped at one message (4 KiB)
+and lands in a shared per-core scratch slot, while the largest service image is 405 KiB.
+
+**New arch seam, one per arch:** `copy_user_to_kernel(src, dst, len) -> bool`, **bounded to ONE PAGE
+per call**. The loader copies the overlap of a single destination page at a time, so the kernel never
+holds more than a page of an untrusted image at once. The bound lives in the seam, where it can be
+read off the source, rather than in the caller's discipline (26.6).
+
+| file | count | what |
+|---|---|---|
+| `arch/x86_64/syscall_entry.rs` | 15 -> 16 (+1) | the guarded `copy_nonoverlapping`, under the same `USER_COPY_ACTIVE` guard as `read_user_bytes`: a #PF on the source does not return, `pf_handler` kills the caller. |
+| `arch/arm/mod.rs` | 49 -> 50 (+1) | the same copy, after `validate_user_ptr` + `user_range_accessible` probing, as this port's `read_user_bytes` already does. |
+| `arch/aarch64/uaccess.rs` | unchanged | the new `copy_user_to_kernel` is a SAFE wrapper over the existing private `copy_from_user`. |
+| `loader.rs` | 2 -> **1** (-1) | **shrank.** See below. |
+
+**`loader.rs` got smaller while gaining the ability to read user memory**, which is worth recording
+because the obvious implementation would have grown it. The first attempt added an `unsafe fn
+copy_out(off, *mut u8, len)` beside the existing raw `write_bytes` zeroing and raw
+`copy_nonoverlapping`: 2 -> 4, in a file that is neither a permitted layer nor one of 18.5's
+grandfathered floors.
+
+Instead the destination page is turned into a **safe slice ONCE**:
+
+```rust
+// SAFETY: `phys` is from the frame allocator and exclusively ours until mapped; the HHDM is
+// established before load() is ever called.
+let page: &mut [u8] = unsafe {
+    core::slice::from_raw_parts_mut((get_hhdm_offset() + phys) as *mut u8, PAGE_SIZE)
+};
+page.fill(0);                                   // was: raw write_bytes
+src.read_into(src_off, &mut page[a..b]);        // was: raw copy_nonoverlapping
+```
+
+Both raw writes become safe slice operations, and the only remaining raw access in the whole loader
+is that one `from_raw_parts_mut`. This is 18.5's rule applied rather than argued around: the new raw
+access belongs in a permitted layer (the arch seam), and the caller keeps none of it.
+
+**The double-fetch this design closes.** A user image is mutable by its owner WHILE the kernel reads
+it, so validating program headers in place and then acting on them would let a supplier pass
+validation and rewrite the offsets before the copy - landing bytes at an address the kernel approved
+a different value for. The header window (one page: an ELF64 header is 64 bytes and a program header
+56, so 72 of them fit) is therefore fetched ONCE into a bounded kernel buffer, and every decision is
+taken from that immutable copy. Segment CONTENT is streamed live and never interpreted, so a byte
+that changes mid-copy can only corrupt the image its own supplier provided. An image whose program
+headers sit beyond the window is refused, loudly, rather than read in place.
+
+## `smp/names.rs` NEW, 4 lines (2026-08-30) - owned task names, so a SPAWNER can name what it spawns
+
+Task names were `[&'static str; MAX_TASKS]`. That is a small thing with a large consequence: a name
+had to be a string literal compiled into the kernel, so a caller could not supply one - which is
+exactly why the kernel held a `service_config` row per service. Making the bytes owned is the
+prerequisite for taking that catalogue out of ring 0 (`docs/probe-params-design.md`; 193 rows and
+2,317 lines left `kernel/src/task/mod.rs` in the same change).
+
+**Why it is in `smp/` and not `task/`.** Owning the bytes needs interior mutability behind a shared
+`static`. Written where it is used, that would have grown `task/scheduler.rs` from 37 to 40 - a
+grandfathered floor, which 18.5 permits to grow only by a CLAUDE.md amendment, and only after trying
+a permitted layer first. A permitted layer fits here honestly rather than as a dodge: a shared array
+with one writer per slot and readers on every core IS a concurrency primitive, and it belongs beside
+`SpinLock`. `task/scheduler.rs` stays at 37 with no `unsafe` of its own; the four blocks are audited
+once, here.
+
+| Block | Argument |
+|---|---|
+| `unsafe impl Sync for NameTable` | Every write goes through `set`, whose caller guarantees it is the only writer for that slot; readers only read bytes below an `Acquire`-loaded length. |
+| `get`: `&*self.bytes.get()` | The length was published with `Release` after those bytes were written, so they are initialised and stable. The target is a `static`, so the returned `'static` borrow is genuine and not an assertion. |
+| `set`: `&mut *self.bytes.get()` | Caller-guaranteed exclusive write access to the slot (the spawn path holds it reserved with interrupts off, before the task is enqueued and therefore before another core can observe it). |
+| `set` (the `unsafe fn` itself) | The single-writer precondition is a real data-race precondition, not boot ordering, so 18.5's "make it a safe `fn`" does not apply - violating it is UB, not a wedge. |
+
+**Length last, and length first.** The writer publishes bytes then length (`Release`); a reader loads
+length (`Acquire`) then bytes. A reader racing a write sees the old length over new bytes, or the new
+length over new bytes - never a length that outruns what has been written.
+
+Bounded and flat (26.6.1): a fixed `MAX_TASKS * 32` byte array in `.bss`. No heap, no interner.
 
 ## `arch/arm/irq.rs` 13 -> 16 (+3): routing the USB interrupt to userspace (arm32 Phase 1)
 

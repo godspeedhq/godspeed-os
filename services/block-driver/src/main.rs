@@ -149,10 +149,27 @@ fn backend_run(ctx: &ServiceContext) -> ! {
     // first request, through the same self-heal that already recovers a stick plugged in after boot -
     // hardware-proven across several plug/unplug cycles. Trading a guaranteed 20 s stall for a
     // recovery path that is exercised constantly is the right way round.
-    let sectors = xhciblk::sectors_now(&ctx);
-    if sectors == 0 {
-        ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");
-    }
+    // THE STARTUP COUNT IS FOR THE LOG LINE ONLY - `serve` re-derives capacity on every request, so
+    // this number is shadowed the moment anything asks. What matters is that it does not ANNOUNCE a
+    // verdict it has not earned: "no USB storage stick" said on an unanswered query is the sentence
+    // that made a restarting `xhci` look like an empty bay in the log, and a reader who trusted it
+    // went looking for the stick rather than for the peer.
+    let sectors = match xhciblk::sectors_now(&ctx) {
+        xhciblk::Capacity::Sectors(n) => {
+            if n == 0 {
+                ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");
+            }
+            n
+        }
+        xhciblk::Capacity::Unreachable => {
+            // "No USABLE capacity" covers both cases this arm carries - a peer that said nothing
+            // and one whose reply did not parse - without claiming either. Saying "not answering"
+            // for a reply that arrived but was too short is the same species of wrong sentence
+            // this whole change is about.
+            ctx.log("block-driver: no usable capacity from the USB host service yet (no answer, or an answer that did not parse) - re-derived on the first request");
+            0
+        }
+    };
     usbdisk::run(ctx, sectors)
 }
 

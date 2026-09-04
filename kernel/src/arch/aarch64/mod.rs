@@ -782,6 +782,11 @@ extern "C" fn boot_high() -> ! {
         video::start_console(fb);
     }
 
+    // Which image, which machine (see `crate::banner`). OUTSIDE the framebuffer check on purpose: a
+    // headless Pi is exactly the case whose log is read over the serial cable. This port does not
+    // reach `kernel_main`, so the call is here rather than there.
+    crate::banner();
+
     // Vectors AFTER the MMU, because VBAR_EL1 holds a virtual address and installing it before
     // translation is live would point at an address that is about to mean something else. From here on
     // a fault reports itself instead of wandering off into whatever sits at the reset vector.
@@ -888,10 +893,10 @@ extern "C" fn boot_high() -> ! {
             // second path also has to be kept working to be worth having, and this one was not being
             // exercised. The driver is deleted, so this is the only path and cannot rot.
             //
-            // `NIC_FOUND` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
+            // `soc_nic_present` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
             // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
             // can drive was found", which a probed-and-present GENET satisfies.
-            pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
+            GENET_PRESENT.store(true, core::sync::atomic::Ordering::Release);
             // Route GENET's interrupt to userspace. Registered LEVEL-triggered, which is what makes
             // `route::deliver` mask it before handing it over: GENET holds its line until the driver
             // clears `INTRL2_0`, and that register is in MMIO only the driver maps.
@@ -929,12 +934,10 @@ extern "C" fn boot_high() -> ! {
             // The BDF is the encoding `pci::clear_bus_master` and friends take on x86. Those are all
             // stubs here (there is no generic config-space accessor exposed at this layer), so it is
             // recorded for the log and for whoever wires the quiesce path, not acted on.
-            pci::XHCI_MMIO_BASE.store(dev.bar0, core::sync::atomic::Ordering::Relaxed);
-            pci::XHCI_BDF.store(
-                ((dev.bus as u32) << 8) | ((dev.dev as u32) << 3) | (dev.func as u32),
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            pci::XHCI_FOUND.store(true, core::sync::atomic::Ordering::Release);
+            // NOTHING TO RECORD HERE ANY MORE. This stored the VL805's BAR0, BDF and a
+            // "found" flag into three per-class statics; `pcie::init` has already put the same
+            // device in the generic table, and `pci::xhci()` is a lookup in that table (D3d). The
+            // statics were a second copy of a fact one line of enumeration already held.
 
             // The kernel does not drive USB. There is no longer a build in which it does.
             {
@@ -1074,6 +1077,15 @@ extern "C" fn boot_high() -> ! {
 }
 
 /// Print a u64 as `0x...` - enough diagnostics to report a register without pulling in formatting.
+/// RESIDUAL, recorded rather than left to be discovered (§26.7): a line assembled from SEVERAL calls
+/// is not atomic, even though each call is.
+///
+/// `put_str` claims the UART for its own run and releases it, so a boot line built as
+/// `put_str(..) + put_dec(..) + put_str(..)` has gaps another core can write into. The claim is
+/// owner-aware and nests, so the fix is bracketing helpers around a whole line rather than a claim per
+/// token - but every such site is boot-time code, where contention is lowest, and the interleaving
+/// actually observed on hardware came from the runtime paths (kernel log against service console),
+/// which are now serialised per line. Left open deliberately, not overlooked.
 pub(crate) fn put_hex(v: u64) {
     put_str(b"0x");
     let mut started = false;
@@ -1111,14 +1123,12 @@ pub(crate) fn put_str(s: &[u8]) {
     // reporting how many cores had come up. An instrument that loses the measurement is worse than no
     // instrument, because it looks like a result.
     #[cfg(feature = "pi4")]
-    let held = claim_serial();
+    let claim = claim_serial();
     for &b in s {
         put_byte(b);
     }
     #[cfg(feature = "pi4")]
-    if held {
-        SERIAL_BUSY.store(false, Ordering::Release);
-    }
+    release_serial(claim);
     // Serial first, then the display: serial is the source of truth, and a mirror that ran first would
     // put the display ahead of the log it is mirroring.
     #[cfg(feature = "pi4")]
@@ -1371,7 +1381,7 @@ pub fn net_frame_rx(_dst: &mut [u8]) -> usize {
 pub fn net_info() -> Option<([u8; 6], bool)> {
     None
 }
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
@@ -1494,11 +1504,64 @@ pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 //
 // `\n` is expanded to `\r\n`: the neutral log emits bare LF, and a serial terminal needs the CR or
 // every line starts where the last one ended.
+/// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
+///
+/// **A log has to say which MACHINE it came from.** The boot banner reports the ARCH, and an arch name
+/// is not a board: this project runs two ARM boards whose behaviour has already diverged in ways that
+/// mattered (one has PCIe and an SMMU-less DMA posture, the other has no PCI at all), and reading a
+/// serial log while having to ASK which produced it is how a fact about one board becomes a claim
+/// about the port.
+///
+/// `MIDR` carries the implementer in bits [31:24] and the part number in [15:4]. Only the parts this
+/// project actually runs on are named; anything else prints its raw ids rather than a guess, because a
+/// wrong name is worse than a number a reader can look up.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let midr: u64;
+    // SAFETY: reading MIDR is a side-effect-free system-register read, available at this exception level.
+    unsafe { core::arch::asm!("mrs {}, midr_el1", out(reg) midr, options(nomem, nostack)) };
+    let implementer = ((midr >> 24) & 0xFF) as u32;
+    let part        = ((midr >> 4) & 0xFFF) as u32;
+
+    let name: &[u8] = match (implementer, part) {
+        (0x41, 0xD08) => b"ARM Cortex-A72",       // Raspberry Pi 4 (BCM2711)
+        (0x41, 0xC07) => b"ARM Cortex-A7",        // Raspberry Pi 2 (BCM2836)
+        (0x41, 0xD03) => b"ARM Cortex-A53",
+        (0x41, 0xD0B) => b"ARM Cortex-A76",
+        (0x42, _)     => b"Broadcom",
+        (0x41, _)     => b"ARM",
+        _             => b"",
+    };
+
+    let mut n = 0usize;
+    for &b in name { if n < buf.len() { buf[n] = b; n += 1; } }
+    // Always append the raw ids. A named part still benefits from them (two boards can share a core),
+    // and an unnamed one has nothing else to go on.
+    for &b in b" (impl 0x" { if n < buf.len() { buf[n] = b; n += 1; } }
+    n = push_hex(buf, n, implementer);
+    for &b in b" part 0x" { if n < buf.len() { buf[n] = b; n += 1; } }
+    n = push_hex(buf, n, part);
+    if n < buf.len() { buf[n] = b')'; n += 1; }
+    n
+}
+
+/// Lower-case hex, no padding - enough for the two small ids above.
+fn push_hex(buf: &mut [u8], mut n: usize, v: u32) -> usize {
+    let mut started = false;
+    for shift in (0..8).rev() {
+        let nib = ((v >> (shift * 4)) & 0xF) as u8;
+        if nib == 0 && !started && shift != 0 { continue; }
+        started = true;
+        let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        if n < buf.len() { buf[n] = c; n += 1; }
+    }
+    n
+}
+
 pub fn serial_write_byte(b: u8) {
     if b == b'\n' { put_byte(b'\r'); }
     put_byte(b);
 }
-/// Held by whichever core is mid-line on the UART.
+/// Held by whichever core is mid-line on the UART, as `core_id + 1`. `0` means free.
 ///
 /// **Without this, multi-core logging is not merely untidy - it is unreadable, and it lies.** Four cores
 /// writing a byte at a time into one FIFO interleave at character granularity, so lines vanish into each
@@ -1507,41 +1570,362 @@ pub fn serial_write_byte(b: u8) {
 /// because their output was shredded by the boot core's. Debugging SMP through that instrument means
 /// drawing conclusions from evidence the instrument destroyed.
 ///
-/// The claim is BOUNDED and never fatal: a core that cannot get it writes anyway rather than spinning
-/// forever. A garbled line is bad; a core deadlocked inside the panic handler trying to report why is
-/// worse, and this path is reachable from panics and ISRs.
+/// The claim is BOUNDED and never fatal: a core that cannot get it within a deadline writes anyway
+/// rather than spinning forever. A garbled line is bad; a core deadlocked inside the panic handler
+/// trying to report why is worse, and this path is reachable from panics and ISRs.
+///
+/// The OWNER is stored, not just a flag, so a write that re-enters this path on the same core - an ISR
+/// logging while that core is mid-line, or a panic raised inside a write - is recognised as nested and
+/// proceeds instead of waiting for a claim it already holds.
 #[cfg(feature = "pi4")]
-static SERIAL_BUSY: AtomicBool = AtomicBool::new(false);
+static SERIAL_OWNER: AtomicU32 = AtomicU32::new(0);
 
-/// Try ONCE for the serial claim. Never spins.
+/// Guards the DISPLAY mirror, separately from the UART.
 ///
-/// **A log line must never make a core wait.** The first version spun up to two million times for the
-/// claim, and held it across the framebuffer render - so every core stalled behind every other core's
-/// glyph drawing and cache maintenance. Boot went from seconds to 104 SECONDS, characters trickled out
-/// one at a time, and a core that had spent ten seconds spinning was correctly declared wedged by the
-/// liveness watchdog. Tidy logs are not worth a stalled scheduler; that trade was never mine to make.
-///
-/// So: one attempt. A contended writer emits its bytes anyway and skips only the display mirror, which
-/// is the expensive part and the part nobody is reading during contention. Lines can interleave under
-/// load - which is what the 32-bit port accepts, for exactly this reason.
+/// Two different costs want two different policies. The UART run is the bottleneck and is worth waiting
+/// for; the framebuffer render is expensive, happens only while the boot log still mirrors, and is
+/// never worth making another core wait for. So the mirror keeps the original try-once rule - a
+/// contended core simply skips it - while the UART gets a bounded wait.
 #[cfg(feature = "pi4")]
-fn claim_serial() -> bool {
-    SERIAL_BUSY
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+static MIRROR_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// What a claim attempt produced.
+#[cfg(feature = "pi4")]
+enum SerialClaim {
+    /// Acquired here; this writer must release it.
+    Held,
+    /// Already held BY THIS CORE further up the stack. Proceed, and do NOT release - the outer writer
+    /// still owns it and releasing here would hand the UART away mid-line.
+    Nested,
+    /// The deadline passed with another core still holding. Write anyway: interleaved output is bad,
+    /// a stalled core is worse, and this is exactly the behaviour the port had before the wait existed.
+    Expired,
+}
+
+/// Longest a core will wait for the UART before writing anyway.
+///
+/// A DURATION, not a spin count, because a count means a different wait on every machine and the two
+/// boards this runs on clock the generic timer differently (54 MHz on the Pi 4, 62.5 MHz under QEMU).
+///
+/// **DELIBERATELY SHORTER THAN THE LONGEST WRITE, which is a compromise and not an oversight.**
+///
+/// The tempting reasoning is: the neutral log flushes up to `SERIAL_STAGE` (512) bytes in one call,
+/// 512 bytes at 115200 baud is ~44 ms, so a deadline below that expires mid-write and accomplishes
+/// nothing. That reasoning is correct about the mechanism and wrong about the remedy. Raising the
+/// deadline to 150 ms was tried on hardware and made chaos rounds take 6.4 SECONDS each against a
+/// baseline near 1 - cores spending their quanta waiting on a UART instead of running services. That
+/// is the 104-second-boot failure returning by a different route, and it is a far worse bug than a
+/// garbled log line.
+///
+/// So the wait is sized to serialise SHORT lines and to give up rather than queue behind a long flush.
+///
+/// **THE RING IS WHAT ACTUALLY FIXED THE SPLICE, and it is built - this is no longer an interim.** An
+/// earlier revision of this comment ended "this constant is the honest interim" and said splices still
+/// occurred; both were true when written and neither is true now. Runtime writers queue whole lines and
+/// never wait (see `serial_emit`), and hardware measured ZERO splices across 100 chaos rounds on both
+/// the Pi 4 and two x86 boards.
+///
+/// What still uses this deadline is therefore narrow: `put_str`, the EARLY BOOT writer that is
+/// deliberately left off the ring, and the drainer, which is the one core already doing everyone's
+/// wire work. Neither is an ordinary runtime writer, and no ordinary runtime writer waits at all.
+#[cfg(feature = "pi4")]
+fn serial_claim_deadline_ticks() -> u64 {
+    // 10 ms - about one short line's worth of UART time. `timer::frequency` reads CNTFRQ_EL0; a
+    // machine reporting 0 gets no wait at all, which is the old behaviour rather than an unbounded one.
+    timer::frequency() / 100
+}
+
+/// Claim the UART for one line, waiting a BOUNDED time for it.
+///
+/// **Why waiting is affordable here, when spinning for this claim once cost a 104-second boot.** That
+/// disaster was not the wait itself: it was holding the claim across the framebuffer render, so every
+/// core queued behind every other core's glyph drawing and cache maintenance. The render is now outside
+/// the claim entirely (see `MIRROR_BUSY`), and what remains inside it is the UART byte run.
+///
+/// THE WAIT IS VERY NEARLY FREE, and that is the argument this rests on rather than a measurement.
+/// `put_byte` spins for FIFO space, so a contended writer was never proceeding cheaply - it was
+/// already blocking, just destructively. The UART is the bottleneck either way: two cores interleaving
+/// two 80-byte lines occupy it for the same total time as writing those lines one after the other, and
+/// the last core to finish finishes at the same moment under both schemes. Serialising spends time
+/// that was being spent anyway, and buys whole lines with it. What it does NOT do is add a new class
+/// of stall: the pre-existing one is simply relocated from the FIFO wait to the claim wait.
+///
+/// Heavy contention degrades to the OLD behaviour rather than to a stalled core: past the deadline a
+/// writer interleaves exactly as it always did. So this is a strict improvement in the common case
+/// (one other core mid-line, waited out) and a no-op in the pathological one.
+#[cfg(feature = "pi4")]
+fn claim_serial() -> SerialClaim {
+    // SAFETY: a side-effect-free MPIDR_EL1 read. Valid at any point including early boot, which is why
+    // the owner can be identified on THIS path - unlike x86, where core identity costs an APIC MMIO
+    // read with a boot-ordering precondition and must not be taken on every log line.
+    let me = unsafe { boot::get_lapic_id() } + 1;
+    if SERIAL_OWNER.load(Ordering::Acquire) == me {
+        return SerialClaim::Nested;
+    }
+    let deadline = read_cycle_counter().wrapping_add(serial_claim_deadline_ticks());
+    loop {
+        if SERIAL_OWNER
+            .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return SerialClaim::Held;
+        }
+        if read_cycle_counter() >= deadline {
+            return SerialClaim::Expired;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Release the claim, but ONLY if this writer is the one that took it.
+///
+/// A nested writer must not release: the outer one on this core still owns the line it is midway
+/// through, and handing the UART away here would let another core land inside it - reintroducing
+/// exactly the interleaving the claim exists to prevent.
+#[cfg(feature = "pi4")]
+fn release_serial(claim: SerialClaim) {
+    if matches!(claim, SerialClaim::Held) {
+        SERIAL_OWNER.store(0, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE SERIAL LINE RING - why no RUNTIME writer waits for the UART.
+//
+// Four cores writing a byte at a time into one 32-entry FIFO interleave at character granularity, so
+// lines vanish into each other. An instrument that destroys its own measurement is worse than none,
+// because it looks like a result.
+//
+// THREE DESIGNS WERE TRIED ON HARDWARE. Recording the failures, because each one is the argument for
+// what came after it:
+//
+//   1. Claim the UART and SPIN. Held the claim across the framebuffer render too: boot took 104
+//      seconds and cores were declared wedged.
+//   2. Claim it and spin for a BOUNDED time. At 10 ms chaos rounds ran ~2x slow and splices survived;
+//      at 150 ms - sized to actually cover a 512-byte flush, ~44 ms of wire time - rounds went from
+//      about a second to 6.4. Waiting is never worth it: interleaving, a core makes progress and
+//      produces ugly output; waiting, it does nothing at all.
+//   3. A ring, with EVERY writer queueing into it - `put_str` included. That hung the machine before
+//      its first line: no serial output at all, just the firmware's rainbow. `put_str` is the EARLY
+//      BOOT writer, running before the MMU and before the vector table, and it has no splice problem
+//      to fix - every interleave observed was runtime, kernel log against service console. Extending
+//      a runtime fix into the one context with no safety net bought nothing and cost the boot.
+//
+// So: the ring serves the RUNTIME writers only. `put_str` is left exactly as it was, direct and
+// claimed, because that is the code that boots.
+// ---------------------------------------------------------------------------
+
+/// Longest line the ring will take. Matches `log::SERIAL_STAGE`, the largest single flush the neutral
+/// log produces; anything longer goes straight to the wire rather than being truncated.
+#[cfg(feature = "pi4")]
+const SERIAL_LINE_MAX: usize = 512;
+
+/// Lines the ring holds. 128 KiB of `.bss`, fixed - no heap (§26.6.1), bound readable off the constant.
+///
+/// Was 24, sized before the kernel had a name-directory trace. That trace is arch-NEUTRAL
+/// (`ipc/names.rs`) and adds roughly 1,100 lines to a three-minute chaos run, which on the arm32 port
+/// overflowed a 96-line ring three times over. Matching that port's 256 here rather than waiting to
+/// discover the same thing on this one: a full ring drops whole lines, loudly and counted, and a
+/// dropped line is a step missing from the history the trace exists to provide.
+#[cfg(feature = "pi4")]
+const SERIAL_RING_LINES: usize = 256;
+
+/// Lines one core puts on the wire before letting another take over.
+///
+/// A WRITER BECOMES THE DRAINER, so this is work conscripted from whoever happened to log next - and
+/// at a full ring's worth (24) over two passes that was up to 48 lines, roughly a third of a second of
+/// wire time at 115200. A core disappearing for 340 ms to do everyone else's logging is not bounded
+/// behaviour in any useful sense (§26.6); it is the same "one core pays for everyone" shape that made
+/// the spin design unusable, just relocated.
+///
+/// Four lines is enough to keep the wire busy - the next writer along picks up where this one stopped,
+/// and under any load worth draining there is always a next writer. If there is not, the ring simply
+/// waits for one, which costs latency on an idle machine and nothing else.
+#[cfg(feature = "pi4")]
+const SERIAL_DRAIN_BUDGET: usize = 4;
+
+#[cfg(feature = "pi4")]
+struct SerialRing {
+    buf: [[u8; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
+    len: [u16; SERIAL_RING_LINES],
+    head: usize,
+    count: usize,
+    /// Lines lost to a full ring. REPORTED on the next drain, never silently discarded (invariant 12).
+    dropped: u32,
+}
+
+#[cfg(feature = "pi4")]
+impl SerialRing {
+    const fn new() -> Self {
+        SerialRing {
+            buf: [[0; SERIAL_LINE_MAX]; SERIAL_RING_LINES],
+            len: [0; SERIAL_RING_LINES],
+            head: 0,
+            count: 0,
+            dropped: 0,
+        }
+    }
+}
+
+/// The queue.
+///
+/// **Every acquisition is `try_lock`, never `lock`.** This path is reachable from ordinary code, from
+/// interrupt handlers, and from the panic path, and it must not be able to spin or to touch interrupt
+/// state. A failed try writes straight to the wire instead - so a same-core ISR that logs while the
+/// task it interrupted holds the lock DEGRADES to an interleaved line rather than deadlocking, and no
+/// caller can ever be parked here. The hold is a memcpy, so a failed try is rare.
+#[cfg(feature = "pi4")]
+static SERIAL_RING: crate::smp::SpinLock<SerialRing> = crate::smp::SpinLock::new(SerialRing::new());
+
+/// Set while a core is putting queued lines on the wire. Not a lock anyone waits on: a core that finds
+/// it taken has already handed its line over and simply returns.
+#[cfg(feature = "pi4")]
+static SERIAL_DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Once a panic starts the ring is bypassed entirely: a machine that is stopping may never drain a
+/// queue, and the last thing it says is the thing worth saying.
+#[cfg(feature = "pi4")]
+static SERIAL_PANIC_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Stop queueing; write straight to the wire from here on. Called before the panic's first line.
+#[cfg(feature = "pi4")]
+pub fn serial_enter_panic_mode() {
+    SERIAL_PANIC_MODE.store(true, Ordering::Release);
+}
+
+/// Straight onto the wire. `raw` writes bytes verbatim; otherwise `\n` becomes `\r\n`, which a serial
+/// terminal needs or every line starts where the last one ended.
+#[cfg(feature = "pi4")]
+fn serial_write_direct(s: &[u8], raw: bool) {
+    if raw {
+        for &b in s { put_byte(b); }
+    } else {
+        for &b in s { serial_write_byte(b); }
+    }
+}
+
+/// Hand one whole line to the ring, then put queued lines on the wire if nobody else is.
+///
+/// CR expansion happens HERE, so the ring holds bytes exactly as they belong on the wire and the
+/// drainer needs to know nothing about who queued them.
+#[cfg(feature = "pi4")]
+fn serial_emit(s: &[u8], raw: bool) {
+    if SERIAL_PANIC_MODE.load(Ordering::Acquire) {
+        serial_write_direct(s, raw);
+        return;
+    }
+
+    let queued = match SERIAL_RING.try_lock() {
+        None => false, // contended for the microsecond of a memcpy - just write it
+        Some(mut r) => {
+            if r.count == SERIAL_RING_LINES {
+                // The wire is slower than the system is talking. Count it and say so on the next
+                // drain rather than pretending the line was written.
+                r.dropped = r.dropped.saturating_add(1);
+                true
+            } else {
+                let idx = (r.head + r.count) % SERIAL_RING_LINES;
+                let mut n = 0usize;
+                let mut fits = true;
+                for &b in s {
+                    if !raw && b == b'\n' {
+                        if n == SERIAL_LINE_MAX { fits = false; break; }
+                        r.buf[idx][n] = b'\r';
+                        n += 1;
+                    }
+                    if n == SERIAL_LINE_MAX { fits = false; break; }
+                    r.buf[idx][n] = b;
+                    n += 1;
+                }
+                if fits {
+                    r.len[idx] = n as u16;
+                    r.count += 1;
+                    true
+                } else {
+                    false // too long to queue whole; a half-queued line is worse than an interleaved one
+                }
+            }
+        }
+    };
+
+    if !queued {
+        serial_write_direct(s, raw);
+        return;
+    }
+    serial_drain();
+}
+
+/// Put queued lines on the wire. At most one core at a time; the rest have handed their line over.
+#[cfg(feature = "pi4")]
+fn serial_drain() {
+    // Two passes: the second closes the window where a line is queued between the last pop and the
+    // release, which would otherwise sit until some later write happened to drain it.
+    for _ in 0..2 {
+        if SERIAL_DRAINING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // someone else has the wire; our line is queued and they will write it
+        }
+
+        // Serialised against `put_str`, which writes directly under the same claim. Only the DRAINER
+        // ever waits here - one core doing everyone's wire work - and ordinary writers have already
+        // returned. If the claim expires it writes anyway, exactly as `put_str` would.
+        let claim = claim_serial();
+
+        let mut line = [0u8; SERIAL_LINE_MAX];
+        let mut lost = 0u32;
+        let mut wrote = 0usize;
+        while wrote < SERIAL_DRAIN_BUDGET {
+            let n = match SERIAL_RING.try_lock() {
+                None => break, // contended; leave the rest for the next writer
+                Some(mut r) => {
+                    if r.dropped > 0 {
+                        lost = lost.saturating_add(r.dropped);
+                        r.dropped = 0;
+                    }
+                    if r.count == 0 { break; }
+                    let idx = r.head;
+                    let n = r.len[idx] as usize;
+                    line[..n].copy_from_slice(&r.buf[idx][..n]);
+                    r.head = (r.head + 1) % SERIAL_RING_LINES;
+                    r.count -= 1;
+                    n
+                }
+            };
+            serial_write_direct(&line[..n], true);
+            wrote += 1;
+        }
+
+        if lost > 0 {
+            serial_write_direct(b"\r\nserial: log lines lost to a full ring\r\n", true);
+        }
+
+        release_serial(claim);
+        SERIAL_DRAINING.store(false, Ordering::Release);
+
+        let pending = match SERIAL_RING.try_lock() {
+            Some(r) => r.count > 0,
+            None => false,
+        };
+        if !pending { return; }
+    }
 }
 
 #[cfg(feature = "pi4")]
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
-    let held = claim_serial();
-    for &b in s { serial_write_byte(b); }
-    // The display mirror happens ONLY for the core that holds the claim. It renders glyphs and cleans
-    // cache lines, which is far more expensive than the UART write - making every other core wait for
-    // it is what turned a boot into a two-minute crawl. A contended writer's bytes still reach serial,
-    // which is the record that matters.
-    if held {
+    // Queued, not written here: this is a RUNTIME path and no runtime writer may wait for the wire.
+    serial_emit(s, false);
+
+    // The mirror keeps the ORIGINAL rule: one attempt, and a contended core skips it. It is expensive,
+    // it only does anything while the boot log still reaches the display, and nobody is reading the
+    // screen during contention anyway. Serial keeps the full record either way.
+    if MIRROR_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
         video::mirror_log(s);
-        SERIAL_BUSY.store(false, Ordering::Release);
+        MIRROR_BUSY.store(false, Ordering::Release);
     }
 }
 
@@ -1566,9 +1950,15 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// gate has nothing to select - honoured as soon as one exists.
 #[cfg(feature = "pi4")]
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
-    for &b in s {
-        serial_write_byte(b);
-    }
+    // TAKES THE SAME CLAIM AS THE KERNEL LOG, because the UART does not care which side of the
+    // syscall boundary a byte came from. This path was unclaimed while the log path was serialised,
+    // so the two shredded each other: a chaos separator woven through a `cap::get:` line, a device
+    // descriptor spliced into a service banner. Serialising only the kernel's own writers fixes half
+    // a problem and leaves the half a person actually reads - the shell's output - still broken.
+    // Queued like the kernel log, and against the SAME ring - the wire does not care which side of
+    // the syscall boundary a byte came from, and serialising only one of the two is what left the
+    // visible half of the log still shredded.
+    serial_emit(s, false);
     // The gate is now real: `false` means a full-screen app owns the display, so this text belongs on
     // serial only.
     if to_fb {
@@ -1677,13 +2067,7 @@ pub fn console_notice(s: &[u8]) {
 /// call is still a line another core can land inside.
 #[cfg(feature = "pi4")]
 fn serial_write_bytes_lockfree_no_fb(s: &[u8]) {
-    let held = claim_serial();
-    for &b in s {
-        serial_write_byte(b);
-    }
-    if held {
-        SERIAL_BUSY.store(false, Ordering::Release);
-    }
+    serial_emit(s, false);
 }
 
 /// A fixed stack buffer that `write!` can render into. No heap (§26.6.1): the bound is the buffer,
@@ -2171,12 +2555,16 @@ pub mod syscall_entry {
     #[cfg(feature = "pi4")]
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { super::uaccess::read_user_bytes(ptr, len) }
     #[cfg(feature = "pi4")]
+    pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool { super::uaccess::copy_user_to_kernel(src, dst, len) }
+    #[cfg(feature = "pi4")]
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { super::uaccess::write_user_bytes(dst, src) }
 
     #[cfg(not(feature = "pi4"))]
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
     #[cfg(not(feature = "pi4"))]
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
+    #[cfg(not(feature = "pi4"))]
+    pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
     #[cfg(not(feature = "pi4"))]
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
     /// The free-running physical counter. Monotonic, never reset, shared by all cores - which is what
@@ -2196,7 +2584,47 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// No unlocked-fault-write counter on this arch: the x86 fault handlers are the ones that bypass the
+/// serial lock (audits/kernel-audit.md Audit 10). Reports 0 rather than pretending to measure
+/// something - a zero it HAS earned, because nothing here writes unlocked.
+///
+/// Lives at the ARCH TOP LEVEL, not inside `mod pci`, because `syscall::dispatch` reaches it as
+/// `crate::arch::imp::serial_unlocked_emit_count` - which is where x86 defines it too.
+// PCI CONFIGURATION ACCESS for a userspace enumerator (step D2, aarch64).
+//
+// This board has no port I/O - `in`/`out` are x86 instructions - but it DOES have PCIe, and its
+// configuration space is reached through an INDEX/DATA pair that is structurally the same shape as
+// x86's CF8/CFC, just memory-mapped. So the same single primitive serves, with the same division of
+// knowledge: the kernel performs the access and enforces which register may be touched, the service
+// knows what the bits mean.
+//
+// WHY THE KERNEL MEDIATES RATHER THAN GRANTING AN MMIO WINDOW. The obvious alternative - hand the
+// service a mapping of the root-complex registers and let it drive the pair itself - cannot be made
+// safe here. MMIO grants are PAGE-granular, and `EXT_CFG_INDEX` (0x9000) shares its 4 KiB page with
+// `RGR1_SW_INIT_1` (0x9210), the bridge's software-reset control. Granting the page to read config
+// space would also grant the power to reset the root complex out from under every device on it.
+// Register granularity is only available from in here, which is exactly the argument the x86 port
+// allowlist makes (docs/service-ownership.md, D2).
+
+/// One complete PCI configuration read, for a holder of `PCI_CFG`.
+///
+/// The work - the lock, the bus-range check, the register access - is in `pcie`, beside the pair it
+/// serializes and the code that programmed the bus range. This is the arch's entry point for the
+/// syscall and nothing more.
+pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
+    pcie::cfg_read_gated(sel, off)
+}
+
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
 pub mod interrupts {
+    /// The MSI vector pool is x86-only (`arch/x86_64/interrupts.rs`, step D1b). Neither Pi has one:
+    /// a pool hands vectors to devices found on a PCI bus, and there is no PCI bus here to find them
+    /// on - `pci::find_by_class` returns `None`, so `task::pci_msi_vector` returns before it ever
+    /// consults these. LEN 0 states that plainly ("the pool holds nothing") rather than naming a
+    /// range of vectors this arch does not route.
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     /// `DAIF.I` is the IRQ mask. It is a MASK, so **clearing** it enables interrupts and setting it
@@ -2370,28 +2798,140 @@ pub mod rtc {
 }
 
 // ---------------------------------------------------------------------------
+/// The Pi 4 has GENET on the SoC. Presence is what the boot probe found - the flag it used to
+/// set was `pci::NIC_FOUND`, which put a non-PCI device into a PCI variable and is exactly the
+/// conflation step D removes.
+pub fn soc_nic_present() -> bool { GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
+static GENET_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
-    pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static AHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static AHCI_ABAR: AtomicU64 = AtomicU64::new(0);
-    pub static AHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
-    pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    /// The Pi 4 HAS PCIe and a real table - what it has no PCI ethernet controller. GENET is on the
+    /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
+    /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
+    /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
+    /// next looking for the table that does exist twenty lines below.)
+    /// The xHCI controller on this machine, from the generic table - `None` if there is none.
+    ///
+    /// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
+    /// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
+    /// was: "a general design would enumerate every controller + device and bind by class". This is that
+    /// design, and it is one line, because `find_by_class` already returns the first match - the pick the
+    /// array existed to make.
+    ///
+    /// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
+    /// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
+    /// answers only "is there one, and what is it" when nobody said.
+    /// No EHCI on this port - the Pi 4's USB is the VL805 xHCI.
+    pub fn ehci() -> Option<PciDevice> { None }
+    pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
+
+    pub fn nic() -> Option<PciDevice> { None }
+    pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
+
+    // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
+    /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+    /// The Pi 4 has PCIe (the VL805 hangs the USB-A ports off it), so unlike arm32 this table is
+    /// REAL - filled by `pcie::init` as it walks the bridge (step D1 for this port).
+    ///
+    /// Small because the bus is: the Pi 4's root complex carries one device. 8 leaves room for a
+    /// board that carries more without pretending the machine is a PC.
+    pub const MAX_DEVICES: usize = 8;
+
+    static DEV_BDF:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0xFFFF) }; MAX_DEVICES];
+    static DEV_CLASS: [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+    static DEV_BARS:  [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+    static DEV_IRQ:   [core::sync::atomic::AtomicU8; MAX_DEVICES] =
+        [const { core::sync::atomic::AtomicU8::new(0) }; MAX_DEVICES];
+    static DEV_VEN:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    /// Record one device exactly as the bus reported it. Called by `pcie::init` for EVERY device it
+    /// meets, before any per-class branch decides whether it is one this kernel cares about - that
+    /// order is the point: a table built from what the bus says is a table that can serve a driver
+    /// for a device the kernel has no name for.
+    pub fn record_device(bdf: u32, class_code: u32, bars: [u64; 6], irq_line: u8,
+                         vendor: u16, device: u16) {
+        use core::sync::atomic::Ordering;
+        let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+
+        // UPDATE IN PLACE if this BDF is already recorded, rather than appending a second entry.
+        //
+        // This port records each device TWICE on purpose: once from raw config space as the scan
+        // meets it, and again for the controller it drives once this code has ASSIGNED that device's
+        // BAR (the firmware here assigns none). Appending both would leave two rows for one device
+        // with `find_by_class` returning the FIRST - the one whose BAR0 is still 0 - so every lookup
+        // would hand back the useless row and the driver would get no mapping.
+        let existing = (0..n.min(MAX_DEVICES)).find(|&i| DEV_BDF[i].load(Ordering::Relaxed) == bdf);
+        let slot = match existing {
+            Some(i) => i,
+            None if n < MAX_DEVICES => { DEVICE_COUNT.store(n as u32 + 1, Ordering::Relaxed); n }
+            None => {
+                crate::kprintln!("pcie: device table full ({}) - {:#06x} class {:#08x} NOT recorded",
+                                 MAX_DEVICES, bdf, class_code);
+                return;
+            }
+        };
+        let n = slot;
+        DEV_BDF[n].store(bdf, Ordering::Relaxed);
+        DEV_CLASS[n].store(class_code, Ordering::Relaxed);
+        for (i, b) in bars.iter().enumerate() { DEV_BARS[n * 6 + i].store(*b, Ordering::Relaxed); }
+        DEV_IRQ[n].store(irq_line, Ordering::Relaxed);
+        DEV_VEN[n].store(((vendor as u32) << 16) | device as u32, Ordering::Relaxed);
+    }
+
+    /// The `n`th device the scan found, or `None`.
+    pub fn device_at(n: usize) -> Option<PciDevice> {
+        use core::sync::atomic::Ordering;
+        if n >= DEVICE_COUNT.load(Ordering::Relaxed) as usize { return None; }
+        let vd = DEV_VEN[n].load(Ordering::Relaxed);
+        let mut bar = [0u64; 6];
+        for (i, b) in bar.iter_mut().enumerate() { *b = DEV_BARS[n * 6 + i].load(Ordering::Relaxed); }
+        Some(PciDevice {
+            index:      n,
+            bdf:        DEV_BDF[n].load(Ordering::Relaxed),
+            class_code: DEV_CLASS[n].load(Ordering::Relaxed),
+            bar,
+            irq_line:   DEV_IRQ[n].load(Ordering::Relaxed),
+            vendor:     (vd >> 16) as u16,
+            device:     vd as u16,
+        })
+    }
+
+    /// The FIRST device whose class code matches, or `None`. Same rule as x86: first, not best - a
+    /// driver that must have a SPECIFIC instance names a BDF, which is what `device_at` is for.
+    pub fn find_by_class(class_code: u32) -> Option<PciDevice> {
+        use core::sync::atomic::Ordering;
+        let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+        (0..n.min(MAX_DEVICES)).find_map(|i| match device_at(i) {
+            Some(d) if d.class_code == class_code => Some(d),
+            _ => None,
+        })
+    }
+
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}
     pub fn set_power_d0(bdf: u32) {}
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
     pub fn program_xhci_msi() -> bool { false }
     pub fn program_ehci_msi() -> bool { false }
     pub fn route_ehci_intx() {}

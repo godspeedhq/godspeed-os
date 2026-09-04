@@ -174,6 +174,23 @@ const RTL_ISR_RDU:  u16 = 1 << 4;  // Rx Descriptor Unavailable - the ring fille
 const RTL_ISR_FOVW: u16 = 1 << 6;  // Rx FIFO Overflow - also halts RX until the ring is re-armed
 
 // C+ 16-byte descriptor word 0 (opts1): flags in the high bits, length/size in the low 14 bits.
+/// Empty RX drains before this driver reports the chip's own counters, once. TWO triggers, because
+/// "never received anything" and "stopped receiving" need very different thresholds.
+///
+/// `NEVER`: this instance has reaped ZERO frames and been asked this many times. That is exactly the
+/// observed failure - a NIC that comes back from a chaos restart with link UP and TX working and
+/// never receives again - and it cannot fire on a link that has ever worked, so it can be LOW.
+///
+/// Low matters: the drain loops are PACED (see net-stack's poll-pacing comment), so empty drains
+/// accrue in the hundreds over a 20 s DHCP window, not the thousands. A threshold in the tens of
+/// thousands would sit silent through the very failure this exists to catch - an instrument that
+/// cannot reach its own trigger.
+const RX_SILENCE_NEVER: u32 = 256;
+
+/// `STALLED`: frames DID arrive at some point and then stopped. A quiet-but-healthy link reaches this
+/// legitimately, so it is high - and the report is one line per driver lifetime either way.
+const RX_SILENCE_STALLED: u32 = 20_000;
+
 const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
 const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
 const RTL_DESC_FS:  u32 = 1 << 29; // first segment (TX)
@@ -199,7 +216,7 @@ fn realtek_main(ctx: ServiceContext) -> ! {
 
     let mmio = match ctx.mmio() {
         Some(m) => m,
-        None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); serve_status(&ctx, &[0u8; 7]); }
+        None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); serve_status(&ctx, &[0u8; 8]); }
     };
     // Reset: set CR.RST, wait on the bit self-clearing (bounded SMALL + loud). If MMIO is not reaching
     // the chip (D3 / no memory-space) every read is 0xff, so RST never clears - we TIME OUT, not spin.
@@ -222,9 +239,12 @@ fn realtek_main(ctx: ServiceContext) -> ! {
         Some(arena) => realtek_serve(&ctx, &mmio, &arena, reset_ok, &mac),
         None => {
             ctx.log("nic-driver: RTL8168 has no DMA arena - serving empty replies");
-            let mut sreply = [0u8; 7];
+            // Eight bytes, with the LINK the PHY reported above - see the e1000 STATUS reply for
+            // why seven is unreadable rather than "down". Degraded on frames, still honest on link.
+            let mut sreply = [0u8; 8];
             sreply[0] = reset_ok as u8;
             sreply[1..7].copy_from_slice(&mac);
+            sreply[7] = link_up as u8;
             serve_status(&ctx, &sreply);
         }
     }
@@ -314,6 +334,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
+    // RX GROUND TRUTH. Added after a T630 chaos run left this NIC with link UP and TX working
+    // (net-stack reported "6 sent 0 SEND-FAILED") and ZERO frames received, permanently. The log
+    // could not say whether the chip stopped receiving, the driver stopped reaping, or delivery to
+    // net-stack failed - because none of those three numbers was ever LOGGED, only served on request.
+    // All three look identical from outside, and they are three different bugs.
+    let mut empty_drains = 0u32;
+    let mut rx_silence_logged = false;
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -439,7 +466,51 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 }
             }
             out[0] = nfr;
-            if nfr > 0 { rx_count = rx_count.saturating_add(nfr as u16); }
+            if nfr > 0 {
+                rx_count = rx_count.saturating_add(nfr as u16);
+                empty_drains = 0;
+            } else {
+                empty_drains = empty_drains.saturating_add(1);
+                // Asked for frames this many times running with none to give. A quiet link does that
+                // legitimately, so the threshold is high enough that only a STUCK receive path trips
+                // it - and it reports ONCE per driver lifetime, never per drain (§26.4: loud, not
+                // noise). A restart re-arms it, which is right: each instance gets to say so once.
+                // Never received anything -> report early. Received then stopped -> report late.
+                let trip = (rx_count == 0 && empty_drains >= RX_SILENCE_NEVER)
+                    || empty_drains >= RX_SILENCE_STALLED;
+                if trip && !rx_silence_logged {
+                    rx_silence_logged = true;
+                    // The CHIP's own tally counters, read as `net stats` reads them - layer-1 ground
+                    // truth, independent of anything this driver believes:
+                    //
+                    //   RxOk > 0, reaped == 0     -> chip received; the DRIVER is not reaping
+                    //                                (ring not re-armed, OWN bit, rx_idx desynced)
+                    //   RxOk == 0, Missed > 0     -> chip received and DROPPED it (no buffers armed)
+                    //   RxOk == 0, Missed == 0    -> nothing reached the chip (wire / PHY / filter)
+                    //   reaped > 0, reply_fails>0 -> reaped fine; DELIVERY to net-stack is broken
+                    //
+                    // Four outcomes, one line, four different bugs.
+                    let tb = arena.phys_at(TALLY_OFF);
+                    for i in 0..64 { arena.write8(TALLY_OFF + i, 0); }
+                    mmio.write32(RTL_DTCCR + 4, (tb >> 32) as u32);
+                    mmio.write32(RTL_DTCCR, ((tb as u32) & !0x3F) | 0x08);
+                    let mut td = 0u32;
+                    while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 {
+                        ctx.yield_cpu(); td += 1;
+                    }
+                    let phy = mmio.read8(RTL_PHYSTATUS);
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: RX SILENT {} drains - chip RxOk={} RxErr={} Missed={} TxOk={} (dump {}), reaped={} reply_fails={} link={} rx_idx={}",
+                        empty_drains,
+                        arena.read32(TALLY_OFF + 0x08),
+                        arena.read32(TALLY_OFF + 0x18) & 0xFFFF,
+                        arena.read32(TALLY_OFF + 0x1C) & 0xFFFF,
+                        arena.read32(TALLY_OFF + 0x00),
+                        if td < TALLY_POLL_MAX { "ok" } else { "TIMED OUT" },
+                        rx_count, reply_fails,
+                        if phy & 0x02 != 0 { "up" } else { "DOWN" }, rx_idx));
+                }
+            }
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
@@ -1113,9 +1184,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // A 1-byte `[3]` STATUS query (the `net` nic-mac diagnostic) is answered with [ok, mac], NOT
         // treated as a frame to transmit (which would stall the caller on the RX poll).
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
-            let mut sreply = [0u8; 7];
+            // EIGHT bytes: [ok, mac(6), LINK]. This replied with seven and no link byte, and the
+            // consumer reads `p[7]` after requiring `p.len() >= 8` (`read_link` in the shell,
+            // `link_is_up` in net-stack). A seven-byte answer is therefore not "link down" - it is
+            // UNREADABLE, and both callers correctly report it as "link state unknown". So on an
+            // e1000 the selfcheck's `net lease` gate could never pass: not because the cable was
+            // out, but because the driver answered in a shape nothing could parse.
+            //
+            // The link is read LIVE from the device, as the RTL8168 path already does - STATUS bit 1
+            // (LU), the constant this file has always carried for it. A cached or assumed value
+            // would re-create the same class of bug one layer up: an answer that is not a
+            // measurement.
+            let mut sreply = [0u8; 8];
             sreply[0] = 1; // e1000 is up
             sreply[1..7].copy_from_slice(&e1000_mac);
+            sreply[7] = mmio.as_ref()
+                .map_or(0, |m| ((m.read32(REG_STATUS) >> 1) & 1) as u8);
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply)), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;

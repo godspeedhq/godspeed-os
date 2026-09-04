@@ -18,9 +18,21 @@ static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 /// Load the embedded ARM service ELF and confirm the loader parsed and mapped it.
 ///
 /// The checks are the ones that distinguish "parsed a real ELF" from "returned something": the entry
-/// VA must be the `user.ld` base (`0x400000`), and a non-trivial number of bytes must have been
-/// mapped (a service is several pages of text/rodata/data/bss). A parser that silently accepted
-/// garbage, or mis-read the ELF32 field offsets, would fail one of these.
+/// VA must lie INSIDE the image `user.ld` places at `0x400000`, and a non-trivial number of bytes
+/// must have been mapped (a service is several pages of text/rodata/data/bss). A parser that
+/// silently accepted garbage, or mis-read the ELF32 field offsets, would fail one of these.
+///
+/// The entry check used to demand `entry_va == 0x400000` EXACTLY, and that was testing a coincidence
+/// rather than a property. `e_entry` is the address of `service_main` (build.rs passes
+/// `--entry=service_main`), not the first byte of `.text`, so the equality only held while the
+/// linker happened to place that function first. An unrelated edit to the SDK reordered it to
+/// `0x4000e8` and this selftest reported `loader FAIL` on a boot where the logger loaded and ran
+/// perfectly - a test crying wolf is worse than no test, because the next real failure reads as more
+/// of the same.
+///
+/// The REAL failure mode it exists to catch is `e_entry = 0`: `#[no_mangle]` drifting off
+/// `service_main` leaves the symbol mangled, the entry zero, and the service takes a `rip=0` page
+/// fault the instant it is scheduled. A range check catches that and does not care about layout.
 pub fn selftest() {
     if LOGGER_ELF.len() < 64 {
         pl011_write(b"arm32: loader selftest SKIP - no ARM logger ELF embedded (placeholder)\r\n");
@@ -37,12 +49,15 @@ pub fn selftest() {
             write_dec_pub((loaded.mapped_bytes / 1024) as u32);
             pl011_write(b" KiB into a fresh page table\r\n");
 
-            let entry_ok = loaded.entry_va == 0x0040_0000;
+            // Inside the mapped image, not exactly at its base - see the note above.
+            let base = 0x0040_0000u64;
+            let entry_ok = loaded.entry_va as u64 >= base
+                && (loaded.entry_va as u64) < base + loaded.mapped_bytes as u64;
             let mapped_ok = loaded.mapped_bytes >= 4096;
             if entry_ok && mapped_ok {
                 pl011_write(b"arm32: loader PASS (neutral loader maps a real 32-bit ARM service)\r\n");
             } else {
-                if !entry_ok { pl011_write(b"arm32:   entry VA is not the user.ld base 0x400000\r\n"); }
+                if !entry_ok { pl011_write(b"arm32:   entry VA is outside the image mapped at 0x400000 (e_entry=0 = #[no_mangle] not on service_main)\r\n"); }
                 if !mapped_ok { pl011_write(b"arm32:   suspiciously little mapped for a service\r\n"); }
                 pl011_write(b"arm32: loader FAIL - see above\r\n");
             }

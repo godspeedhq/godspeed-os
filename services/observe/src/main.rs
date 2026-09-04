@@ -13,6 +13,13 @@ use godspeed_sdk::ServiceContext;
 const MAX_SLOTS:      u32 = 224;
 const YIELD_INTERVAL: u32 = 500;
 const FRAME_SIZE:     u64 = 4096;
+/// Width of the TASK NAME column.
+///
+/// Sized to the longest service name in the tree (`resource-server` / `driver-skeleton`, 15). It is
+/// a DISPLAY width, not a limit: the kernel allows a 32-byte name, and a longer one is truncated with
+/// a visible `+` rather than being allowed to break the row's alignment.
+const NAME_COL: usize = 15;
+
 const QUEUE_MAX:      u8  = 16;
 const MAX_CORES:      u32 = 16;
 
@@ -292,7 +299,7 @@ fn print_state(
 
     // --- Task table ---
     ctx.console_line_fmt(live, format_args!(
-        "{}TASK NAME         CORE STATE      MEM_USED/LIMIT/%     RESTARTS  QUEUE  CPU%  UPTIME", p));
+        "{}TASK NAME             CORE STATE      MEM_USED/LIMIT/%     RESTARTS  QUEUE  CPU%  UPTIME", p));
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid {
@@ -328,11 +335,22 @@ fn print_state(
             else if stat.uptime_secs >= 60    { (stat.uptime_secs / 60,    'm') }
             else                              { (stat.uptime_secs,         's') };
 
+        // A name too long for the column is MARKED, not allowed to shove the rest of the row right.
+        // `hw-enumerator` (13) did exactly that when the field was 12 wide: every column after it
+        // shifted on that one line, which reads as a rendering glitch rather than as information.
+        // The field now fits the longest service name in the tree (15) and anything longer is
+        // truncated with a `+`, so the table stays a table and the truncation is visible rather than
+        // silent (invariant 12). Task names can be up to 32 bytes, so this cannot be solved by
+        // picking a bigger number - only by saying when it did not fit.
+        let nm = stat.name_str();
+        let over = if nm.chars().count() > NAME_COL { "+" } else { " " };
+
         ctx.console_line_fmt(live, format_args!(
-            "{}{:<4} {:<12} C{:<3} {:<10} {:>3} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>5}{}",
+            "{}{:<4} {:<w$.w$}{} C{:<3} {:<10} {:>3} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>5}{}",
             p,
             slot,
-            stat.name_str(),
+            nm,
+            over,
             stat.core,
             stat.state_str(),
             uval, uunit,
@@ -341,6 +359,7 @@ fn print_state(
             stat.queue_depth, QUEUE_MAX, full_mark,
             task_pct,
             up_val, up_unit,
+            w = NAME_COL,
         ));
     }
 

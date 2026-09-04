@@ -22,6 +22,7 @@
 #![no_main]
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
+use godspeed_sdk::service_context::{AcquireFailure, DeadlineOutcomeInto};
 
 mod crc32;
 use crc32::crc32;
@@ -3502,6 +3503,57 @@ impl BlockReply {
 static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Is the peer currently unreachable, and how many times has that been true without being said?
+///
+/// **THE FLOOD THIS PREVENTS DESTROYED A DEBUGGING SESSION.** Every block request that cannot reach
+/// `block-driver` used to print a line, and `fs` is asked for blocks continuously - so a peer that
+/// stayed unreachable produced one line every ~30 ms, 1135 of them in a single Pi 2 run, until the log
+/// ended. On a 115200 serial port that is most of the wire: the lines were SPLICED into every other
+/// message, including the fault report naming the service that had just died, which had to be
+/// reassembled character by character to be read at all.
+///
+/// So the instrument destroyed the evidence it existed to provide - the same defect the kernel's own
+/// acquire diagnostic had (`fe09e428`), and the same fix. The outage is still LOUD (§26.7), but loud
+/// ONCE. What makes that safe rather than a silent fallback is the RE-ARM: the latch clears the moment
+/// a reacquire succeeds, and the recovery line carries the suppressed count - so a second, later
+/// outage is reported in full, and no occurrence is ever unaccounted for. A latch that never cleared
+/// would be hiding failures, which is the thing this project does not do.
+static PEER_UNREACHABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static PEER_UNREACHABLE_SUPPRESSED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Report that `block-driver` could not be reacquired, saying WHICH failure it was - once per outage.
+///
+/// The message this replaces named two causes and committed to neither ("either the name is not
+/// registered right now, or this service has no free cap slot left"), because the kernel returned a
+/// bare `-1` for both. They are opposite failures: an unregistered name is transient and heals on the
+/// next attempt, while a full cap table is terminal - this service can never hold another capability
+/// and will not recover until it is restarted. Reading the first as the second (or the reverse) sends
+/// the reader after the wrong service, and on the Pi 2 it did exactly that.
+fn report_peer_unreachable(ctx: &ServiceContext, why: AcquireFailure) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if PEER_UNREACHABLE.swap(true, Relaxed) {
+        // Already reported for this outage. Counted, so the recovery line can account for it.
+        PEER_UNREACHABLE_SUPPRESSED.fetch_add(1, Relaxed);
+        return;
+    }
+    PEER_UNREACHABLE_SUPPRESSED.store(0, Relaxed);
+    ctx.log_fmt(format_args!(
+        "fs: block-driver send failed AND it could not be reacquired - {}. Storage is unavailable until this clears; further attempts are counted, not logged",
+        why.reason()));
+}
+
+/// Clear the outage latch and say so, with what was suppressed while it was set.
+fn report_peer_recovered(ctx: &ServiceContext) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !PEER_UNREACHABLE.swap(false, Relaxed) { return; }
+    let n = PEER_UNREACHABLE_SUPPRESSED.swap(0, Relaxed);
+    ctx.log_fmt(format_args!(
+        "fs: block-driver reacquired - storage is back ({} further failure(s) went unlogged during the outage)",
+        n));
+}
+
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
@@ -3568,32 +3620,109 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
             ctx.stack_used(), 256 * 1024));
     }
 
+    // THE RETRY IS GATED ON WHICH FAILURE HAPPENED, and that gate is the whole fix.
+    //
+    // This loop used to retry on `None` from the `_into` helper, which collapses four outcomes into
+    // one. Two of them want OPPOSITE responses:
+    //   SendFailed - the request never left (stale cap after the peer respawned, or an exhausted cap
+    //                table here). Nothing is in flight, so reacquire and retry ONCE. This is the only
+    //                safe retry, and it is the one that heals a restarted `block-driver`.
+    //   Timeout    - the request WAS delivered and no reply came. Re-sending asks for the work twice
+    //                and, since only the op tag distinguishes replies, desyncs every later exchange.
+    // Collapsed together, a caller must guess wrong in one direction. The old code guessed "retry",
+    // which is right for the first and wrong for the second.
+    //
+    // It also could not say what went wrong, and said something specific anyway: "did not answer
+    // within 30 s (and could not be reacquired)" was printed for failures that took MILLISECONDS and
+    // never reached a reacquire. On hardware that sent the reader after `block-driver`, which was
+    // alive the whole time with an empty queue. A message that names a cause it did not observe is
+    // worse than one that admits it does not know.
+    // RE-ALIGN BEFORE ASKING. Anything sitting in the reply mailbox is a reply to a request this
+    // service already gave up on - it is synchronous, so it has no other call outstanding - and
+    // leaving it there is what made a single timeout permanent: the next request receives the stale
+    // reply, discards it, fails, and leaves its own reply behind for the request after that. One
+    // discard per request, one new orphan per request, alternating forever with the volume mounted
+    // and every operation failing (133 times in one storm run).
+    //
+    // Detection was never the problem - the tag caught every one of them. What was missing was the
+    // repair, and the repair is one line: drop the orphans before issuing the next request rather
+    // than after receiving the wrong answer to it.
+    let stale = ctx.drain_stale_replies();
+    if stale > 0 {
+        ctx.log_fmt(format_args!(
+            "fs: dropped {} orphaned block reply(s) before this request - the protocol was out of step and is now re-aligned",
+            stale));
+    }
+
+    let mut last = "";
     for attempt in 0..2 {
-        if attempt == 1 && !ctx.reacquire_by_name("block-driver") {
-            break;
+        if attempt == 1 && last == "send failed" {
+            // The DETAIL form, because the two failures want different readings and this is the line
+            // an operator acts on. Rate-limited to once per outage (see `PEER_UNREACHABLE`), after a
+            // flood of these shredded a hardware log.
+            match ctx.reacquire_cap_detail("block-driver") {
+                Err(why) => {
+                    report_peer_unreachable(ctx, why);
+                    return None;
+                }
+                Ok(_) => report_peer_recovered(ctx),
+            }
         }
-        if let Some(n) =
-            ctx.request_with_reply_deadline_into("block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
+        match ctx.request_with_reply_deadline_outcome_into(
+            "block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
         {
-            if n == 0 {
-                return None;
+            DeadlineOutcomeInto::Reply(n) => {
+                if n == 0 {
+                    return None;
+                }
+                if rbuf[0] != tag {
+                    ctx.log_fmt(format_args!(
+                        "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
+                        rbuf[0], tag));
+                    // Do NOT re-send: the request is already with the driver, and asking twice would
+                    // ask for the WORK twice. This request fails and the caller retries at its own
+                    // level - which now WORKS, because the drain at the top of this function clears
+                    // the orphan first. The old comment claimed "by which point the queue has
+                    // drained"; nothing drained it, and that assumption is what made one late reply
+                    // permanent.
+                    return None;
+                }
+                return Some(BlockReply { buf: rbuf, len: n - 1 });
             }
-            if rbuf[0] != tag {
+            // Delivered, unanswered. The peer is alive and holding the request; re-sending would ask
+            // for the work twice and desync the tags.
+            DeadlineOutcomeInto::Timeout => {
                 ctx.log_fmt(format_args!(
-                    "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
-                    rbuf[0], tag));
-                // Do NOT re-send: the request is already with the driver, and asking twice would ask
-                // for the WORK twice. The caller retries at its own level, by which point the queue
-                // has drained.
+                    "fs: block-driver received the request but did not reply within {} s - failing (NOT re-sent: a late reply would desync the protocol)",
+                    BLOCK_RPC_SECS));
                 return None;
             }
-            return Some(BlockReply { buf: rbuf, len: n - 1 });
-        }
-        if attempt == 1 {
-            break;
+            // Alive but backed up. The send NEVER LEFT, so nothing can arrive late and a retry is
+            // safe - the same reasoning that makes `SendFailed` retryable. What differs is that the
+            // cap is fine and reacquiring would be pointless: the QUEUE is the problem, so yield and
+            // ask again.
+            //
+            // Failing here instead of retrying was a REGRESSION I introduced with this match. The old
+            // code retried on every failure, which was wrong for `Timeout` and right for this - and
+            // collapsing them lost the right half along with the wrong one. It showed up as `edit`
+            // hanging while CREATING a file (a burst of writes fills the driver's queue) while editing
+            // an existing one, which writes at the same rate but starts from a warm queue, kept
+            // working: 10 passed, 5 failed, and every failure a timeout rather than a wrong answer.
+            DeadlineOutcomeInto::QueueFull => {
+                if attempt == 1 {
+                    ctx.log("fs: block-driver queue still full after a yield - failing");
+                    return None;
+                }
+                last = "queue full";
+                ctx.yield_cpu();   // let the driver drain before asking again
+                continue;
+            }
+            // The one worth retrying.
+            DeadlineOutcomeInto::SendFailed => { last = "send failed"; }
         }
     }
-    ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing");
+    ctx.log_fmt(format_args!(
+        "fs: block-driver unreachable ({}) even after reacquiring by name - failing", last));
     None
 }
 
