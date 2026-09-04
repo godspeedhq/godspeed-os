@@ -327,12 +327,10 @@ pub fn soc_nic_present() -> bool { false }
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
-    pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
+    pub fn ehci() -> Option<PciDevice> { None }
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }

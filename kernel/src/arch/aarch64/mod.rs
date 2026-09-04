@@ -2808,9 +2808,6 @@ static GENET_PRESENT: core::sync::atomic::AtomicBool =
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
-    pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-    pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-    pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
     /// The Pi 4 HAS PCIe and a real table - what it has no PCI ethernet controller. GENET is on the
     /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
@@ -2828,6 +2825,8 @@ pub mod pci {
     /// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
     /// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
     /// answers only "is there one, and what is it" when nobody said.
+    /// No EHCI on this port - the Pi 4's USB is the VL805 xHCI.
+    pub fn ehci() -> Option<PciDevice> { None }
     pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
     pub fn nic() -> Option<PciDevice> { None }

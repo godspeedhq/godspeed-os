@@ -814,7 +814,7 @@ pub fn drain_event_log() -> u32 {
     // reporting, not interpretation - the kernel is saying which device faulted, which it must
     // know to report anything useful at all.
     let xhci_bdf = crate::arch::x86_64::pci::xhci().map_or(0xFFFF, |d| d.bdf);
-    let ehci_bdf = crate::arch::x86_64::pci::EHCI_BDF.load(Ordering::Relaxed);
+    let ehci_bdf = crate::arch::x86_64::pci::ehci().map_or(0xFFFF, |d| d.bdf);
 
     // SAFETY: mmio_va mapped in bringup; head/tail are valid registers.
     let mut head = unsafe { mmio_read64(mmio_va, reg::EVENT_LOG_HEAD) } & 0xFFF;

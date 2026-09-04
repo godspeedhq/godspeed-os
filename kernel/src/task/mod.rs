@@ -467,7 +467,7 @@ impl HwClass {
             // mailbox call on the Pi) and the floor that brought it up is the one that knows.
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
             HwClass::Xhci => crate::arch::imp::pci::xhci().is_some(),
-            HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
+            HwClass::Ehci => crate::arch::imp::pci::ehci().is_some(),
             // Present if the bus reports one. On a port with no PCI the arch stub answers None,
             // which is the same "no NIC here" this used to get from a static nothing ever set.
             HwClass::Nic  => crate::arch::imp::pci::nic().is_some()
@@ -524,7 +524,7 @@ impl HwClass {
             // out to be.
             HwClass::Framebuffer => 0,
             HwClass::Xhci => crate::arch::imp::pci::xhci().map_or(0, |d| d.bar[0]),
-            HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
+            HwClass::Ehci => crate::arch::imp::pci::ehci().map_or(0, |d| d.bar[0]),
             // A DEVICE OF THE CLASS IS A DEVICE, whatever chip it turns out to be. This arm used to
             // read a per-class static AND require the vendor to be one of two the kernel had been
             // taught (`0x100E_8086` e1000, `0x8168_10EC` RTL8168). That whitelist is precisely what
@@ -647,7 +647,7 @@ impl HwClass {
                 by_class
             }
             HwClass::Xhci => crate::arch::imp::pci::xhci().map_or(0xFFFF, |d| d.bdf),
-            HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
+            HwClass::Ehci => crate::arch::imp::pci::ehci().map_or(0xFFFF, |d| d.bdf),
             HwClass::Nic  => crate::arch::imp::pci::nic().map_or(0xFFFF, |d| d.bdf),
             HwClass::None => 0xFFFF,
         }

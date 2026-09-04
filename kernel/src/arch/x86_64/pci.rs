@@ -10,7 +10,7 @@
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
@@ -184,19 +184,20 @@ pub fn first_memory_bar(d: &PciDevice) -> u64 {
 /// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
 /// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
 /// answers only "is there one, and what is it" when nobody said.
+/// The EHCI controller on this machine, from the generic table - `None` if there is none.
+///
+/// Replaces `EHCI_FOUND`/`EHCI_MMIO_BASE`/`EHCI_IRQ`/`EHCI_BDF`. This one has more kernel-side callers
+/// than the others - BIOS handoff, an FLR probe, MSI programming and INTx routing - and every one of
+/// them is legitimate kernel work that needs to know WHICH device. That is the distinction the
+/// 2026-09-04 amendment draws: the kernel keeps the facts it needs to program hardware, and gives up
+/// being TAUGHT that "EHCI" is a thing to hold four variables for. 0x0C0320 is the device's own claim.
+pub fn ehci() -> Option<PciDevice> { find_by_class(0x0C_03_20) }
+
 pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
 pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
 
 
-/// Discovered EHCI (USB 2.0) controller - the T630's back ports hang off it
-/// (§12). The userspace `ehci` driver gets this BAR mapped at spawn, exactly as
-/// the `xhci` driver gets the xHCI BAR. First EHCI found wins.
-pub static EHCI_FOUND: AtomicBool = AtomicBool::new(false);
-pub static EHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-pub static EHCI_IRQ: AtomicU8 = AtomicU8::new(0);
-/// PCI BDF of the EHCI controller - IOMMU device-table index (H1). 0xFFFF if none.
-pub static EHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
 
 // AHCI is PCI class 0x01 (mass storage), subclass 0x06 (SATA), progif 0x01 (AHCI).
 const CLASS_MASS_STORAGE: u8 = 0x01;
@@ -472,11 +473,9 @@ pub fn set_power_d0(bdf: u32) {
 /// handed off. Re-enable when EHCI confinement is revisited.
 #[allow(dead_code)]
 pub fn ehci_bios_handoff() {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
-    let mmio = EHCI_MMIO_BASE.load(Ordering::Relaxed);
-    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = ehci() else { return };
+    let mmio = dev.bar[0];
+    let bdf = dev.bdf;
     if mmio == 0 || bdf == 0xFFFF {
         return;
     }
@@ -665,10 +664,8 @@ pub fn xhci_bios_handoff() {
 /// machine does not scrub the controller's stale firmware-era internal DMA state.
 /// Detection only - does not perform the reset. No-op if no EHCI.
 pub fn ehci_flr_probe() {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
-    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = ehci() else { return };
+    let bdf = dev.bdf;
     if bdf == 0xFFFF {
         return;
     }
@@ -988,10 +985,8 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 /// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
 /// boot which interrupt path the running machine's EHCI needs.
 pub fn program_ehci_msi() -> bool {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return false;
-    }
-    let bdf = EHCI_BDF.load(Ordering::Relaxed);
+    let Some(dev) = ehci() else { return false };
+    let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::EHCI_CORE);
     // MSI first, MSI-X only as a fallback - see `msi_ordering`.
@@ -1016,9 +1011,7 @@ pub fn program_ehci_msi() -> bool {
 /// matches the hardware delivers. Each is registered as a level route so dispatch masks - and the
 /// driver unmasks - the whole set together. No-op if no EHCI. Call after `ioapic::init()`.
 pub fn route_ehci_intx() {
-    if !EHCI_FOUND.load(Ordering::Relaxed) {
-        return;
-    }
+    let Some(dev_pci) = ehci() else { return };
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     // Deliver to the BSP (core 0) - a legacy PCI INTx pin routes through the IOAPIC only to the
     // BSP on this hardware (unlike an MSI, which can target any core). The EHCI driver is pinned
@@ -1027,13 +1020,13 @@ pub fn route_ehci_intx() {
     // idle, halted AP doesn't service promptly). Verified on the T630: INTx delivers to the BSP;
     // routing it to an AP's LAPIC id silently dropped it.
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
-    let legacy = EHCI_IRQ.load(Ordering::Relaxed);
+    let legacy = dev_pci.irq_line;
 
     // Legacy INTx only asserts the device's INTx# pin when PCI Command bit 10 (Interrupt
     // Disable) is CLEAR. If firmware left it set (common after MSI-style init elsewhere), even
     // a correct IOAPIC route delivers nothing. Clear it (and keep bus-master for the EHCI's DMA).
     {
-        let bdf = EHCI_BDF.load(Ordering::Relaxed);
+        let bdf = dev_pci.bdf;
         let bus = ((bdf >> 8) & 0xFF) as u8;
         let dev = ((bdf >> 3) & 0x1F) as u8;
         let func = (bdf & 0x07) as u8;
@@ -1140,12 +1133,6 @@ pub fn init() {
                     if progif == PROGIF_XHCI {
                     }
                     // Record the first EHCI controller (T630 back ports, §12).
-                    if progif == PROGIF_EHCI && !EHCI_FOUND.load(Ordering::Relaxed) {
-                        EHCI_MMIO_BASE.store(mmio_base, Ordering::Relaxed);
-                        EHCI_IRQ.store(irq, Ordering::Relaxed);
-                        EHCI_BDF.store(make_bdf(bus as u8, dev, func), Ordering::Relaxed);
-                        EHCI_FOUND.store(true, Ordering::Relaxed);
-                    }
                 }
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
@@ -1186,10 +1173,6 @@ pub fn init() {
     // Two independent views of one truth must agree BEFORE anything is switched over to the new one.
     // Printed once at boot, so the agreement is evidence in the log rather than an assumption in a
     // commit message - and the day they disagree, the log says which device and which fact.
-    // Sentinel for "resolve this the BAR_AUTO way" - out of range of a real BAR index (0..5), so it
-    // can never collide with one.
-    const BAR_AUTO_IX: usize = usize::MAX;
-
     let n = DEVICE_COUNT.load(Ordering::Relaxed);
     crate::kprintln!("pci: device table - {} device(s) recorded (generic, no class knowledge)", n);
 
@@ -1227,38 +1210,14 @@ pub fn init() {
     }
     crate::kprintln!("pci: derive-from-BDF vs scan: {}",
                      if derive_ok { "AGREES on every device" } else { "DISAGREES - see above" });
-    for (label, want_found, want_bar, want_class, bar_ix) in [
-        ("EHCI", EHCI_FOUND.load(Ordering::Relaxed), EHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_20, 0),
-        // Ethernet: class 0x02, subclass 0x00, prog-if 0x00. Both models we drive (e1000, RTL8168)
-        // report the same triple - which is the point: the class code says "ethernet controller",
-        // and WHICH ethernet controller is the driver's business, not the kernel's.
-    ] {
-        // Resolve the index the same way the spawn path does, so the two sides compare like with like.
-        let bar_of = |d: &PciDevice| -> u64 {
-            if bar_ix == BAR_AUTO_IX {
-                d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0)
-            } else {
-                d.bar[bar_ix.min(5)]
-            }
-        };
-        // Name the index the way a reader thinks of it. Printing the sentinel put
-        // `BAR18446744073709551615` in the boot log - a number that means "auto" to this function and
-        // nothing at all to anyone reading it.
-        let bar_name: &str = if bar_ix == BAR_AUTO_IX { "AUTO" } else {
-            ["0", "1", "2", "3", "4", "5"][bar_ix.min(5)]
-        };
-        match find_by_class(want_class) {
-            Some(d) if want_found && bar_of(&d) == want_bar =>
-                crate::kprintln!("pci:   {} class {:#08x} AGREES (BAR {} {:#x} BDF {:#06x})",
-                                 label, want_class, bar_name, bar_of(&d), d.bdf),
-            Some(d) =>
-                crate::kprintln!("pci:   {} class {:#08x} DISAGREES - table BAR {} {:#x}, static {:#x} (found={})",
-                                 label, want_class, bar_name, bar_of(&d), want_bar, want_found),
-            None if !want_found =>
-                crate::kprintln!("pci:   {} class {:#08x} absent from both - agrees", label, want_class),
-            None =>
-                crate::kprintln!("pci:   {} class {:#08x} MISSING from the table but the static says found (BAR {:#x})",
-                                 label, want_class, want_bar),
-        }
-    }
+    // THE STATIC-VS-TABLE CROSS-CHECK IS GONE, because there are no statics left to check.
+    //
+    // It compared four per-class statics - xHCI, EHCI, AHCI, NIC - against the generic table that was
+    // going to replace them, and printed AGREES on every machine on every boot for weeks. That is
+    // what made deleting them a mechanical step rather than a leap: by the time each one went, its
+    // replacement had already been proven equal to it on four machines, in the log, repeatedly.
+    //
+    // What remains above is the OTHER cross-check and it stays: the scan's recorded table against a
+    // fresh read of config space by BDF. Those are still two independent views of one truth, and the
+    // day they disagree the log says which device and which fact.
 }
