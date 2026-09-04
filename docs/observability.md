@@ -390,13 +390,40 @@ Phased so that the kernel change is **pulled into existence** by a service that 
 the wall (26.2), not built ahead of one. Each phase is independently useful and independently
 shippable.
 
-### Phase 0 - build the service against what already exists
+### Phase 0 - build the service against what already exists - **DONE 2026-09-04**
 
-**The rename half is DONE** (section 9). What remains here is giving the service the observability
-job. Note the correction to this phase's own headline: it is not "no kernel change at all" - the
-kernel carries hard-coded service-name lists (two in `scheduler.rs`, four in `build.rs`), so the
-rename edited the kernel. No new responsibility and no growth, but a kernel source edit and therefore
-real re-verification, which is the expensive part.
+Both halves shipped: the rename (section 9, `7dc157b0`) and the metrics stream (`b91cea82`).
+
+Correct the headline first, because it was wrong: this was **not** "no kernel change at all". The
+kernel carries hard-coded service-name lists (two in `task/scheduler.rs`, four in `build.rs`), so the
+rename edited the kernel. No new responsibility and no growth - but a kernel SOURCE edit, and that is
+the expensive kind, because it reopens the question of whether the kernel is still correct. What is
+genuinely true is the claim worth making: **no new kernel responsibility, no new syscall, no new
+capability, nothing on the IPC fast path.**
+
+What a service now has, and the shape of each:
+
+| stream | how | costs the emitter |
+|---|---|---|
+| **logs** | `ctx.log()`, syscall 5 to the kernel floor | works even when `events` is dead |
+| **traces** | automatic in the SDK; needs only `ipc_send = ["events"]` | one relaxed load when not tracing |
+| **metrics** | `ctx.metric(name, value)`, `try_send` and discard | nothing it can be blocked or slowed by |
+
+Read back with `trace metrics` (a record source, so it filters and formats like any other).
+
+**Two things this phase settled that the plan above did not anticipate.**
+
+*The self-observation rule needed no mechanism.* `events` publishes its own four rows by writing into
+the table it already owns, and it cannot accidentally do otherwise: it holds no send cap to itself, so
+`ctx.metric` resolves to `u32::MAX` and returns - the same cut that already stopped the sink tracing
+its own sends. The rule in section 9 turned out to be a generalisation of something the SDK was
+already doing deliberately, not a new constraint.
+
+*Bounds bite immediately, and that is the system working.* The metric name field was first sized at
+`PEER_LEN`, and the sink's own first metric (`ring.recorded`, 13 bytes) was silently truncated to
+`ring.recorde`. Two fixes, both in the spirit of 26.6.1: give the field its own size (20) rather than
+borrowing one meant for service names, and REPORT the truncation once, because a name quietly becoming
+a different name would merge two metrics into one row with the values interleaving.
 
 ```
    InspectKernel (24 queries) --pull--+
