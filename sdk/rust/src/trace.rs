@@ -53,6 +53,36 @@ pub const TRACE_OP_DUMP: u8 = 2;
 /// Ask for ring capacity / accepted / dropped.
 pub const TRACE_OP_STATUS: u8 = 3;
 
+/// Publish a METRIC sample: `[4][owner:12][name:12][value(8, le)]`.
+///
+/// A metric is a SET, not an increment. The emitting service already holds the counter - it is that
+/// service's own state, with an owner (§3.8) - and publishes the current value; `events` remembers the
+/// last one published. That keeps the sink free of accumulation semantics it would otherwise have to
+/// define (what does an increment mean across a restart of either side?), and it means a service that
+/// dies leaves its final published value behind instead of taking it along - the one useful thing an
+/// observer can still learn from a service that is gone.
+pub const TRACE_OP_METRIC: u8 = 4;
+/// Ask for the metric table.
+pub const TRACE_OP_METRICS: u8 = 5;
+
+/// Bytes of a METRIC's name. Deliberately NOT `PEER_LEN`.
+///
+/// `PEER_LEN` is 12 because the longest SERVICE name that matters is `block-driver`. A metric name is a
+/// different kind of thing and wants more room - `ring.recorded` is already 13 - so reusing the service
+/// bound for it was wrong, and it bit immediately: the sink's own first metric was truncated to
+/// `ring.recorde`. Sizing a field by what it will hold, rather than by what an adjacent field holds, is
+/// the whole fix.
+pub const MET_NAME_LEN: usize = 20;
+
+/// Wire length of one metric: owner[12] + name[20] + value(8).
+///
+/// FIXED, like an event, and for the same reason: no allocation anywhere on the path, and a bound a
+/// reader can read off the source (§26.6.1). A name longer than `MET_NAME_LEN` is still TRUNCATED
+/// rather than refused - a truncated name identifies the sample to a human, where a refused sample is
+/// a hole in the instrument - but the truncation is now REPORTED once by `ServiceContext::metric`,
+/// because a name silently becoming a different name is exactly the quiet loss invariant 12 forbids.
+pub const MET_LEN: usize = PEER_LEN + MET_NAME_LEN + 8;
+
 /// A request was sent and the caller is now awaiting a reply.
 pub const KIND_REQUEST: u8 = 1;
 /// A reply came back.
@@ -213,6 +243,26 @@ pub fn sink_slot() -> u32 {
 /// here is a CMOS RTC read on the caller's hot path (see `ServiceContext::trace_emit`), and an
 /// observer that costs the observed a millisecond of port I/O per IPC is not an observer, it is a
 /// brake.
+/// Encode one metric sample.
+///
+/// The OWNER is this service's declared name (`trace_as`), exactly as for an event: identity is not
+/// ambient, so the emitter says who it is, and the sample is its own testimony - no more and no less
+/// trustworthy than the value beside it.
+///
+/// No clock read. The sink stamps the sample, for the reason recorded on `trace_emit`: a CMOS RTC read
+/// on every publish would put up to a millisecond of port I/O on the emitting service's path, and that
+/// once cost the shell its keystrokes. An observer must not be able to slow what it observes.
+pub fn encode_metric(name: &str, value: u64) -> [u8; 1 + MET_LEN] {
+    let mut b = [0u8; 1 + MET_LEN];
+    b[0] = TRACE_OP_METRIC;
+    CALLER.read_into(&mut b[1..1 + PEER_LEN]);
+    let n = name.len().min(MET_NAME_LEN);
+    b[1 + PEER_LEN..1 + PEER_LEN + n].copy_from_slice(&name.as_bytes()[..n]);
+    b[1 + PEER_LEN + MET_NAME_LEN..1 + PEER_LEN + MET_NAME_LEN + 8]
+        .copy_from_slice(&value.to_le_bytes());
+    b
+}
+
 pub fn encode(peer: &str, op: u8, kind: u8) -> [u8; 1 + EV_LEN] {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut b = [0u8; 1 + EV_LEN];

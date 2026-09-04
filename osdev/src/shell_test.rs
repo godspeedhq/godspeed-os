@@ -542,6 +542,37 @@ pub fn run(image_path: &Path, smp: u32) {
         None => { println!("shell-test: FAIL - timed out after `trace status`"); fail += 3; }
     }
 
+    // METRICS. Two separate claims, and the second is the one worth having a test for.
+    //
+    // (1) `events` publishes its OWN numbers, and does it by writing into the table it already owns
+    //     rather than by sending itself a message. A sink that reported its own reporting would fill
+    //     with itself - the send is a reportable event, which produces a record, which is a send. Its
+    //     rows appearing here is that local-write path working.
+    // (2) `fs` publishes over IPC like any other service, which is the path a new service would use.
+    //
+    // The `ls` runs first because `fs` publishes every 32 requests rather than on every one (an
+    // observer that doubles the traffic it measures is not an observer), so the row only exists once
+    // real work has happened. That is the design, not a wait for a timer.
+    for _ in 0..12 {
+        send(&mut write_half, b"ls /\r");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
+    }
+    send(&mut write_half, b"trace metrics\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => {
+            check!(r.contains("owner") && r.contains("metric") && r.contains("value") && r.contains("age_s"),
+                   "trace metrics: renders the table header");
+            check!(r.contains("events"), "trace metrics: `events` publishes its own rows (local write, no IPC hop)");
+            check!(r.contains("ring.recorded"), "trace metrics: the sink's own ring counter is published");
+            check!(r.contains("blk.outages"), "trace metrics: `fs` published over IPC, like any other service");
+            check!(r.contains("requests"), "trace metrics: fs's request counter arrived");
+            check!(r.contains("metrics.held"), "trace metrics: the sink counts its own table");
+            check!(r.contains("LAST value its owner published"),
+                   "trace metrics: says a value can outlive its owner, so age_s must be read");
+        }
+        None => { println!("shell-test: FAIL - timed out after `trace metrics`"); fail += 6; }
+    }
+
     // Events must actually be RECORDED - the shell has been making fs/console calls all along.
     send(&mut write_half, b"trace ipc\r          q");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {

@@ -797,7 +797,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "status"]),
+    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "metrics", "status"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -6652,6 +6652,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
                 "deps"     => match build_deps_table(ctx, split_first(arg).1.trim()) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "endpoints" => build_endpoints_table(ctx),
                 "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "metrics"  => match build_trace_metrics_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 other      => {
                     ctx.console_writeln_fmt(format_args!(
                         "trace: '{}' is not a record source - pipe 'trace ipc' or 'trace failures'", other));
@@ -7066,6 +7067,7 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
         "blocked" => trace_blocked(ctx),
         "ipc" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
+        "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
         "deps" => trace_deps(ctx, rest),
         "endpoint" => trace_endpoint(ctx, rest),
@@ -7969,6 +7971,80 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln_fmt(format_args!(
             "trace deps: stopped at {} edges - the graph is larger than this view", DEPS_MAX_ROWS));
     }
+    Ok(())
+}
+
+/// `trace metrics` as a record producer: one row per published sample.
+///
+/// `age_s` is the point of the view as much as `value` is. A metric is the last value its owner
+/// PUBLISHED, and `events` keeps it after that owner dies (a sample survives its emitter, which is the
+/// one useful thing left to learn from a service that is gone). Without an age, a number frozen at the
+/// moment of a crash is indistinguishable from a number being maintained right now, and an instrument
+/// that cannot tell those apart is worse than none.
+#[inline(never)]
+fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
+    use godspeed_sdk::trace::{MET_LEN, MET_NAME_LEN, PEER_LEN};
+    let req = [godspeed_sdk::trace::TRACE_OP_METRICS];
+    let reply = match trace_ask(ctx, &req) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("trace: the `events` service did not answer in 3 attempts (it holds the metrics)");
+            return None;
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.is_empty() {
+        ctx.console_writeln("trace: events returned an empty metrics reply");
+        return None;
+    }
+    let n = b[0] as usize;
+    let out = MET_LEN + 4;
+    if b.len() < 1 + n * out {
+        ctx.console_writeln("trace: events returned a short metrics reply");
+        return None;
+    }
+    let now = ctx.epoch_secs_monotonic() as u32;
+    let mut t = Table::new(&["owner", "metric", "value", "age_s"]);
+    for i in 0..n {
+        let o = 1 + i * out;
+        let owner = &b[o..o + PEER_LEN];
+        let name = &b[o + PEER_LEN..o + PEER_LEN + MET_NAME_LEN];
+        let v = o + PEER_LEN + MET_NAME_LEN;
+        let value = u64::from_le_bytes([
+            b[v], b[v + 1], b[v + 2], b[v + 3], b[v + 4], b[v + 5], b[v + 6], b[v + 7],
+        ]);
+        let at_s = u32::from_le_bytes([b[o + MET_LEN], b[o + MET_LEN + 1], b[o + MET_LEN + 2], b[o + MET_LEN + 3]]);
+        let trim = |x: &[u8]| -> usize { x.iter().position(|&c| c == 0).unwrap_or(x.len()) };
+        let ov = t.intern(&owner[..trim(owner)]);
+        let nv = t.intern(&name[..trim(name)]);
+        t.add_row(&[ov, nv, Value::Int(value), Value::Int(now.saturating_sub(at_s) as u64)]);
+    }
+    Some(t)
+}
+
+fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let t = match build_trace_metrics_table(ctx) {
+        Some(t) => t,
+        None => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
+        ctx.console_writeln("trace: no metrics published (a service publishes with ctx.metric, and needs ipc_send=[\"events\"])");
+        return Ok(());
+    }
+    // ONE FRAME. The table is at most 64 rows, so it never needs the pager `trace ipc` uses - but it
+    // does need the same batching: a row written straight to the console is two syscalls against a
+    // 16-deep queue, and that is what once made the keyboard look dead while the machine was fine.
+    let w = t.grid_widths();
+    let mut f = FrameBuf::new();
+    let mut lb = LineBuf::new();
+    t.grid_header(&mut lb, &w);
+    lb.flush_into(ctx, &mut f);
+    for r in 0..t.nrows() {
+        t.grid_row(&mut lb, r, &w);
+        lb.flush_into(ctx, &mut f);
+    }
+    f.flush(ctx);
+    ctx.console_writeln("trace: a metric is the LAST value its owner published - `events` keeps it after the owner dies, so check age_s.");
     Ok(())
 }
 

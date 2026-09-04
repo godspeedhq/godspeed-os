@@ -463,27 +463,53 @@ trace deps fs | assert contains block-driver
 trace deps shell | to grid | assert contains parent
 trace deps shell | where peer contains fs | assert contains fs
 # The endpoint inventory, and the inverse lookup it exists to feed.
-trace endpoints | assert contains logger
+trace endpoints | assert contains events
 trace endpoints | where name contains fs | assert contains fs
 # The ring itself answers, and reports its drop count (a silent loss is the bug - invariant 12).
 assert ok trace status
 # The shell has been calling `fs` throughout this suite, so the ring holds real traffic.
 trace ipc | assert contains outcome
+# ===== events: the METRIC table, in the same service that holds the ring =====
+# This is the half of `events` that is not the trace ring, and the reason the service is no longer
+# called `logger`: it holds published samples as well as events, and never held a log line in its life
+# (`ctx.log()` is syscall 5, straight to the kernel ring and serial - CLAUDE.md 11.4).
+assert ok trace metrics
+# THE SINK PUBLISHES ITS OWN NUMBERS BY LOCAL WRITE, NEVER BY SENDING ITSELF A MESSAGE. A send is
+# itself a reportable event, so a self-emit over IPC would feed the ring from the ring and fill it with
+# its own reporting. These rows existing is that local-write path working, and it is the executable
+# form of the rule in docs/observability.md 9.
+trace metrics | assert contains ring.recorded
+trace metrics | assert contains metrics.held
+# ...and an ORDINARY service publishes over IPC, which is the path any new service would use. `fs` has
+# served this entire suite, so it is far past its 32-request publish interval.
+trace metrics | assert contains blk.outages
+# It is a record source like `trace ipc`, so it filters like one.
+trace metrics | where owner contains events | assert contains ring.recorded
+# An unknown view is refused loudly here too.
+assert fails trace metricz
+
 # Every view refuses an unknown subject LOUDLY rather than answering with nothing.
 assert fails trace chain nosuchsvc
 assert fails trace deps nosuchsvc
 assert fails trace endpoint notanumber
 assert fails trace nosuchview
 
-# THE SINK IS RESTARTABLE, AND THE READER MUST SURVIVE IT. `logger` holds the trace ring; killing it
+# THE SINK IS RESTARTABLE, AND THE READER MUST SURVIVE IT. `events` holds the trace ring; killing it
 # invalidates every cached capability to it. Without a reacquire the shell keeps a stale generation
 # forever, so `trace ipc` reports a live service as unreachable and every emission logs a kernel
 # gen-mismatch - which is exactly what a chaos storm produced on hardware (cap 985 vs record 1025)
 # before this was fixed. Kill it, then prove the views still work (14.3: reacquire by name, retry).
-assert ok chaos kill-storm logger 1
+assert ok chaos kill-storm events 1
 assert ok trace status
 trace ipc | assert contains outcome
-trace endpoints | assert contains logger
+trace endpoints | assert contains events
+# THE METRIC TABLE IS VOLATILE AND DIES WITH THE SINK. That is correct, not a gap: a restart is a
+# re-init and not a resume (14.2), and it is exactly why `events` must never acquire a durable-storage
+# dependency - a service that reports a storage failure must not be downstream of storage. What has to
+# survive the kill is the VIEW, which answers again and refills as services publish. The one thing it
+# can never report is its OWN death; the supervisor's death notification and the kernel's unconditional
+# serial write do that, and both sit beneath it.
+assert ok trace metrics
 
 # ===== files: create / read / overwrite / append / empty / quoted =====
 echo ''

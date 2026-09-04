@@ -43,7 +43,10 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::trace::{EV_LEN, PEER_LEN, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_STATUS};
+use godspeed_sdk::trace::{
+    EV_LEN, MET_LEN, MET_NAME_LEN, PEER_LEN, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_METRIC, TRACE_OP_METRICS,
+    TRACE_OP_STATUS,
+};
 use godspeed_sdk::{Message, ServiceContext};
 
 /// Events retained. 192 x 34 B is about 6.5 KiB, inside this service's existing footprint.
@@ -54,6 +57,32 @@ use godspeed_sdk::{Message, ServiceContext};
 /// somewhere it does not belong. If longer history is ever wanted, the honest answer is a bigger arena
 /// HERE, where it costs one service more memory and costs the kernel nothing.
 const RING: usize = 192;
+
+/// Distinct metric samples retained: 64 x 36 B is about 2.3 KiB, and the whole table fits in one 4 KiB
+/// reply message with room to spare.
+///
+/// A FIXED table, not a map that grows with distinct names, because a counter keyed by arbitrary
+/// strings is unbounded state wearing a small hat (§26.6.1). 64 is a bound a reader can read off this
+/// line. When it is full the sink says so, loudly and once - a 65th metric that vanished silently
+/// would make every number here suspect, since nothing would tell you which ones were missing.
+const METRICS: usize = 64;
+
+/// Wire length of one metric in a DUMP reply: the emitted record plus the stamp the sink adds.
+const MET_OUT: usize = MET_LEN + 4;
+
+/// One published sample. Keyed by (owner, name): two services may both publish `requests` and they are
+/// different numbers, so the owner is part of the identity rather than a label beside it.
+#[derive(Clone, Copy, Default)]
+struct Met {
+    owner: [u8; PEER_LEN],
+    name: [u8; MET_NAME_LEN],
+    /// The LAST value published. A metric is a set, not an increment (`sdk::trace::TRACE_OP_METRIC`) -
+    /// the owning service holds the counter and publishes what it reads.
+    value: u64,
+    /// When the sink accepted it. Stamped HERE for the same reason an event is: the publisher must not
+    /// pay a clock read.
+    at_s: u32,
+}
 
 /// One recorded event - mirrors the wire format in `sdk::trace`.
 #[derive(Clone, Copy, Default)]
@@ -97,6 +126,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut next = 0usize; // write cursor
     let mut total = 0u64; // events ever accepted
     let mut dropped = 0u64; // events overwritten before being read
+    let mut mets = [Met::default(); METRICS];
+    let mut nmets = 0usize; // occupied slots
+    let mut mets_full = 0u64; // samples refused because the table is full
+    let mut mets_full_said = false; // the refusal is reported ONCE, not once per sample
 
     // The event clock, CACHED. `epoch_secs_monotonic` is a CMOS RTC read on x86 - `wait_update_clear`
     // can spin ~1 ms before seven port-I/O reads - so calling it per event would cap this sink at
@@ -181,6 +214,120 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 out[8..16].copy_from_slice(&total.to_le_bytes());
                 out[16..24].copy_from_slice(&dropped.to_le_bytes());
                 reply(&ctx, &out);
+            }
+            // A published metric sample. Same fire-and-forget contract as an event: the publisher
+            // used `try_send` and did not wait, so this must never be the reason a service is slow.
+            TRACE_OP_METRIC if b.len() >= 1 + MET_LEN => {
+                let m = &b[1..1 + MET_LEN];
+                let tsc = ctx.read_tsc();
+                if tsc.wrapping_sub(at_tsc) >= per_sec {
+                    at_s = ctx.epoch_secs_monotonic() as u32;
+                    at_tsc = tsc;
+                }
+                let mut owner = [0u8; PEER_LEN];
+                owner.copy_from_slice(&m[0..PEER_LEN]);
+                let mut name = [0u8; MET_NAME_LEN];
+                name.copy_from_slice(&m[PEER_LEN..PEER_LEN + MET_NAME_LEN]);
+                let v = PEER_LEN + MET_NAME_LEN;
+                let value = u64::from_le_bytes([
+                    m[v], m[v + 1], m[v + 2], m[v + 3], m[v + 4], m[v + 5], m[v + 6], m[v + 7],
+                ]);
+                match mets[..nmets].iter().position(|e| e.owner == owner && e.name == name) {
+                    Some(i) => {
+                        mets[i].value = value;
+                        mets[i].at_s = at_s;
+                    }
+                    None if nmets < METRICS => {
+                        mets[nmets] = Met { owner, name, value, at_s };
+                        nmets += 1;
+                    }
+                    // FULL. Refused, counted, and said ONCE - saying it per sample would flood the
+                    // very channel an operator needs to read the warning on. The count is served in
+                    // the dump, so the number of refusals is recoverable even after the one line
+                    // has scrolled away.
+                    None => {
+                        mets_full += 1;
+                        if !mets_full_said {
+                            mets_full_said = true;
+                            ctx.log("events: metric table FULL (64) - further samples with new names are refused, not dropped silently; `trace metrics` reports the count");
+                        }
+                    }
+                }
+            }
+            // `trace metrics` - the whole table.
+            TRACE_OP_METRICS => {
+                // SELF-OBSERVATION IS A LOCAL WRITE, NEVER A MESSAGE. This service cannot publish its
+                // own numbers the way every other service does: `ctx.metric()` sends, a send is a
+                // reportable event, and a sink that reported its own reporting would fill with itself.
+                // So it writes its rows straight into the table it already owns, here, at read time -
+                // no timer, no hop, and no recursion possible (`docs/observability.md` 9).
+                //
+                // Its own DEATH is still not in here, and cannot be: the supervisor's death
+                // notification and the kernel's unconditional serial write are what report that, and
+                // both sit beneath this service rather than inside it.
+                // `metrics.held` is written LAST, after the others are in, because it counts the
+                // table it is itself a row of. Read before the insertions it reported 2 while the
+                // table held 6 - an instrument off by its own contribution, which is worse than no
+                // instrument because it looks authoritative.
+                let mine: [(&str, u64); 3] = [
+                    ("ring.recorded", total),
+                    ("ring.dropped", dropped),
+                    ("metrics.refused", mets_full),
+                ];
+                for (n, v) in mine {
+                    let mut name = [0u8; MET_NAME_LEN];
+                    let k = n.len().min(MET_NAME_LEN);
+                    name[..k].copy_from_slice(&n.as_bytes()[..k]);
+                    let mut owner = [0u8; PEER_LEN];
+                    owner[.."events".len()].copy_from_slice(b"events");
+                    match mets[..nmets].iter().position(|e| e.owner == owner && e.name == name) {
+                        Some(i) => {
+                            mets[i].value = v;
+                            mets[i].at_s = at_s;
+                        }
+                        None if nmets < METRICS => {
+                            mets[nmets] = Met { owner, name, value: v, at_s };
+                            nmets += 1;
+                        }
+                        None => {}
+                    }
+                }
+
+                // Now the self-count, with every other row already present - including the three
+                // just added, and including this one once it exists.
+                {
+                    let mut name = [0u8; MET_NAME_LEN];
+                    name[.."metrics.held".len()].copy_from_slice(b"metrics.held");
+                    let mut owner = [0u8; PEER_LEN];
+                    owner[.."events".len()].copy_from_slice(b"events");
+                    match mets[..nmets].iter().position(|e| e.owner == owner && e.name == name) {
+                        Some(i) => {
+                            mets[i].value = nmets as u64;
+                            mets[i].at_s = at_s;
+                        }
+                        None if nmets < METRICS => {
+                            // +1 counts the row being added by this very statement.
+                            mets[nmets] = Met { owner, name, value: nmets as u64 + 1, at_s };
+                            nmets += 1;
+                        }
+                        None => {}
+                    }
+                }
+
+                // The whole table, always: METRICS is 64 and 64 x 44 + 1 = 2817 B, comfortably inside
+                // one 4 KiB message. No second cap to keep in step with the first (§26.4).
+                let n = nmets;
+                let mut out = [0u8; 1 + METRICS * MET_OUT];
+                out[0] = n as u8;
+                for i in 0..n {
+                    let e = &mets[i];
+                    let o = 1 + i * MET_OUT;
+                    out[o..o + PEER_LEN].copy_from_slice(&e.owner);
+                    out[o + PEER_LEN..o + PEER_LEN + MET_NAME_LEN].copy_from_slice(&e.name);
+                    out[o + PEER_LEN + MET_NAME_LEN..o + MET_LEN].copy_from_slice(&e.value.to_le_bytes());
+                    out[o + MET_LEN..o + MET_LEN + 4].copy_from_slice(&e.at_s.to_le_bytes());
+                }
+                reply(&ctx, &out[..1 + n * MET_OUT]);
             }
             // Anything else is drained and dropped, which is the job this service already had: an
             // unconsumed endpoint fills at 16 and never empties.

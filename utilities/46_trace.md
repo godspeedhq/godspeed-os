@@ -118,7 +118,7 @@ the kernel.
 
 ## 5. Command surface
 
-As shipped - seven views, each named for WHAT IT SHOWS rather than what you give it:
+As shipped - eight views, each named for WHAT IT SHOWS rather than what you give it:
 
 ```text
   trace blocked                 what is stuck, everywhere
@@ -129,7 +129,56 @@ As shipped - seven views, each named for WHAT IT SHOWS rather than what you give
   trace ipc                     what happened - the ring, paged and pipeable
   trace failures                the same ring, only the failures
   trace status                  ring size, recorded, dropped
+  trace metrics                 published samples: owner, metric, value, age
 ```
+
+### `trace metrics` - what services are counting
+
+The ring answers "what just happened". `trace metrics` answers "how much, so far", and it reads the
+other half of the same service - the metric table in `events`.
+
+```text
+gsh> trace metrics
+owner   metric           value  age_s
+fs      requests         32     1
+fs      blk.outages      0      1
+events  ring.recorded    139    0
+events  ring.dropped     0      0
+events  metrics.held     6      0
+events  metrics.refused  0      0
+```
+
+| column | meaning |
+|---|---|
+| `owner` | the service that published it, as that service declared itself (`trace_as`). Part of the identity, not a label beside it: two services may both publish `requests` and they are different numbers. |
+| `metric` | the name the publisher chose, up to 20 bytes. Longer is truncated, and the SDK says so once. |
+| `value` | the LAST value published. A metric is a SET, not an increment - the owning service holds the counter and publishes what it currently reads. |
+| `age_s` | seconds since the sink accepted it. **Read this column.** |
+
+**Why `age_s` is not decoration.** `events` keeps a sample after its publisher dies - which is the
+point, because the final value of a service that crashed is the one useful thing left to learn from it.
+The cost of that is a number frozen at the moment of death being indistinguishable from a number being
+maintained right now. The age is what tells them apart, and an instrument that cannot is worse than
+none.
+
+A publisher chooses its own interval, and should not publish on every operation: `fs` publishes every
+32 requests, because a metric costing an IPC send per request would double the traffic it exists to
+measure. So a value can lag by up to one interval on a quiet machine, and the age shows the lag rather
+than implying there is none.
+
+**It is a record source**, so it filters and formats like `trace ipc`:
+
+```text
+trace metrics | where owner contains fs
+trace metrics | select metric,value | to json
+```
+
+**What is NOT in here, and cannot be: `events` reporting its own death.** Its own rows are published by
+writing straight into the table it already owns, never by sending itself a message - a send is itself a
+reportable event, so a self-emit over IPC would feed the ring from the ring. That local write works
+right up until the process stops, and then nothing in it can say so. The supervisor's death
+notification and the kernel's unconditional serial write are what report that, and both sit beneath
+this service rather than inside it (`docs/observability.md` §9).
 
 `trace task <slot>` and `trace service <name>` were folded into `trace chain`: they printed identical
 output from identical code while being named after the SUBJECT KIND, which made them look like two
@@ -199,7 +248,7 @@ The argument is a service NAME or a task SLOT; digits are read as a slot. `trace
 gsh> trace deps fs
 fs
 |-- block-driver  27 calls  (capacity)
-`-- logger  (trace sink - its own traffic is never recorded)
+`-- events  (trace sink - its own traffic is never recorded)
 (2 reply address(es) hidden - `trace deps fs | where peer contains reply` lists them)
 ```
 
@@ -212,7 +261,7 @@ contract declared.
 | `27 calls` | how many exchanges with that peer are STILL IN THE RING. A recent window, never a lifetime total. `0` means "not in the last 64 events", never "never" |
 | `(capacity)` | the distinct operations seen, by name. A bare number is an opcode this shell has no name for |
 | `4 FAILED` | of those calls, how many ended in anything other than a reply |
-| `(trace sink - its own traffic is never recorded)` | `logger` always reads 0 calls: emissions to the ring are deliberately not traced, so this is the MOST used capability here, not an unused one |
+| `(trace sink - its own traffic is never recorded)` | `events` always reads 0 calls: emissions to the ring are deliberately not traced, so this is the MOST used capability here, not an unused one |
 | `reply#119` | a send capability whose endpoint no live task owns - a return address, not a dependency. Counted below the tree rather than drawn in it |
 | `stopped at N edges` | the walk hit its bound; the graph is larger than the view |
 
@@ -235,7 +284,7 @@ As records (`| to grid`), one row per EDGE:
 gsh> trace endpoints
 slot  name          endpoint  state      queue
 0     supervisor    100       BlockRecv  0
-1     logger        102       BlockRecv  0
+1     events        102       BlockRecv  0
 6     fs            112       BlockRecv  0
 ```
 
@@ -330,13 +379,13 @@ something stuck is `trace blocked`.
 
 ```text
 trace: ring 192 events; 2 recorded; 0 DROPPED (oldest overwritten before being read)
-trace: the ring lives in the `logger` service - the kernel records nothing.
+trace: the ring lives in the `events` service - the kernel records nothing.
 ```
 
 | number | what it counts |
 |---|---|
 | `ring N events` | capacity. Fixed, no heap |
-| `N recorded` | events ever ACCEPTED by the sink since it last started. A logger restart resets it |
+| `N recorded` | events ever ACCEPTED by the sink since it last started. An `events` restart resets it |
 | `N DROPPED` | events overwritten before anyone read them. **This cannot see the other kind of loss** - an event whose `try_send` failed never arrived, so it is invisible here and shows only as a gap in a caller's `seq` |
 
 ---
@@ -344,7 +393,7 @@ trace: the ring lives in the `logger` service - the kernel records nothing.
 #### Who is traced at all
 
 Only exchanges made through the SDK's request/reply calls, by services whose contract grants
-`ipc_send = ["logger"]`. Today that is `fs` and `shell`. Tracing is authority: visible in
+`ipc_send = ["events"]`. Today that is `fs` and `shell`. Tracing is authority: visible in
 `caps <service>`, revocable, and absent by default - not a global switch. A service holding no such
 capability emits nothing, at a cost of one relaxed atomic load.
 
@@ -554,7 +603,7 @@ ratified history: it is the reasoning that had to be worked through to see why i
 
 | §6 proposed (in the kernel) | As built (in userspace) |
 |---|---|
-| ring in kernel `.bss` | a fixed array in the `logger` service |
+| ring in kernel `.bss` | a fixed array in the `events` service |
 | `sender`/`receiver` task slots | the peer's **NAME**, because the emitter knows it |
 | `endpoint` + `generation` | not recorded - the name is what a reader wanted the endpoint to resolve to |
 | kernel-assigned `message_id` | not assigned; see `trace tree`, still out of scope |
@@ -571,7 +620,7 @@ point the same way - which is usually the sign the design is right.
 
 (The first attempt was a `tracer` service of its own. The enforcement layer refused it, correctly: the
 kernel holds a `service_config` per service, pinned as debt that may only shrink, so even a userspace
-ring would have cost ring 0 three lines. `logger` is already in every one of those lists and its whole
+ring would have cost ring 0 three lines. `events` is already in every one of those lists and its whole
 purpose is diagnostic data, so the ring there costs the kernel **exactly zero**.)
 
 **Layers touched:**
@@ -580,23 +629,23 @@ purpose is diagnostic data, so the ring there costs the kernel **exactly zero**.
 |---|---|
 | `sdk/rust/src/trace.rs` | wire format (34 B: seq, at_s, caller[12], peer[12], op, kind), lazy one-time arming, per-peer opcode offset |
 | `sdk/rust/src/service_context.rs` | `trace_emit`; three emission points in `request_with_reply` |
-| `services/logger/src/main.rs` | the 192-event ring, dump + status replies |
+| `services/events/src/main.rs` | the 192-event ring, dump + status replies |
 | `services/shell/src/main.rs` | `trace ipc`, `trace failures`, `trace status` |
 | **kernel** | **nothing** |
 
 **Cost when not tracing: one `Relaxed` load, branch not taken** - and nothing at the routing point, so
-`B1`/`B2` cannot move. A service traces only if its contract granted it `ipc_send = ["logger"]`, so
+`B1`/`B2` cannot move. A service traces only if its contract granted it `ipc_send = ["events"]`, so
 tracing is **authority**: visible in `caps <service>`, revocable, absent by default (§3.1). §6 asked
 for a benchmark before shipping a switch on the fast path; there is no switch and no fast-path write,
 so the thing that needed measuring does not exist.
 
 **Bounded and loud (§26.6, invariant 12):** fixed ring, fixed events, no heap. Full = overwrite the
 oldest and **count it**; `trace status` reports the count. Emission is `try_send` with the result
-discarded, so a full logger queue costs the emitter nothing and loses one event - the right trade on
+discarded, so a full sink queue costs the emitter nothing and loses one event - the right trade on
 an observability path, and the opposite of the one made on a correctness path. An observer must never
 be able to slow, block or break the thing it observes.
 
-**The reader is not recorded.** A call to `logger` itself is never traced: `trace ipc` reaches the ring
+**The reader is not recorded.** A call to `events` itself is never traced: `trace ipc` reaches the ring
 by asking the service that holds it, so tracing those calls would fill the ring with the reader's own
 questions, two per dump, pushing out the traffic the reader came to see. Every other peer is still
 recorded and `trace status` still counts every accepted event, so nothing is hidden.
@@ -609,7 +658,7 @@ Verified in QEMU (`osdev test shell`, 140/0/2 - 10 of them `trace`):
 ```
 gsh> trace status
 trace: ring 192 events; 2 recorded; 0 DROPPED (oldest overwritten before being read)
-trace: the ring lives in the `logger` service - the kernel records nothing.
+trace: the ring lives in the `events` service - the kernel records nothing.
 gsh> trace ipc
 seq  t+s  peer       op  event
 0    0    net-stack  2   REQUEST
@@ -660,7 +709,7 @@ order, because the first three theories were all wrong:
 | wrappers marked `#[inline]` | 212/10 | the extra frame and the 4 KiB `Message` move |
 | wrappers with the trace calls removed | **222/0** | the wrapper structure itself |
 | the clock read removed from emitter AND sink | 213/9 | the CMOS RTC read |
-| `logger` moved off core 0 | **222/0** | - the answer |
+| `events` moved off core 0 | **222/0** | - the answer |
 
 **Every trace event WAKES the sink, and the sink was on core 0 with the shell.** Two events per `fs`
 request preempted the shell twice per round trip; the paths that do many round trips blew their
@@ -668,10 +717,10 @@ window, and the shell was descheduled often enough to stop draining the console.
 
 Three things changed as a result, and each is a rule worth keeping:
 
-1. **The sink does not live on the interactive core.** ARM had already moved `logger` off core 0 for a
+1. **The sink does not live on the interactive core.** ARM had already moved `events` off core 0 for a
    different reason (keeping the serial writer away from the microframe-timed USB driver); x86 now
    needs it for this one. An unavailable preferred core falls back to round-robin rather than failing
-   the spawn, so a machine with fewer cores still gets its logger.
+   the spawn, so a machine with fewer cores still gets its events.
 2. **One event per exchange, not two.** A REQUEST plus an outcome doubled the traffic through the
    sink's single 16-deep endpoint. Every exchange still produces exactly one event carrying its fate,
    so nothing is lost but the duplicate. A request still IN FLIGHT is therefore not in the ring - and
@@ -679,7 +728,7 @@ Three things changed as a result, and each is a rule worth keeping:
    the kernel, live (mechanism A).
 3. **The sink stamps the time, from a cached clock.** `epoch_secs_monotonic` is a CMOS RTC read on
    x86 - `wait_update_clear` can spin ~1 ms before seven port-I/O reads - so per-event it would cap
-   the sink near a thousand events a second. `logger` reads the cycle counter per event (one
+   the sink near a thousand events a second. `events` reads the cycle counter per event (one
    instruction) and refreshes the seconds only when one has actually elapsed.
 
 The reader also **retries** a busy sink three times before reporting it, because a full queue is
@@ -714,7 +763,7 @@ argument rather than an apology:
   to userspace ... so no ABI change". Surfacing it would grow the syscall surface for a diagnostic,
   which is not a trade this project makes.
 - The obvious objection - a self-declared name is a claim, not a fact - **does not survive contact
-  with what the event already is.** A service holding `ipc_send = ["logger"]` can already write any
+  with what the event already is.** A service holding `ipc_send = ["events"]` can already write any
   `peer` and any `outcome` it likes, because the whole event is its testimony. `caller` is exactly as
   trustworthy as the two fields beside it: as trustworthy as the service you granted trace authority
   to. It opens nothing.
@@ -749,7 +798,7 @@ Three questions, three sources, and the kernel is only in one of them.
                           |                            |                             |
                           v                            v                             v
                   +---------------+           +----------------+          +--------------------+
-                  | kernel, LIVE  |           | kernel, LIVE   |          | logger, a RING     |
+                  | kernel, LIVE  |           | kernel, LIVE   |          | events, a RING     |
                   | who awaits    |           | capability     |          | of past exchanges  |
                   | which endpoint|           | tables         |          |                    |
                   +---------------+           +----------------+          +--------------------+
@@ -764,7 +813,7 @@ into a service.
 ### How an event gets into the ring
 
 ```text
-   fs                                     kernel                    logger
+   fs                                     kernel                    events
    |                                        |                          |
    |-- request_with_reply("block-driver") ->|                          |
    |                                        |-- deliver -> block-driver|
@@ -788,16 +837,16 @@ Three properties fall out of that picture, and each is deliberate:
   syscall, and nothing added to the IPC fast path.
 - **The emitter never waits.** `try_send` and the result is discarded: a full sink costs the emitting
   service nothing and loses one event, which the ring counts and `trace status` reports.
-- **A service that holds no `logger` send cap emits nothing**, at the cost of one relaxed load.
+- **A service that holds no `events` send cap emits nothing**, at the cost of one relaxed load.
   Tracing is authority, visible in `caps <service>` and revocable.
 
 ### Why the sink is not on the interactive core
 
 ```text
    BEFORE                                  AFTER
-   core 0: shell  logger                   core 0: shell
-           ^^^^^  ^^^^^^                   core 2: logger
-           every event WAKES logger,
+   core 0: shell  events                   core 0: shell
+           ^^^^^  ^^^^^^                   core 2: events
+           every event WAKES events,
            preempting the shell            the wake lands on another core
            twice per fs request
 
@@ -836,7 +885,7 @@ net-stack                            endpoint 4 - NO LIVE OWNER.
 `-- time                             holder  slot  rights
     `-- fs                           xhci    8     write
         |-- block-driver
-        `-- logger  (trace sink - its own traffic is never recorded)
+        `-- events  (trace sink - its own traffic is never recorded)
 (3 reply address(es) not shown: reply#119 reply#107 - `trace endpoint <id>` resolves one)
 ```
 
@@ -878,14 +927,14 @@ service-to-service with the kernel uninvolved.
 ### What the same hardware run says about the ring's limits
 
 `trace failures` came back empty after a 100-round `chaos max-carnage` - 559 kills. That is the design
-working, and worth stating rather than discovering later: **`logger` was itself killed 51 times**, and
-a restarted logger starts with an empty ring. Emission is `try_send`, so events aimed at a dead sink
+working, and worth stating rather than discovering later: **`events` was itself killed 51 times**, and
+a restarted `events` starts with an empty ring. Emission is `try_send`, so events aimed at a dead sink
 are lost too.
 
 For the question this tool exists to answer - *why is this task not progressing, right now* - that is
 correct, and no ring in a restartable service can behave otherwise. For *post-mortem of a storm that
 killed the recorder 51 times*, it cannot help, and only persistence would - which the ring
-deliberately is not (see the `logger` header on why history that survives nothing is the right call).
+deliberately is not (see the `events` header on why history that survives nothing is the right call).
 
 **Still out of scope, unchanged:** `trace tree <message-id>` needs parent-id propagation through every
 service's request path (§6, and `docs/net-tags-design.md` describes the same problem for
@@ -903,7 +952,7 @@ net-stack <-> nic-driver). It is not made easier or harder by this; it is simply
    dissolved.** The recorder is the service that owns the protocol, and a service is entitled to
    interpret its own messages. Nothing privileges a convention inside the kernel, because the kernel
    is not involved.
-3. **Ring size**, if built. **ANSWERED: 192 events (~4 KiB) in `logger`.** Sized for "what just
+3. **Ring size**, if built. **ANSWERED: 192 events (~4 KiB) in `events`.** Sized for "what just
    happened", which is the question a stalled chain asks - deliberately not for "what happened a
    minute ago", which needs either a much larger ring or filtering at the emitter, and
    filtering-in-the-middle is the first step toward putting a programmable VM where it does not

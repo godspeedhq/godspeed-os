@@ -46,7 +46,7 @@ killing a non-recoverable thing would just wedge:
 | `block-driver` | the **supervisor** (Phase D, §6.1) - re-inits the controller on respawn. |
 | `fs` | the **supervisor** (Phase D) - re-mounts to a consistent state via its crash-consistency journal (`docs/persistence.md` §6.8). |
 | `shell` | the **supervisor** - a fresh prompt (the in-flight command is lost - a re-init, not a resume, §14.2). |
-| `xhci` / `ehci` / `logger` | the **supervisor** - drivers re-grant MMIO/DMA/IRQ + re-enumerate; logger re-drains the ring buffer. |
+| `xhci` / `ehci` / `events` | the **supervisor** - drivers re-grant MMIO/DMA/IRQ + re-enumerate; events re-drains the ring buffer. |
 
 The kernel notifies the supervisor on the death of this **directly-restartable set** so it respawns
 them immediately. And on death a service's name is **unregistered from the kernel directory** (§14.2),
@@ -109,7 +109,7 @@ yields to let the service drain and re-sends to confirm it recovered. It is **`t
 blocking `send`** (§8.9): blocking into a full queue would hang the shell flooding *itself*.
 
 - **Targets:** anything with a registered recv endpoint. The shell acquires a SEND cap to `<svc>` **by
-  name** (`AcquireSendCap`) - so `fs`, `logger`, `block-driver`, even `supervisor` are floodable.
+  name** (`AcquireSendCap`) - so `fs`, `events`, `block-driver`, even `supervisor` are floodable.
 - **Payload:** a minimal benign message the target drains and drops - no writes, no side effects. The
   test stresses the *queue*, not the disk.
 - **Verdict:** `PASS` = the service survived every flood (no `EndpointDead`) and still accepts messages.
@@ -131,7 +131,7 @@ this very command, which runs *inside* the shell) and the **kernel** (not a task
 The shell is itself restartable - a direct `kill shell` respawns a fresh prompt - but `max-carnage`
 can't be the one to kill it, because a fresh shell wouldn't resume the in-flight carnage loop.
 Directly-restarted victims (the whole named set - supervisor, block-driver, fs, shell, xhci, ehci,
-logger) are confirmed back up each round; only demo services like `ping`/`pong` (full build) revive on
+events) are confirmed back up each round; only demo services like `ping`/`pong` (full build) revive on
 the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded
 from the **TSC** (so the sequence differs every run).
 
@@ -158,10 +158,10 @@ rounds: 1000000; victims killed: 1000000
   fs             killed 143k, recovered 143k
   xhci           killed 137k, recovered 137k
   ehci           killed 139k, recovered 139k
-  logger         killed 133k, recovered 133k
+  events         killed 133k, recovered 133k
 directly-restarted recoveries confirmed: 1000000/1000000
 kernel: SURVIVED 1000000 random kills (no panic - this command returned)
-survivors (live now): supervisor logger block-driver fs shell xhci ehci  (7 live)
+survivors (live now): supervisor events block-driver fs shell xhci ehci  (7 live)
 verdict: PASS (kernel survived)
 ```
 
@@ -169,13 +169,13 @@ All output is **ASCII** (the framebuffer font has no em-dash/ellipsis - they ren
 panel) and `q to quit` matches the rest of the shell (`observe`, the help pager).
 
 > **The whole tree regrows from the kernel.** Only the *directly*-restarted services (supervisor by
-> the kernel; block-driver/fs by the supervisor) recover on their own death. The rest (`logger`,
+> the kernel; block-driver/fs by the supervisor) recover on their own death. The rest (`events`,
 > `xhci`, `ehci`, …) are not watched individually - but the moment `max-carnage` kills the
 > **supervisor** (a valid random target), the kernel respawns it, and the supervisor **re-runs its
 > boot sequence**, re-spawning every service it owns *fresh*. So a long carnage run that hits the
 > supervisor tends to **fully restore the system**. Hardware-proven on the HP T630: `chaos
 > max-carnage 30` killed the supervisor 6× and every service was alive again at the end (`observe`:
-> xhci/ehci/logger all `Ready`, no kernel panic). A *re-init*, not a resume (§14.2/§25) - a revived
+> xhci/ehci/events all `Ready`, no kernel panic). A *re-init*, not a resume (§14.2/§25) - a revived
 > driver re-enumerates its devices and resumes polling; in-flight state is not preserved.
 
 ## 6. Capabilities

@@ -1199,6 +1199,62 @@ impl ServiceContext {
         }
     }
 
+    /// Publish a metric sample to `events`. Fire-and-forget, and never able to slow this service down.
+    ///
+    /// The value is a SET, not an increment: this service owns the counter (it is this service's own
+    /// state, §3.8) and publishes what it currently reads; `events` remembers the last sample. So a
+    /// service that dies leaves its final value behind rather than taking it along, which is the one
+    /// useful thing an observer can still learn from a service that is gone.
+    ///
+    /// Shaped exactly like `trace_emit`, and the shape is the point:
+    /// - `try_send`, result DISCARDED. An observer must never slow, block or fail the thing it
+    ///   observes. A full sink loses one sample, which the sink counts and reports (invariant 12).
+    /// - No clock read here. The sink stamps it; a CMOS RTC read on every publish once cost the shell
+    ///   its keystrokes.
+    /// - Reacquire on failure only, so the healthy path is unchanged and a restarted sink does not
+    ///   leave every emitter holding a stale generation forever (14.3).
+    ///
+    /// SELF-OBSERVATION NEEDS NO CHECK HERE, and that is deliberate. `events` holds no send cap to
+    /// `events`, so this resolves to `u32::MAX` inside its own address space and returns - the same cut
+    /// that stops the sink tracing its own sends. A service reporting on itself must never take an IPC
+    /// hop, because the hop is itself a reportable event and the ring would fill with itself. `events`
+    /// counts its own work locally instead (`docs/observability.md` 9).
+    pub fn metric(&self, name: &str, value: u64) {
+        // FUNCTION-LOCAL, so the latch is owned by the only code that reads it (§3.8, invariant 9).
+        // A one-shot: it never resets, because the point is to say it once for the life of the service.
+        static TRUNCATED_SAID: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !crate::trace::resolved() {
+            crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
+        }
+        let slot = crate::trace::sink_slot();
+        if slot == u32::MAX {
+            return;
+        }
+        // A TRUNCATED NAME IS A DIFFERENT NAME. Said once per service, not per sample: repeating it
+        // would flood the channel the warning has to be read on, and one line names the offender well
+        // enough to fix it. Silence here would mean two metrics quietly merging into one row under a
+        // shared prefix, with the numbers interleaving and nothing to say why (invariant 12).
+        if name.len() > crate::trace::MET_NAME_LEN
+            && !TRUNCATED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            self.log_fmt(format_args!(
+                "sdk: metric name '{}' is longer than {} bytes and was TRUNCATED - shorten it, or two metrics will share one row",
+                name, crate::trace::MET_NAME_LEN));
+        }
+        let m = crate::trace::encode_metric(name, value);
+        if self
+            .try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&m))
+            .is_err()
+        {
+            if self.reacquire_by_name(crate::trace::SINK_NAME) {
+                if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
+                    crate::trace::set_sink_slot(fresh);
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // The request/reply family: each wraps its `_inner` implementation with one
     // trace event on the way in and one on the way out.
