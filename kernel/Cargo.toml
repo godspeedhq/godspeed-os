@@ -41,6 +41,13 @@ proptest = "1"
 panic = "abort"
 
 [features]
+# The ROUTINE half of the name-directory trace - every register and every clear. OFF by default,
+# because it is ~1,200-2,000 lines per chaos run on every port and its question has been answered:
+# it caught the `block-driver` "no disk" latch on a Pi 4 by putting the name's clear and re-register
+# 440 ms either side of the failure. The four ANOMALY reports are NOT behind this and never should
+# be - they are silent in a healthy run, so they cost nothing to leave in, and they are the half that
+# says something is wrong rather than merely what happened.
+name-trace = []
 # Diagnostic only, OFF by default. Prints capability IDENTITY across the file-cap invoke path
 # path alone, so it costs nothing on any other work today - but §7.10 means real file I/O will run
 # through that path eventually, at which point this would become per-request logging on every read

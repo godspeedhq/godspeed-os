@@ -63,6 +63,17 @@ features = [
     "iommu-fault-test",
     "memmap-clamp-test",
     "mmio-map-fault-test",
+# The ROUTINE half of the kernel's name-directory trace - every register, every clear. Admitted as a
+# feature rather than left in because it is ~1,200-2,000 lines per chaos run on every port, and both
+# ARM ports needed a deeper serial ring to carry it without dropping lines. It earned its keep: it
+# caught the `block-driver` "no disk" latch on a Pi 4 by putting the name's clear and its re-register
+# 440 ms either side of the failure, which is what showed the name was never the problem.
+#
+# It gates OUTPUT ONLY - no control flow, no responsibility. The four ANOMALY reports (a live
+# instance's name cleared, a stale entry kept, a name already absent, an eviction) are deliberately
+# NOT behind it: they are silent in a healthy run, so they cost nothing to leave in, and they are the
+# half that says something is wrong rather than merely what happened.
+    "name-trace",
     "pi4",
     "pi4-demo-services",
     "pi4-sched-demo",

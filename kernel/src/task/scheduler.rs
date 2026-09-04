@@ -2274,7 +2274,7 @@ pub fn kill_task_by_slot(slot: usize) {
                 // service death is the same order as the `kill_task` line beside it, and the transport
                 // now carries the volume without losing anything.
                 crate::ipc::names::UnregisterOutcome::Cleared => {
-                    crate::kprintln!("ipc::names: '{}' cleared by its own dying endpoint {:?} (slot {})",
+                    crate::name_trace!("ipc::names: '{}' cleared by its own dying endpoint {:?} (slot {})",
                         task_name, ep_id, slot);
                 }
                 crate::ipc::names::UnregisterOutcome::NotFound => {
