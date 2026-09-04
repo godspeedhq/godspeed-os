@@ -135,6 +135,35 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
     0
 }
 
+/// What asking `xhci` for the capacity actually produced.
+///
+/// **"MY PEER IS RESTARTING" IS NOT "THERE IS NO DISK", and collapsing the two took storage down on
+/// the Pi 4.** The hotplug crashed `xhci`; the kernel cleared its name correctly and re-registered it
+/// 440 ms later, also correctly. `block-driver` asked 215 ms into that window, got "the name does not
+/// resolve" - true, and transient - and published `no USB storage stick - NO disk`, serving 0 sectors.
+/// `fs` mounted against nothing and the running selfcheck died fifteen seconds later. Every name gap
+/// in that run closed: 440, 323, 246, 470, 455, 168, 285, 527 ms. Not one failed.
+///
+/// So the three zeros this function used to return are not one answer. `Sectors(0)` is `xhci` SAYING
+/// the bay is empty, which is a fact worth publishing. `Unreachable` is `xhci` saying nothing at all,
+/// which is a fact about the PEER and says nothing whatever about the hardware.
+///
+/// The fix is deliberately NOT "remember the last capacity". That is a derived view outliving its
+/// source, it is what made `drives` report 15267 MiB for a stick unplugged minutes earlier, and
+/// §26.4/§14.3 both forbid it. The answer is to report a transient failure AS one and let the caller
+/// retry - which `fs` already does, and which is the same discipline the reply-orphan fix follows.
+pub enum Capacity {
+    /// `xhci` answered: this many sectors. Zero means it has no device bound, which is an answer.
+    Sectors(u64),
+    /// `xhci` said NOTHING - restarting, or its cap went stale across a restart. NOT a verdict about
+    /// the disk, and must never be published as one.
+    ///
+    /// Only silence qualifies. Any reply, however terse, is an answer from the peer and belongs in
+    /// `Sectors` - mapping a short reply here made a diskless boot retry forever instead of coming up
+    /// with no disk.
+    Unreachable,
+}
+
 /// Ask `xhci` for the capacity RIGHT NOW - one attempt, no waiting for enumeration.
 ///
 /// Deliberately not `sectors()`. That one waits up to 20 s because it runs at startup, when the
@@ -146,7 +175,7 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
 /// so removing the device changed nothing anything above could see. That is a derived view outliving
 /// its source, which §26.4 and §14.3 both forbid - the disk is `xhci`'s truth, and a cached copy of
 /// another service's truth must be re-derived, not remembered.
-pub fn sectors_now(ctx: &ServiceContext) -> u64 {
+pub fn sectors_now(ctx: &ServiceContext) -> Capacity {
     // ZERO HAS THREE CAUSES AND THEY NEEDED TELLING APART. A post-chaos Pi 2 served
     // `storage unavailable` for 23 s across two selfcheck runs while `dwc2` demonstrably HAD the
     // stick - it had just enumerated it and read sector 0 back as "GSFS". Everything above this
@@ -156,25 +185,38 @@ pub fn sectors_now(ctx: &ServiceContext) -> u64 {
     // Logged only on the ZERO paths, so a healthy mount stays silent and a stuck one explains itself
     // on the first request rather than after another hardware round (§26.7).
     let Some(r) = rpc(ctx, &[OP_CAPACITY]) else {
-        ctx.log("block-driver: capacity 0 - the USB host service did not ANSWER (cap stale after its restart, or it is busy)");
-        return 0;
+        // UNREACHABLE, not empty. See `Capacity` - this is the case that took storage down.
+        ctx.log("block-driver: the USB host service did not ANSWER (restarting, or its cap went stale) - reporting storage UNAVAILABLE, not 'no disk'");
+        return Capacity::Unreachable;
     };
     let p = r.payload_bytes();
     if p.len() < 9 {
+        // A SHORT REPLY IS STILL A REPLY. This was briefly mapped to `Unreachable`, on the reasoning
+        // that a reply which does not parse tells you nothing - and it broke a diskless boot outright:
+        // `fs` got STATUS_ERR instead of "0 sectors", treated it as transient exactly as intended, and
+        // retried forever without ever reaching `serving file API`.
+        //
+        // The peer ANSWERED. On both ARM ports a one-byte reply is `[STATUS_ERR]`, which the USB host
+        // service sends when it has no mass-storage device bound - so this is an empty bay reported
+        // tersely, not a protocol mismatch, and the old comment saying otherwise was wrong. Publishing
+        // zero lets a diskless machine come up diskless, which is the correct outcome and the one it
+        // had before.
         ctx.log_fmt(format_args!(
-            "block-driver: capacity 0 - short reply, {} bytes (want 9) - protocol mismatch, not an empty bay", p.len()));
-        return 0;
+            "block-driver: capacity 0 - the USB host service replied {} byte(s), not a capacity: it is reachable with no disk bound", p.len()));
+        return Capacity::Sectors(0);
     }
     if p[0] != STATUS_OK {
         ctx.log_fmt(format_args!(
             "block-driver: capacity 0 - the USB host service REFUSED (status {}) - it is reachable but has no disk bound", p[0]));
-        return 0;
+        return Capacity::Sectors(0);
     }
     let n = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
     if n == 0 {
+        // THE ONE ZERO THAT IS AN ANSWER: `xhci` is up, it replied, and it has nothing bound. That is
+        // a fact about the hardware and is published as one.
         ctx.log("block-driver: capacity 0 - the USB host service ANSWERED zero: no mass-storage device bound");
     }
-    n
+    Capacity::Sectors(n)
 }
 
 /// Read one 512-byte sector. `false` means the read did not happen - never a partially-filled buf.

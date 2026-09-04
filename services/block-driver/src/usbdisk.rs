@@ -268,11 +268,21 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
         // invoked somewhere else may never be invoked at all. An earlier attempt at this was reverted
         // because it appeared to cost input latency - that turned out to be logging and a pessimistic
         // probe timeout, both since fixed, and a capacity query is not a hot path (mount, and `drives`).
-        let sectors = super::xhciblk::sectors_now(ctx);
-        let mut out = [0u8; 9];
-        out[0] = STATUS_OK;
-        out[1..9].copy_from_slice(&sectors.to_le_bytes());
-        reply.send(ctx, &out);
+        // AN UNREACHABLE PEER IS AN ERROR, NOT A CAPACITY OF ZERO. This sent STATUS_OK with 0
+        // sectors whatever the reason, so "xhci is restarting" arrived at `fs` as "the volume is
+        // empty" - indistinguishable from an unplugged stick, and acted on as one. `fs` mounts
+        // against nothing, and the client that was mid-file-operation fails.
+        //
+        // STATUS_ERR is what `fs` already retries; a zero is what it believes.
+        match super::xhciblk::sectors_now(ctx) {
+            super::xhciblk::Capacity::Sectors(sectors) => {
+                let mut out = [0u8; 9];
+                out[0] = STATUS_OK;
+                out[1..9].copy_from_slice(&sectors.to_le_bytes());
+                reply.send(ctx, &out);
+            }
+            super::xhciblk::Capacity::Unreachable => reply.send(ctx, &[STATUS_ERR]),
+        }
         return;
     }
     if p.len() < 9 { return err(ctx); }
