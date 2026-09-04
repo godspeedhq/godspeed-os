@@ -1079,6 +1079,17 @@ impl ServiceContext {
     /// without a reply mailbox awaits replies on the endpoint its CLIENTS send to, so draining there
     /// would silently eat client requests - the precise hazard the `CallDeadline` amendment (§8.2)
     /// exists to describe. No mailbox, no drain, and the caller keeps the behaviour it had.
+    ///
+    /// SO THIS REPAIR IS CONDITIONAL, and the condition is not theoretical. A reply mailbox is an
+    /// OPTIONAL endpoint (`routing::try_register_optional`): it is refused when the routing table is
+    /// near full, and a bare-metal T630 refuses three times during `selfcheck`. A service refused one
+    /// falls back to its shared endpoint and silently loses this repair - which is correct, because
+    /// the alternative is eating client traffic, but it means "the desync is fixed" holds only where
+    /// the mailbox was granted.
+    ///
+    /// Measured rather than assumed: an arm32 Pi 2 run logged ZERO refusals, so `fs` had its mailbox
+    /// and the repair was live on that port. `routing: reply endpoint refused` in a log is how you
+    /// know a machine is in the other case.
     pub fn drain_stale_replies(&self) -> usize {
         let Some((recv, _)) = self.reply_mailbox() else { return 0 };
         let mut n = 0usize;
