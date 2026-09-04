@@ -249,3 +249,81 @@ section 24; these are the abbreviations you meet while reading the code.
 - **SDK** - `sdk/rust`, the crate every service links against.
 - **POSIX** - the Unix interface standard GodspeedOS deliberately does **not** implement (section 2.2,
   Appendix B.3).
+
+### Buses and devices
+
+- **PCIe** - PCI Express. Electrically different, same configuration model, so the same class-code
+  lookup finds a device on either. The Pi 4 reaches its USB controller this way.
+- **BDF** - Bus/Device/Function: the three numbers that name one device on a PCI bus, packed here as
+  `(bus << 8) | (dev << 3) | func`. It is an identifier, not an address - the kernel reads that
+  device's own registers to learn what it is worth.
+- **BAR** - Base Address Register. Where a device's registers live in memory. Which BAR holds them is
+  a property of the device, not its class: an xHCI uses BAR0, an AHCI controller uses BAR5.
+- **SMMU** - the ARM name for an IOMMU. Neither Raspberry Pi wires one up, which is recorded rather
+  than glossed over.
+- **INTx** - the legacy PCI interrupt pin. Routed through the **IOAPIC** and, on this hardware,
+  deliverable only to the boot processor - which is why the EHCI driver is pinned to core 0.
+- **SoC** - System on Chip. A controller soldered into the processor package rather than sitting on a
+  bus, so no scan can find it: the Pi 4's ethernet is one, and is asked about separately.
+
+### Storage
+
+- **SATA** - the drive attachment the T630 and Wyse boot from.
+- **SSD** - solid-state drive.
+- **LBA** - Logical Block Address: which 512-byte sector, counted from zero. The unit of the block
+  protocol between `fs` and `block-driver`.
+- **PIO** - Programmed I/O: moving data through CPU register reads and writes instead of **DMA**.
+  Slower, and needs no DMA authority at all.
+- **MSC** - USB Mass Storage Class: how a USB stick presents itself, driven over **BOT**.
+- **BOT** - Bulk-Only Transport: the command wrapper (CBW), data, status (CSW) sequence that carries
+  **SCSI** commands over USB bulk endpoints.
+- **SCSI** - the command set inside those wrappers (`READ(10)`, `WRITE(10)`, `INQUIRY`).
+
+### USB
+
+- **xHCI** - the USB 3 host controller interface. Class code `0x0C0330` everywhere, forever, which is
+  what lets a driver name its device without the kernel being taught what one is.
+- **EHCI** - the USB 2 host controller interface (`0x0C0320`). Present on the T630, absent on the
+  Wyse - both cases are exercised.
+- **DWC2** - the DesignWare USB 2 controller in the Raspberry Pi 2. One controller carrying the
+  keyboard, the disk and the network at once.
+- **TRB** - Transfer Request Block: one 16-byte entry on an xHCI ring - a command, a data stage, or a
+  completion event. A completion event carries the address of the TRB it completes, which is what lets
+  a reply be matched to the request that asked for it rather than merely to the same slot.
+- **PHY** - the physical-layer chip that actually drives the wire, addressed through **MDIO**.
+- **MDIO** - the two-wire management bus used to read and write PHY registers.
+
+### Serial, display, and boot
+
+- **PL011** - the ARM UART on both Raspberry Pis. On the Pi 4 the firmware routes it to Bluetooth
+  unless `dtoverlay=disable-bt` says otherwise, which is why that line is in the boot config.
+- **FIFO** - the small hardware queue in front of a device, 16 bytes deep on the PL011. Writing past a
+  full one drops bytes, so every write polls first.
+- **ANSI / CSI** - the escape sequences a terminal interprets for colour and cursor movement. Handled
+  by the `console` service; the kernel's boot floor discards them deliberately.
+- **ESP** - EFI System Partition: the FAT partition UEFI firmware loads a bootloader from.
+- **BSP / AP** - Bootstrap Processor and Application Processor: the core that starts first, and every
+  other core it then brings up.
+- **EL0 / EL1** - AArch64 exception levels: user code and kernel code respectively.
+
+### Networking
+
+- **MAC** - the six-byte hardware address of a network interface.
+- **IP** - Internet Protocol: the addressing `net-stack` routes on, alongside the TCP and UDP
+  transports it speaks.
+- **ARP** - Address Resolution Protocol: finds the **MAC** address for an **IP** address.
+- **ICMP** - the protocol `ping` uses.
+- **DHCP** - how the machine is given an address when it comes up.
+- **DNS** - name resolution.
+- **SNTP** - the time protocol the clock is set from on a machine with no **RTC**.
+- **RX / TX** - receive and transmit, the two directions of a network ring.
+
+### The system
+
+- **IPC** - Inter-Process Communication: the message passing that every operation in this system
+  crosses. Synchronous, copied by the kernel, bounded queues, and always under a capability.
+- **TCB** - Trusted Computing Base: the parts whose compromise compromises everything. Here it is the
+  kernel alone, plus DMA-capable drivers on a machine with no **IOMMU**.
+- **ABI** - the calling convention a service and the kernel agree on at the syscall boundary.
+- **API** - the operations one component offers another.
+- **CPU / RAM** - processor and memory.
