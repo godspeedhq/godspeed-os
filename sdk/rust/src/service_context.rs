@@ -1054,6 +1054,45 @@ impl ServiceContext {
               crate::capability::CapHandle(d.reply_grant_slot)))
     }
 
+    /// Discard replies left over from requests this service already gave up on. Returns how many.
+    ///
+    /// **A DETECTED DESYNC HAS TO BE REPAIRABLE, and this is the repair.** `fs` tags every block
+    /// request and checks the tag on the reply, so a stale reply is always DETECTED - and detection
+    /// was all there was. The mismatched reply was discarded and the request failed, which leaves this
+    /// service's own reply still queued for the NEXT request to find. Every subsequent request then
+    /// receives its predecessor's reply, discards it, fails, and queues another: permanently one reply
+    /// out of phase, alternating forever, with the volume mounted and every operation failing.
+    ///
+    /// Observed 133 times in one `osdev test peer-storm` run, still alternating after the storm had
+    /// stopped. The code that discarded expected the queue to drain on its own - "the caller retries
+    /// at its own level, by which point the queue has drained" - and it never does, because each
+    /// retry consumes exactly one stale reply and contributes exactly one more.
+    ///
+    /// WHY DRAINING IS SAFE HERE, which is the whole reason this is in the SDK rather than hand-rolled
+    /// at a call site: it drains the dedicated REPLY MAILBOX, an endpoint that carries nothing but
+    /// replies to calls this service made. A caller that is synchronous - one outstanding request at a
+    /// time, which is what `request_with_reply*` enforces - can have nothing legitimate waiting there
+    /// at the moment it is about to issue a new request. Anything present is a reply it stopped
+    /// waiting for.
+    ///
+    /// **It refuses to drain the SHARED endpoint**, and that refusal is load-bearing. A service
+    /// without a reply mailbox awaits replies on the endpoint its CLIENTS send to, so draining there
+    /// would silently eat client requests - the precise hazard the `CallDeadline` amendment (§8.2)
+    /// exists to describe. No mailbox, no drain, and the caller keeps the behaviour it had.
+    pub fn drain_stale_replies(&self) -> usize {
+        let Some((recv, _)) = self.reply_mailbox() else { return 0 };
+        let mut n = 0usize;
+        // Bounded by the endpoint's own depth (§8.5): a queue that cannot hold more than 16 cannot
+        // yield more than 16, so this terminates without needing to trust the peer.
+        for _ in 0..16 {
+            match crate::ipc::try_recv(recv) {
+                Ok(Some(_)) => n += 1,
+                _ => break,
+            }
+        }
+        n
+    }
+
     pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
         let slot = Self::ctx().recv_slot;
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }

@@ -3637,6 +3637,23 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // never reached a reacquire. On hardware that sent the reader after `block-driver`, which was
     // alive the whole time with an empty queue. A message that names a cause it did not observe is
     // worse than one that admits it does not know.
+    // RE-ALIGN BEFORE ASKING. Anything sitting in the reply mailbox is a reply to a request this
+    // service already gave up on - it is synchronous, so it has no other call outstanding - and
+    // leaving it there is what made a single timeout permanent: the next request receives the stale
+    // reply, discards it, fails, and leaves its own reply behind for the request after that. One
+    // discard per request, one new orphan per request, alternating forever with the volume mounted
+    // and every operation failing (133 times in one storm run).
+    //
+    // Detection was never the problem - the tag caught every one of them. What was missing was the
+    // repair, and the repair is one line: drop the orphans before issuing the next request rather
+    // than after receiving the wrong answer to it.
+    let stale = ctx.drain_stale_replies();
+    if stale > 0 {
+        ctx.log_fmt(format_args!(
+            "fs: dropped {} orphaned block reply(s) before this request - the protocol was out of step and is now re-aligned",
+            stale));
+    }
+
     let mut last = "";
     for attempt in 0..2 {
         if attempt == 1 && last == "send failed" {
@@ -3663,8 +3680,11 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
                         "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
                         rbuf[0], tag));
                     // Do NOT re-send: the request is already with the driver, and asking twice would
-                    // ask for the WORK twice. The caller retries at its own level, by which point the
-                    // queue has drained.
+                    // ask for the WORK twice. This request fails and the caller retries at its own
+                    // level - which now WORKS, because the drain at the top of this function clears
+                    // the orphan first. The old comment claimed "by which point the queue has
+                    // drained"; nothing drained it, and that assumption is what made one late reply
+                    // permanent.
                     return None;
                 }
                 return Some(BlockReply { buf: rbuf, len: n - 1 });
