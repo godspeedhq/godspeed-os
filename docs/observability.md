@@ -99,7 +99,7 @@ service counts, and sends. This is the `events` shape again.
 data only the kernel has - and it **already exposes them, by PULL**:
 
 ```
-   InspectKernel (syscall 13)     24 queries
+   InspectKernel (syscall 13)     25 queries
    TaskStat                       per-task state
         |
         +-- gated by the INTROSPECT capability (3.1, docs/introspection-capability.md)
@@ -500,7 +500,7 @@ borrowing one meant for service names, and REPORT the truncation once, because a
 a different name would merge two metrics into one row with the values interleaving.
 
 ```
-   InspectKernel (24 queries) --pull--+
+   InspectKernel (25 queries) --pull--+
    TaskStat                   --pull--+--> events --> exposition
    kernel text ring           --drain-+      |
    its own 192-event trace ring ------+      +-- holds INTROSPECT + a log cap

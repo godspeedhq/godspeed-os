@@ -248,13 +248,17 @@ os/
   contracts/
     schema/service.schema.json
 
-  docs/
-    bootstrap.md
-    ipc.md
-    capability.md
-    restart.md
-    smp.md
-    unsafe-audit.md
+  docs/                  # narrative design notes; `docs/CLAUDE.md` is the index
+    observability.md     #   the events sink: logs, traces, metrics, persistence
+    service-ownership.md #   who owns a service: images, authority, discovery
+    naming-design.md     #   name resolution out of the kernel (Path C)
+    persistence.md       #   block driver + filesystem, file-as-capability
+    console-service.md   #   the terminal, and the kernel's boot/panic floor
+    ...                  #   (~30 files; the index lists them all)
+
+  audits/                # append-only EVIDENCE, not documentation
+    unsafe-audit.md      #   every unsafe block; CI checks it matches source
+    kernel-audit.md  security-audit.md  userspace-audit.md  documentation-audit.md
 
   tests/
     qemu/
@@ -345,7 +349,7 @@ os/
 
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
-> and deriving copies - `docs/registry.md`). It owns no kernel-critical state, so its
+> and deriving copies). It owns no kernel-critical state, so its
 > *runtime* death degrades name resolution temporarily rather than corrupting the
 > system, and it is now **restartable** (see §6.2, §6.3). Its *boot-time* spawn must
 > still succeed (the name service must come up to bootstrap), which remains fatal
@@ -361,7 +365,9 @@ os/
 > outright (crate, config, spawn, §22 Test 11/1B moved off it). This is the bounded "one
 > exception" of Path C (§3.7): a thin naming *directory* stays in the kernel - justified by §6.3
 > (the recovery anchor must be unkillable) - even though name *policy* lives in the supervisor.
-> `docs/registry.md` is now historical.
+> the registry's own design note was DELETED with the service (`9a880b12`, pre-public cleanup), so
+> this amendment and `docs/naming-design.md` are the whole record. This line used to point at the
+> file itself, which sent a reader after a document that no longer exists.
 
 ### 6.2 Failure Semantics
 
@@ -2448,7 +2454,9 @@ Out of scope for v1. If pursued later, Limine supports chainloading other bootlo
 
 - The integration code lives in `kernel/src/arch/x86_64/boot.rs`.
 - The Limine protocol version used is pinned in the workspace `Cargo.toml`. Protocol version bumps are PR-reviewed.
-- A short narrative of the boot handoff (Limine → kernel main) lives in `docs/bootstrap.md` (the §11 walkthrough).
+- The boot handoff (Limine to kernel main) is §11 itself. A separate `docs/bootstrap.md` was listed
+  here and in §5 but was never written; §11 is the walkthrough, and pointing at it is both truthful
+  and shorter than writing a second file to repeat it.
 
 ---
 
@@ -2546,7 +2554,7 @@ Constraint: this must not pollute kernel scope. The kernel publishes; the metric
 > left as written, including the old name, because it is dated; only this line is added, so a
 > reader is not sent looking for a service that no longer answers to it.)*
 >
-> Kernel STATE is already published by pull (`InspectKernel`, 24 queries, and `TaskStat`, gated by
+> Kernel STATE is already published by pull (`InspectKernel`, 25 queries, and `TaskStat`, gated by
 > INTROSPECT). Kernel EVENTS can ride the §11.4 shape: a bounded ring the kernel writes and a service
 > DRAINS - no endpoint, no consumer identity, no policy in the kernel. `docs/observability.md` has
 > the full argument and the three-part test any new mechanism must pass first. Non-normative, as is

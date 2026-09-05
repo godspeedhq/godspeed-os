@@ -1,7 +1,13 @@
 # Design Note: Console Service - separating logs from the interactive console
 
-**Status:** DESIGN (draft for discussion). Not yet implemented.
-**Branch:** `feat/console-service` (off `main`).
+**Status:** **BUILT and shipped.** `services/console/` is the terminal; 1,172 lines of terminal
+emulation left the kernel for it, and what ring 0 kept is the boot/panic blit in `kernel/src/bootcon`
+(CLAUDE.md 11.4, amended 2026-08-17). Hardware-verified on the Pi 2: chaos 50 rounds, 0 kernel
+panics, selfcheck 350/0.
+
+*(This line said "DESIGN (draft for discussion). Not yet implemented." long after it shipped. The
+design below is unedited - it is why the console looks the way it does - but the header claimed the
+opposite of the truth, which is worse than being thin.)*
 **Date:** 2026-06-05
 **Pins:** §26.10 (kernel = mechanism, not policy), Appendix B.3 (shell = capability-broker holding a console cap), Appendix C.1 / live `observe`.
 

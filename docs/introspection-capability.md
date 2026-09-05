@@ -1,7 +1,10 @@
 # Design Note: Gating Introspection Behind a Capability (§3.1)
 
-**Status:** DESIGN - approved, not yet implemented.
-**Branch:** `feat/introspect-cap` (off `feat/observe`).
+**Status:** **BUILT.** `InspectKernel` and `TaskStat` are gated by the `INTROSPECT` capability (26
+references in `kernel/src/`), and the adversarial suite pins the denial (A11,
+`introspection_denied_without_cap`).
+
+*(This said "approved, not yet implemented" after it had been implemented AND pinned by a test.)*
 **Date:** 2026-06-03
 **Pins:** §3.1 (no ambient authority), §3.3 (authority is explicit), invariant 1, §26.9 (authority stays visible and scoped).
 
