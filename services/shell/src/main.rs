@@ -8166,7 +8166,7 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
         }
     };
     let b = r.payload_bytes();
-    if b.len() < 68 {
+    if b.len() < 76 {
         ctx.console_writeln("events persist: short status");
         return None;
     }
@@ -8180,7 +8180,8 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     let elapsed = u64::from_le_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]]);
     let lifetime = u64::from_le_bytes([b[51], b[52], b[53], b[54], b[55], b[56], b[57], b[58]]);
     let pieces = u64::from_le_bytes([b[59], b[60], b[61], b[62], b[63], b[64], b[65], b[66]]).max(1);
-    let pl = (b[67] as usize).min(b.len().saturating_sub(68));
+    let filled = u64::from_le_bytes([b[67], b[68], b[69], b[70], b[71], b[72], b[73], b[74]]);
+    let pl = (b[75] as usize).min(b.len().saturating_sub(76));
 
     // COVERAGE IS MEASURED, NEVER THE NUMBER THAT WAS ASKED FOR. A duration is a prediction about how
     // chatty the machine will be, and the machine decides that - so the rate comes from what has
@@ -8199,14 +8200,19 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
         1
     };
     let kib_day = if elapsed >= 5 { lifetime.saturating_mul(86400) / elapsed / 1024 } else { 0 };
+    // PREPARING is a real state, not a slow "idle". The extent has to be made readable before a line
+    // can be written into it, and on slow storage that takes a while - saying so is the difference
+    // between "working on it" and "silently did nothing".
     let st = t.intern(if full {
         b"full".as_slice()
+    } else if on && filled < capbytes {
+        b"preparing".as_slice()
     } else if on {
         b"recording".as_slice()
     } else {
         b"idle".as_slice()
     });
-    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[68..68 + pl]) };
+    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[76..76 + pl]) };
     let covers = t.intern(&cov[..covn]);
     let _ = bytes;
     t.add_row(&[

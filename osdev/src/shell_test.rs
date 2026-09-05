@@ -1761,7 +1761,7 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     send(&mut write_half, b"y\r");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
 
-    send(&mut write_half, b"events persist start /cap.log sticky\r");
+    send(&mut write_half, b"events persist start /cap.log 256KiB sticky\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(r) => {
             check!(r.contains("STICKY"), "boot 1: the capture is recorded as sticky");
@@ -1792,7 +1792,9 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
             fail += 2;
         }
     }
-    // It is really recording, not merely announcing.
+    // It is really recording, not merely announcing. A resumed capture PREPARES first - the extent
+    // has to be made readable before a line can go in it - so allow for that rather than racing it.
+    thread::sleep(Duration::from_secs(5));
     send(&mut write2, b"events persist status\r");
     match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
         Some(r) => check!(r.contains("recording"), "boot 2: the resumed capture is actually recording"),

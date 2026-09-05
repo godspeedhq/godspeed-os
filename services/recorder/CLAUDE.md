@@ -64,6 +64,14 @@ read: storage error
 Every capture was unretrievable, and the tests missed it because they asserted that BYTES WERE WRITTEN
 and never that they could be read back. The selfcheck asserts the read now.
 
+**And the fill must be INCREMENTAL.** Doing it inside the START request blocked the caller on device
+I/O: 800 ms on a SATA SSD, over twelve seconds on the Pi 4's USB stick, where the request timed out and
+the capture never began. The size was never the real defect - blocking a caller on an unbounded amount
+of device I/O is, and it would have bitten again on any slower medium. `start` allocates and answers at
+once; the fill runs in this service's own loop, which reports `preparing` until it is done. While
+preparing the loop does NOT park on `recv_timeout`: two seconds between slices capped the fill at about
+85 KB a tick, so a megabyte took half a minute.
+
 **`fs` replies `[tag, status]`, not `[status]`.** Reading byte 0 as the status made every successful
 write look like a failure - the file was created AND the service reported that it could not be. Both
 halves convincing, which is the worst kind of wrong.

@@ -79,6 +79,23 @@ cannot survive a pipeline whatever format it is in. `read` is the tool that will
 so the file is shaped for `read`. For records, use the LIVE window - `events log | to json` - which is
 small enough to pipe.
 
+**It PREPARES before it records, and `status` says so.** The extent has to be made readable before a
+line can go into it, and on slow storage that takes a while - filling 4 MiB over the Pi 4's USB stick
+took longer than a caller was willing to wait, and the capture never began. So `start` allocates and
+answers AT ONCE, and the filling happens in the recorder's own loop:
+
+```text
+> events persist start /log.txt 8MiB
+> events persist status
+state      covers  kib_day  capacity_kib  ...
+preparing  -       0        8192
+...a moment later...
+recording  ~2d     11400    8192
+```
+
+Blocking a caller on an unbounded amount of device I/O was the defect, not the size - it would have
+bitten again on any slower medium. Nothing waits on `recorder`, so a slow disk delays only the capture.
+
 **Zero-filled on creation, and it has to be.** `OP_WRITE_NEW` allocates the extent but writes no data
 blocks, so everything past the last chunk written carried a stored CRC of zero and `fs` refused the
 whole file - `read` returned `storage error` and the capture was unretrievable. Every file is written

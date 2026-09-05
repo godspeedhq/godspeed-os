@@ -128,20 +128,43 @@ fn fs_call(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8]) -> bool {
 /// A capture that cannot be read back is not a capture. The cost is one pass of zero chunks when a
 /// file is created (at start, and at each rotation), which is why the default size is modest: it is
 /// paid at a moment the operator is already waiting, and never again while recording.
-fn zero_fill(ctx: &ServiceContext, path: &[u8], capacity: u64) -> bool {
+/// Chunks of pre-fill per tick. BOUNDED so the loop stays responsive: a capture on slow storage takes
+/// longer to become ready, and nothing else waits on it while it does.
+const FILL_CHUNKS_PER_TICK: usize = 24;
+
+/// Advance the pre-fill of the current piece by one bounded slice. True while it still has work.
+///
+/// INCREMENTAL, AND THAT IS THE POINT. The first version filled the whole extent inside the START
+/// request, so the SHELL blocked on storage I/O - 800 ms on a SATA SSD, and over TWELVE SECONDS on the
+/// Pi 4's USB stick, where the request timed out and the capture never began. The size was never the
+/// real defect: blocking a caller on an unbounded amount of device I/O is, and it would have bitten
+/// again on any slower medium.
+///
+/// Doing it here costs a capture some time before it is READY, which `status` reports as `preparing`
+/// rather than hiding. Nothing waits on this service, so slow storage delays only the capture.
+fn fill_step(ctx: &ServiceContext, cap: &mut Capture) -> bool {
+    if cap.filled >= cap.capacity {
+        return false;
+    }
     let zeros = [0u8; IO_CHUNK];
-    let mut off = 0u64;
-    while off < capacity {
-        let n = IO_CHUNK.min((capacity - off) as usize);
+    let mut p = [0u8; PATH_MAX + 2];
+    let pn = cap.cur_path(&mut p);
+    for _ in 0..FILL_CHUNKS_PER_TICK {
+        if cap.filled >= cap.capacity {
+            break;
+        }
+        let n = IO_CHUNK.min((cap.capacity - cap.filled) as usize);
         let mut tail = [0u8; 8 + IO_CHUNK];
-        tail[..8].copy_from_slice(&off.to_le_bytes());
+        tail[..8].copy_from_slice(&cap.filled.to_le_bytes());
         tail[8..8 + n].copy_from_slice(&zeros[..n]);
-        if !fs_call(ctx, FS_OP_WRITE_AT, path, &tail[..8 + n]) {
+        if !fs_call(ctx, FS_OP_WRITE_AT, &p[..pn], &tail[..8 + n]) {
+            ctx.log("recorder: pre-fill write failed - stopping the capture");
+            cap.on = false;
             return false;
         }
-        off += n as u64;
+        cap.filled += n as u64;
     }
-    true
+    cap.filled < cap.capacity
 }
 
 struct Capture {
@@ -166,6 +189,9 @@ struct Capture {
     /// it cannot answer "how fast is this filling" - which is the only honest way to say how long a
     /// capture actually covers.
     total_written: u64,
+    /// Bytes of the current piece zero-filled so far. While this is below `capacity` the capture is
+    /// PREPARING, not recording.
+    filled: u64,
     /// Epoch seconds when the capture started. Coverage is a MEASURED rate, never the estimate the
     /// caller asked for: a duration is a target, and the machine decides whether it was met.
     started_at: u64,
@@ -189,6 +215,7 @@ impl Capture {
             full: false,
             rotations: 0,
             total_written: 0,
+            filled: 0,
             started_at: 0,
         }
     }
@@ -292,17 +319,12 @@ fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
     cap.full = false;
     let mut p = [0u8; PATH_MAX + 2];
     let pn = cap.cur_path(&mut p);
-    if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes())
-        || !zero_fill(ctx, &p[..pn], cap.capacity)
-    {
+    cap.filled = 0;
+    if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes()) {
         ctx.log("recorder: could not open the next capture file - stopping");
         cap.on = false;
         return;
     }
-    let mut hdr = [0u8; 48];
-    let mut hn = 0usize;
-    for &c in b"recorder: piece begins" { hdr[hn] = c; hn += 1; }
-    let _ = cap.push_line(ctx, &hdr[..hn]);
     ctx.log_fmt(format_args!("recorder: rotated ({} so far) - /...{} is the newest", cap.rotations, cap.rotations.min(1)));
 }
 
@@ -454,7 +476,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("recorder: ready (idle - `events persist start` begins a capture)");
 
     loop {
-        if let Some(msg) = ctx.recv_timeout(wait) {
+        // WHILE PREPARING, DO NOT SLEEP. `recv_timeout` parks for two seconds between messages, which
+        // is right when idle or recording and hopeless while filling: it capped the pre-fill at one
+        // slice per tick - about 85 KB every two seconds - so a megabyte took half a minute and a
+        // capture that was stopped before it finished left an unfilled tail that `read` refuses.
+        //
+        // Non-blocking here instead, so the fill runs as fast as the device allows while control
+        // messages are still served every iteration.
+        let preparing = cap.on && cap.filled < cap.capacity;
+        let incoming = if preparing { ctx.try_recv() } else { ctx.recv_timeout(wait) };
+        if let Some(msg) = incoming {
             let p = msg.payload_bytes();
             match p.first().copied() {
                 Some(REC_OP_START) if p.len() >= 11 => {
@@ -481,28 +512,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     cap.started_at = ctx.epoch_secs_monotonic() as u64;
                     let mut path = [0u8; PATH_MAX];
                     path[..plen].copy_from_slice(&cap.path[..plen]);
-                    if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes())
-                        || !zero_fill(&ctx, &path[..plen], cap.capacity)
-                    {
+                    // ALLOCATE ONLY, then answer. The extent is one cheap `fs` call; the pre-fill is
+                    // the expensive part and now happens in the loop below, so the caller is never
+                    // blocked on an unbounded amount of device I/O.
+                    if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes()) {
                         ctx.log("recorder: could not create the capture file - is there a filesystem?");
                         reply(&ctx, &[REC_ERR]);
                         continue;
                     }
                     cap.on = true;
-                    // A HEADER, so a file with no footer is known to have died rather than finished.
-                    let mut hdr = [0u8; 32];
-                    let mut hn = 0usize;
-                    for &c in b"recorder" {
-                        hdr[hn] = c;
-                        hn += 1;
-                    }
-                    hdr[hn] = US;
-                    hn += 1;
-                    for &c in b"capture started" {
-                        hdr[hn] = c;
-                        hn += 1;
-                    }
-                    let _ = cap.push_line(&ctx, &hdr[..hn]);
+                    cap.filled = 0;
                     ctx.log_fmt(format_args!(
                         "recorder: capturing to {} pieces of {} KiB ({} KiB total)",
                         PIECES, cap.capacity / 1024, total / 1024));
@@ -515,7 +534,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     reply(&ctx, &[REC_OK]);
                 }
                 Some(REC_OP_STATUS) => {
-                    let mut out = [0u8; 72 + PATH_MAX];
+                    let mut out = [0u8; 80 + PATH_MAX];
                     out[0] = REC_OK;
                     out[1] = cap.on as u8;
                     out[2] = cap.full as u8;
@@ -533,15 +552,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     out[43..51].copy_from_slice(&elapsed.to_le_bytes());
                     out[51..59].copy_from_slice(&cap.total_written.to_le_bytes());
                     out[59..67].copy_from_slice(&(PIECES as u64).to_le_bytes());
-                    out[67] = cap.plen as u8;
-                    out[68..68 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
-                    reply(&ctx, &out[..68 + cap.plen]);
+                    // How far the pre-fill has got. A capture that is still PREPARING is not idle and
+                    // is not recording, and saying so is the difference between "it is working on it"
+                    // and "it silently did nothing".
+                    out[67..75].copy_from_slice(&cap.filled.to_le_bytes());
+                    out[75] = cap.plen as u8;
+                    out[76..76 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
+                    reply(&ctx, &out[..76 + cap.plen]);
                 }
                 _ => reply(&ctx, &[REC_ERR]),
             }
         }
         if cap.on {
-            drain(&ctx, &mut cap);
+            if cap.filled < cap.capacity {
+                // PREPARING: still making the extent readable. No draining yet - a line written past
+                // the fill point would sit in a region `read` still refuses.
+                if !fill_step(&ctx, &mut cap) && cap.on && cap.filled >= cap.capacity {
+                    // A HEADER, so a file with no footer is known to have died rather than finished.
+                    let mut hdr = [0u8; 32];
+                    let mut hn = 0usize;
+                    for &c in b"recorder" {
+                        hdr[hn] = c;
+                        hn += 1;
+                    }
+                    hdr[hn] = US;
+                    hn += 1;
+                    for &c in b"capture started" {
+                        hdr[hn] = c;
+                        hn += 1;
+                    }
+                    let _ = cap.push_line(&ctx, &hdr[..hn]);
+                    ctx.log_fmt(format_args!("recorder: ready - capturing to {} KiB", cap.capacity / 1024));
+                }
+            } else {
+                drain(&ctx, &mut cap);
+            }
         }
     }
 }

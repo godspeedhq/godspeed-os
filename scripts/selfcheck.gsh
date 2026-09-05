@@ -550,7 +550,12 @@ assert ok read /sc/evt.log
 # draining its endpoint and drops the very events worth capturing. Here the blocking is harmless -
 # nothing depends on `recorder`, so a stalled disk stalls it alone and the volatile window survives.
 events persist status | assert contains not running
-assert ok events persist start /sc/cap.log 8MiB
+assert ok events persist start /sc/cap.log 256KiB
+# THE CAPTURE PREPARES BEFORE IT RECORDS. `start` answers at once and the extent is made readable in
+# the recorder's own loop, so nothing blocks the prompt on device I/O - which is what broke on the Pi 4,
+# where filling 4 MiB over USB took longer than the caller was willing to wait. On slow storage this
+# takes a moment, so wait for readiness rather than assuming it.
+wait 3
 events persist status | assert contains recording
 # BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
 # allocates a file's whole extent up front, so the size is fixed when the capture starts and total
@@ -573,8 +578,10 @@ ls /sc | assert contains cap.log
 # STICKY: recorded in a plain-text marker the shell reads at the next boot. Plain text on purpose -
 # `read /persist.conf` shows exactly what will happen, which is the difference between a setting and a
 # surprise. A capture that resumed silently forever because someone forgot is the hazard here.
-assert ok events persist start /sc/sticky.log 4MiB sticky
+assert ok events persist start /sc/sticky.log 256KiB sticky
 read /persist.conf | assert contains /sc/sticky.log
+# Same wait as above: a fresh capture PREPARES before it records.
+wait 3
 events persist status | assert contains recording
 # AN EXPLICIT STOP STAYS STOPPED. Leaving the marker would make the one command that means "enough"
 # the one that did not take, and the capture would return at the next boot.
@@ -587,8 +594,8 @@ assert ok events persist stop
 #   fs: data block CRC mismatch at lba 4229 (stored 0x00000000, actual 0x0fbb6d54) - refusing
 # A capture that cannot be read back is not a capture. The file is zero-filled on creation now, and
 # this is the assertion that would have caught it.
-events persist start /sc/tiny.log
-wait 2
+events persist start /sc/tiny.log 256KiB
+wait 3
 events persist stop
 read /sc/tiny.log | assert contains capture started
 read /sc/tiny.log | assert contains recorder:
