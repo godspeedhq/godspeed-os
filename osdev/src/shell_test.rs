@@ -4547,6 +4547,29 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - `selfcheck` timed out"); fail += 1; }
     }
 
+    // RUN IT A SECOND TIME, IN THE SAME BOOT. Re-runnability is its own property and this suite has
+    // now lost it twice: once when `delete /sc` on an already-clean tree was the single failure in an
+    // otherwise perfect run, and again when `events persist status` asserted "not running" - true only
+    // before `recorder` had ever been spawned, so a second run said "idle" and failed. Hardware found
+    // that one, on a Pi 4, after the first two runs had passed.
+    //
+    // A suite that only passes on a fresh boot fails the first time someone runs it twice, which is
+    // exactly when they are investigating something.
+    send(&mut write_half, b"selfcheck\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
+        Some(r) => {
+            let _ = std::fs::write("build/selfcheck-transcript-2.txt", r.as_bytes());
+            if r.contains("failed 0") && !r.contains("--- failures ---") {
+                println!("script-test: PASS - `selfcheck` is RE-RUNNABLE (second run, same boot, failed 0)");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck` not green on a SECOND run (re-runnability)");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - second `selfcheck` timed out"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nscript-test: {pass} passed, {fail} failed");

@@ -497,9 +497,14 @@ events metrics | assert contains msgs.received
 # undeclared service publishes under a BLANK owner, and since the key is (owner, name) every such
 # service collides into ONE row with the counters interleaving. Caught exactly that way: a single
 # `msgs.received 1920` belonging to nobody, which was `console` plus nine others.
+# BUSY services only, and that is not laziness. The table is VOLATILE: when chaos kills `events` its
+# rows go with it, and a service republishes only when it next RECEIVES something. A quiet service like
+# `time` is therefore legitimately absent for a while after a sink restart - which is the design, not a
+# fault, and it failed here after 61 restarts in a chaos run. Assert on services that are certainly
+# doing work while the suite runs.
 events metrics | where owner contains console | assert contains msgs.received
 events metrics | where owner contains block-driver | assert contains msgs.received
-events metrics | where owner contains time | assert contains msgs.received
+events metrics | where owner contains fs | assert contains msgs.received
 # It is a record source like `events ipc`, so it filters like one.
 events metrics | where owner contains events | assert contains ring.recorded
 # An unknown view is refused loudly here too.
@@ -549,7 +554,12 @@ assert ok read /sc/evt.log
 # Why it is a separate service at all: a file write BLOCKS on a reply, and a blocked `events` stops
 # draining its endpoint and drops the very events worth capturing. Here the blocking is harmless -
 # nothing depends on `recorder`, so a stalled disk stalls it alone and the volatile window survives.
-events persist status | assert contains not running
+# NOT asserted: the exact idle STATE. On the first selfcheck of a boot `recorder` has never been
+# spawned and status says "not running"; on a second run it is already there and says "idle". Both mean
+# "not capturing", and asserting one of them made the suite pass only on a fresh boot - the same
+# re-runnability trap as the `delete /sc` line above. It must ANSWER; which flavour of not-capturing it
+# is carries no information.
+assert ok events persist status
 assert ok events persist start /sc/cap.log 256KiB
 # THE CAPTURE PREPARES BEFORE IT RECORDS. `start` answers at once and the extent is made readable in
 # the recorder's own loop, so nothing blocks the prompt on device I/O - which is what broke on the Pi 4,
