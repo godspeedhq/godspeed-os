@@ -1243,9 +1243,17 @@ impl ServiceContext {
             // This is the ordinary reacquire-by-name recovery every client owes a restartable peer
             // (14.3); the trace path just never did it. Only on FAILURE, so the healthy path is
             // unchanged, and if the sink is genuinely down the next emission tries again.
+            //
+            // AND RETRY ON THE FRESH SLOT. Reacquiring but dropping the event that prompted it is a
+            // recovery that discards its own result (26.7) - the peer is reachable again and the
+            // sample is thrown away anyway. 14.3 says reacquire AND retry; this used to do half.
             if self.reacquire_by_name(crate::trace::SINK_NAME) {
                 if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
                     crate::trace::set_sink_slot(fresh);
+                    let _ = self.try_send_by_handle(
+                        CapHandle(fresh),
+                        &crate::ipc::Message::from_bytes(&ev),
+                    );
                 }
             }
         }
@@ -1299,9 +1307,18 @@ impl ServiceContext {
             .try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&m))
             .is_err()
         {
+            // AND RETRY, for the reason given on the trace path above. It matters MORE here: a
+            // publisher samples on an INTERVAL (`fs` every 32 requests), so a dropped sample is not
+            // retried for another whole interval - and after a sink restart that meant TWO intervals
+            // with no row for that service at all. A service with no row is indistinguishable from a
+            // dead one, which is the single question this metric exists to answer.
             if self.reacquire_by_name(crate::trace::SINK_NAME) {
                 if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
                     crate::trace::set_sink_slot(fresh);
+                    let _ = self.try_send_by_handle(
+                        CapHandle(fresh),
+                        &crate::ipc::Message::from_bytes(&m),
+                    );
                 }
             }
         }

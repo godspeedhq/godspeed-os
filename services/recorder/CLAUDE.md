@@ -88,6 +88,28 @@ the file held only the malformed header - and the assertion failed for exactly t
 assertion that can be satisfied by something other than what it names is not pinning anything; both now
 assert the whole line.
 
+## OPEN: `events persist status` occasionally reads as a short reply
+
+Seen once, in QEMU, and not reproduced in the run immediately after:
+
+```
+> events persist status | assert contains rotations
+events persist: short status
+```
+
+The recorder CANNOT send a short status - the reply is always `76 + plen` bytes and the shell's floor
+is 76 - so the shell received a message that was not this reply. A `start`/`stop` acknowledgement is
+`[REC_OK]`, one byte, which is the right size to produce exactly this. The leading hypothesis is
+therefore a LATE reply matched to a later call: `request_with_reply_deadline` derives a one-shot reply
+cap and removes it on timeout, so a reply that arrives after its call gave up can land on a reused
+slot. `call_deadline` correlates by reply cap, which rules out the plain-recv hazard the CLAUDE.md
+CallDeadline amendment describes, but not slot REUSE.
+
+Recorded rather than fixed, per 26.7: it is one observation, the mechanism is unproven, and the fix
+would touch the reply-cap lifetime that every service's request/reply rides on. Reproducing it under
+instrumentation comes first. Consequence while it stands: a `status` read can be refused loudly - it
+prints and returns None, never a wrong number.
+
 ## Coverage is measured, never promised
 
 A duration (`7d`) is converted to bytes with an assumed fill rate, which is a prediction about how

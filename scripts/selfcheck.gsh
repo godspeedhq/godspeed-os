@@ -484,9 +484,11 @@ assert ok events metrics
 # form of the rule in docs/observability.md 9.
 events metrics | assert contains ring.recorded
 events metrics | assert contains metrics.held
-# ...and an ORDINARY service publishes over IPC, which is the path any new service would use. `fs` has
-# served this entire suite, so it is far past its 32-request publish interval.
-events metrics | assert contains blk.outages
+# ...and an ORDINARY service publishes over IPC, which is the path any new service would use. That
+# assertion is made LATER, after the file sections, and the move is the whole point: `fs` publishes
+# every 32 requests and this section runs BEFORE any file work, so at this line `fs` may not have
+# served 32 requests since the last sink restart - and after a chaos storm it has not. The comment
+# here used to claim "`fs` has served this entire suite", which is simply false this early in the file.
 # EVERY internal service is registered, not just the two that started with the cap. `msgs.received` is
 # counted in the SDK's receive paths, so a service gets it by existing rather than by remembering to
 # add it - which is the same reason trace emission lives there. It publishes on the FIRST message as
@@ -503,8 +505,6 @@ events metrics | assert contains msgs.received
 # fault, and it failed here after 61 restarts in a chaos run. Assert on services that are certainly
 # doing work while the suite runs.
 events metrics | where owner contains console | assert contains msgs.received
-events metrics | where owner contains block-driver | assert contains msgs.received
-events metrics | where owner contains fs | assert contains msgs.received
 # It is a record source like `events ipc`, so it filters like one.
 events metrics | where owner contains events | assert contains ring.recorded
 # An unknown view is refused loudly here too.
@@ -709,6 +709,20 @@ write /sc/q.txt "two words"
 read /sc/q.txt | assert contains two words
 assert fails read /sc/missing.txt
 assert fails-with FileNotFound read /sc/missing.txt
+
+# ===== events: the metric rows that need FILE TRAFFIC to exist (moved here deliberately) =====
+# `fs` publishes `requests` and `blk.outages` every 32 requests it serves, and the SDK publishes
+# `msgs.received` on a service's first message and every 64th. The sink's table is VOLATILE - a chaos
+# storm that restarts `events` wipes it - so these rows exist only once their owner has served enough
+# traffic SINCE that restart. Asserting them in the metrics section above meant asserting them before
+# this suite had done any file work, which is why they failed on the T630 after a 100-round storm and
+# passed everywhere else: pure luck about where each service sat in its publish interval.
+#
+# By this line the suite has written a 256 KiB capture and this whole files section through `fs`, so
+# both owners are far past their interval. Deterministic, and no extra runtime.
+events metrics | assert contains blk.outages
+events metrics | where owner contains block-driver | assert contains msgs.received
+events metrics | where owner contains fs | assert contains msgs.received
 
 # ===== directories: mkdir (parents) + delete guard =====
 echo ''
