@@ -8067,13 +8067,13 @@ const REC_OK: u8 = 0;
 /// which is the same mistake the log made.
 #[inline(never)]
 fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
-    let mut t = Table::new(&["state", "lines", "bytes", "capacity", "lost", "path"]);
+    let mut t = Table::new(&["state", "lines", "bytes", "capacity", "rotations", "lost", "path"]);
     if slot_of(ctx, "recorder").is_none() {
         // NOT AN ERROR, and not an empty table either. "Nothing is recording" is a real answer, and a
         // caller piping this needs a row to see it in.
         let st = t.intern(b"not running");
         let none = t.intern(b"-");
-        t.add_row(&[st, Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), none]);
+        t.add_row(&[st, Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), none]);
         return Some(t);
     }
     let _ = ctx.reacquire_by_name("recorder");
@@ -8085,7 +8085,7 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
         }
     };
     let b = r.payload_bytes();
-    if b.len() < 36 {
+    if b.len() < 44 {
         ctx.console_writeln("events persist: short status");
         return None;
     }
@@ -8095,7 +8095,8 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     let bytes = u64::from_le_bytes([b[11], b[12], b[13], b[14], b[15], b[16], b[17], b[18]]);
     let lost = u64::from_le_bytes([b[19], b[20], b[21], b[22], b[23], b[24], b[25], b[26]]);
     let capbytes = u64::from_le_bytes([b[27], b[28], b[29], b[30], b[31], b[32], b[33], b[34]]);
-    let pl = (b[35] as usize).min(b.len().saturating_sub(36));
+    let rotations = u64::from_le_bytes([b[35], b[36], b[37], b[38], b[39], b[40], b[41], b[42]]);
+    let pl = (b[43] as usize).min(b.len().saturating_sub(44));
     let st = t.intern(if full {
         b"full".as_slice()
     } else if on {
@@ -8103,12 +8104,13 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     } else {
         b"idle".as_slice()
     });
-    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[36..36 + pl]) };
+    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[44..44 + pl]) };
     t.add_row(&[
         st,
         Value::Int(lines),
         Value::Int(bytes),
         Value::Int(capbytes),
+        Value::Int(rotations),
         Value::Int(lost),
         path,
     ]);
@@ -8217,7 +8219,7 @@ fn events_persist(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
             // A CAPTURE WITH A HOLE MUST SAY SO. The window is 8 KiB; a slow disk lets lines fall out
             // before they are read, and a file that silently skips them reads as complete.
             for r in 0..t.nrows() {
-                if t.cell_bytes(r, 4) != b"0" {
+                if t.cell_bytes(r, 5) != b"0" {
                     ctx.console_writeln("events persist: lines were LOST - the window wrapped faster than the disk could take them");
                 }
             }

@@ -123,6 +123,11 @@ struct Capture {
     stage: [u8; IO_CHUNK],
     staged: usize,
     full: bool,
+    /// Which of the two files is being written. Rotation keeps the RECENT past, which is the half a
+    /// crash investigation needs - a capture that stopped when full would have kept the beginning and
+    /// discarded the crash.
+    alt: bool,
+    rotations: u64,
 }
 
 impl Capture {
@@ -141,6 +146,20 @@ impl Capture {
             stage: [0; IO_CHUNK],
             staged: 0,
             full: false,
+            alt: false,
+            rotations: 0,
+        }
+    }
+
+    /// The file currently being written: the base path, or the base path plus `.1`.
+    fn cur_path(&self, out: &mut [u8; PATH_MAX + 2]) -> usize {
+        out[..self.plen].copy_from_slice(&self.path[..self.plen]);
+        if self.alt {
+            out[self.plen] = b'.';
+            out[self.plen + 1] = b'1';
+            self.plen + 2
+        } else {
+            self.plen
         }
     }
 
@@ -157,9 +176,9 @@ impl Capture {
         tail[..8].copy_from_slice(&self.written.to_le_bytes());
         tail[8..8 + self.staged].copy_from_slice(&self.stage[..self.staged]);
         let n = 8 + self.staged;
-        let mut p = [0u8; PATH_MAX];
-        p[..self.plen].copy_from_slice(&self.path[..self.plen]);
-        let ok = fs_call(ctx, FS_OP_WRITE_AT, &p[..self.plen], &tail[..n]);
+        let mut p = [0u8; PATH_MAX + 2];
+        let pn = self.cur_path(&mut p);
+        let ok = fs_call(ctx, FS_OP_WRITE_AT, &p[..pn], &tail[..n]);
         if ok {
             self.written += self.staged as u64;
             self.staged = 0;
@@ -186,6 +205,46 @@ impl Capture {
         self.lines += 1;
         true
     }
+}
+
+/// Close the current file and begin the other one. Bounded at TWO files: total disk use is fixed at
+/// twice the chosen size, forever, no matter how long a capture runs.
+///
+/// Rotation rather than stopping, because stopping keeps the WRONG HALF. A fixed file that stops when
+/// full preserves the beginning of a session and discards everything after - and the reason to run a
+/// capture for an hour is almost always to catch something at the END of it. Two files always hold
+/// between one and two files' worth of the most recent history, and each is readable in order, which a
+/// single wrapping file would not be.
+fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
+    let mut foot = [0u8; 64];
+    let mut n = 0usize;
+    for &c in b"recorder" { foot[n] = c; n += 1; }
+    foot[n] = US; n += 1;
+    for &c in b"file full - continuing in the other file" { foot[n] = c; n += 1; }
+    // Straight into the stage: `push_line` would refuse, the capture being full.
+    for &c in foot[..n].iter().chain(NEWLINE.iter()) {
+        if cap.staged < IO_CHUNK {
+            cap.stage[cap.staged] = c;
+            cap.staged += 1;
+        }
+    }
+    let _ = cap.flush(ctx, true);
+
+    cap.alt = !cap.alt;
+    cap.rotations += 1;
+    cap.written = 0;
+    cap.staged = 0;
+    cap.full = false;
+    let mut p = [0u8; PATH_MAX + 2];
+    let pn = cap.cur_path(&mut p);
+    if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes()) {
+        // The rotation target could not be created. Say so and stop, rather than carry on appending
+        // to a file that is already full and silently losing every line.
+        ctx.log("recorder: could not open the next capture file - stopping");
+        cap.on = false;
+        return;
+    }
+    ctx.log_fmt(format_args!("recorder: rotated ({} so far) - now writing the other file", cap.rotations));
 }
 
 /// Close the capture: footer, final flush, and a line saying which it was.
@@ -269,7 +328,7 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
     }
     cap.cursor = next;
     if cap.full {
-        finish(ctx, cap, b"FULL");
+        rotate(ctx, cap);
     }
 }
 
@@ -341,9 +400,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     out[11..19].copy_from_slice(&cap.written.to_le_bytes());
                     out[19..27].copy_from_slice(&cap.lost.to_le_bytes());
                     out[27..35].copy_from_slice(&cap.capacity.to_le_bytes());
-                    out[35] = cap.plen as u8;
-                    out[36..36 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
-                    reply(&ctx, &out[..36 + cap.plen]);
+                    out[35..43].copy_from_slice(&cap.rotations.to_le_bytes());
+                    out[43] = cap.plen as u8;
+                    out[44..44 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
+                    reply(&ctx, &out[..44 + cap.plen]);
                 }
                 _ => reply(&ctx, &[REC_ERR]),
             }

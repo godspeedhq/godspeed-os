@@ -553,6 +553,15 @@ assert ok read /sc/evt.log
 events persist status | assert contains not running
 assert ok events persist start /sc/cap.log
 events persist status | assert contains recording
+# BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
+# allocates a file's whole extent up front, so the size is fixed when the capture starts and total
+# disk use is twice that, no matter how long it runs. A forgotten capture cannot fill a disk.
+#
+# It ROTATES rather than stopping, because stopping keeps the wrong half: a fixed file that stops when
+# full preserves the START of a session and discards everything after - and the reason to run a capture
+# for an hour is almost always to catch something at the END.
+events persist status | assert contains rotations
+events persist status | to json | assert contains capacity
 ls /sc | assert contains cap.log
 assert ok events persist stop
 # The footer is what makes a capture readable as COMPLETE. A file with a header and no footer died.
