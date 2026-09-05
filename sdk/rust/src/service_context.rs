@@ -1207,7 +1207,40 @@ impl ServiceContext {
         // ["events"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
         // rest of its life, which is the cost the untraced majority pays.
         if crate::trace::should_resolve() {
-            crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
+            let mut slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+            if slot == u32::MAX {
+                // NO CAP WIRED AT SPAWN - ASK THE KERNEL FOR ONE. `find_send_slot` only inspects caps
+                // this service ALREADY HOLDS, so a service spawned during the milliseconds `events`
+                // was restarting has nothing to find, resolves to MAX, and returns early on every
+                // emission for the rest of its life. The reacquire that would fix it sits behind a
+                // send FAILURE - and a send that never happens never fails, so it was unreachable.
+                //
+                // Measured on the T630: after a storm that restarted the sink ~48 times, `fs` and
+                // `block-driver` published NOTHING for the remaining 9.4 s of the run, while the
+                // sink's own LOCALLY-written rows were all present. That split - local rows yes, every
+                // IPC-delivered row no - is the signature of a publisher whose message never left.
+                //
+                // `AcquireSendCap` is authorised by the DECLARATION, which the kernel keeps now even
+                // when the peer was down at spawn. This is the call that spends it (14.3).
+                if self.reacquire_by_name(crate::trace::SINK_NAME) {
+                    slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+                }
+            }
+            crate::trace::set_sink_slot(slot);
+            // AND SAY IT, IF IT TOOK MORE THAN ONE TRY. This report was written once already and
+            // silently lost: the edit that added it failed to apply and only its trace.rs half landed,
+            // so `take_late_resolve` sat with no caller and the hardware run reported "0 late
+            // resolves" - a zero that measured nothing. A missing instrument reads exactly like a
+            // healthy system, which is the worst way for one to fail.
+            if slot != u32::MAX {
+                if let Some(missed) = crate::trace::take_late_resolve() {
+                    if missed > 1 {
+                        self.log_fmt(format_args!(
+                            "sdk: events sink resolved LATE - {} emission(s) went nowhere first",
+                            missed - 1));
+                    }
+                }
+            }
         }
         let slot = crate::trace::sink_slot();
         if slot == u32::MAX {
@@ -1285,7 +1318,40 @@ impl ServiceContext {
         static TRUNCATED_SAID: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
         if crate::trace::should_resolve() {
-            crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
+            let mut slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+            if slot == u32::MAX {
+                // NO CAP WIRED AT SPAWN - ASK THE KERNEL FOR ONE. `find_send_slot` only inspects caps
+                // this service ALREADY HOLDS, so a service spawned during the milliseconds `events`
+                // was restarting has nothing to find, resolves to MAX, and returns early on every
+                // emission for the rest of its life. The reacquire that would fix it sits behind a
+                // send FAILURE - and a send that never happens never fails, so it was unreachable.
+                //
+                // Measured on the T630: after a storm that restarted the sink ~48 times, `fs` and
+                // `block-driver` published NOTHING for the remaining 9.4 s of the run, while the
+                // sink's own LOCALLY-written rows were all present. That split - local rows yes, every
+                // IPC-delivered row no - is the signature of a publisher whose message never left.
+                //
+                // `AcquireSendCap` is authorised by the DECLARATION, which the kernel keeps now even
+                // when the peer was down at spawn. This is the call that spends it (14.3).
+                if self.reacquire_by_name(crate::trace::SINK_NAME) {
+                    slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+                }
+            }
+            crate::trace::set_sink_slot(slot);
+            // AND SAY IT, IF IT TOOK MORE THAN ONE TRY. This report was written once already and
+            // silently lost: the edit that added it failed to apply and only its trace.rs half landed,
+            // so `take_late_resolve` sat with no caller and the hardware run reported "0 late
+            // resolves" - a zero that measured nothing. A missing instrument reads exactly like a
+            // healthy system, which is the worst way for one to fail.
+            if slot != u32::MAX {
+                if let Some(missed) = crate::trace::take_late_resolve() {
+                    if missed > 1 {
+                        self.log_fmt(format_args!(
+                            "sdk: events sink resolved LATE - {} emission(s) went nowhere first",
+                            missed - 1));
+                    }
+                }
+            }
         }
         let slot = crate::trace::sink_slot();
         if slot == u32::MAX {
