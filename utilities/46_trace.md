@@ -166,6 +166,19 @@ when the capture starts; two files rotate, so total disk use is twice that, fore
 capture cannot fill a disk. It ROTATES rather than stopping because stopping keeps the wrong half - a
 fixed file that stops when full preserves the start of a session and discards the crash at the end.
 
+**Reading it back.** The file is written as `owner: text`, one line each, so `read /log.txt` shows a
+log. It is NOT records, and that is a deliberate choice rather than an omission: the shell pipe
+truncates a producer at 16 KiB (`CAP_MAX`) and every sink clips at 4 KiB, so a multi-megabyte capture
+cannot survive a pipeline whatever format it is in. `read` is the tool that will actually consume it,
+so the file is shaped for `read`. For records, use the LIVE window - `events log | to json` - which is
+small enough to pipe.
+
+**Zero-filled on creation, and it has to be.** `OP_WRITE_NEW` allocates the extent but writes no data
+blocks, so everything past the last chunk written carried a stored CRC of zero and `fs` refused the
+whole file - `read` returned `storage error` and the capture was unretrievable. Every file is written
+through once at creation, which is the pause you see when a capture starts or rotates, and the reason
+the default size is modest.
+
 **`sticky`** records the capture in `/persist.conf`, a plain line the shell reads at the next boot and
 resumes unattended, announcing it. Plain text on purpose: `read /persist.conf` shows exactly what will
 happen, which is the difference between a setting and a surprise. An explicit `stop` deletes it, so the

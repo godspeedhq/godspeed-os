@@ -68,6 +68,8 @@ const EV_HDR: usize = 25;
 
 /// The record separator `events` writes between a line's owner and its text.
 const US: u8 = 0x1f;
+/// Longest owner name written to disk (matches the SDK `PEER_LEN`).
+const PEER_OUT: usize = 12;
 const NEWLINE: [u8; 1] = [10];
 
 fn reply(ctx: &ServiceContext, out: &[u8]) {
@@ -104,6 +106,34 @@ fn fs_call(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8]) -> bool {
         }
         None => false,
     }
+}
+
+/// Fill a freshly created capture file with zeros, so every block carries a valid CRC.
+///
+/// WITHOUT THIS THE FILE CANNOT BE READ AT ALL. `OP_WRITE_NEW` allocates the extent but writes no
+/// data blocks, so everything past the last chunk we wrote has a stored CRC of zero - and `fs`
+/// correctly refuses it:
+///
+///   fs: data block CRC mismatch at lba 4229 (stored 0x00000000, actual 0x0fbb6d54) - refusing
+///   read: storage error
+///
+/// A capture that cannot be read back is not a capture. The cost is one pass of zero chunks when a
+/// file is created (at start, and at each rotation), which is why the default size is modest: it is
+/// paid at a moment the operator is already waiting, and never again while recording.
+fn zero_fill(ctx: &ServiceContext, path: &[u8], capacity: u64) -> bool {
+    let zeros = [0u8; IO_CHUNK];
+    let mut off = 0u64;
+    while off < capacity {
+        let n = IO_CHUNK.min((capacity - off) as usize);
+        let mut tail = [0u8; 8 + IO_CHUNK];
+        tail[..8].copy_from_slice(&off.to_le_bytes());
+        tail[8..8 + n].copy_from_slice(&zeros[..n]);
+        if !fs_call(ctx, FS_OP_WRITE_AT, path, &tail[..8 + n]) {
+            return false;
+        }
+        off += n as u64;
+    }
+    true
 }
 
 struct Capture {
@@ -237,7 +267,9 @@ fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
     cap.full = false;
     let mut p = [0u8; PATH_MAX + 2];
     let pn = cap.cur_path(&mut p);
-    if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes()) {
+    if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes())
+        || !zero_fill(ctx, &p[..pn], cap.capacity)
+    {
         // The rotation target could not be created. Say so and stop, rather than carry on appending
         // to a file that is already full and silently losing every line.
         ctx.log("recorder: could not open the next capture file - stopping");
@@ -317,8 +349,43 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
                 let cut = line.iter().position(|&c| c == US).unwrap_or(line.len());
                 line[..cut] == cap.filter[..cap.flen]
             };
-            if keep && !cap.push_line(ctx, line) {
-                break;
+            if keep {
+                // WRITTEN AS `owner: text`, NOT `owner US text`.
+                //
+                // The wire form separates the fields with 0x1F so the shell can build records from
+                // them. On DISK that is the wrong shape: the file is consumed with `read`, and a
+                // control character in the middle of every line reads as corruption. It cannot usefully
+                // be piped into records either - the shell pipe truncates at 16 KiB (CAP_MAX) and every
+                // sink clips at 4 KiB, so a multi-megabyte capture never survives a pipeline whatever
+                // its format. Optimise for the tool that will actually read it.
+                //
+                // The owner is dropped from the text where the text already opens with it, exactly as
+                // the live view does, so `fs: serving file API` does not become `fs: fs: serving...`.
+                let cut = line.iter().position(|&c| c == US).unwrap_or(0);
+                let (owner, mut text) = line.split_at(cut);
+                if !text.is_empty() {
+                    text = &text[1..]; // past the separator
+                }
+                if !owner.is_empty() && text.len() > owner.len() && &text[..owner.len()] == owner {
+                    let scan = text.len().min(owner.len() + 24);
+                    let mut i = 0usize;
+                    while i + 1 < scan {
+                        if text[i] == b':' && text[i + 1] == b' ' {
+                            text = &text[i + 2..];
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                let mut out = [0u8; PEER_OUT + 2 + 256];
+                let mut n = 0usize;
+                for &c in owner.iter().take(PEER_OUT) { out[n] = c; n += 1; }
+                out[n] = b':'; n += 1;
+                out[n] = b' '; n += 1;
+                for &c in text.iter().take(256) { out[n] = c; n += 1; }
+                if !cap.push_line(ctx, &out[..n]) {
+                    break;
+                }
             }
         }
         ls = end + 1;
@@ -362,7 +429,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     cap.capacity = (mib as u64) << 20;
                     let mut path = [0u8; PATH_MAX];
                     path[..plen].copy_from_slice(&cap.path[..plen]);
-                    if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes()) {
+                    if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes())
+                        || !zero_fill(&ctx, &path[..plen], cap.capacity)
+                    {
                         ctx.log("recorder: could not create the capture file - is there a filesystem?");
                         reply(&ctx, &[REC_ERR]);
                         continue;

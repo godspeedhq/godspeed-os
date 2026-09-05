@@ -574,6 +574,18 @@ events persist status | assert contains recording
 assert ok events persist stop
 assert fails read /persist.conf
 assert ok events persist stop
+# THE CAPTURE MUST BE READABLE WITH `read`, which is not a given and was not true at first.
+# `OP_WRITE_NEW` allocates the extent but writes no data blocks, so everything past the last chunk
+# written had a stored CRC of zero and `fs` correctly refused the whole file:
+#   fs: data block CRC mismatch at lba 4229 (stored 0x00000000, actual 0x0fbb6d54) - refusing
+# A capture that cannot be read back is not a capture. The file is zero-filled on creation now, and
+# this is the assertion that would have caught it.
+events persist start /sc/tiny.log
+wait 2
+events persist stop
+read /sc/tiny.log | assert contains capture started
+read /sc/tiny.log | assert contains recorder:
+
 # The footer is what makes a capture readable as COMPLETE. A file with a header and no footer died.
 events persist status | assert contains idle
 
