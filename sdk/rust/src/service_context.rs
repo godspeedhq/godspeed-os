@@ -1348,7 +1348,7 @@ impl ServiceContext {
     ///
     /// A request still IN FLIGHT is therefore not in the ring - and that is the one question the ring
     /// was never the right instrument for: `events blocked` reads it from the kernel, live, which is
-    /// what a hang needs (`utilities/46_events.md` mechanism A).
+    /// what a hang needs (`utilities/46_trace.md` mechanism A).
     #[inline]
     fn trace_in(&self, peer: &str, msg: &crate::ipc::Message) -> u8 {
         // The opcode's byte is the PEER'S protocol's business, not a fixed 0 - see `trace_op_at`.
@@ -2405,7 +2405,7 @@ impl ServiceContext {
     ///
     /// With [`Self::task_awaits_endpoint`] this is the whole of the blocked-chain walk: map the
     /// endpoint a stuck task awaits back to the task that owns it, then ask what THAT one awaits.
-    /// See `utilities/46_events.md`.
+    /// See `utilities/47_events.md`.
     pub fn task_own_endpoint(&self, slot: u32) -> u64 {
         // SAFETY: syscall(13) = InspectKernel; query_id=24 = the task's own endpoint.
         let ret = unsafe { raw_syscall(13, 24, slot as u64, 0) };

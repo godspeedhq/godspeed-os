@@ -2165,7 +2165,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
         7 => scheduler::core_total_ticks(arg1 as usize) as i64,
         8 => crate::smp::core::ready_count() as i64,
-        // 24/25: the two facts the blocked-chain walk needs (`utilities/46_events.md`). Both EXPOSE
+        // 24/25: the two facts the blocked-chain walk needs (`utilities/46_trace.md`). Both EXPOSE
         // state the kernel already keeps for correctness - 24 is the endpoint a task owns (already
         // read to compute its queue depth), 25 is the endpoint it is blocked-in-CALL awaiting, which
         // exists so a dead replier can wake it with `ReplyDead` (§8.6). Nothing new is recorded and

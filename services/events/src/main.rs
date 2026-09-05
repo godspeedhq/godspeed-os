@@ -6,7 +6,7 @@
 //! 1. **Drain its endpoint.** The endpoint EXISTS, so anything sent here must be consumed or the
 //!    16-deep queue sits full forever (a stub that only parks never recv's, and a `chaos flood-storm`
 //!    then wedges it permanently).
-//! 2. **Hold the IPC trace ring** (`utilities/46_events.md` mechanism B) - a bounded history of
+//! 2. **Hold the IPC trace ring** (`utilities/47_events.md` mechanism B) - a bounded history of
 //!    request/reply events emitted by services that hold a send cap to this one, read back by the
 //!    `trace` utility.
 //!

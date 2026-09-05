@@ -17,7 +17,7 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 | `capability.rs`       | `CapHandle` (opaque slot index), `CapError` (mirrors kernel errors) |
 | `ipc.rs`              | `Message`, `recv`, `send`, `try_send`, `call` (synchronous request/reply), `IpcError` (incl. `ReplyDead`) |
 | `record.rs`           | `Table` (the typed structured-pipe value), `Value`, `RecordSink`; `where`/`select`/`sort` ops, `to_json`/`to_yaml`/`to_grid` renderers, `from_json`. The model behind typed pipes (`docs/records.md`), shared so any service can produce records |
-| `trace.rs`            | The IPC trace wire format + emission arming (`utilities/46_events.md`). A service emits only if its contract granted `ipc_send = ["events"]`, so tracing is AUTHORITY, not a switch; the ring itself lives in the `events` service and the kernel records nothing |
+| `trace.rs`            | The IPC trace wire format + emission arming (`utilities/47_events.md`). A service emits only if its contract granted `ipc_send = ["events"]`, so tracing is AUTHORITY, not a switch; the ring itself lives in the `events` service and the kernel records nothing |
 | `service_context.rs`  | `ServiceContext`: handed to `service_main`; named cap lookup; log helpers; spawn helpers (TCB-only); `request_with_reply` (synchronous request/reply, waits on truth without hanging) |
 
 ## `ServiceContext` contract

@@ -3,7 +3,7 @@
 The observability sink. **Restartable.** Not a TCB member.
 
 Was `logger`, and the rename is the name catching up with the job: it holds events, and has never held
-a log line in its life (see the syscall floor below). Full command surface: `utilities/46_events.md`.
+a log line in its life (see the syscall floor below). Full command surface: `utilities/47_events.md`.
 
 ## What it holds - three streams, all VOLATILE
 

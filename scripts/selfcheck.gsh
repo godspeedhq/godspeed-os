@@ -387,7 +387,7 @@ if $hwe > 0 {
     # table" for a moment, so assert the state the supervisor keeps it in.
     status | where name contains hw-enumerator | assert lacks Dead
     # The kernel directory resolves it by name - the property that makes it reacquirable (§14.3).
-    events endpoints | assert contains hw-enumerator
+    trace endpoints | assert contains hw-enumerator
 
     # THE AUTHORITY, which is the part actually worth pinning. `pci_cfg` is a hardware capability
     # granted to a userspace service, so its SHAPE is a security claim and not an implementation
@@ -446,25 +446,30 @@ assert fails kill nosuchservice
 assert fails restart supervisor
 assert fails restart nosuchservice
 
-# ===== events: the IPC observability views =====
+# ===== trace: LIVE kernel state - what is stuck right now =====
 echo ''
-echo '===== events: blocked / chain / deps / endpoints / ipc / status ====='
+echo '===== trace: blocked / chain / deps / endpoints ====='
 # Every view must ANSWER. A healthy machine has nothing blocked, and saying so is the correct answer -
 # an empty result would not be (idle on your own endpoint is not stuck).
 # `blocked`, `chain` and `status` print a report rather than records, so they are not pipe producers -
 # `assert ok` is the form for those, and it is not a weaker check here: each returns Err when it cannot
 # answer, which is exactly the failure being guarded against.
-assert ok events blocked
-assert ok events chain shell
+# BOTH commands answer `help` and `version`, per conventions rules 1, 5 and 6.
+assert ok trace help
+assert ok trace version
+assert ok events help
+assert ok events version
+assert ok trace blocked
+assert ok trace chain shell
 # `deps` reads the LIVE capability table, so the shell must show the peers it actually holds.
-events deps shell | assert contains fs
-events deps fs | assert contains block-driver
+trace deps shell | assert contains fs
+trace deps fs | assert contains block-driver
 # The tree and the record stream are the same data - the grid header names every filterable column.
-events deps shell | to grid | assert contains parent
-events deps shell | where peer contains fs | assert contains fs
+trace deps shell | to grid | assert contains parent
+trace deps shell | where peer contains fs | assert contains fs
 # The endpoint inventory, and the inverse lookup it exists to feed.
-events endpoints | assert contains events
-events endpoints | where name contains fs | assert contains fs
+trace endpoints | assert contains events
+trace endpoints | where name contains fs | assert contains fs
 # The ring itself answers, and reports its drop count (a silent loss is the bug - invariant 12).
 assert ok events status
 # The shell has been calling `fs` throughout this suite, so the ring holds real traffic.
@@ -602,11 +607,15 @@ events persist status | assert contains idle
 # self-observation rule in section 9 of docs/observability.md doing its job on the test that forgot it.
 # An unknown view under the new name is refused as loudly as under the old one.
 assert fails events nosuchview
+# TWO COMMANDS, TWO SOURCES - and each refuses the other's views by NAME, so a reader who had the
+# right question and the wrong command is told which one to use.
+assert fails events deps shell
+assert fails trace metrics
 
 # Every view refuses an unknown subject LOUDLY rather than answering with nothing.
-assert fails events chain nosuchsvc
-assert fails events deps nosuchsvc
-assert fails events endpoint notanumber
+assert fails trace chain nosuchsvc
+assert fails trace deps nosuchsvc
+assert fails trace endpoint notanumber
 assert fails events nosuchview
 
 # THE SINK IS RESTARTABLE, AND THE READER MUST SURVIVE IT. `events` holds the trace ring; killing it
@@ -617,7 +626,7 @@ assert fails events nosuchview
 assert ok chaos kill-storm events 1
 assert ok events status
 events ipc | assert contains outcome
-events endpoints | assert contains events
+trace endpoints | assert contains events
 # THE METRIC TABLE IS VOLATILE AND DIES WITH THE SINK. That is correct, not a gap: a restart is a
 # re-init and not a resume (14.2), and it is exactly why `events` must never acquire a durable-storage
 # dependency - a service that reports a storage failure must not be downstream of storage. What has to

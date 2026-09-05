@@ -82,4 +82,4 @@ when the log they needed had already rotated away.
 its volatile window, and every line also reached serial and the kernel ring by syscall before the
 recorder ever saw a copy.
 
-Full treatment: `utilities/46_events.md`, `docs/observability.md` §9b.
+Full treatment: `utilities/47_events.md`, `docs/observability.md` §9b.

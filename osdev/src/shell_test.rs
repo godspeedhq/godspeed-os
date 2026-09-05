@@ -456,7 +456,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -------------------------------------------------------------------
-    // trace - the IPC blocked-chain reader (utilities/46_events.md)
+    // trace - the IPC blocked-chain reader (utilities/46_trace.md)
     //
     // It reads kernel state that already exists and records nothing, so the assertions that
     // matter are that it RESOLVES: a chain must name the task holding the endpoint awaited,
@@ -480,18 +480,18 @@ pub fn run(image_path: &Path, smp: u32) {
     // short enough to fit - the prompt showed `qtrace blocked` and the suite failed one check down.
     send(&mut write_half, b"events help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("events blocked") && r.contains("events chain"),
+        Some(r) => check!(r.contains("events ipc") && r.contains("events metrics"),
                           "events: help lists its subcommands (conventions rules 1+6)"),
         None => { println!("shell-test: FAIL - timed out after `events help`"); fail += 1; }
     }
 
     // Healthy machine: either a table of genuinely-blocked tasks, or the explicit "nothing is
     // blocked" line. An EMPTY response is the failure - a question met with silence.
-    send(&mut write_half, b"events blocked\r");
+    send(&mut write_half, b"trace blocked\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("no task is blocked") || r.contains("awaiting"),
-                          "events blocked: answers, never silent"),
-        None => { println!("shell-test: FAIL - timed out after `events blocked`"); fail += 1; }
+                          "trace blocked: answers, never silent"),
+        None => { println!("shell-test: FAIL - timed out after `trace blocked`"); fail += 1; }
     }
 
     // The shell is running (it is executing this), so it must report as such, not as stuck.
@@ -502,25 +502,25 @@ pub fn run(image_path: &Path, smp: u32) {
                           "events ipc help: explains that view's columns"),
         None => { println!("shell-test: FAIL - timed out after `events ipc help`"); fail += 1; }
     }
-    send(&mut write_half, b"events deps help\r");
+    send(&mut write_half, b"trace deps help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("reply#NNN") && r.contains("to grid"),
-                          "events deps help: explains the tree and its table form"),
-        None => { println!("shell-test: FAIL - timed out after `events deps help`"); fail += 1; }
+                          "trace deps help: explains the tree and its table form"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps help`"); fail += 1; }
     }
     send(&mut write_half, b"q\r");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
-    send(&mut write_half, b"events chain shell\r");
+    send(&mut write_half, b"trace chain shell\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("task ") && r.contains("shell"),
-                          "events chain: resolves a name to its task and prints the chain"),
-        None => { println!("shell-test: FAIL - timed out after `events chain shell`"); fail += 1; }
+                          "trace chain: resolves a name to its task and prints the chain"),
+        None => { println!("shell-test: FAIL - timed out after `trace chain shell`"); fail += 1; }
     }
 
-    send(&mut write_half, b"events chain nosuchsvc\r");
+    send(&mut write_half, b"trace chain nosuchsvc\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("no live task named"), "events chain: unknown name refused loudly"),
-        None => { println!("shell-test: FAIL - timed out after `events chain nosuchsvc`"); fail += 1; }
+        Some(r) => check!(r.contains("no live task named"), "trace chain: unknown name refused loudly"),
+        None => { println!("shell-test: FAIL - timed out after `trace chain nosuchsvc`"); fail += 1; }
     }
 
     // Rule 3: `help` is the word; anything else is `unknown:`, which teaches the real word.
@@ -604,16 +604,16 @@ pub fn run(image_path: &Path, smp: u32) {
         }
         None => { println!("shell-test: FAIL - timed out after `events ipc | to json`"); fail += 2; }
     }
-    // `events deps` - the dependency view, built from live CAPABILITY state, not a contract.
-    send(&mut write_half, b"events deps fs\r");
+    // `trace deps` - the dependency view, built from live CAPABILITY state, not a contract.
+    send(&mut write_half, b"trace deps fs\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => {
             check!(r.contains("block-driver"),
-                   "events deps fs: names the peer it holds a send cap to");
+                   "trace deps fs: names the peer it holds a send cap to");
             check!(r.contains("calls") && r.contains("who calls whom"),
-                   "events deps fs: draws the graph as a tree with observed call counts");
+                   "trace deps fs: draws the graph as a tree with observed call counts");
         }
-        None => { println!("shell-test: FAIL - timed out after `events deps fs`"); fail += 2; }
+        None => { println!("shell-test: FAIL - timed out after `trace deps fs`"); fail += 2; }
     }
     // PING FIRST, deliberately. A peer is wired at spawn only if it was already registered, so
     // `net-stack` starts with no cap to `nic-driver` and acquires it by name on first use. Without
@@ -621,18 +621,18 @@ pub fn run(image_path: &Path, smp: u32) {
     // and misleading about the system - so exercise the path, then look.
     send(&mut write_half, b"ping count 2 10.0.2.2\r");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20));
-    send(&mut write_half, b"events deps net-stack\r");
+    send(&mut write_half, b"trace deps net-stack\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("nic-driver"),
-                          "events deps net-stack: the NIC dependency appears once it has been used"),
-        None => { println!("shell-test: FAIL - timed out after `events deps net-stack`"); fail += 1; }
+                          "trace deps net-stack: the NIC dependency appears once it has been used"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps net-stack`"); fail += 1; }
     }
     // The reply addresses are IN the record with their parents, so the pipe lists them properly -
     // which is why the tree footer is a count and a pointer rather than an id list that grows.
-    send(&mut write_half, b"events deps shell | where peer contains reply\r");
+    send(&mut write_half, b"trace deps shell | where peer contains reply\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("reply#") && r.contains("parent"),
-                          "events deps | where peer contains reply: lists the reply addresses with their holders"),
+                          "trace deps | where peer contains reply: lists the reply addresses with their holders"),
         None => { println!("shell-test: FAIL - timed out after `where peer contains reply`"); fail += 1; }
     }
     // An UNKNOWN COLUMN must select nothing, not everything: a mistyped column used to pass the
@@ -643,70 +643,70 @@ pub fn run(image_path: &Path, smp: u32) {
                           "where: an unknown column selects NOTHING, and says so"),
         None => { println!("shell-test: FAIL - timed out after `where nosuchcol`"); fail += 1; }
     }
-    // `events deps` must name its own table form - a tree hides that its rows are records.
-    send(&mut write_half, b"events deps fs\r");
+    // `trace deps` must name its own table form - a tree hides that its rows are records.
+    send(&mut write_half, b"trace deps fs\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("to grid") && r.contains("header names every column"),
-                          "events deps: points at the grid, whose header names the columns"),
-        None => { println!("shell-test: FAIL - timed out after `events deps fs` legend"); fail += 1; }
+                          "trace deps: points at the grid, whose header names the columns"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps fs` legend"); fail += 1; }
     }
-    // `events endpoints` - the INVENTORY: the map from service names to endpoint ids, which is what
-    // made `events endpoint <id>` usable deliberately rather than by copying an id out of a tree.
-    send(&mut write_half, b"events endpoints\r");
+    // `trace endpoints` - the INVENTORY: the map from service names to endpoint ids, which is what
+    // made `trace endpoint <id>` usable deliberately rather than by copying an id out of a tree.
+    send(&mut write_half, b"trace endpoints\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => {
             check!(r.contains("endpoint") && r.contains("shell") && r.contains("fs"),
-                   "events endpoints: lists live services with their endpoint ids");
+                   "trace endpoints: lists live services with their endpoint ids");
             check!(r.contains("live endpoints"),
-                   "events endpoints: says what it is showing");
+                   "trace endpoints: says what it is showing");
         }
-        None => { println!("shell-test: FAIL - timed out after `events endpoints`"); fail += 2; }
+        None => { println!("shell-test: FAIL - timed out after `trace endpoints`"); fail += 2; }
     }
-    send(&mut write_half, b"events endpoints | where name contains fs | to json\r");
+    send(&mut write_half, b"trace endpoints | where name contains fs | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("\"endpoint\":") && r.contains("\"fs\""),
-                          "events endpoints: filters and pipes like every other record source"),
-        None => { println!("shell-test: FAIL - timed out after `events endpoints | to json`"); fail += 1; }
+                          "trace endpoints: filters and pipes like every other record source"),
+        None => { println!("shell-test: FAIL - timed out after `trace endpoints | to json`"); fail += 1; }
     }
-    // `events endpoint` - the INVERSE of deps: who owns an endpoint and who can reach it.
-    send(&mut write_half, b"events endpoint 4\r");
+    // `trace endpoint` - the INVERSE of deps: who owns an endpoint and who can reach it.
+    send(&mut write_half, b"trace endpoint 4\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("endpoint 4")
                           && (r.contains("held by") || r.contains("NO LIVE OWNER")
                               || r.contains("no live task holds")),
-                          "events endpoint: answers with an owner and its holders"),
-        None => { println!("shell-test: FAIL - timed out after `events endpoint`"); fail += 1; }
+                          "trace endpoint: answers with an owner and its holders"),
+        None => { println!("shell-test: FAIL - timed out after `trace endpoint`"); fail += 1; }
     }
-    send(&mut write_half, b"events endpoint notanumber\r");
+    send(&mut write_half, b"trace endpoint notanumber\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
-        Some(r) => check!(r.contains("needs an endpoint id"), "events endpoint: bad id refused loudly"),
-        None => { println!("shell-test: FAIL - timed out after `events endpoint notanumber`"); fail += 1; }
+        Some(r) => check!(r.contains("needs an endpoint id"), "trace endpoint: bad id refused loudly"),
+        None => { println!("shell-test: FAIL - timed out after `trace endpoint notanumber`"); fail += 1; }
     }
     // A service with MANY peers, so the tree is multi-level and the connectors are exercised.
-    send(&mut write_half, b"events deps shell\r");
+    send(&mut write_half, b"trace deps shell\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => {
             check!(r.contains("fs") && r.contains("console") && r.contains("time"),
-                   "events deps shell: names its several peers");
+                   "trace deps shell: names its several peers");
             // NESTED, not merely present: `block-driver` is also a DIRECT peer of the shell, so
             // "contains block-driver" passed while the tree was flat. Require the indent that
             // only a second level can produce.
             check!(r.contains("│   ") || r.contains("    └── ")
                    || r.contains("    ├── "),
-                   "events deps shell: descends BELOW a peer (a second level is drawn)");
+                   "trace deps shell: descends BELOW a peer (a second level is drawn)");
         }
-        None => { println!("shell-test: FAIL - timed out after `events deps shell`"); fail += 2; }
+        None => { println!("shell-test: FAIL - timed out after `trace deps shell`"); fail += 2; }
     }
-    send(&mut write_half, b"events deps nosuchsvc\r");
+    send(&mut write_half, b"trace deps nosuchsvc\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
-        Some(r) => check!(r.contains("no live service"), "events deps: unknown name refused loudly"),
-        None => { println!("shell-test: FAIL - timed out after `events deps nosuchsvc`"); fail += 1; }
+        Some(r) => check!(r.contains("no live service"), "trace deps: unknown name refused loudly"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps nosuchsvc`"); fail += 1; }
     }
-    send(&mut write_half, b"events deps fs | to json\r");
+    send(&mut write_half, b"trace deps fs | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("\"peer\":") && r.contains("\"parent\":") && r.contains("\"depth\":"),
-                          "events deps: pipes the graph as records (parent -> peer edges)"),
-        None => { println!("shell-test: FAIL - timed out after `events deps | to json`"); fail += 1; }
+                          "trace deps: pipes the graph as records (parent -> peer edges)"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps | to json`"); fail += 1; }
     }
     send(&mut write_half, b"events ipc | count\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
@@ -3824,7 +3824,7 @@ pub fn run_reply_server(image_path: &Path, smp: u32) {
 /// THE PROOF is asker logging `HANG woke with no reply ... (ReplyDead recovered)` AFTER the server was
 /// killed while it was demonstrably blocked (server logged it withheld the reply first). No hang, no
 /// panic. This is the reply-side twin of §22 Test 4 (a blocked *sender* wakes with `EndpointDead`).
-/// `trace` against a REAL blocked chain (`utilities/46_events.md` mechanism A).
+/// `trace` against a REAL blocked chain (`utilities/46_trace.md` mechanism A).
 ///
 /// Everything else about `trace` can be checked on a healthy machine, but the thing that matters -
 /// the multi-hop walk - cannot: a healthy machine has nothing blocked, so the chain never gets past
@@ -3837,12 +3837,12 @@ pub fn run_reply_server(image_path: &Path, smp: u32) {
 /// task stuck on another task, deterministically, for as long as we care to look.
 ///
 /// THE PROOFS:
-///   1. `events blocked` NAMES asker as blocked, with a non-zero awaited endpoint - the state the
+///   1. `trace blocked` NAMES asker as blocked, with a non-zero awaited endpoint - the state the
 ///      kernel keeps in `CALL_AWAIT_EP` for the reply-side death-wake (§8.6) is readable.
 ///   2. It resolves that endpoint to `reply-server` - the endpoint-to-owner mapping works ACROSS
 ///      tasks, which is the whole of the walk and is what one hop can never demonstrate.
-///   3. `events chain asker` prints the chain as a tree, naming the same peer.
-///   4. `events chain reply-server` shows the far end waiting for work, not stuck on anyone - so the
+///   3. `trace chain asker` prints the chain as a tree, naming the same peer.
+///   4. `trace chain reply-server` shows the far end waiting for work, not stuck on anyone - so the
 ///      walk terminates on a fact rather than running off the end.
 /// Then the machine is killed; nothing here changes system behaviour, which is the point of a reader.
 pub fn run_trace_chain(image_path: &Path, smp: u32) {
@@ -3906,35 +3906,35 @@ pub fn run_trace_chain(image_path: &Path, smp: u32) {
            "setup: reply-server withheld its reply - asker is now genuinely blocked");
 
     // PROOF 1 + 2: the blocked table names the stuck task AND resolves what it waits on to a peer.
-    send(&mut write_half, b"events blocked\r");
+    send(&mut write_half, b"trace blocked\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
         Some(r) => {
-            check!(r.contains("asker"), "events blocked: names the blocked task");
+            check!(r.contains("asker"), "trace blocked: names the blocked task");
             check!(r.contains("reply-server"),
-                   "events blocked: RESOLVES the awaited endpoint to the task holding it (the walk)");
-            check!(r.contains("call"), "events blocked: reports it as blocked in a CALL");
+                   "trace blocked: RESOLVES the awaited endpoint to the task holding it (the walk)");
+            check!(r.contains("call"), "trace blocked: reports it as blocked in a CALL");
         }
-        None => { println!("trace: FAIL - timed out on `events blocked`"); fail += 3; }
+        None => { println!("trace: FAIL - timed out on `trace blocked`"); fail += 3; }
     }
 
     // PROOF 3: the same relationship as a tree, rooted by service name.
-    send(&mut write_half, b"events chain asker\r");
+    send(&mut write_half, b"trace chain asker\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
         Some(r) => {
-            check!(r.contains("asker"), "events chain asker: roots the tree at the named task");
-            check!(r.contains("awaiting endpoint"), "events chain asker: names the endpoint awaited");
-            check!(r.contains("reply-server"), "events chain asker: walks the hop to the peer");
+            check!(r.contains("asker"), "trace chain asker: roots the tree at the named task");
+            check!(r.contains("awaiting endpoint"), "trace chain asker: names the endpoint awaited");
+            check!(r.contains("reply-server"), "trace chain asker: walks the hop to the peer");
         }
-        None => { println!("trace: FAIL - timed out on `events chain asker`"); fail += 3; }
+        None => { println!("trace: FAIL - timed out on `trace chain asker`"); fail += 3; }
     }
 
     // PROOF 4: the far end of the chain terminates on a fact. reply-server is not stuck on anyone -
     // it is sitting on its own endpoint, which is what a service waiting for work looks like.
-    send(&mut write_half, b"events chain reply-server\r");
+    send(&mut write_half, b"trace chain reply-server\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
         Some(r) => check!(r.contains("awaits no task"),
-                          "events chain reply-server: the walk TERMINATES on a fact, not off the end"),
-        None => { println!("trace: FAIL - timed out on `events chain reply-server`"); fail += 1; }
+                          "trace chain reply-server: the walk TERMINATES on a fact, not off the end"),
+        None => { println!("trace: FAIL - timed out on `trace chain reply-server`"); fail += 1; }
     }
 
     let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();

@@ -515,7 +515,7 @@ the old story (Commandment III - and the amendment is the truth).
 
 ## Audit: the `trace` branch (2026-08-30, `feat/trace` @ `f1f4d5ff`)
 
-Requested before merge. Scope: everything this branch wrote - `utilities/46_events.md`, the trace code
+Requested before merge. Scope: everything this branch wrote - `utilities/46_trace.md`, the trace code
 comments, and the per-directory guides it touched. Six defects, all fixed; every one of them was
 created by a LATER change in the same branch invalidating an EARLIER piece of prose.
 

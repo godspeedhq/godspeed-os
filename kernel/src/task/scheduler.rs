@@ -1026,7 +1026,7 @@ pub struct TaskStatRaw {
     pub uptime_secs: u64,
     /// The endpoint this task OWNS (0 = none). Already read here to compute `queue_depth`; exposing it
     /// costs nothing and is what lets a reader map an awaited endpoint back to the task that owns it,
-    /// which is the whole of the blocked-chain walk (`utilities/46_events.md`).
+    /// which is the whole of the blocked-chain walk (`utilities/46_trace.md`).
     pub endpoint:    u64,
 }
 

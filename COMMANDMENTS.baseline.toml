@@ -147,7 +147,7 @@ service_configs = [
 # identical on every board running this system. The alternative is granting that service a second,
 # far wider MMIO window for one identity fact, which is more authority for less honesty.
 #
-# 24 + 25 (the blocked-chain reader, `utilities/46_events.md`) answer the same question, and 25 answers
+# 24 + 25 (the blocked-chain reader, `utilities/46_trace.md`) answer the same question, and 25 answers
 # it on impossibility - the same bar as 23.
 #
 # 25 is the endpoint a task is blocked-in-CALL awaiting a reply from. It lives in
@@ -167,7 +167,7 @@ service_configs = [
 # task not progressing?" becomes a walk of state the kernel already keeps, with NO event ring, no
 # switch, no message ids, and no cost when unused (nothing runs until asked). The rejected alternative
 # was a trace buffer written on the IPC fast path - genuinely new kernel state and cost - which
-# `utilities/46_events.md` records as mechanism B, deliberately not built.
+# `utilities/47_events.md` records as mechanism B, deliberately not built.
 #
 # Neither query changes what the kernel DOES. Both are read-only, both are INTROSPECT-gated by falling
 # outside the ungated list, and the system behaves identically whether anything reads them or not.
