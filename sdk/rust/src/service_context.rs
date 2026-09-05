@@ -1320,14 +1320,28 @@ impl ServiceContext {
             // interval), while CapTableFull is TERMINAL until this service restarts - it will never
             // publish again, and that deserves to be said out loud once rather than discovered as an
             // absence. Invariant 12, and 26.7's "a recovery that itself fails is still a failure".
-            static ACQ_FAILED_SAID: core::sync::atomic::AtomicBool =
+            // ONE LATCH PER SEVERITY, and the wording matches the severity. A single latch was
+            // wrong twice over: it said "metrics stop here" for the TRANSIENT case (the sink is
+            // simply mid-restart - the next interval reconnects, and a kill-storm produces this by
+            // the dozen), and having latched on that it would then stay silent about a genuinely
+            // TERMINAL cause arriving later. Observed on the T630: 17 of these during a 100-round
+            // storm, every one of them transient and every one of them overstating the damage.
+            static ACQ_TRANSIENT_SAID: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            static ACQ_TERMINAL_SAID: core::sync::atomic::AtomicBool =
                 core::sync::atomic::AtomicBool::new(false);
             let acq = self.reacquire_cap_detail(crate::trace::SINK_NAME);
             if let Err(why) = acq {
-                if !ACQ_FAILED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                    self.log_fmt(format_args!(
-                        "sdk: cannot reacquire the events sink ({}) - metrics from this service stop here",
-                        why.reason()));
+                let transient = matches!(why, AcquireFailure::NameNotRegistered);
+                let said = if transient { &ACQ_TRANSIENT_SAID } else { &ACQ_TERMINAL_SAID };
+                if !said.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    if transient {
+                        self.log("sdk: events sink not registered right now - samples dropped until it is back");
+                    } else {
+                        self.log_fmt(format_args!(
+                            "sdk: cannot reacquire the events sink ({}) - metrics from this service stop here",
+                            why.reason()));
+                    }
                 }
             }
             if acq.is_ok() {
