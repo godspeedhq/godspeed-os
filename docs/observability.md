@@ -384,6 +384,50 @@ land on their own so the diff stays reviewable. The measured cost was 56 sites, 
 
 ---
 
+## 9a. The rule: every stream the sink serves is RECORDS, never free text
+
+**Ratified 2026-09-05, after breaking it once.**
+
+> A view served by `events` returns rows with named fields. It is queryable with the same `where` as
+> every other view, and it converts with `to json` / `to yaml`. A view that can only be printed is not
+> finished.
+
+Metrics and IPC traces were built this way from the start - `owner, metric, value, age_s` and
+`seq, sec, caller, peer, op, outcome`. The LOG was not: it was built as a byte ring of formatted
+lines, because that is what a log looks like.
+
+**The cost arrived immediately, which is why this is a rule and not a preference.** Filtering the log
+by service needed a bespoke argument parsed in the shell (`events log 4 fs`), hand-rolling what `where`
+already does - and the hand-rolled version was wrong on its first run, returning lines belonging to
+other services. Two mechanisms for one operation, one of them broken, and the broken one written
+because the data had the wrong shape.
+
+As records the whole thing disappears:
+
+```text
+events log | where owner=fs | to json
+[
+  {"owner": "fs", "text": "disk capacity = 0 sectors (0 MiB)"},
+  {"owner": "fs", "text": "serving file API"}
+]
+```
+
+Three properties follow that the text form could not have had:
+
+- **The owner is a FIELD, not a prefix.** `where owner=dwc2` matches even though that service writes
+  its lines as `dwc2-svc:`. A text-prefix match could not, and deciding where a name ends inside a
+  string is exactly the guesswork a field removes.
+- **No fact is stated twice.** The service name lives in `owner`, so it is stripped from `text` -
+  `{"owner": "fs", "text": "fs: serving file API"}` was the first output and is noise.
+- **Printing is a RENDERING, not the format.** `events log` prints `owner: text` because a log should
+  read like a log, and a 240-byte `text` column would be wider than any screen. Piped, it is rows.
+  Same data, two renderings, exactly as `trace ipc` already does.
+
+The rule binds anything added later. A new stream that can only be printed has picked the wrong shape,
+and the filter someone writes for it will be the second mechanism this section exists to prevent.
+
+---
+
 ## 10. The plan
 
 Phased so that the kernel change is **pulled into existence** by a service that has demonstrably hit

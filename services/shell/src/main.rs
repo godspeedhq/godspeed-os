@@ -6660,6 +6660,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
                 "endpoints" => build_endpoints_table(ctx),
                 "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "metrics"  => match build_trace_metrics_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "log"      => match build_events_log_table(ctx)    { Some(t) => t, None => return Err(ShellError::Unknown) },
                 other      => {
                     ctx.console_writeln_fmt(format_args!(
                         "trace: '{}' is not a record source - pipe 'trace ipc' or 'trace failures'", other));
@@ -8045,72 +8046,108 @@ fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
 /// saw a copy - so serial is complete and this is a convenience. What this window CANNOT show is
 /// anything printed before `events` started (the kernel's 16 KiB ring is not exposed to userspace), or
 /// a line lost when the sink's queue was momentarily full.
-fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+/// `events log` as a RECORD SOURCE: one row per held line, `owner` and `text`.
+///
+/// Records, not text, and that is a rule rather than a preference for this one view: every stream the
+/// sink serves is queryable the same way. Metrics and IPC traces were already records; the log was the
+/// outlier, and the cost of that showed up immediately as a hand-rolled per-service filter in the
+/// shell - duplicated machinery that `where` already provides, and that was wrong on its first outing.
+/// With a record the answer is `events log | where owner=fs`, using the same `where` as everything else.
+///
+/// The sink stores `owner US text NL`. The owner is a FIELD, never a prefix glued to the text, which
+/// also removes the guesswork of deciding where a name ends - `dwc2` logs its lines as `dwc2-svc:`.
+#[inline(never)]
+fn build_events_log_table(ctx: &ServiceContext) -> Option<Table> {
     let req = [godspeed_sdk::trace::TRACE_OP_LOGS];
     let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
             ctx.console_writeln("events: the `events` service did not answer in 3 attempts (it holds the log)");
-            return Err(ShellError::Unknown);
+            return None;
         }
     };
     let b = reply.payload_bytes();
     if b.len() < 9 {
         ctx.console_writeln("events: short log reply");
-        return Err(ShellError::Unknown);
+        return None;
     }
-    let lines = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-    let wrapped = b[8] != 0;
     let body = &b[9..];
-    if body.is_empty() {
+    let mut t = Table::new(&["owner", "text"]);
+    let mut ls = 0usize;
+    for i in 0..=body.len() {
+        let end = if i == body.len() { body.len() } else if body[i] == b'\n' { i } else { continue };
+        if end > ls {
+            let line = &body[ls..end];
+            let cut = line.iter().position(|&c| c == 0x1f).unwrap_or(line.len());
+            let owner = &line[..cut];
+            let mut text = if cut < line.len() { &line[cut + 1..] } else { &line[..0] };
+            // DROP THE SELF-PREFIX FROM `text`, since `owner` is already a field. Every service opens
+            // its lines with its own name, so keeping it produced
+            // `{"owner": "fs", "text": "fs: disk capacity = ..."}` - the same fact twice, which is
+            // noise in a record and exactly what having fields is supposed to remove.
+            //
+            // Only when the text actually starts with the owner, and only as far as the first `: `, so
+            // `dwc2-svc: net tx` yields `net tx` without having to know where the name ends. A line
+            // that does NOT name itself is untouched, and one with no separator is left whole.
+            if !owner.is_empty() && text.len() > owner.len() && &text[..owner.len()] == owner {
+                let scan = text.len().min(owner.len() + 24);
+                for i in 0..scan.saturating_sub(1) {
+                    if text[i] == b':' && text[i + 1] == b' ' {
+                        text = &text[i + 2..];
+                        break;
+                    }
+                }
+            }
+            let ov = t.intern(owner);
+            let tv = t.intern(text);
+            t.add_row(&[ov, tv]);
+        }
+        ls = end + 1;
+        if end == body.len() { break; }
+    }
+    Some(t)
+}
+
+/// `events log [n]` - the last `n` held lines, rendered as a log rather than as a grid.
+///
+/// A grid is the wrong shape here and the pipe is the right one: a log line runs to 240 bytes, so a
+/// `text` column would be far wider than any screen. Printed it reads as a log; piped it is records.
+/// Same data, two renderings - exactly what `trace ipc` does, which prints a grid and pipes rows.
+///
+/// NO PAGER, deliberately. `trace ipc` pages and waits for a keypress, which is right at a prompt and
+/// fatal in a script - a bare `assert ok events ipc` hung the whole selfcheck suite until the harness
+/// timed out. This prints a bounded screenful and returns.
+fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let t = match build_events_log_table(ctx) {
+        Some(t) => t,
+        None => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
         ctx.console_writeln("events: no log lines held yet (a service logs, and the copy arrives here)");
         return Ok(());
     }
-    // ONE FRAME, for the reason every other multi-line view batches: a line written straight to the
-    // console is two syscalls against a 16-deep queue.
-    // A SCREENFUL BY DEFAULT, not the whole 8 KiB window. `events log` used to print everything it
-    // held - about 3 KB on a booted machine: more than anyone reads, and enough console traffic to
-    // slow a capture harness noticeably. `events log <n>` asks for more or fewer. The WINDOW is
-    // still whatever the sink holds; this bounds only what is DRAWN.
     let want = arg.trim().parse::<usize>().unwrap_or(20).max(1);
-    let mut seen = 0usize;
-    let mut from = 0usize;
-    for i in (0..body.len()).rev() {
-        if body[i] == b'\n' {
-            seen += 1;
-            if seen > want {
-                from = i + 1;
-                break;
-            }
-        }
-    }
-    let body = &body[from..];
-
+    let first = t.nrows().saturating_sub(want);
     let mut f = FrameBuf::new();
-    let mut start = 0usize;
-    for i in 0..body.len() {
-        if body[i] == b'\n' {
-            f.put(ctx, &body[start..i]);
-            f.put(ctx, b"\r\n");
-            start = i + 1;
+    for r in first..t.nrows() {
+        let owner = t.cell_bytes(r, 0);
+        let text = t.cell_bytes(r, 1);
+        // `owner: text`, always - the record no longer carries the name inside the text, so printing it
+        // here is what restores the familiar log line rather than duplicating it.
+        if !owner.is_empty() {
+            f.put(ctx, owner);
+            f.put(ctx, b": ");
         }
-    }
-    if start < body.len() {
-        f.put(ctx, &body[start..]);
+        f.put(ctx, text);
         f.put(ctx, b"\r\n");
     }
     f.flush(ctx);
-    if wrapped {
-        ctx.console_writeln_fmt(format_args!(
-            "events: {} line(s) logged; OLDER LINES OVERWRITTEN - this is an 8 KiB window, serial has the rest.",
-            lines));
-    } else {
-        ctx.console_writeln_fmt(format_args!(
-            "events: {} line(s) logged, none overwritten. Lines printed BEFORE `events` started are on serial only.",
-            lines));
-    }
+    ctx.console_writeln_fmt(format_args!(
+        "events: {} line(s) held ({} shown). This is a COPY - serial has the authoritative record, including everything printed before `events` started. Filter with `events log | where owner=<service>`.",
+        t.nrows(), t.nrows() - first));
     Ok(())
 }
+
 
 fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = match build_trace_metrics_table(ctx) {

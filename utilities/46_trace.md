@@ -169,8 +169,30 @@ Three consequences, stated rather than left to be discovered:
   beneath it survives anything, including a panic that halts every core.
 
 It prints a screenful by default rather than everything it holds - about 3 KB on a booted machine is
-more than anyone reads. `events log 100` asks for more. It is TEXT, not records, so it refuses to
-start a pipe rather than yield something that is not a table.
+more than anyone reads. `events log 100` asks for more.
+
+**It is a RECORD SOURCE**, like every other view here - `owner` and `text`:
+
+```text
+gsh> events log | where owner=fs | to json
+[
+  {"owner": "fs", "text": "disk capacity = 0 sectors (0 MiB)"},
+  {"owner": "fs", "text": "serving file API"}
+]
+```
+
+The owner is a FIELD, which is what makes `where owner=dwc2` match a service that writes its lines as
+`dwc2-svc:` - a text-prefix match could not, and guessing where a name ends inside a string is exactly
+what a field removes. The name is stripped from `text` for the same reason: `owner` already holds it,
+and stating one fact twice is what fields exist to stop.
+
+Printing is a rendering, not the format. `events log` shows `owner: text` because a log should read
+like a log and a 240-byte column would be wider than any screen; piped, it is rows. Same data, two
+renderings - what `trace ipc` already does.
+
+This is a rule rather than a convenience, and it was ratified after being broken: the log was first
+built as text, and filtering it by service then needed a bespoke argument hand-rolled in the shell,
+duplicating `where` and getting it wrong on the first run. `docs/observability.md` §9a.
 
 ### `trace metrics` - what services are counting
 

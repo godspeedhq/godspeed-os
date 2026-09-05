@@ -360,20 +360,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         *wrapped = true;
                     }
                 };
-                // PREPEND THE OWNER ONLY IF THE LINE DOES NOT ALREADY SAY IT. Every service in this
-                // tree opens its log lines with its own name (`fs: serving file API`), which is the
-                // house convention - so stamping the owner unconditionally produced
-                // `block-driver block-driver: capacity 0`. The owner is still recorded for a line
-                // that does NOT name itself, which is the case this attribution exists for.
-                let says_own_name = text.len() > olen
-                    && &text[..olen] == &owner[..olen]
-                    && (text[olen] == b':' || text[olen] == b' ');
-                if !says_own_name {
-                    for &c in &owner[..olen] {
-                        push(c, &mut loghead, &mut logwrapped);
-                    }
-                    push(b' ', &mut loghead, &mut logwrapped);
+                // STORED AS A RECORD: `owner US text NL`, where US is 0x1F.
+                //
+                // The owner is a FIELD, not a prefix glued onto the text. That is what lets the reader
+                // hand this to the record pipeline - `events log | where owner=fs` uses the same `where`
+                // every other view uses, instead of a filter hand-rolled in the shell for this one view.
+                // The first attempt did glue them together, and the bespoke filter that had to follow
+                // was both duplicated machinery and wrong.
+                //
+                // It also removes a problem that only shows up on real services: `dwc2` logs its lines
+                // as `dwc2-svc: ...`, so any "does the text already name its owner" test has to guess
+                // where the name ends. With a separate field there is nothing to guess.
+                for &c in &owner[..olen] {
+                    push(c, &mut loghead, &mut logwrapped);
                 }
+                push(0x1f, &mut loghead, &mut logwrapped);
                 for &c in text {
                     // A newline inside the text would split one line into two on read-back, so it is
                     // rendered as a space. The line is one line because one `ctx.log` call made it.

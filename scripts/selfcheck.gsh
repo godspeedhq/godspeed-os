@@ -523,6 +523,24 @@ events metrics | where owner contains events | assert contains ring.recorded
 # - about 3 KB on a booted machine - which is more than anyone reads and enough console
 # traffic to slow a capture harness. `events log <n>` asks for more.
 assert ok events log 5
+# EVERY STREAM THE SINK SERVES IS RECORDS, not free text. That is the rule, and the log was the one
+# view breaking it: it printed lines, so filtering it needed a bespoke per-service argument in the
+# shell - duplicated machinery that `where` already provides, and wrong on its first outing. As
+# records the answer is the same `where` every other view uses, and `to json` / `to yaml` come free.
+# Asserted on the COLUMN rather than on any service's line: which services logged recently varies by
+# machine and by how far the 8 KiB window has wrapped, but the shape never does.
+events log | assert contains owner
+events log | to json | assert contains owner
+events log | to yaml | assert contains owner
+# NOT asserted here: filtering for a SPECIFIC owner. Which services have logged inside the 8 KiB
+# window varies by machine and by how far it has wrapped, so any such assertion is a coin flip on
+# hardware. Filtering by owner is already pinned above, on the metrics view, where the rows are stable.
+#
+# One owner can NEVER appear, and it is worth knowing why: `events` itself. It holds no send cap to
+# itself, so its `ctx.log()` copy resolves to `u32::MAX` and goes nowhere - the same cut that stops the
+# sink tracing its own sends. Its lines reach serial by syscall like everyone's; only the queryable
+# copy is absent. `events log | where owner=events` was asserted here at first and failed, which is the
+# self-observation rule in section 9 of docs/observability.md doing its job on the test that forgot it.
 # An unknown view under the new name is refused as loudly as under the old one.
 assert fails events nosuchview
 
