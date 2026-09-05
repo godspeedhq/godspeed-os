@@ -2325,6 +2325,9 @@ pub fn kill_task_by_slot(slot: usize) {
         // only grows, and what it costs is promptness, which the reconcile sweep eventually restores.
         static DEATH_NOTIFY_DROPPED: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
+        /// Deaths that reached no supervisor at all, because its endpoint was gone at that instant.
+        static DEATH_NOTIFY_UNHEARD: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
         use core::sync::atomic::Ordering;
 
         // RESTART count (the observe RESTARTS column): only the restartable/managed set accrues a
@@ -2395,7 +2398,22 @@ pub fn kill_task_by_slot(slot: usize) {
             ) {
                 match crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg) {
                     crate::ipc::routing::Enqueue::Woke(sup_slot) => wake_by_slot(sup_slot, 0),
-                    crate::ipc::routing::Enqueue::Queued | crate::ipc::routing::Enqueue::NoEndpoint => {}
+                    crate::ipc::routing::Enqueue::Queued => {}
+                    // THE SUPERVISOR WAS NOT THERE TO HEAR IT. Its endpoint is dead or unregistered -
+                    // it is itself dead-and-respawning, which `chaos` causes constantly - so the
+                    // notification is lost and the service comes back only on the reconcile sweep.
+                    //
+                    // This, not a full queue, is what actually happens: a run that produced 144 of
+                    // these produced ZERO full queues. The first version of this code reported only
+                    // the full-queue case and stayed silent on this one, which is the case that occurs.
+                    crate::ipc::routing::Enqueue::NoEndpoint => {
+                        let n = DEATH_NOTIFY_UNHEARD.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 64 == 0 {
+                            crate::kprintln!(
+                                "kernel: death of '{}' UNHEARD - the supervisor endpoint is gone ({} so far); the reconcile sweep will respawn it, not promptly",
+                                task_name, n);
+                        }
+                    }
                     // THE ONE MESSAGE THAT SAYS A SERVICE DIED, DISCARDED. The supervisor's queue is
                     // 16 deep and a storm can fill it, so this will happen - the kernel must not block
                     // on a userspace queue. What it must not do is stay quiet: the service comes back

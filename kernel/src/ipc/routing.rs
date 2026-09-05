@@ -549,7 +549,13 @@ pub enum Enqueue {
     Woke(usize),
     /// Queued; nobody was waiting.
     Queued,
-    /// No such endpoint, or it is Dead. Not a loss: there is nobody to deliver to.
+    /// No such endpoint, or it is Dead.
+    ///
+    /// WHETHER THIS IS A LOSS DEPENDS ON THE CALLER, so it is reported rather than judged here. For an
+    /// IRQ it is not: a driver that is gone cannot want its interrupt. For a DEATH NOTIFICATION it is,
+    /// and it is the common case - `chaos` kills the supervisor too, and a death arriving while the
+    /// supervisor is itself dead-and-respawning finds this. Hardware settled it: one run produced 144
+    /// notifications the supervisor never received and ZERO full queues.
     NoEndpoint,
     /// DROPPED - the endpoint's queue was full. A real loss, and the caller must say so.
     QueueFull,
@@ -643,6 +649,9 @@ pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
 ///
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
+/// Messages accepted into a queue and then lost when that endpoint died.
+static QUEUED_LOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     let mut table = TABLE.lock_irq();
     let idx = match find_index(&*table, endpoint) {
@@ -651,6 +660,29 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     };
     table[idx].liveness   = EndpointLiveness::Dead;
     table[idx].generation = table[idx].generation.bump();
+
+    // MESSAGES DIE WITH THE ENDPOINT, and this is where they are lost. Everything queued here was
+    // ACCEPTED - the sender was told nothing was wrong, because at the time nothing was - and it goes
+    // in the drain below without ever being read.
+    //
+    // That is the mechanism behind "supervisor: reconcile respawned X (missed death notification)": a
+    // death notification is queued onto a live supervisor endpoint, the supervisor then dies, and the
+    // notification is discarded here. Two earlier guesses were wrong and measurement disproved both -
+    // a run with 144 such misses had ZERO full queues and ZERO sends to a dead endpoint. It was always
+    // this.
+    //
+    // Bounded and rate-limited: an endpoint dying with a full queue is 16 messages, and a storm kills
+    // many endpoints, so say the first and then every 64th.
+    let discarded = table[idx].queue.len();
+    if discarded > 0 {
+        let n = QUEUED_LOST.fetch_add(discarded as u64, core::sync::atomic::Ordering::Relaxed)
+            + discarded as u64;
+        if n <= discarded as u64 || n % 64 < discarded as u64 {
+            crate::kprintln!(
+                "kernel: endpoint {} died holding {} unread message(s) - they are LOST ({} total); a death notification among them is why a service comes back on the reconcile sweep rather than promptly",
+                endpoint.0, discarded, n);
+        }
+    }
     table[idx].queue.drain();
     let rx = table[idx].blocked_receiver.take();
     let tx = table[idx].blocked_sender.take();

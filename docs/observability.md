@@ -499,9 +499,33 @@ turns out to be possible is worth hearing the first time.
 The behaviour is unchanged: the kernel still drops, because it must not block on a userspace queue.
 What changed is that a 53-second outage can now name its own cause.
 
-Proven to fire rather than assumed. QEMU's chaos never fills that queue, so the natural condition was
-not reproducible locally - the success arm was temporarily routed into the drop arm, the message was
-observed once with the count, and the patch reverted (0 occurrences after, 172/0 either way).
+### And the first two diagnoses were both WRONG
+
+Worth recording in full, because the measurement is the only reason it is right now.
+
+**Guess 1: the supervisor's queue fills and the notification is dropped.** Plausible - the discarded
+`Result` was real and is still worth fixing. Disproved by the next hardware run: **144 supervisor-side
+misses, ZERO full queues.**
+
+**Guess 2: the supervisor's endpoint is dead when the notification arrives**, since chaos kills the
+supervisor too. Also plausible, also wrong: `kill all-services` produced misses and **zero** sends to a
+dead endpoint.
+
+**What actually happens** is the one place neither guess looked. The notification is queued
+SUCCESSFULLY onto a live supervisor endpoint; the supervisor then dies; and `kill_endpoint` discards
+the whole queue. The sender was told nothing was wrong, because at the time nothing was.
+
+So the report belongs at the teardown, not at the send, and it fires there naturally - no forcing:
+
+```text
+kernel: endpoint 100 died holding 6 unread message(s) - they are LOST (6 total); a death
+        notification among them is why a service comes back on the reconcile sweep rather than promptly
+```
+
+The lesson is the one this project keeps relearning: **a plausible mechanism is not a measured one.**
+Both guesses survived a reading of the code and died to a single grep of a hardware log. The guard
+built for the first guess is what disproved it - which is the argument for making a silent thing loud
+even when you are confident you already know what it will say.
 
 ---
 

@@ -36,6 +36,13 @@ impl MessageQueue {
         self.len == QUEUE_DEPTH
     }
 
+    /// How many messages are waiting. Used by the teardown path to say how many were DISCARDED when
+    /// an endpoint died - a message queued onto a service that then dies is lost, and silently until
+    /// this could be counted.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
