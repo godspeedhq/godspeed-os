@@ -6,7 +6,7 @@
 //! 1. **Drain its endpoint.** The endpoint EXISTS, so anything sent here must be consumed or the
 //!    16-deep queue sits full forever (a stub that only parks never recv's, and a `chaos flood-storm`
 //!    then wedges it permanently).
-//! 2. **Hold the IPC trace ring** (`utilities/46_trace.md` mechanism B) - a bounded history of
+//! 2. **Hold the IPC trace ring** (`utilities/46_events.md` mechanism B) - a bounded history of
 //!    request/reply events emitted by services that hold a send cap to this one, read back by the
 //!    `trace` utility.
 //!
@@ -36,7 +36,7 @@
 //!
 //! # Bounded, and loud about loss (§26.6, invariant 12)
 //!
-//! Fixed ring, fixed events, no heap. Full = overwrite the oldest and COUNT it; `trace status` reports
+//! Fixed ring, fixed events, no heap. Full = overwrite the oldest and COUNT it; `events status` reports
 //! the count. A ring that discards silently is the bug this project just fixed in the x86 keyboard
 //! path - an instrument that loses data without saying so is worse than no instrument.
 
@@ -125,7 +125,7 @@ fn reply(ctx: &ServiceContext, out: &[u8]) {
         // until the table is full. `block-driver`, `console` and `fs` all do this - this service was
         // the one that did not.
         //
-        // It was visible before it was fatal: `trace deps fs` drew `events -> shell`, because a
+        // It was visible before it was fatal: `events deps fs` drew `events -> shell`, because a
         // retained return address is indistinguishable from a wired peer (both SEND|GRANT to a live
         // task's endpoint). A leak that shows up as a wrong arrow in a diagram is a lucky leak.
         ctx.remove_cap(cap);
@@ -203,7 +203,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 next += 1;
                 total += 1;
             }
-            // `trace ipc` / `trace failures` - the most recent events, oldest of the tail first.
+            // `events ipc` / `events failures` - the most recent events, oldest of the tail first.
             TRACE_OP_DUMP => {
                 let want = if b.len() >= 2 { b[1] as usize } else { 110 };
                 let have = (total as usize).min(RING);
@@ -223,7 +223,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 reply(&ctx, &out[..1 + n * EV_LEN]);
             }
-            // `trace status` - capacity / recorded / dropped.
+            // `events status` - capacity / recorded / dropped.
             TRACE_OP_STATUS => {
                 let mut out = [0u8; 24];
                 out[0..8].copy_from_slice(&(RING as u64).to_le_bytes());
@@ -265,12 +265,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         mets_full += 1;
                         if !mets_full_said {
                             mets_full_said = true;
-                            ctx.log("events: metric table FULL (64) - further samples with new names are refused, not dropped silently; `trace metrics` reports the count");
+                            ctx.log("events: metric table FULL (64) - further samples with new names are refused, not dropped silently; `events metrics` reports the count");
                         }
                     }
                 }
             }
-            // `trace metrics` - the whole table.
+            // `events metrics` - the whole table.
             TRACE_OP_METRICS => {
                 // SELF-OBSERVATION IS A LOCAL WRITE, NEVER A MESSAGE. This service cannot publish its
                 // own numbers the way every other service does: `ctx.metric()` sends, a send is a

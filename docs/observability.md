@@ -9,7 +9,7 @@ already half-evidenced by work that had shipped.
 an endpoint to expose that data on?
 
 **The answer: almost certainly not.** Appendix C.2 of `CLAUDE.md` says "the kernel emits structured
-events ... on a known endpoint". That line predates the `trace` utility, which shipped with **zero
+events ... on a known endpoint". That line predates the IPC tracing work, which shipped with **zero
 kernel growth** and is direct evidence against it.
 
 ---
@@ -22,7 +22,7 @@ kernel growth** and is direct evidence against it.
 | **traces** | a 192-event ring INSIDE `events`; instrumentation in the SDK | none |
 | **metrics** | see below | pull only, already exists |
 
-The `trace` utility answers "what is stuck", "who can reach whom" and "what just happened", and the
+The tracing views answer "what is stuck", "who can reach whom" and "what just happened", and the
 kernel gained nothing for it: no ring in ring 0, no retention policy, no message-identity scheme, no
 control syscall, no new capability, and nothing on the IPC fast path.
 
@@ -210,7 +210,7 @@ pulled into existence by a real need (26.2), not built ahead of one.
 
 ## 7. What this costs today, and why it gets cheaper
 
-During the `trace` work the `service_configs` pin **refused a new `tracer` service** - the kernel
+During the tracing work the `service_configs` pin **refused a new `tracer` service** - the kernel
 holds a config row per service, so adding one was a kernel change. That refusal is what forced the
 trace ring into `events`, which turned out to be the better design anyway.
 
@@ -247,7 +247,7 @@ it knows, by the two mechanisms it already has, and forms no opinion about consu
 ## 9. The service WAS renamed: `logger` -> `events` (done 2026-09-04)
 
 **The name was already wrong.** The service holds the 192-event IPC TRACE ring; it stopped being a
-logger when `trace` shipped. So this was not a rename in anticipation of a new job - it was the name
+logger when the IPC trace ring shipped. So this was not a rename in anticipation of a new job - it was the name
 catching up with the job it already had.
 
 **Shipped in commit 7dc157b0**, verified in QEMU: identity 24/0, shell 165/0, commandments 15 pass,
@@ -265,7 +265,7 @@ code (the supervisor's image table and MANAGED list, contracts, the name directo
 
 - **`observe` already exists** - the live top/htop view. `observability` blurs the two;
   `events` and `observe` read as complementary: one HOLDS the stream, the other RENDERS the state.
-- **House style is one short word** - `trace`, `drives`, `edit`, `observe`.
+- **House style is one short word** - `drives`, `edit`, `observe`.
 - **It names what the thing holds.** Log lines are events. IPC trace records are events. Metric
   samples are events. An honest unifying noun.
 - `observability` is a PROPERTY OF A SYSTEM, not a component. A service named after a property tends
@@ -421,7 +421,7 @@ Three properties follow that the text form could not have had:
   `{"owner": "fs", "text": "fs: serving file API"}` was the first output and is noise.
 - **Printing is a RENDERING, not the format.** `events log` prints `owner: text` because a log should
   read like a log, and a 240-byte `text` column would be wider than any screen. Piped, it is rows.
-  Same data, two renderings, exactly as `trace ipc` already does.
+  Same data, two renderings, exactly as `events ipc` already does.
 
 The rule binds anything added later. A new stream that can only be printed has picked the wrong shape,
 and the filter someone writes for it will be the second mechanism this section exists to prevent.
@@ -474,8 +474,7 @@ What a service now has, and the shape of each:
 | **traces** | automatic in the SDK; needs only `ipc_send = ["events"]` | one relaxed load when not tracing |
 | **metrics** | `ctx.metric(name, value)`, `try_send` and discard | nothing it can be blocked or slowed by |
 
-Read back with `events metrics` (a record source, so it filters and formats like any other);
-`trace` remains as the older name for every view.
+Read back with `events metrics` (a record source, so it filters and formats like any other).
 
 **And logs became queryable without a kernel change**, which is worth recording because the obvious
 route needed one. `drain_kernel_ring_buffer()` is a no-op stub and no syscall exposes the kernel's
@@ -669,7 +668,7 @@ clearing it.
 ## 12. Amending C.2
 
 Appendix C.2 is explicitly non-normative, so this note does not amend the constitution. But its
-"known endpoint" phrasing should be read in light of the `trace` evidence: the kernel does not need
+"known endpoint" phrasing should be read in light of the tracing evidence: the kernel does not need
 to publish to an endpoint, and the reasons it should not are the same ones that kept the trace ring
 out of ring 0.
 

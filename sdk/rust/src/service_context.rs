@@ -1162,7 +1162,7 @@ impl ServiceContext {
     /// The whole cost when this service is not tracing is the `enabled()` load and a not-taken
     /// branch. When it IS tracing, the send is `try_send` and its result is DISCARDED on purpose: an
     /// observer must never be able to slow, block, or fail the thing it observes. A full events queue
-    /// loses one event, which the ring counts and `trace status` reports - a visible loss, not a
+    /// loses one event, which the ring counts and `events status` reports - a visible loss, not a
     /// silent one (invariant 12).
     ///
     /// Recursion is cut at the source: `events` itself holds no `events` send cap, so the sink cannot trace
@@ -1217,7 +1217,7 @@ impl ServiceContext {
         // `events` for it, so tracing that call would fill the ring with the reader's own questions -
         // each dump adding two more events, pushing out the traffic the reader came to see. An
         // instrument that mostly measures itself is not measuring anything. This hides nothing: every
-        // OTHER peer is still recorded, and `trace status` still counts every event accepted.
+        // OTHER peer is still recorded, and `events status` still counts every event accepted.
         if peer == crate::trace::SINK_NAME {
             return;
         }
@@ -1236,7 +1236,7 @@ impl ServiceContext {
         if self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev)).is_err() {
             // THE SINK RESTARTED - REACQUIRE IT. The slot is resolved once and cached, so a `events`
             // respawn left every emitter holding a stale generation FOREVER: tracing silently stopped,
-            // `trace ipc` could not reach the ring, and each emission logged a kernel gen-mismatch.
+            // `events ipc` could not reach the ring, and each emission logged a kernel gen-mismatch.
             // Seen on hardware after a chaos storm restarted `events` forty times - cap generation 985
             // against a live record of 1025.
             //
@@ -1320,7 +1320,7 @@ impl ServiceContext {
     // Instrumenting them ALL is also deliberate. The first cut traced only `request_with_reply`, and
     // on hardware that produced an EMPTY ring while the shell was busily talking to `fs` - because the
     // shell uses `_abortable` and `_deadline`, not the plain one. Partial instrumentation is worse
-    // than none: `trace ipc` then shows SOME traffic and silently omits the rest, with nothing on
+    // than none: `events ipc` then shows SOME traffic and silently omits the rest, with nothing on
     // screen saying which. That is a silent gap in the instrument, which is the exact failure this
     // ring exists to prevent (26.4, invariant 12).
     //
@@ -1347,8 +1347,8 @@ impl ServiceContext {
     /// ABORTED), so nothing is lost but the duplicate.
     ///
     /// A request still IN FLIGHT is therefore not in the ring - and that is the one question the ring
-    /// was never the right instrument for: `trace blocked` reads it from the kernel, live, which is
-    /// what a hang needs (`utilities/46_trace.md` mechanism A).
+    /// was never the right instrument for: `events blocked` reads it from the kernel, live, which is
+    /// what a hang needs (`utilities/46_events.md` mechanism A).
     #[inline]
     fn trace_in(&self, peer: &str, msg: &crate::ipc::Message) -> u8 {
         // The opcode's byte is the PEER'S protocol's business, not a fixed 0 - see `trace_op_at`.
@@ -2405,7 +2405,7 @@ impl ServiceContext {
     ///
     /// With [`Self::task_awaits_endpoint`] this is the whole of the blocked-chain walk: map the
     /// endpoint a stuck task awaits back to the task that owns it, then ask what THAT one awaits.
-    /// See `utilities/46_trace.md`.
+    /// See `utilities/46_events.md`.
     pub fn task_own_endpoint(&self, slot: u32) -> u64 {
         // SAFETY: syscall(13) = InspectKernel; query_id=24 = the task's own endpoint.
         let ret = unsafe { raw_syscall(13, 24, slot as u64, 0) };

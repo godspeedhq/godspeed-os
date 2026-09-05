@@ -604,7 +604,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // cannot slow this loop even at the moment it publishes.
     //
     // The consequence, stated rather than discovered: on a quiet system the numbers lag by up to 31
-    // requests, and `trace metrics` shows an `age_s` so that lag is visible instead of implied.
+    // requests, and `events metrics` shows an `age_s` so that lag is visible instead of implied.
     const PUBLISH_EVERY: u64 = 32;
     let mut served = 0u64;
     loop {

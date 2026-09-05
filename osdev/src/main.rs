@@ -2536,7 +2536,7 @@ fn run_reply_server_test() {
 /// answers (b"HANG") and blocks for the reply; the harness KILLs `reply-server` while asker is blocked
 /// and asserts asker wakes with `ReplyDead` (`request_with_reply` -> None) instead of hanging - the
 /// reply-side twin of §22 Test 4 (a blocked sender wakes with `EndpointDead`). No panic.
-/// `trace` against a REAL blocked chain (`utilities/46_trace.md`, mechanism A).
+/// `trace` against a REAL blocked chain (`utilities/46_events.md`, mechanism A).
 ///
 /// The multi-hop walk is the one thing a healthy machine cannot prove: with nothing blocked, the
 /// chain never gets past one hop and the endpoint-to-owner resolution is never exercised. This reuses
@@ -2544,7 +2544,7 @@ fn run_reply_server_test() {
 /// a synchronous `Call` - a deterministically stuck chain - then reads it with `trace`.
 fn run_trace_chain_test() {
     println!("
-=== trace: reading a REAL blocked chain (utilities/46_trace.md mechanism A) ===");
+=== trace: reading a REAL blocked chain (utilities/46_events.md mechanism A) ===");
     cmd_build_reply();
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }

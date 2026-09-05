@@ -1,12 +1,7 @@
 # `events` - logs, IPC traces, metrics, and capturing them to disk
 
-**The command is `events`. `trace` is the older name and every view still answers to it.** The service
-holds three streams now - logs, IPC traces and metrics - and only one of them is a trace, so a reader
-named after the service is the discoverable one.
-
-**This file is `46_events.md` and was `46_trace.md`.** Renamed when `events` became the primary name,
-because the source of truth for a command should not be filed under its alias. The history below is
-unedited: it is why the design is what it is.
+One command over one service: the 192-event IPC trace ring, the metric table, the log window, and
+capturing any of it to disk. The views are named for WHAT THEY SHOW rather than what you give them.
 
 **Status:** **BUILT and QEMU-verified.** Mechanism A (`events blocked` / `chain` / `deps` /
 `endpoints`), mechanism B (the 192-event ring - see §8b, which supersedes the line this status used to
@@ -58,8 +53,8 @@ main proposal in this document:
 
 | | Mechanism | Cost when unused | New kernel state |
 |---|---|---|---|
-| **A. Blocked-chain** (`trace blocked`, `trace task`, `trace service`) | a **state query** | **zero** - nothing runs until asked | one `u64` per task (blocked-since), for the `FOR` column |
-| **B. Event history** (`trace ipc`, `trace tree`, `trace failures`) | a **bounded ring** written at the IPC routing point | one relaxed atomic load + predicted branch | a fixed ring + counters |
+| **A. Blocked-chain** (`events blocked`, `trace task`, `trace service`) | a **state query** | **zero** - nothing runs until asked | one `u64` per task (blocked-since), for the `FOR` column |
+| **B. Event history** (`events ipc`, `trace tree`, `events failures`) | a **bounded ring** written at the IPC routing point | one relaxed atomic load + predicted branch | a fixed ring + counters |
 
 **A answers the question. B explains what led up to it.** A is cheap enough to always be available; B
 is the part that needs a switch. Building A first is not a staging convenience - it is where the value
@@ -128,24 +123,18 @@ the kernel.
 
 ## 5. Command surface
 
-**The command is `events`; `trace` is the older name and still works.** The service holds three
-streams now - logs, IPC traces and metrics - and only one of them is a trace, so a reader named after
-the service is the discoverable one: someone wanting to see events types `events`. `trace` is kept
-because it is in muscle memory, throughout these docs, and in several hundred selfcheck assertions,
-and breaking that buys nothing. Every view below accepts either name.
-
 As shipped - nine views, each named for WHAT IT SHOWS rather than what you give it:
 
 ```text
-  trace blocked                 what is stuck, everywhere
-  trace chain <name|slot>       what one task is stuck behind, as a tree
-  trace deps <service>          what it can call, as a tree, with what it has called
-  trace endpoints               every live endpoint and its owner - the map from names to ids
-  trace endpoint <id>           the inverse: who owns an endpoint, and who can reach it
-  trace ipc                     what happened - the ring, paged and pipeable
-  trace failures                the same ring, only the failures
-  trace status                  ring size, recorded, dropped
-  trace metrics                 published samples: owner, metric, value, age
+  events blocked                 what is stuck, everywhere
+  events chain <name|slot>       what one task is stuck behind, as a tree
+  events deps <service>          what it can call, as a tree, with what it has called
+  events endpoints               every live endpoint and its owner - the map from names to ids
+  events endpoint <id>           the inverse: who owns an endpoint, and who can reach it
+  events ipc                     what happened - the ring, paged and pipeable
+  events failures                the same ring, only the failures
+  events status                  ring size, recorded, dropped
+  events metrics                 published samples: owner, metric, value, age
   events log [n]                the last n log lines the sink has kept (default 20)
   events persist start|stop|status   capture the log to disk (see below)
 ```
@@ -270,19 +259,19 @@ and stating one fact twice is what fields exist to stop.
 
 Printing is a rendering, not the format. `events log` shows `owner: text` because a log should read
 like a log and a 240-byte column would be wider than any screen; piped, it is rows. Same data, two
-renderings - what `trace ipc` already does.
+renderings - what `events ipc` already does.
 
 This is a rule rather than a convenience, and it was ratified after being broken: the log was first
 built as text, and filtering it by service then needed a bespoke argument hand-rolled in the shell,
 duplicating `where` and getting it wrong on the first run. `docs/observability.md` §9a.
 
-### `trace metrics` - what services are counting
+### `events metrics` - what services are counting
 
-The ring answers "what just happened". `trace metrics` answers "how much, so far", and it reads the
+The ring answers "what just happened". `events metrics` answers "how much, so far", and it reads the
 other half of the same service - the metric table in `events`.
 
 ```text
-gsh> trace metrics
+gsh> events metrics
 owner   metric           value  age_s
 fs      requests         32     1
 fs      blk.outages      0      1
@@ -334,11 +323,11 @@ start-up. Widening the field was the alternative and was rejected on cost - the 
 4 KiB message, so a 16-byte field drops this view from 110 events per screen to 95, and trading real
 scrollback for four characters of a name is the wrong way round.
 
-**It is a record source**, so it filters and formats like `trace ipc`:
+**It is a record source**, so it filters and formats like `events ipc`:
 
 ```text
-trace metrics | where owner contains fs
-trace metrics | select metric,value | to json
+events metrics | where owner contains fs
+events metrics | select metric,value | to json
 ```
 
 **What is NOT in here, and cannot be: `events` reporting its own death.** Its own rows are published by
@@ -348,9 +337,9 @@ right up until the process stops, and then nothing in it can say so. The supervi
 notification and the kernel's unconditional serial write are what report that, and both sit beneath
 this service rather than inside it (`docs/observability.md` §9).
 
-`trace task <slot>` and `trace service <name>` were folded into `trace chain`: they printed identical
+`trace task <slot>` and `trace service <name>` were folded into `events chain`: they printed identical
 output from identical code while being named after the SUBJECT KIND, which made them look like two
-things and made `trace service fs` read oddly beside `trace deps fs`. The argument disambiguates
+things and made `trace service fs` read oddly beside `events deps fs`. The argument disambiguates
 itself - digits are a slot, anything else is a name.
 
 ### Reading the output: every command, every column, every number
@@ -360,10 +349,10 @@ what each column holds, and what a number in it actually counts.
 
 ---
 
-#### `trace blocked` - who is stuck on someone else
+#### `events blocked` - who is stuck on someone else
 
 ```text
-gsh> trace blocked
+gsh> events blocked
 no task is blocked on another task.
 ```
 
@@ -380,17 +369,17 @@ slot  name   blocked  awaiting  held_by
 | `slot` | the kernel scheduler slot of the blocked task (the same number `status` shows) |
 | `name` | that task's service name |
 | `blocked` | HOW it is waiting: `call` (a synchronous request awaiting its reply) or `recv` |
-| `awaiting` | the ENDPOINT ID it is waiting on - an opaque kernel id, resolvable with `trace endpoint` |
+| `awaiting` | the ENDPOINT ID it is waiting on - an opaque kernel id, resolvable with `events endpoint` |
 | `held_by` | the service that OWNS that endpoint, i.e. the one that owes the answer |
 
 `held_by` is the payoff: it turns "task 9 is blocked" into "task 9 is waiting on reply-server".
 
 ---
 
-#### `trace chain <name|slot>` - the same, as a tree from one task
+#### `events chain <name|slot>` - the same, as a tree from one task
 
 ```text
-gsh> trace chain asker
+gsh> events chain asker
 task 9 "asker" BlockRecv (call)
    awaiting endpoint 116
    `- task 8 "reply-server" BlockRecv (recv)
@@ -405,19 +394,19 @@ waiting on nobody - and says which kind of root it is:
 | `awaits no task - blocked on its own endpoint, waiting for work` | idle. The chain ends here because this service is fine |
 | `awaits no task - it is runnable, so the chain is not stuck here` | running right now |
 
-The argument is a service NAME or a task SLOT; digits are read as a slot. `trace chain 7` and
-`trace chain shell` are the same query.
+The argument is a service NAME or a task SLOT; digits are read as a slot. `events chain 7` and
+`events chain shell` are the same query.
 
 ---
 
-#### `trace deps <service>` - what it can call, and what it has called
+#### `events deps <service>` - what it can call, and what it has called
 
 ```text
-gsh> trace deps fs
+gsh> events deps fs
 fs
 |-- block-driver  27 calls  (capacity)
 `-- events  (trace sink - its own traffic is never recorded)
-(2 reply address(es) hidden - `trace deps fs | where peer contains reply` lists them)
+(2 reply address(es) hidden - `events deps fs | where peer contains reply` lists them)
 ```
 
 Indentation is the call direction: a child is a service its parent **holds a SEND capability to**.
@@ -446,10 +435,10 @@ As records (`| to grid`), one row per EDGE:
 
 ---
 
-#### `trace endpoints` - the map from names to ids
+#### `events endpoints` - the map from names to ids
 
 ```text
-gsh> trace endpoints
+gsh> events endpoints
 slot  name          endpoint  state      queue
 0     supervisor    100       BlockRecv  0
 1     events        102       BlockRecv  0
@@ -457,15 +446,15 @@ slot  name          endpoint  state      queue
 ```
 
 The inventory the other views assume you have. Ids reach you one at a time from `caps <service>` (as
-`endpoint#N`), from `trace blocked`'s `awaiting` column and from `trace deps`' reply list - none of
-which answers "what endpoints exist", so `trace endpoint <id>` could not be used deliberately without
+`endpoint#N`), from `events blocked`'s `awaiting` column and from `events deps`' reply list - none of
+which answers "what endpoints exist", so `events endpoint <id>` could not be used deliberately without
 first assembling this by hand.
 
 | column | what it holds |
 |---|---|
 | `slot` | the task's scheduler slot, as `status` shows it |
 | `name` | the service |
-| `endpoint` | the id to pass to `trace endpoint <id>` |
+| `endpoint` | the id to pass to `events endpoint <id>` |
 | `state` | the task state - `BlockRecv` here means idle, waiting for work |
 | `queue` | messages WAITING in that endpoint. Non-zero on an idle service means work is arriving faster than it drains |
 
@@ -473,14 +462,14 @@ Only PRIMARY endpoints appear, because that is what the kernel reports per task.
 has no name here - which is exactly why an unresolvable capability shows as `reply#NNN` in a
 dependency tree rather than as a service.
 
-A record source, so it filters and pipes: `trace endpoints | where name contains fs | to json`.
+A record source, so it filters and pipes: `events endpoints | where name contains fs | to json`.
 
 ---
 
-#### `trace endpoint <id>` - what an endpoint is, and who can reach it
+#### `events endpoint <id>` - what an endpoint is, and who can reach it
 
 ```text
-gsh> trace endpoint 116
+gsh> events endpoint 116
 endpoint 116 - owned by task 8 "reply-server" (BlockRecv)
 held by:
 holder     slot  rights
@@ -507,7 +496,7 @@ endpoint. Three shapes of answer:
 
 ---
 
-#### `trace ipc` and `trace failures` - what happened
+#### `events ipc` and `events failures` - what happened
 
 ```text
 seq  sec  caller  peer          op        outcome
@@ -516,12 +505,12 @@ seq  sec  caller  peer          op        outcome
 6    2    fs      block-driver  capacity  REPLY
 ```
 
-One row per completed exchange, oldest first, newest last. `trace failures` is the same ring filtered
+One row per completed exchange, oldest first, newest last. `events failures` is the same ring filtered
 to the failures.
 
 | column | what the NUMBER or word actually is |
 |---|---|
-| `seq` | the CALLER'S OWN event counter, starting at 0 when that service started. Not global - a mixed dump interleaves several sequences and can look unsorted; it is not, rows are in ring order. A GAP is the one loss nothing else can see: an event whose send failed on a full queue never reached the ring, so `trace status` reports 0 dropped while events are being lost |
+| `seq` | the CALLER'S OWN event counter, starting at 0 when that service started. Not global - a mixed dump interleaves several sequences and can look unsorted; it is not, rows are in ring order. A GAP is the one loss nothing else can see: an event whose send failed on a full queue never reached the ring, so `events status` reports 0 dropped while events are being lost |
 | `sec` | when the RING recorded the row, counted from the oldest row shown, in whole seconds. NOT a latency, and not when the call was made. It exists to show a HOLE - forty rows in one second, then a four-second gap, and that gap is the stall |
 | `caller` | who made the call, as that service declared itself (`ctx.trace_as`). `?` means a service traced without declaring a name |
 | `peer` | who was called, by name. The emitter knew it, so no lookup is involved |
@@ -539,11 +528,11 @@ Outcomes, and what each one tells you to do:
 | `ABORTED` | the user pressed `q`. Not a failure of anything |
 
 A request still IN FLIGHT is not here: one row is written per exchange, when it ends. The live view of
-something stuck is `trace blocked`.
+something stuck is `events blocked`.
 
 ---
 
-#### `trace status` - the ring itself
+#### `events status` - the ring itself
 
 ```text
 trace: ring 192 events; 2 recorded; 0 DROPPED (oldest overwritten before being read)
@@ -567,10 +556,10 @@ capability emits nothing, at a cost of one relaxed atomic load.
 
 ---
 
-### `trace blocked` - the whole point, in one screen
+### `events blocked` - the whole point, in one screen
 
 ```
-gsh> trace blocked
+gsh> events blocked
 PID  NAME          STATE        WAITING ON              FOR
 42   shell         BlockedCall  fs:7 gen=3              12ms
 7    fs            BlockedCall  block-driver:4 gen=1     11ms
@@ -591,12 +580,12 @@ Two failure shapes it must name rather than hide:
   is a task about to be woken with `ReplyDead`, and saying so distinguishes "stuck" from "already
   losing".
 
-### `trace task 42` / `trace service fs`  *(as PROPOSED; shipped as `trace chain`)*
+### `trace task 42` / `trace service fs`  *(as PROPOSED; shipped as `events chain`)*
 
 The same walk, rooted at one task, printed as the tree the requirement asks for. Two subcommands were
-proposed here, one per subject kind - they shipped as a single `trace chain <name|slot>`, because they
+proposed here, one per subject kind - they shipped as a single `events chain <name|slot>`, because they
 printed identical output from identical code and naming them after the SUBJECT rather than the VIEW
-made `trace service fs` read oddly beside `trace deps fs`. The sketch below also shows a per-hop
+made `trace service fs` read oddly beside `events deps fs`. The sketch below also shows a per-hop
 duration, which was not built: the kernel does not stamp when a task blocked, and adding that stamp is
 kernel growth for a diagnostic. See the reference section above for what it actually prints.
 
@@ -629,7 +618,7 @@ A task that is **not** blocked prints one line saying so. That is a real answer,
 | `op` | u8 | byte 0 of the message, opaque - see §7 |
 
 **Bounded** (§26.6): a fixed ring in `.bss`, sized once. Full = **drop the oldest, count the drop**, and
-`trace status` reports the count. A silent drop is exactly the bug just fixed in the x86 input ring;
+`events status` reports the count. A silent drop is exactly the bug just fixed in the x86 input ring;
 this must not repeat it (invariant 12).
 
 **Near-zero when off**: one `Relaxed` load of an `AtomicBool` at the routing point, branch not taken.
@@ -644,7 +633,7 @@ request path, and it is the same problem `docs/net-tags-design.md` already descr
 net-stack <-> nic-driver. **Proposed: out of v1**, and re-read that design first if it is ever picked
 up, because doing it twice differently would be worse than not doing it.
 
-Without propagation, `trace ipc` still gives a time-ordered log per endpoint, and the requirement's
+Without propagation, `events ipc` still gives a time-ordered log per endpoint, and the requirement's
 failure/recovery example works, because that one is a **time sequence, not a tree**:
 
 ```
@@ -676,7 +665,7 @@ failure/recovery example works, because that one is a **time sequence, not a tre
 > The section below is kept as the reasoning that led there, per 1 (an amendment is ratified history).
 
 `op` is byte 0 of the message. Every service protocol in this tree happens to put its opcode there
-(`fs`, `block-driver`, the block IPC protocol). Recording it is what makes `trace ipc` readable rather
+(`fs`, `block-driver`, the block IPC protocol). Recording it is what makes `events ipc` readable rather
 than a wall of endpoint numbers.
 
 **The case for:** the kernel stores a byte and attaches no meaning. It is exactly as opaque as the
@@ -689,14 +678,14 @@ in byte 0 gets a misleading trace.
 
 **Proposed:** record it, name the field `first_byte` in the kernel and only call it `op` in the
 utility, and state in the code comment that the kernel attaches no meaning to it. If that reads as
-sophistry on review, drop it - `trace ipc` is still useful without it, and the constitution is worth
+sophistry on review, drop it - `events ipc` is still useful without it, and the constitution is worth
 more than a column.
 
 ---
 
 ## 8. Proposed order
 
-1. **Mechanism A** - `trace blocked`, `trace task`, `trace service`. New kernel surface: two
+1. **Mechanism A** - `events blocked`, `trace task`, `trace service`. New kernel surface: two
    `InspectKernel` queries (awaited endpoint per slot; blocked-since per slot) plus one `u64` per task.
    No ring, no switch, no cost. Answers the question.
 2. **Use it.** Find out whether B is needed. §26.2 - features are pulled into existence.
@@ -728,7 +717,7 @@ the only possible source), and 24 is disclosure of a read `task_stat` already pe
 Verified in QEMU (`osdev test shell`, 136/0/2):
 
 ```
-gsh> trace blocked
+gsh> events blocked
 no task is blocked on another task.
 gsh> trace service shell
 task 7 "shell" Running (-)
@@ -744,7 +733,7 @@ build feature were needed - the situation already existed, and had only ever bee
 death-wake. Read live, mid-block:
 
 ```
-gsh> trace blocked
+gsh> events blocked
 slot  name   blocked  awaiting  held_by
 9     asker  call     116       reply-server
 
@@ -798,7 +787,7 @@ purpose is diagnostic data, so the ring there costs the kernel **exactly zero**.
 | `sdk/rust/src/trace.rs` | wire format (34 B: seq, at_s, caller[12], peer[12], op, kind), lazy one-time arming, per-peer opcode offset |
 | `sdk/rust/src/service_context.rs` | `trace_emit`; three emission points in `request_with_reply` |
 | `services/events/src/main.rs` | the 192-event ring, dump + status replies |
-| `services/shell/src/main.rs` | `trace ipc`, `trace failures`, `trace status` |
+| `services/shell/src/main.rs` | `events ipc`, `events failures`, `events status` |
 | **kernel** | **nothing** |
 
 **Cost when not tracing: one `Relaxed` load, branch not taken** - and nothing at the routing point, so
@@ -808,15 +797,15 @@ for a benchmark before shipping a switch on the fast path; there is no switch an
 so the thing that needed measuring does not exist.
 
 **Bounded and loud (§26.6, invariant 12):** fixed ring, fixed events, no heap. Full = overwrite the
-oldest and **count it**; `trace status` reports the count. Emission is `try_send` with the result
+oldest and **count it**; `events status` reports the count. Emission is `try_send` with the result
 discarded, so a full sink queue costs the emitter nothing and loses one event - the right trade on
 an observability path, and the opposite of the one made on a correctness path. An observer must never
 be able to slow, block or break the thing it observes.
 
-**The reader is not recorded.** A call to `events` itself is never traced: `trace ipc` reaches the ring
+**The reader is not recorded.** A call to `events` itself is never traced: `events ipc` reaches the ring
 by asking the service that holds it, so tracing those calls would fill the ring with the reader's own
 questions, two per dump, pushing out the traffic the reader came to see. Every other peer is still
-recorded and `trace status` still counts every accepted event, so nothing is hidden.
+recorded and `events status` still counts every accepted event, so nothing is hidden.
 
 **Time is shown relative to the oldest event in the dump.** The stored value is an epoch second; the
 absolute number says nothing on its own, and the **gap** between events is what a stall looks like.
@@ -824,10 +813,10 @@ absolute number says nothing on its own, and the **gap** between events is what 
 Verified in QEMU (`osdev test shell`, 140/0/2 - 10 of them `trace`):
 
 ```
-gsh> trace status
+gsh> events status
 trace: ring 192 events; 2 recorded; 0 DROPPED (oldest overwritten before being read)
 trace: the ring lives in the `events` service - the kernel records nothing.
-gsh> trace ipc
+gsh> events ipc
 seq  t+s  peer       op  event
 0    0    net-stack  2   REQUEST
 1    0    net-stack  2   REPLY
@@ -838,7 +827,7 @@ Real traffic, named, with no kernel involvement of any kind.
 ### What hardware caught that QEMU did not: the ring was empty
 
 The first cut instrumented `request_with_reply`. On the Wyse, after a `selfcheck` and two `ls`
-commands, `trace ipc` still said **no events recorded** - while `fs` was demonstrably answering.
+commands, `events ipc` still said **no events recorded** - while `fs` was demonstrably answering.
 
 The SDK has **eight** request/reply variants, each an independent implementation, and the shell talks
 to `fs` through `_abortable` and `_deadline` - never the plain one. So nothing was ever emitted for
@@ -849,7 +838,7 @@ success.
 The fix is a **wrapper per variant** rather than an edit inside each body: eight functions with
 several early returns inside a wait loop each, and a wrapper cannot miss an exit because the value
 returned IS the outcome. All eight, not the busy ones - **partial instrumentation is worse than
-none**, because `trace ipc` then shows SOME traffic and silently omits the rest with nothing on screen
+none**, because `events ipc` then shows SOME traffic and silently omits the rest with nothing on screen
 saying which, which is a silent gap in the instrument built to prevent silent gaps (26.4,
 invariant 12).
 
@@ -862,7 +851,7 @@ outcomes the original four kinds could not express:
 - **`ABORTED`** - the user pressed `q`. Not a failure of anything, and recorded so a gap in a chain is
   explained rather than mysterious.
 
-`trace failures` shows `QUEUE_FULL` (a request that never arrived) and not `ABORTED` (a change of
+`events failures` shows `QUEUE_FULL` (a request that never arrived) and not `ABORTED` (a change of
 mind).
 
 ### What the SUITE caught that neither had: the observer was stealing the shell's core
@@ -892,7 +881,7 @@ Three things changed as a result, and each is a rule worth keeping:
 2. **One event per exchange, not two.** A REQUEST plus an outcome doubled the traffic through the
    sink's single 16-deep endpoint. Every exchange still produces exactly one event carrying its fate,
    so nothing is lost but the duplicate. A request still IN FLIGHT is therefore not in the ring - and
-   that is the one question the ring was never the right instrument for: `trace blocked` reads it from
+   that is the one question the ring was never the right instrument for: `events blocked` reads it from
    the kernel, live (mechanism A).
 3. **The sink stamps the time, from a cached clock.** `epoch_secs_monotonic` is a CMOS RTC read on
    x86 - `wait_update_clear` can spin ~1 ms before seven port-I/O reads - so per-event it would cap
@@ -940,19 +929,19 @@ A service that never declares itself reads `?`, which is the honest answer rathe
 
 ### Reading it: pages, pipes, and a legend
 
-`trace ipc` is a **record source**, like `status` or `ls` - one producer feeding three uses, rather
+`events ipc` is a **record source**, like `status` or `ls` - one producer feeding three uses, rather
 than a printer plus a serialiser that drift apart:
 
 - **Console**: a grid, with a two-line legend above it.
 - **Taller than the screen**: it pages, with `help`'s keys (up/down, space, `g`/`G`, `q`). The pager
   was `help`-shaped - it called `help_render_line` directly - and is now given a render closure, so
   the one screenful-at-a-time reader in the system is shared instead of copied.
-- **Piped**: `trace ipc | to json`, `| to yaml`, `| where caller=fs`, `| where outcome=TIMEOUT`,
+- **Piped**: `events ipc | to json`, `| to yaml`, `| where caller=fs`, `| where outcome=TIMEOUT`,
   `| count`, `| sort`. The legend is console-only; a pipe carries records and nothing else.
 
 A dump shows the newest **64** events - what a record `Table` holds - while the ring keeps 192.
 Asking for more only produced "result exceeded the record bound - truncated" on every run, and a bound
-announced every time is noise that trains you to ignore it. `trace status` remains where the true ring
+announced every time is noise that trains you to ignore it. `events status` remains where the true ring
 size and drop count live.
 
 ### The shape of the whole thing
@@ -961,8 +950,8 @@ Three questions, three sources, and the kernel is only in one of them.
 
 ```text
                     WHAT IS STUCK NOW            WHO CAN REACH WHOM            WHAT HAPPENED
-                    trace blocked                trace deps                    trace ipc
-                    trace chain                  trace endpoint                trace failures
+                    events blocked                events deps                    events ipc
+                    events chain                  events endpoint                events failures
                           |                            |                             |
                           v                            v                             v
                   +---------------+           +----------------+          +--------------------+
@@ -1004,7 +993,7 @@ Three properties fall out of that picture, and each is deliberate:
 - **The kernel is not on the path at all.** No ring in ring 0, no retention policy, no control
   syscall, and nothing added to the IPC fast path.
 - **The emitter never waits.** `try_send` and the result is discarded: a full sink costs the emitting
-  service nothing and loses one event, which the ring counts and `trace status` reports.
+  service nothing and loses one event, which the ring counts and `events status` reports.
 - **A service that holds no `events` send cap emits nothing**, at the cost of one relaxed load.
   Tracing is authority, visible in `caps <service>` and revocable.
 
@@ -1023,7 +1012,7 @@ Three properties fall out of that picture, and each is deliberate:
    Enter keystrokes lost
 ```
 
-### What `trace deps` reads, and what it cannot
+### What `events deps` reads, and what it cannot
 
 ```text
    contract (fs.toml)          kernel service_config          fs's LIVE cap table
@@ -1033,28 +1022,28 @@ Three properties fall out of that picture, and each is deliberate:
    host-only:                  inside the kernel:               task_caps(slot)
    reconciled at build         not readable from a                    |
    time, never ships           service                                v
-                                                              trace deps  <-- reads THIS
+                                                              events deps  <-- reads THIS
 ```
 
-`trace deps` walks the right-hand column: capabilities a service is holding right now, each endpoint
+`events deps` walks the right-hand column: capabilities a service is holding right now, each endpoint
 resolved back to its owning task. The left-hand columns are what "declared" would mean, and neither is
 reachable without new kernel surface - which is why that view waits for the supervisor to own service
 policy.
 
-### `trace deps` and `trace endpoint`: authority, in both directions
+### `events deps` and `events endpoint`: authority, in both directions
 
-`trace ipc` answers "what happened"; `trace chain` answers "what is stuck now". Neither answers the
+`events ipc` answers "what happened"; `events chain` answers "what is stuck now". Neither answers the
 question the capability model makes most worth asking - **who can reach whom** - so two views do:
 
 ```
-gsh> trace deps net-stack            gsh> trace endpoint 4
+gsh> events deps net-stack            gsh> events endpoint 4
 net-stack                            endpoint 4 - NO LIVE OWNER.
 |-- nic-driver                       held by:
 `-- time                             holder  slot  rights
     `-- fs                           xhci    8     write
         |-- block-driver
         `-- events  (trace sink - its own traffic is never recorded)
-(3 reply address(es) not shown: reply#119 reply#107 - `trace endpoint <id>` resolves one)
+(3 reply address(es) not shown: reply#119 reply#107 - `events endpoint <id>` resolves one)
 ```
 
 Both are built from the LIVE capability table (`task_caps`), not from a contract: a row is not "the
@@ -1063,7 +1052,7 @@ whose endpoint block-driver owns". That is 26.9 - authority inspectable as it ac
 
 **A tree and a record stream are the same data.** The table holds one row per EDGE
 (`depth, parent, peer, grant, calls, failed, ops`), which is what a tree IS, so the console draws it
-and a pipe gets the rows - `trace deps shell | where peer=fs`, `| to json`, `| to grid`. `to grid`
+and a pipe gets the rows - `events deps shell | where peer=fs`, `| to json`, `| to grid`. `to grid`
 was added for this: the grid was every record source's console rendering but could not be ASKED for,
 so a producer that draws something else had no way to offer the table.
 
@@ -1087,14 +1076,14 @@ Four bugs surfaced only because the tree draws structure a table hides, and each
 
 **What it deliberately does NOT show: DECLARED dependencies.** A contract's `ipc_send` list lives in
 `service_config` inside the kernel (the `.toml` never ships - `contract_check.py` reconciles it at
-build time), so `trace deps <svc> declared` would need a new `InspectKernel` query: kernel-surface
+build time), so `events deps <svc> declared` would need a new `InspectKernel` query: kernel-surface
 growth for a diagnostic, which this project does not do. It is deferred to the work that moves the
 service catalogue into the supervisor, after which the supervisor owns that policy and the query is
 service-to-service with the kernel uninvolved.
 
 ### What the same hardware run says about the ring's limits
 
-`trace failures` came back empty after a 100-round `chaos max-carnage` - 559 kills. That is the design
+`events failures` came back empty after a 100-round `chaos max-carnage` - 559 kills. That is the design
 working, and worth stating rather than discovering later: **`events` was itself killed 51 times**, and
 a restarted `events` starts with an empty ring. Emission is `try_send`, so events aimed at a dead sink
 are lost too.

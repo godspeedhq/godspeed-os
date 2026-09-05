@@ -72,7 +72,6 @@ fails.
 | [`caps`](utilities/caps.md) | what authority a service actually holds |
 | [`whatis`](utilities/whatis.md) | what a name is: built-in, script, pipe stage, or service |
 | [`events`](utilities/events.md) | logs, IPC traces, metrics, and capturing them to disk |
-| [`trace`](utilities/events.md) | the same views under their older name |
 | [`mem`](utilities/mem.md) | memory |
 | [`cores`](utilities/cores.md) | the cores that came up |
 | [`uptime`](utilities/uptime.md) | how long since boot |

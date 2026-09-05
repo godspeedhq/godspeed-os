@@ -63,7 +63,7 @@ pub mod ipc;
 pub mod mmio;
 pub mod record;
 pub mod service_context;
-/// IPC trace emission - the client half of the trace ring `events` holds (`utilities/46_trace.md`).
+/// IPC trace emission - the client half of the trace ring `events` holds (`utilities/46_events.md`).
 pub mod trace;
 pub(crate) mod syscall;
 

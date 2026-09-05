@@ -110,7 +110,7 @@ fn set_call_await(caller_slot: usize, target: EndpointId) {
 /// **Reads state the kernel already keeps for correctness; it records nothing new.** `CALL_AWAIT_EP`
 /// exists so a dead replier wakes its caller with `ReplyDead` (§8.6). That same record answers "why is
 /// this task not progressing?", because the chain of who-awaits-whom IS the causal chain - so the
-/// `trace` utility is a reader of this, not a tracer (`utilities/46_trace.md`).
+/// The `events` views read this; the kernel is not a tracer (`utilities/46_events.md`).
 ///
 /// Relaxed, and deliberately so: this is a best-effort snapshot for an operator, on the same contract
 /// as `task_stat`. A value read the instant before the awaited endpoint replies is stale, and that is

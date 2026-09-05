@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! IPC trace emission - the client half of the trace ring that `events` holds (`utilities/46_trace.md`).
+//! IPC trace emission - the client half of the trace ring that `events` holds (`utilities/46_events.md`).
 //!
 //! # Why the instrumentation is HERE and not in the kernel
 //!
@@ -23,7 +23,7 @@
 //!
 //! Emission is `try_send` and the result is discarded. An observer must not be able to slow, block or
 //! break the thing it observes: a full events queue costs the emitting service nothing and loses one
-//! event, which the ring counts and `trace status` reports. That is the correct trade here, and the
+//! event, which the ring counts and `events status` reports. That is the correct trade here, and the
 //! opposite of the one made on a correctness path.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
