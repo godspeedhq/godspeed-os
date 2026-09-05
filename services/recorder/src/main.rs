@@ -349,6 +349,11 @@ fn basename(p: &[u8]) -> &[u8] {
 }
 
 /// Close the capture: footer, final flush, and a line saying which it was.
+///
+/// The footer is written in the ON-DISK form (`owner: text`), not the wire form (`owner US text`).
+/// It is one of only two lines this service writes directly - every other line arrives from `events`
+/// and is converted by the drain (see the note there). Emitting the raw separator here put a control
+/// byte in the first and last lines of every capture while the body read cleanly.
 fn finish(ctx: &ServiceContext, cap: &mut Capture, why: &[u8]) {
     let mut foot = [0u8; 96];
     let mut n = 0usize;
@@ -356,7 +361,9 @@ fn finish(ctx: &ServiceContext, cap: &mut Capture, why: &[u8]) {
         foot[n] = c;
         n += 1;
     }
-    foot[n] = US;
+    foot[n] = b':';
+    n += 1;
+    foot[n] = b' ';
     n += 1;
     for &c in b"capture ended (" {
         foot[n] = c;
@@ -569,13 +576,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the fill point would sit in a region `read` still refuses.
                 if !fill_step(&ctx, &mut cap) && cap.on && cap.filled >= cap.capacity {
                     // A HEADER, so a file with no footer is known to have died rather than finished.
+                    // In the ON-DISK form, like the footer and like every drained line - see `finish`.
                     let mut hdr = [0u8; 32];
                     let mut hn = 0usize;
                     for &c in b"recorder" {
                         hdr[hn] = c;
                         hn += 1;
                     }
-                    hdr[hn] = US;
+                    hdr[hn] = b':';
+                    hn += 1;
+                    hdr[hn] = b' ';
                     hn += 1;
                     for &c in b"capture started" {
                         hdr[hn] = c;

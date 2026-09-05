@@ -612,8 +612,15 @@ assert ok events persist stop
 events persist start /sc/tiny.log 256KiB
 wait 3
 events persist stop
-read /sc/tiny.log | assert contains capture started
-read /sc/tiny.log | assert contains recorder:
+# BOTH IN THE ON-DISK FORM `owner: text`. The header and footer are the only two lines the recorder
+# writes directly; every other line arrives from `events` and is converted on the way in. They used to
+# be emitted in the WIRE form, putting a 0x1F control byte in the first and last line of every capture.
+# The old assertion here was `contains recorder:`, which passed anyway on a fast machine - the
+# recorder's own log line came back through the drain and supplied a `recorder:` by luck. The Pi 2 was
+# slow enough to stop the capture before that tick fired, and failed. Assert the WHOLE header and
+# footer, so the form is pinned and no accident can satisfy it.
+read /sc/tiny.log | assert contains recorder: capture started
+read /sc/tiny.log | assert contains recorder: capture ended
 
 # The footer is what makes a capture readable as COMPLETE. A file with a header and no footer died.
 events persist status | assert contains idle

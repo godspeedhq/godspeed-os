@@ -50,7 +50,7 @@ Rotation **renames**, so `/log.txt` is always the newest piece and `/log.txt.1` 
 earlier version alternated between the two names, which meant the current file depended on a rotation
 count only `status` could tell you.
 
-## Two things that had to be learned the hard way
+## Three things that had to be learned the hard way
 
 **The file must be zero-filled on creation.** `OP_WRITE_NEW` allocates the extent but writes no data
 blocks, so everything past the last chunk written had a stored CRC of zero and `fs` correctly refused
@@ -75,6 +75,18 @@ preparing the loop does NOT park on `recv_timeout`: two seconds between slices c
 **`fs` replies `[tag, status]`, not `[status]`.** Reading byte 0 as the status made every successful
 write look like a failure - the file was created AND the service reported that it could not be. Both
 halves convincing, which is the worst kind of wrong.
+
+**The header and footer must be in the ON-DISK form, not the wire form.** They are the only two lines
+this service writes directly - every other line arrives from `events` as `owner US text` and is
+converted to `owner: text` on the way in. Both were emitted with the raw 0x1F separator, so every
+capture opened and closed with a control byte in a file whose body read cleanly.
+
+The test that should have caught it asserted `contains recorder:` and passed on three machines out of
+four: the recorder's own log line comes back through the drain, correctly formatted, and supplied the
+`recorder:` by accident. The Pi 2 was slow enough to stop the capture before that drain tick fired, so
+the file held only the malformed header - and the assertion failed for exactly the right reason. An
+assertion that can be satisfied by something other than what it names is not pinning anything; both now
+assert the whole line.
 
 ## Coverage is measured, never promised
 
