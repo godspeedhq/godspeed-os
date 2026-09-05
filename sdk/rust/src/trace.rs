@@ -238,12 +238,62 @@ pub fn resolved() -> bool {
     RESOLVED.load(Ordering::Relaxed)
 }
 
-/// Record the outcome of resolution. `u32::MAX` means this service holds no `events` send cap, which is
-/// remembered so the lookup happens exactly once per service lifetime.
+/// How often a service that has NOT resolved the sink may try again, in emissions. Bounded on purpose
+/// (26.6): a service which genuinely holds no `events` cap pays one short in-memory scan per this many
+/// emissions rather than one on every emission.
+const RESOLVE_RETRY_EVERY: u64 = 64;
+static RESOLVE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the outcome of resolution. A VALID slot latches for the life of the service; a MISS does
+/// NOT.
+///
+/// It used to latch either way, on the reading that `u32::MAX` means "this service holds no `events`
+/// send cap" - a permanent fact deserving a permanent answer. It is not permanent. It also happens
+/// when the sink is simply mid-restart at the instant of this service's FIRST emission, and chaos
+/// restarts the sink constantly. A service unlucky in that window then returned early on every
+/// subsequent emission forever: it never sent, so it never saw a send failure, so it never reached the
+/// reacquire path that exists precisely to recover from a restarted sink.
+///
+/// Observed on the T630: `fs` respawned 0.5 s after `events` did, published SIX metric rows before the
+/// chaos storm and exactly ZERO for the remaining life of the machine. Silent, permanent, and
+/// invisible except as a missing row - which is the one thing `msgs.received` exists to rule out
+/// (a service with no row is indistinguishable from a dead one).
 #[inline]
 pub fn set_sink_slot(slot: u32) {
     TRACER_SLOT.store(slot, Ordering::Relaxed);
-    RESOLVED.store(true, Ordering::Release);
+    RESOLVED.store(slot != u32::MAX, Ordering::Release);
+}
+
+/// Number of resolution attempts that MISSED. Read only to report a late resolve (see
+/// `take_late_resolve`), so the silent window is measured rather than argued about.
+static RESOLVE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// If this service resolved the sink only AFTER one or more misses, return how many and consume the
+/// fact so it is reported exactly once. `None` on the healthy path (resolved first try) and on every
+/// call thereafter, so a normal boot prints nothing.
+///
+/// This exists because the failure it reports was invisible: a service that missed simply stopped
+/// publishing forever, and the only evidence was a row that never appeared. Invariant 12 - a silent
+/// degradation is the bug.
+#[inline]
+pub fn take_late_resolve() -> Option<u64> {
+    let n = RESOLVE_MISSES.swap(0, Ordering::Relaxed);
+    if n == 0 { None } else { Some(n) }
+}
+
+/// Whether the caller should attempt (re)resolution now. False once resolved; after a miss, true only
+/// every `RESOLVE_RETRY_EVERY`th call, so recovery is bounded work rather than a lookup per emission.
+#[inline]
+pub fn should_resolve() -> bool {
+    if RESOLVED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let n = RESOLVE_TICK.fetch_add(1, Ordering::Relaxed);
+    if n > 0 && n % RESOLVE_RETRY_EVERY != 0 {
+        return false;
+    }
+    RESOLVE_MISSES.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// The cap slot to emit on, or `u32::MAX` if this service is not tracing.

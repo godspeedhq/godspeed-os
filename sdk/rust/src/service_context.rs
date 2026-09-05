@@ -1206,7 +1206,7 @@ impl ServiceContext {
         // nowhere else to resolve from. A service whose contract does not grant `ipc_send =
         // ["events"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
         // rest of its life, which is the cost the untraced majority pays.
-        if !crate::trace::resolved() {
+        if crate::trace::should_resolve() {
             crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
         }
         let slot = crate::trace::sink_slot();
@@ -1284,7 +1284,7 @@ impl ServiceContext {
         // A one-shot: it never resets, because the point is to say it once for the life of the service.
         static TRUNCATED_SAID: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
-        if !crate::trace::resolved() {
+        if crate::trace::should_resolve() {
             crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
         }
         let slot = crate::trace::sink_slot();
@@ -1315,10 +1315,18 @@ impl ServiceContext {
             if self.reacquire_by_name(crate::trace::SINK_NAME) {
                 if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
                     crate::trace::set_sink_slot(fresh);
-                    let _ = self.try_send_by_handle(
-                        CapHandle(fresh),
-                        &crate::ipc::Message::from_bytes(&m),
-                    );
+                    // A RETRY THAT STILL FAILS IS ITS OWN OUTCOME (26.7): the reacquire worked, so
+                    // this is not "the sink is down" - it is a fresh cap that still would not take the
+                    // sample. Said once per service; silence here would look identical to success.
+                    static RETRY_FAILED_SAID: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
+                    if self
+                        .try_send_by_handle(CapHandle(fresh), &crate::ipc::Message::from_bytes(&m))
+                        .is_err()
+                        && !RETRY_FAILED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.log("sdk: events sink reacquired but the retried sample still failed");
+                    }
                 }
             }
         }

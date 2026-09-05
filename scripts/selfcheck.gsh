@@ -720,6 +720,13 @@ assert fails-with FileNotFound read /sc/missing.txt
 #
 # By this line the suite has written a 256 KiB capture and this whole files section through `fs`, so
 # both owners are far past their interval. Deterministic, and no extra runtime.
+#
+# AND IT IS DELIBERATELY AFTER `chaos kill-storm events` ABOVE, which makes this a regression test for
+# the bug it caught: a service whose FIRST emission landed while the sink was mid-restart used to latch
+# "no sink" for its entire life and go permanently silent, because it never sent again and so never
+# reached the reacquire path. `fs` did exactly that on the T630 - six rows before the storm, zero for
+# the rest of the boot. These three rows existing AFTER the sink was deliberately killed is the proof
+# that a publisher recovers rather than dying quiet.
 events metrics | assert contains blk.outages
 events metrics | where owner contains block-driver | assert contains msgs.received
 events metrics | where owner contains fs | assert contains msgs.received
