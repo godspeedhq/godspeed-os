@@ -532,6 +532,17 @@ assert ok events log 5
 events log | assert contains owner
 events log | to json | assert contains owner
 events log | to yaml | assert contains owner
+# PERSISTING TO DISK NEEDS NO NEW MECHANISM, and this is where that is proved. `events` must never
+# gain an `fs` peer (docs/logging.md: a service that reports a storage failure must not be downstream
+# of storage), so the drain happens on the READER side: `events` is a record source, `write` is a
+# generic pipe sink, and the shell already holds both caps. The dependency points the right way -
+# the drainer needs `events` and `fs`; neither of them needs the drainer.
+mkdir /sc
+events log | write /sc/evt.log
+read /sc/evt.log | assert contains owner
+events log | where owner=block-driver | write append /sc/evt.log
+assert ok read /sc/evt.log
+
 # NOT asserted here: filtering for a SPECIFIC owner. Which services have logged inside the 8 KiB
 # window varies by machine and by how far it has wrapped, so any such assertion is a coin flip on
 # hardware. Filtering by owner is already pinned above, on the metrics view, where the rows are stable.
