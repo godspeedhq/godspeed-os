@@ -449,6 +449,45 @@ that captures them is a bad shape - it wants a credential file or a capability, 
 
 ---
 
+## 9c. Recorded, not fixed: death notifications are dropped silently
+
+**Found on a Pi 4, 2026-09-05, and NOT caused by the observability work** - the notification path is
+untouched by it. Recorded here because it was diagnosed here and the evidence should not be lost.
+
+A chaos run produced **138** of these:
+
+```text
+supervisor: reconcile respawned xhci (missed death notification)
+```
+
+One of them cost the machine its storage for ~53 seconds: `xhci` died, the supervisor never heard,
+`block-driver` could not resolve the name, `fs` came up degraded (`serving file API` with no `mounted`
+line before it), and a selfcheck run in that window failed 112 file operations. It recovered when the
+periodic reconcile sweep noticed.
+
+The mechanism is one line, in `kernel/src/ipc/routing.rs`:
+
+```rust
+table[idx].queue.enqueue(msg).ok();   // the error is DISCARDED
+```
+
+A death notification goes into the supervisor's 16-deep queue with `try_send` semantics. Under a storm
+many services die at once, the queue fills, and the notification is dropped **with no count and no
+log**. The reconcile sweep is the backstop and it works - but it is slow, and nothing says why a
+service was late coming back.
+
+**The silence is the part that offends invariant 12**, not the drop. Dropping is defensible: the kernel
+must not block on a userspace queue, and a bounded queue must discard something. What is not defensible
+is discarding the one message that says a service died and never mentioning it - the operator sees a
+53-second storage outage with no stated cause, and the log blames a reconcile sweep for a failure that
+happened somewhere else entirely.
+
+The smallest honest fix is a counter and a line, not a redesign: count drops on that path and report
+them, so a slow recovery names its own reason. That is a kernel edit and therefore re-verification, so
+it is recorded rather than taken unilaterally.
+
+---
+
 ## 10. The plan
 
 Phased so that the kernel change is **pulled into existence** by a service that has demonstrably hit

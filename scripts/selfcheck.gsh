@@ -541,6 +541,11 @@ events log | to yaml | assert contains owner
 # of storage), so the drain happens on the READER side: `events` is a record source, `write` is a
 # generic pipe sink, and the shell already holds both caps. The dependency points the right way -
 # the drainer needs `events` and `fs`; neither of them needs the drainer.
+# GUARDED, like the file section below. The disk PERSISTS ACROSS BOOTS, so `/sc` is usually already
+# there on hardware and a bare `mkdir` fails - which is the single failure this suite reported on an
+# otherwise clean Pi 4 run. QEMU never showed it, because its test disk is formatted fresh every time:
+# a suite that is only ever run against a new disk cannot see the state a real machine keeps.
+if ls /sc { delete /sc recursive }
 mkdir /sc
 events log | write /sc/evt.log
 read /sc/evt.log | assert contains owner
