@@ -1659,6 +1659,164 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
 /// Step 4: drive the file commands (ls / read / write / mkdir / cd) end to end. Boots
 /// bare-metal with a RAW AHCI disk, flashes it, then exercises the commands including
 /// relative paths and `..` (the shell's current-directory + path resolution).
+/// Boot QEMU with a SATA data disk and return (child, serial buffer, write half).
+///
+/// Extracted so a test can boot the SAME disk twice - which `run_sticky` needs, because a setting that
+/// survives a reboot cannot be tested inside one boot.
+fn boot_shell(
+    image_path: &Path,
+    persist_path: &str,
+    smp: u32,
+    who: &str,
+) -> (std::process::Child, Arc<Mutex<Vec<u8>>>, std::net::TcpStream) {
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive", &format!("format=raw,file={image_str},if=ide"),
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-smp", &smp.to_string(),
+        "-m", "512M",
+        "-serial", &format!("tcp::{shell_port},server"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("{who}-test: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => {
+            eprintln!("{who}-test: could not connect to serial {shell_port}");
+            child.kill().ok();
+            std::process::exit(1);
+        }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    (child, buf, write_half)
+}
+
+/// `osdev test sticky` - a STICKY capture must survive a reboot, unattended.
+///
+/// The only test here that needs TWO boots, and it needs them for the reason the feature exists: a
+/// capture you set up before walking away is worth nothing if the machine restarting ends it. Boot 1
+/// records the sticky capture; boot 2 shares the same SATA disk and must resume it with nobody typing
+/// anything.
+///
+/// Boot 2 also checks the negative half, which is the part that makes sticky safe rather than a trap:
+/// an explicit `stop` deletes the marker, so a capture that was told to end does NOT come back.
+pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("sticky-test: two boots on one disk - a capture must survive a reboot");
+    let mut fail = 0usize;
+    let mut pass = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok {
+                println!("sticky-test: PASS - {}", $label);
+                pass += 1;
+            } else {
+                println!("sticky-test: FAIL - {}", $label);
+                fail += 1;
+            }
+        };
+    }
+
+    // ---- boot 1: flash, then record a sticky capture -------------------------------------------
+    let (mut child, buf, mut write_half) = boot_shell(image_path, persist_path, smp, "sticky");
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        println!("sticky-test: FAIL - boot 1 never reached a prompt");
+        child.kill().ok();
+        println!("\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+    send(&mut write_half, b"drives flash\r");
+    let _ = collect_until(&buf, &mut cursor, b"?", Duration::from_secs(20));
+    send(&mut write_half, b"y\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+
+    send(&mut write_half, b"events persist start /cap.log sticky\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("STICKY"), "boot 1: the capture is recorded as sticky");
+            check!(r.contains("capturing"), "boot 1: the capture actually started");
+        }
+        None => {
+            println!("sticky-test: FAIL - timed out starting the sticky capture");
+            fail += 2;
+        }
+    }
+    // Let a few lines reach the file, so boot 2 resumes a capture with real content behind it.
+    thread::sleep(Duration::from_secs(4));
+    child.kill().ok();
+    let _ = child.wait();
+
+    // ---- boot 2: SAME disk, nobody types anything ----------------------------------------------
+    println!("sticky-test: boot 2 - same disk, no input, the capture must come back on its own");
+    let (mut child2, buf2, mut write2) = boot_shell(image_path, persist_path, smp, "sticky");
+    let mut cur2 = 0usize;
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(90)) {
+        Some(r) => {
+            check!(r.contains("resuming STICKY capture"),
+                   "boot 2: resumed the capture WITHOUT anyone typing (the whole point)");
+            check!(r.contains("/cap.log"), "boot 2: resumed the right target");
+        }
+        None => {
+            println!("sticky-test: FAIL - boot 2 never reached a prompt");
+            fail += 2;
+        }
+    }
+    // It is really recording, not merely announcing.
+    send(&mut write2, b"events persist status\r");
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(r.contains("recording"), "boot 2: the resumed capture is actually recording"),
+        None => { println!("sticky-test: FAIL - timed out on status"); fail += 1; }
+    }
+    // THE NEGATIVE HALF. An explicit stop must delete the marker, or the one command meaning "enough"
+    // is the one that did not take - and the capture would return at every boot forever.
+    send(&mut write2, b"events persist stop\r");
+    let _ = collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30));
+    send(&mut write2, b"read /persist.conf\r");
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(!r.contains("/cap.log"), "stop DELETED the sticky marker (it will not come back)"),
+        None => { println!("sticky-test: FAIL - timed out reading the marker"); fail += 1; }
+    }
+    child2.kill().ok();
+    let _ = child2.wait();
+
+    let passed = 6usize.saturating_sub(fail);
+    println!("\n  {passed} passed  {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
 pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     println!("files-test: booting (smp={smp}) with a RAW AHCI disk - scripted mode");
 

@@ -360,6 +360,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the first `gsh> ` the serial-driven shell-test waits on.
     ctx.console_boot_complete();
 
+    // RESUME A STICKY CAPTURE, if one was recorded. Deliberately after `console_boot_complete`: fs is
+    // at its slowest while mounting and replaying its journal, and this read retries rather than
+    // giving up on one slow answer - a capture missed because storage was half a second late is
+    // exactly the unattended failure sticky exists to prevent.
+    sticky_resume(ctx);
+
     // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
     // can only echo single bytes blindly, so it prints the `[` and `A` of an arrow
     // key's `ESC [ A` sequence before the shell consumes them - smearing "[A" onto
@@ -7062,7 +7068,7 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     true
 }
 
-fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_trace(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     let mut it = arg.split_whitespace();
     let sub = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("");
@@ -8117,72 +8123,175 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     Some(t)
 }
 
+/// Spawn `recorder` if needed and tell it to begin. Shared by the command and by the sticky resume,
+/// so a capture started at boot is the same capture in every respect as one started by hand.
+fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, mib: u8) -> Result<(), ShellError> {
+    // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted - and
+    // staying out of the kernel's managed-service lists is what keeps this feature free of a kernel
+    // change.
+    if slot_of(ctx, "recorder").is_none() && ctx.spawn("recorder").is_err() {
+        ctx.console_writeln("events persist: could not spawn `recorder`");
+        return Err(ShellError::Unknown);
+    }
+    // Acquire by NAME, because it was not running when this shell was wired (§14.3).
+    let _ = ctx.reacquire_by_name("recorder");
+
+    let pb = path.as_bytes();
+    let fb = filter.as_bytes();
+    let mut req = [0u8; 96];
+    req[0] = REC_OP_START;
+    req[1] = mib;
+    let pl = pb.len().min(60);
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&pb[..pl]);
+    let fo = 3 + pl;
+    let fl = fb.len().min(12);
+    req[fo] = fl as u8;
+    req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
+    let n = fo + 1 + fl;
+    match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&req[..n]), 12) {
+        Some(r) if r.payload_bytes().first() == Some(&REC_OK) => {
+            if filter.is_empty() {
+                ctx.console_writeln_fmt(format_args!("events persist: capturing everything to {}", path));
+            } else {
+                ctx.console_writeln_fmt(format_args!("events persist: capturing {} to {}", filter, path));
+            }
+            ctx.console_writeln("events persist: two files of a FIXED size, rotating - `events persist status` shows how far in it is.");
+            Ok(())
+        }
+        Some(_) => {
+            ctx.console_writeln("events persist: recorder refused (no filesystem, or a bad path)");
+            Err(ShellError::Unknown)
+        }
+        None => {
+            ctx.console_writeln("events persist: recorder did not answer");
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// Where a STICKY capture records what to resume. One line: `<mib> <filter-or-dash> <path>`.
+///
+/// Plain text on purpose - `read /persist.conf` shows exactly what will happen at the next boot, which
+/// is the difference between a setting and a surprise (§26.4). A capture that resumes silently forever
+/// because someone forgot is the hazard this whole feature has to avoid.
+const STICKY_PATH: &[u8] = b"/persist.conf";
+/// Seconds allowed for a sticky read or write. Generous: these happen once at boot and once per
+/// `start`, never on a hot path.
+const STICKY_SECS: i64 = 8;
+
+/// Record a sticky capture, so the next boot resumes it.
+fn sticky_write(ctx: &ShellCtx, mib: u8, filter: &str, path: &str) -> bool {
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    let m = if mib == 0 { 1 } else { mib };
+    if m >= 100 { buf[n] = b'0' + m / 100; n += 1; }
+    if m >= 10 { buf[n] = b'0' + (m / 10) % 10; n += 1; }
+    buf[n] = b'0' + m % 10; n += 1;
+    buf[n] = b' '; n += 1;
+    let f = if filter.is_empty() { "-" } else { filter };
+    for &c in f.as_bytes().iter().take(12) { buf[n] = c; n += 1; }
+    buf[n] = b' '; n += 1;
+    for &c in path.as_bytes().iter().take(64) { buf[n] = c; n += 1; }
+    matches!(fs_request_bounded(ctx, OP_WRITE_FILE, STICKY_PATH, &buf[..n], STICKY_SECS).as_ref()
+                 .map(|r| r.payload_bytes().first() == Some(&FS_OK)), Some(true))
+}
+
+/// Forget a sticky capture. Called on `stop`, so an explicit stop stays stopped across a reboot -
+/// otherwise the one command that means "enough" would be the one that did not take.
+fn sticky_clear(ctx: &ShellCtx) {
+    let _ = fs_request(ctx, OP_DELETE, STICKY_PATH, &[]);
+}
+
+/// True if a sticky capture is recorded.
+fn sticky_set(ctx: &ShellCtx) -> bool {
+    let mut buf = [0u8; 128];
+    fs_read_file(ctx, STICKY_PATH, &mut buf, STICKY_SECS).map_or(false, |n| n > 0)
+}
+
+/// Resume a sticky capture at boot, if one was recorded.
+///
+/// THE FS READ IS SAFE HERE NOW, and it was not always. The shell used to read the clock floor at
+/// startup and stopped: fs is at its slowest right then (mounting, replaying its journal), the read
+/// timed out, and the abandoned request poisoned the reply channel for the whole session - a reply
+/// carried no request id, so the next command consumed it and every command after was one answer
+/// behind. Tag correlation ended that: a reply whose tag nobody awaits is DISCARDED, and the deadline
+/// now bounds the whole wait rather than each attempt. What remains is only the risk of a slow fs
+/// making this read fail, which is why it retries rather than giving up on one timeout.
+///
+/// Loud either way. A capture that resumes says so, and one that was recorded but could not be resumed
+/// says THAT - the silent case is the only unacceptable one (invariant 12).
+fn sticky_resume(ctx: &ShellCtx) {
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    for _ in 0..4 {
+        if let Some(got) = fs_read_file(ctx, STICKY_PATH, &mut buf, STICKY_SECS) {
+            n = got;
+            break;
+        }
+        // Not there, or storage is still settling. Either way, yield and try once more - a sticky
+        // capture missed because fs was half a second late would be exactly the unattended failure
+        // this feature exists to prevent.
+        for _ in 0..512 {
+            ctx.yield_cpu();
+        }
+    }
+    if n == 0 {
+        return; // no sticky capture recorded - the ordinary case, and silent on purpose
+    }
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut it = text.split_whitespace();
+    let mib = it.next().unwrap_or("1").parse::<u8>().unwrap_or(1);
+    let filter = it.next().unwrap_or("-");
+    let path = it.next().unwrap_or("");
+    if path.is_empty() || !path.starts_with('/') {
+        ctx.log("events persist: /persist.conf is unreadable - not resuming (delete it to silence this)");
+        return;
+    }
+    let filter = if filter == "-" { "" } else { filter };
+    if persist_begin(ctx, path, filter, mib).is_err() {
+        ctx.log_fmt(format_args!(
+            "events persist: STICKY capture to {} could NOT be resumed - storage may be unavailable", path));
+        return;
+    }
+    ctx.log_fmt(format_args!(
+        "events persist: resuming STICKY capture to {} (recorded in /persist.conf; `events persist stop` ends it for good)", path));
+}
+
 /// `events persist start|stop|status` - capture the event log to a file.
 ///
 /// The shell is the broker here, which is the whole point of the arrangement: it holds `spawn` and it
 /// can acquire a cap to `recorder` by name once that service exists. `events` gains nothing and keeps
 /// no `fs` peer, so a stalled disk can never stop it draining (see `services/recorder/src/main.rs`).
-fn events_persist(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     let (verb, rest) = split_first(arg.trim());
     match verb {
         "start" => {
             let (path, tail) = split_first(rest.trim());
             if path.is_empty() || !path.starts_with('/') {
-                ctx.console_writeln("usage: events persist start /path [service] [mib]");
+                ctx.console_writeln("usage: events persist start /path [service] [mib] [sticky]");
                 return Err(ShellError::Unknown);
             }
-            // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted -
-            // and staying out of the kernel's managed-service lists is what keeps this whole feature
-            // free of a kernel change.
-            if slot_of(ctx, "recorder").is_none() {
-                if ctx.spawn("recorder").is_err() {
-                    ctx.console_writeln("events persist: could not spawn `recorder`");
-                    return Err(ShellError::Unknown);
-                }
-            }
-            // Acquire by NAME, because it was not running when this shell was wired (§14.3).
-            let _ = ctx.reacquire_by_name("recorder");
-
             let mut filter: &str = "";
             let mut mib: u8 = 0;
+            let mut sticky = false;
             for tok in tail.split_whitespace() {
                 match tok.parse::<u8>() {
                     Ok(n) if n > 0 => mib = n,
+                    _ if tok == "sticky" => sticky = true,
                     _ => filter = tok,
                 }
             }
-            let pb = path.as_bytes();
-            let fb = filter.as_bytes();
-            let mut req = [0u8; 96];
-            req[0] = REC_OP_START;
-            req[1] = mib;
-            let pl = pb.len().min(64);
-            req[2] = pl as u8;
-            req[3..3 + pl].copy_from_slice(&pb[..pl]);
-            let fo = 3 + pl;
-            let fl = fb.len().min(12);
-            req[fo] = fl as u8;
-            req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
-            let n = fo + 1 + fl;
-            match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&req[..n]), 8) {
-                Some(r) if r.payload_bytes().first() == Some(&REC_OK) => {
-                    if filter.is_empty() {
-                        ctx.console_writeln_fmt(format_args!("events persist: capturing everything to {}", path));
-                    } else {
-                        ctx.console_writeln_fmt(format_args!("events persist: capturing {} to {}", filter, path));
-                    }
-                    ctx.console_writeln("events persist: the file is a FIXED size and stops when full - `events persist status` shows how far in it is.");
-                    Ok(())
-                }
-                Some(_) => {
-                    ctx.console_writeln("events persist: recorder refused (no filesystem, or a bad path)");
-                    Err(ShellError::Unknown)
-                }
-                None => {
-                    ctx.console_writeln("events persist: recorder did not answer");
-                    Err(ShellError::Unknown)
+            persist_begin(ctx, path, filter, mib)?;
+            if sticky {
+                // RECORDED BEFORE IT IS ANNOUNCED, so the message never claims more than is true.
+                if sticky_write(ctx, mib, filter, path) {
+                    ctx.console_writeln("events persist: STICKY - this resumes after a reboot. `events persist stop` ends it for good, and /persist.conf says what will happen.");
+                } else {
+                    ctx.console_writeln("events persist: capturing, but STICKY could not be recorded - it will NOT resume after a reboot");
                 }
             }
+            Ok(())
         }
         "stop" => {
             if slot_of(ctx, "recorder").is_none() {
@@ -8192,6 +8301,9 @@ fn events_persist(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
             let _ = ctx.reacquire_by_name("recorder");
             match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STOP]), 8) {
                 Some(_) => {
+                    // AN EXPLICIT STOP STAYS STOPPED. Leaving the marker would make the one command
+                    // that means "enough" the one that did not take.
+                    sticky_clear(ctx);
                     ctx.console_writeln("events persist: stopped (the capture file has its footer, so it reads as complete)");
                     Ok(())
                 }
@@ -8216,6 +8328,9 @@ fn events_persist(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
                 lb.flush_into(ctx, &mut f);
             }
             f.flush(ctx);
+            if sticky_set(ctx) {
+                ctx.console_writeln("events persist: STICKY - this resumes after a reboot (/persist.conf). `events persist stop` ends it for good.");
+            }
             // A CAPTURE WITH A HOLE MUST SAY SO. The window is 8 KiB; a slow disk lets lines fall out
             // before they are read, and a file that silently skips them reads as complete.
             for r in 0..t.nrows() {

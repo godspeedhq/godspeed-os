@@ -137,7 +137,40 @@ As shipped - nine views, each named for WHAT IT SHOWS rather than what you give 
   trace status                  ring size, recorded, dropped
   trace metrics                 published samples: owner, metric, value, age
   events log [n]                the last n log lines the sink has kept (default 20)
+  events persist start|stop|status   capture the log to disk (see below)
 ```
+
+### `events persist` - keeping a capture when the screen cannot
+
+```text
+events persist start /log.txt                  everything, 1 MiB
+events persist start /log.txt fs 8             only fs, 8 MiB
+events persist start /log.txt sticky           resumes after a reboot
+events persist stop
+events persist status
+```
+
+Written by **`recorder`**, not by `events`, and that split is the design rather than tidiness. A file
+write BLOCKS on a reply from `fs`; `events` is a single-threaded recv loop, so while it waited it would
+stop draining its endpoint and drop the very events worth capturing. On a sick disk that is the full
+deadline, repeatedly - `events` would go blind exactly when it matters. `recorder` blocks instead, and
+nothing depends on `recorder`, so a stalled disk costs the capture and leaves the volatile window
+readable.
+
+**Spawned on demand**, never at boot, and not restarted on death - a respawned recorder would not know
+its target and would be alive writing nothing while `status` said "running". The file opens with a
+header and closes with a footer, so one without a footer says it died.
+
+**Bounded, and not by counting.** `fs` allocates a file's whole extent up front, so the size is fixed
+when the capture starts; two files rotate, so total disk use is twice that, forever. A forgotten
+capture cannot fill a disk. It ROTATES rather than stopping because stopping keeps the wrong half - a
+fixed file that stops when full preserves the start of a session and discards the crash at the end.
+
+**`sticky`** records the capture in `/persist.conf`, a plain line the shell reads at the next boot and
+resumes unattended, announcing it. Plain text on purpose: `read /persist.conf` shows exactly what will
+happen, which is the difference between a setting and a surprise. An explicit `stop` deletes it, so the
+one command meaning "enough" is not the one that fails to take. Pinned by `osdev test sticky`, which is
+the only two-boot test here - a setting that survives a reboot cannot be proved inside one boot.
 
 ### `events log` - what was printed, after it has scrolled away
 

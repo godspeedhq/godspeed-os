@@ -428,6 +428,27 @@ and the filter someone writes for it will be the second mechanism this section e
 
 ---
 
+## 9b. Persisting a capture, and where it may live
+
+**Built 2026-09-05.** `events persist start|stop|status`, written by a separate `recorder` service.
+
+The rule this obeys is the one `docs/logging.md` set: **`events` may hold bounded VOLATILE state and
+must never acquire a durable-storage dependency.** The concrete reason turned out to be sharper than
+the dependency diagram suggests - a file write BLOCKS on a reply, and a blocked `events` is not
+draining its endpoint, so it drops the log copies, traces and metrics arriving while it waits. On a
+sick disk that is the full deadline, repeatedly. It would go blind at the moment it is most needed.
+
+`recorder` has the identical blocking problem and it does not matter, because nothing depends on it.
+That is the whole argument for a separate service, and it is worth keeping in that form: the question
+is never "does this component block" but "who else stops when it does".
+
+**A future remote sink** (`events persist start <url>`) was raised and is not built. One thing to decide
+deliberately before it is: credentials on a command line land in shell history AND in the event log
+itself, which the recorder is at that moment writing to disk. Credentials looping through the thing
+that captures them is a bad shape - it wants a credential file or a capability, not an argument.
+
+---
+
 ## 10. The plan
 
 Phased so that the kernel change is **pulled into existence** by a service that has demonstrably hit

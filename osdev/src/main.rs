@@ -1342,6 +1342,7 @@ fn cmd_test(suite: &str) {
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
+        "sticky"       => run_sticky_test(),
         "edit"         => run_edit_test(),
         "script"       => run_script_test(),
         "big-script"   => run_big_script_test(),
@@ -2146,6 +2147,20 @@ fn run_drives_scripted_test() {
 
 /// Step 4: scripted file commands (ls/read/write/mkdir/cd). Build bare-metal, attach a
 /// RAW AHCI disk, flash it, then exercise the file commands incl. relative paths + `..`.
+/// `osdev test sticky` - two boots on ONE disk, proving a sticky capture resumes unattended.
+fn run_sticky_test() {
+    let kernel_elf = std::path::Path::new("target/x86_64-godspeed/release/kernel");
+    let kernel_elf = if kernel_elf.exists() { kernel_elf } else { std::path::Path::new("target/x86_64-unknown-none/release/kernel") };
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found - run `osdev build` first"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_sticky.img";
+    std::fs::write(persist, vec![0u8; 32 * 1024 * 1024]).expect("failed to create persist disk");
+    crate::shell_test::run_sticky(&image_path, persist, 4);
+}
+
 fn run_files_test() {
     println!("\n=== files 4: ls / read / write / mkdir / cd (RAW AHCI disk) ===");
     cmd_build_bare_metal();
