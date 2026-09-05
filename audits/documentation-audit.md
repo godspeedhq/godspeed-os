@@ -515,13 +515,13 @@ the old story (Commandment III - and the amendment is the truth).
 
 ## Audit: the `trace` branch (2026-08-30, `feat/trace` @ `f1f4d5ff`)
 
-Requested before merge. Scope: everything this branch wrote - `utilities/46_trace.md`, the trace code
+Requested before merge. Scope: everything this branch wrote - `utilities/46_events.md`, the trace code
 comments, and the per-directory guides it touched. Six defects, all fixed; every one of them was
 created by a LATER change in the same branch invalidating an EARLIER piece of prose.
 
 ### DOC-1 (HIGH) - a section's factual premise was false, and we had disproved it ourselves
 
-`46_trace.md` 7 read: *"`op` is byte 0 of the message. Every service protocol in this tree happens to
+`46_events.md` 7 read: *"`op` is byte 0 of the message. Every service protocol in this tree happens to
 put its opcode there (`fs`, `block-driver`, the block IPC protocol)."*
 
 Both of those protocols prepend a one-byte CORRELATION TAG, which this branch discovered while
@@ -532,7 +532,7 @@ the original kept as ratified history per 1.
 
 ### DOC-2 (MEDIUM) - a whole view was missing from its own reference
 
-`trace endpoints` did not appear anywhere in `46_trace.md`, including a section headed "every command,
+`trace endpoints` did not appear anywhere in `46_events.md`, including a section headed "every command,
 every column, every number". It was added after that section was written. A reference that claims
 completeness and silently omits a command is worse than one that does not claim it.
 

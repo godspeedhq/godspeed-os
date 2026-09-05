@@ -7,7 +7,7 @@ Structured log sink (§11.4). **Restartable.** Not a TCB member.
 `events` does two things, both "somewhere to put diagnostic data that someone reads later":
 
 1. **Drains its recv endpoint**, dropping any message it does not recognise.
-2. **Holds the IPC trace ring** (`utilities/46_trace.md` §8b) - a fixed 192-event history of
+2. **Holds the IPC trace ring** (`utilities/46_events.md` §8b) - a fixed 192-event history of
    request/reply events emitted by services whose contract grants them `ipc_send = ["events"]`, read
    back by the `trace` utility (`trace ipc`, `trace failures`, `trace status`). Full = overwrite the
    oldest and **count** it; `trace status` reports the count, because a silent loss is the bug

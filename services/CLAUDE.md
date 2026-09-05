@@ -40,6 +40,12 @@ restarts *itself* (a dead task can't); the kernel is the messenger, the supervis
 **Revived on a supervisor respawn (only)** - `ping`, `pong` (demo services, bare-metal skips them) are
 not individually watched; a supervisor respawn re-runs its boot sequence and re-spawns them fresh.
 
+## Spawned on demand, and deliberately NOT restarted
+
+| Service | Notes |
+|---------|-------|
+| `recorder/` | Drains the `events` log to a file (`events persist`). The shell spawns it on demand; it is absent from the boot set AND from the kernel's managed-service lists, which is what keeps the whole persistence feature free of a kernel change. It is not restarted on death **on purpose**: a respawned recorder would not know its target path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The capture file opens with a header and closes with a footer, so one without a footer says it died. See `services/recorder/CLAUDE.md` |
+
 ## Supervisor spawn order
 
 The supervisor spawns services in this order:

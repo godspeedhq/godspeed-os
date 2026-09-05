@@ -1,7 +1,17 @@
-# `trace` - observing IPC call chains
+# `events` - logs, IPC traces, metrics, and capturing them to disk
 
-**Status:** **Mechanism A BUILT** (`trace blocked` / `task` / `service`), QEMU-verified, 6 checks in
-`osdev test shell`. Mechanism B (the event ring) is DESIGNED AND DELIBERATELY NOT BUILT - see §8.
+**The command is `events`. `trace` is the older name and every view still answers to it.** The service
+holds three streams now - logs, IPC traces and metrics - and only one of them is a trace, so a reader
+named after the service is the discoverable one.
+
+**This file is `46_events.md` and was `46_trace.md`.** Renamed when `events` became the primary name,
+because the source of truth for a command should not be filed under its alias. The history below is
+unedited: it is why the design is what it is.
+
+**Status:** **BUILT and QEMU-verified.** Mechanism A (`events blocked` / `chain` / `deps` /
+`endpoints`), mechanism B (the 192-event ring - see §8b, which supersedes the line this status used to
+carry saying the ring was deliberately not built; it IS built, as a SERVICE, and the kernel gained
+nothing for it), the metric table, the log window, and `events persist` with its `recorder`.
 **Version:** 0.1.0
 **Pins:** §4.3 (kernel scope = the six), §4.4 (anti-scope), §8 (IPC), §8.6 (failure semantics),
 §26.4 (no silent complexity), §26.6 (bounded), §26.10 (mechanism not policy), invariant 12 (loud).
