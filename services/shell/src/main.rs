@@ -797,8 +797,8 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "log", "metrics", "status"]),
-    ("events",  &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "log", "metrics", "status"]),
+    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "log", "metrics", "persist", "status"]),
+    ("events",  &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "log", "metrics", "persist", "status"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -6660,6 +6660,10 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
                 "endpoints" => build_endpoints_table(ctx),
                 "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "metrics"  => match build_trace_metrics_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "persist"  => match split_first(split_first(arg).1.trim()).0 {
+                    "" | "status" => match build_persist_status_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                    _ => { ctx.console_writeln("events persist: only `status` is a record source"); return Err(ShellError::Unknown); }
+                },
                 "log"      => match build_events_log_table(ctx)    { Some(t) => t, None => return Err(ShellError::Unknown) },
                 other      => {
                     ctx.console_writeln_fmt(format_args!(
@@ -7077,6 +7081,8 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
         // is what the docs and the selfcheck use, so both resolve to the same view.
         "ipc" | "trace" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
+        // `persist` needs the whole remainder (`start /p svc 4`), not the two tokens `sub`/`rest`.
+        "persist" => events_persist(ctx, arg["persist".len()..].trim()),
         "log" => events_log(ctx, rest),
         "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
@@ -8046,6 +8052,185 @@ fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
 /// saw a copy - so serial is complete and this is a convenience. What this window CANNOT show is
 /// anything printed before `events` started (the kernel's 16 KiB ring is not exposed to userspace), or
 /// a line lost when the sink's queue was momentarily full.
+/// `recorder` control opcodes. Duplicated here rather than shared: services do not depend on one
+/// another's crates, and a protocol is a wire format, not a Rust type (§8).
+const REC_OP_START: u8 = 1;
+const REC_OP_STOP: u8 = 2;
+const REC_OP_STATUS: u8 = 3;
+const REC_OK: u8 = 0;
+
+/// `events persist status` as a RECORD SOURCE - one row describing the capture.
+///
+/// Records rather than a printed sentence, because that is the rule every view here obeys
+/// (`docs/observability.md` §9a): it filters with the same `where` and converts with `to json`. The
+/// first version printed prose and could not be asserted on in a script without a bespoke matcher,
+/// which is the same mistake the log made.
+#[inline(never)]
+fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
+    let mut t = Table::new(&["state", "lines", "bytes", "capacity", "lost", "path"]);
+    if slot_of(ctx, "recorder").is_none() {
+        // NOT AN ERROR, and not an empty table either. "Nothing is recording" is a real answer, and a
+        // caller piping this needs a row to see it in.
+        let st = t.intern(b"not running");
+        let none = t.intern(b"-");
+        t.add_row(&[st, Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), none]);
+        return Some(t);
+    }
+    let _ = ctx.reacquire_by_name("recorder");
+    let r = match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STATUS]), 8) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("events persist: recorder did not answer");
+            return None;
+        }
+    };
+    let b = r.payload_bytes();
+    if b.len() < 36 {
+        ctx.console_writeln("events persist: short status");
+        return None;
+    }
+    let on = b[1] != 0;
+    let full = b[2] != 0;
+    let lines = u64::from_le_bytes([b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10]]);
+    let bytes = u64::from_le_bytes([b[11], b[12], b[13], b[14], b[15], b[16], b[17], b[18]]);
+    let lost = u64::from_le_bytes([b[19], b[20], b[21], b[22], b[23], b[24], b[25], b[26]]);
+    let capbytes = u64::from_le_bytes([b[27], b[28], b[29], b[30], b[31], b[32], b[33], b[34]]);
+    let pl = (b[35] as usize).min(b.len().saturating_sub(36));
+    let st = t.intern(if full {
+        b"full".as_slice()
+    } else if on {
+        b"recording".as_slice()
+    } else {
+        b"idle".as_slice()
+    });
+    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[36..36 + pl]) };
+    t.add_row(&[
+        st,
+        Value::Int(lines),
+        Value::Int(bytes),
+        Value::Int(capbytes),
+        Value::Int(lost),
+        path,
+    ]);
+    Some(t)
+}
+
+/// `events persist start|stop|status` - capture the event log to a file.
+///
+/// The shell is the broker here, which is the whole point of the arrangement: it holds `spawn` and it
+/// can acquire a cap to `recorder` by name once that service exists. `events` gains nothing and keeps
+/// no `fs` peer, so a stalled disk can never stop it draining (see `services/recorder/src/main.rs`).
+fn events_persist(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let (verb, rest) = split_first(arg.trim());
+    match verb {
+        "start" => {
+            let (path, tail) = split_first(rest.trim());
+            if path.is_empty() || !path.starts_with('/') {
+                ctx.console_writeln("usage: events persist start /path [service] [mib]");
+                return Err(ShellError::Unknown);
+            }
+            // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted -
+            // and staying out of the kernel's managed-service lists is what keeps this whole feature
+            // free of a kernel change.
+            if slot_of(ctx, "recorder").is_none() {
+                if ctx.spawn("recorder").is_err() {
+                    ctx.console_writeln("events persist: could not spawn `recorder`");
+                    return Err(ShellError::Unknown);
+                }
+            }
+            // Acquire by NAME, because it was not running when this shell was wired (§14.3).
+            let _ = ctx.reacquire_by_name("recorder");
+
+            let mut filter: &str = "";
+            let mut mib: u8 = 0;
+            for tok in tail.split_whitespace() {
+                match tok.parse::<u8>() {
+                    Ok(n) if n > 0 => mib = n,
+                    _ => filter = tok,
+                }
+            }
+            let pb = path.as_bytes();
+            let fb = filter.as_bytes();
+            let mut req = [0u8; 96];
+            req[0] = REC_OP_START;
+            req[1] = mib;
+            let pl = pb.len().min(64);
+            req[2] = pl as u8;
+            req[3..3 + pl].copy_from_slice(&pb[..pl]);
+            let fo = 3 + pl;
+            let fl = fb.len().min(12);
+            req[fo] = fl as u8;
+            req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
+            let n = fo + 1 + fl;
+            match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&req[..n]), 8) {
+                Some(r) if r.payload_bytes().first() == Some(&REC_OK) => {
+                    if filter.is_empty() {
+                        ctx.console_writeln_fmt(format_args!("events persist: capturing everything to {}", path));
+                    } else {
+                        ctx.console_writeln_fmt(format_args!("events persist: capturing {} to {}", filter, path));
+                    }
+                    ctx.console_writeln("events persist: the file is a FIXED size and stops when full - `events persist status` shows how far in it is.");
+                    Ok(())
+                }
+                Some(_) => {
+                    ctx.console_writeln("events persist: recorder refused (no filesystem, or a bad path)");
+                    Err(ShellError::Unknown)
+                }
+                None => {
+                    ctx.console_writeln("events persist: recorder did not answer");
+                    Err(ShellError::Unknown)
+                }
+            }
+        }
+        "stop" => {
+            if slot_of(ctx, "recorder").is_none() {
+                ctx.console_writeln("events persist: nothing is recording");
+                return Ok(());
+            }
+            let _ = ctx.reacquire_by_name("recorder");
+            match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STOP]), 8) {
+                Some(_) => {
+                    ctx.console_writeln("events persist: stopped (the capture file has its footer, so it reads as complete)");
+                    Ok(())
+                }
+                None => {
+                    ctx.console_writeln("events persist: recorder did not answer");
+                    Err(ShellError::Unknown)
+                }
+            }
+        }
+        "" | "status" => {
+            let t = match build_persist_status_table(ctx) {
+                Some(t) => t,
+                None => return Err(ShellError::Unknown),
+            };
+            let w = t.grid_widths();
+            let mut f = FrameBuf::new();
+            let mut lb = LineBuf::new();
+            t.grid_header(&mut lb, &w);
+            lb.flush_into(ctx, &mut f);
+            for r in 0..t.nrows() {
+                t.grid_row(&mut lb, r, &w);
+                lb.flush_into(ctx, &mut f);
+            }
+            f.flush(ctx);
+            // A CAPTURE WITH A HOLE MUST SAY SO. The window is 8 KiB; a slow disk lets lines fall out
+            // before they are read, and a file that silently skips them reads as complete.
+            for r in 0..t.nrows() {
+                if t.cell_bytes(r, 4) != b"0" {
+                    ctx.console_writeln("events persist: lines were LOST - the window wrapped faster than the disk could take them");
+                }
+            }
+            Ok(())
+        }
+        other => {
+            ctx.console_writeln_fmt(format_args!(
+                "events persist: '{}' is not start, stop or status", other));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
 /// `events log` as a RECORD SOURCE: one row per held line, `owner` and `text`.
 ///
 /// Records, not text, and that is a rule rather than a preference for this one view: every stream the
@@ -8067,11 +8252,14 @@ fn build_events_log_table(ctx: &ServiceContext) -> Option<Table> {
         }
     };
     let b = reply.payload_bytes();
-    if b.len() < 9 {
+    // 25-byte header: next cursor, oldest held, lines held, wrapped. The reader here wants only the
+    // text; the cursor fields exist for `recorder`, which drains repeatedly and must know both what is
+    // new and when the window outran it.
+    if b.len() < 25 {
         ctx.console_writeln("events: short log reply");
         return None;
     }
-    let body = &b[9..];
+    let body = &b[25..];
     let mut t = Table::new(&["owner", "text"]);
     let mut ls = 0usize;
     for i in 0..=body.len() {

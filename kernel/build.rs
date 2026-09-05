@@ -102,6 +102,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         ("SUPERVISOR", "supervisor"),
         ("DWC2",       "dwc2"),
         ("EVENTS",     "events"),
+        ("RECORDER",   "recorder"),
         ("CONSOLE",    "console"),
         ("TIME",       "time"),
         ("CONTROL",    "control"),
@@ -136,7 +137,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // for x86 hardware (PCI/AHCI/Realtek/xHCI) absent on the Pi 2, so they stay placeholders until real
     // Pi drivers (SD/EMMC, DWC2, LAN9514) exist. `probe` does not build for ARM (x86-only fault module).
     let arm_built: &[&str] = &[
-        "events", "console", "ping", "pong", "supervisor", "shell",
+        "events", "recorder", "console", "ping", "pong", "supervisor", "shell",
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
@@ -196,14 +197,14 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // is the only way it learns the wall clock. `control` is inert on a board driven from its own
     // console, and is embedded so the service set does not differ per arch without a reason.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["events", "console", "time", "control", "ping", "pong", "supervisor", "shell",
+        &["events", "recorder", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["events", "console", "time", "control", "supervisor", "shell",
+        &["events", "recorder", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# `recorder` - drains the `events` log to a file so a capture outlives the screen.
+#
+# NOT SPAWNED AT BOOT. The shell starts it on `events persist start` and it idles until told what to
+# capture. That is what keeps this feature a zero-kernel-change one: a service that runs at boot and
+# survives its own death has to join the kernel's managed-service lists, and this one does not.
+#
+# It is deliberately NOT restarted on death either. A respawned recorder would not know its target
+# path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The
+# capture file opens with a header and closes with a footer instead, so a file with no footer says it
+# died.
+name    = "recorder"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+ipc_receive = ["recorder"]
+# `events` - the source it drains, with a cursor so repeated reads do not re-write the same lines.
+# `fs`     - the destination. THIS is the peer that must never belong to `events` itself: a file write
+#            blocks on a reply, and a blocked `events` stops draining its endpoint and starts dropping
+#            the very events worth capturing. Here the blocking is harmless, because nothing depends on
+#            this service - if the disk stalls, `recorder` stalls and the volatile window survives.
+ipc_send    = ["events", "fs"]
+log_write   = true

@@ -191,6 +191,7 @@ static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
+static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -244,6 +245,12 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      8 * 1024 * 1024, u32::MAX, &["events"],
      godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
     ("events", EVENTS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
+    // NOT in the boot set - the shell spawns it on `events persist start` and it idles until told
+    // what to capture. Being absent from the kernel managed lists is what keeps the whole persistence
+    // feature a zero-kernel-change one, and a recorder that came back without its target path would
+    // be alive and writing nothing while `status` said running.
+    ("recorder", RECORDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
+     u32::MAX, &["events", "fs"], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.

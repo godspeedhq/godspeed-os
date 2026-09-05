@@ -384,32 +384,74 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 loglines += 1;
             }
             // `events log` - the tail of the scrollback.
+            // `events log [since]` - the window, or only what is new since a cursor.
+            //
+            // THE CURSOR IS WHAT MAKES REPEATED DRAINING POSSIBLE. Without it every read returns the
+            // whole 8 KiB window, so anything appending in a loop re-writes lines it already wrote.
+            // A `recorder` draining every few seconds needs to ask "what is new", and to be TOLD when
+            // the answer is incomplete.
+            //
+            // No per-line sequence is stored. Lines are appended in order and the ring holds the most
+            // recent, so the sequences present are contiguous and end at `loglines` - counting the
+            // lines currently held gives the oldest one still here. That costs a walk of at most 8 KiB
+            // on a query, which is rare, and saves eight bytes on every line, which is not.
             TRACE_OP_LOGS => {
+                let since = if b.len() >= 9 {
+                    u64::from_le_bytes([b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]])
+                } else {
+                    0
+                };
                 let have = if logwrapped { LOG_BYTES } else { loghead };
                 let n = have.min(LOG_REPLY_MAX);
-                let mut out = [0u8; 17 + LOG_REPLY_MAX];
-                out[0..8].copy_from_slice(&loglines.to_le_bytes());
-                out[8] = logwrapped as u8;
+                let mut buf = [0u8; LOG_REPLY_MAX];
                 let start = (loghead + LOG_BYTES - n) % LOG_BYTES;
                 for i in 0..n {
-                    out[9 + i] = logbuf[(start + i) % LOG_BYTES];
+                    buf[i] = logbuf[(start + i) % LOG_BYTES];
                 }
                 // DROP A PARTIAL FIRST LINE. Starting mid-sentence reads as corruption rather than as
                 // a window, and a reader cannot tell the two apart.
                 let mut skip = 0usize;
                 if n < have || logwrapped {
-                    while skip < n && out[9 + skip] != b'\n' {
+                    while skip < n && buf[skip] != b'\n' {
                         skip += 1;
                     }
                     if skip < n {
                         skip += 1;
                     }
                 }
-                let body = n - skip;
-                for i in 0..body {
-                    out[9 + i] = out[9 + skip + i];
+                let view = &buf[skip..n];
+                let held = view.iter().filter(|&&c| c == b'\n').count() as u64;
+                let oldest = loglines.saturating_sub(held) + 1;
+
+                // Skip the lines this caller has already seen. A caller whose cursor is BEHIND
+                // `oldest` lost lines to the wrap; it learns that from `oldest` in the reply rather
+                // than by noticing a gap it cannot see (invariant 12).
+                let already = if since >= oldest { since - oldest + 1 } else { 0 };
+                let mut from = 0usize;
+                let mut passed = 0u64;
+                if already > 0 {
+                    for (i, &c) in view.iter().enumerate() {
+                        if c == b'\n' {
+                            passed += 1;
+                            if passed >= already {
+                                from = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if passed < already {
+                        from = view.len();
+                    }
                 }
-                reply(&ctx, &out[..9 + body]);
+                let body = &view[from..];
+
+                let mut out = [0u8; 25 + LOG_REPLY_MAX];
+                out[0..8].copy_from_slice(&loglines.to_le_bytes());   // next cursor
+                out[8..16].copy_from_slice(&oldest.to_le_bytes());    // oldest still held
+                out[16..24].copy_from_slice(&held.to_le_bytes());     // lines in the window
+                out[24] = logwrapped as u8;
+                out[25..25 + body.len()].copy_from_slice(body);
+                reply(&ctx, &out[..25 + body.len()]);
             }
             // Anything else is drained and dropped, which is the job this service already had: an
             // unconsumed endpoint fills at 16 and never empties.

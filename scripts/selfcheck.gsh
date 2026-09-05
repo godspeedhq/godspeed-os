@@ -543,6 +543,21 @@ read /sc/evt.log | assert contains owner
 events log | where owner=block-driver | write append /sc/evt.log
 assert ok read /sc/evt.log
 
+# ===== events persist: capture to disk, via a service that is NOT `events` =====
+# `recorder` drains `events` and writes the file. It is spawned ON DEMAND by the line below and is
+# absent from the kernel managed-service lists, so this whole feature costs the kernel nothing.
+#
+# Why it is a separate service at all: a file write BLOCKS on a reply, and a blocked `events` stops
+# draining its endpoint and drops the very events worth capturing. Here the blocking is harmless -
+# nothing depends on `recorder`, so a stalled disk stalls it alone and the volatile window survives.
+events persist status | assert contains not running
+assert ok events persist start /sc/cap.log
+events persist status | assert contains recording
+ls /sc | assert contains cap.log
+assert ok events persist stop
+# The footer is what makes a capture readable as COMPLETE. A file with a header and no footer died.
+events persist status | assert contains idle
+
 # NOT asserted here: filtering for a SPECIFIC owner. Which services have logged inside the 8 KiB
 # window varies by machine and by how far it has wrapped, so any such assertion is a coin flip on
 # hardware. Filtering by owner is already pinned above, on the metrics view, where the rows are stable.
