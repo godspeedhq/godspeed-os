@@ -143,12 +143,38 @@ As shipped - nine views, each named for WHAT IT SHOWS rather than what you give 
 ### `events persist` - keeping a capture when the screen cannot
 
 ```text
-events persist start /log.txt                  everything, 1 MiB
-events persist start /log.txt fs 8             only fs, 8 MiB
-events persist start /log.txt sticky           resumes after a reboot
+events persist start /log.txt                  everything, the default budget
+events persist start /log.txt 7d               target a week
+events persist start /log.txt 64MiB            an exact disk budget
+events persist start /log.txt fs 7d sticky     only fs, a week, resumes after a reboot
 events persist stop
 events persist status
 ```
+
+**Every budget carries a unit** - `h`/`d`/`w` for a duration, `KiB`/`MiB`/`GiB` for a size. Nothing is
+bare, because a bare number would have to mean megabytes or minutes by convention and `16m` cannot be
+read as either without guessing. That also removes the last heuristic from the parser: a token without
+a unit is unambiguously a service name. `MB` is REFUSED rather than treated as `MiB` - they differ by
+4.8%, and quietly giving less than was asked for is a small lie found late.
+
+**A duration is a target, never a promise.** Converting `7d` to bytes needs a fill rate, and that is a
+prediction about how chatty the machine will be - which the machine decides. So `status` reports the
+MEASURED rate and what the budget actually covers at it:
+
+```text
+> events persist status
+state      covers  kib_day  capacity_kib  lines  rotations  lost  path
+recording  ~2d     11400    16384         842    0          0     /log.txt
+```
+
+Ask for a week on a box four times chattier than assumed and this says `~2d`, rather than letting you
+discover it when the log you needed had already rotated away. `covers` reports the guaranteed FLOOR,
+not the best case, because a rotation discards a whole piece.
+
+**Rotation renames, so `/log.txt` is always the newest.** The previous piece is `/log.txt.1`. An
+earlier version alternated between the two names, which meant the current file depended on a rotation
+count only `status` could tell you - the file you wanted was a coin toss. Renames are metadata only, so
+rotating costs no data movement however big a piece is.
 
 Written by **`recorder`**, not by `events`, and that split is the design rather than tidiness. A file
 write BLOCKS on a reply from `fs`; `events` is a single-threaded recv loop, so while it waited it would

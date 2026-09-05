@@ -551,7 +551,7 @@ assert ok read /sc/evt.log
 # draining its endpoint and drops the very events worth capturing. Here the blocking is harmless -
 # nothing depends on `recorder`, so a stalled disk stalls it alone and the volatile window survives.
 events persist status | assert contains not running
-assert ok events persist start /sc/cap.log
+assert ok events persist start /sc/cap.log 8MiB
 events persist status | assert contains recording
 # BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
 # allocates a file's whole extent up front, so the size is fixed when the capture starts and total
@@ -561,12 +561,20 @@ events persist status | assert contains recording
 # full preserves the START of a session and discards everything after - and the reason to run a capture
 # for an hour is almost always to catch something at the END.
 events persist status | assert contains rotations
+# COVERAGE IS MEASURED, not the number that was asked for: `covers` is what the budget buys at the
+# rate this machine is actually logging at, so a duration is a target and never a promise.
+events persist status | assert contains covers
+events persist status | assert contains kib_day
+# EVERY BUDGET CARRIES A UNIT. A bare number would have to mean megabytes or minutes by
+# convention, and `16m` cannot be read as either without guessing - so nothing is bare, and a
+# token without a unit is unambiguously a service name.
+assert fails events persist start /sc/bad.log 64MB
 events persist status | to json | assert contains capacity
 ls /sc | assert contains cap.log
 # STICKY: recorded in a plain-text marker the shell reads at the next boot. Plain text on purpose -
 # `read /persist.conf` shows exactly what will happen, which is the difference between a setting and a
 # surprise. A capture that resumed silently forever because someone forgot is the hazard here.
-assert ok events persist start /sc/sticky.log sticky
+assert ok events persist start /sc/sticky.log 4MiB sticky
 read /persist.conf | assert contains /sc/sticky.log
 events persist status | assert contains recording
 # AN EXPLICIT STOP STAYS STOPPED. Leaving the marker would make the one command that means "enough"

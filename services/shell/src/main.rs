@@ -8073,13 +8073,14 @@ const REC_OK: u8 = 0;
 /// which is the same mistake the log made.
 #[inline(never)]
 fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
-    let mut t = Table::new(&["state", "lines", "bytes", "capacity", "rotations", "lost", "path"]);
+    let mut t = Table::new(&["state", "covers", "kib_day", "capacity_kib", "lines", "rotations", "lost", "path"]);
     if slot_of(ctx, "recorder").is_none() {
         // NOT AN ERROR, and not an empty table either. "Nothing is recording" is a real answer, and a
         // caller piping this needs a row to see it in.
         let st = t.intern(b"not running");
         let none = t.intern(b"-");
-        t.add_row(&[st, Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), none]);
+        let dash = t.intern(b"-");
+        t.add_row(&[st, dash, Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), none]);
         return Some(t);
     }
     let _ = ctx.reacquire_by_name("recorder");
@@ -8091,7 +8092,7 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
         }
     };
     let b = r.payload_bytes();
-    if b.len() < 44 {
+    if b.len() < 68 {
         ctx.console_writeln("events persist: short status");
         return None;
     }
@@ -8102,7 +8103,28 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     let lost = u64::from_le_bytes([b[19], b[20], b[21], b[22], b[23], b[24], b[25], b[26]]);
     let capbytes = u64::from_le_bytes([b[27], b[28], b[29], b[30], b[31], b[32], b[33], b[34]]);
     let rotations = u64::from_le_bytes([b[35], b[36], b[37], b[38], b[39], b[40], b[41], b[42]]);
-    let pl = (b[43] as usize).min(b.len().saturating_sub(44));
+    let elapsed = u64::from_le_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]]);
+    let lifetime = u64::from_le_bytes([b[51], b[52], b[53], b[54], b[55], b[56], b[57], b[58]]);
+    let pieces = u64::from_le_bytes([b[59], b[60], b[61], b[62], b[63], b[64], b[65], b[66]]).max(1);
+    let pl = (b[67] as usize).min(b.len().saturating_sub(68));
+
+    // COVERAGE IS MEASURED, NEVER THE NUMBER THAT WAS ASKED FOR. A duration is a prediction about how
+    // chatty the machine will be, and the machine decides that - so the rate comes from what has
+    // actually been written, and `covers` is what the budget buys AT THAT RATE. Ask for 7d on a box
+    // four times chattier than assumed and this says ~2d, rather than letting you find out when the
+    // log you needed had already rotated away.
+    let mut cov = [0u8; 16];
+    let covn = if elapsed >= 5 && lifetime > 0 {
+        let total_cap = capbytes.saturating_mul(pieces);
+        // (PIECES-1)/PIECES of the budget is the GUARANTEED floor, since a rotation discards a whole
+        // piece; report the floor rather than the best case.
+        let floor = total_cap / pieces * (pieces - 1).max(1);
+        brief_duration(floor.saturating_mul(elapsed) / lifetime, &mut cov)
+    } else {
+        cov[0] = b'-';
+        1
+    };
+    let kib_day = if elapsed >= 5 { lifetime.saturating_mul(86400) / elapsed / 1024 } else { 0 };
     let st = t.intern(if full {
         b"full".as_slice()
     } else if on {
@@ -8110,12 +8132,17 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     } else {
         b"idle".as_slice()
     });
-    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[44..44 + pl]) };
+    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[68..68 + pl]) };
+    let covers = t.intern(&cov[..covn]);
+    let _ = bytes;
     t.add_row(&[
         st,
+        covers,
+        Value::Int(kib_day),
+        // The whole budget across every piece, so "what is this costing me on disk" has an answer that
+        // does not require knowing the piece count.
+        Value::Int(capbytes.saturating_mul(pieces) / 1024),
         Value::Int(lines),
-        Value::Int(bytes),
-        Value::Int(capbytes),
         Value::Int(rotations),
         Value::Int(lost),
         path,
@@ -8125,7 +8152,7 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
 
 /// Spawn `recorder` if needed and tell it to begin. Shared by the command and by the sticky resume,
 /// so a capture started at boot is the same capture in every respect as one started by hand.
-fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, mib: u8) -> Result<(), ShellError> {
+fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Result<(), ShellError> {
     // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted - and
     // staying out of the kernel's managed-service lists is what keeps this feature free of a kernel
     // change.
@@ -8140,11 +8167,11 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, mib: u8) -> Result<()
     let fb = filter.as_bytes();
     let mut req = [0u8; 96];
     req[0] = REC_OP_START;
-    req[1] = mib;
+    req[1..9].copy_from_slice(&budget.to_le_bytes());
     let pl = pb.len().min(60);
-    req[2] = pl as u8;
-    req[3..3 + pl].copy_from_slice(&pb[..pl]);
-    let fo = 3 + pl;
+    req[9] = pl as u8;
+    req[10..10 + pl].copy_from_slice(&pb[..pl]);
+    let fo = 10 + pl;
     let fl = fb.len().min(12);
     req[fo] = fl as u8;
     req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
@@ -8170,6 +8197,87 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, mib: u8) -> Result<()
     }
 }
 
+/// Bytes a machine is assumed to log per day, used ONLY to turn a duration into a disk budget.
+///
+/// Measured on an idle Pi 2: lines average ~60 bytes and the `dwc2` heartbeat alone emits about eight
+/// every fifteen seconds, which comes to roughly 3 MB a day. Rounded up, because underestimating means
+/// a capture covers less than asked and that is the direction that hurts.
+///
+/// IT IS AN ASSUMPTION, AND THE MACHINE OVERRULES IT. A busy box logs an order of magnitude more, so
+/// `events persist status` reports the MEASURED rate and what the capture actually covers. The
+/// duration you ask for is a target; the status is the truth.
+const ASSUMED_BYTES_PER_DAY: u64 = 4 * 1024 * 1024;
+
+/// What a `start` argument turned out to be.
+enum Budget {
+    /// A disk budget in bytes, from a duration or an explicit size.
+    Bytes(u64),
+    /// A number with a unit we deliberately refuse, rather than guess at.
+    BadUnit,
+    /// Not a budget at all - so it is a service name.
+    NotABudget,
+}
+
+/// Parse `7d` / `12h` / `1w`, or `64MiB` / `512KiB` / `1GiB`.
+///
+/// EVERY BUDGET CARRIES A UNIT. A bare number would have to mean megabytes or minutes by convention,
+/// and `16m` cannot be read as either without guessing - so nothing is bare, and a token without a
+/// unit is unambiguously a service name. That removes the last heuristic from this parser rather than
+/// documenting around it.
+fn parse_budget(tok: &str) -> Budget {
+    let digits = tok.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &tok[digits.len()..];
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Budget::NotABudget;
+    }
+    let n: u64 = match digits.parse() {
+        Ok(v) if v > 0 => v,
+        _ => return Budget::NotABudget,
+    };
+    match unit {
+        "h" => Budget::Bytes(n * ASSUMED_BYTES_PER_DAY / 24),
+        "d" => Budget::Bytes(n * ASSUMED_BYTES_PER_DAY),
+        "w" => Budget::Bytes(n * 7 * ASSUMED_BYTES_PER_DAY),
+        "KiB" => Budget::Bytes(n * 1024),
+        "MiB" => Budget::Bytes(n * 1024 * 1024),
+        "GiB" => Budget::Bytes(n * 1024 * 1024 * 1024),
+        // REFUSED, NOT SILENTLY ACCEPTED. MB and MiB differ by 4.8%, so treating them as equal quietly
+        // gives less than was asked for - a small lie that is only discovered when the capture turns
+        // out shorter than expected. `m` is refused for the reason the whole scheme exists: minutes and
+        // megabytes cannot be told apart.
+        "MB" | "GB" | "KB" | "kb" | "mb" | "gb" | "m" | "M" => Budget::BadUnit,
+        _ => Budget::NotABudget,
+    }
+}
+
+/// Seconds as a short human duration: `3d`, `14h`, `42m`, `9s`.
+fn brief_duration(secs: u64, out: &mut [u8; 16]) -> usize {
+    let (n, unit) = if secs >= 86400 {
+        (secs / 86400, b'd')
+    } else if secs >= 3600 {
+        (secs / 3600, b'h')
+    } else if secs >= 60 {
+        (secs / 60, b'm')
+    } else {
+        (secs, b's')
+    };
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    let mut v = n.max(1);
+    while v > 0 {
+        i -= 1;
+        d[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let mut k = 0usize;
+    for &c in &d[i..] {
+        out[k] = c;
+        k += 1;
+    }
+    out[k] = unit;
+    k + 1
+}
+
 /// Where a STICKY capture records what to resume. One line: `<mib> <filter-or-dash> <path>`.
 ///
 /// Plain text on purpose - `read /persist.conf` shows exactly what will happen at the next boot, which
@@ -8181,13 +8289,16 @@ const STICKY_PATH: &[u8] = b"/persist.conf";
 const STICKY_SECS: i64 = 8;
 
 /// Record a sticky capture, so the next boot resumes it.
-fn sticky_write(ctx: &ShellCtx, mib: u8, filter: &str, path: &str) -> bool {
+fn sticky_write(ctx: &ShellCtx, budget: u64, filter: &str, path: &str) -> bool {
     let mut buf = [0u8; 128];
     let mut n = 0usize;
-    let m = if mib == 0 { 1 } else { mib };
-    if m >= 100 { buf[n] = b'0' + m / 100; n += 1; }
-    if m >= 10 { buf[n] = b'0' + (m / 10) % 10; n += 1; }
-    buf[n] = b'0' + m % 10; n += 1;
+    // The BYTE budget, so a resumed capture is byte-for-byte the one that was asked for - re-deriving
+    // it from a duration at the next boot would silently re-estimate against a different machine mood.
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    let mut v = budget.max(1);
+    while v > 0 { i -= 1; d[i] = b'0' + (v % 10) as u8; v /= 10; }
+    for &c in &d[i..] { buf[n] = c; n += 1; }
     buf[n] = b' '; n += 1;
     let f = if filter.is_empty() { "-" } else { filter };
     for &c in f.as_bytes().iter().take(12) { buf[n] = c; n += 1; }
@@ -8241,7 +8352,7 @@ fn sticky_resume(ctx: &ShellCtx) {
     }
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
     let mut it = text.split_whitespace();
-    let mib = it.next().unwrap_or("1").parse::<u8>().unwrap_or(1);
+    let budget = it.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
     let filter = it.next().unwrap_or("-");
     let path = it.next().unwrap_or("");
     if path.is_empty() || !path.starts_with('/') {
@@ -8249,7 +8360,7 @@ fn sticky_resume(ctx: &ShellCtx) {
         return;
     }
     let filter = if filter == "-" { "" } else { filter };
-    if persist_begin(ctx, path, filter, mib).is_err() {
+    if persist_begin(ctx, path, filter, budget).is_err() {
         ctx.log_fmt(format_args!(
             "events persist: STICKY capture to {} could NOT be resumed - storage may be unavailable", path));
         return;
@@ -8273,19 +8384,27 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
                 return Err(ShellError::Unknown);
             }
             let mut filter: &str = "";
-            let mut mib: u8 = 0;
+            let mut budget: u64 = 0;
             let mut sticky = false;
             for tok in tail.split_whitespace() {
-                match tok.parse::<u8>() {
-                    Ok(n) if n > 0 => mib = n,
-                    _ if tok == "sticky" => sticky = true,
-                    _ => filter = tok,
+                if tok == "sticky" {
+                    sticky = true;
+                    continue;
+                }
+                match parse_budget(tok) {
+                    Budget::Bytes(b) => budget = b,
+                    Budget::BadUnit => {
+                        ctx.console_writeln_fmt(format_args!(
+                            "events persist: '{}' - use h/d/w for a duration or KiB/MiB/GiB for a size. MB and MiB differ by 4.8%, so this is refused rather than guessed.", tok));
+                        return Err(ShellError::Unknown);
+                    }
+                    Budget::NotABudget => filter = tok,
                 }
             }
-            persist_begin(ctx, path, filter, mib)?;
+            persist_begin(ctx, path, filter, budget)?;
             if sticky {
                 // RECORDED BEFORE IT IS ANNOUNCED, so the message never claims more than is true.
-                if sticky_write(ctx, mib, filter, path) {
+                if sticky_write(ctx, budget, filter, path) {
                     ctx.console_writeln("events persist: STICKY - this resumes after a reboot. `events persist stop` ends it for good, and /persist.conf says what will happen.");
                 } else {
                     ctx.console_writeln("events persist: capturing, but STICKY could not be recorded - it will NOT resume after a reboot");
@@ -8334,7 +8453,7 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             // A CAPTURE WITH A HOLE MUST SAY SO. The window is 8 KiB; a slow disk lets lines fall out
             // before they are read, and a file that silently skips them reads as complete.
             for r in 0..t.nrows() {
-                if t.cell_bytes(r, 5) != b"0" {
+                if t.cell_bytes(r, 6) != b"0" {
                     ctx.console_writeln("events persist: lines were LOST - the window wrapped faster than the disk could take them");
                 }
             }

@@ -29,7 +29,7 @@
 use godspeed_sdk::{Message, ServiceContext};
 
 /// Control opcodes on this service's endpoint.
-pub const REC_OP_START: u8 = 1; // [1][mib][plen][path][flen][filter]
+pub const REC_OP_START: u8 = 1; // [1][capacity:u64][plen][path][flen][filter]
 pub const REC_OP_STOP: u8 = 2; // [2]
 pub const REC_OP_STATUS: u8 = 3; // [3]
 
@@ -39,6 +39,8 @@ pub const REC_ERR: u8 = 1;
 /// `fs` opcodes. Wire format is [tag, op, path_len, path.., data..].
 const FS_OP_WRITE_NEW: u8 = 24;
 const FS_OP_WRITE_AT: u8 = 25;
+const FS_OP_RENAME: u8 = 15;
+const FS_OP_DELETE: u8 = 16;
 const FS_OK: u8 = 0;
 /// Correlation tag for this service's own `fs` requests. Distinct from 0, which is both what an
 /// unthinking caller sends and the value of `FS_OK` - a collision that has hidden a bug before.
@@ -51,13 +53,19 @@ const FS_TAG: u8 = 0xE1;
 /// aligned offset, and nothing follows it.
 const IO_CHUNK: usize = 7 * 508;
 
-/// Default capture size when the caller does not say: big enough for a long session at a few hundred
-/// bytes a line, small enough that a forgotten capture cannot eat a disk.
-const DEFAULT_MIB: u8 = 1;
+/// Default capture size when the caller does not say. The shell normally computes one from a duration;
+/// this is the floor if it sends nothing.
+const DEFAULT_CAPACITY: u64 = 8 * 1024 * 1024;
 
 /// How long to wait for a control message before draining anyway. The loop must serve requests AND
 /// drain on a timer; `recv_timeout` does both without a second task.
 const DRAIN_MS: u64 = 2000;
+
+/// How many files a capture is spread over. The budget is divided among them, so the guaranteed
+/// retention is (PIECES-1)/PIECES of what was asked for: with 2 you always hold at least half, and the
+/// oscillation is what `covers` reports. Raising it tightens the floor and costs one rename per
+/// rotation; it is deliberately ONE constant, so changing it is a one-line decision.
+const PIECES: usize = 2;
 
 const PATH_MAX: usize = 64;
 const FILTER_MAX: usize = 12;
@@ -153,11 +161,14 @@ struct Capture {
     stage: [u8; IO_CHUNK],
     staged: usize,
     full: bool,
-    /// Which of the two files is being written. Rotation keeps the RECENT past, which is the half a
-    /// crash investigation needs - a capture that stopped when full would have kept the beginning and
-    /// discarded the crash.
-    alt: bool,
     rotations: u64,
+    /// Bytes written since the capture began, ACROSS rotations. `written` resets at each rotation, so
+    /// it cannot answer "how fast is this filling" - which is the only honest way to say how long a
+    /// capture actually covers.
+    total_written: u64,
+    /// Epoch seconds when the capture started. Coverage is a MEASURED rate, never the estimate the
+    /// caller asked for: a duration is a target, and the machine decides whether it was met.
+    started_at: u64,
 }
 
 impl Capture {
@@ -176,21 +187,21 @@ impl Capture {
             stage: [0; IO_CHUNK],
             staged: 0,
             full: false,
-            alt: false,
             rotations: 0,
+            total_written: 0,
+            started_at: 0,
         }
     }
 
-    /// The file currently being written: the base path, or the base path plus `.1`.
+    /// The file currently being written - ALWAYS the base path.
+    ///
+    /// Rotation renames rather than alternating, so `/log.txt` is the newest piece at every moment and
+    /// `read /log.txt` needs no knowledge of how many rotations have happened. The previous version
+    /// swapped between two names, which meant the current file depended on a rotation count only
+    /// `status` could tell you - the file you wanted was a coin toss.
     fn cur_path(&self, out: &mut [u8; PATH_MAX + 2]) -> usize {
         out[..self.plen].copy_from_slice(&self.path[..self.plen]);
-        if self.alt {
-            out[self.plen] = b'.';
-            out[self.plen + 1] = b'1';
-            self.plen + 2
-        } else {
-            self.plen
-        }
+        self.plen
     }
 
     /// Commit the staged bytes at the current offset. `final_tail` allows the one short write, which
@@ -211,6 +222,7 @@ impl Capture {
         let ok = fs_call(ctx, FS_OP_WRITE_AT, &p[..pn], &tail[..n]);
         if ok {
             self.written += self.staged as u64;
+            self.total_written += self.staged as u64;
             self.staged = 0;
         }
         ok
@@ -248,9 +260,7 @@ impl Capture {
 fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
     let mut foot = [0u8; 64];
     let mut n = 0usize;
-    for &c in b"recorder" { foot[n] = c; n += 1; }
-    foot[n] = US; n += 1;
-    for &c in b"file full - continuing in the other file" { foot[n] = c; n += 1; }
+    for &c in b"recorder: piece full - continuing in a fresh one" { foot[n] = c; n += 1; }
     // Straight into the stage: `push_line` would refuse, the capture being full.
     for &c in foot[..n].iter().chain(NEWLINE.iter()) {
         if cap.staged < IO_CHUNK {
@@ -260,7 +270,22 @@ fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
     }
     let _ = cap.flush(ctx, true);
 
-    cap.alt = !cap.alt;
+    // SHIFT THE PIECES DOWN, oldest first: .N-1 is deleted, .N-2 becomes .N-1, and the base becomes
+    // .1. The base name is then free for a fresh file, which is what keeps `/log.txt` the newest at
+    // every moment. Renames are metadata only, so this costs no data movement however big a piece is.
+    let mut from = [0u8; PATH_MAX + 4];
+    let mut to = [0u8; PATH_MAX + 4];
+    for i in (1..PIECES).rev() {
+        let fl = suffixed(&cap.path[..cap.plen], i - 1, &mut from);
+        let tl = suffixed(&cap.path[..cap.plen], i, &mut to);
+        // Delete the destination first: a rename onto an existing name is not guaranteed to replace it,
+        // and a rotation that silently failed would leave the oldest piece never ageing out.
+        let _ = fs_call(ctx, FS_OP_DELETE, &to[..tl], &[]);
+        // OP_RENAME takes the NEW NAME as a bare basename, not a path.
+        let base = basename(&to[..tl]);
+        let _ = fs_call(ctx, FS_OP_RENAME, &from[..fl], base);
+    }
+
     cap.rotations += 1;
     cap.written = 0;
     cap.staged = 0;
@@ -270,13 +295,35 @@ fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
     if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes())
         || !zero_fill(ctx, &p[..pn], cap.capacity)
     {
-        // The rotation target could not be created. Say so and stop, rather than carry on appending
-        // to a file that is already full and silently losing every line.
         ctx.log("recorder: could not open the next capture file - stopping");
         cap.on = false;
         return;
     }
-    ctx.log_fmt(format_args!("recorder: rotated ({} so far) - now writing the other file", cap.rotations));
+    let mut hdr = [0u8; 48];
+    let mut hn = 0usize;
+    for &c in b"recorder: piece begins" { hdr[hn] = c; hn += 1; }
+    let _ = cap.push_line(ctx, &hdr[..hn]);
+    ctx.log_fmt(format_args!("recorder: rotated ({} so far) - /...{} is the newest", cap.rotations, cap.rotations.min(1)));
+}
+
+/// `path` with `.N` appended, or `path` itself when `n == 0`. The newest piece has no suffix.
+fn suffixed(path: &[u8], n: usize, out: &mut [u8; PATH_MAX + 4]) -> usize {
+    out[..path.len()].copy_from_slice(path);
+    if n == 0 {
+        return path.len();
+    }
+    let mut k = path.len();
+    out[k] = b'.'; k += 1;
+    out[k] = b'0' + (n as u8).min(9); k += 1;
+    k
+}
+
+/// The last path segment. `OP_RENAME` names the destination within the same directory.
+fn basename(p: &[u8]) -> &[u8] {
+    match p.iter().rposition(|&c| c == b'/') {
+        Some(i) => &p[i + 1..],
+        None => p,
+    }
 }
 
 /// Close the capture: footer, final flush, and a line saying which it was.
@@ -410,23 +457,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if let Some(msg) = ctx.recv_timeout(wait) {
             let p = msg.payload_bytes();
             match p.first().copied() {
-                Some(REC_OP_START) if p.len() >= 4 => {
-                    let mib = if p[1] == 0 { DEFAULT_MIB } else { p[1] };
-                    let plen = (p[2] as usize).min(PATH_MAX);
-                    if p.len() < 3 + plen + 1 {
+                Some(REC_OP_START) if p.len() >= 11 => {
+                    let want = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
+                    let total = if want == 0 { DEFAULT_CAPACITY } else { want };
+                    let plen = (p[9] as usize).min(PATH_MAX);
+                    if p.len() < 10 + plen + 1 {
                         reply(&ctx, &[REC_ERR]);
                         continue;
                     }
                     cap = Capture::new();
                     cap.plen = plen;
-                    cap.path[..plen].copy_from_slice(&p[3..3 + plen]);
-                    let fo = 3 + plen;
+                    cap.path[..plen].copy_from_slice(&p[10..10 + plen]);
+                    let fo = 10 + plen;
                     let flen = (p[fo] as usize).min(FILTER_MAX);
                     if flen > 0 && p.len() >= fo + 1 + flen {
                         cap.flen = flen;
                         cap.filter[..flen].copy_from_slice(&p[fo + 1..fo + 1 + flen]);
                     }
-                    cap.capacity = (mib as u64) << 20;
+                    // The caller's number is the TOTAL disk budget; it is split across the pieces, so
+                    // "64MiB" means 64 MiB on disk rather than 64 per file. Asking for a budget and
+                    // quietly using a multiple of it is the kind of small lie that is found late.
+                    cap.capacity = (total / PIECES as u64).max(64 * 1024);
+                    cap.started_at = ctx.epoch_secs_monotonic() as u64;
                     let mut path = [0u8; PATH_MAX];
                     path[..plen].copy_from_slice(&cap.path[..plen]);
                     if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes())
@@ -451,7 +503,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hn += 1;
                     }
                     let _ = cap.push_line(&ctx, &hdr[..hn]);
-                    ctx.log_fmt(format_args!("recorder: capturing to a {} MiB file", mib));
+                    ctx.log_fmt(format_args!(
+                        "recorder: capturing to {} pieces of {} KiB ({} KiB total)",
+                        PIECES, cap.capacity / 1024, total / 1024));
                     reply(&ctx, &[REC_OK]);
                 }
                 Some(REC_OP_STOP) => {
@@ -461,7 +515,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     reply(&ctx, &[REC_OK]);
                 }
                 Some(REC_OP_STATUS) => {
-                    let mut out = [0u8; 40 + PATH_MAX];
+                    let mut out = [0u8; 72 + PATH_MAX];
                     out[0] = REC_OK;
                     out[1] = cap.on as u8;
                     out[2] = cap.full as u8;
@@ -470,9 +524,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     out[19..27].copy_from_slice(&cap.lost.to_le_bytes());
                     out[27..35].copy_from_slice(&cap.capacity.to_le_bytes());
                     out[35..43].copy_from_slice(&cap.rotations.to_le_bytes());
-                    out[43] = cap.plen as u8;
-                    out[44..44 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
-                    reply(&ctx, &out[..44 + cap.plen]);
+                    // MEASURED, not requested. Elapsed seconds and lifetime bytes let the reader work
+                    // out the real fill rate and therefore what the capture actually covers - which is
+                    // the only honest answer, because a duration asked for is a prediction about how
+                    // chatty the machine will be and the machine decides that.
+                    let now = ctx.epoch_secs_monotonic() as u64;
+                    let elapsed = now.saturating_sub(cap.started_at);
+                    out[43..51].copy_from_slice(&elapsed.to_le_bytes());
+                    out[51..59].copy_from_slice(&cap.total_written.to_le_bytes());
+                    out[59..67].copy_from_slice(&(PIECES as u64).to_le_bytes());
+                    out[67] = cap.plen as u8;
+                    out[68..68 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
+                    reply(&ctx, &out[..68 + cap.plen]);
                 }
                 _ => reply(&ctx, &[REC_ERR]),
             }
