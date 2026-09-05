@@ -2321,6 +2321,12 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::ipc::free_endpoint_id(ep_id);
         }
 
+        // How many death notifications the supervisor never received. A COUNT, not a resource: it
+        // only grows, and what it costs is promptness, which the reconcile sweep eventually restores.
+        static DEATH_NOTIFY_DROPPED: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        use core::sync::atomic::Ordering;
+
         // RESTART count (the observe RESTARTS column): only the restartable/managed set accrues a
         // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
@@ -2387,10 +2393,26 @@ pub fn kill_task_by_slot(slot: usize) {
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
             ) {
-                if let Some(sup_slot) =
-                    crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg)
-                {
-                    wake_by_slot(sup_slot, 0);
+                match crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg) {
+                    crate::ipc::routing::Enqueue::Woke(sup_slot) => wake_by_slot(sup_slot, 0),
+                    crate::ipc::routing::Enqueue::Queued | crate::ipc::routing::Enqueue::NoEndpoint => {}
+                    // THE ONE MESSAGE THAT SAYS A SERVICE DIED, DISCARDED. The supervisor's queue is
+                    // 16 deep and a storm can fill it, so this will happen - the kernel must not block
+                    // on a userspace queue. What it must not do is stay quiet: the service comes back
+                    // only when the periodic reconcile sweep notices, tens of seconds later, and
+                    // without this line that delay has no stated cause.
+                    //
+                    // Rate-limited to the first and then every 64th, because a storm that drops one
+                    // notification drops many, and a per-drop line would flood the very channel the
+                    // warning has to be read on.
+                    crate::ipc::routing::Enqueue::QueueFull => {
+                        let n = DEATH_NOTIFY_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 64 == 0 {
+                            crate::kprintln!(
+                                "kernel: death notification for '{}' DROPPED - supervisor queue full ({} so far); it will be respawned by the reconcile sweep, not promptly",
+                                task_name, n);
+                        }
+                    }
                 }
             }
         }

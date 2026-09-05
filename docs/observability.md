@@ -482,9 +482,26 @@ is discarding the one message that says a service died and never mentioning it -
 53-second storage outage with no stated cause, and the log blames a reconcile sweep for a failure that
 happened somewhere else entirely.
 
-The smallest honest fix is a counter and a line, not a redesign: count drops on that path and report
-them, so a slow recovery names its own reason. That is a kernel edit and therefore re-verification, so
-it is recorded rather than taken unilaterally.
+**FIXED 2026-09-05.** `enqueue_from_interrupt` no longer returns `Option<usize>` - which could not
+distinguish "delivered to a receiver that was not blocked" from "dropped on the floor" - but an
+`Enqueue` enum with an explicit `QueueFull`. The death-notification path reports it:
+
+```text
+kernel: death notification for 'time' DROPPED - supervisor queue full (1 so far);
+        it will be respawned by the reconcile sweep, not promptly
+```
+
+Rate-limited to the first and then every 64th, because a storm that drops one drops many and a
+per-drop line would flood the channel the warning has to be read on. The IRQ path, which already
+reserves half the queue so this cannot happen, says it ONCE if it ever does - an impossible case that
+turns out to be possible is worth hearing the first time.
+
+The behaviour is unchanged: the kernel still drops, because it must not block on a userspace queue.
+What changed is that a 53-second outage can now name its own cause.
+
+Proven to fire rather than assumed. QEMU's chaos never fills that queue, so the natural condition was
+not reproducible locally - the success arm was temporarily routed into the drop arm, the message was
+observed once with the count, and the patch reverted (0 occurrences after, 172/0 either way).
 
 ---
 

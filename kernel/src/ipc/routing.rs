@@ -531,21 +531,58 @@ pub fn take_call_waiter(dead_ep: EndpointId) -> Option<usize> {
 ///
 /// Returns the blocked receiver slot if a task was waiting on `recv`, so the
 /// caller can call `scheduler::wake_by_slot` (which handles the cross-core IPI).
-pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usize> {
+/// What became of a kernel-originated enqueue. `Option<usize>` could not say, which is the point.
+///
+/// This used to return `Option<usize>` - "the slot to wake, if one was blocked" - and swallow the
+/// enqueue result with `.ok()`. A full queue was therefore INDISTINGUISHABLE from a successful delivery
+/// to a receiver that was not blocked, so a dropped message left no trace at all.
+///
+/// That cost a Pi 4 its storage for 53 seconds: a death notification for `xhci` was dropped, the
+/// supervisor never heard, `block-driver` could not resolve the name, and `fs` sat degraded until the
+/// periodic reconcile sweep noticed. The run dropped 138 notifications and said nothing about any of
+/// them, so the log blamed a reconcile sweep for a failure that happened somewhere else.
+///
+/// DROPPING IS NOT THE DEFECT and this does not change it: the kernel must never block on a userspace
+/// queue, and a bounded queue must discard something (§26.6). Being silent about it is (invariant 12).
+pub enum Enqueue {
+    /// Queued, and this slot was blocked awaiting it - wake it.
+    Woke(usize),
+    /// Queued; nobody was waiting.
+    Queued,
+    /// No such endpoint, or it is Dead. Not a loss: there is nobody to deliver to.
+    NoEndpoint,
+    /// DROPPED - the endpoint's queue was full. A real loss, and the caller must say so.
+    QueueFull,
+}
+
+pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Enqueue {
     let mut table = TABLE.lock_irq();
-    let idx = find_index(&*table, endpoint)?;
+    let idx = match find_index(&*table, endpoint) {
+        Some(i) => i,
+        None => return Enqueue::NoEndpoint,
+    };
 
     if table[idx].liveness == EndpointLiveness::Dead {
-        return None;
+        return Enqueue::NoEndpoint;
     }
 
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        table[idx].queue.enqueue(msg).ok();
-        return Some(slot);
+        // A blocked receiver implies an empty queue, so this cannot fail - but if it ever did, putting
+        // the receiver back matters: taking it and then not queueing anything would leave a task
+        // blocked forever with nothing coming.
+        return match table[idx].queue.enqueue(msg) {
+            Ok(()) => Enqueue::Woke(slot),
+            Err(_) => {
+                table[idx].blocked_receiver = Some(slot);
+                Enqueue::QueueFull
+            }
+        };
     }
 
-    table[idx].queue.enqueue(msg).ok();
-    None
+    match table[idx].queue.enqueue(msg) {
+        Ok(()) => Enqueue::Queued,
+        Err(_) => Enqueue::QueueFull,
+    }
 }
 
 /// Kernel-originated delivery that applies BACK-PRESSURE instead of dropping.

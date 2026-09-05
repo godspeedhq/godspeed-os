@@ -160,13 +160,30 @@ pub unsafe fn deliver(irq: u8) {
         //
         // (The EOI below still fires unconditionally, on every path.)
         const IRQ_NOTIFY_RESERVE: u8 = (crate::ipc::queue::QUEUE_DEPTH / 2) as u8;
+        static IRQ_DROP_SAID: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
         if crate::ipc::routing::endpoint_queue_depth(ep) < IRQ_NOTIFY_RESERVE {
             let msg = crate::ipc::message::Message::interrupt_event(irq);
-            if let Some(receiver_slot) = crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
+            match crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
                 // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
                 // to its core if it lives on a different core than the one handling
                 // this IRQ (§12.2 cross-core delivery path).
-                crate::task::scheduler::wake_by_slot(receiver_slot, 0);
+                crate::ipc::routing::Enqueue::Woke(receiver_slot) => {
+                    crate::task::scheduler::wake_by_slot(receiver_slot, 0);
+                }
+                crate::ipc::routing::Enqueue::Queued
+                | crate::ipc::routing::Enqueue::NoEndpoint => {}
+                // Should be unreachable: the depth guard above reserves half the queue precisely so
+                // this cannot happen. Said ONCE if it ever does, because a silently lost interrupt is
+                // a driver that stops for no visible reason - and an impossible case that turns out to
+                // be possible is worth hearing about the first time, not the hundredth.
+                crate::ipc::routing::Enqueue::QueueFull => {
+                    if !IRQ_DROP_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                        crate::kprintln!(
+                            "kernel: IRQ {} to endpoint {} DROPPED - queue full despite the reserve; the driver missed an interrupt",
+                            irq, ep.0);
+                    }
+                }
             }
         }
     }
