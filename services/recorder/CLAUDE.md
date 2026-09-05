@@ -90,7 +90,7 @@ assert the whole line.
 
 ## OPEN: `events persist status` occasionally reads as a short reply
 
-Seen once, in QEMU, and not reproduced in the run immediately after:
+Seen TWICE now, both in QEMU, each time not reproducing on the next run (2026-09-05, 2026-09-06):
 
 ```
 > events persist status | assert contains rotations
@@ -104,6 +104,11 @@ therefore a LATE reply matched to a later call: `request_with_reply_deadline` de
 cap and removes it on timeout, so a reply that arrives after its call gave up can land on a reused
 slot. `call_deadline` correlates by reply cap, which rules out the plain-recv hazard the CLAUDE.md
 CallDeadline amendment describes, but not slot REUSE.
+
+The second sighting sharpened the shape: `rotations` passed and `covers` - the VERY NEXT call -
+returned short, exactly as the first time. Consecutive identical requests, one good then one short,
+is what a reply stream offset by one looks like, which fits the late-reply hypothesis better than a
+malformed status ever could.
 
 Recorded rather than fixed, per 26.7: it is one observation, the mechanism is unproven, and the fix
 would touch the reply-cap lifetime that every service's request/reply rides on. Reproducing it under

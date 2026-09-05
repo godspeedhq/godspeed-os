@@ -260,8 +260,33 @@ static RESOLVE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// (a service with no row is indistinguishable from a dead one).
 #[inline]
 pub fn set_sink_slot(slot: u32) {
-    TRACER_SLOT.store(slot, Ordering::Relaxed);
+    let prev = TRACER_SLOT.swap(slot, Ordering::Relaxed);
     RESOLVED.store(slot != u32::MAX, Ordering::Release);
+    if slot != u32::MAX && prev != slot {
+        SINK_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Set when the sink slot changes to a live one - a first resolve, or a reacquire after the sink
+/// restarted. Consumed by the first emission that follows.
+static SINK_CHANGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True ONCE after the sink changed, then false until it changes again.
+///
+/// A restarted sink starts EMPTY, and a publisher on an interval does not fill it again until its
+/// next boundary - up to 64 messages for `msgs.received`. For a quiet service that is a long time to
+/// have no row, and a service with no row is indistinguishable from a dead one, which is the single
+/// question this metric answers. 14.3 says a client reacquires AND re-establishes what hung off the
+/// old instance; a counter the new sink has never seen is exactly that.
+///
+/// Cheap on the hot path: a relaxed LOAD on the common (unchanged) call, and the swap only in the
+/// rare tick that follows a restart.
+#[inline]
+pub fn take_sink_changed() -> bool {
+    if !SINK_CHANGED.load(Ordering::Relaxed) {
+        return false;
+    }
+    SINK_CHANGED.swap(false, Ordering::Relaxed)
 }
 
 /// Number of resolution attempts that MISSED. Read only to report a late resolve (see

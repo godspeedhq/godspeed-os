@@ -880,7 +880,13 @@ impl ServiceContext {
         // is indistinguishable from one that is dead, which is precisely the question this metric exists
         // to answer. Observed: `block-driver`, `time`, `xhci`, `ehci` and `dwc2` all absent from a
         // healthy machine. One extra send per service for the life of the machine.
-        if n == 1 || n % PUBLISH_EVERY == 0 {
+        // ...OR THE SINK JUST CAME BACK. A restarted sink has never heard of this service, and
+        // waiting out the interval leaves it looking dead for up to 63 more messages - on a service
+        // that only receives when someone else does I/O, that is however long the machine stays
+        // quiet. Republishing on the first message after a reacquire is the metric half of "reacquire
+        // and re-establish" (14.3). Observed: `block-driver` had no row for the whole window after a
+        // chaos storm restarted the sink, purely because its next 64th message had not arrived.
+        if n == 1 || n % PUBLISH_EVERY == 0 || crate::trace::take_sink_changed() {
             self.metric("msgs.received", n);
         }
     }
