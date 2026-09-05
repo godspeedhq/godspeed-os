@@ -1312,7 +1312,25 @@ impl ServiceContext {
             // retried for another whole interval - and after a sink restart that meant TWO intervals
             // with no row for that service at all. A service with no row is indistinguishable from a
             // dead one, which is the single question this metric exists to answer.
-            if self.reacquire_by_name(crate::trace::SINK_NAME) {
+            // THE FAILING BRANCH IS NAMED, NOT COLLAPSED TO A BOOL. This used to be
+            // `if reacquire_by_name(..)`, so a reacquire that FAILED did nothing and said nothing -
+            // the sample was dropped and the service simply stopped publishing, with no symptom but a
+            // row that never appeared. The three causes are not alike and the difference is the whole
+            // diagnosis: NameNotRegistered is transient (the sink is mid-restart, try again next
+            // interval), while CapTableFull is TERMINAL until this service restarts - it will never
+            // publish again, and that deserves to be said out loud once rather than discovered as an
+            // absence. Invariant 12, and 26.7's "a recovery that itself fails is still a failure".
+            static ACQ_FAILED_SAID: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            let acq = self.reacquire_cap_detail(crate::trace::SINK_NAME);
+            if let Err(why) = acq {
+                if !ACQ_FAILED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    self.log_fmt(format_args!(
+                        "sdk: cannot reacquire the events sink ({}) - metrics from this service stop here",
+                        why.reason()));
+                }
+            }
+            if acq.is_ok() {
                 if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
                     crate::trace::set_sink_slot(fresh);
                     // A RETRY THAT STILL FAILS IS ITS OWN OUTCOME (26.7): the reacquire worked, so
