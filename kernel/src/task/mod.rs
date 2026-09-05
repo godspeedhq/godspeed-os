@@ -1962,8 +1962,14 @@ fn spawn_service_with_image(
                 ),
             }
         } else {
+            // The DECLARATION is still recorded below, so this is a delay rather than a life
+            // sentence. It did not used to be: the name was dropped here along with the cap, and
+            // `AcquireSendCap` - which authorises a reacquire only for a declared name - then refused
+            // this service its peer forever. Saying "will reacquire" is the difference between a
+            // line that reports a transient wiring gap and one that reported a permanent break
+            // without knowing it.
             crate::kprintln!(
-                "task: peer '{}' not yet registered, no SEND cap for '{}'",
+                "task: peer '{}' not yet registered, no SEND cap for '{}' (declared - will reacquire)",
                 peer_name, name
             );
         }
@@ -2287,6 +2293,28 @@ fn spawn_service_with_image(
                     if let Ok(nm) = core::str::from_utf8(&peer_data[i].2[..l.min(PEER_NAME_BYTES)]) {
                         names[nn] = nm; nn += 1;
                     }
+                }
+                // AND EVERY DECLARED PEER THAT COULD NOT BE WIRED. `peer_data` holds only the peers
+                // whose names RESOLVED at this instant, so recording just those conflated two
+                // different things: what this service is allowed to talk to (a contract fact, fixed
+                // for its lifetime) and who happened to be running when it spawned (an accident of
+                // scheduling). A peer that was down for the 47 ms of this spawn was therefore never
+                // recorded as declared - and since `AcquireSendCap` authorises a reacquire only for a
+                // DECLARED name, that service could never reach that peer again. Not "until the peer
+                // came back": never, for the life of the instance.
+                //
+                // Measured on the T630: `fs` spawned 47 ms before `block-driver` during a chaos storm,
+                // came up with no declaration for it, and answered every file operation with "storage
+                // unavailable" for the rest of the boot while `block-driver` sat idle beside it having
+                // received one message. 113 failures, one dropped string.
+                //
+                // 14.3 is explicit that a client reacquires a restarted peer; denying the declaration
+                // denies the recovery the constitution promises. The CAP is legitimately absent here -
+                // there was nothing to mint one from - but the DECLARATION is not the kernel's to drop.
+                for &pn in send_peers {
+                    if nn >= MAX_SEND_PEERS { break; }
+                    if pn.is_empty() || names[..nn].iter().any(|&n| n == pn) { continue; }
+                    names[nn] = pn; nn += 1;
                 }
                 scheduler::set_task_peers(task_slot, &names[..nn]);
             }
