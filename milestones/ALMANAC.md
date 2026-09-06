@@ -50,11 +50,17 @@
 - [2026-07-25 - The day the second architecture stopped being a demonstration](#2026-07-25---the-day-the-second-architecture-stopped-being-a-demonstration)
 - [2026-07-27 - The day a stick swap ended the hunt, and the recovery earned its keep](#2026-07-27---the-day-a-stick-swap-ended-the-hunt-and-the-recovery-earned-its-keep)
 - [2026-07-31 - The day I learned what my instruments could not see](#2026-07-31---the-day-i-learned-what-my-instruments-could-not-see)
+- [2026-08-09 to 2026-08-12 - The day the kernel gave up the USB stack, and then gave up the choice](#2026-08-09-to-2026-08-12---the-day-the-kernel-gave-up-the-usb-stack-and-then-gave-up-the-choice)
+- [2026-08-17 to 2026-08-29 - The day the terminal left the kernel, and I learned what earns ring 0](#2026-08-17-to-2026-08-29---the-day-the-terminal-left-the-kernel-and-i-learned-what-earns-ring-0)
+- [2026-09-03 to 2026-09-04 - The day the kernel stopped interpreting the bus](#2026-09-03-to-2026-09-04---the-day-the-kernel-stopped-interpreting-the-bus)
+- [2026-09-05 to 2026-09-06 - The day five bugs stood in a line, each hiding the one behind it](#2026-09-05-to-2026-09-06---the-day-five-bugs-stood-in-a-line-each-hiding-the-one-behind-it)
+- [2026-09-06 - The day the second core stopped being an answer](#2026-09-06---the-day-the-second-core-stopped-being-an-answer)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
   - [2026-06-28 - The day my own test lied to me](#2026-06-28---the-day-my-own-test-lied-to-me)
   - [2026-07-25 - The day I tuned against a number the disk was writing](#2026-07-25---the-day-i-tuned-against-a-number-the-disk-was-writing)
+  - [2026-09-06 - The day I read a zero that had never been measured](#2026-09-06---the-day-i-read-a-zero-that-had-never-been-measured)
 - [The Named Bugs - the teachers](#the-named-bugs---the-teachers)
 
 ---
@@ -818,7 +824,180 @@ the pressure of a failure I had misattributed.
 
 ---
 
+## 2026-08-09 to 2026-08-12 - The day the kernel gave up the USB stack, and then gave up the choice
+
+`kernel/src/arch/aarch64/xhci.rs` was 2,742 lines of ring-0 code parsing descriptors supplied by
+whatever someone had plugged in. It worked. It had driven a keyboard and a disk on a Raspberry Pi 4
+for weeks. On this day it was deleted, and the `xhci` SERVICE drove the controller instead - through
+an MMIO capability and a DMA arena granted at spawn, reaching the console through `CONSOLE_PUSH`,
+serving storage over the block protocol `block-driver` already spoke. The kernel's entire remaining
+involvement with USB became establishing that the controller is present and saying so.
+
+The move was done behind a feature flag first, so both drivers could exist while the service was
+proven on hardware. Then the flag was deleted too, and that second deletion is the part worth
+remembering.
+
+**What I came to understand:** a flag that selects between a compliant kernel and a non-compliant one
+does not resolve the violation, it *stores* it. As long as `usb-via-xhci` existed, there was a build
+of GodspeedOS in which the kernel drove USB - one flag away, and Commandment I was satisfiable rather
+than satisfied. It was also a genuine footgun: the flag had to reach three crates, and setting some
+of them gave two drivers on one controller, or none, with every half booting fine alone.
+
+And I had to be precise about what the move actually bought, because the milestone is real but
+narrower than "Commandment I closed" sounds. The Pi 4 has no SMMU wired up: `confine_device` returns
+`false`, and the service is granted its controller's BAR plus a DMA arena including its physical
+base. So it can still point the controller's DMA anywhere, which is kernel-equivalent reach by the
+same rule that governs an unconfined x86 driver. The honest statement is: **a buggy USB driver on the
+Pi 4 is now bounded; a compromised one is still kernel-equivalent.** What closed was the accident
+surface - ring-0 descriptor parsing became a restartable service - and the ambient authority, since
+the service holds only what its contract grants. The trust posture is unchanged until an SMMU
+confines the device, and saying otherwise would have been the nicer sentence and the wrong one.
+
+---
+
+## 2026-08-17 to 2026-08-29 - The day the terminal left the kernel, and I learned what earns ring 0
+
+Two more evictions, on the port with the least room for them. `arch/arm/dwc2.rs` - the whole ARM32 USB
+stack, keyboard and networking and mass storage - became `services/dwc2`, driven by a real device
+interrupt rather than the core-0 timer tick. And `kernel/src/fbcon`, 1,172 lines of terminal
+emulation, became `services/console`: the ANSI/CSI state machine, the UTF-8 decoder, the shadow grid,
+the cursor, scrolling, reverse video, all of it out.
+
+What stayed behind cannot format, cannot position, and cannot scroll. Reaching the bottom of the
+screen clears it and starts again at the top.
+
+**What I came to understand:** the test for ring-0 residency is not "is this important" or "is this
+hard to do elsewhere". It is **impossibility**. A panic halts every core, including the `console`
+service, so a panic cannot ask a service to report it - the kernel must be able to say the machine
+died using only itself. Boot output has the same shape: it precedes every service, including the one
+that would render it. That argument justifies exactly a bounded blit and not one line more. Rendering
+a shell prompt is policy; a display driver is anti-scope by name. The operator control channel had
+asked for ring-0 residency earlier and failed this same bar, which is how I knew the bar was real and
+not built to fit what I already wanted to keep.
+
+The evictions also made honest a claim that had been quietly arch-specific. The logging floor said the
+kernel writes to "the serial console", which is always true on a PC and false on a Pi wired to a TV. A
+kernel that can only speak to a port it does not have is mute, and a boot failure on that machine was
+a frozen screen with no reason on it.
+
+---
+
+## 2026-09-03 to 2026-09-04 - The day the kernel stopped interpreting the bus
+
+The kernel held a table of what every device class was: which BAR, which IRQ, which BDF, per class,
+sixteen of them. A driver was spawned because the kernel knew what an xHCI was. By the end of D3 the
+supervisor owned the images and a driver named a device *class code*, which the kernel resolved from
+a table it holds no opinion about. `service_config` rows went 222 to 2. Embedded images went 30 to 1.
+Per-class device statics went 16 to 0.
+
+Four bugs surfaced during it, each found by an instrument built for a different one: an `fs` reply
+desync, a `block-driver` "no disk" latch, an xHCI port-status misattribution, and an arm32 serial
+splice that was corrupting the very evidence being used to chase the other three.
+
+**What I came to understand:** "the kernel is mechanism, not policy" is easy to agree with and hard to
+notice breaking. Not one of those sixteen statics arrived as a policy decision. Each arrived as one
+more small fact the kernel happened to know, and the aggregate was a kernel with opinions about PCI.
+The question that catches this is not "is this policy?" - nobody ever answers yes - but "does the
+kernel have to *interpret* anything here, or can it be handed the answer?"
+
+---
+
+## 2026-09-05 to 2026-09-06 - The day five bugs stood in a line, each hiding the one behind it
+
+`logger` became `events`, which was the name catching up with the job: it had held the IPC trace ring
+since tracing shipped and had never held a log line in its life. Then it grew metrics and a log
+window, and `recorder` grew beside it to put a capture on disk. Ordinary feature work.
+
+Then the hardware disagreed, five times, and every disagreement presented identically: **a row that
+simply was not there.**
+
+1. The sink was reacquired on send failure - and the sample that triggered the reacquire was dropped.
+2. A missed resolve latched forever, because `u32::MAX` was read as "this service holds no sink cap",
+   a permanent fact, when it is also what a service sees if the sink happens to be mid-restart at its
+   first emission.
+3. **The kernel dropped the peer DECLARATION** when a declared peer was down at spawn. Not the
+   capability - the declaration. `AcquireSendCap` authorises a reacquire only for a declared name, so
+   a service spawned during the 47 milliseconds its peer was restarting could never reach that peer
+   again, for the life of the instance. It cost `fs` its disk and produced 113 failures in one run,
+   with storage reported unavailable while `block-driver` sat idle beside it having received exactly
+   one message.
+4. A capless publisher never *asked* for a capability, because the reacquire that would have fixed it
+   sat behind a send failure - and a send that never happens never fails.
+5. Liveness waited out its 64-message interval after a restart, so a quiet service read as dead.
+
+**What I came to understand:** the third is a violation of the restart contract, in the kernel, and it
+had been there the whole time. The constitution promises a client can reacquire a restarted peer; a
+scheduling accident of 47 milliseconds silently revoked that promise for the life of a service. It was
+findable only because an error message, added mid-investigation for an unrelated reason, distinguished
+"refused" from "the name does not resolve" - two words apart, and the whole diagnosis hung on them.
+
+The shape they share is the lesson, and it generalises well past observability: **a recovery path that
+only runs on failure cannot recover a component that never gets far enough to fail.** Four of the five
+were a version of that. If a thing recovers only when it errors, ask what happens to the one that
+never starts.
+
+---
+
+## 2026-09-06 - The day the second core stopped being an answer
+
+Several times, a scheduling or liveness problem had been answered by moving a service to a different
+core. That is not a fix; it is a workaround that depends on a second core existing to absorb the
+fault. So the absorber was taken away: one core, on a Raspberry Pi 4 that has four.
+
+It survived. Three clean self-checks, a hundred rounds of Maximum Carnage, 611 kills, 500 endpoint
+floods, zero panics, zero liveness wedges. The cost was **1.6x slower for 4x fewer cores**, which is
+what a synchronous-IPC microkernel should cost when most services are blocked on `recv` most of the
+time. Predictable degradation, no correctness cliff.
+
+The experiment found something on its first boot, before any of that. The compiler said it without
+being asked:
+
+```
+warning: struct `PlacementInvalid` is never constructed
+```
+
+The placement rule promises that a contracted core which is unavailable *rejects the spawn*, with the
+rationale spelled out: silently rerouting would be exactly the kind of reinterpretation a capability
+system is designed to forbid. It had never been enforced. `xhci` declares core 2 and started on core 0
+without a word, on every machine, for the entire life of the project.
+
+**What I came to understand:** every conclusion ever drawn from "it works on core N" rested on a fact
+the kernel never checked. Those placement lines have been decorative. That is worse than a missing
+feature - it is a silent fallback at the kernel boundary, which the contribution rules list as an
+automatic rejection - and what makes it instructive rather than merely wrong is that the *type
+existed*. `PlacementInvalid` was defined, `resolve()` named it in its signature, and nothing ever
+constructed one. The shape of enforcement was in place without the enforcement, which is the most
+convincing way for a guarantee to be absent.
+
+---
+
 ## The Days I Was Wrong
+
+### 2026-09-06 - The day I read a zero that had never been measured
+
+Chasing why a service had stopped publishing metrics, I added an instrument: a one-shot line that
+would say so if the sink had been resolved late. The hardware run came back and the line was not
+there. I reported that as evidence - *"resolved LATE: 0, so the latch was never the cause"* - and
+moved the investigation somewhere else on the strength of it.
+
+The instrument had no call site. The edit that added it had two halves; the first landed in
+`trace.rs`, the second hit an assertion error and never wrote, and I re-ran only the other half. The
+helper compiled, was public, and was called by nothing. The zero was not a measurement of a healthy
+system. It was not a measurement at all.
+
+**What I came to understand:** a missing instrument reads *exactly* like a healthy one. Both produce
+silence, and silence is what I was treating as information. Every other kind of broken tool announces
+itself - a test that cannot compile, a check that errors - but an instrument that was never wired in
+returns the same thing a passing system does, and it returns it confidently.
+
+The habit that comes out of it is small and mechanical: after adding a report, verify the CALL SITE
+exists, not that the helper compiles. `grep -c` for the caller, in the same breath as writing it. I
+already knew to distrust a number I had not earned; what I had not internalised is that **an absence
+is a number too**, and it needs earning in the same way.
+
+There is an uncomfortable second half. It cost a hardware round-trip, which is the user's time and not
+mine, and I had reported the conclusion with more confidence than the evidence carried. The correction
+was mine to make and I made it in the next message - but the run was already spent.
 
 ### 2026-07-27 - The day I almost rewrote the world to fix a dodgy part
 
