@@ -134,9 +134,21 @@ BUS - freezing every core... the log died between `halted` and `done`".
 
   - **With `ehci` spawned:** the machine reboot-loops during USB bring-up. Three boots, dying at a
     varying point in the xHCI reset - `reset: entering` once, `reset: halted` twice.
-  - **With `ehci` NOT spawned:** it boots, and selfcheck plus 100 chaos rounds pass clean. But
-    **typing on the USB keyboard reboots it, while typing on serial does not** - the sharpest
-    discriminator available, and it points at the xHCI HID/interrupt path rather than at reset.
+  - **With `ehci` NOT spawned:** it boots, and selfcheck plus 100 chaos rounds pass clean (driven
+    from serial). Typing on the USB keyboard reboots it; typing on serial does not.
+
+    **That second symptom is an ARTIFACT OF THE BISECT, not a single-core finding**, and the
+    correction matters more than the observation. The T630's back sockets are wired to the EHCI
+    controller, not the xHCI - `services/ehci/src/main.rs` says so in its own header, and the run
+    confirms it: `xhci: no HID keyboard/mouse on any port`, all eight ports `connected=0`. Removing
+    the `ehci` service removed the driver for the controller the keyboard is plugged into, so the
+    firmware's legacy USB keyboard emulation still owned it. Every keystroke then enters a BIOS SMM
+    handler that does DMA on a device behind an IOMMU we have since switched on (`translation ON`),
+    for a controller whose BIOS ownership handoff this driver has never performed (`eecp=0xa0` is
+    present; the code calls handoff future work). A silent platform reset is an unsurprising outcome.
+
+    So the bisect answered its question - `ehci` IS implicated in symptom one - and introduced a
+    second symptom of its own. It says nothing about the xHCI HID path, which never saw a device.
 
   RULED OUT, so nobody re-derives them: not `ehci` interleaving during xhci's CNR window (`spin()`
   does not yield, so nothing else runs there); not an uninitialised schedule pointer (HCRESET
@@ -144,8 +156,12 @@ BUS - freezing every core... the log died between `halted` and `done`".
   multi-core). NOT explained: why one core differs at all, when four cores run both drivers genuinely
   simultaneously, which should be worse. Three theories were tried and none survived.
 
-  A weak correlation was also tested and REJECTED: `observe-now` being killed appeared before two
-  reboots, but it was killed five times and survived three.
+  A correlation was tested, rejected, and then RE-READ correctly. `observe-now` being killed appeared
+  before two reboots but was killed five times, so it is not causal - that much was right. What the
+  rejection missed is WHY it correlated at all: `observe` is a full-screen view you quit with a
+  KEYPRESS, so its death usually follows a keystroke. The two are both downstream of the real
+  variable, which the operator had identified from the start. A correlation that fails is worth one
+  more question - what are these two things both downstream of - before it is filed away.
 
 ## Next steps, in order
 
