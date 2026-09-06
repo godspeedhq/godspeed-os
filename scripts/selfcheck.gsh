@@ -727,6 +727,16 @@ assert fails-with FileNotFound read /sc/missing.txt
 # reached the reacquire path. `fs` did exactly that on the T630 - six rows before the storm, zero for
 # the rest of the boot. These three rows existing AFTER the sink was deliberately killed is the proof
 # that a publisher recovers rather than dying quiet.
+# DRIVE THE TRAFFIC THESE ROWS ARE MADE OF, immediately before asserting them. A row appears when
+# its owner RECEIVES something, so asserting one for a service that happens to be idle is asserting
+# a coin flip. `block-driver` only receives when `fs` touches the disk, and after a chaos storm has
+# restarted the sink there is no guarantee anything has since. Observed exactly once in four runs on
+# a single-core Wyse - the rarest kind of failure to chase and the easiest to remove.
+#
+# A write and a read back is one round trip through fs to block-driver and back, so by the next line
+# both have received something since the sink last restarted. Deterministic, not hopeful.
+write /sc/mrow.txt row
+read /sc/mrow.txt | assert contains row
 events metrics | assert contains blk.outages
 events metrics | where owner contains block-driver | assert contains msgs.received
 events metrics | where owner contains fs | assert contains msgs.received
