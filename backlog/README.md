@@ -52,6 +52,7 @@ direction.
 | [7](07-events-remote-sink.md) | `events persist start <url>` - ship a capture off-box | Feature | - |
 | [8](08-d3-assignment-vs-reenumeration.md) | D3: the assignment/re-enumeration split, and "cost 2" | Design decision | the D3 gate |
 | [9](09-constrained-targets-and-sizing.md) | Constrained targets: boot-size the arenas (~22 MiB of .bss), and what really blocks a microcontroller | Design question | any small-memory port |
+| [10](10-ipc-efficiency.md) | IPC cost: fewer ROUND TRIPS, not a tighter protocol - batching, co-location, and the fixed 4 KiB message | Performance | the hot paths |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.

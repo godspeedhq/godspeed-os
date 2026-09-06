@@ -1,6 +1,7 @@
 # IPC efficiency - backlog
 
-**Status:** backlog. Nothing here is built. Recorded because the cost it addresses grows with every
+**Status:** tracked as [`backlog/10-ipc-efficiency.md`](../backlog/10-ipc-efficiency.md) - the status
+lives there, the reasoning lives here. Nothing here is built. Recorded because the cost it addresses grows with every
 step of §4.4's kernel-shrinking work, and the decisions are easier to make before a hot path depends
 on them.
 
