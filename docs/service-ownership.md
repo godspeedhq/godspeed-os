@@ -775,6 +775,8 @@ all" - a rule PCI does not have and Intel chipsets routinely break.
 So the gate D3 was waiting on is OPEN: the two walks agree on every machine available, which is what
 "record, cross-check, and only then switch over" asked for. What remains for D3 is design, not data -
 see the assignment/re-enumeration split below, and cost 2, which is still unresolved.
+Tracked as open work in [`backlog/08-d3-assignment-vs-reenumeration.md`](../backlog/08-d3-assignment-vs-reenumeration.md);
+the reasoning stays here, the status lives there.
 
 The Wyse also produced a false `NIC ... DISAGREES` on a machine whose networking was perfect: the
 cross-check compared `bar[0]` against a BAR_AUTO-resolved address, which asks whether BAR0 equals BAR2

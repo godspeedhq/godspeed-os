@@ -83,15 +83,9 @@ the sink comes back. `docs/observability.md` §13 is the full account and the ru
 
 ## Still not implemented
 
-*(Tracked as [`backlog/06-kernel-ring-not-drainable.md`](../../backlog/06-kernel-ring-not-drainable.md).)*
-
-`ctx.drain_kernel_ring_buffer()` is a **no-op stub** and no syscall exposes the kernel's 16 KiB ring to
-userspace. That is why `events log` begins when `events` does. Draining it would need a new
-`InspectKernel` query - kernel growth, for a diagnostic - so it is recorded here rather than built
-(§26.2, and the three-part test in `docs/observability.md` §6).
-
-*(The other two items this section used to list have shipped: services do now deliver a log payload
-over IPC, and captures are appended to a file - by `recorder`.)*
+`ctx.drain_kernel_ring_buffer()` is a no-op stub, so `events log` begins when this service does.
+Tracked, with the reasoning and the cost, in
+[`backlog/06-kernel-ring-not-drainable.md`](../../backlog/06-kernel-ring-not-drainable.md).
 
 ## Supervisor retry (§11.3)
 
@@ -99,16 +93,8 @@ The **supervisor** spawns `events` (init was removed, Phase 5) and retries once 
 falls back to the kernel ring buffer meanwhile. It is not TCB, so a spawn failure does not panic the
 kernel.
 
-## TODO: per-core kernel log buffers (post-v1 / post-BP2)
+## Kernel log contention
 
-Current `kprintln!` uses a kernel-side `SpinLock` + synchronous UART write. Under heavy diagnostic load multiple cores contend for the lock and busy-wait on the UART FIFO.
-
-Proposed architecture:
-- **Kernel side**: static per-core ring buffers (e.g. 4 KiB each) in BSS. `kprintln!` writes to the calling core's own buffer (SPSC - no lock needed). If the buffer is full, increment a per-core `dropped_log_count` and discard.
-- **Drain**: new `ReadKernelLog(core_id)` syscall returns buffered bytes for that core. Events polls all cores via this syscall and writes to UART.
-- **Panic path**: keep a `panic_serial_direct()` that bypasses the buffer and writes raw to COM1 (the halting core retakes UART ownership).
-- **Ordering**: logs from different cores may appear out of order. Add a TSC timestamp per entry if post-hoc ordering is needed.
-
-Benefits: eliminates cross-core SpinLock contention on the kernel log path; UART is owned by a single writer; dropped-log counter makes buffer pressure visible.
-
-Work estimate: ~200-300 lines across `kernel/src/log.rs`, `kernel/src/syscall/dispatch.rs`, and `services/events/src/main.rs`.
+`kprintln!` holds a kernel-side `SpinLock` across a synchronous UART write, which is what makes log
+lines splice into each other under load. The problem, its evidence and the proposed
+per-core-buffer design are in [`backlog/04-serial-splice.md`](../../backlog/04-serial-splice.md).
