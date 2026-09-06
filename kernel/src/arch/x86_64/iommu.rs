@@ -292,29 +292,6 @@ static DEV_TABLE_VA: AtomicU64 = AtomicU64::new(0);
 static CMD_BUF_PHYS: AtomicU64 = AtomicU64::new(0);
 static EVENT_LOG_PHYS: AtomicU64 = AtomicU64::new(0);
 
-/// DTE word 2, bits [61:60] - `IntCtl`, the disposition of fixed/arbitrated interrupts the IOMMU
-/// intercepts from this device. `01b` = FORWARD UNREMAPPED: the interrupt is delivered as the device
-/// sent it, unchanged.
-///
-/// This word used to be written as zero, which is `IntCtl = 00b` - and 00b is not "no opinion", it is
-/// TARGET ABORT. With `CTRL_IOMMU_EN` set the IOMMU is in the path of every device interrupt MESSAGE
-/// (an MSI is a memory write to 0xFEEx_xxxx, so it is translated like any other), so a zeroed word 2
-/// silently dropped the MSIs of every device behind this IOMMU.
-///
-/// The T630 showed it as an asymmetry no other explanation fit: its xHCI is the machine's ONLY MSI
-/// device and also its only confined device, and reported `0 MSI` across five minutes and 592 passes
-/// while its EHCI - which has no MSI capability and takes legacy INTx through the IOAPIC, so it is
-/// not a device memory write and never reaches this field - woke on every keystroke. Same core, same
-/// keyboard, opposite behaviour.
-///
-/// **This does not weaken DMA confinement, which is the §6.4 guarantee and §22 Test 12's subject.**
-/// `IntCtl` governs interrupt disposition only; the I/O page-table root and the IR/IW permissions in
-/// word 0 are untouched, so a confined device still reaches only its granted arena. Forwarding is the
-/// honest setting for a kernel that does not implement an interrupt remapping table: remapping (`10b`)
-/// would require an IRTE per vector, which is real machinery and not a constant, and is not something
-/// to fake with a value whose meaning we did not choose.
-const DTE_INTCTL_FORWARD: u64 = 1 << 60;
-
 /// Write one DTE (`bdf`-th entry) in the device table at HHDM VA `dt_va`.
 ///
 /// # Safety
@@ -326,9 +303,7 @@ unsafe fn write_dte(dt_va: u64, bdf: u32, data0: u64, data1: u64) {
     unsafe {
         core::ptr::write_volatile(entry as *mut u64, data0);
         core::ptr::write_volatile((entry + 8) as *mut u64, data1);
-        // Word 2 carries IntCtl. Set for EVERY entry - passthrough and confined alike - because both
-        // sit behind an enabled IOMMU and both were dropping interrupts for the same reason.
-        core::ptr::write_volatile((entry + 16) as *mut u64, DTE_INTCTL_FORWARD);
+        core::ptr::write_volatile((entry + 16) as *mut u64, 0);
         core::ptr::write_volatile((entry + 24) as *mut u64, 0);
     }
 }
