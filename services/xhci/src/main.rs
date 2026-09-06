@@ -3963,7 +3963,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ~28 ms per wait) matches NEITHER the 10 ms repeat branch (100/sec) nor the 500 ms idle
             // branch (2/sec), and only 5.6 wakes/sec come from messages. Reading the code cannot say
             // which; counting can.
-            if repeat_armed { fast_waits = fast_waits.saturating_add(1); }
+            // Counted from the deadline ACTUALLY TAKEN, not from `repeat_armed` alone. Splitting on
+            // `repeat_armed` was right while it was the only fast branch; with the polling floor added
+            // it charged ~92 wakes/sec to "idle", and the T630 log read `5690 idle` for a driver
+            // running flat out at the tick. An instrument that reports the wrong mode is how a 500 ms
+            // input floor went unnoticed in the first place - it does not get to happen twice.
+            let wake_fast = repeat_armed || (polling && hid_needs_poll);
+            if wake_fast { fast_waits = fast_waits.saturating_add(1); }
             else { idle_waits = idle_waits.saturating_add(1); }
             //
             // `hid_needs_poll` is the third branch, and it is the one that makes this correct on a
@@ -3979,7 +3985,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // from then on. Interrupt-driven boards never set it and keep the 2-wakes/sec idle that
             // the power work bought; boards where MSI is silent - or is delivered but not for HID -
             // pay one slow keystroke, once, and are at the tick floor forever after.
-            let deadline = if repeat_armed || (polling && hid_needs_poll) {
+            let deadline = if wake_fast {
                 base
             } else if polling {
                 ctx.duration_cycles(HUB_POLL_MS)
