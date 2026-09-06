@@ -273,6 +273,7 @@ os/
     contract_check.py    #   every contract matches its kernel service_config
     unsafe_check.py      #   the unsafe audit matches the source
     doc_refs.py          #   no doc points at a file that does not exist
+    facts_check.py       #   a number a doc restates matches the code that owns it
     arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
 
   utilities/             # the SPEC for every shell utility, one file each (48)
@@ -1502,7 +1503,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 ```text
   ┌─────────────────────────────────────────────────────────────────────┐
   │  Foundation - must pass before anything else                        │
-  │  Identity (§22) - Tests 1-11 ✅ - Constitutional invariants        │
+  │  Identity (§22) - Tests 1-15 ✅ - Constitutional invariants        │
   └──────────────────────┬──────────────────────────────────────────────┘
           ┌──────────────┴─────────────────┐
           ▼                                ▼

@@ -395,8 +395,8 @@ pub fn cmd_build() {
     //
     // And the SUPERVISOR must be compiled after the services IT embeds, for the same reason one layer
     // down. It used to sit FIRST in this list, so every image this path wrote carried a supervisor
-    // holding the PREVIOUS build of all 22 services beside a current kernel - silently, because a
-    // stale file is not a missing one. That is the exact bug `scripts/embed_order_check.py` was
+    // holding the PREVIOUS build of every service it embeds beside a current kernel - silently,
+    // because a stale file is not a missing one. That is the exact bug `scripts/embed_order_check.py` was
     // written for on the Pi ports; it was here too, on the default path that `osdev run` and the
     // property/fuzz/chaos/stress suites all use.
     //

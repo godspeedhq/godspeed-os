@@ -57,6 +57,12 @@ jobs:
       - name: "Dash check (ASCII hyphen only, CLAUDE.md section 21)"
         run: python3 scripts/dash_check.py
 
+      - name: Doc reference check (no doc points at a file that does not exist)
+        run: python3 scripts/doc_refs.py
+
+      - name: Fact check (a number a doc restates must match the code that owns it)
+        run: python3 scripts/facts_check.py
+
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py
 
