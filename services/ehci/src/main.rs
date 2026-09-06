@@ -778,6 +778,11 @@ fn poll_devices(
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
+    // Was the current pass woken by our INTx? Set from the wait, read where a report is harvested.
+    let mut irq_this_pass = false;
+    // Proof that interrupts are not covering HID here, so the tick floor must be polled for.
+    let mut hid_needs_poll = false;
+    let mut hid_poll_noted = false;
     let mut sts_logged = false;                          // log when USBSTS first shows USBINT
     // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance, unlike
     // the coarse kernel tick), CALIBRATED to this machine's TSC rate so ~300 ms initial / ~50 ms
@@ -813,6 +818,7 @@ fn poll_devices(
                     // `reboot` (§6.4).
                     ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
                 } else {
+                    if !irq_this_pass { hid_needs_poll = true; }
                     godspeed_sdk::hid::decode_keyboard(
                         &rep, &mut kb_last, &mut kb_rep, &mut kb_caps, ctx.read_tsc(),
                         |ch| ctx.console_push(ch),
@@ -883,7 +889,47 @@ fn poll_devices(
         // Residual to watch: a boot-protocol report is a state SNAPSHOT, so a press+release
         // completed entirely inside one interval could be missed. Human presses last far longer
         // than 10 ms, but fast typing is the thing to check on hardware.
-        ctx.sleep(POLL_SLEEP_CYCLES);
+        //
+        // BLOCK ON THE INTERRUPT, with the poll interval as the deadline rather than the pace.
+        //
+        // The paragraph above this one says the controller's INTx "will not drive a block-and-wake
+        // loop, so the driver must keep its own self-driven re-arm". That was TRUE when it was
+        // written and is not true now, and the difference is measured rather than argued: this
+        // driver's INTx was routed to `bsp_lapic_id()`, which returned an unpublished 0 on every
+        // boot, so on a machine whose BSP is LAPIC id 16 the interrupt was delivered nowhere. The
+        // kernel now publishes core 0's real id and the T630's own log reports
+        // `irq: FIRST delivery of vector 0x29 on core 0 (routed: yes)` - the interrupt arrives, and
+        // it arrives at THIS endpoint.
+        //
+        // So the wait is no longer a pace to be kept. `recv_timeout` returns EARLY on the interrupt
+        // and otherwise at the deadline, which makes the deadline a hot-plug watchdog instead of a
+        // 100-times-a-second heartbeat. Same worst-case latency, and the core can actually halt
+        // between keystrokes - the property the `sleep` above was reaching for and could not have,
+        // because a task that must re-arm itself is never absent from the run queue for long.
+        //
+        // The message is DISCARDED deliberately: the only thing that arrives here is the kernel's
+        // IRQ notification, and its content carries nothing this loop needs - the work is driven by
+        // reading the controller's status at the top of the pass, exactly as before. What changed is
+        // what wakes us, not what we do when woken.
+        // A report that turned up on a pass no interrupt woke means interrupts are NOT covering HID
+        // completions on this controller, whatever the setup reported. The xHCI shipped a 500 ms idle
+        // on precisely that assumption and cost half a second per keystroke on the machine where it
+        // was false; the same mistake is not worth making twice in one day, in the same shape, in the
+        // driver next door. Proof, not assumption: one such report and the deadline drops to the tick
+        // floor for good.
+        let deadline = if hid_needs_poll {
+            ctx.duration_cycles(POLL_SLEEP_CYCLES)
+        } else {
+            ctx.duration_cycles(POLL_DEADLINE_MS)
+        };
+        if hid_needs_poll && !hid_poll_noted {
+            ctx.log("ehci: a HID report arrived with no interrupt - polling input at the 10ms tick");
+            hid_poll_noted = true;
+        }
+        let woke = ctx.recv_timeout(deadline);
+        // Was this pass woken by our INTx, or did the deadline simply expire? The notification is a
+        // one-byte payload equal to the vector, exactly as the xHCI identifies its MSI.
+        irq_this_pass = woke.as_ref().is_some_and(|m| m.payload_bytes() == [EHCI_INT_VECTOR]);
     }
 }
 
@@ -937,6 +983,14 @@ const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 /// Granularity is one scheduler quantum, so any non-zero value means "one quantum": ~10 ms now that
 /// the APIC timer is PIT-calibrated, which is also the keyboard's own bInterval.
 const POLL_SLEEP_CYCLES: u64 = 1;
+/// Deadline for the interrupt-driven main wait, in milliseconds.
+///
+/// This is a WATCHDOG, not a pace. The controller's INTx wakes the loop when a transfer completes,
+/// so this bounds only how long the driver can go without noticing something an interrupt cannot
+/// report - a device appearing or vanishing on a root port, which is read from PORTSC rather than
+/// signalled. It is deliberately far longer than the old one-tick pace: 100 wakes a second was the
+/// cost of having no wake source at all, and there is one now.
+const POLL_DEADLINE_MS: u64 = 250;
 
 /// How often to re-read the hub ports while waiting for something to be plugged in.
 ///
