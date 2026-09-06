@@ -790,13 +790,41 @@ pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
             } else {
                 config_write32(bus, dev, func, cap + 0x08, vector as u32);      // data
             }
+            // UNMASK THE VECTOR. Message Control bit 8 says the function implements per-vector
+            // masking, and when it does, the Mask Bits register gates delivery INDEPENDENTLY of the
+            // enable bit: a masked vector is programmed, enabled, and silently undeliverable.
+            //
+            // The register was never written here, so whatever state firmware left it in was
+            // inherited. That is not a safe thing to inherit on this class of device - the BIOS owns
+            // the USB controllers for legacy keyboard emulation and hands them over mid-flight (see
+            // `ehci_bios_handoff`), so it is entirely entitled to have masked the vector on its way
+            // out. The T630's xHCI is the machine's only MSI device and reports `0 MSI` across ten
+            // thousand driver passes while every stage of the setup claims success; a mask bit left
+            // set produces precisely that, and nothing in the log could have shown it.
+            //
+            // Offsets shift with the address width: data is at +0x0C (64-bit) or +0x08 (32-bit), and
+            // Mask Bits is the dword after it.
+            let pvm = ctrl & (1 << 8) != 0;
+            let mask_off = if is_64 { cap + 0x10 } else { cap + 0x0C };
+            let mask_before = if pvm { config_read32(bus, dev, func, mask_off) } else { 0 };
+            if pvm {
+                config_write32(bus, dev, func, mask_off, 0);
+            }
             // Enable MSI (ctrl bit 0); Multiple Message Enable = 0 (bits[6:4]) → 1 vector.
             let new_ctrl = (ctrl & !(0x7u16 << 4)) | 1;
             let new_hdr = (hdr & 0x0000_FFFF) | ((new_ctrl as u32) << 16);
             config_write32(bus, dev, func, cap, new_hdr);
+            // READ BACK, and say what the hardware actually holds - not what we asked it to hold.
+            // The previous version of this line reported the WRITE and stopped there, so a device
+            // that accepted the write and delivered nothing looked identical to one that worked. A
+            // whole boot was spent unable to tell whether a fix had even landed; that is the gap this
+            // closes, and it is worth more than the fix above if the fix turns out to be wrong.
+            let ctrl_after = (config_read32(bus, dev, func, cap) >> 16) as u16;
+            let mask_after = if pvm { config_read32(bus, dev, func, mask_off) } else { 0 };
             crate::kprintln!(
-                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr)",
-                bus, dev, func, vector, if is_64 { 64 } else { 32 }
+                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr) ctrl={:#06x}->{:#06x} pvm={} mask={:#x}->{:#x}",
+                bus, dev, func, vector, if is_64 { 64 } else { 32 },
+                ctrl, ctrl_after, if pvm { "yes" } else { "no" }, mask_before, mask_after
             );
             return true;
         }
