@@ -114,6 +114,12 @@ PI4_SERVICES = _pi4_services()
 # it now that all four cores come up on every boot and survive a carnage run - a Pi 4 running on one of
 # its four cores is not the machine.
 FEATURES = "pi4,pi4-smp"
+# `--single-core` builds WITHOUT `pi4-smp`, so the other three cores are never released and the
+# machine runs on core 0 alone. Not a new kernel configuration: 11.3 already says the system runs
+# single-core when zero APs come up, and `pi4-smp` is an ALREADY-PINNED feature - so this needs no
+# new flag and adds no kernel surface, which is why it is done this way round. See backlog/02.
+if "--single-core" in sys.argv:
+    FEATURES = "pi4"
 if "--features" in sys.argv:
     i = sys.argv.index("--features")
     if i + 1 >= len(sys.argv):

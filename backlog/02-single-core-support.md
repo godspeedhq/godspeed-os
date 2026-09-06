@@ -54,6 +54,31 @@ placement only when they have a real reason". Whatever the answers, they should 
 the contracts as comments, because right now the reason for `ehci -> core 3` is not recorded
 anywhere.
 
+## How to actually run it (branch `test/single-core`)
+
+**No new kernel feature, deliberately.** The first attempt added `single-core` to
+`kernel/Cargo.toml` and the enforcement layer refused it:
+
+```
+Commandment I - kernel feature flags are pinned
+  new kernel feature 'single-core': a switch on what the kernel IS, which can add a
+  responsibility no other pin sees
+  An exemption is legitimate ONLY if a CLAUDE.md amendment already accepts it.
+```
+
+That is the aarch64 lesson enforced mechanically - *a flag that selects between a compliant and a
+non-compliant kernel leaves the violation one build away*. The check was right, the flag was
+reverted, and the test is built out of what already exists instead:
+
+| machine | how | new kernel surface |
+|---------|-----|--------------------|
+| **Pi 4** | `py scripts/pi4_build.py --release --single-core` - builds WITHOUT the already-pinned `pi4-smp`, so the other three cores are never released | none |
+| **x86 (QEMU)** | `cargo run -p osdev -- run --smp 1` | none |
+| **x86 (T630 / Wyse)** | disable the extra cores in BIOS/UEFI setup | none |
+| **Pi 2** | not available yet - `ap_count()` is hard-coded to 3 in `arch/arm/mod.rs` with no feature over it | would need a change |
+
+Verified on the Pi 4 image: `smp: core 0 ready`, and every service spawns on core 0.
+
 ## Next steps, in order
 
 1. Settle item 1 first. Until `PlacementInvalid` is enforced or 9.2 is amended, a single-core run
