@@ -83,6 +83,8 @@ the sink comes back. `docs/observability.md` §13 is the full account and the ru
 
 ## Still not implemented
 
+*(Tracked as [`backlog/06-kernel-ring-not-drainable.md`](../../backlog/06-kernel-ring-not-drainable.md).)*
+
 `ctx.drain_kernel_ring_buffer()` is a **no-op stub** and no syscall exposes the kernel's 16 KiB ring to
 userspace. That is why `events log` begins when `events` does. Draining it would need a new
 `InspectKernel` query - kernel growth, for a diagnostic - so it is recorded here rather than built

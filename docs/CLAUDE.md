@@ -70,3 +70,10 @@ It records design intent for a far-future multi-node capability extension. Nothi
 ## These docs trail the spec
 
 Docs are updated as a courtesy to readers; the spec (`CLAUDE.md`) is the authority. When implementing a feature, read the spec section first, then the doc if you want more detail. Do not treat doc and spec as equal - the spec wins on any conflict.
+
+## Open items
+
+Anything **recorded rather than closed** (26.7) lives in [`backlog/`](../backlog/README.md),
+one file per item, each carrying its evidence, what is RULED OUT, and the next concrete step.
+Before chasing a bug, look there: several entries exist specifically to stop the next person
+re-deriving dead ends that already cost a session.
