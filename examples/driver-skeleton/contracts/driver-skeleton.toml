@@ -30,7 +30,7 @@ hw_interrupt = [11]
 # NOTE: a DMA arena is NOT a contract field - it is granted at spawn to recognised DMA drivers
 # (reach it via ctx.dma_region()); recognising a NEW driver is a small kernel-side hook, shown
 # working in the e1000 example.
-log_write    = true   # may write to the logger
+log_write    = true   # may write to `events`
 
 [placement]
 # OPTIONAL in general (omit -> the supervisor round-robins across cores), but a driver usually

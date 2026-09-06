@@ -56,7 +56,7 @@ request = "32MiB"   # minimum the service needs to start
 limit   = "64MiB"   # maximum it may ever allocate (AllocDenied past this)
 
 [capabilities]
-log_write = true    # the ONLY authority hello holds: write to the logger
+log_write = true    # the ONLY authority hello holds: write to `events`
 
 # No [placement] section: omitting it (as hello does) makes the supervisor ROUND-ROBIN the service
 # across the ready cores - the right default. (Omitting does NOT mean "core 0".) Pin a core only with

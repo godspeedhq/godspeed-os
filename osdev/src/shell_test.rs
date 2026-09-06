@@ -462,27 +462,27 @@ pub fn run(image_path: &Path, smp: u32) {
     // matter are that it RESOLVES: a chain must name the task holding the endpoint awaited,
     // and a healthy machine must SAY so rather than answer with an empty table.
     // -------------------------------------------------------------------
-    send(&mut write_half, b"trace version\r");
+    send(&mut write_half, b"events version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         // The SHARED version, and the creator credit - the same bar every other utility is held to.
-        // `trace 0.` passed while the utility reported 0.1.0 from a private constant and every help
+        // `events 0.` passed while the utility reported 0.1.0 from a private constant and every help
         // header said 0.4.0; an assertion that cannot see a two-version utility is not much of one.
-        Some(r) => check!(r.contains(&format!("trace {ver}")) && r.contains("Bankole Ogundero"),
-                          "trace: version reports the shared version + credit (conventions rule 5)"),
-        None => { println!("shell-test: FAIL - timed out after `trace version`"); fail += 1; }
+        Some(r) => check!(r.contains(&format!("events {ver}")) && r.contains("Bankole Ogundero"),
+                          "events: version reports the shared version + credit (conventions rule 5)"),
+        None => { println!("shell-test: FAIL - timed out after `events version`"); fail += 1; }
     }
 
-    // WHETHER `trace help` pages depends on the console HEIGHT, so drive it in a way that works
+    // WHETHER `events help` pages depends on the console HEIGHT, so drive it in a way that works
     // either way: the command, then a lone `q` afterwards. If a pager is up the q quits it; if the
     // help fit on one screen the q is an unknown command and harmless.
     //
     // Sending pager keys unconditionally leaked them into the NEXT command the moment the help got
     // short enough to fit - the prompt showed `qtrace blocked` and the suite failed one check down.
-    send(&mut write_half, b"trace help\r");
+    send(&mut write_half, b"events help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("trace blocked") && r.contains("trace chain"),
-                          "trace: help lists its subcommands (conventions rules 1+6)"),
-        None => { println!("shell-test: FAIL - timed out after `trace help`"); fail += 1; }
+        Some(r) => check!(r.contains("events ipc") && r.contains("events metrics"),
+                          "events: help lists its subcommands (conventions rules 1+6)"),
+        None => { println!("shell-test: FAIL - timed out after `events help`"); fail += 1; }
     }
 
     // Healthy machine: either a table of genuinely-blocked tasks, or the explicit "nothing is
@@ -496,11 +496,11 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // The shell is running (it is executing this), so it must report as such, not as stuck.
     // Per-view help: the top level is the MAP, each view carries its own columns.
-    send(&mut write_half, b"trace ipc help\r");
+    send(&mut write_half, b"events ipc help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("outcome") && r.contains("QUEUE_FULL") && r.contains("seq"),
-                          "trace ipc help: explains that view's columns"),
-        None => { println!("shell-test: FAIL - timed out after `trace ipc help`"); fail += 1; }
+                          "events ipc help: explains that view's columns"),
+        None => { println!("shell-test: FAIL - timed out after `events ipc help`"); fail += 1; }
     }
     send(&mut write_half, b"trace deps help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
@@ -524,54 +524,85 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // Rule 3: `help` is the word; anything else is `unknown:`, which teaches the real word.
-    send(&mut write_half, b"trace -h\r");
+    send(&mut write_half, b"events -h\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("unknown: trace"), "trace: -h is unknown, not a hidden synonym"),
-        None => { println!("shell-test: FAIL - timed out after `trace -h`"); fail += 1; }
+        Some(r) => check!(r.contains("unknown: events"), "events: -h is unknown, not a hidden synonym"),
+        None => { println!("shell-test: FAIL - timed out after `events -h`"); fail += 1; }
     }
 
-    // The event ring, which lives in `logger` - not the kernel, and not a service of its own.
+    // The event ring, which lives in `events` - not the kernel, and not a service of its own.
     // The shell itself holds the emit cap, so simply having run commands should have filled it.
-    send(&mut write_half, b"trace status\r");
+    send(&mut write_half, b"events status\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
-            check!(r.contains("ring 192 events"), "trace status: reports the ring capacity");
-            check!(r.contains("DROPPED"), "trace status: reports drops (a silent loss is the bug, invariant 12)");
-            check!(r.contains("the kernel records nothing"), "trace status: says where the ring lives");
+            check!(r.contains("ring 192 events"), "events status: reports the ring capacity");
+            check!(r.contains("DROPPED"), "events status: reports drops (a silent loss is the bug, invariant 12)");
+            check!(r.contains("the kernel records nothing"), "events status: says where the ring lives");
         }
-        None => { println!("shell-test: FAIL - timed out after `trace status`"); fail += 3; }
+        None => { println!("shell-test: FAIL - timed out after `events status`"); fail += 3; }
+    }
+
+    // METRICS. Two separate claims, and the second is the one worth having a test for.
+    //
+    // (1) `events` publishes its OWN numbers, and does it by writing into the table it already owns
+    //     rather than by sending itself a message. A sink that reported its own reporting would fill
+    //     with itself - the send is a reportable event, which produces a record, which is a send. Its
+    //     rows appearing here is that local-write path working.
+    // (2) `fs` publishes over IPC like any other service, which is the path a new service would use.
+    //
+    // The `ls` runs first because `fs` publishes every 32 requests rather than on every one (an
+    // observer that doubles the traffic it measures is not an observer), so the row only exists once
+    // real work has happened. That is the design, not a wait for a timer.
+    for _ in 0..12 {
+        send(&mut write_half, b"ls /\r");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
+    }
+    send(&mut write_half, b"events metrics\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => {
+            check!(r.contains("owner") && r.contains("metric") && r.contains("value") && r.contains("age_s"),
+                   "events metrics: renders the table header");
+            check!(r.contains("events"), "events metrics: `events` publishes its own rows (local write, no IPC hop)");
+            check!(r.contains("ring.recorded"), "events metrics: the sink's own ring counter is published");
+            check!(r.contains("blk.outages"), "events metrics: `fs` published over IPC, like any other service");
+            check!(r.contains("requests"), "events metrics: fs's request counter arrived");
+            check!(r.contains("metrics.held"), "events metrics: the sink counts its own table");
+            check!(r.contains("LAST value its owner published"),
+                   "events metrics: says a value can outlive its owner, so age_s must be read");
+        }
+        None => { println!("shell-test: FAIL - timed out after `events metrics`"); fail += 6; }
     }
 
     // Events must actually be RECORDED - the shell has been making fs/console calls all along.
-    send(&mut write_half, b"trace ipc\r          q");
+    send(&mut write_half, b"events ipc\r          q");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => {
             check!(r.contains("REPLY") || r.contains("TIMEOUT") || r.contains("PEER_LOST"),
-                   "trace ipc: the ring recorded real IPC outcomes");
+                   "events ipc: the ring recorded real IPC outcomes");
             check!(r.contains("outcome") && r.contains("peer") && r.contains("caller"),
-                   "trace ipc: columns are named, not abbreviated");
+                   "events ipc: columns are named, not abbreviated");
             // The CALL GRAPH, not just a list of calls: who called whom.
             check!(r.contains("shell") && (r.contains("fs") || r.contains("console")),
-                   "trace ipc: the caller is named, so a row is an edge not a fact");
+                   "events ipc: the caller is named, so a row is an edge not a fact");
             // Shaped like `observe`'s legend: banner, short lines that fit a narrow console, banner.
             check!(r.contains("legend") && r.contains("from the oldest row shown")
                    && r.contains("IPC events"),
-                   "trace ipc: a legend explains the columns");
+                   "events ipc: a legend explains the columns");
             check!(r.contains("QUEUE_FULL") && r.contains("PEER_LOST"),
-                   "trace ipc: the legend names every outcome a row can carry");
+                   "events ipc: the legend names every outcome a row can carry");
         }
-        None => { println!("shell-test: FAIL - timed out after `trace ipc`"); fail += 5; }
+        None => { println!("shell-test: FAIL - timed out after `events ipc`"); fail += 5; }
     }
     // A record source, so it PIPES: one producer feeds the grid, the pager and the record verbs.
-    send(&mut write_half, b"trace ipc | to json\r");
+    send(&mut write_half, b"events ipc | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => {
             check!(r.contains("\"peer\":") && r.contains("\"outcome\":") && r.contains("\"caller\":"),
-                   "trace ipc | to json: the ring pipes as records");
+                   "events ipc | to json: the ring pipes as records");
             check!(!r.contains("from the oldest row shown"),
-                   "trace ipc | to json: the legend stays OFF the pipe (records only)");
+                   "events ipc | to json: the legend stays OFF the pipe (records only)");
         }
-        None => { println!("shell-test: FAIL - timed out after `trace ipc | to json`"); fail += 2; }
+        None => { println!("shell-test: FAIL - timed out after `events ipc | to json`"); fail += 2; }
     }
     // `trace deps` - the dependency view, built from live CAPABILITY state, not a contract.
     send(&mut write_half, b"trace deps fs\r");
@@ -677,12 +708,12 @@ pub fn run(image_path: &Path, smp: u32) {
                           "trace deps: pipes the graph as records (parent -> peer edges)"),
         None => { println!("shell-test: FAIL - timed out after `trace deps | to json`"); fail += 1; }
     }
-    send(&mut write_half, b"trace ipc | count\r");
+    send(&mut write_half, b"events ipc | count\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         // `count` on a record stream prints the bare number, not the word "rows".
         Some(r) => check!(r.chars().any(|c| c.is_ascii_digit()) && !r.contains("cannot"),
-                          "trace ipc | count: counts rows of the record stream"),
-        None => { println!("shell-test: FAIL - timed out after `trace ipc | count`"); fail += 1; }
+                          "events ipc | count: counts rows of the record stream"),
+        None => { println!("shell-test: FAIL - timed out after `events ipc | count`"); fail += 1; }
     }
 
 
@@ -713,12 +744,12 @@ pub fn run(image_path: &Path, smp: u32) {
     // Compact predicate: where col<op>val (no spaces, no quotes needed).
     send(&mut write_half, b"status | where name=shell\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("shell") && !r.contains("logger"), "status | where name=shell: filters rows"),
+        Some(r) => check!(r.contains("shell") && !r.contains("events"), "status | where name=shell: filters rows"),
         None    => { println!("shell-test: FAIL - status|where timeout"); fail += 1; }
     }
     send(&mut write_half, b"status | where name=shell | to json\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"logger\""), "status | where … | to json: filtered JSON"),
+        Some(r) => check!(r.contains("\"name\": \"shell\"") && !r.contains("\"events\""), "status | where … | to json: filtered JSON"),
         None    => { println!("shell-test: FAIL - status|where|json timeout"); fail += 1; }
     }
     // select: project columns.
@@ -1062,18 +1093,18 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // -----------------------------------------------------------------------
     // Least privilege (H10) - a non-spawning service must NOT hold the spawn cap.
-    // `logger` never spawns, so after SPAWN was gated to {init, supervisor, shell,
-    // probes}, `caps logger` lists no spawn. This is the negative regression test
+    // `events` never spawns, so after SPAWN was gated to {init, supervisor, shell,
+    // probes}, `caps events` lists no spawn. This is the negative regression test
     // that locks the gate in: if a future change re-grants spawn universally, the
     // word "spawn" reappears here and this fails.
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"caps logger\r");
+    send(&mut write_half, b"caps events\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
-            check!(r.contains("caps for logger"), "caps logger: header");
-            check!(!r.contains("spawn"), "least-privilege: logger does NOT hold spawn");
+            check!(r.contains("caps for events"), "caps events: header");
+            check!(!r.contains("spawn"), "least-privilege: events does NOT hold spawn");
         }
-        None => { println!("shell-test: FAIL - timed out after caps logger"); fail += 2; }
+        None => { println!("shell-test: FAIL - timed out after caps events"); fail += 2; }
     }
 
     // caps as a record producer (docs/records.md): piped, it emits resource/rights rows.
@@ -1250,7 +1281,7 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
-    // chaos flood-storm = the DRAIN resilience axis, and it only applies to DRAIN-style services (logger +
+    // chaos flood-storm = the DRAIN resilience axis, and it only applies to DRAIN-style services (events +
     // the drivers' idle paths), pinned below. It does NOT apply to fs/shell, which are REPLY-style (recv ->
     // do work -> reply): flooding one with junk makes it try to PROCESS the junk - fs does a block read and
     // blocks on the no-disk block-driver (which can never reply) - so it clogs by design, not by bug. That is
@@ -1268,19 +1299,19 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // -----------------------------------------------------------------------
     // FLOOD-ENDPOINT DRAIN regression. The disease: a registered service that idles without recv'ing lets a
-    // flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER. It recurred in logger (a
+    // flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER. It recurred in events (a
     // park stub) and the USB drivers' idle paths - including xhci's NO-CONTROLLER idle, which the original
     // sweep missed and this very pin caught. In QEMU there is no USB controller, so xhci/ehci sit in exactly
     // that no-controller idle path. Each must DRAIN under flood and survive; a regression here means a
     // non-draining idle loop came back.
     // -----------------------------------------------------------------------
-    send(&mut write_half, b"chaos flood-storm logger 5\r");
+    send(&mut write_half, b"chaos flood-storm events 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(r) => {
-            check!(r.contains("flood-storm logger") && r.contains("verdict: PASS"), "chaos: flood-storm logger - idle endpoint drains, PASS (was a park stub)");
-            check!(r.contains("survived: 5/5"), "chaos: flood-storm logger - survived all 5 (drained, not clogged)");
+            check!(r.contains("flood-storm events") && r.contains("verdict: PASS"), "chaos: flood-storm events - idle endpoint drains, PASS (was a park stub)");
+            check!(r.contains("survived: 5/5"), "chaos: flood-storm events - survived all 5 (drained, not clogged)");
         }
-        None => { println!("shell-test: FAIL - chaos flood-storm logger timed out (endpoint clogged / panic?)"); fail += 2; }
+        None => { println!("shell-test: FAIL - chaos flood-storm events timed out (endpoint clogged / panic?)"); fail += 2; }
     }
     send(&mut write_half, b"chaos flood-storm xhci 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
@@ -1628,6 +1659,166 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
 /// Step 4: drive the file commands (ls / read / write / mkdir / cd) end to end. Boots
 /// bare-metal with a RAW AHCI disk, flashes it, then exercises the commands including
 /// relative paths and `..` (the shell's current-directory + path resolution).
+/// Boot QEMU with a SATA data disk and return (child, serial buffer, write half).
+///
+/// Extracted so a test can boot the SAME disk twice - which `run_sticky` needs, because a setting that
+/// survives a reboot cannot be tested inside one boot.
+fn boot_shell(
+    image_path: &Path,
+    persist_path: &str,
+    smp: u32,
+    who: &str,
+) -> (std::process::Child, Arc<Mutex<Vec<u8>>>, std::net::TcpStream) {
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive", &format!("format=raw,file={image_str},if=ide"),
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-smp", &smp.to_string(),
+        "-m", "512M",
+        "-serial", &format!("tcp::{shell_port},server"),
+        "-serial", "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("{who}-test: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => {
+            eprintln!("{who}-test: could not connect to serial {shell_port}");
+            child.kill().ok();
+            std::process::exit(1);
+        }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    (child, buf, write_half)
+}
+
+/// `osdev test sticky` - a STICKY capture must survive a reboot, unattended.
+///
+/// The only test here that needs TWO boots, and it needs them for the reason the feature exists: a
+/// capture you set up before walking away is worth nothing if the machine restarting ends it. Boot 1
+/// records the sticky capture; boot 2 shares the same SATA disk and must resume it with nobody typing
+/// anything.
+///
+/// Boot 2 also checks the negative half, which is the part that makes sticky safe rather than a trap:
+/// an explicit `stop` deletes the marker, so a capture that was told to end does NOT come back.
+pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("sticky-test: two boots on one disk - a capture must survive a reboot");
+    let mut fail = 0usize;
+    let mut pass = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok {
+                println!("sticky-test: PASS - {}", $label);
+                pass += 1;
+            } else {
+                println!("sticky-test: FAIL - {}", $label);
+                fail += 1;
+            }
+        };
+    }
+
+    // ---- boot 1: flash, then record a sticky capture -------------------------------------------
+    let (mut child, buf, mut write_half) = boot_shell(image_path, persist_path, smp, "sticky");
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        println!("sticky-test: FAIL - boot 1 never reached a prompt");
+        child.kill().ok();
+        println!("\n  0 passed  1 failed");
+        std::process::exit(1);
+    }
+    send(&mut write_half, b"drives flash\r");
+    let _ = collect_until(&buf, &mut cursor, b"?", Duration::from_secs(20));
+    send(&mut write_half, b"y\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+
+    send(&mut write_half, b"events persist start /cap.log 256KiB sticky\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            check!(r.contains("STICKY"), "boot 1: the capture is recorded as sticky");
+            check!(r.contains("capturing"), "boot 1: the capture actually started");
+        }
+        None => {
+            println!("sticky-test: FAIL - timed out starting the sticky capture");
+            fail += 2;
+        }
+    }
+    // Let a few lines reach the file, so boot 2 resumes a capture with real content behind it.
+    thread::sleep(Duration::from_secs(4));
+    child.kill().ok();
+    let _ = child.wait();
+
+    // ---- boot 2: SAME disk, nobody types anything ----------------------------------------------
+    println!("sticky-test: boot 2 - same disk, no input, the capture must come back on its own");
+    let (mut child2, buf2, mut write2) = boot_shell(image_path, persist_path, smp, "sticky");
+    let mut cur2 = 0usize;
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(90)) {
+        Some(r) => {
+            check!(r.contains("resuming STICKY capture"),
+                   "boot 2: resumed the capture WITHOUT anyone typing (the whole point)");
+            check!(r.contains("/cap.log"), "boot 2: resumed the right target");
+        }
+        None => {
+            println!("sticky-test: FAIL - boot 2 never reached a prompt");
+            fail += 2;
+        }
+    }
+    // It is really recording, not merely announcing. A resumed capture PREPARES first - the extent
+    // has to be made readable before a line can go in it - so allow for that rather than racing it.
+    thread::sleep(Duration::from_secs(5));
+    send(&mut write2, b"events persist status\r");
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(r.contains("recording"), "boot 2: the resumed capture is actually recording"),
+        None => { println!("sticky-test: FAIL - timed out on status"); fail += 1; }
+    }
+    // THE NEGATIVE HALF. An explicit stop must delete the marker, or the one command meaning "enough"
+    // is the one that did not take - and the capture would return at every boot forever.
+    send(&mut write2, b"events persist stop\r");
+    let _ = collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30));
+    send(&mut write2, b"read /persist.conf\r");
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(!r.contains("/cap.log"), "stop DELETED the sticky marker (it will not come back)"),
+        None => { println!("sticky-test: FAIL - timed out reading the marker"); fail += 1; }
+    }
+    child2.kill().ok();
+    let _ = child2.wait();
+
+    let passed = 6usize.saturating_sub(fail);
+    println!("\n  {passed} passed  {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
 pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     println!("files-test: booting (smp={smp}) with a RAW AHCI disk - scripted mode");
 
@@ -3402,19 +3593,19 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     }
     check!(answered, "the restarted shell answers commands (session recovered)");
 
-    // ── Directly-restartable driver/logger: kill `logger` over the control channel and confirm the
+    // ── Directly-restartable driver/events: kill `events` over the control channel and confirm the
     // supervisor respawns it on its OWN death (not only via a lucky supervisor respawn). This is the
-    // fix that keeps `chaos max-carnage` from leaving `xhci`/`ehci`/`logger` dead at the end of a run.
-    // logger is the hardware-independent stand-in for xhci/ehci (same death-notification + restart
+    // fix that keeps `chaos max-carnage` from leaving `xhci`/`ehci`/`events` dead at the end of a run.
+    // events is the hardware-independent stand-in for xhci/ehci (same death-notification + restart
     // arm); the actual USB keyboard recovery is verified on real hardware (QEMU has no USB keyboard).
-    println!("fs-restart: sending 'KILL logger' over the control channel …");
+    println!("fs-restart: sending 'KILL events' over the control channel …");
     match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
-        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL logger\n");
-            let restarted = collect_until(&buf, &mut cursor, b"supervisor: logger restarted", Duration::from_secs(20));
-            check!(restarted.is_some(), "supervisor respawned logger on its own death (directly restartable)");
+        Some(mut ctrl) => { thread::sleep(Duration::from_millis(100)); send(&mut ctrl, b"\nKILL events\n");
+            let restarted = collect_until(&buf, &mut cursor, b"supervisor: events restarted", Duration::from_secs(20));
+            check!(restarted.is_some(), "supervisor respawned events on its own death (directly restartable)");
             drop(ctrl);
         }
-        None => { println!("fs-restart: FAIL - could not connect to control port (logger kill)"); fail += 1; }
+        None => { println!("fs-restart: FAIL - could not connect to control port (events kill)"); fail += 1; }
     }
 
     // No panic anywhere in the whole session.
@@ -4356,6 +4547,29 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - `selfcheck` timed out"); fail += 1; }
     }
 
+    // RUN IT A SECOND TIME, IN THE SAME BOOT. Re-runnability is its own property and this suite has
+    // now lost it twice: once when `delete /sc` on an already-clean tree was the single failure in an
+    // otherwise perfect run, and again when `events persist status` asserted "not running" - true only
+    // before `recorder` had ever been spawned, so a second run said "idle" and failed. Hardware found
+    // that one, on a Pi 4, after the first two runs had passed.
+    //
+    // A suite that only passes on a fresh boot fails the first time someone runs it twice, which is
+    // exactly when they are investigating something.
+    send(&mut write_half, b"selfcheck\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
+        Some(r) => {
+            let _ = std::fs::write("build/selfcheck-transcript-2.txt", r.as_bytes());
+            if r.contains("failed 0") && !r.contains("--- failures ---") {
+                println!("script-test: PASS - `selfcheck` is RE-RUNNABLE (second run, same boot, failed 0)");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck` not green on a SECOND run (re-runnability)");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - second `selfcheck` timed out"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nscript-test: {pass} passed, {fail} failed");
@@ -4957,7 +5171,7 @@ pub fn run_peer_storm(image_path: &Path, persist_path: &str, smp: u32) {
 ///
 /// THE HYPOTHESIS UNDER TEST. When the supervisor dies, the kernel respawns it and it reconciles by
 /// ADOPTING the services still running - ten of them in a row on the hardware run that first showed
-/// this, with not one `name-map +` line among them. Only `logger`, which happened to be killed and
+/// this, with not one `name-map +` line among them. Only `events`, which happened to be killed and
 /// respawned, went through the path that registers a name. So the suspicion is: adoption records the
 /// service in the supervisor's PRIVATE map and never touches the kernel's name directory, and a name
 /// missing at that moment stays missing until that service is killed and respawned - which is exactly

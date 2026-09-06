@@ -141,7 +141,7 @@ impl Table {
 
     /// The bytes of a string cell; empty for a numeric or absent one.
     ///
-    /// Exists so one table can be DERIVED from another - `trace deps` reads the event table to count
+    /// Exists so one table can be DERIVED from another - `events deps` reads the event table to count
     /// what a service actually called. Without it the only way to consume a `Table` was to render it
     /// and re-parse the text, which is the round-trip this record model exists to avoid.
     pub fn cell_bytes(&self, r: usize, c: usize) -> &[u8] {

@@ -68,7 +68,11 @@ log_write = true
 # 0 sectors, no disk, `ls` broken, while dwc2 had the stick enumerated and bound the whole time.
 # Every layer healthy in isolation, and the missing piece the edge between them - twice now, on two
 # different boards.
-ipc_send = ["dwc2", "xhci"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send = ["dwc2", "xhci", "events"]
 
 [placement]
 # DECLARED. The prose above argued that stating a core here would be a second copy of an

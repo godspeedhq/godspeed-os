@@ -170,7 +170,7 @@ fn next_restart_count(name: &str) -> u64 {
 
 /// Record that restartable service `name` died (and will be respawned): bump its per-name restart
 /// count. Called ONLY from the death path for the supervisor-managed/restartable set (`fs`,
-/// `block-driver`, `shell`, `xhci`, `ehci`, `logger`, `supervisor`). Transient utilities the shell
+/// `block-driver`, `shell`, `xhci`, `ehci`, `events`, `supervisor`). Transient utilities the shell
 /// re-invokes are never bumped, so they never show a restart. The respawn reads the new count via
 /// `next_restart_count`; the first death of a name records count 1.
 fn bump_name_restart(name: &str) {
@@ -2321,6 +2321,15 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::ipc::free_endpoint_id(ep_id);
         }
 
+        // How many death notifications the supervisor never received. A COUNT, not a resource: it
+        // only grows, and what it costs is promptness, which the reconcile sweep eventually restores.
+        static DEATH_NOTIFY_DROPPED: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        /// Deaths that reached no supervisor at all, because its endpoint was gone at that instant.
+        static DEATH_NOTIFY_UNHEARD: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        use core::sync::atomic::Ordering;
+
         // RESTART count (the observe RESTARTS column): only the restartable/managed set accrues a
         // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
@@ -2330,7 +2339,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
         // only view of recovery said nothing happened.
         if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console" | "supervisor"
+            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console" | "supervisor"
             | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
             // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
             // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
@@ -2343,7 +2352,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
         // it respawns the service IMMEDIATELY - its own death, not only a lucky supervisor respawn.
         // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
-        // `xhci` / `ehci` + `logger`. Without the drivers here, a `chaos max-carnage` that killed
+        // `xhci` / `ehci` + `events`. Without the drivers here, a `chaos max-carnage` that killed
         // them in its last rounds left them dead until the supervisor happened to be respawned (it
         // re-runs its boot sequence and re-spawns them) - so the keyboard could stay dead. Now their
         // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
@@ -2377,7 +2386,7 @@ pub fn kill_task_by_slot(slot: usize) {
         if task_name == "console" {
             crate::bootcon::reclaim_on_death();
         }
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console"
             | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
             // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
             // still come back - on the next reconcile sweep - which is exactly why the omission hides:
@@ -2387,10 +2396,41 @@ pub fn kill_task_by_slot(slot: usize) {
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
             ) {
-                if let Some(sup_slot) =
-                    crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg)
-                {
-                    wake_by_slot(sup_slot, 0);
+                match crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg) {
+                    crate::ipc::routing::Enqueue::Woke(sup_slot) => wake_by_slot(sup_slot, 0),
+                    crate::ipc::routing::Enqueue::Queued => {}
+                    // THE SUPERVISOR WAS NOT THERE TO HEAR IT. Its endpoint is dead or unregistered -
+                    // it is itself dead-and-respawning, which `chaos` causes constantly - so the
+                    // notification is lost and the service comes back only on the reconcile sweep.
+                    //
+                    // This, not a full queue, is what actually happens: a run that produced 144 of
+                    // these produced ZERO full queues. The first version of this code reported only
+                    // the full-queue case and stayed silent on this one, which is the case that occurs.
+                    crate::ipc::routing::Enqueue::NoEndpoint => {
+                        let n = DEATH_NOTIFY_UNHEARD.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 64 == 0 {
+                            crate::kprintln!(
+                                "kernel: death of '{}' UNHEARD - the supervisor endpoint is gone ({} so far); the reconcile sweep will respawn it, not promptly",
+                                task_name, n);
+                        }
+                    }
+                    // THE ONE MESSAGE THAT SAYS A SERVICE DIED, DISCARDED. The supervisor's queue is
+                    // 16 deep and a storm can fill it, so this will happen - the kernel must not block
+                    // on a userspace queue. What it must not do is stay quiet: the service comes back
+                    // only when the periodic reconcile sweep notices, tens of seconds later, and
+                    // without this line that delay has no stated cause.
+                    //
+                    // Rate-limited to the first and then every 64th, because a storm that drops one
+                    // notification drops many, and a per-drop line would flood the very channel the
+                    // warning has to be read on.
+                    crate::ipc::routing::Enqueue::QueueFull => {
+                        let n = DEATH_NOTIFY_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 64 == 0 {
+                            crate::kprintln!(
+                                "kernel: death notification for '{}' DROPPED - supervisor queue full ({} so far); it will be respawned by the reconcile sweep, not promptly",
+                                task_name, n);
+                        }
+                    }
                 }
             }
         }

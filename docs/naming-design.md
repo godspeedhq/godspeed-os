@@ -316,7 +316,8 @@ To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
 - **§6.1/§6.2/§6.3 (TCB):** the big one (Phase 6) - **the supervisor becomes restartable**: its death
   is no longer a kernel panic; the kernel respawns it and it recovers from the directory. The
   non-restartable set shrinks to **`{kernel}` only** - §6.3's goal reached at its floor. Retire
-  `registry` from §6.1, the Glossary, and `docs/registry.md` (Phase 4).
+  `registry` from §6.1 and the Glossary (Phase 4). The registry's own design note was deleted with
+  the service (`9a880b12`); this document is the record.
 - **§13 (Contracts) note:** `send_peers` is a *requirement the supervisor fulfils*, not something the
   kernel resolves - sharpening §13.3. *(In effect since Phase 3.)*
 - **§22:** extend Test 11 to pin client-resolution-after-restart via the directory (Phase 4); add a new

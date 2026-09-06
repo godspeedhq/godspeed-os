@@ -60,6 +60,7 @@
   - [`wait`](utilities/wait.md)
   - [`whatis`](utilities/whatis.md)
   - [`trace`](utilities/trace.md)
+  - [`events`](utilities/events.md)
 
 # The gsh Language
 

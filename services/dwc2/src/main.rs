@@ -103,7 +103,7 @@ const IRQ_RX_ROUNDS: u32 = 8;
 fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // CONSOLE ONLY. The port-level detail is already logged beside every call site, and
     // logging here as well printed each notice TWICE in the serial capture - once from the
-    // logger and once from the console, which shares the same line.
+    // events and once from the console, which shares the same line.
     ctx.console_write("\r\n");
     ctx.console_writeln_fmt(args);
     // GIVE THE PROMPT BACK. The shell reads byte 10 as Enter, so this makes it redraw `gsh>`
@@ -172,6 +172,12 @@ fn dispatch(
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
+    // called - so a traced service says. Without it every event reads `?` in the caller column, and
+    // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
+    // ten unnamed services all collide into one row and their counters interleave. Observed as a
+    // single `msgs.received 1920` belonging to nobody.
+    ctx.trace_as("dwc2");
     // PREFIX `dwc2-svc:`, not `dwc2:`.
     //
     // The IN-KERNEL driver already owns the `dwc2:` prefix and prints heavily - hub ports, MSC

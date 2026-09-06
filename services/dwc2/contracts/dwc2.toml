@@ -16,6 +16,11 @@ limit   = "64MiB"
 
 [capabilities]
 ipc_receive = ["dwc2"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send    = ["events"]
 hw_device   = "dwc2"
 hw_interrupt = [41]   # 0x29, the BCM2836 USB line
 log_write   = true

@@ -16,7 +16,7 @@ limit   = "64MiB"
 # ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 ipc_receive = ["cap-grant"]   # OWNS its endpoint - the grantable SEND|GRANT cap it hands out points here
 ipc_send    = ["receiver"]    # the peer it transfers the grantable cap to
-log_write   = true            # may write to the logger
+log_write   = true            # may write to `events`
 
 # No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across
 # the ready cores: the right default for almost every service. (Omitting does NOT mean "core 0".)

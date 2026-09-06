@@ -29,7 +29,7 @@ const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 
 /// Idle forever by DRAINING our IPC endpoint, never `ctx.park()`. A registered driver that parks
 /// never recv's, so a flood-storm (or any stray send) fills its 16-deep queue and it sits at 16/16
-/// FOREVER - the logger stub bug in another guise. recv() parks the task between messages, so the
+/// FOREVER - `events` stub bug in another guise. recv() parks the task between messages, so the
 /// core still idles; it just no longer clogs. Used at every dead end where ehci has nothing left to
 /// do (no controller MMIO, reset failed, or no high-speed device present at boot).
 fn idle_draining(ctx: &ServiceContext) -> ! {
@@ -41,6 +41,12 @@ fn idle_draining(ctx: &ServiceContext) -> ! {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
+    // called - so a traced service says. Without it every event reads `?` in the caller column, and
+    // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
+    // ten unnamed services all collide into one row and their counters interleave. Observed as a
+    // single `msgs.received 1920` belonging to nobody.
+    ctx.trace_as("ehci");
     ctx.log("ehci: driver starting");
 
     let mmio = match ctx.ehci_mmio() {

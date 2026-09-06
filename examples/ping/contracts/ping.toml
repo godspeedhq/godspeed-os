@@ -19,7 +19,7 @@ ipc_send    = ["pong"]   # may SEND to pong (the peer). Reacquiring pong after a
                          # kernel NAME DIRECTORY (a syscall: ctx.reacquire_by_name -> reacquire_cap), not a
                          # contracted send-peer.
 ipc_receive = ["ping"]               # OWNS and receives on its own "ping" endpoint
-log_write   = true                   # may write to the logger
+log_write   = true                   # may write to `events`
 
 [placement]
 # OPTIONAL. Omit this whole section and the supervisor ROUND-ROBINS the service across the

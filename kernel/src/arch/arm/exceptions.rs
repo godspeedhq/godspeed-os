@@ -205,7 +205,7 @@ unsafe extern "C" fn stub_svc() {
         // Save the caller's USER-banked SP_usr/LR_usr on ITS OWN kernel stack. A syscall that blocks
         // (recv/console_read/yield) switches to another USER task, which runs in ring 3 and clobbers
         // the shared USER bank; without this the caller resumes on the WRONG user stack (the shell,
-        // woken from console_read, resumed on the logger's shallow SP and faulted just above the stack
+        // woken from console_read, resumed on `events`'s shallow SP and faulted just above the stack
         // top). Stacking it here (not in switch_context) keeps it per-task, so it survives every switch
         // inside the syscall and is restored on the way out - the syscall-path twin of stub_irq's
         // trap-frame USER-bank save. `r6` is callee-saved (pushed above), free to use as a scratch base;

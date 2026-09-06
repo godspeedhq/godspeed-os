@@ -227,7 +227,7 @@ const EHCI_DMA_PAGES:      u64 = 16;
 /// Send peers a service may be wired with.
 ///
 /// RAISED 4 -> 6 (2026-08-29). The shell legitimately needs five (`fs`, `block-driver`, `time`,
-/// `console`, `logger`), and at four the fifth was dropped SILENTLY - the contract declared it, the
+/// `console`, `events`), and at four the fifth was dropped SILENTLY - the contract declared it, the
 /// service never got the cap, and the only symptom was a peer that behaved as though it did not exist.
 /// The cap itself is right (a fixed array, §26.6); the silence was the bug, and the loud reject below
 /// is the other half of this fix.
@@ -1552,7 +1552,7 @@ fn spawn_service_with_image(
     // actually start other services: init (spawns the trusted root), supervisor
     // (spawns services + probes), the shell (brokers spawn/kill/restart), and the
     // test-driver probes (property/stress/perf/chaos modes spawn victims; matched by
-    // ELF identity so no probe family is missed). logger, the drivers,
+    // ELF identity so no probe family is missed). events, the drivers,
     // ping, pong, and observe never spawn and no longer hold the authority to.
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
@@ -1962,8 +1962,14 @@ fn spawn_service_with_image(
                 ),
             }
         } else {
+            // The DECLARATION is still recorded below, so this is a delay rather than a life
+            // sentence. It did not used to be: the name was dropped here along with the cap, and
+            // `AcquireSendCap` - which authorises a reacquire only for a declared name - then refused
+            // this service its peer forever. Saying "will reacquire" is the difference between a
+            // line that reports a transient wiring gap and one that reported a permanent break
+            // without knowing it.
             crate::kprintln!(
-                "task: peer '{}' not yet registered, no SEND cap for '{}'",
+                "task: peer '{}' not yet registered, no SEND cap for '{}' (declared - will reacquire)",
                 peer_name, name
             );
         }
@@ -2288,6 +2294,28 @@ fn spawn_service_with_image(
                         names[nn] = nm; nn += 1;
                     }
                 }
+                // AND EVERY DECLARED PEER THAT COULD NOT BE WIRED. `peer_data` holds only the peers
+                // whose names RESOLVED at this instant, so recording just those conflated two
+                // different things: what this service is allowed to talk to (a contract fact, fixed
+                // for its lifetime) and who happened to be running when it spawned (an accident of
+                // scheduling). A peer that was down for the 47 ms of this spawn was therefore never
+                // recorded as declared - and since `AcquireSendCap` authorises a reacquire only for a
+                // DECLARED name, that service could never reach that peer again. Not "until the peer
+                // came back": never, for the life of the instance.
+                //
+                // Measured on the T630: `fs` spawned 47 ms before `block-driver` during a chaos storm,
+                // came up with no declaration for it, and answered every file operation with "storage
+                // unavailable" for the rest of the boot while `block-driver` sat idle beside it having
+                // received one message. 113 failures, one dropped string.
+                //
+                // 14.3 is explicit that a client reacquires a restarted peer; denying the declaration
+                // denies the recovery the constitution promises. The CAP is legitimately absent here -
+                // there was nothing to mint one from - but the DECLARATION is not the kernel's to drop.
+                for &pn in send_peers {
+                    if nn >= MAX_SEND_PEERS { break; }
+                    if pn.is_empty() || names[..nn].iter().any(|&n| n == pn) { continue; }
+                    names[nn] = pn; nn += 1;
+                }
                 scheduler::set_task_peers(task_slot, &names[..nn]);
             }
         }
@@ -2343,12 +2371,12 @@ fn spawn_service_with_image(
 
 /// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
 /// The kernel's ONE direct spawn (Path C / Phase 5 - `init` is removed). The kernel boots the
-/// SUPERVISOR directly; the supervisor then spawns logger and all services. Uses `SUPERVISOR_ELF`
+/// SUPERVISOR directly; the supervisor then spawns events and all services. Uses `SUPERVISOR_ELF`
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
 /// owns the death-notification endpoint). A *boot-time* spawn failure is fatal (§6.2, §11.3); a later
 /// *runtime* death is recovered by the kernel respawning it (Phase 6 - see below).
-// C1-1: `arm_spawn_logger_neutral` and `arm_spawn_shell_neutral` USED TO LIVE HERE, and with them the
-// `arm-sched-spawn` / `arm-shell` / `arm-spawn-logger` / `pi4-sched-spawn` bring-up builds in which the
+// C1-1: `arm_spawn_events_neutral` and `arm_spawn_shell_neutral` USED TO LIVE HERE, and with them the
+// `arm-sched-spawn` / `arm-shell` / `arm-spawn-events` / `pi4-sched-spawn` bring-up builds in which the
 // kernel started a service directly. They were scaffolding from before the supervisor path worked, and
 // they were gated on ARCHITECTURE rather than on the features that called them, so every ARM and
 // AArch64 kernel carried the ability whether or not anything reached it.

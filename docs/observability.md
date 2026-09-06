@@ -1,44 +1,105 @@
 # Observability: metrics, logs and traces, without a kernel endpoint
 
-**Status:** design note. Nothing here is built. Recorded because the question came up and the answer
-is already half-evidenced by work that shipped.
+**Status:** design note, now PARTLY BUILT. Section 9's rename shipped on 2026-09-04 (`logger` ->
+`events`, commit 7dc157b0), together with the section 1 correction that prompted it. Everything from
+section 10's phase 1 onward is still design. Recorded because the question came up and the answer was
+already half-evidenced by work that had shipped.
 
 **The question.** An observability service that serves metrics, logs and traces - does the kernel need
 an endpoint to expose that data on?
 
 **The answer: almost certainly not.** Appendix C.2 of `CLAUDE.md` says "the kernel emits structured
-events ... on a known endpoint". That line predates the `trace` utility, which shipped with **zero
+events ... on a known endpoint". That line predates the IPC tracing work, which shipped with **zero
 kernel growth** and is direct evidence against it.
 
 ---
 
-## 1. Two thirds of this is already answered, and it needed no kernel
+## 1. Two thirds of this is already answered, and it needed no NEW kernel
 
 | stream | where it lives today | kernel involvement |
 |---|---|---|
-| **logs** | the `logger` SERVICE; every service sends to it | none |
-| **traces** | a 192-event ring INSIDE `logger`; instrumentation in the SDK | none |
+| **logs** | syscall 5, straight to the kernel's 16 KiB ring + serial. **Not the service** | the EXISTING 11.4 floor; no new growth |
+| **traces** | a 192-event ring INSIDE `events`; instrumentation in the SDK | none |
 | **metrics** | see below | pull only, already exists |
 
-The `trace` utility answers "what is stuck", "who can reach whom" and "what just happened", and the
+The tracing views answer "what is stuck", "who can reach whom" and "what just happened", and the
 kernel gained nothing for it: no ring in ring 0, no retention policy, no message-identity scheme, no
 control syscall, no new capability, and nothing on the IPC fast path.
 
 The design question that settled it was **"why can't the trace be a service?"** - and every objection
 to putting a ring in the kernel turned out to be an objection to it being in the kernel.
 
+### Correction 2026-09-04: logs never reach the `events` service at all
+
+The logs row above used to read *"the `events` SERVICE; every service sends to it"*, with no kernel
+involvement. **Both halves were wrong**, and the error survived a long time because it describes the
+arrangement the NAME implies - which is the same reason section 9 wants the name changed.
+
+What actually happens: `ctx.log()` is **syscall 5**, gated by the `log_write` capability slot, and it
+writes the kernel's 16 KiB ring buffer **and serial, directly**. The service's contract has no
+`log_write` at all; it declares only `ipc_receive`. Its endpoint is drained and unrecognised messages
+are dropped (`services/events/CLAUDE.md`).
+
+```
+   TODAY - and the arrow that does NOT exist
+
+   any service
+   +----------------------+      syscall 5 (Log), gated by log_write
+   |  ctx.log("ready")    |------------------------+
+   |                      |                        |
+   |  SDK trace record    |------ IPC ------+      |
+   +----------------------+                 |      v
+                                            |   +--------------------------------+
+                                            |   |  kernel: 16 KiB ring + serial  |
+                                            |   |  written UNCONDITIONALLY       |
+                                            |   +--------------------------------+
+                                            |                  |
+                                            |                  |  drained ONCE,
+                                            v                  v  at events start
+                                     +------------------------------+
+                                     |  events  (-> `events`)       |
+                                     |    192-event trace ring      |
+                                     |    endpoint: drained,        |
+                                     |    unrecognised = dropped    |
+                                     +------------------------------+
+
+   There is no   ctx.log() ---> events   arrow. There never was one.
+```
+
+**Three consequences, and the first is the one that matters most:**
+
+1. **Logging does not depend on the service being up.** When `events` is dead `ctx.log()` still
+   works: it never blocks on it and never returns `EndpointDead` from it, so a chaos storm that kills
+   `events` loses **no log output**. That is a property to protect, not an accident to tidy up.
+2. **So logs must NOT be re-pointed at `events` when it is built.** Routing them through the service
+   would make observing a failure depend on that service being alive - the same argument as section
+   9's "must never depend on storage", one layer further up. The instinct to "wire our existing
+   services to `events`" is right for metrics, right for traces, and **wrong for logs.**
+3. **What genuinely wires to the service** is traces (`ipc_send = ["events"]` in a contract, which is
+   a real IPC path that exists today) and metrics (new). Logs stay on the syscall floor.
+
+This also sharpens section 9's tier table: the serial-and-kernel-ring floor is not a FALLBACK that
+`events` degrades to, it is a **separate path `events` was never on**. That is why "the kernel keeps
+writing to serial unconditionally" is load-bearing rather than reassurance.
+
+**Two docs disagreed, and this one was wrong.** `docs/logging.md` has recorded the truth all along -
+*"nothing currently logs THROUGH `events`. `ctx.log()` is syscall 5"* - while this note asserted the
+opposite in its opening table. A reader who started here would have built the wrong model of the
+system and had no reason to doubt it. Both are now consistent; if the log path ever changes, it
+changes in both.
+
 ---
 
 ## 2. Metrics split in two, and only one half is a question
 
 **Service-level metrics** (a service counting its own work) are not a kernel matter at all. The
-service counts, and sends. This is the `logger` shape again.
+service counts, and sends. This is the `events` shape again.
 
 **Kernel-level metrics** (IPC volume, scheduler statistics, memory accounting, restart counts) are
 data only the kernel has - and it **already exposes them, by PULL**:
 
 ```
-   InspectKernel (syscall 13)     24 queries
+   InspectKernel (syscall 13)     25 queries
    TaskStat                       per-task state
         |
         +-- gated by the INTROSPECT capability (3.1, docs/introspection-capability.md)
@@ -96,7 +157,7 @@ objections were decisive there:
 This is not hypothetical - it is how kernel logs already reach userspace (11.4):
 
 ```
-   kernel  --writes-->  [ bounded ring, overwrites when full ]  <--drains--  logger
+   kernel  --writes-->  [ bounded ring, overwrites when full ]  <--drains--  events
                           16 KiB, no policy, no endpoint,
                           no consumer identity, no cap
 ```
@@ -117,11 +178,11 @@ Checked rather than assumed, because it changes the answer:
 
 ```
    kprintln!  ->  [u8; 16 KiB] BYTE ring  ->  serial (always)
-                                          ->  drained ONCE, when `logger` starts
+                                          ->  drained ONCE, when `events` starts
 ```
 
 `kernel/src/log.rs` is a **byte ring of formatted, human-readable lines** - not typed records - and
-`drain_to_logger` has exactly one caller, the logger's startup. After that everything reaches serial
+`drain_to_events` has exactly one caller, `events`'s startup. After that everything reaches serial
 and the ring only matters again on the next boot.
 
 **So "kernel events ride the existing ring" would mean PARSING TEXT**, which is fragile and creates a
@@ -149,9 +210,9 @@ pulled into existence by a real need (26.2), not built ahead of one.
 
 ## 7. What this costs today, and why it gets cheaper
 
-During the `trace` work the `service_configs` pin **refused a new `tracer` service** - the kernel
+During the tracing work the `service_configs` pin **refused a new `tracer` service** - the kernel
 holds a config row per service, so adding one was a kernel change. That refusal is what forced the
-trace ring into `logger`, which turned out to be the better design anyway.
+trace ring into `events`, which turned out to be the better design anyway.
 
 After step C (`docs/service-ownership.md`) adding a service costs a crate, a contract and a line in
 the supervisor. **So an observability service becomes cheap precisely because of the catalogue work**,
@@ -170,7 +231,7 @@ and there is no longer any pressure to fold it into an existing service to dodge
    +-------------------+        |   holds:         |
                                 |    INTROSPECT    |
    +-------------------+        |    a log cap     |
-   |  logger (ring)  <-|--query-|    a trace cap   |
+   |  events (ring)  <-|--query-|    a trace cap   |
    +-------------------+        +------------------+
                                         |
                                         v
@@ -183,22 +244,28 @@ it knows, by the two mechanisms it already has, and forms no opinion about consu
 
 ---
 
-## 9. The service should be renamed: `logger` -> `events`
+## 9. The service WAS renamed: `logger` -> `events` (done 2026-09-04)
 
-**The name is already wrong.** `logger` holds the 192-event IPC TRACE ring; it stopped being a logger
-when `trace` shipped. So this is not a rename in anticipation of a new job - it is the name catching
-up with the job it already has.
+**The name was already wrong.** The service holds the 192-event IPC TRACE ring; it stopped being a
+logger when the IPC trace ring shipped. So this was not a rename in anticipation of a new job - it was the name
+catching up with the job it already had.
+
+**Shipped in commit 7dc157b0**, verified in QEMU: identity 24/0, shell 165/0, commandments 15 pass,
+redteam restored 0. Runtime evidence rather than a clean compile - `events: ready (drains its
+endpoint; holds the IPC trace ring)`, `trace: ring 192 events; 82 recorded; 0 DROPPED`, and zero
+occurrences of the old name anywhere in the serial log. The rest of this section is why, kept in
+place because the reasoning is what a future reader needs.
 
 **It is cheap, and the reason is the capability model working.** `ctx.log()` resolves through
 `log_write_slot` - a CAPABILITY, not a name - so essentially every call site in the system is already
-insulated from what the receiving service is called. Only ~46 literal `"logger"` occurrences exist in
+insulated from what the receiving service is called. Only ~46 literal `"events"` occurrences exist in
 code (the supervisor's image table and MANAGED list, contracts, the name directory, tests).
 
 **`events` rather than `observability`:**
 
 - **`observe` already exists** - the live top/htop view. `observability` blurs the two;
   `events` and `observe` read as complementary: one HOLDS the stream, the other RENDERS the state.
-- **House style is one short word** - `trace`, `drives`, `edit`, `observe`.
+- **House style is one short word** - `drives`, `edit`, `observe`.
 - **It names what the thing holds.** Log lines are events. IPC trace records are events. Metric
   samples are events. An honest unifying noun.
 - `observability` is a PROPERTY OF A SYSTEM, not a component. A service named after a property tends
@@ -207,7 +274,7 @@ code (the supervisor's image table and MANAGED list, contracts, the name directo
 ### The constraint that must survive the rename
 
 `docs/logging.md` makes a load-bearing argument that this service is a **stateless broker, not a
-store**: a persisting logger cycles through `fs`, and worse, **makes observing a storage failure
+store**: a persisting events cycles through `fs`, and worse, **makes observing a storage failure
 depend on storage.**
 
 Renaming it to `events` invites exactly the violation - "events implies history, history implies
@@ -238,11 +305,227 @@ So `events` is a convenience layer over a floor that outlives it, not the system
 floor must not be weakened to make `events` look better: the kernel keeps writing to serial
 unconditionally, exactly as it does now.
 
-### Timing
+### The second constraint: self-observation must never take an IPC hop
 
-Do the rename **as part of** the observability work, not before it. Standalone it is 46 sites of
-churn with no behaviour change; bundled, the new name is justified by the new job and lands in one
-coherent commit.
+**Can `events` observe itself?** Three ways yes, one way never, and the shape that would look most
+natural to write is the one that turns recursion on.
+
+```
+   +---------------------------------------------------------------------+
+   |  `events`, observing itself                                          |
+   +---------------------------------------------------------------------+
+   |                                                                      |
+   |  its own logs     -- syscall 5 --> kernel ring + serial       OK     |
+   |                      leaves the building entirely; never              |
+   |                      touches its own endpoint, so no loop            |
+   |                                                                      |
+   |  its own metrics  -- local write --> its own table            OK     |
+   |                      no IPC hop, therefore no recursion              |
+   |                                                                      |
+   |  its own traces   ----------------> its own ring              NOISY  |
+   |                      it is the endpoint EVERYONE sends to, so        |
+   |                      tracing its own recvs costs one record per      |
+   |                      real event: self-noise at 1:1 with signal       |
+   |                                                                      |
+   |  its own DEATH    ------------------------------------------  NEVER  |
+   |                      structurally impossible                         |
+   +---------------------------------------------------------------------+
+```
+
+**The rule, stated before anyone codes it:**
+
+> A service reporting on ITSELF writes locally or uses the syscall floor. It must never do so by
+> sending itself a message.
+
+A self-emit that takes an IPC hop is the one construction that feeds the ring from the ring: the
+send is itself a traceable event, which produces a record, which is a send. Nothing else in the
+design has this property, and it is invisible until the ring is full of itself. Self-emit is a
+function call.
+
+The logs row above is the pattern to copy, and the 2026-09-04 correction in section 1 is why it
+already works: `ctx.log()` leaves for the kernel floor, so `events` logging about `events` never
+touches its own endpoint. It gets self-observation for free by not being clever.
+
+### Its own death is the one event it cannot report
+
+Worth stating as a property rather than discovering it during a storm. The single most useful thing
+`events` could tell you about `events` is the one thing it structurally cannot:
+
+```
+                        events dies
+                             |
+              +--------------+--------------+
+              v                             v
+      +----------------+        +---------------------------+
+      |  supervisor    |        |  kernel ring + serial     |
+      |  gets the      |        |  written unconditionally, |
+      |  death notif,  |        |  survives a panic that    |
+      |  respawns it   |        |  halts every core         |
+      +----------------+        +---------------------------+
+
+      Both sit BENEATH it. Neither routes through it. That is the
+      whole reason the floor is not allowed to move.
+```
+
+So the watchman is watched by the two components that cannot die, and neither of them depends on the
+one that can. This is not a gap to close - closing it (by persisting, or by having `events` guard
+itself) is precisely the violation section 9 opens by forbidding.
+
+### Timing - and what was actually done instead
+
+The advice here was to do the rename **as part of** the observability work rather than before it,
+since standalone it is churn with no behaviour change.
+
+**It shipped first anyway, and the reason is worth recording.** The section 1 correction changed what
+the rename MEANS: once it was established that logs never reached the service, the name was not merely
+imprecise, it was actively misleading about the system's structure - it implied an arrow that does not
+exist. That makes it a correctness fix to the codebase's own vocabulary, not cosmetic churn, and those
+land on their own so the diff stays reviewable. The measured cost was 56 sites, not 46.
+
+---
+
+## 9a. The rule: every stream the sink serves is RECORDS, never free text
+
+**Ratified 2026-09-05, after breaking it once.**
+
+> A view served by `events` returns rows with named fields. It is queryable with the same `where` as
+> every other view, and it converts with `to json` / `to yaml`. A view that can only be printed is not
+> finished.
+
+Metrics and IPC traces were built this way from the start - `owner, metric, value, age_s` and
+`seq, sec, caller, peer, op, outcome`. The LOG was not: it was built as a byte ring of formatted
+lines, because that is what a log looks like.
+
+**The cost arrived immediately, which is why this is a rule and not a preference.** Filtering the log
+by service needed a bespoke argument parsed in the shell (`events log 4 fs`), hand-rolling what `where`
+already does - and the hand-rolled version was wrong on its first run, returning lines belonging to
+other services. Two mechanisms for one operation, one of them broken, and the broken one written
+because the data had the wrong shape.
+
+As records the whole thing disappears:
+
+```text
+events log | where owner=fs | to json
+[
+  {"owner": "fs", "text": "disk capacity = 0 sectors (0 MiB)"},
+  {"owner": "fs", "text": "serving file API"}
+]
+```
+
+Three properties follow that the text form could not have had:
+
+- **The owner is a FIELD, not a prefix.** `where owner=dwc2` matches even though that service writes
+  its lines as `dwc2-svc:`. A text-prefix match could not, and deciding where a name ends inside a
+  string is exactly the guesswork a field removes.
+- **No fact is stated twice.** The service name lives in `owner`, so it is stripped from `text` -
+  `{"owner": "fs", "text": "fs: serving file API"}` was the first output and is noise.
+- **Printing is a RENDERING, not the format.** `events log` prints `owner: text` because a log should
+  read like a log, and a 240-byte `text` column would be wider than any screen. Piped, it is rows.
+  Same data, two renderings, exactly as `events ipc` already does.
+
+The rule binds anything added later. A new stream that can only be printed has picked the wrong shape,
+and the filter someone writes for it will be the second mechanism this section exists to prevent.
+
+---
+
+## 9b. Persisting a capture, and where it may live
+
+**Built 2026-09-05.** `events persist start|stop|status`, written by a separate `recorder` service.
+
+The rule this obeys is the one `docs/logging.md` set: **`events` may hold bounded VOLATILE state and
+must never acquire a durable-storage dependency.** The concrete reason turned out to be sharper than
+the dependency diagram suggests - a file write BLOCKS on a reply, and a blocked `events` is not
+draining its endpoint, so it drops the log copies, traces and metrics arriving while it waits. On a
+sick disk that is the full deadline, repeatedly. It would go blind at the moment it is most needed.
+
+`recorder` has the identical blocking problem and it does not matter, because nothing depends on it.
+That is the whole argument for a separate service, and it is worth keeping in that form: the question
+is never "does this component block" but "who else stops when it does".
+
+**A future remote sink** (`events persist start <url>`) was raised and is not built. One thing to decide
+deliberately before it is: credentials on a command line land in shell history AND in the event log
+itself, which the recorder is at that moment writing to disk. Credentials looping through the thing
+that captures them is a bad shape - it wants a credential file or a capability, not an argument.
+
+---
+
+## 9c. Recorded, not fixed: death notifications are dropped silently
+
+**Found on a Pi 4, 2026-09-05, and NOT caused by the observability work** - the notification path is
+untouched by it. Recorded here because it was diagnosed here and the evidence should not be lost.
+
+A chaos run produced **138** of these:
+
+```text
+supervisor: reconcile respawned xhci (missed death notification)
+```
+
+One of them cost the machine its storage for ~53 seconds: `xhci` died, the supervisor never heard,
+`block-driver` could not resolve the name, `fs` came up degraded (`serving file API` with no `mounted`
+line before it), and a selfcheck run in that window failed 112 file operations. It recovered when the
+periodic reconcile sweep noticed.
+
+The mechanism is one line, in `kernel/src/ipc/routing.rs`:
+
+```rust
+table[idx].queue.enqueue(msg).ok();   // the error is DISCARDED
+```
+
+A death notification goes into the supervisor's 16-deep queue with `try_send` semantics. Under a storm
+many services die at once, the queue fills, and the notification is dropped **with no count and no
+log**. The reconcile sweep is the backstop and it works - but it is slow, and nothing says why a
+service was late coming back.
+
+**The silence is the part that offends invariant 12**, not the drop. Dropping is defensible: the kernel
+must not block on a userspace queue, and a bounded queue must discard something. What is not defensible
+is discarding the one message that says a service died and never mentioning it - the operator sees a
+53-second storage outage with no stated cause, and the log blames a reconcile sweep for a failure that
+happened somewhere else entirely.
+
+**FIXED 2026-09-05.** `enqueue_from_interrupt` no longer returns `Option<usize>` - which could not
+distinguish "delivered to a receiver that was not blocked" from "dropped on the floor" - but an
+`Enqueue` enum with an explicit `QueueFull`. The death-notification path reports it:
+
+```text
+kernel: death notification for 'time' DROPPED - supervisor queue full (1 so far);
+        it will be respawned by the reconcile sweep, not promptly
+```
+
+Rate-limited to the first and then every 64th, because a storm that drops one drops many and a
+per-drop line would flood the channel the warning has to be read on. The IRQ path, which already
+reserves half the queue so this cannot happen, says it ONCE if it ever does - an impossible case that
+turns out to be possible is worth hearing the first time.
+
+The behaviour is unchanged: the kernel still drops, because it must not block on a userspace queue.
+What changed is that a 53-second outage can now name its own cause.
+
+### And the first two diagnoses were both WRONG
+
+Worth recording in full, because the measurement is the only reason it is right now.
+
+**Guess 1: the supervisor's queue fills and the notification is dropped.** Plausible - the discarded
+`Result` was real and is still worth fixing. Disproved by the next hardware run: **144 supervisor-side
+misses, ZERO full queues.**
+
+**Guess 2: the supervisor's endpoint is dead when the notification arrives**, since chaos kills the
+supervisor too. Also plausible, also wrong: `kill all-services` produced misses and **zero** sends to a
+dead endpoint.
+
+**What actually happens** is the one place neither guess looked. The notification is queued
+SUCCESSFULLY onto a live supervisor endpoint; the supervisor then dies; and `kill_endpoint` discards
+the whole queue. The sender was told nothing was wrong, because at the time nothing was.
+
+So the report belongs at the teardown, not at the send, and it fires there naturally - no forcing:
+
+```text
+kernel: endpoint 100 died holding 6 unread message(s) - they are LOST (6 total); a death
+        notification among them is why a service comes back on the reconcile sweep rather than promptly
+```
+
+The lesson is the one this project keeps relearning: **a plausible mechanism is not a measured one.**
+Both guesses survived a reading of the code and died to a single grep of a hardware log. The guard
+built for the first guess is what disproved it - which is the argument for making a silent thing loud
+even when you are confident you already know what it will say.
 
 ---
 
@@ -252,12 +535,51 @@ Phased so that the kernel change is **pulled into existence** by a service that 
 the wall (26.2), not built ahead of one. Each phase is independently useful and independently
 shippable.
 
-### Phase 0 - build the service against what already exists
+### Phase 0 - build the service against what already exists - **DONE 2026-09-04**
 
-No kernel change at all. Rename `logger` -> `events` (section 9) and give it the observability job:
+Both halves shipped: the rename (section 9, `7dc157b0`) and the metrics stream (`b91cea82`).
+
+Correct the headline first, because it was wrong: this was **not** "no kernel change at all". The
+kernel carries hard-coded service-name lists (two in `task/scheduler.rs`, four in `build.rs`), so the
+rename edited the kernel. No new responsibility and no growth - but a kernel SOURCE edit, and that is
+the expensive kind, because it reopens the question of whether the kernel is still correct. What is
+genuinely true is the claim worth making: **no new kernel responsibility, no new syscall, no new
+capability, nothing on the IPC fast path.**
+
+What a service now has, and the shape of each:
+
+| stream | how | costs the emitter |
+|---|---|---|
+| **logs** | `ctx.log()`, syscall 5 to the kernel floor | works even when `events` is dead |
+| **traces** | automatic in the SDK; needs only `ipc_send = ["events"]` | one relaxed load when not tracing |
+| **metrics** | `ctx.metric(name, value)`, `try_send` and discard | nothing it can be blocked or slowed by |
+
+Read back with `events metrics` (a record source, so it filters and formats like any other).
+
+**And logs became queryable without a kernel change**, which is worth recording because the obvious
+route needed one. `drain_kernel_ring_buffer()` is a no-op stub and no syscall exposes the kernel's
+16 KiB ring to userspace, so `events log` could not be built by draining it. What works instead:
+`ctx.log()` performs its syscall FIRST and unconditionally, then offers a best-effort COPY to
+`events`. That is not the re-pointing section 1 forbids - the floor still fires first and a dead
+sink still loses no log output - it is a duplicate kept for querying. The limitation that follows is
+stated in the view itself: lines printed before `events` exists are on serial only.
+
+**Two things this phase settled that the plan above did not anticipate.**
+
+*The self-observation rule needed no mechanism.* `events` publishes its own four rows by writing into
+the table it already owns, and it cannot accidentally do otherwise: it holds no send cap to itself, so
+`ctx.metric` resolves to `u32::MAX` and returns - the same cut that already stopped the sink tracing
+its own sends. The rule in section 9 turned out to be a generalisation of something the SDK was
+already doing deliberately, not a new constraint.
+
+*Bounds bite immediately, and that is the system working.* The metric name field was first sized at
+`PEER_LEN`, and the sink's own first metric (`ring.recorded`, 13 bytes) was silently truncated to
+`ring.recorde`. Two fixes, both in the spirit of 26.6.1: give the field its own size (20) rather than
+borrowing one meant for service names, and REPORT the truncation once, because a name quietly becoming
+a different name would merge two metrics into one row with the values interleaving.
 
 ```
-   InspectKernel (24 queries) --pull--+
+   InspectKernel (25 queries) --pull--+
    TaskStat                   --pull--+--> events --> exposition
    kernel text ring           --drain-+      |
    its own 192-event trace ring ------+      +-- holds INTROSPECT + a log cap
@@ -426,9 +748,50 @@ clearing it.
 ## 12. Amending C.2
 
 Appendix C.2 is explicitly non-normative, so this note does not amend the constitution. But its
-"known endpoint" phrasing should be read in light of the `trace` evidence: the kernel does not need
+"known endpoint" phrasing should be read in light of the tracing evidence: the kernel does not need
 to publish to an endpoint, and the reasons it should not are the same ones that kept the trace ring
 out of ring 0.
 
 C.2's actual constraint - *"the kernel publishes; the metrics service interprets"* - is exactly right
 and is preserved here. Only the transport changes: a drained ring rather than an endpoint.
+
+---
+
+## 13. What a publisher owes the sink after the sink dies (found on hardware, 2026-09-06)
+
+The sink is restartable and its three stores are volatile, which the sections above treat as settled.
+What was NOT thought through is the other side of that: what a PUBLISHER has to do when the thing it
+publishes to is replaced under it. Four separate defects lived in that gap, each hidden by the one
+before it, and all four presented identically - a row that simply was not there.
+
+1. **Reacquire, then drop the sample anyway.** `metric()` reacquired the sink on send failure and
+   discarded the event that triggered it. 14.3 says reacquire AND retry; this did half, so the sink
+   missed a full publish interval every time it restarted.
+2. **A missed resolve latching forever.** `u32::MAX` was read as "this service holds no sink cap" - a
+   permanent fact - when it is also what a service sees if the sink is mid-restart at its first
+   emission. It then returned early on every emission for life.
+3. **The kernel dropping the DECLARATION.** A service spawned in the milliseconds its peer was down
+   was recorded as not declaring that peer at all, so `AcquireSendCap` refused it forever. This one
+   was not observability-specific: it cost `fs` its `block-driver` and produced 113 failures in one
+   run, with storage reported unavailable while `block-driver` sat idle beside it.
+4. **A capless publisher never ASKING.** `find_send_slot` only inspects caps a service already holds,
+   so a service that started with none resolved to MAX and returned early - and the reacquire that
+   would have fixed it sat behind a send failure, which never happened because the send never did.
+
+The shape they share is worth naming, because it is not specific to metrics: **a recovery path that
+only runs on failure cannot recover a component that never gets far enough to fail.** Every one of
+these was silent, and each looked exactly like a healthy quiet service.
+
+The rule that falls out, for anything that publishes to a restartable peer:
+
+- resolve LAZILY and RETRY a failed resolve, bounded - never latch a miss;
+- when resolution finds nothing, ASK (the declaration authorises it) rather than waiting for a
+  failure that a non-existent send cannot produce;
+- on reacquire, RE-ESTABLISH what the new instance never saw, rather than waiting out an interval;
+- and report each distinct failure once, named - "not registered" and "cap table full" need opposite
+  responses and only one of them is terminal.
+
+Instrumentation note, since it cost a hardware round-trip: one of these reports was added with its
+call site missing, so the run came back "0 late resolves" and that zero was read as evidence. **A
+missing instrument is indistinguishable from a healthy system.** Verify the call site exists, not just
+that the helper compiles.

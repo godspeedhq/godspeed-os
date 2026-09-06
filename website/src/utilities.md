@@ -71,7 +71,8 @@ fails.
 | [`observe`](utilities/observe.md) | the live full-screen view |
 | [`caps`](utilities/caps.md) | what authority a service actually holds |
 | [`whatis`](utilities/whatis.md) | what a name is: built-in, script, pipe stage, or service |
-| [`trace`](utilities/trace.md) | observing IPC call chains |
+| [`trace`](utilities/trace.md) | live kernel state: what is stuck, who can reach whom |
+| [`events`](utilities/events.md) | what was recorded: IPC ring, metrics, logs, capture to disk |
 | [`mem`](utilities/mem.md) | memory |
 | [`cores`](utilities/cores.md) | the cores that came up |
 | [`uptime`](utilities/uptime.md) | how long since boot |

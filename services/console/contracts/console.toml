@@ -10,6 +10,11 @@ limit   = "8MiB"
 # writes serial and then `try_send`s the same bytes to this endpoint, so the transport is ordinary IPC
 # and needs no capability of its own.
 ipc_receive = ["console"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send    = ["events"]
 # The framebuffer, granted by the kernel at spawn (`service_hw`), Normal non-cacheable + USER. Declared
 # here as the device this service drives, and reconciled against the kernel's own table by
 # `scripts/contract_check.py` so the two cannot diverge.

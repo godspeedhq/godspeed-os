@@ -2169,7 +2169,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // state the kernel already keeps for correctness - 24 is the endpoint a task owns (already
         // read to compute its queue depth), 25 is the endpoint it is blocked-in-CALL awaiting, which
         // exists so a dead replier can wake it with `ReplyDead` (§8.6). Nothing new is recorded and
-        // nothing is written; `trace` is a READER of the kernel, not a tracer in it.
+        // nothing is written; `events` is a READER of the kernel, not a tracer in it.
         //
         // INTROSPECT-gated by falling outside the ungated list above, which is the right default:
         // both disclose another task's state.

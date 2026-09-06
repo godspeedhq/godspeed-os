@@ -22,7 +22,7 @@ limit   = "64MiB"
 # and documented in `contracts/CLAUDE.md`. The complete set of options:
 #   ipc_send     = ["peer", ...]      services this service may SEND IPC to
 #   ipc_receive  = ["myname", ...]    endpoint names this service OWNS and receives on
-#   log_write    = true               write to the logger service
+#   log_write    = true               write to the `events` service
 #   hw_mmio      = ["0xBASE+0xSIZE"]  a device MMIO register window (drivers; CLAUDE.md §12.3)
 #   hw_interrupt = [IRQ, ...]         IRQ lines (0-255) routed to this service (drivers; §12.2)
 #   hw_pio       = ["0xBASE+0xLEN"]   kernel-mediated I/O port ranges (drivers)

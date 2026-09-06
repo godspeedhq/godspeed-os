@@ -9,7 +9,7 @@
 
 | Component | License | Why |
 |-----------|---------|-----|
-| **The OS** - kernel + trusted root (`supervisor`, arch, smp) + system services (`logger`, `block-driver`, `fs`, drivers, `shell`) + host tooling (`osdev`) + tests | **GPL-2.0-only** (like Linux) | The OS itself stays free and open; improvements flow back. |
+| **The OS** - kernel + trusted root (`supervisor`, arch, smp) + system services (`events`, `block-driver`, `fs`, drivers, `shell`) + host tooling (`osdev`) + tests | **GPL-2.0-only** (like Linux) | The OS itself stays free and open; improvements flow back. |
 | **SDK** (`sdk/rust`) | **Apache-2.0** | Services link it; permissive keeps the app ecosystem free to choose any license. Apache-2.0 adds an explicit patent grant over plain MIT. |
 | **Examples** (`examples/`) | **Apache-2.0** | They are reference apps meant to be copied as the starting point for real services; permissive keeps that copy unencumbered. |
 | **Userspace services / apps** | **Any license** (their authors' choice) | They are separate programs over IPC - not derivative works of the kernel. A service built against the SDK carries **no copyleft**, so proprietary commercial services are fine. |

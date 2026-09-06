@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! IPC trace emission - the client half of the trace ring that `logger` holds (`utilities/46_trace.md`).
+//! IPC trace emission - the client half of the trace ring that `events` holds (`utilities/47_events.md`).
 //!
 //! # Why the instrumentation is HERE and not in the kernel
 //!
@@ -16,14 +16,14 @@
 //! # Cost when not tracing
 //!
 //! One `Relaxed` load, branch not taken. A service is tracing only if its contract granted it
-//! `ipc_send = ["logger"]` and the lazy resolution below found that cap - so tracing is AUTHORITY,
+//! `ipc_send = ["events"]` and the lazy resolution below found that cap - so tracing is AUTHORITY,
 //! visible in `caps <service>`, revocable, and absent by default (§3.1: no ambient anything).
 //!
 //! # Never blocks, never fails loudly
 //!
 //! Emission is `try_send` and the result is discarded. An observer must not be able to slow, block or
-//! break the thing it observes: a full logger queue costs the emitting service nothing and loses one
-//! event, which the ring counts and `trace status` reports. That is the correct trade here, and the
+//! break the thing it observes: a full events queue costs the emitting service nothing and loses one
+//! event, which the ring counts and `events status` reports. That is the correct trade here, and the
 //! opposite of the one made on a correctness path.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -44,14 +44,60 @@ pub const EV_LEN: usize = 4 + 4 + PEER_LEN + PEER_LEN + 1 + 1;
 
 /// The service that holds the ring. A call to THIS peer is never traced: the reader reaches the ring
 /// through it, so recording those calls would fill the ring with the reader's own questions.
-pub const SINK_NAME: &str = "logger";
+pub const SINK_NAME: &str = "events";
 
-/// Message opcodes understood by the ring in `logger` (byte 0 of the payload).
+/// Message opcodes understood by the ring in `events` (byte 0 of the payload).
 pub const TRACE_OP_EVENT: u8 = 1;
 /// Ask for the most recent events; byte 1 = how many are wanted.
 pub const TRACE_OP_DUMP: u8 = 2;
 /// Ask for ring capacity / accepted / dropped.
 pub const TRACE_OP_STATUS: u8 = 3;
+
+/// Publish a METRIC sample: `[4][owner:12][name:12][value(8, le)]`.
+///
+/// A metric is a SET, not an increment. The emitting service already holds the counter - it is that
+/// service's own state, with an owner (§3.8) - and publishes the current value; `events` remembers the
+/// last one published. That keeps the sink free of accumulation semantics it would otherwise have to
+/// define (what does an increment mean across a restart of either side?), and it means a service that
+/// dies leaves its final published value behind instead of taking it along - the one useful thing an
+/// observer can still learn from a service that is gone.
+pub const TRACE_OP_METRIC: u8 = 4;
+/// Ask for the metric table.
+pub const TRACE_OP_METRICS: u8 = 5;
+
+/// A LOG COPY: `[6][owner:12][utf-8 text]`, variable length.
+///
+/// **This is a copy, never the log itself.** `ctx.log()` performs its syscall FIRST and
+/// unconditionally - the kernel ring and serial are written whether or not `events` is alive, exists,
+/// or is reachable - and only then offers this duplicate so the line can be queried later. The
+/// distinction is the whole design: re-pointing logs AT the service would make observing a failure
+/// depend on a service that can fail, which is the storage argument in CLAUDE.md 15 one layer up.
+/// Adding a copy costs a `try_send` whose result is discarded and takes nothing away from the floor.
+///
+/// What this cannot carry, stated rather than discovered: lines written BEFORE `events` exists. Those
+/// live in the kernel's 16 KiB ring, which no syscall exposes to userspace, so `events log` begins at
+/// the moment `events` does. Boot output is serial's job, and always was.
+pub const TRACE_OP_LOG: u8 = 6;
+/// Ask for recent log lines; byte 1 = how many bytes are wanted (0 = as many as fit).
+pub const TRACE_OP_LOGS: u8 = 7;
+
+/// Bytes of a METRIC's name. Deliberately NOT `PEER_LEN`.
+///
+/// `PEER_LEN` is 12 because the longest SERVICE name that matters is `block-driver`. A metric name is a
+/// different kind of thing and wants more room - `ring.recorded` is already 13 - so reusing the service
+/// bound for it was wrong, and it bit immediately: the sink's own first metric was truncated to
+/// `ring.recorde`. Sizing a field by what it will hold, rather than by what an adjacent field holds, is
+/// the whole fix.
+pub const MET_NAME_LEN: usize = 20;
+
+/// Wire length of one metric: owner[12] + name[20] + value(8).
+///
+/// FIXED, like an event, and for the same reason: no allocation anywhere on the path, and a bound a
+/// reader can read off the source (§26.6.1). A name longer than `MET_NAME_LEN` is still TRUNCATED
+/// rather than refused - a truncated name identifies the sample to a human, where a refused sample is
+/// a hole in the instrument - but the truncation is now REPORTED once by `ServiceContext::metric`,
+/// because a name silently becoming a different name is exactly the quiet loss invariant 12 forbids.
+pub const MET_LEN: usize = PEER_LEN + MET_NAME_LEN + 8;
 
 /// A request was sent and the caller is now awaiting a reply.
 pub const KIND_REQUEST: u8 = 1;
@@ -81,7 +127,7 @@ pub const KIND_ABORTED: u8 = 6;
 ///
 /// So the caller says who it is. The objection writes itself - a self-declared name is a claim, not a
 /// fact - and it does not survive contact with what the event already is: a service holding
-/// `ipc_send = ["logger"]` can already write any `peer` and any `outcome` it likes, because the whole
+/// `ipc_send = ["events"]` can already write any `peer` and any `outcome` it likes, because the whole
 /// event is its testimony. A `caller` field is exactly as trustworthy as the two fields beside it,
 /// which is to say as trustworthy as the service you granted trace authority to. It opens nothing.
 ///
@@ -180,7 +226,7 @@ pub fn caller_set() -> bool { CALLER.is_set() }
 /// Whether resolution has been attempted yet. Emission arms itself LAZILY, on the first call, because
 /// a service is handed a context and has no init hook to run in - so there is nowhere to arm it from.
 static RESOLVED: AtomicBool = AtomicBool::new(false);
-/// The cap slot for `logger`: `u32::MAX` means "resolved, and this service has no logger send cap", which
+/// The cap slot for `events`: `u32::MAX` means "resolved, and this service has no events send cap", which
 /// is the normal case and costs one relaxed load per call forever after.
 static TRACER_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Per-service event counter, so a reader can see gaps where events were dropped.
@@ -192,12 +238,95 @@ pub fn resolved() -> bool {
     RESOLVED.load(Ordering::Relaxed)
 }
 
-/// Record the outcome of resolution. `u32::MAX` means this service holds no `logger` send cap, which is
-/// remembered so the lookup happens exactly once per service lifetime.
+/// How often a service that has NOT resolved the sink may try again, in emissions. Bounded on purpose
+/// (26.6): a service which genuinely holds no `events` cap pays one short in-memory scan per this many
+/// emissions rather than one on every emission.
+const RESOLVE_RETRY_EVERY: u64 = 64;
+static RESOLVE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the outcome of resolution. A VALID slot latches for the life of the service; a MISS does
+/// NOT.
+///
+/// It used to latch either way, on the reading that `u32::MAX` means "this service holds no `events`
+/// send cap" - a permanent fact deserving a permanent answer. It is not permanent. It also happens
+/// when the sink is simply mid-restart at the instant of this service's FIRST emission, and chaos
+/// restarts the sink constantly. A service unlucky in that window then returned early on every
+/// subsequent emission forever: it never sent, so it never saw a send failure, so it never reached the
+/// reacquire path that exists precisely to recover from a restarted sink.
+///
+/// The damage would be silent and permanent, invisible except as a missing row - which is the one
+/// thing `msgs.received` exists to rule out, since a service with no row is indistinguishable from a
+/// dead one.
+///
+/// HONESTY ABOUT WHAT THIS DID AND DID NOT FIX. This was written while chasing a T630 run where `fs`
+/// published six metric rows before a chaos storm and none afterwards, and the latch looked like the
+/// cause. It was not: `events` restarted 0.5 s BEFORE `fs` there, so `fs` resolved successfully and
+/// never latched at all. That run was the capless-publisher bug (`metric`/`trace_emit` never ASKING
+/// for a cap) on top of the kernel dropping the peer declaration. This change stands on its own
+/// merits - a permanent answer to a transient condition is wrong however rarely it fires - but it is
+/// not the fix that closed that failure, and saying otherwise would leave the next reader chasing a
+/// cause that was already ruled out.
 #[inline]
 pub fn set_sink_slot(slot: u32) {
-    TRACER_SLOT.store(slot, Ordering::Relaxed);
-    RESOLVED.store(true, Ordering::Release);
+    let prev = TRACER_SLOT.swap(slot, Ordering::Relaxed);
+    RESOLVED.store(slot != u32::MAX, Ordering::Release);
+    if slot != u32::MAX && prev != slot {
+        SINK_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Set when the sink slot changes to a live one - a first resolve, or a reacquire after the sink
+/// restarted. Consumed by the first emission that follows.
+static SINK_CHANGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True ONCE after the sink changed, then false until it changes again.
+///
+/// A restarted sink starts EMPTY, and a publisher on an interval does not fill it again until its
+/// next boundary - up to 64 messages for `msgs.received`. For a quiet service that is a long time to
+/// have no row, and a service with no row is indistinguishable from a dead one, which is the single
+/// question this metric answers. 14.3 says a client reacquires AND re-establishes what hung off the
+/// old instance; a counter the new sink has never seen is exactly that.
+///
+/// Cheap on the hot path: a relaxed LOAD on the common (unchanged) call, and the swap only in the
+/// rare tick that follows a restart.
+#[inline]
+pub fn take_sink_changed() -> bool {
+    if !SINK_CHANGED.load(Ordering::Relaxed) {
+        return false;
+    }
+    SINK_CHANGED.swap(false, Ordering::Relaxed)
+}
+
+/// Number of resolution attempts that MISSED. Read only to report a late resolve (see
+/// `take_late_resolve`), so the silent window is measured rather than argued about.
+static RESOLVE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// If this service resolved the sink only AFTER one or more misses, return how many and consume the
+/// fact so it is reported exactly once. `None` on the healthy path (resolved first try) and on every
+/// call thereafter, so a normal boot prints nothing.
+///
+/// This exists because the failure it reports was invisible: a service that missed simply stopped
+/// publishing forever, and the only evidence was a row that never appeared. Invariant 12 - a silent
+/// degradation is the bug.
+#[inline]
+pub fn take_late_resolve() -> Option<u64> {
+    let n = RESOLVE_MISSES.swap(0, Ordering::Relaxed);
+    if n == 0 { None } else { Some(n) }
+}
+
+/// Whether the caller should attempt (re)resolution now. False once resolved; after a miss, true only
+/// every `RESOLVE_RETRY_EVERY`th call, so recovery is bounded work rather than a lookup per emission.
+#[inline]
+pub fn should_resolve() -> bool {
+    if RESOLVED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let n = RESOLVE_TICK.fetch_add(1, Ordering::Relaxed);
+    if n > 0 && n % RESOLVE_RETRY_EVERY != 0 {
+        return false;
+    }
+    RESOLVE_MISSES.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// The cap slot to emit on, or `u32::MAX` if this service is not tracing.
@@ -213,6 +342,39 @@ pub fn sink_slot() -> u32 {
 /// here is a CMOS RTC read on the caller's hot path (see `ServiceContext::trace_emit`), and an
 /// observer that costs the observed a millisecond of port I/O per IPC is not an observer, it is a
 /// brake.
+/// Encode one metric sample.
+///
+/// The OWNER is this service's declared name (`trace_as`), exactly as for an event: identity is not
+/// ambient, so the emitter says who it is, and the sample is its own testimony - no more and no less
+/// trustworthy than the value beside it.
+///
+/// No clock read. The sink stamps the sample, for the reason recorded on `trace_emit`: a CMOS RTC read
+/// on every publish would put up to a millisecond of port I/O on the emitting service's path, and that
+/// once cost the shell its keystrokes. An observer must not be able to slow what it observes.
+/// Encode one log copy. Text is truncated to `max` bytes at a char boundary by the caller.
+pub fn encode_log(text: &[u8], out: &mut [u8; 1 + PEER_LEN + LOG_TEXT_MAX]) -> usize {
+    out[0] = TRACE_OP_LOG;
+    CALLER.read_into(&mut out[1..1 + PEER_LEN]);
+    let n = text.len().min(LOG_TEXT_MAX);
+    out[1 + PEER_LEN..1 + PEER_LEN + n].copy_from_slice(&text[..n]);
+    1 + PEER_LEN + n
+}
+
+/// Longest log text carried in one copy. A longer line still reaches serial in full - only the
+/// queryable copy is clipped - so the loss is bounded and the authoritative record is untouched.
+pub const LOG_TEXT_MAX: usize = 240;
+
+pub fn encode_metric(name: &str, value: u64) -> [u8; 1 + MET_LEN] {
+    let mut b = [0u8; 1 + MET_LEN];
+    b[0] = TRACE_OP_METRIC;
+    CALLER.read_into(&mut b[1..1 + PEER_LEN]);
+    let n = name.len().min(MET_NAME_LEN);
+    b[1 + PEER_LEN..1 + PEER_LEN + n].copy_from_slice(&name.as_bytes()[..n]);
+    b[1 + PEER_LEN + MET_NAME_LEN..1 + PEER_LEN + MET_NAME_LEN + 8]
+        .copy_from_slice(&value.to_le_bytes());
+    b
+}
+
 pub fn encode(peer: &str, op: u8, kind: u8) -> [u8; 1 + EV_LEN] {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut b = [0u8; 1 + EV_LEN];

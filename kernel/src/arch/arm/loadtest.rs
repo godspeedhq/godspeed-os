@@ -2,8 +2,8 @@
 //! Loader selftest - proving the neutral ELF loader parses and maps a real 32-bit ARM service.
 //!
 //! Increment 5 wired the neutral `loader.rs` to parse ELF32 (as well as ELF64) and check the machine
-//! against an arch constant, and `build.rs` now embeds the ARM-built `logger` ELF. This proves the two
-//! meet: the embedded logger is handed to `loader::load`, which parses its ELF32 headers, allocates
+//! against an arch constant, and `build.rs` now embeds the ARM-built `events` ELF. This proves the two
+//! meet: the embedded events is handed to `loader::load`, which parses its ELF32 headers, allocates
 //! frames from the (live) neutral allocator, maps its segments into a fresh page table, and returns
 //! the entry VA - the exact path the spawner will drive in increment 6, minus running it.
 
@@ -11,9 +11,9 @@ use super::pl011_write;
 use super::exceptions::write_hex32;
 use super::timer::write_dec_pub;
 
-/// The ARM `logger` service, embedded by `build.rs` (`SVC_LOGGER_ELF`). On a not-yet-ported arch this
-/// is the empty placeholder; on ARM with the logger built it is the real 32-bit ARM EXEC ELF.
-static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
+/// The ARM `events` service, embedded by `build.rs` (`SVC_EVENTS_ELF`). On a not-yet-ported arch this
+/// is the empty placeholder; on ARM with `events` built it is the real 32-bit ARM EXEC ELF.
+static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 
 /// Load the embedded ARM service ELF and confirm the loader parsed and mapped it.
 ///
@@ -26,7 +26,7 @@ static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 /// rather than a property. `e_entry` is the address of `service_main` (build.rs passes
 /// `--entry=service_main`), not the first byte of `.text`, so the equality only held while the
 /// linker happened to place that function first. An unrelated edit to the SDK reordered it to
-/// `0x4000e8` and this selftest reported `loader FAIL` on a boot where the logger loaded and ran
+/// `0x4000e8` and this selftest reported `loader FAIL` on a boot where `events` loaded and ran
 /// perfectly - a test crying wolf is worse than no test, because the next real failure reads as more
 /// of the same.
 ///
@@ -34,15 +34,15 @@ static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 /// `service_main` leaves the symbol mangled, the entry zero, and the service takes a `rip=0` page
 /// fault the instant it is scheduled. A range check catches that and does not care about layout.
 pub fn selftest() {
-    if LOGGER_ELF.len() < 64 {
-        pl011_write(b"arm32: loader selftest SKIP - no ARM logger ELF embedded (placeholder)\r\n");
+    if EVENTS_ELF.len() < 64 {
+        pl011_write(b"arm32: loader selftest SKIP - no ARM events ELF embedded (placeholder)\r\n");
         return;
     }
 
-    match crate::loader::load(LOGGER_ELF) {
+    match crate::loader::load(EVENTS_ELF) {
         Ok(loaded) => {
             pl011_write(b"arm32: loader - parsed ARM ELF (");
-            write_dec_pub(LOGGER_ELF.len() as u32);
+            write_dec_pub(EVENTS_ELF.len() as u32);
             pl011_write(b" bytes), entry ");
             write_hex32(loaded.entry_va as u32);
             pl011_write(b", mapped ");

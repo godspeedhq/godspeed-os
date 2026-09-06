@@ -175,6 +175,12 @@ fn backend_run(ctx: &ServiceContext) -> ! {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
+    // called - so a traced service says. Without it every event reads `?` in the caller column, and
+    // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
+    // ten unnamed services all collide into one row and their counters interleave. Observed as a
+    // single `msgs.received 1920` belonging to nobody.
+    ctx.trace_as("block-driver");
     // On the ARM ports the backend needs NO MMIO: the USB stack is in the kernel and the disk is
     // reached through syscalls. Going through the `ctx.mmio()` gate would refuse a perfectly good USB
     // stick on any board that does not also hand the service a peripheral window it never reads - which
@@ -188,7 +194,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("block-driver: no AHCI controller found (no SATA disk?)");
             // DRAIN our IPC endpoint forever, never just yield: a registered service that idles here without
             // recv'ing lets a flood (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER - the
-            // flood-endpoint disease (the logger stub / xhci idle()). recv() parks between messages, so the
+            // flood-endpoint disease (`events` stub / xhci idle()). recv() parks between messages, so the
             // core still idles. We POLL (try_recv) rather than block on recv: a cross-core flood that must
             // WAKE a deeply-blocked recv on an AP is unreliable under QEMU TCG (the drain flaked in the
             // flood-storm pin); the self-driven poll drains every quantum with no wake needed. Pinned by the

@@ -596,8 +596,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // come up either mounted or on a genuinely raw/unreadable disk; if block-driver restarts at run
     // time, `serve` reacquires it by name and the client retries (§14.3).
     ctx.log("fs: serving file API");
+    // PUBLISHED EVERY 32 REQUESTS, not every one. A metric that costs an IPC send per request would
+    // double this service's traffic to measure it, and an observer that changes the thing it observes
+    // is not an observer (the same rule that keeps a clock read off `trace_emit`). 32 bounds the
+    // overhead as a FRACTION of load rather than as a rate, so a busy `fs` publishes often and an idle
+    // one costs nothing - and `ctx.metric` is `try_send` with the result discarded, so a full sink
+    // cannot slow this loop even at the moment it publishes.
+    //
+    // The consequence, stated rather than discovered: on a quiet system the numbers lag by up to 31
+    // requests, and `events metrics` shows an `age_s` so that lag is visible instead of implied.
+    const PUBLISH_EVERY: u64 = 32;
+    let mut served = 0u64;
     loop {
         let msg = ctx.recv();
+        served += 1;
+        if served % PUBLISH_EVERY == 0 {
+            ctx.metric("requests", served);
+            ctx.metric("blk.outages", PEER_OUTAGES.load(core::sync::atomic::Ordering::Relaxed) as u64);
+        }
         // LS1 self-heal: if we came up DEGRADED on a storage I/O error, re-attempt the mount when a
         // request arrives, before serving it. block-driver's AHCI disk detection can transiently miss
         // under a heavy restart-storm (a present disk reads sig=0xffffffff and is declared "no disk")
@@ -3522,6 +3538,11 @@ static PEER_UNREACHABLE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static PEER_UNREACHABLE_SUPPRESSED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+/// How many DISTINCT outages have been entered since this instance started. Monotonic, unlike
+/// `PEER_UNREACHABLE_SUPPRESSED`, which is reset at the start of each one so the recovery line can say
+/// what it suppressed. Published as a metric: "storage went away and came back N times" is the kind of
+/// thing that is obvious in hindsight and invisible while it is happening.
+static PEER_OUTAGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Report that `block-driver` could not be reacquired, saying WHICH failure it was - once per outage.
 ///
@@ -3539,6 +3560,7 @@ fn report_peer_unreachable(ctx: &ServiceContext, why: AcquireFailure) {
         return;
     }
     PEER_UNREACHABLE_SUPPRESSED.store(0, Relaxed);
+    PEER_OUTAGES.fetch_add(1, Relaxed);
     ctx.log_fmt(format_args!(
         "fs: block-driver send failed AND it could not be reacquired - {}. Storage is unavailable until this clears; further attempts are counted, not logged",
         why.reason()));

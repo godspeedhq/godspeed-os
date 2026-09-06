@@ -20,7 +20,7 @@ limit   = "16MiB"
 # use; not a scattered `if name ==` branch), gated on the discovered NIC actually being an Intel e1000.
 # Reach it via ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC driver
 # would add both (see driver-skeleton).
-log_write = true   # may write to the logger
+log_write = true   # may write to `events`
 
 [placement]
 # OPTIONAL (omit -> the supervisor round-robins across cores). A driver usually pins for

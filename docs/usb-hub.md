@@ -1,8 +1,11 @@
 # USB Hub Enumeration (xHCI)
 
-**Status:** Design + in-progress, on `feat/dell-wyse-5070-goldmont-plus`. Trails `CLAUDE.md` (§12
-drivers); does not amend it. The EHCI side already does this (`services/ehci/src/main.rs`); this doc
-is the plan to give the xHCI driver the equivalent, adapted to xHCI's very different addressing model.
+**Status:** **BUILT.** The `xhci` service enumerates through hubs (438 hub references in
+`services/xhci/src/main.rs`), which is what makes the Wyse 5070's back-port keyboard - behind a
+Realtek hub - work. Trails `CLAUDE.md` (§12 drivers); does not amend it.
+
+*(This said "in-progress, on `feat/dell-wyse-5070-goldmont-plus`". That branch no longer exists: the
+work merged. A status naming a dead branch sends a reader looking for code that is already in main.)*
 
 ---
 

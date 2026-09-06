@@ -81,7 +81,7 @@ memmap-clamp-test = []
 # not return - scheduler::run IS the idle loop - so it replaces the rest of the boot.
 pi4-sched-demo = []
 # NOTE (C1-1): the bring-up features that had the KERNEL spawn a service directly - `arm-sched-spawn`,
-# `arm-shell`, `arm-spawn-logger`, `pi4-sched-spawn` - are gone. The kernel spawns the supervisor and
+# `arm-shell`, `arm-spawn-events`, `pi4-sched-spawn` - are gone. The kernel spawns the supervisor and
 # nothing else, so a new port is brought up by getting the supervisor running, which is the thing that
 # has to work anyway.
 # The real OS bootstrap on the Pi 4: the kernel makes its ONE direct spawn (the supervisor), which then
@@ -119,12 +119,12 @@ pi4-smp = []
 # unproven one on the strength of an argument. Build both sides with it (`pi4_build.py
 # Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
 arm-sched-demo = []
-# Run a real USER service (the logger) THROUGH the neutral scheduler on ARM, preemptively, alongside
+# Run a real USER service (`events`) THROUGH the neutral scheduler on ARM, preemptively, alongside
 # spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
 # Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
 # trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
 arm-sched-ipc = []
-# Spawn a service (logger) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
+# Spawn a service (events) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
 # task::spawn_service_with_config - the machinery the supervisor's spawn syscall uses - works on ARM.
 # The real OS bootstrap: kernel spawns the SUPERVISOR, which spawns the services (arch/arm/sched_supervisor.rs).
 arm-supervisor = []

@@ -50,7 +50,7 @@ use godspeed_sdk::service_context::supcmd;
 ///
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
-/// retained return address burns a cap-table slot per request (the `logger` leak, §26.6).
+/// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
 fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
 
@@ -190,7 +190,8 @@ static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 /// no PCI bus at all, so the service would have nothing to read.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
-static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
+static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
+static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -228,7 +229,7 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
-    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0, 0),
+    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack", "events"], 0, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
     // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
     // config space at all - that would be write access to every BAR and command register of every
@@ -241,9 +242,15 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // registers on its spawn and kill paths, so a split interface raced the kernel too.)
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     8 * 1024 * 1024, u32::MAX, &[],
+     8 * 1024 * 1024, u32::MAX, &["events"],
      godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
-    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
+    ("events", EVENTS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
+    // NOT in the boot set - the shell spawns it on `events persist start` and it idles until told
+    // what to capture. Being absent from the kernel managed lists is what keeps the whole persistence
+    // feature a zero-kernel-change one, and a recorder that came back without its target path would
+    // be alive and writing nothing while `status` said running.
+    ("recorder", RECORDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
+     u32::MAX, &["events", "fs"], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -260,7 +267,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::ACQUIRE_ANY, 0, 0),
     // The COM2 operator channel. FIRE_IRQ is the one privilege only this service holds.
     ("control", CONTROL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     8 * 1024 * 1024, u32::MAX, &["supervisor"],
+     8 * 1024 * 1024, u32::MAX, &["supervisor", "events"],
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
@@ -282,7 +289,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter.
     ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
                        | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
-     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "logger", "supervisor"],
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "events", "supervisor"],
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
@@ -290,9 +297,9 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::REBOOT
      | godspeed_sdk::service_context::privbits::GPIO
      | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
-    ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "logger"],
+    ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
-    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 1 }, &["nic-driver", "time"],
+    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 1 }, &["nic-driver", "time", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT
      | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
     // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
@@ -310,7 +317,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // WITH the thing it warns about.
     ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      if cfg!(target_arch = "arm") { 2 } else { 1 },
-     if cfg!(target_arch = "arm") { &["dwc2"] } else if cfg!(target_arch = "aarch64") { &["xhci"] } else { &[] },
+     if cfg!(target_arch = "arm") { &["dwc2", "events"] } else if cfg!(target_arch = "aarch64") { &["xhci", "events"] } else { &["events"] },
      0, 0,
      // NAMED BY THE BUS, not by the kernel (step D1). 0x010601 is the industry-standard PCI class
      // code for an AHCI SATA controller - class 0x01 mass storage, subclass 0x06 SATA, prog-if 0x01
@@ -332,7 +339,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // non-cacheable pixel stores in one un-preemptible stretch, and sharing a core with dwc2's
     // 125 us split-transaction windows produced NYET storms and a six-second keyboard stall.
     ("console", CONSOLE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 3 } else { 0 }, &[], 0, 0,
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 3 } else { 0 }, &["events"], 0, 0,
      godspeed_sdk::service_context::hwclass::FRAMEBUFFER),
     // The four INTERRUPT-DRIVEN drivers. None of them names a vector: the kernel derives it from the
     // device class (`hw_irqs_for`), because routing a vector IS authority - on ARM, granting the USB
@@ -350,7 +357,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // refuses any privilege the supervisor cannot delegate - so it is set where it is used and the
     // grant is simply never exercised elsewhere.
     ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 1, if cfg!(target_arch = "arm") { &["dwc2"] } else { &[] },
+     16 * 1024 * 1024, 1, if cfg!(target_arch = "arm") { &["dwc2", "events"] } else { &["events"] },
      if cfg!(target_arch = "aarch64") { godspeed_sdk::service_context::privbits::NET_DEVICE } else { 0 }, 0,
      // x86: named by the bus. 0x020000 is class 0x02 network, subclass 0x00 ethernet - the class
      // EVERY PCI ethernet controller reports, whoever made it.
@@ -384,7 +391,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
 #[cfg(target_arch = "x86_64")]
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 2, &[],
+     64 * 1024 * 1024, 2, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      // Named by the bus, WITH an interrupt (step D1b). 0x0C0330 is the industry-standard class code
      // for an xHCI USB controller - class 0x0C serial bus, subclass 0x03 USB, prog-if 0x30 xHCI -
@@ -397,14 +404,14 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      // enumerated THROUGH the confined domain.
      godspeed_sdk::service_context::hwclass::pci_irq(0x0C_03_30, 0, true)),
     ("ehci", EHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 3, &[],
+     64 * 1024 * 1024, 3, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::EHCI),
 ];
 #[cfg(target_arch = "aarch64")]
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 2, &[],
+     64 * 1024 * 1024, 2, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::XHCI),
 ];
@@ -413,7 +420,7 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
 #[cfg(target_arch = "arm")]
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("dwc2", DWC2_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 0, &[],
+     64 * 1024 * 1024, 0, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::DWC2),
 ];
@@ -432,7 +439,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
     // preference, which is what the contract declares. The DIFFERENCE between those two is carried
     // explicitly: an override is STRICT (reject if that core is not ready), a preference FALLS BACK
-    // to round-robin. Sending the preference as an override is what made `logger` and `xhci` fail to
+    // to round-robin. Sending the preference as an override is what made `events` and `xhci` fail to
     // spawn at all on a 2-core machine instead of landing on another core.
     let caller_chose = !(core == 0xFFFF || core == u32::MAX);
     req.core         = if caller_chose { core } else { table_core };
@@ -856,7 +863,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// the previous); nic-driver before net-stack.
 const MANAGED_N: usize = 13;
 const MANAGED: [&str; MANAGED_N] =
-    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "console", "nic-driver", "net-stack",
+    ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
      // clock the shell and net-stack now ask for; `control` owns the COM2 operator channel the test
      // harness drives. A service that is embedded and configured but never spawned is the C5-1 shape
@@ -1000,27 +1007,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut name_map = NameCapMap::new();
 
     // Path C / Phase 5: the kernel boots the supervisor directly (init is removed), so the
-    // supervisor now spawns the logger - moved here from init. logger is not TCB (§11.3): retry
+    // supervisor now spawns `events` - moved here from init. events is not TCB (§11.3): retry
     // once on failure and continue without it (its output falls back to the kernel ring buffer).
-    ctx.log("supervisor: spawning logger...");
-    if let Some(cap) = ctx.acquire_send_grant_cap("logger") {
-        // Supervisor RESPAWN: the logger is still alive (only the supervisor died). Adopt it - reacquire
+    ctx.log("supervisor: spawning events...");
+    if let Some(cap) = ctx.acquire_send_grant_cap("events") {
+        // Supervisor RESPAWN: `events` is still alive (only the supervisor died). Adopt it - reacquire
         // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
-        // rejects, which used to print a misleading "logger spawn failed" on every `kill supervisor`.
+        // rejects, which used to print a misleading "events spawn failed" on every `kill supervisor`.
         // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
-        record_name_quiet(&ctx, &mut name_map, "logger", cap);
-        ctx.log("supervisor: adopted running logger");
-    } else if !spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) {
-        // Through the image table: the supervisor carries logger's image now, and it does not route
+        record_name_quiet(&ctx, &mut name_map, "events", cap);
+        ctx.log("supervisor: adopted running events");
+    } else if !spawn_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
+        // Through the image table: the supervisor carries events's image now, and it does not route
         // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
         // nothing. Same shape as pong/ping.
-        ctx.log("supervisor: logger spawn failed, retrying");
-        let _ = spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF);
+        ctx.log("supervisor: events spawn failed, retrying");
+        let _ = spawn_mapped(&ctx, &mut name_map, "events", 0xFFFF);
     }
 
-    // The terminal (docs/console-service.md §9). Spawned right after the logger and before anything
+    // The terminal (docs/console-service.md §9). Spawned right after `events` and before anything
     // that produces console output, so the display changes hands once, early, rather than mid-boot.
-    // Like the logger it is not TCB: if it fails to spawn, console output still reaches serial (which
+    // Like `events` it is not TCB: if it fails to spawn, console output still reaches serial (which
     // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
     ctx.log("supervisor: spawning console...");
     if let Some(cap) = ctx.acquire_send_grant_cap("console") {
@@ -1372,7 +1379,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
     // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
     // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
-    // `ehci`, `logger`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
+    // `ehci`, `events`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
     // task can't respawn itself; the only death that is unrecoverable is the kernel's. Other
     // restart/kill commands still arrive via the
     // COM2 control channel (control::process_pending in the timer ISR).
@@ -1424,7 +1431,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if respawn_retry(&ctx, &mut name_map, "shell") { ctx.log("supervisor: shell restarted"); }
                 else { ctx.log("supervisor: shell restart FAILED"); }
             }
-            // The USB host drivers + logger are directly restartable now: their OWN death respawns
+            // The USB host drivers + events are directly restartable now: their OWN death respawns
             // them immediately (re-granting MMIO/DMA/IRQ caps + re-initialising the controller),
             // instead of waiting for a lucky supervisor respawn. This is what keeps a `chaos
             // max-carnage` that kills `xhci`/`ehci` in its last rounds from leaving the keyboard dead.
@@ -1448,10 +1455,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if respawn_retry(&ctx, &mut name_map, "dwc2") { ctx.log("supervisor: dwc2 restarted"); }
                 else { ctx.log("supervisor: dwc2 restart FAILED"); }
             }
-            "logger" => {
-                ctx.log("supervisor: logger died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "logger") { ctx.log("supervisor: logger restarted"); }
-                else { ctx.log("supervisor: logger restart FAILED"); }
+            "events" => {
+                ctx.log("supervisor: events died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "events") { ctx.log("supervisor: events restarted"); }
+                else { ctx.log("supervisor: events restart FAILED"); }
             }
             // counter (examples/counter, counter-test build): respawn it wired to `fs` - the fresh
             // instance reconstructs its count from /counter.dat (§14/§15). The "died/restarted" lines

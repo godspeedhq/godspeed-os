@@ -141,7 +141,7 @@ Components depend on each other without an explicit contract.
 
 | Violation | The correct pattern |
 |-----------|---------------------|
-| Shell depends on logger output formatting. | Depend on a stable interface (a typed record / a documented protocol), not on how a peer happens to render text today. |
+| Shell depends on events output formatting. | Depend on a stable interface (a typed record / a documented protocol), not on how a peer happens to render text today. |
 | Filesystem assumes the block size. | Query it from `block-driver`, or negotiate it; do not bake a peer's internal constant into your logic. |
 | Driver knows the scheduler quantum. | Wait on the hardware event, not on "roughly a quantum" of time (Commandment VIII). The quantum is not your contract. |
 | Network stack knows the NIC vendor. | The driver abstracts the device; the stack talks a device-neutral interface. Vendor specifics stop at the driver. |

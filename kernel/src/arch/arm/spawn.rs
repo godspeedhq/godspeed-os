@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The finish line: spawn a real GodspeedOS service and run it to `ready` on ARM.
 //!
-//! Everything the campaign built converges here. This takes the ARM `logger` ELF (embedded by
+//! Everything the campaign built converges here. This takes the ARM `events` ELF (embedded by
 //! `build.rs`, built in increment 4), loads it with the neutral loader (5) into a fresh address space
 //! (page tables from 3, frames from 1), sets up a task with a `LOG_WRITE` capability, and enters it at
-//! PL0 (3). The service runs its own compiled `service_main`, calls `ctx.log("logger: ready")`, which
+//! PL0 (3). The service runs its own compiled `service_main`, calls `ctx.log("events: ready")`, which
 //! issues a real `svc` (2) into the neutral syscall dispatcher, which validates the capability and
 //! writes to the kernel log - and the line appears on the console.
 //!
@@ -22,7 +22,7 @@ use crate::memory::frame::PhysAddr;
 
 
 // Must match the SDK's ServiceContext layout (sdk/rust/src/service_context.rs) - the kernel writes
-// this page, the service reads it. Only the fields the logger touches on startup need real values.
+// this page, the service reads it. Only the fields `events` touches on startup need real values.
 pub(super) const SERVICE_CTX_VA: u32 = 0x003f_f000;
 pub(super) const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 pub(super) const USER_STACK_TOP: u32 = 0x8000_0000;

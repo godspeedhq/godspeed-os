@@ -110,7 +110,7 @@ fn set_call_await(caller_slot: usize, target: EndpointId) {
 /// **Reads state the kernel already keeps for correctness; it records nothing new.** `CALL_AWAIT_EP`
 /// exists so a dead replier wakes its caller with `ReplyDead` (§8.6). That same record answers "why is
 /// this task not progressing?", because the chain of who-awaits-whom IS the causal chain - so the
-/// `trace` utility is a reader of this, not a tracer (`utilities/46_trace.md`).
+/// The `events` views read this; the kernel is not a tracer (`utilities/47_events.md`).
 ///
 /// Relaxed, and deliberately so: this is a best-effort snapshot for an operator, on the same contract
 /// as `task_stat`. A value read the instant before the awaited endpoint replies is stale, and that is
@@ -531,21 +531,64 @@ pub fn take_call_waiter(dead_ep: EndpointId) -> Option<usize> {
 ///
 /// Returns the blocked receiver slot if a task was waiting on `recv`, so the
 /// caller can call `scheduler::wake_by_slot` (which handles the cross-core IPI).
-pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usize> {
+/// What became of a kernel-originated enqueue. `Option<usize>` could not say, which is the point.
+///
+/// This used to return `Option<usize>` - "the slot to wake, if one was blocked" - and swallow the
+/// enqueue result with `.ok()`. A full queue was therefore INDISTINGUISHABLE from a successful delivery
+/// to a receiver that was not blocked, so a dropped message left no trace at all.
+///
+/// That cost a Pi 4 its storage for 53 seconds: a death notification for `xhci` was dropped, the
+/// supervisor never heard, `block-driver` could not resolve the name, and `fs` sat degraded until the
+/// periodic reconcile sweep noticed. The run dropped 138 notifications and said nothing about any of
+/// them, so the log blamed a reconcile sweep for a failure that happened somewhere else.
+///
+/// DROPPING IS NOT THE DEFECT and this does not change it: the kernel must never block on a userspace
+/// queue, and a bounded queue must discard something (§26.6). Being silent about it is (invariant 12).
+pub enum Enqueue {
+    /// Queued, and this slot was blocked awaiting it - wake it.
+    Woke(usize),
+    /// Queued; nobody was waiting.
+    Queued,
+    /// No such endpoint, or it is Dead.
+    ///
+    /// WHETHER THIS IS A LOSS DEPENDS ON THE CALLER, so it is reported rather than judged here. For an
+    /// IRQ it is not: a driver that is gone cannot want its interrupt. For a DEATH NOTIFICATION it is,
+    /// and it is the common case - `chaos` kills the supervisor too, and a death arriving while the
+    /// supervisor is itself dead-and-respawning finds this. Hardware settled it: one run produced 144
+    /// notifications the supervisor never received and ZERO full queues.
+    NoEndpoint,
+    /// DROPPED - the endpoint's queue was full. A real loss, and the caller must say so.
+    QueueFull,
+}
+
+pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Enqueue {
     let mut table = TABLE.lock_irq();
-    let idx = find_index(&*table, endpoint)?;
+    let idx = match find_index(&*table, endpoint) {
+        Some(i) => i,
+        None => return Enqueue::NoEndpoint,
+    };
 
     if table[idx].liveness == EndpointLiveness::Dead {
-        return None;
+        return Enqueue::NoEndpoint;
     }
 
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        table[idx].queue.enqueue(msg).ok();
-        return Some(slot);
+        // A blocked receiver implies an empty queue, so this cannot fail - but if it ever did, putting
+        // the receiver back matters: taking it and then not queueing anything would leave a task
+        // blocked forever with nothing coming.
+        return match table[idx].queue.enqueue(msg) {
+            Ok(()) => Enqueue::Woke(slot),
+            Err(_) => {
+                table[idx].blocked_receiver = Some(slot);
+                Enqueue::QueueFull
+            }
+        };
     }
 
-    table[idx].queue.enqueue(msg).ok();
-    None
+    match table[idx].queue.enqueue(msg) {
+        Ok(()) => Enqueue::Queued,
+        Err(_) => Enqueue::QueueFull,
+    }
 }
 
 /// Kernel-originated delivery that applies BACK-PRESSURE instead of dropping.
@@ -606,6 +649,9 @@ pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
 ///
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
+/// Messages accepted into a queue and then lost when that endpoint died.
+static QUEUED_LOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     let mut table = TABLE.lock_irq();
     let idx = match find_index(&*table, endpoint) {
@@ -614,6 +660,29 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     };
     table[idx].liveness   = EndpointLiveness::Dead;
     table[idx].generation = table[idx].generation.bump();
+
+    // MESSAGES DIE WITH THE ENDPOINT, and this is where they are lost. Everything queued here was
+    // ACCEPTED - the sender was told nothing was wrong, because at the time nothing was - and it goes
+    // in the drain below without ever being read.
+    //
+    // That is the mechanism behind "supervisor: reconcile respawned X (missed death notification)": a
+    // death notification is queued onto a live supervisor endpoint, the supervisor then dies, and the
+    // notification is discarded here. Two earlier guesses were wrong and measurement disproved both -
+    // a run with 144 such misses had ZERO full queues and ZERO sends to a dead endpoint. It was always
+    // this.
+    //
+    // Bounded and rate-limited: an endpoint dying with a full queue is 16 messages, and a storm kills
+    // many endpoints, so say the first and then every 64th.
+    let discarded = table[idx].queue.len();
+    if discarded > 0 {
+        let n = QUEUED_LOST.fetch_add(discarded as u64, core::sync::atomic::Ordering::Relaxed)
+            + discarded as u64;
+        if n <= discarded as u64 || n % 64 < discarded as u64 {
+            crate::kprintln!(
+                "kernel: endpoint {} died holding {} unread message(s) - they are LOST ({} total); a death notification among them is why a service comes back on the reconcile sweep rather than promptly",
+                endpoint.0, discarded, n);
+        }
+    }
     table[idx].queue.drain();
     let rx = table[idx].blocked_receiver.take();
     let tx = table[idx].blocked_sender.take();

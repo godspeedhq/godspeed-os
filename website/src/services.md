@@ -57,7 +57,7 @@ Arrows point from the caller to the service it sends to.
              │         └──────┬───────┘         │  restarts what dies
              │                │                 │
      ┌───────▼──────┐  ┌──────▼──────┐   ┌──────▼──────┐
-     │   control    │  │    shell    │   │   logger    │
+     │   control    │  │    shell    │   │   events    │
      │ (COM2 ops)   │  │  (the user) │   │             │
      └──────────────┘  └──┬───┬───┬──┘   └─────────────┘
                           │   │   │
@@ -121,7 +121,7 @@ There is no `stdin` and no `fork`. A pipe `A | B` is the shell creating an endpo
 end to each side (Appendix D.3). A killed shell respawns as a fresh prompt - the in-flight command is
 lost, the session is not.
 
-**Peers:** `fs`, `block-driver`, `time`, `console`, `logger`, `supervisor`.
+**Peers:** `fs`, `block-driver`, `time`, `console`, `events`, `supervisor`.
 
 ### `fs` - the filesystem, and files as capabilities
 
@@ -139,7 +139,7 @@ A file **is** a capability (§7.10): unforgeable, non-escalating, revocable by g
 commits metadata through a crash-consistent redo journal, so its death is a restart rather than a
 reboot - which is what took it out of the trusted computing base.
 
-**Peers:** `block-driver`, `logger`.
+**Peers:** `block-driver`, `events`.
 
 ### `block-driver` - blocks, and nothing above them
 
@@ -212,17 +212,49 @@ cannot ask a service to report it (§11.4).
 
 **Peers:** `fs`, `net-stack`.
 
-### `logger` - a broker, not a store
+### `events` - the observability sink
+
+**Logging does NOT go through it, and that is the design.** `ctx.log()` is a syscall: it writes the
+kernel's 16 KiB ring buffer and the serial console DIRECTLY, for every service, for the life of the
+machine. So a chaos storm that kills this service loses no log output, and `ctx.log()` never blocks
+on it and never fails because of it.
 
 ```
-   any service ──▶ logger ──▶ serial + the kernel ring buffer
-                       └────▶ the `trace` ring (IPC events, in-memory)
+   ctx.log()  ──syscall 5──▶  kernel ring + serial          (always, never via events)
+                     └──────▶  events  (a best-effort COPY, offered after the fact)
+
+   ctx.metric() / IPC trace ──▶ events ──▶ three VOLATILE stores:
+                                             192-event IPC trace ring
+                                             64-slot metric table, keyed (owner, name)
+                                             8 KiB log window
 ```
 
-Stateless on purpose. A logger that persisted would depend on `fs`, which would make observing a
-storage failure depend on storage.
+That ordering is the whole point and must not be inverted: re-pointing logs AT this service would
+make observing a failure depend on a service that can fail.
 
-**Peers:** none.
+Everything it holds is volatile and starts empty after a restart - a re-init, not a resume. The
+publishers are what make that work: they resolve lazily, ask the kernel for a cap when they hold
+none, retry a sample after reacquiring, and republish their liveness row on the first message after
+the sink returns.
+
+**Read it with:** `events ipc`, `events metrics`, `events log`, `events status`.
+**Peers:** fourteen services publish to it; it publishes to nobody.
+
+### `recorder` - the capture that outlives the screen
+
+Spawned **on demand** by `events persist start`, never at boot, and deliberately **not restarted**.
+
+Writing to disk blocks, and a blocked single-threaded loop stops draining its endpoint - so if
+`events` did this itself it would drop the very events worth capturing, on a sick disk, exactly when
+they matter. `recorder` has the identical problem and it does not matter, because nothing depends on
+it: the dependency points the right way.
+
+It is not restarted on purpose. A respawned recorder would not know its target path, so it would be
+alive and writing nothing while `status` said "running" - worse than dead, because dead is visible.
+Instead a capture opens with a header and closes with a footer, so a file with no footer says plainly
+that it died.
+
+**Peers:** `events`, `fs`.
 
 ### `hw-enumerator` - hardware discovery in userspace
 

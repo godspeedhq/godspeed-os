@@ -167,7 +167,7 @@ service_configs = [
 # task not progressing?" becomes a walk of state the kernel already keeps, with NO event ring, no
 # switch, no message ids, and no cost when unused (nothing runs until asked). The rejected alternative
 # was a trace buffer written on the IPC fast path - genuinely new kernel state and cost - which
-# `utilities/46_trace.md` records as mechanism B, deliberately not built.
+# `utilities/47_events.md` records as mechanism B, deliberately not built.
 #
 # Neither query changes what the kernel DOES. Both are read-only, both are INTROSPECT-gated by falling
 # outside the ungated list, and the system behaves identically whether anything reads them or not.

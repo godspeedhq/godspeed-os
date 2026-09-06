@@ -100,7 +100,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -
     its bytes always have somewhere to go.
 14. **Multiple same-type targets are a COMMA-separated list, never spaced.** `kill ehci,xhci,fs`,
-    `spawn ping,pong`, `restart fs,logger`, `delete /a,/b`, `mkdir docs,tmp`, `fmt a.gsh,b.gsh`,
+    `spawn ping,pong`, `restart fs,events`, `delete /a,/b`, `mkdir docs,tmp`, `fmt a.gsh,b.gsh`,
     `chaos max-carnage nic-driver,net-stack` - one argument, comma-delimited. NOT spaced
     (`kill ehci xhci fs`): the shell tokenizes a line to a small fixed arg count (`MAX_ARGS = 4`), so a
     spaced list silently caps at ~3 targets, while a comma-list is a SINGLE token and is therefore

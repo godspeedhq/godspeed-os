@@ -40,7 +40,7 @@ Userspace issues **`svc #0`**. The register convention (matched by the SDK's `ra
 and calls `arm_boot_main` (`mod.rs`). That runs the machine bring-up (MMU short-descriptor tables,
 exception vectors at `VBAR`, generic timer, PL011, frame allocator, DWC2 probe) + boot selftests, then
 dispatches to **one** boot path selected by a cargo feature: `arm-supervisor` (the real OS: kernel spawns
-the supervisor, which spawns logger + shell + ping/pong) or `arm-shell` (kernel spawns logger + shell
+the supervisor, which spawns events + shell + ping/pong) or `arm-shell` (kernel spawns events + shell
 directly). The shipping build is `arm-supervisor` with the supervisor's `bare-metal` feature (clean
 `gsh>` prompt). `docs/arm32-status.md` has the build/run commands.
 

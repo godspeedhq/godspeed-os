@@ -1203,8 +1203,8 @@ not merely catch a violation, it produced a better design.
 
 ### Where step C stopped, and exactly what each remaining service waits on
 
-**Pin 29 -> 19. Ten services the kernel has never heard of:** `pong`, `ping`, `time`, `logger`,
-`asker`, `roster`, `reply-server`, `holder`, `upper`, `mem-pressure`. That includes `logger`, which
+**Pin 29 -> 19. Ten services the kernel has never heard of:** `pong`, `ping`, `time`, `events`,
+`asker`, `roster`, `reply-server`, `holder`, `upper`, `mem-pressure`. That includes `events`, which
 every service logs through, and `time`, which the shell and net-stack depend on - so the mechanism is
 carrying load-bearing services, not only demos.
 
@@ -1459,7 +1459,7 @@ embedded set never reaches zero:
 ```
    stays embedded in kernel.bin        moves to signed packages on disk
    ----------------------------        --------------------------------
-   supervisor   (recovery anchor)      shell, console, logger, time,
+   supervisor   (recovery anchor)      shell, console, events, time,
    block-driver (reach the disk)       net-stack, nic-driver, xhci, ehci,
    fs           (read the disk)        observe, chaos, ping, pong, ...
    shell?       (a prompt on a

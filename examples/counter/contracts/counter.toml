@@ -17,7 +17,7 @@ limit   = "64MiB"
 # ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 ipc_send    = ["fs"]        # send file-API ops (read/write /counter.dat) to the fs service
 ipc_receive = ["counter"]   # OWNS its endpoint - fs replies here (load needs the reply round-trip)
-log_write   = true          # may write progress + recovery messages to the logger
+log_write   = true          # may write progress + recovery messages to `events`
 
 # No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across
 # the ready cores: the right default for almost every service. (Omitting does NOT mean "core 0".)

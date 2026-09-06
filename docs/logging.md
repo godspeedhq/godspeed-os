@@ -1,16 +1,16 @@
 # Logging (design, not built)
 
-> **Status: non-normative.** This records design intent for what the `logger` service is *for*. Nothing
+> **Status: non-normative.** This records design intent for what the `events` service is *for*. Nothing
 > here amends the constitution; when it and `CLAUDE.md` disagree, `CLAUDE.md` wins. What exists today is
 > described under "What runs now" at the end.
 
 ## The one-line purpose
 
-**The logger is a broker, not a store.**
+**`events` is a broker, not a store.**
 
 The kernel's 16 KiB ring buffer (§11.4) is a *mechanism*: a bounded byte sink that drains to serial. It
 deliberately has no opinion about levels, formats, retention, or who may read what. All of that is
-policy, and policy belongs in a service (§26.10). The logger exists to be the place where "I have
+policy, and policy belongs in a service (§26.10). `events` exists to be the place where "I have
 something to say" becomes "these particular consumers hear it".
 
 That is the whole justification for it being a service at all. If the answer were "make the kernel ring
@@ -20,7 +20,7 @@ buffer bigger and cleverer", we would be growing the kernel to hold policy, whic
 
 There is no ambient `stdout` here. A service can emit only because something handed it a send cap at
 spawn (§3.1, Appendix B.3). So logging is not a special subsystem: it is a **pipe whose far end happens
-to be the logger** - the same primitive as `cmd1 | cmd2`, where the shell mints an endpoint and grants
+to be `events`** - the same primitive as `cmd1 | cmd2`, where the shell mints an endpoint and grants
 SEND to one side and RECV to the other (Appendix D.3, `docs/pipes.md`).
 
 This collapse is worth keeping. Logging and piping should not be two mechanisms that happen to look
@@ -37,10 +37,10 @@ ignore the rest. Logs carry secrets. A single global stream that any holder of o
 is exactly the hole the rest of the system spends its effort not having.
 
 **Adopted - subscription as a delegated resource capability (§7.10).** A log stream is a resource. The
-logger mints a cap to one service's stream and hands it over; the kernel validates and routes it, exactly
+events mints a cap to one service's stream and hands it over; the kernel validates and routes it, exactly
 as it does for a file cap. Three properties fall out for free:
 
-- **Who can hear whom is kernel-enforced**, not enforced by access-control code inside the logger.
+- **Who can hear whom is kernel-enforced**, not enforced by access-control code inside `events`.
 - **Revocation is a generation bump.** Cut a diagnostic tool off mid-stream and its next read fails
   `CapRevoked`.
 - **Grants narrow.** Hand a tool a read-only cap to exactly one service's stream and nothing else.
@@ -77,13 +77,13 @@ because the capability check has already happened.
 
 ## Stateless is load-bearing
 
-Keeping the logger **stateless** is what makes it a *router* rather than a database, and routers are
+Keeping `events` **stateless** is what makes it a *router* rather than a database, and routers are
 always available. It holds a bounded window at most.
 
 The moment it persists, it needs storage; storage means `fs`; and `fs` and `block-driver` both log. That
-is a **cycle** - logger to fs to block-driver and back to logger. §8.9 is blunt about the consequence:
+is a **cycle** - events to fs to block-driver and back to events. §8.9 is blunt about the consequence:
 the kernel does not detect deadlock, and in any protocol where two services send to each other at least
-one direction MUST use `try_send`. A logger that blocks writing to storage while storage blocks logging
+one direction MUST use `try_send`. An `events` that blocks writing to storage while storage blocks logging
 is the textbook mutual block.
 
 Worse than the deadlock is the observability inversion: **if the log path runs through storage, a storage
@@ -97,7 +97,7 @@ the router and serial keep working. Serial stays wired underneath everything as 
 ## Shape
 
 ```text
-services --(send cap)--> logger  (stateless router, unforgeable attribution)
+services --(send cap)--> events  (stateless router, unforgeable attribution)
                             |
               +-------------+-------------+
               v             v             v
@@ -108,7 +108,7 @@ services --(send cap)--> logger  (stateless router, unforgeable attribution)
 ## Obligations any implementation inherits
 
 - **Bounded queues force a stated loss policy.** Endpoints are 16 deep (§8.5). Under a log storm the
-  logger's queue fills, and the sender either blocks - a service hung by its own diagnostics, which is
+  events's queue fills, and the sender either blocks - a service hung by its own diagnostics, which is
   unacceptable - or drops. §26.6 wants the saturation behaviour named; §26.7 wants the drop **counted and
   reported**, never silent. "How many did I lose" is part of the protocol, not an afterthought.
 - **Formatting is fine; buffering is not.** §26.6.1 rules out a heap. Streaming JSON (or whatever) through
@@ -122,9 +122,9 @@ services --(send cap)--> logger  (stateless router, unforgeable attribution)
 
 ## What runs now
 
-`services/logger/src/main.rs` is 29 lines and does almost none of the above:
+`services/events/src/main.rs` is 29 lines and does almost none of the above:
 
-1. Logs `logger: ready` at startup.
+1. Logs `events: ready` at startup.
 2. Blocks on `recv()` and **drops every message**.
 
 The drop loop is not laziness - it is a real fix. The service owns an endpoint, and an endpoint has a
@@ -132,7 +132,7 @@ The drop loop is not laziness - it is a real fix. The service owns an endpoint, 
 and sit at 16/16 forever, failing every later sender. Blocking on `recv` and dropping keeps it drained
 while still parking the task between messages, so the core idles.
 
-Note what this means: **nothing currently logs *through* the logger.** `ctx.log()` is syscall 5 - it goes
+Note what this means: **nothing currently logs *through* `events`.** `ctx.log()` is syscall 5 - it goes
 straight to the kernel ring buffer and out to serial, never touching the service. Its practical value
 today is as the simplest restartable service: stateless, so it is the trivial restart case (§15), and the
 second thing the supervisor spawns, which makes it a useful canary that the spawn path works before

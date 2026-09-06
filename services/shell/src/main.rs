@@ -360,6 +360,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the first `gsh> ` the serial-driven shell-test waits on.
     ctx.console_boot_complete();
 
+    // RESUME A STICKY CAPTURE, if one was recorded. Deliberately after `console_boot_complete`: fs is
+    // at its slowest while mounting and replaying its journal, and this read retries rather than
+    // giving up on one slow answer - a capture missed because storage was half a second late is
+    // exactly the unattended failure sticky exists to prevent.
+    sticky_resume(ctx);
+
     // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
     // can only echo single bytes blindly, so it prints the `[` and `A` of an arrow
     // key's `ESC [ A` sequence before the shell consumes them - smearing "[A" onto
@@ -786,7 +792,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio", "trace",
+    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -797,7 +803,8 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "status"]),
+    ("events",  &["failures", "ipc", "log", "metrics", "persist", "status"]),
+    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -848,7 +855,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // `nic-driver,net-<tab>` finishes `net-stack` while the earlier listed targets are preserved verbatim.
     if "chaos".as_bytes() == cmd && prior == 1 && words.clone().next() == Some("max-carnage".as_bytes()) {
         const TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
+            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -868,7 +875,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
     if "kill".as_bytes() == cmd && prior == 0 {
         const KILL_TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "logger", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
+            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -898,7 +905,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
     if "restart".as_bytes() == cmd && prior == 0 {
-        const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "logger", "xhci",
+        const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "events", "xhci",
             "ehci", "shell", "nic-driver", "net-stack", "ping", "pong", "version", "help"];
         return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
     }
@@ -1602,6 +1609,12 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "version" => cmd_version_os(ctx, out),
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, if argc >= 2 { args[1] } else { "" }, out),
+        // `events` IS the reader; `trace` is the older name for the same views and keeps working.
+        // The service holds three streams now - logs, IPC traces and metrics - and only one of them
+        // is a trace, so a reader named after the service is the discoverable one. `trace` stays
+        // because it is in muscle memory, the docs and several hundred selfcheck assertions, and
+        // breaking that would be churn with nothing bought.
+        "events"  => cmd_events(ctx, s["events".len()..].trim()),
         "trace"   => cmd_trace(ctx, s["trace".len()..].trim()),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
@@ -4198,7 +4211,7 @@ fn help_block_lines(rows: &[Row], footer: bool) -> usize {
 /// CLAMPED TO THE CONSOLE WIDTH, and that is load-bearing rather than cosmetic. The pager counts
 /// LOGICAL lines and paints one per screen row; a line longer than the terminal wraps onto a second
 /// row, so every wrapped row pushes the frame down, scrolls the pinned header off the top and makes
-/// the whole thing look like it started in the middle. That is exactly what `trace help` did on a
+/// the whole thing look like it started in the middle. That is exactly what `events help` did on a
 /// 102-column display while looking perfect on serial, which has no width at all.
 ///
 /// The rows are short now, but content should not be able to break the frame - so an over-long line
@@ -4282,17 +4295,26 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
         ], true),
-        "trace" => help_block(ctx, "trace", "who waits on whom, who can reach whom, what just happened", &[
+        "events" => help_block(ctx, "events", "what the sink RECORDED: logs, IPC traces, metrics", &[
+            ("events ipc", "recent IPC exchanges, oldest first", "events ipc"),
+            ("events failures", "the same, only timeouts and lost peers", "events failures"),
+            ("events log [n]", "the last n log lines the sink kept", "events log 20"),
+            ("events metrics", "published samples: owner, metric, value, age", "events metrics"),
+            ("events status", "ring size, events recorded, events dropped", "events status"),
+            ("events persist ...", "capture the log to disk (start/stop/status)", "events persist status"),
+            ("", "", ""),
+            ("events <view> help", "what that view's output MEANS, column by column", "events ipc help"),
+            ("", "for LIVE kernel state - what is stuck right now - use `trace`", ""),
+        ], true),
+        "trace" => help_block(ctx, "trace", "what the kernel is doing RIGHT NOW", &[
             ("trace blocked", "every task stuck on another task", "trace blocked"),
             ("trace chain <name|slot>", "the same, as a tree from one task", "trace chain fs"),
             ("trace deps <service>", "what it can call, as a tree", "trace deps shell"),
             ("trace endpoints", "every live endpoint and its owner", "trace endpoints"),
             ("trace endpoint <id>", "who owns one, and who can reach it", "trace endpoint 112"),
-            ("trace ipc", "recent IPC exchanges, oldest first", "trace ipc"),
-            ("trace failures", "the same, only timeouts and lost peers", "trace failures"),
-            ("trace status", "ring size, events recorded, events dropped", "trace status"),
             ("", "", ""),
-            ("trace <view> help", "what that view's output MEANS, column by column", "trace ipc help"),
+            ("trace <view> help", "what that view's output MEANS, column by column", "trace deps help"),
+            ("", "for what was RECORDED - the ring, metrics, logs - use `events`", ""),
         ], true),
         "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
             ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
@@ -4394,8 +4416,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "caps" => help_block(ctx, "caps", "show a service's capabilities (records when piped)", &[
             ("caps", "this shell's own capabilities", "caps"),
-            ("caps <service>", "capabilities held by <service>", "caps logger"),
-            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights contains send"),
+            ("caps <service>", "capabilities held by <service>", "caps events"),
+            ("caps [service] | <verb>", "piped: records resource/rights", "caps events | where rights contains send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
             ("spawn <svc>", "start the service <svc>", "spawn pong"),
@@ -4404,13 +4426,13 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "kill" => help_block(ctx, "kill", "stop a service (it self-heals - the supervisor respawns it)", &[
             ("kill <svc>", "kill one service; it recovers (only the kernel never dies)", "kill pong"),
             ("kill <svc>,<svc>,...", "kill several at once (comma-separated, NO spaces)", "kill ehci,xhci,fs"),
-            ("kill all-services", "nuke EVERY service - drivers, storage, net, logger, supervisor, and this shell last; each self-heals", "kill all-services"),
+            ("kill all-services", "nuke EVERY service - drivers, storage, net, events, supervisor, and this shell last; each self-heals", "kill all-services"),
             ("(per-service rules still apply)", "supervisor is killable + kernel-respawned; spawn/restart of it stay refused", "kill supervisor"),
         ], true),
         "restart" => help_block(ctx, "restart", "restart a service", &[
             ("restart <name>", "restart (re-placed per contract)", "restart pong"),
             ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
-            ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,logger"),
+            ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,events"),
         ], true),
         "reboot" => help_block(ctx, "reboot", "hardware reset", &[
             ("reboot", "reset the machine", "reboot"),
@@ -4513,7 +4535,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "where" => help_block(ctx, "where", "keep records whose field matches (record-pipe stage)", &[
             ("<records> | where <col><op><val>", "ops: = != > < >= <=, and the word `contains`", "status | where mem>0"),
             ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
-            ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps logger | where rights contains send"),
+            ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps events | where rights contains send"),
         ], true),
         "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
             ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
@@ -4637,6 +4659,11 @@ static HELP: &[HelpRow] = &[
     Sec("Services"),
     Row("status", "list all live tasks"),
     Row("observe [now]", "live view (q to quit) / one-shot frame"),
+    // Neither of these was ever listed here, so `help` did not mention the observability tools at all.
+    // Two entries because they are two commands over two SOURCES: `trace` walks live kernel state,
+    // `events` reads what the sink recorded.
+    Row("trace <view>", "live kernel state: blocked / chain / deps / endpoints"),
+    Row("events <view>", "what was recorded: ipc / failures / log / metrics / persist"),
     Row("caps [service]", "capabilities (default: this shell)"),
     Row("roster", "example record service (a typed table; try roster | where role=core)"),
     Row("spawn <svc>[,svc,...]", "start a service or a comma-list"),
@@ -4766,7 +4793,7 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
 /// The pager, over ANY indexable set of lines.
 ///
 /// This was `help`-shaped: it called `help_render_line` directly, so the one screenful-at-a-time
-/// reader in the system could only ever read `help`. `trace ipc` needs exactly the same thing and
+/// reader in the system could only ever read `help`. `events ipc` needs exactly the same thing and
 /// there is no reason for a second copy of it, so the caller now supplies how to render line `i`.
 /// Everything else - the in-place repaint, the key handling, the clamping - is unchanged.
 fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
@@ -4776,7 +4803,7 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
     // A PINNED region, repainted at the top of every frame and never scrolled.
     //
     // The pager homes to row 1 and paints over whatever was there, so anything printed BEFORE it is
-    // gone the moment the first frame lands - which is exactly what happened to `trace ipc`'s legend
+    // gone the moment the first frame lands - which is exactly what happened to `events ipc`'s legend
     // on a framebuffer console: printed, then immediately overwritten, and invisible. A table's column
     // header has the same problem one page in, for the same reason: it was line 0 of the scrolling
     // region, so page 2 lost the column names.
@@ -5027,7 +5054,7 @@ const PIPE_ONLY_VERBS: &[&str] = &["where", "select", "to", "from", "sum", "min"
 /// demo/on-demand services. Purely descriptive (a lookup miss here means "unknown", not an error in
 /// anything) - keep roughly in sync with the supervisor's managed set + the shell's spawn targets.
 const KNOWN_SERVICES: &[&str] = &[
-    "supervisor", "block-driver", "fs", "logger", "shell", "xhci", "ehci", "nic-driver", "net-stack",
+    "supervisor", "block-driver", "fs", "events", "shell", "xhci", "ehci", "nic-driver", "net-stack",
     "ping", "pong", "greet", "roster", "chaos", "observe", "mem-pressure",
 ];
 
@@ -6341,7 +6368,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "trace")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -6644,17 +6671,31 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
-            // `trace ipc` / `trace failures` are record sources; the other subcommands are readers
+            // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
             // is refused loudly rather than quietly yielding the wrong thing.
-            "trace"   => match split_first(arg).0 {
-                "ipc"      => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
-                "deps"     => match build_deps_table(ctx, split_first(arg).1.trim()) { Some(t) => t, None => return Err(ShellError::Unknown) },
+            // Two commands, two sources: `trace` walks live kernel state, `events` reads the sink.
+            "trace" => match split_first(arg).0 {
+                "deps"      => match build_deps_table(ctx, split_first(arg).1.trim()) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "endpoints" => build_endpoints_table(ctx),
+                other       => {
+                    ctx.console_writeln_fmt(format_args!(
+                        "trace: '{}' is not a record source - pipe 'trace deps' or 'trace endpoints'", other));
+                    return Err(ShellError::Unknown);
+                }
+            },
+            "events" => match split_first(arg).0 {
+                "ipc"      => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "metrics"  => match build_trace_metrics_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "persist"  => match split_first(split_first(arg).1.trim()).0 {
+                    "" | "status" => match build_persist_status_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                    _ => { ctx.console_writeln("events persist: only `status` is a record source"); return Err(ShellError::Unknown); }
+                },
+                "log"      => match build_events_log_table(ctx)    { Some(t) => t, None => return Err(ShellError::Unknown) },
                 other      => {
                     ctx.console_writeln_fmt(format_args!(
-                        "trace: '{}' is not a record source - pipe 'trace ipc' or 'trace failures'", other));
+                        "events: '{}' is not a record source - pipe 'events ipc', 'events failures', 'events metrics' or 'events log'", other));
                     return Err(ShellError::Unknown);
                 }
             },
@@ -6983,11 +7024,11 @@ const TRACE_SLOTS: u32 = 256;
 /// What it deliberately does NOT do: interpret a message. The kernel sees an opaque byte array, so
 /// this prints `awaiting endpoint 7`, never `fs.read("/etc/config")`. Naming an operation is protocol
 /// knowledge and belongs to the service that owns the protocol (4.4, 26.10).
-/// `trace <view> help` - what ONE view's output means.
+/// `events <view> help` - what ONE view's output means.
 ///
 /// The top-level help listed every view AND every column, which made it taller than a console and
 /// turned a reference into something you had to page through to find one line. A view's columns are
-/// only interesting once you are looking at that view, so they live with it. `trace help` is now the
+/// only interesting once you are looking at that view, so they live with it. `events help` is now the
 /// map; this is the detail, one screen at a time, and neither needs a pager.
 fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     match view {
@@ -7025,7 +7066,7 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
             ("NO LIVE OWNER", "its task died, or it is a reply-only mailbox", ""),
             ("holder / rights", "every live task holding a cap, and its rights", ""),
         ], false),
-        "ipc" | "failures" => help_block(ctx, "trace ipc", "recent IPC exchanges, oldest first", &[
+        "ipc" | "failures" => help_block(ctx, "events ipc", "recent IPC exchanges, oldest first", &[
             ("seq", "the CALLER'S own count. A gap = an event that never arrived", ""),
             ("sec", "when the RING saw it, from the oldest row. Not a latency", ""),
             ("caller / peer", "who called, and who was called, by name", ""),
@@ -7035,9 +7076,9 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
             ("PEER_LOST", "the send failed, or the peer died mid-call", ""),
             ("QUEUE_FULL", "the peer is ALIVE and congested - not absent", ""),
             ("in flight", "not here: one row per exchange, written when it ENDS", ""),
-            ("filtering", "it is a record source", "trace ipc | where outcome=TIMEOUT"),
+            ("filtering", "it is a record source", "events ipc | where outcome=TIMEOUT"),
         ], false),
-        "status" => help_block(ctx, "trace status", "the ring itself", &[
+        "status" => help_block(ctx, "events status", "the ring itself", &[
             ("ring N events", "capacity. Fixed, no heap", ""),
             ("N recorded", "events accepted since the sink last started", ""),
             ("N DROPPED", "overwritten before being read", ""),
@@ -7049,32 +7090,82 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     true
 }
 
-fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+/// `events <view>` - what the SINK has recorded.
+///
+/// Split from `trace` on a real boundary rather than a preference: every view here reads the `events`
+/// service, and every view in `cmd_trace` reads the LIVE KERNEL. They shared one dispatcher because
+/// that was convenient, not because they were the same command - and `trace deps fs` was the tell,
+/// since `deps` never touches this service at all. The doc has called them mechanism B and mechanism A
+/// throughout.
+fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     let mut it = arg.split_whitespace();
     let sub = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("");
     match sub {
-        "" | "help" => { util_help(ctx, "trace"); Ok(()) }
+        "" | "help" => {
+            util_help(ctx, "events");
+            Ok(())
+        }
         // The SHARED version printer, like every other utility. This hand-rolled its own with a
-        // private `TRACE_VERSION` constant, so `trace version` said 0.1.0 while every help header
-        // said 0.4.0 - one utility reporting two versions of itself, which is the one thing a
-        // `version` command exists to be trusted about. It also skipped the creator credit that
-        // conventions rule 5 requires and the suite asserts for every other utility.
-        "version" => { util_version(ctx, "trace"); Ok(()) }
-        // `trace <view> help` - the detail for one view, before the view itself runs.
+        // private constant, so `version` said 0.1.0 while every help header said 0.4.0 - one utility
+        // reporting two versions of itself, which is the one thing a `version` command exists to be
+        // trusted about.
+        "version" => {
+            util_version(ctx, "events");
+            Ok(())
+        }
+        // `events <view> help` - the detail for one view, before the view itself runs.
         v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
-        "blocked" => trace_blocked(ctx),
         "ipc" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
+        // `persist` needs the whole remainder (`start /p svc 7d`), not the two tokens `sub`/`rest`.
+        "persist" => events_persist(ctx, arg["persist".len()..].trim()),
+        "log" => events_log(ctx, rest),
+        "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
+        // The live-state views live under `trace`, and saying so is worth more than a bare "unknown":
+        // a reader who typed `trace deps fs` has the right question and the wrong command.
+        "blocked" | "chain" | "deps" | "endpoint" | "endpoints" => {
+            ctx.console_writeln_fmt(format_args!(
+                "events {}: that reads LIVE kernel state, so it is `trace {}`. `events` shows what the sink RECORDED.",
+                sub, sub
+            ));
+            Err(ShellError::Unknown)
+        }
+        _ => {
+            ctx.console_writeln_fmt(format_args!("unknown: events {}", sub));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `trace <view>` - what the kernel is doing RIGHT NOW.
+///
+/// Every view here walks live kernel state through `task_stat` / `InspectKernel`. Nothing here reads
+/// the `events` service, and nothing here is recorded anywhere - ask again a second later and the
+/// answer may differ, which is the point.
+fn cmd_trace(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let mut it = arg.split_whitespace();
+    let sub = it.next().unwrap_or("");
+    let rest = it.next().unwrap_or("");
+    match sub {
+        "" | "help" => {
+            util_help(ctx, "trace");
+            Ok(())
+        }
+        "version" => {
+            util_version(ctx, "trace");
+            Ok(())
+        }
+        v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
+        "blocked" => trace_blocked(ctx),
         "deps" => trace_deps(ctx, rest),
         "endpoint" => trace_endpoint(ctx, rest),
         "endpoints" => trace_endpoints(ctx),
         // ONE view, EITHER subject. This was two subcommands - `trace task <slot>` and `trace service
         // <name>` - which named the SUBJECT KIND while every other subcommand names the VIEW. That
         // read as two different things right up until you noticed they printed identical output from
-        // identical code, and it left `trace service fs` and `trace deps fs` looking like siblings
-        // when only one of them is named for what it shows.
+        // identical code.
         //
         // The argument disambiguates itself: all digits is a slot, anything else is a name. No flag,
         // no second verb, and nothing a caller has to remember beyond "chain of what?".
@@ -7094,6 +7185,14 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
                 },
             }
         }
+        // The recorded views live under `events`, and the same courtesy applies in this direction.
+        "ipc" | "failures" | "log" | "metrics" | "status" | "persist" => {
+            ctx.console_writeln_fmt(format_args!(
+                "trace {}: that reads what the sink RECORDED, so it is `events {}`. `trace` shows live kernel state.",
+                sub, sub
+            ));
+            Err(ShellError::Unknown)
+        }
         _ => {
             ctx.console_writeln_fmt(format_args!("unknown: trace {}", sub));
             Err(ShellError::Unknown)
@@ -7101,36 +7200,36 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     }
 }
 
-/// Ask `logger` for its recent trace events (`utilities/46_trace.md` mechanism B).
+/// Ask `events` for its recent trace events (`utilities/47_events.md` mechanism B).
 ///
 /// The ring lives in that service, not the kernel - so this is an ordinary request/reply to an
-/// ordinary service, and a logger that is dead or absent is answered with a sentence rather than a
+/// ordinary service, and an `events` that is dead or absent is answered with a sentence rather than a
 /// hang (Commandment VIII: a missing dependency RETURNS, loudly).
 /// Build the trace ring's events as a `Table`.
 ///
-/// A TABLE and not printed text, so `trace ipc` is a record source like `status` or `ls`: it renders
+/// A TABLE and not printed text, so `events ipc` is a record source like `status` or `ls`: it renders
 /// as a grid on the console, pages when it is taller than the screen, and pipes into the record verbs
-/// (`trace ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
+/// (`events ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
 /// the alternative was a printer plus a separate serialiser that would drift apart.
 fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table> {
     // Ask for exactly what a record `Table` can hold - not a screenful, and not the whole ring.
     //
     // The ring keeps 192 events and one reply message could carry ~180 of them, but `REC_MAX_ROWS` is
     // 64, so asking for more only produced a loud "result exceeded the record bound - truncated" on
-    // every single run. A bound announced once in `trace status` is information; the same bound
+    // every single run. A bound announced once in `events status` is information; the same bound
     // announced on every command is noise that trains you to ignore it. So the newest 64 are what a
-    // dump shows, and `trace status` remains the place that says how much history exists.
+    // dump shows, and `events status` remains the place that says how much history exists.
     let req = [godspeed_sdk::trace::TRACE_OP_DUMP, REC_MAX_ROWS as u8];
     let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
-            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            ctx.console_writeln("trace: the `events` service did not answer in 3 attempts (it holds the ring)");
             return None;
         }
     };
     let b = reply.payload_bytes();
     if b.is_empty() {
-        ctx.console_writeln("trace: logger returned nothing");
+        ctx.console_writeln("trace: events returned nothing");
         return None;
     }
     let n = b[0] as usize;
@@ -7150,7 +7249,7 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
     //   peer    - the service that was CALLED, by name (the emitter knew it; see `sdk::trace`).
     //   op      - that protocol's OPCODE, taken from the byte the EMITTING SERVICE says it lives in
     //             (`ctx.trace_op_at`), and rendered by NAME where this shell knows the protocol.
-    //             `utilities/46_trace.md` 7 worried that "byte 0 is the opcode" is a CONVENTION and
+    //             `utilities/47_events.md` 7 worried that "byte 0 is the opcode" is a CONVENTION and
     //             that a protocol putting something else there would produce a misleading column. It
     //             was right, and both busy protocols do exactly that: `shell -> fs` and
     //             `fs -> block-driver` each PREPEND a one-byte correlation tag, so byte 0 is a
@@ -7184,7 +7283,7 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
             godspeed_sdk::trace::KIND_ABORTED    => "ABORTED",
             _ => "?",
         };
-        // `trace failures` is the same ring, FILTERED - not a second recording path. QUEUE_FULL is a
+        // `events failures` is the same ring, FILTERED - not a second recording path. QUEUE_FULL is a
         // failure to get there, so it belongs; ABORTED is the user changing their mind, so it does not.
         if failures_only && !matches!(kind, godspeed_sdk::trace::KIND_TIMEOUT
                                           | godspeed_sdk::trace::KIND_PEER_LOST
@@ -7284,7 +7383,7 @@ impl RecordSink for LineBuf {
 ///
 /// A number tells you nothing without a lookup table, and a reader who has to hold `11 = read` in
 /// their head is doing work the tool should have done. The names cost nothing: they are as short as
-/// the numbers once rendered, and they make the column filterable in words - `trace ipc | where
+/// the numbers once rendered, and they make the column filterable in words - `events ipc | where
 /// op=read`.
 ///
 /// WHERE THIS KNOWLEDGE COMES FROM matters. For `fs` it is the shell's OWN opcode constants - it is
@@ -7381,7 +7480,7 @@ fn build_deps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
         // EVERY send capability, and the GRANT bit REPORTED rather than used as a filter.
         //
         // This filtered `SEND|GRANT` out, because a reply capability carries GRANT (it is derived from
-        // the caller's self-grant) and counting those had `logger` "calling" the shell. But a peer the
+        // the caller's self-grant) and counting those had `events` "calling" the shell. But a peer the
         // SUPERVISOR provides at spawn carries GRANT too - it must, or the supervisor could not
         // re-delegate it - so the filter also deleted real wiring: `net-stack` showed no `nic-driver`
         // dependency at all, right after a ping that demonstrably used it.
@@ -7586,7 +7685,7 @@ const DEPS_MAX_ROWS: usize = 48;
 
 /// What the columns mean, printed above the grid on the CONSOLE path only.
 ///
-/// Not in the pipe path: `trace ipc | to json` must emit records and nothing else, so a legend there
+/// Not in the pipe path: `events ipc | to json` must emit records and nothing else, so a legend there
 /// would be corrupting the stream with prose.
 /// Returns the number of LINES it wrote, because the pager PINS this region and its frame arithmetic
 /// depends on that number being exact. It was a hand-maintained constant and drifted twice - most
@@ -7620,7 +7719,7 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     };
     if t.nrows() == 0 {
         ctx.console_writeln(if failures_only { "trace: no failure events recorded" }
-                            else { "trace: no events recorded (is any service granted ipc_send=[\"logger\"]?)" });
+                            else { "trace: no events recorded (is any service granted ipc_send=[\"events\"]?)" });
         return Ok(());
     }
     // PAGE when it does not fit, exactly as `help` does - a ring dump is routinely taller than the
@@ -7674,7 +7773,7 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     Ok(())
 }
 
-/// `trace status` - ring capacity, events accepted, events DROPPED.
+/// `events status` - ring capacity, events accepted, events DROPPED.
 ///
 /// The drop count is the point. A ring that silently discards is the failure this project just fixed
 /// in the x86 keyboard path; one that reports what it lost is an instrument you can trust the rest of
@@ -7687,14 +7786,14 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
 /// (the same distinction `KIND_QUEUE_FULL` exists for). Bounded: three attempts, then it says so.
 fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     for _ in 0..3 {
-        if let Some(r) = ctx.request_with_reply("logger", &Message::from_bytes(req)) {
+        if let Some(r) = ctx.request_with_reply("events", &Message::from_bytes(req)) {
             return Some(r);
         }
         // REACQUIRE BETWEEN ATTEMPTS. A busy sink is transient and a yield is the right answer, but a
         // RESTARTED one never recovers by waiting: the cap is stale and every retry fails identically.
-        // After a chaos storm restarted `logger` forty times, this loop failed three times in a row
+        // After a chaos storm restarted `events` forty times, this loop failed three times in a row
         // and reported a live service as unreachable (14.3 - reacquire by name, then retry).
-        let _ = ctx.reacquire_by_name("logger");
+        let _ = ctx.reacquire_by_name("events");
         ctx.yield_cpu();
     }
     None
@@ -7910,7 +8009,7 @@ fn trace_endpoint_holders(ctx: &ServiceContext, id: u64) -> Result<(), ShellErro
 ///
 /// The table this renders holds one row per EDGE (`parent`, `peer`, `depth`), which is what a tree
 /// is. So the console draws the edges as a tree and a pipe gets the rows - one producer, two
-/// renderings, exactly as `trace ipc` does for its grid, its pager and its pipe. Neither form is a
+/// renderings, exactly as `events ipc` does for its grid, its pager and its pipe. Neither form is a
 /// lossy summary of the other, which is what makes it safe to have both:
 ///
 ///   trace deps shell                      -> the tree
@@ -7972,18 +8071,659 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     Ok(())
 }
 
+/// `events metrics` as a record producer: one row per published sample.
+///
+/// `age_s` is the point of the view as much as `value` is. A metric is the last value its owner
+/// PUBLISHED, and `events` keeps it after that owner dies (a sample survives its emitter, which is the
+/// one useful thing left to learn from a service that is gone). Without an age, a number frozen at the
+/// moment of a crash is indistinguishable from a number being maintained right now, and an instrument
+/// that cannot tell those apart is worse than none.
+#[inline(never)]
+fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
+    use godspeed_sdk::trace::{MET_LEN, MET_NAME_LEN, PEER_LEN};
+    let req = [godspeed_sdk::trace::TRACE_OP_METRICS];
+    let reply = match trace_ask(ctx, &req) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("trace: the `events` service did not answer in 3 attempts (it holds the metrics)");
+            return None;
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.is_empty() {
+        ctx.console_writeln("trace: events returned an empty metrics reply");
+        return None;
+    }
+    let n = b[0] as usize;
+    let out = MET_LEN + 4;
+    if b.len() < 1 + n * out {
+        ctx.console_writeln("trace: events returned a short metrics reply");
+        return None;
+    }
+    let now = ctx.epoch_secs_monotonic() as u32;
+    let mut t = Table::new(&["owner", "metric", "value", "age_s"]);
+    for i in 0..n {
+        let o = 1 + i * out;
+        let owner = &b[o..o + PEER_LEN];
+        let name = &b[o + PEER_LEN..o + PEER_LEN + MET_NAME_LEN];
+        let v = o + PEER_LEN + MET_NAME_LEN;
+        let value = u64::from_le_bytes([
+            b[v], b[v + 1], b[v + 2], b[v + 3], b[v + 4], b[v + 5], b[v + 6], b[v + 7],
+        ]);
+        let at_s = u32::from_le_bytes([b[o + MET_LEN], b[o + MET_LEN + 1], b[o + MET_LEN + 2], b[o + MET_LEN + 3]]);
+        let trim = |x: &[u8]| -> usize { x.iter().position(|&c| c == 0).unwrap_or(x.len()) };
+        // AN UNNAMED PUBLISHER READS `?`, NOT BLANK. A service that never called `trace_as` publishes
+        // under an empty owner, and since the key is (owner, name) EVERY such service collides into
+        // one row with their counters interleaving. `?` matches what the trace ring already shows for
+        // an undeclared caller, and the warning under the table names the consequence - a blank cell
+        // looks like a formatting quirk, which is how this went unnoticed until the numbers were wrong.
+        let ow = &owner[..trim(owner)];
+        let ov = if ow.is_empty() { t.intern(b"?") } else { t.intern(ow) };
+        let nv = t.intern(&name[..trim(name)]);
+        t.add_row(&[ov, nv, Value::Int(value), Value::Int(now.saturating_sub(at_s) as u64)]);
+    }
+    Some(t)
+}
+
+/// `events log` - the queryable tail of what services printed.
+///
+/// NOT the authoritative log, and the distinction matters when something has gone wrong. Every line
+/// here also went to serial and the kernel ring the moment it was written, by syscall, before `events`
+/// saw a copy - so serial is complete and this is a convenience. What this window CANNOT show is
+/// anything printed before `events` started (the kernel's 16 KiB ring is not exposed to userspace), or
+/// a line lost when the sink's queue was momentarily full.
+/// `recorder` control opcodes. Duplicated here rather than shared: services do not depend on one
+/// another's crates, and a protocol is a wire format, not a Rust type (§8).
+const REC_OP_START: u8 = 1;
+const REC_OP_STOP: u8 = 2;
+const REC_OP_STATUS: u8 = 3;
+const REC_OK: u8 = 0;
+
+/// `events persist status` as a RECORD SOURCE - one row describing the capture.
+///
+/// Records rather than a printed sentence, because that is the rule every view here obeys
+/// (`docs/observability.md` §9a): it filters with the same `where` and converts with `to json`. The
+/// first version printed prose and could not be asserted on in a script without a bespoke matcher,
+/// which is the same mistake the log made.
+#[inline(never)]
+fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
+    let mut t = Table::new(&["state", "covers", "kib_day", "capacity_kib", "lines", "rotations", "lost", "path"]);
+    if slot_of(ctx, "recorder").is_none() {
+        // NOT AN ERROR, and not an empty table either. "Nothing is recording" is a real answer, and a
+        // caller piping this needs a row to see it in.
+        let st = t.intern(b"not running");
+        let none = t.intern(b"-");
+        let dash = t.intern(b"-");
+        t.add_row(&[st, dash, Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), Value::Int(0), none]);
+        return Some(t);
+    }
+    let _ = ctx.reacquire_by_name("recorder");
+    // ASK, AND CHECK THE ANSWER ANSWERS THIS QUESTION. The kernel matches a reply to a `call` by
+    // which ENDPOINT sent it, not by which call it answers, so a stale message from the recorder -
+    // a `[REC_OK]` from an earlier start/stop that arrived late - is handed to the next call instead.
+    // That is what "short status" was, three times: a one-byte acknowledgement parsed as a status.
+    //
+    // Every recorder reply now carries the op it answers at byte 1. A reply for a different op means
+    // the queue held a straggler, and the RIGHT reply is behind it - so ask once more rather than
+    // reporting a failure that is really a queue artefact. One retry, not a loop: if the second
+    // answer is also wrong, something is genuinely out of step and that must be said, not hidden.
+    let mut attempt = 0;
+    let b = loop {
+        let r = match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STATUS]), 8) {
+            Some(r) => r,
+            None => {
+                ctx.console_writeln("events persist: recorder did not answer");
+                return None;
+            }
+        };
+        let p = r.payload_bytes();
+        if p.len() >= 2 && p[1] != REC_OP_STATUS && attempt == 0 {
+            attempt += 1;
+            continue;
+        }
+        if p.len() < 77 || p[1] != REC_OP_STATUS {
+            ctx.console_writeln("events persist: the recorder answered a different request - try again");
+            return None;
+        }
+        break r;
+    };
+    let b = b.payload_bytes();
+    let on = b[2] != 0;
+    let full = b[3] != 0;
+    let lines = u64::from_le_bytes([b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]]);
+    let bytes = u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]);
+    let lost = u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]);
+    let capbytes = u64::from_le_bytes([b[28], b[29], b[30], b[31], b[32], b[33], b[34], b[35]]);
+    let rotations = u64::from_le_bytes([b[36], b[37], b[38], b[39], b[40], b[41], b[42], b[43]]);
+    let elapsed = u64::from_le_bytes([b[44], b[45], b[46], b[47], b[48], b[49], b[50], b[51]]);
+    let lifetime = u64::from_le_bytes([b[52], b[53], b[54], b[55], b[56], b[57], b[58], b[59]]);
+    let pieces = u64::from_le_bytes([b[60], b[61], b[62], b[63], b[64], b[65], b[66], b[67]]).max(1);
+    let filled = u64::from_le_bytes([b[68], b[69], b[70], b[71], b[72], b[73], b[74], b[75]]);
+    let pl = (b[76] as usize).min(b.len().saturating_sub(77));
+
+    // COVERAGE IS MEASURED, NEVER THE NUMBER THAT WAS ASKED FOR. A duration is a prediction about how
+    // chatty the machine will be, and the machine decides that - so the rate comes from what has
+    // actually been written, and `covers` is what the budget buys AT THAT RATE. Ask for 7d on a box
+    // four times chattier than assumed and this says ~2d, rather than letting you find out when the
+    // log you needed had already rotated away.
+    let mut cov = [0u8; 16];
+    let covn = if elapsed >= 5 && lifetime > 0 {
+        let total_cap = capbytes.saturating_mul(pieces);
+        // (PIECES-1)/PIECES of the budget is the GUARANTEED floor, since a rotation discards a whole
+        // piece; report the floor rather than the best case.
+        let floor = total_cap / pieces * (pieces - 1).max(1);
+        brief_duration(floor.saturating_mul(elapsed) / lifetime, &mut cov)
+    } else {
+        cov[0] = b'-';
+        1
+    };
+    let kib_day = if elapsed >= 5 { lifetime.saturating_mul(86400) / elapsed / 1024 } else { 0 };
+    // PREPARING is a real state, not a slow "idle". The extent has to be made readable before a line
+    // can be written into it, and on slow storage that takes a while - saying so is the difference
+    // between "working on it" and "silently did nothing".
+    let st = t.intern(if full {
+        b"full".as_slice()
+    } else if on && filled < capbytes {
+        b"preparing".as_slice()
+    } else if on {
+        b"recording".as_slice()
+    } else {
+        b"idle".as_slice()
+    });
+    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[77..77 + pl]) };
+    let covers = t.intern(&cov[..covn]);
+    let _ = bytes;
+    t.add_row(&[
+        st,
+        covers,
+        Value::Int(kib_day),
+        // The whole budget across every piece, so "what is this costing me on disk" has an answer that
+        // does not require knowing the piece count.
+        Value::Int(capbytes.saturating_mul(pieces) / 1024),
+        Value::Int(lines),
+        Value::Int(rotations),
+        Value::Int(lost),
+        path,
+    ]);
+    Some(t)
+}
+
+/// Spawn `recorder` if needed and tell it to begin. Shared by the command and by the sticky resume,
+/// so a capture started at boot is the same capture in every respect as one started by hand.
+fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Result<(), ShellError> {
+    // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted - and
+    // staying out of the kernel's managed-service lists is what keeps this feature free of a kernel
+    // change.
+    if slot_of(ctx, "recorder").is_none() && ctx.spawn("recorder").is_err() {
+        ctx.console_writeln("events persist: could not spawn `recorder`");
+        return Err(ShellError::Unknown);
+    }
+    // Acquire by NAME, because it was not running when this shell was wired (§14.3).
+    let _ = ctx.reacquire_by_name("recorder");
+
+    let pb = path.as_bytes();
+    let fb = filter.as_bytes();
+    let mut req = [0u8; 96];
+    req[0] = REC_OP_START;
+    req[1..9].copy_from_slice(&budget.to_le_bytes());
+    let pl = pb.len().min(60);
+    req[9] = pl as u8;
+    req[10..10 + pl].copy_from_slice(&pb[..pl]);
+    let fo = 10 + pl;
+    let fl = fb.len().min(12);
+    req[fo] = fl as u8;
+    req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
+    let n = fo + 1 + fl;
+    match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&req[..n]), 12) {
+        // The op tag must say START, for the same reason `status` checks it: a stale reply from
+        // the recorder is handed to whichever call asks next, and accepting one here would report a
+        // capture started that never was.
+        Some(r) if r.payload_bytes().first() == Some(&REC_OK)
+            && r.payload_bytes().get(1) == Some(&REC_OP_START) => {
+            if filter.is_empty() {
+                ctx.console_writeln_fmt(format_args!("events persist: capturing everything to {}", path));
+            } else {
+                ctx.console_writeln_fmt(format_args!("events persist: capturing {} to {}", filter, path));
+            }
+            ctx.console_writeln("events persist: two files of a FIXED size, rotating - `events persist status` shows how far in it is.");
+            Ok(())
+        }
+        Some(_) => {
+            ctx.console_writeln("events persist: recorder refused (no filesystem, or a bad path)");
+            Err(ShellError::Unknown)
+        }
+        None => {
+            ctx.console_writeln("events persist: recorder did not answer");
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// Bytes a machine is assumed to log per day, used ONLY to turn a duration into a disk budget.
+///
+/// Measured on an idle Pi 2: lines average ~60 bytes and the `dwc2` heartbeat alone emits about eight
+/// every fifteen seconds, which comes to roughly 3 MB a day. Rounded up, because underestimating means
+/// a capture covers less than asked and that is the direction that hurts.
+///
+/// IT IS AN ASSUMPTION, AND THE MACHINE OVERRULES IT. A busy box logs an order of magnitude more, so
+/// `events persist status` reports the MEASURED rate and what the capture actually covers. The
+/// duration you ask for is a target; the status is the truth.
+const ASSUMED_BYTES_PER_DAY: u64 = 4 * 1024 * 1024;
+
+/// What a `start` argument turned out to be.
+enum Budget {
+    /// A disk budget in bytes, from a duration or an explicit size.
+    Bytes(u64),
+    /// A number with a unit we deliberately refuse, rather than guess at.
+    BadUnit,
+    /// Not a budget at all - so it is a service name.
+    NotABudget,
+}
+
+/// Parse `7d` / `12h` / `1w`, or `64MiB` / `512KiB` / `1GiB`.
+///
+/// EVERY BUDGET CARRIES A UNIT. A bare number would have to mean megabytes or minutes by convention,
+/// and `16m` cannot be read as either without guessing - so nothing is bare, and a token without a
+/// unit is unambiguously a service name. That removes the last heuristic from this parser rather than
+/// documenting around it.
+fn parse_budget(tok: &str) -> Budget {
+    let digits = tok.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &tok[digits.len()..];
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Budget::NotABudget;
+    }
+    let n: u64 = match digits.parse() {
+        Ok(v) if v > 0 => v,
+        _ => return Budget::NotABudget,
+    };
+    match unit {
+        "h" => Budget::Bytes(n * ASSUMED_BYTES_PER_DAY / 24),
+        "d" => Budget::Bytes(n * ASSUMED_BYTES_PER_DAY),
+        "w" => Budget::Bytes(n * 7 * ASSUMED_BYTES_PER_DAY),
+        "KiB" => Budget::Bytes(n * 1024),
+        "MiB" => Budget::Bytes(n * 1024 * 1024),
+        "GiB" => Budget::Bytes(n * 1024 * 1024 * 1024),
+        // REFUSED, NOT SILENTLY ACCEPTED. MB and MiB differ by 4.8%, so treating them as equal quietly
+        // gives less than was asked for - a small lie that is only discovered when the capture turns
+        // out shorter than expected. `m` is refused for the reason the whole scheme exists: minutes and
+        // megabytes cannot be told apart.
+        "MB" | "GB" | "KB" | "kb" | "mb" | "gb" | "m" | "M" => Budget::BadUnit,
+        _ => Budget::NotABudget,
+    }
+}
+
+/// Seconds as a short human duration: `3d`, `14h`, `42m`, `9s`.
+fn brief_duration(secs: u64, out: &mut [u8; 16]) -> usize {
+    let (n, unit) = if secs >= 86400 {
+        (secs / 86400, b'd')
+    } else if secs >= 3600 {
+        (secs / 3600, b'h')
+    } else if secs >= 60 {
+        (secs / 60, b'm')
+    } else {
+        (secs, b's')
+    };
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    let mut v = n.max(1);
+    while v > 0 {
+        i -= 1;
+        d[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let mut k = 0usize;
+    for &c in &d[i..] {
+        out[k] = c;
+        k += 1;
+    }
+    out[k] = unit;
+    k + 1
+}
+
+/// Where a STICKY capture records what to resume. One line: `<mib> <filter-or-dash> <path>`.
+///
+/// Plain text on purpose - `read /persist.conf` shows exactly what will happen at the next boot, which
+/// is the difference between a setting and a surprise (§26.4). A capture that resumes silently forever
+/// because someone forgot is the hazard this whole feature has to avoid.
+const STICKY_PATH: &[u8] = b"/persist.conf";
+/// Seconds allowed for a sticky read or write. Generous: these happen once at boot and once per
+/// `start`, never on a hot path.
+const STICKY_SECS: i64 = 8;
+
+/// Record a sticky capture, so the next boot resumes it.
+fn sticky_write(ctx: &ShellCtx, budget: u64, filter: &str, path: &str) -> bool {
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    // The BYTE budget, so a resumed capture is byte-for-byte the one that was asked for - re-deriving
+    // it from a duration at the next boot would silently re-estimate against a different machine mood.
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    let mut v = budget.max(1);
+    while v > 0 { i -= 1; d[i] = b'0' + (v % 10) as u8; v /= 10; }
+    for &c in &d[i..] { buf[n] = c; n += 1; }
+    buf[n] = b' '; n += 1;
+    let f = if filter.is_empty() { "-" } else { filter };
+    for &c in f.as_bytes().iter().take(12) { buf[n] = c; n += 1; }
+    buf[n] = b' '; n += 1;
+    for &c in path.as_bytes().iter().take(64) { buf[n] = c; n += 1; }
+    matches!(fs_request_bounded(ctx, OP_WRITE_FILE, STICKY_PATH, &buf[..n], STICKY_SECS).as_ref()
+                 .map(|r| r.payload_bytes().first() == Some(&FS_OK)), Some(true))
+}
+
+/// Forget a sticky capture. Called on `stop`, so an explicit stop stays stopped across a reboot -
+/// otherwise the one command that means "enough" would be the one that did not take.
+fn sticky_clear(ctx: &ShellCtx) {
+    let _ = fs_request(ctx, OP_DELETE, STICKY_PATH, &[]);
+}
+
+/// True if a sticky capture is recorded.
+fn sticky_set(ctx: &ShellCtx) -> bool {
+    let mut buf = [0u8; 128];
+    fs_read_file(ctx, STICKY_PATH, &mut buf, STICKY_SECS).map_or(false, |n| n > 0)
+}
+
+/// Resume a sticky capture at boot, if one was recorded.
+///
+/// THE FS READ IS SAFE HERE NOW, and it was not always. The shell used to read the clock floor at
+/// startup and stopped: fs is at its slowest right then (mounting, replaying its journal), the read
+/// timed out, and the abandoned request poisoned the reply channel for the whole session - a reply
+/// carried no request id, so the next command consumed it and every command after was one answer
+/// behind. Tag correlation ended that: a reply whose tag nobody awaits is DISCARDED, and the deadline
+/// now bounds the whole wait rather than each attempt. What remains is only the risk of a slow fs
+/// making this read fail, which is why it retries rather than giving up on one timeout.
+///
+/// Loud either way. A capture that resumes says so, and one that was recorded but could not be resumed
+/// says THAT - the silent case is the only unacceptable one (invariant 12).
+fn sticky_resume(ctx: &ShellCtx) {
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    for _ in 0..4 {
+        if let Some(got) = fs_read_file(ctx, STICKY_PATH, &mut buf, STICKY_SECS) {
+            n = got;
+            break;
+        }
+        // Not there, or storage is still settling. Either way, yield and try once more - a sticky
+        // capture missed because fs was half a second late would be exactly the unattended failure
+        // this feature exists to prevent.
+        for _ in 0..512 {
+            ctx.yield_cpu();
+        }
+    }
+    if n == 0 {
+        return; // no sticky capture recorded - the ordinary case, and silent on purpose
+    }
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut it = text.split_whitespace();
+    let budget = it.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+    let filter = it.next().unwrap_or("-");
+    let path = it.next().unwrap_or("");
+    if path.is_empty() || !path.starts_with('/') {
+        ctx.log("events persist: /persist.conf is unreadable - not resuming (delete it to silence this)");
+        return;
+    }
+    let filter = if filter == "-" { "" } else { filter };
+    if persist_begin(ctx, path, filter, budget).is_err() {
+        ctx.log_fmt(format_args!(
+            "events persist: STICKY capture to {} could NOT be resumed - storage may be unavailable", path));
+        return;
+    }
+    ctx.log_fmt(format_args!(
+        "events persist: resuming STICKY capture to {} (recorded in /persist.conf; `events persist stop` ends it for good)", path));
+}
+
+/// `events persist start|stop|status` - capture the event log to a file.
+///
+/// The shell is the broker here, which is the whole point of the arrangement: it holds `spawn` and it
+/// can acquire a cap to `recorder` by name once that service exists. `events` gains nothing and keeps
+/// no `fs` peer, so a stalled disk can never stop it draining (see `services/recorder/src/main.rs`).
+fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let (verb, rest) = split_first(arg.trim());
+    match verb {
+        "start" => {
+            let (path, tail) = split_first(rest.trim());
+            if path.is_empty() || !path.starts_with('/') {
+                ctx.console_writeln("usage: events persist start /path [service] [mib] [sticky]");
+                return Err(ShellError::Unknown);
+            }
+            let mut filter: &str = "";
+            let mut budget: u64 = 0;
+            let mut sticky = false;
+            for tok in tail.split_whitespace() {
+                if tok == "sticky" {
+                    sticky = true;
+                    continue;
+                }
+                match parse_budget(tok) {
+                    Budget::Bytes(b) => budget = b,
+                    Budget::BadUnit => {
+                        ctx.console_writeln_fmt(format_args!(
+                            "events persist: '{}' - use h/d/w for a duration or KiB/MiB/GiB for a size. MB and MiB differ by 4.8%, so this is refused rather than guessed.", tok));
+                        return Err(ShellError::Unknown);
+                    }
+                    Budget::NotABudget => filter = tok,
+                }
+            }
+            persist_begin(ctx, path, filter, budget)?;
+            if sticky {
+                // RECORDED BEFORE IT IS ANNOUNCED, so the message never claims more than is true.
+                if sticky_write(ctx, budget, filter, path) {
+                    ctx.console_writeln("events persist: STICKY - this resumes after a reboot. `events persist stop` ends it for good, and /persist.conf says what will happen.");
+                } else {
+                    ctx.console_writeln("events persist: capturing, but STICKY could not be recorded - it will NOT resume after a reboot");
+                }
+            }
+            Ok(())
+        }
+        "stop" => {
+            if slot_of(ctx, "recorder").is_none() {
+                ctx.console_writeln("events persist: nothing is recording");
+                return Ok(());
+            }
+            let _ = ctx.reacquire_by_name("recorder");
+            match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STOP]), 8) {
+                // Deliberately NOT tag-checked, unlike `start` and `status`: stop's outcome does not
+                // depend on the payload (the request was delivered either way), and if a straggler
+                // is consumed here the real reply is absorbed by the retry in `status`. Checking it
+                // would add a failure path for a case that is already handled one layer over.
+                Some(_) => {
+                    // AN EXPLICIT STOP STAYS STOPPED. Leaving the marker would make the one command
+                    // that means "enough" the one that did not take.
+                    sticky_clear(ctx);
+                    ctx.console_writeln("events persist: stopped (the capture file has its footer, so it reads as complete)");
+                    Ok(())
+                }
+                None => {
+                    ctx.console_writeln("events persist: recorder did not answer");
+                    Err(ShellError::Unknown)
+                }
+            }
+        }
+        "" | "status" => {
+            let t = match build_persist_status_table(ctx) {
+                Some(t) => t,
+                None => return Err(ShellError::Unknown),
+            };
+            let w = t.grid_widths();
+            let mut f = FrameBuf::new();
+            let mut lb = LineBuf::new();
+            t.grid_header(&mut lb, &w);
+            lb.flush_into(ctx, &mut f);
+            for r in 0..t.nrows() {
+                t.grid_row(&mut lb, r, &w);
+                lb.flush_into(ctx, &mut f);
+            }
+            f.flush(ctx);
+            if sticky_set(ctx) {
+                ctx.console_writeln("events persist: STICKY - this resumes after a reboot (/persist.conf). `events persist stop` ends it for good.");
+            }
+            // A CAPTURE WITH A HOLE MUST SAY SO. The window is 8 KiB; a slow disk lets lines fall out
+            // before they are read, and a file that silently skips them reads as complete.
+            for r in 0..t.nrows() {
+                if t.cell_bytes(r, 6) != b"0" {
+                    ctx.console_writeln("events persist: lines were LOST - the window wrapped faster than the disk could take them");
+                }
+            }
+            Ok(())
+        }
+        other => {
+            ctx.console_writeln_fmt(format_args!(
+                "events persist: '{}' is not start, stop or status", other));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `events log` as a RECORD SOURCE: one row per held line, `owner` and `text`.
+///
+/// Records, not text, and that is a rule rather than a preference for this one view: every stream the
+/// sink serves is queryable the same way. Metrics and IPC traces were already records; the log was the
+/// outlier, and the cost of that showed up immediately as a hand-rolled per-service filter in the
+/// shell - duplicated machinery that `where` already provides, and that was wrong on its first outing.
+/// With a record the answer is `events log | where owner=fs`, using the same `where` as everything else.
+///
+/// The sink stores `owner US text NL`. The owner is a FIELD, never a prefix glued to the text, which
+/// also removes the guesswork of deciding where a name ends - `dwc2` logs its lines as `dwc2-svc:`.
+#[inline(never)]
+fn build_events_log_table(ctx: &ServiceContext) -> Option<Table> {
+    let req = [godspeed_sdk::trace::TRACE_OP_LOGS];
+    let reply = match trace_ask(ctx, &req) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("events: the `events` service did not answer in 3 attempts (it holds the log)");
+            return None;
+        }
+    };
+    let b = reply.payload_bytes();
+    // 25-byte header: next cursor, oldest held, lines held, wrapped. The reader here wants only the
+    // text; the cursor fields exist for `recorder`, which drains repeatedly and must know both what is
+    // new and when the window outran it.
+    if b.len() < 25 {
+        ctx.console_writeln("events: short log reply");
+        return None;
+    }
+    let body = &b[25..];
+    let mut t = Table::new(&["owner", "text"]);
+    let mut ls = 0usize;
+    for i in 0..=body.len() {
+        let end = if i == body.len() { body.len() } else if body[i] == b'\n' { i } else { continue };
+        if end > ls {
+            let line = &body[ls..end];
+            let cut = line.iter().position(|&c| c == 0x1f).unwrap_or(line.len());
+            let owner = &line[..cut];
+            let mut text = if cut < line.len() { &line[cut + 1..] } else { &line[..0] };
+            // DROP THE SELF-PREFIX FROM `text`, since `owner` is already a field. Every service opens
+            // its lines with its own name, so keeping it produced
+            // `{"owner": "fs", "text": "fs: disk capacity = ..."}` - the same fact twice, which is
+            // noise in a record and exactly what having fields is supposed to remove.
+            //
+            // Only when the text actually starts with the owner, and only as far as the first `: `, so
+            // `dwc2-svc: net tx` yields `net tx` without having to know where the name ends. A line
+            // that does NOT name itself is untouched, and one with no separator is left whole.
+            if !owner.is_empty() && text.len() > owner.len() && &text[..owner.len()] == owner {
+                let scan = text.len().min(owner.len() + 24);
+                for i in 0..scan.saturating_sub(1) {
+                    if text[i] == b':' && text[i + 1] == b' ' {
+                        text = &text[i + 2..];
+                        break;
+                    }
+                }
+            }
+            let ov = t.intern(owner);
+            let tv = t.intern(text);
+            t.add_row(&[ov, tv]);
+        }
+        ls = end + 1;
+        if end == body.len() { break; }
+    }
+    Some(t)
+}
+
+/// `events log [n]` - the last `n` held lines, rendered as a log rather than as a grid.
+///
+/// A grid is the wrong shape here and the pipe is the right one: a log line runs to 240 bytes, so a
+/// `text` column would be far wider than any screen. Printed it reads as a log; piped it is records.
+/// Same data, two renderings - exactly what `events ipc` does, which prints a grid and pipes rows.
+///
+/// NO PAGER, deliberately. `events ipc` pages and waits for a keypress, which is right at a prompt and
+/// fatal in a script - a bare `assert ok events ipc` hung the whole selfcheck suite until the harness
+/// timed out. This prints a bounded screenful and returns.
+fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let t = match build_events_log_table(ctx) {
+        Some(t) => t,
+        None => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
+        ctx.console_writeln("events: no log lines held yet (a service logs, and the copy arrives here)");
+        return Ok(());
+    }
+    let want = arg.trim().parse::<usize>().unwrap_or(20).max(1);
+    let first = t.nrows().saturating_sub(want);
+    let mut f = FrameBuf::new();
+    for r in first..t.nrows() {
+        let owner = t.cell_bytes(r, 0);
+        let text = t.cell_bytes(r, 1);
+        // `owner: text`, always - the record no longer carries the name inside the text, so printing it
+        // here is what restores the familiar log line rather than duplicating it.
+        if !owner.is_empty() {
+            f.put(ctx, owner);
+            f.put(ctx, b": ");
+        }
+        f.put(ctx, text);
+        f.put(ctx, b"\r\n");
+    }
+    f.flush(ctx);
+    ctx.console_writeln_fmt(format_args!(
+        "events: {} line(s) held ({} shown). This is a COPY - serial has the authoritative record, including everything printed before `events` started. Filter with `events log | where owner=<service>`.",
+        t.nrows(), t.nrows() - first));
+    Ok(())
+}
+
+
+fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let t = match build_trace_metrics_table(ctx) {
+        Some(t) => t,
+        None => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
+        ctx.console_writeln("trace: no metrics published (a service publishes with ctx.metric, and needs ipc_send=[\"events\"])");
+        return Ok(());
+    }
+    // ONE FRAME. The table is at most 64 rows, so it never needs the pager `events ipc` uses - but it
+    // does need the same batching: a row written straight to the console is two syscalls against a
+    // 16-deep queue, and that is what once made the keyboard look dead while the machine was fine.
+    let w = t.grid_widths();
+    let mut f = FrameBuf::new();
+    let mut lb = LineBuf::new();
+    t.grid_header(&mut lb, &w);
+    lb.flush_into(ctx, &mut f);
+    for r in 0..t.nrows() {
+        t.grid_row(&mut lb, r, &w);
+        lb.flush_into(ctx, &mut f);
+    }
+    f.flush(ctx);
+    let mut unnamed = false;
+    for r in 0..t.nrows() {
+        if t.cell_bytes(r, 0) == b"?" { unnamed = true; }
+    }
+    if unnamed {
+        ctx.console_writeln("trace: a `?` owner is a service that never called ctx.trace_as - EVERY such service shares that one row, so those numbers are merged and cannot be trusted apart.");
+    }
+    ctx.console_writeln("trace: a metric is the LAST value its owner published - `events` keeps it after the owner dies, so check age_s.");
+    Ok(())
+}
+
 fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     let req = [godspeed_sdk::trace::TRACE_OP_STATUS];
     let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
-            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            ctx.console_writeln("trace: the `events` service did not answer in 3 attempts (it holds the ring)");
             return Err(ShellError::Unknown);
         }
     };
     let b = reply.payload_bytes();
     if b.len() < 24 {
-        ctx.console_writeln("trace: logger returned a short status");
+        ctx.console_writeln("trace: events returned a short status");
         return Err(ShellError::Unknown);
     }
     let cap = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
@@ -7992,7 +8732,7 @@ fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     ctx.console_writeln_fmt(format_args!(
         "trace: ring {} events; {} recorded; {} DROPPED (oldest overwritten before being read)",
         cap, total, dropped));
-    ctx.console_writeln("trace: the ring lives in the `logger` service - the kernel records nothing.");
+    ctx.console_writeln("trace: the ring lives in the `events` service - the kernel records nothing.");
     Ok(())
 }
 
@@ -9082,7 +9822,7 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // Directly-restartable services: their OWN death notifies the supervisor, which respawns them
 // immediately (the supervisor itself is kernel-respawned). chaos confirms recovery for these each
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
-// kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
+// kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/events are
 // directly-restartable so max-carnage can't leave them dead.)
 // `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is the expansion
 // of `kill all-services` and a hard refusal gate for `chaos kill-storm`. So the storm skipped them
@@ -9093,7 +9833,7 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // fourth time. It stays a literal for now because the shell cannot see the supervisor's list, but
 // the honest fix is to derive it from live tasks the way `chaos` derives its own exclusions - which
 // is exactly why chaos has no roster to drift.
-const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger",
+const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
                                        "nic-driver", "net-stack", "time", "control", "dwc2"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
@@ -9175,7 +9915,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         ctx.console_writeln("  max-carnage <all-services|svc|svc,svc,...> <n>  all-services = RANDOM storm, or aim/list; TARGET + ROUNDS required");
         ctx.console_writeln("                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         ctx.console_writeln("  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
-        ctx.console_writeln("  svc: supervisor | block-driver | fs | logger | xhci | ehci | shell | nic-driver | net-stack");
+        ctx.console_writeln("  svc: supervisor | block-driver | fs | events | xhci | ehci | shell | nic-driver | net-stack");
         return Ok(());
     }
     match tok[0] {
@@ -9191,12 +9931,12 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                 ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
                 ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
                 ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
-                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
+                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, events)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
                 ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
                 ctx.console_writeln("  yes            optional 4th word: skip the [y/N] confirm (the warning still prints)");
                 ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
-                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,logger 100");
+                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,events 100");
                 Ok(())
             } else {
                 // A run needs a TARGET (all-services / a service / a comma-list) AND a positive ROUNDS count.
@@ -9208,7 +9948,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                     ctx.console_writeln("  every run needs a target AND a rounds count - there is no uncapped default.");
                     ctx.console_writeln("  e.g. chaos max-carnage all-services 5000   (the firehose - a big N; q aborts early)");
                     ctx.console_writeln("       chaos max-carnage fs 50");
-                    ctx.console_writeln("       chaos max-carnage fs,logger 100");
+                    ctx.console_writeln("       chaos max-carnage fs,events 100");
                     ctx.console_writeln("  add 'yes' as a 4th word to skip the confirm (unattended runs):");
                     ctx.console_writeln("       chaos max-carnage all-services 100 yes");
                     return Ok(());
@@ -9223,14 +9963,14 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                         if slot_of(ctx, seg).is_none() {
                             ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}' in the list", seg));
                             ctx.console_writeln("  every comma-separated target must be a live service");
-                            ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                            ctx.console_writeln("  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                             return Ok(());
                         }
                     }
                 } else if target != "all-services" && slot_of(ctx, target).is_none() {
                     ctx.console_writeln_fmt(format_args!("max-carnage: no live service '{}'.", target));
                     ctx.console_writeln("  target: all-services, one service, or a comma-separated list");
-                    ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
+                    ctx.console_writeln("  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
                 // An optional 4th word skips the confirm: `chaos max-carnage all-services 100 yes`.
@@ -9581,7 +10321,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     /// on what else is runnable.
     ///
     /// That decided the verdict by accident. A service blocked in `recv` is woken by the send itself
-    /// and drains within a yield or two, so `logger` passed. A service that idles on a TIMER - `xhci`
+    /// and drains within a yield or two, so `events` passed. A service that idles on a TIMER - `xhci`
     /// with no controller sleeps between drains, and its 5 ms floors to one 10 ms tick - needs real
     /// time, and the check sampled long before it woke. It was reported as "did NOT drain, CLOGGED
     /// (still full) - flood-endpoint disease" when it was not clogged at all: the tool measured too
@@ -9592,7 +10332,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     const FLOOD_DRAIN_MS: u64 = 50;
 
     if ntok < 2 {
-        ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | logger | block-driver)");
+        ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | events | block-driver)");
         return Err(ShellError::Unknown);
     }
     let svc = tok[1];

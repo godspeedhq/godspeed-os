@@ -21,6 +21,11 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["hw-enumerator"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send    = ["events"]
 log_write   = true
 
 # PCI configuration READ. One gated syscall performs a complete read - select the register and fetch

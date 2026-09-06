@@ -19,7 +19,7 @@ requirement (§26.11), and a diagram you can redraw from memory is the only proo
                ┌────────────────────────────────────────────────────────┐
  applications  │ shell  observe  chaos  edit  examples...               │
                ├────────────────────────────────────────────────────────┤
- services      │ fs  net-stack  console  logger  time                   │
+ services      │ fs  net-stack  console  events  time                   │
                ├────────────────────────────────────────────────────────┤
  DRIVERS       │ block-driver  nic-driver  xhci  ehci  dwc2             │
  (userspace)   │ each one a service, with only what it asked for        │
@@ -266,7 +266,7 @@ The build is pure Cargo plus the `osdev` CLI - identical on every platform. The 
 
 ```
 kernel/       bare-metal microkernel
-services/     system services (supervisor, logger, block-driver, fs, shell, ...)
+services/     system services (supervisor, events, block-driver, fs, shell, ...)
 sdk/rust/     Rust SDK for service development
 osdev/        build / test / run tooling
 contracts/    service contracts and JSON schema

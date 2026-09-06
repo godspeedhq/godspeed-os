@@ -346,7 +346,7 @@ pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 /// PREFERRED core falls back to round-robin instead, so a machine with fewer cores still boots.
 ///
 /// Without this bit a moved service's table preference read as an override, and every service naming
-/// a core the machine does not have failed to spawn rather than degrading - `logger` and `xhci` (both
+/// a core the machine does not have failed to spawn rather than degrading - `events` and `xhci` (both
 /// core 2) simply vanished under `-smp 2`, which 11.3 requires to keep working.
 pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 /// Mint the child's name-wired peer caps WITH `GRANT`, so it can re-delegate them.
@@ -854,6 +854,43 @@ impl ServiceContext {
     /// blocked in `call` with `ReplyDead`, and the supervisor restarts it. Loud, and recovered.
     ///
     /// A service that wants to HANDLE the error instead of dying should call `recv_result`.
+    /// Count one RECEIVED message, and publish the running total every 64.
+    ///
+    /// In the SDK rather than in each service, for the same reason trace emission is: it is the same
+    /// counter in every one of them, and ten hand-placed copies is ten chances to place it wrong. Every
+    /// receive path funnels here, and only a message that actually ARRIVED is counted - a polling
+    /// driver calling `try_recv` in a tight loop counts nothing until something comes.
+    ///
+    /// WHY THIS ONE IS WORTH HAVING EVERYWHERE. Paired with the `age_s` column, it answers the
+    /// question an operator actually has when something is wrong: not "how busy is this service" but
+    /// "is it doing ANYTHING". A `block-driver` whose count last moved forty seconds ago is a
+    /// different fault from one that is still receiving and failing, and nothing else in the system
+    /// distinguishes them.
+    ///
+    /// Costs a service with no `events` cap one relaxed add and a not-taken branch; `events` itself
+    /// holds no send cap to itself, so its own publish resolves to `u32::MAX` and returns - the same
+    /// cut that stops it tracing its own sends. No recursion is possible.
+    #[inline]
+    fn count_recv(&self) {
+        static SERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        const PUBLISH_EVERY: u64 = 64;
+        let n = SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        // THE FIRST MESSAGE PUBLISHES TOO, not just every 64th. Publishing only on the interval meant a
+        // service that had received fewer than 64 messages had NO ROW AT ALL - and a service with no row
+        // is indistinguishable from one that is dead, which is precisely the question this metric exists
+        // to answer. Observed: `block-driver`, `time`, `xhci`, `ehci` and `dwc2` all absent from a
+        // healthy machine. One extra send per service for the life of the machine.
+        // ...OR THE SINK JUST CAME BACK. A restarted sink has never heard of this service, and
+        // waiting out the interval leaves it looking dead for up to 63 more messages - on a service
+        // that only receives when someone else does I/O, that is however long the machine stays
+        // quiet. Republishing on the first message after a reacquire is the metric half of "reacquire
+        // and re-establish" (14.3). Observed: `block-driver` had no row for the whole window after a
+        // chaos storm restarted the sink, purely because its next 64th message had not arrived.
+        if n == 1 || n % PUBLISH_EVERY == 0 || crate::trace::take_sink_changed() {
+            self.metric("msgs.received", n);
+        }
+    }
+
     pub fn recv(&self) -> Message {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC {
@@ -864,7 +901,7 @@ impl ServiceContext {
             panic!("recv: no receive endpoint - this service has no ipc_receive in its contract");
         }
         match crate::ipc::recv(CapHandle(slot)) {
-            Ok(msg) => msg,
+            Ok(msg) => { self.count_recv(); msg }
             Err(e)  => panic!("recv failed: {:?} - endpoint is gone; dying so the supervisor restarts us", e),
         }
     }
@@ -877,7 +914,9 @@ impl ServiceContext {
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
         if slot == u32::MAX { return None; }
-        crate::ipc::try_recv(CapHandle(slot)).ok().flatten()
+        let m = crate::ipc::try_recv(CapHandle(slot)).ok().flatten();
+        if m.is_some() { self.count_recv(); }
+        m
     }
 
     /// Block on this service's recv endpoint until a message arrives or `timeout_cycles`
@@ -891,7 +930,9 @@ impl ServiceContext {
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
         if slot == u32::MAX { return None; }
-        crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten()
+        let m = crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten();
+        if m.is_some() { self.count_recv(); }
+        m
     }
 
     /// Re-open the kernel's IOAPIC gate for a level-triggered IRQ `vector` after this driver
@@ -1126,11 +1167,11 @@ impl ServiceContext {
     ///
     /// The whole cost when this service is not tracing is the `enabled()` load and a not-taken
     /// branch. When it IS tracing, the send is `try_send` and its result is DISCARDED on purpose: an
-    /// observer must never be able to slow, block, or fail the thing it observes. A full logger queue
-    /// loses one event, which the ring counts and `trace status` reports - a visible loss, not a
+    /// observer must never be able to slow, block, or fail the thing it observes. A full events queue
+    /// loses one event, which the ring counts and `events status` reports - a visible loss, not a
     /// silent one (invariant 12).
     ///
-    /// Recursion is cut at the source: `logger` itself holds no `logger` send cap, so the sink cannot trace
+    /// Recursion is cut at the source: `events` itself holds no `events` send cap, so the sink cannot trace
     /// its own sends, and no event can beget another.
     #[inline]
     /// Declare this service's own name for the trace ring, once, at startup.
@@ -1139,7 +1180,24 @@ impl ServiceContext {
     /// Costs nothing in trust: the whole event is already the emitter's testimony (see `crate::trace`).
     /// A service that never calls this still traces; its events read `?` in the caller column, which
     /// is the honest answer rather than a guess.
-    pub fn trace_as(&self, name: &str) { crate::trace::set_caller(name); }
+    pub fn trace_as(&self, name: &str) {
+        // A TRUNCATED SERVICE NAME IS REPORTED, not swallowed. `PEER_LEN` is 12 - sized for
+        // `block-driver` - and `hw-enumerator` is 13, so it appears everywhere as `hw-enumerato`.
+        // Readable, but it is still a name silently becoming a different name, and two services
+        // sharing a 12-byte prefix would merge into ONE metric row with their counters interleaving
+        // (the exact failure an unnamed service caused before every service declared itself).
+        //
+        // Widening `PEER_LEN` was the other option and was rejected on cost: the trace DUMP is bounded
+        // by one 4 KiB message, so a 16-byte field drops it from 110 events per screen to 95. Trading
+        // real scrollback in the tool for four characters of a name is the wrong way round. Say it
+        // once instead, so the fix - a shorter name - is the developer's to make.
+        if name.len() > crate::trace::PEER_LEN {
+            self.log_fmt(format_args!(
+                "sdk: service name '{}' exceeds {} bytes and is TRUNCATED in traces and metrics - shorten it, or two services could share one row",
+                name, crate::trace::PEER_LEN));
+        }
+        crate::trace::set_caller(name);
+    }
 
     /// Declare that requests to `peer` carry their opcode at byte `at` (default 0).
     ///
@@ -1152,20 +1210,53 @@ impl ServiceContext {
     fn trace_emit(&self, peer: &str, op: u8, kind: u8) {
         // Arm lazily, ONCE. A service is handed a context with no init hook to run in, so there is
         // nowhere else to resolve from. A service whose contract does not grant `ipc_send =
-        // ["logger"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
+        // ["events"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
         // rest of its life, which is the cost the untraced majority pays.
-        if !crate::trace::resolved() {
-            crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
+        if crate::trace::should_resolve() {
+            let mut slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+            if slot == u32::MAX {
+                // NO CAP WIRED AT SPAWN - ASK THE KERNEL FOR ONE. `find_send_slot` only inspects caps
+                // this service ALREADY HOLDS, so a service spawned during the milliseconds `events`
+                // was restarting has nothing to find, resolves to MAX, and returns early on every
+                // emission for the rest of its life. The reacquire that would fix it sits behind a
+                // send FAILURE - and a send that never happens never fails, so it was unreachable.
+                //
+                // Measured on the T630: after a storm that restarted the sink ~48 times, `fs` and
+                // `block-driver` published NOTHING for the remaining 9.4 s of the run, while the
+                // sink's own LOCALLY-written rows were all present. That split - local rows yes, every
+                // IPC-delivered row no - is the signature of a publisher whose message never left.
+                //
+                // `AcquireSendCap` is authorised by the DECLARATION, which the kernel keeps now even
+                // when the peer was down at spawn. This is the call that spends it (14.3).
+                if self.reacquire_by_name(crate::trace::SINK_NAME) {
+                    slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+                }
+            }
+            crate::trace::set_sink_slot(slot);
+            // AND SAY IT, IF IT TOOK MORE THAN ONE TRY. This report was written once already and
+            // silently lost: the edit that added it failed to apply and only its trace.rs half landed,
+            // so `take_late_resolve` sat with no caller and the hardware run reported "0 late
+            // resolves" - a zero that measured nothing. A missing instrument reads exactly like a
+            // healthy system, which is the worst way for one to fail.
+            if slot != u32::MAX {
+                if let Some(missed) = crate::trace::take_late_resolve() {
+                    if missed > 1 {
+                        self.log_fmt(format_args!(
+                            "sdk: events sink resolved LATE - {} emission(s) went nowhere first",
+                            missed - 1));
+                    }
+                }
+            }
         }
         let slot = crate::trace::sink_slot();
         if slot == u32::MAX {
             return;
         }
         // Do NOT record a call to the SINK ITSELF. The `trace` utility reads the ring by asking
-        // `logger` for it, so tracing that call would fill the ring with the reader's own questions -
+        // `events` for it, so tracing that call would fill the ring with the reader's own questions -
         // each dump adding two more events, pushing out the traffic the reader came to see. An
         // instrument that mostly measures itself is not measuring anything. This hides nothing: every
-        // OTHER peer is still recorded, and `trace status` still counts every event accepted.
+        // OTHER peer is still recorded, and `events status` still counts every event accepted.
         if peer == crate::trace::SINK_NAME {
             return;
         }
@@ -1176,24 +1267,170 @@ impl ServiceContext {
         // draining the console and lost Enter keystrokes. Measured, not guessed: `osdev test files`
         // was 222/0 before, 213/9 with the clock read, 222/0 again without it.
         //
-        // The SINK stamps the event instead. `logger` has to wake to receive it either way, so the
+        // The SINK stamps the event instead. `events` has to wake to receive it either way, so the
         // cost lands on the service whose job this is rather than on every service that talks to
         // anyone - and the caller already used `try_send` and did not wait. An observer must not be
         // able to slow the thing it observes, and a millisecond of port I/O per IPC is exactly that.
         let ev = crate::trace::encode(peer, op, kind);
         if self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev)).is_err() {
-            // THE SINK RESTARTED - REACQUIRE IT. The slot is resolved once and cached, so a `logger`
+            // THE SINK RESTARTED - REACQUIRE IT. The slot is resolved once and cached, so a `events`
             // respawn left every emitter holding a stale generation FOREVER: tracing silently stopped,
-            // `trace ipc` could not reach the ring, and each emission logged a kernel gen-mismatch.
-            // Seen on hardware after a chaos storm restarted `logger` forty times - cap generation 985
+            // `events ipc` could not reach the ring, and each emission logged a kernel gen-mismatch.
+            // Seen on hardware after a chaos storm restarted `events` forty times - cap generation 985
             // against a live record of 1025.
             //
             // This is the ordinary reacquire-by-name recovery every client owes a restartable peer
             // (14.3); the trace path just never did it. Only on FAILURE, so the healthy path is
             // unchanged, and if the sink is genuinely down the next emission tries again.
+            //
+            // AND RETRY ON THE FRESH SLOT. Reacquiring but dropping the event that prompted it is a
+            // recovery that discards its own result (26.7) - the peer is reachable again and the
+            // sample is thrown away anyway. 14.3 says reacquire AND retry; this used to do half.
             if self.reacquire_by_name(crate::trace::SINK_NAME) {
                 if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
                     crate::trace::set_sink_slot(fresh);
+                    let _ = self.try_send_by_handle(
+                        CapHandle(fresh),
+                        &crate::ipc::Message::from_bytes(&ev),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Publish a metric sample to `events`. Fire-and-forget, and never able to slow this service down.
+    ///
+    /// The value is a SET, not an increment: this service owns the counter (it is this service's own
+    /// state, §3.8) and publishes what it currently reads; `events` remembers the last sample. So a
+    /// service that dies leaves its final value behind rather than taking it along, which is the one
+    /// useful thing an observer can still learn from a service that is gone.
+    ///
+    /// Shaped exactly like `trace_emit`, and the shape is the point:
+    /// - `try_send`, result DISCARDED. An observer must never slow, block or fail the thing it
+    ///   observes. A full sink loses one sample, which the sink counts and reports (invariant 12).
+    /// - No clock read here. The sink stamps it; a CMOS RTC read on every publish once cost the shell
+    ///   its keystrokes.
+    /// - Reacquire on failure only, so the healthy path is unchanged and a restarted sink does not
+    ///   leave every emitter holding a stale generation forever (14.3).
+    ///
+    /// SELF-OBSERVATION NEEDS NO CHECK HERE, and that is deliberate. `events` holds no send cap to
+    /// `events`, so this resolves to `u32::MAX` inside its own address space and returns - the same cut
+    /// that stops the sink tracing its own sends. A service reporting on itself must never take an IPC
+    /// hop, because the hop is itself a reportable event and the ring would fill with itself. `events`
+    /// counts its own work locally instead (`docs/observability.md` 9).
+    pub fn metric(&self, name: &str, value: u64) {
+        // FUNCTION-LOCAL, so the latch is owned by the only code that reads it (§3.8, invariant 9).
+        // A one-shot: it never resets, because the point is to say it once for the life of the service.
+        static TRUNCATED_SAID: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if crate::trace::should_resolve() {
+            let mut slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+            if slot == u32::MAX {
+                // NO CAP WIRED AT SPAWN - ASK THE KERNEL FOR ONE. `find_send_slot` only inspects caps
+                // this service ALREADY HOLDS, so a service spawned during the milliseconds `events`
+                // was restarting has nothing to find, resolves to MAX, and returns early on every
+                // emission for the rest of its life. The reacquire that would fix it sits behind a
+                // send FAILURE - and a send that never happens never fails, so it was unreachable.
+                //
+                // Measured on the T630: after a storm that restarted the sink ~48 times, `fs` and
+                // `block-driver` published NOTHING for the remaining 9.4 s of the run, while the
+                // sink's own LOCALLY-written rows were all present. That split - local rows yes, every
+                // IPC-delivered row no - is the signature of a publisher whose message never left.
+                //
+                // `AcquireSendCap` is authorised by the DECLARATION, which the kernel keeps now even
+                // when the peer was down at spawn. This is the call that spends it (14.3).
+                if self.reacquire_by_name(crate::trace::SINK_NAME) {
+                    slot = self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX);
+                }
+            }
+            crate::trace::set_sink_slot(slot);
+            // AND SAY IT, IF IT TOOK MORE THAN ONE TRY. This report was written once already and
+            // silently lost: the edit that added it failed to apply and only its trace.rs half landed,
+            // so `take_late_resolve` sat with no caller and the hardware run reported "0 late
+            // resolves" - a zero that measured nothing. A missing instrument reads exactly like a
+            // healthy system, which is the worst way for one to fail.
+            if slot != u32::MAX {
+                if let Some(missed) = crate::trace::take_late_resolve() {
+                    if missed > 1 {
+                        self.log_fmt(format_args!(
+                            "sdk: events sink resolved LATE - {} emission(s) went nowhere first",
+                            missed - 1));
+                    }
+                }
+            }
+        }
+        let slot = crate::trace::sink_slot();
+        if slot == u32::MAX {
+            return;
+        }
+        // A TRUNCATED NAME IS A DIFFERENT NAME. Said once per service, not per sample: repeating it
+        // would flood the channel the warning has to be read on, and one line names the offender well
+        // enough to fix it. Silence here would mean two metrics quietly merging into one row under a
+        // shared prefix, with the numbers interleaving and nothing to say why (invariant 12).
+        if name.len() > crate::trace::MET_NAME_LEN
+            && !TRUNCATED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            self.log_fmt(format_args!(
+                "sdk: metric name '{}' is longer than {} bytes and was TRUNCATED - shorten it, or two metrics will share one row",
+                name, crate::trace::MET_NAME_LEN));
+        }
+        let m = crate::trace::encode_metric(name, value);
+        if self
+            .try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&m))
+            .is_err()
+        {
+            // AND RETRY, for the reason given on the trace path above. It matters MORE here: a
+            // publisher samples on an INTERVAL (`fs` every 32 requests), so a dropped sample is not
+            // retried for another whole interval - and after a sink restart that meant TWO intervals
+            // with no row for that service at all. A service with no row is indistinguishable from a
+            // dead one, which is the single question this metric exists to answer.
+            // THE FAILING BRANCH IS NAMED, NOT COLLAPSED TO A BOOL. This used to be
+            // `if reacquire_by_name(..)`, so a reacquire that FAILED did nothing and said nothing -
+            // the sample was dropped and the service simply stopped publishing, with no symptom but a
+            // row that never appeared. The three causes are not alike and the difference is the whole
+            // diagnosis: NameNotRegistered is transient (the sink is mid-restart, try again next
+            // interval), while CapTableFull is TERMINAL until this service restarts - it will never
+            // publish again, and that deserves to be said out loud once rather than discovered as an
+            // absence. Invariant 12, and 26.7's "a recovery that itself fails is still a failure".
+            // ONE LATCH PER SEVERITY, and the wording matches the severity. A single latch was
+            // wrong twice over: it said "metrics stop here" for the TRANSIENT case (the sink is
+            // simply mid-restart - the next interval reconnects, and a kill-storm produces this by
+            // the dozen), and having latched on that it would then stay silent about a genuinely
+            // TERMINAL cause arriving later. Observed on the T630: 17 of these during a 100-round
+            // storm, every one of them transient and every one of them overstating the damage.
+            static ACQ_TRANSIENT_SAID: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            static ACQ_TERMINAL_SAID: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            let acq = self.reacquire_cap_detail(crate::trace::SINK_NAME);
+            if let Err(why) = acq {
+                let transient = matches!(why, AcquireFailure::NameNotRegistered);
+                let said = if transient { &ACQ_TRANSIENT_SAID } else { &ACQ_TERMINAL_SAID };
+                if !said.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    if transient {
+                        self.log("sdk: events sink not registered right now - samples dropped until it is back");
+                    } else {
+                        self.log_fmt(format_args!(
+                            "sdk: cannot reacquire the events sink ({}) - metrics from this service stop here",
+                            why.reason()));
+                    }
+                }
+            }
+            if acq.is_ok() {
+                if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
+                    crate::trace::set_sink_slot(fresh);
+                    // A RETRY THAT STILL FAILS IS ITS OWN OUTCOME (26.7): the reacquire worked, so
+                    // this is not "the sink is down" - it is a fresh cap that still would not take the
+                    // sample. Said once per service; silence here would look identical to success.
+                    static RETRY_FAILED_SAID: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
+                    if self
+                        .try_send_by_handle(CapHandle(fresh), &crate::ipc::Message::from_bytes(&m))
+                        .is_err()
+                        && !RETRY_FAILED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.log("sdk: events sink reacquired but the retried sample still failed");
+                    }
                 }
             }
         }
@@ -1212,7 +1449,7 @@ impl ServiceContext {
     // Instrumenting them ALL is also deliberate. The first cut traced only `request_with_reply`, and
     // on hardware that produced an EMPTY ring while the shell was busily talking to `fs` - because the
     // shell uses `_abortable` and `_deadline`, not the plain one. Partial instrumentation is worse
-    // than none: `trace ipc` then shows SOME traffic and silently omits the rest, with nothing on
+    // than none: `events ipc` then shows SOME traffic and silently omits the rest, with nothing on
     // screen saying which. That is a silent gap in the instrument, which is the exact failure this
     // ring exists to prevent (26.4, invariant 12).
     //
@@ -1239,7 +1476,7 @@ impl ServiceContext {
     /// ABORTED), so nothing is lost but the duplicate.
     ///
     /// A request still IN FLIGHT is therefore not in the ring - and that is the one question the ring
-    /// was never the right instrument for: `trace blocked` reads it from the kernel, live, which is
+    /// was never the right instrument for: `events blocked` reads it from the kernel, live, which is
     /// what a hang needs (`utilities/46_trace.md` mechanism A).
     #[inline]
     fn trace_in(&self, peer: &str, msg: &crate::ipc::Message) -> u8 {
@@ -1843,7 +2080,7 @@ impl ServiceContext {
             // BLOCK for the reply, with a short timeout - do not spin. `try_recv` + `yield_cpu` kept this
             // task permanently RUNNABLE, so a core running a waiting command never reached the scheduler's
             // idle path at all. On ARM that path is where USB hot-plug is watched, so plugging or
-            // unplugging anything during a `ping` was noticed only once the ping ended: the events queued
+            // unplugging anything during a `ping` was noticed only once the ping ended: `events` queued
             // up and all arrived at the prompt. It also pegged the core at 100% for a task that is, in
             // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
             // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
@@ -2297,7 +2534,7 @@ impl ServiceContext {
     ///
     /// With [`Self::task_awaits_endpoint`] this is the whole of the blocked-chain walk: map the
     /// endpoint a stuck task awaits back to the task that owns it, then ask what THAT one awaits.
-    /// See `utilities/46_trace.md`.
+    /// See `utilities/47_events.md`.
     pub fn task_own_endpoint(&self, slot: u32) -> u64 {
         // SAFETY: syscall(13) = InspectKernel; query_id=24 = the task's own endpoint.
         let ret = unsafe { raw_syscall(13, 24, slot as u64, 0) };
@@ -3051,6 +3288,30 @@ impl ServiceContext {
     }
 
     /// Log a string via the kernel ring buffer (syscall 5, requires log_write cap).
+    /// Offer a queryable COPY of one log line to `events`. Never the log itself.
+    ///
+    /// Called only AFTER `log`'s syscall has already written the kernel ring and serial, so the
+    /// authoritative record exists before this runs and does not depend on it in any way. A service
+    /// with no `events` cap does nothing here; `events` itself holds no cap to itself, so its own
+    /// logging cannot recurse into the sink.
+    ///
+    /// NO REACQUIRE ON FAILURE, deliberately, unlike `metric` and `trace_emit`. The cap slot is shared
+    /// between all three, and those two already refresh it after a sink restart - `count_recv`
+    /// publishes every 64 messages, so the slot heals on its own. Reacquiring from inside the LOGGING
+    /// path is the one place it could bite: a reacquire that itself wanted to report something would
+    /// re-enter here. Dropping a copy costs a line of queryable scrollback and nothing else, because
+    /// serial already has it.
+    #[inline]
+    fn log_copy(&self, text: &[u8]) {
+        let slot = crate::trace::sink_slot();
+        if slot == u32::MAX {
+            return;
+        }
+        let mut buf = [0u8; 1 + crate::trace::PEER_LEN + crate::trace::LOG_TEXT_MAX];
+        let n = crate::trace::encode_log(text, &mut buf);
+        let _ = self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&buf[..n]));
+    }
+
     pub fn log(&self, msg: &str) {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return; }
@@ -3094,6 +3355,7 @@ impl ServiceContext {
                 raw_syscall(5, slot as u64, bytes.as_ptr() as u64, end as u64);
                 raw_syscall(5, slot as u64, MARK.as_ptr() as u64, MARK.len() as u64);
             }
+            self.log_copy(&bytes[..end]);
             return;
         }
 
@@ -3101,6 +3363,7 @@ impl ServiceContext {
         unsafe {
             raw_syscall(5, slot as u64, bytes.as_ptr() as u64, len as u64);
         }
+        self.log_copy(bytes);
     }
 
     /// Write a string to the console WITHOUT a trailing newline (syscall 22,
@@ -3451,13 +3714,13 @@ impl ServiceContext {
         self.spawn_on(name, core)
     }
 
-    /// Drain the kernel ring buffer. Called by logger at startup (§11.4).
+    /// Drain the kernel ring buffer. Called by events at startup (§11.4).
     ///
     /// Phase 5: reads the ring buffer via kprintln output (already mirrored to
     /// serial); full drain syscall deferred to Phase 6.
     pub fn drain_kernel_ring_buffer(&self) {
         // Ring buffer is already mirrored to serial at all times (§11.4).
-        // Nothing additional needed until the logger has a dedicated drain syscall.
+        // Nothing additional needed until `events` has a dedicated drain syscall.
     }
 
     /// Receive a log message on this service's recv endpoint.

@@ -2,7 +2,9 @@
 
 **Utility:** `observe` - system metrics viewer
 **Version:** 0.1.0
-**Status:** SPEC (not yet built). This document is written before implementation, per the utility-spec-first rule.
+**Status:** **BUILT and hardware-verified.** `services/observe/` ships, in three modes from one
+binary (`observe`, `observe-now`, `observe-live`). Written spec-first, per the utility-spec-first
+rule, and the spec was not updated when the implementation landed.
 **Last updated:** 2026-06-03
 
 ---

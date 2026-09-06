@@ -4,7 +4,7 @@
 The kernel is `no_std` and cannot parse TOML at spawn, so it carries a compiled `service_config(name)`
 table (`kernel/src/task/mod.rs`) that is the ACTUAL source of a service's caps/placement/memory at
 spawn. The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
-contract that mis-stated the driver's authority; T1 found logger/supervisor memory + supervisor peers
+contract that mis-stated the driver's authority; T1 found events/supervisor memory + supervisor peers
 diverged too). Commandment III: what RUNS cannot differ from what is DECLARED.
 
 This check makes drift impossible for the services that HAVE a contract: it parses each `.toml` and the
@@ -256,7 +256,7 @@ def parse_supervisor_images(name: str):
     # unconditional declaration, and it is strictly more coverage than checking one arch and ignoring
     # the rest.
     # Bound the scan to THIS row's peer expression. `tail` is a fixed window of following text, so a
-    # blind union over it swallowed the NEXT row's peers - `logger` (no peers) read as `asker`'s
+    # blind union over it swallowed the NEXT row's peers - `events` (no peers) read as `asker`'s
     # `["reply-server"]` and failed a check it should pass. Match the expression shape instead:
     # either a plain `&[...]`, or a complete `if cfg!(..) { &[..] } [else if ..] [else { &[..] }]`.
     tail = m.group(4).lstrip()
@@ -280,7 +280,12 @@ def parse_supervisor_images(name: str):
         # the x86-intended core. Without it the shell's row raised a ValueError rather than reporting a
         # mismatch - a checker that CRASHES is worse than one that fails, since it reports nothing at all.
         "core":  _core_of(core_expr),
-        "send":  sorted(re.findall(r'"([^"]+)"', peers_raw)),
+        # DEDUPED, because the comment above says UNION and a union is a set. Concatenating the
+        # branches was indistinguishable from a union until a peer appeared in MORE THAN ONE branch -
+        # `events` is the first, since every port traces - and then `block-driver` read as
+        # ['dwc2','events','events','events','xhci'] and failed against a contract that was correct.
+        # The multiplicity carried no information: a peer granted twice is granted once.
+        "send":  sorted(set(re.findall(r'"([^"]+)"', peers_raw))),
     }
 
 

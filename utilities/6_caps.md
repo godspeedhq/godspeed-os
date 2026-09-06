@@ -46,10 +46,10 @@ Bare `caps` prints the list above; **in a pipe** it is a record producer
 is queryable as data:
 
 ```
-caps logger | where rights contains send     services logger can send to
+caps events | where rights contains send     services events can send to
 caps | where resource=spawn         does this shell hold spawn? (one row if yes)
 caps shell | select resource        just the resources, no rights column
-caps logger | to json               logger's authority as JSON
+caps events | to json               events's authority as JSON
 ```
 
 ## 4. Data source

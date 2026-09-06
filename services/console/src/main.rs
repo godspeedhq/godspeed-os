@@ -60,6 +60,12 @@ const REQ_DIMS: u8 = 1;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
+    // called - so a traced service says. Without it every event reads `?` in the caller column, and
+    // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
+    // ten unnamed services all collide into one row and their counters interleave. Observed as a
+    // single `msgs.received 1920` belonging to nobody.
+    ctx.trace_as("console");
     // The framebuffer grant. Without one there is no display to own - which is the normal case on a
     // machine with no framebuffer, and on the Pi 4 until its mapping is made non-cacheable. Say so and
     // park: a console with nothing to render is not a failure, but it must not pretend to work.

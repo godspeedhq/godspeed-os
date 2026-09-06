@@ -15,6 +15,11 @@ limit   = "64MiB"
 
 [capabilities]
 ipc_receive = ["xhci"]
+# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
+# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
+# `try_send` with the result discarded, so the sink can never slow or fail this service.
+ipc_send    = ["events"]
 # The device is named by its PCI CLASS CODE - the industry-standard (class, subclass, prog-if)
 # triple - not by a name the kernel was taught. 0x0C0330 is class 0x0C serial bus, subclass 0x03 USB,
 # prog-if 0x30 xHCI, and it means that on every machine ever built. The kernel holds no name for it:
