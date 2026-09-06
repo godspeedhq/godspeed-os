@@ -127,7 +127,15 @@ between polls, matching the pattern `xhci` already used.
 **2. `PlacementInvalid` is never constructed (backlog/01).** Every service ran on core 0 whatever its
 contract asked for. That defect was found by this experiment on its first boot.
 
-**3. OPEN: USB on the T630 will not survive a single core.** Two distinct symptoms, both silent
+**3. ROOT-CAUSED (now backlog/11): `ehci` resets a controller the BIOS still owns.** The step
+logging named the exact fatal instruction - the `HCRESET` write - and the registers showed the
+firmware actively running the controller (`RS=1`, periodic schedule live) with a USBLEGSUP capability
+present at `eecp=0xa0` that this driver has never honoured. An SMI is serviced on the core that
+raised it, so four cores absorb it and one core does not. Full treatment and the options in
+[`11-ehci-bios-handoff.md`](11-ehci-bios-handoff.md). Original notes below, kept because the ruling
+out is still useful:
+
+**3a. The symptom as first observed.** Two distinct symptoms, both silent
 resets with no panic - which is a PCI bus wedge, not a software fault. The same signature is already
 documented in `services/xhci/src/main.rs`: an operational-register access mid-reset "WEDGED THE PCI
 BUS - freezing every core... the log died between `halted` and `done`".
