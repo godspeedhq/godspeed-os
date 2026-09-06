@@ -1992,6 +1992,33 @@ fn spawn_service_with_image(
         // register base; a NIC only when it is a model we drive (e1000 / RTL8168) - otherwise 0, so the
         // driver gets no mapping and idles, never touching foreign hardware (Commandment VII).
         let bar = hw.mmio_bar();
+        // TAKE THE CONTROLLER FROM THE FIRMWARE BEFORE HANDING IT TO A DRIVER.
+        //
+        // On a machine with USB legacy support the BIOS is still RUNNING the EHCI when we get here -
+        // measured on the T630: `USBCMD.RS=1`, periodic schedule enabled and active, polling the
+        // keyboard out of firmware memory. A driver that then writes HCRESET is resetting a
+        // controller its owner is using, and the firmware takes an SMI over it.
+        //
+        // An SMI is serviced on the CORE THAT RAISED IT. With several cores the OS keeps running on
+        // the others while the firmware copes, and the damage is invisible; with ONE core there is
+        // nowhere else to run, and the platform goes down - a silent reset, no panic, mid-log. That
+        // is the single-core T630 reboot loop, and it is the same latent defect on every machine.
+        //
+        // `ehci_bios_handoff` is the standard procedure (EHCI 2.1.7): claim the OS-Owned semaphore
+        // in USBLEGSUP, wait for the firmware to release BIOS-Owned, and disable its SMIs on this
+        // controller. It has existed and been correct for some time, marked `#[allow(dead_code)]`
+        // and never called, because EHCI was deliberately left co-owned in IOMMU passthrough - the
+        // arrangement the back-port keyboard worked in. Co-ownership is exactly what cannot survive
+        // one core, and it is not needed: the `ehci` service drives that keyboard itself, HID
+        // decode, key repeat and all.
+        //
+        // Idempotent, bounded, and it reports whether the firmware actually let go. Done at the
+        // GRANT rather than once at boot so a restarted driver - which chaos does constantly - also
+        // gets a controller nobody else is running.
+        #[cfg(target_arch = "x86_64")]
+        if hw == HwClass::Ehci && bar != 0 {
+            crate::arch::imp::pci::ehci_bios_handoff();
+        }
         if bar != 0 {
             let mmio_flags = PageFlags::PRESENT
                 | PageFlags::WRITABLE

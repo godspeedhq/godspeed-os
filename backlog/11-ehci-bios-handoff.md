@@ -39,7 +39,41 @@ platform goes down. Same defect on both - only the single-core case has no slack
 This also explains the earlier confusion cleanly: removing `ehci` made single-core pass 459/0 through
 100 chaos rounds, because nothing then touched the BIOS-owned controller.
 
-## The fix, and why it is not a small change
+## FIXED - the handoff already existed, and was never called
+
+`kernel/src/arch/x86_64/pci::ehci_bios_handoff()` implements the whole EHCI 2.1.7 procedure: claim
+the OS-Owned semaphore in USBLEGSUP, wait (time-bounded) for the firmware to release BIOS-Owned,
+report whether it did, and **disable firmware SMIs on the controller** (`USBLEGCTLSTS = 0`). That
+last step is exactly what makes a later HCRESET safe.
+
+It carried `#[allow(dead_code)]` and had NO CALLERS, with a written reason: EHCI was deliberately
+left co-owned in IOMMU passthrough, "the configuration the back-port keyboard works in". That
+reasoning held only because several cores can absorb the SMI. **Co-ownership was never safe - it was
+survivable**, and single core is where the difference shows.
+
+It is called now, at the EHCI MMIO grant in `task::spawn_service_with_image` - before the driver
+runs, and per-grant rather than once at boot so a RESTARTED driver (chaos does this constantly) also
+gets a controller nobody else is running.
+
+Nothing depended on the firmware keeping it: the `ehci` service drives that keyboard itself - HID
+decode, key repeat, Ctrl+Alt+Del, `CONSOLE_PUSH`.
+
+## The question this raised, answered: it CANNOT be a service
+
+Worth recording, because it is the natural first instinct in this project. USBLEGSUP lives in PCI
+CONFIG space, and this kernel reaches config space through legacy mechanism #1 - ports `0xCF8`
+(address) and `0xCFC` (data). The kernel's own comment calls that pair "a single global register".
+A port pair that addresses EVERY device cannot be granted narrowly: handing it to a service hands
+over every device's configuration, which is kernel-equivalent power.
+
+ECAM would allow a narrow grant - each function gets its own 4 KiB page, which the existing
+`hw_mmio` capability could cover exactly - but this kernel does not implement ECAM, and adding MCFG
+parsing would be MORE kernel surface than the handoff it was meant to avoid.
+
+So this genuinely belongs in the kernel, and no new capability was needed: the kernel already owns
+PCI configuration access and already had the code.
+
+## Historical: why this looked like it needed new kernel surface
 
 EHCI 2.1.7 / the EHCI Extended Capability at `EECP`: set the **HC OS Owned** semaphore, wait for
 **HC BIOS Owned** to clear, then optionally disable SMI generation in `USBLEGCTLSTS`. Both live in

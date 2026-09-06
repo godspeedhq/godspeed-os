@@ -468,10 +468,17 @@ pub fn set_power_d0(bdf: u32) {
 /// userspace `ehci` driver cannot reach, so the kernel must do it. Idempotent;
 /// no-op if no EHCI, no extended caps, or no USB Legacy Support capability.
 ///
-/// Retained but not currently called: EHCI is left in IOMMU passthrough (firmware
-/// co-owns it, the configuration the back-port keyboard works in), so it is not
-/// handed off. Re-enable when EHCI confinement is revisited.
-#[allow(dead_code)]
+/// CALLED at the EHCI MMIO grant (`task::spawn_service_with_image`), before the driver runs.
+///
+/// It was retained-but-uncalled for a while, on the reasoning that EHCI is left in IOMMU
+/// passthrough and firmware co-ownership was "the configuration the back-port keyboard works in".
+/// That held until a SINGLE-CORE machine tried it: co-ownership means the driver's HCRESET resets a
+/// controller the firmware is actively using, the firmware takes an SMI, and an SMI is serviced on
+/// the core that raised it. With four cores the OS survives on the others; with one there is
+/// nowhere else to run and the platform resets. The co-ownership was never safe - it was survivable.
+///
+/// And it is not needed: the `ehci` SERVICE drives that keyboard itself (HID decode, key repeat,
+/// Ctrl+Alt+Del), so nothing depends on the firmware continuing to poll it.
 pub fn ehci_bios_handoff() {
     let Some(dev) = ehci() else { return };
     let mmio = dev.bar[0];
