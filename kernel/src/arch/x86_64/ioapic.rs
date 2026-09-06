@@ -158,8 +158,22 @@ pub fn set_mask(gsi: u8, masked: bool) {
 static BSP_LAPIC_ID: AtomicU8 = AtomicU8::new(0xFF);
 
 /// Record the BSP's local-APIC id (called once at boot before any device routing).
+/// Record the BSP's local APIC id. FIRST WRITER WINS, which is what makes this correct to call from
+/// the per-core APIC init: the BSP runs it before it starts any AP, so the first caller IS the BSP and
+/// a later AP cannot overwrite it with its own id.
+///
+/// This had NO CALLERS. `BSP_LAPIC_ID` therefore sat at its 0xFF sentinel forever and `bsp_lapic_id()`
+/// returned the 0 fallback unconditionally - a hard-coded constant wearing the shape of a lookup, which
+/// is worse than the constant because it reads as though it were measured.
+///
+/// What it broke: `usb_irq_dest_lapic` aims a device's MSI at the driver's core, falling back to the
+/// BSP when that core is not running. On a multi-core boot the fallback is rarely taken, so the real id
+/// came from Limine and the bug stayed hidden. On a SINGLE-CORE boot the contracted core never exists,
+/// so the fallback is always taken and every MSI was addressed to APIC id 0 whether or not that is this
+/// machine's BSP. An MSI aimed at an APIC id nothing answers to is delivered nowhere and reported by
+/// no one, which is the T630's `0 MSI` exactly.
 pub fn set_bsp_lapic_id(id: u8) {
-    BSP_LAPIC_ID.store(id, Ordering::Relaxed);
+    let _ = BSP_LAPIC_ID.compare_exchange(0xFF, id, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 /// The BSP local-APIC id to route level interrupts to (0 if not captured).

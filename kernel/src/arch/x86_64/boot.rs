@@ -338,6 +338,9 @@ pub unsafe fn init_local_apic() {
 
     // SAFETY: ring-0; called once per core; APIC is already initialised above.
     let lapic_id = unsafe { get_lapic_id() };
+    // Publish the BSP's id for MSI/IOAPIC destination programming. First writer wins, and the BSP
+    // reaches here before it starts any AP, so this is the BSP's id and no AP can displace it.
+    crate::arch::x86_64::ioapic::set_bsp_lapic_id(lapic_id as u8);
 
     // Probe for TSC-Deadline timer support (CPUID.1.ECX[24]).
     // On Goldmont+ (Wyse 5070 J5005), the periodic APIC timer is silenced when

@@ -822,9 +822,9 @@ pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
             let ctrl_after = (config_read32(bus, dev, func, cap) >> 16) as u16;
             let mask_after = if pvm { config_read32(bus, dev, func, mask_off) } else { 0 };
             crate::kprintln!(
-                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr) ctrl={:#06x}->{:#06x} pvm={} mask={:#x}->{:#x}",
+                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr) ctrl={:#06x}->{:#06x} pvm={} mask={:#x}->{:#x} dest_apic={}",
                 bus, dev, func, vector, if is_64 { 64 } else { 32 },
-                ctrl, ctrl_after, if pvm { "yes" } else { "no" }, mask_before, mask_after
+                ctrl, ctrl_after, if pvm { "yes" } else { "no" }, mask_before, mask_after, dest_apic
             );
             return true;
         }
