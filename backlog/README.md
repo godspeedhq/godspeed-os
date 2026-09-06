@@ -52,6 +52,7 @@ direction.
 | [7](07-events-remote-sink.md) | `events persist start <url>` - ship a capture off-box | Feature | - |
 | [8](08-d3-assignment-vs-reenumeration.md) | D3: the assignment/re-enumeration split, and "cost 2" | Design decision | the D3 gate |
 | [9](09-constrained-targets-and-sizing.md) | Constrained targets: boot-size the arenas (~22 MiB of .bss), and what really blocks a microcontroller | Design question | any small-memory port |
+| [12](12-xhci-probe-blocks-input.md) | xHCI hub probes block the input loop - typing lags on one core | Latency | - |
 | [11](11-ehci-bios-handoff.md) | `ehci` resets a BIOS-owned controller with no USBLEGSUP handoff - fatal on one core | **Latent everywhere** | single-core on the T630 |
 | [10](10-ipc-efficiency.md) | IPC cost: fewer ROUND TRIPS, not a tighter protocol - batching, co-location, and the fixed 4 KiB message | Performance | the hot paths |
 

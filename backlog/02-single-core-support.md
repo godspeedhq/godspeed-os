@@ -108,8 +108,20 @@ watching it come up on four cores with services on 1, 2 and 3.
 floods, zero panics, zero liveness wedges. Cost: **1.6x slower for 4x fewer cores** - a selfcheck
 took 43 s against 26 s on four. Predictable degradation, no correctness cliff.
 
-**HP T630 (x86_64, AMD), 2026-09-06:** 459/0 through selfcheck + 100 chaos rounds + selfcheck, zero
-panics, zero wedges - **with the `ehci` driver not spawned** (see below).
+**HP T630 (x86_64, AMD), 2026-09-06:** 460/0 x3 through selfcheck + 100 chaos rounds + selfcheck +
+hotplug, zero panics, zero wedges, zero silent resets - **with `ehci` running**, once the EHCI BIOS
+handoff was fixed (backlog/11).
+
+**Raspberry Pi 2 (arm32), 2026-09-06:** 452/0 x3 through the same sweep. The most demanding of the
+four for this question: storage, keyboard AND networking all ride one `dwc2` controller with no
+companion, so if "USB on one core" were a general problem this is where it would have shown. It did
+not.
+
+**Dell Wyse 5070 (x86_64, Intel), 2026-09-06:** 459/0 x3. Also the control that proved the T630's
+fault was EHCI-specific rather than single-core-general: this machine reports `no EHCI controller
+(PCI scan)` and was clean from the first run.
+
+**ALL FOUR MACHINES PASS.** Three instruction sets, four USB topologies, one core each.
 
 So the question this item was raised to answer is answered: **the architecture does not depend on
 having spare cores to spread a problem across.** Where a scheduling or liveness fault had previously
