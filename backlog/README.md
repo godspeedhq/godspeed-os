@@ -44,7 +44,7 @@ direction.
 | # | Item | Severity | Blocks |
 |---|------|----------|--------|
 | [1](01-placement-invalid-never-enforced.md) | `PlacementInvalid` is never constructed - contracted core silently ignored | **Constitutional** | single-core work, 9.2 |
-| [2](02-single-core-support.md) | GodspeedOS on ONE core: what actually breaks | Feature + audit | - |
+| [2](02-single-core-support.md) | Single core: ANSWERED (Pi 4 and T630 both pass) - open remainder is USB on the T630 | Answered / open tail | - |
 | [3](03-pi4-shell-stack-smash.md) | Pi 4 shell faults with a return address of ASCII spaces | Correctness | - |
 | [4](04-serial-splice.md) | The kernel splices one log line into another under load | Observability | evidence quality |
 | [5](05-pi2-clock-floor-never-persists.md) | Pi 2 never writes `/clock.last`, so every boot starts at 1970 | Correctness | - |

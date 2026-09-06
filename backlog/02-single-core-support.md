@@ -102,6 +102,51 @@ responsibility: it removes the AP-start call and pins the arena count at 1, reac
 11.3 already defines. Default builds are byte-identical to before - verified by booting one and
 watching it come up on four cores with services on 1, 2 and 3.
 
+## RESULT: it works, on both architectures tested
+
+**Raspberry Pi 4 (aarch64), 2026-09-06:** 450/0 x3, 100 rounds of Maximum Carnage, 611 kills, 500
+floods, zero panics, zero liveness wedges. Cost: **1.6x slower for 4x fewer cores** - a selfcheck
+took 43 s against 26 s on four. Predictable degradation, no correctness cliff.
+
+**HP T630 (x86_64, AMD), 2026-09-06:** 459/0 through selfcheck + 100 chaos rounds + selfcheck, zero
+panics, zero wedges - **with the `ehci` driver not spawned** (see below).
+
+So the question this item was raised to answer is answered: **the architecture does not depend on
+having spare cores to spread a problem across.** Where a scheduling or liveness fault had previously
+been "fixed" by moving a service to another core, removing the second core did not bring it back.
+195 distinct services and 729 spawns coexisted on one core in the QEMU identity build without a wedge.
+
+## What single-core FOUND, which is the other half of the point
+
+**1. A count-is-not-a-duration bug in `ehci` (fixed, 35b335e1).** `wait()` was `while i < 2_000_000`
+with no yield - an iteration bound bounds nothing in wall-clock, since each turn is an uncached MMIO
+read across PCIe. On four cores the driver has a core to itself and it merely looks rude; on one core
+it is a service spinning on the only core the machine has. Now a 250 ms deadline with `yield_cpu`
+between polls, matching the pattern `xhci` already used.
+
+**2. `PlacementInvalid` is never constructed (backlog/01).** Every service ran on core 0 whatever its
+contract asked for. That defect was found by this experiment on its first boot.
+
+**3. OPEN: USB on the T630 will not survive a single core.** Two distinct symptoms, both silent
+resets with no panic - which is a PCI bus wedge, not a software fault. The same signature is already
+documented in `services/xhci/src/main.rs`: an operational-register access mid-reset "WEDGED THE PCI
+BUS - freezing every core... the log died between `halted` and `done`".
+
+  - **With `ehci` spawned:** the machine reboot-loops during USB bring-up. Three boots, dying at a
+    varying point in the xHCI reset - `reset: entering` once, `reset: halted` twice.
+  - **With `ehci` NOT spawned:** it boots, and selfcheck plus 100 chaos rounds pass clean. But
+    **typing on the USB keyboard reboots it, while typing on serial does not** - the sharpest
+    discriminator available, and it points at the xHCI HID/interrupt path rather than at reset.
+
+  RULED OUT, so nobody re-derives them: not `ehci` interleaving during xhci's CNR window (`spin()`
+  does not yield, so nothing else runs there); not an uninitialised schedule pointer (HCRESET
+  completes cleanly, and the schedules are disabled after it); not a regression (the T630 is fine
+  multi-core). NOT explained: why one core differs at all, when four cores run both drivers genuinely
+  simultaneously, which should be worse. Three theories were tried and none survived.
+
+  A weak correlation was also tested and REJECTED: `observe-now` being killed appeared before two
+  reboots, but it was killed five times and survived three.
+
 ## Next steps, in order
 
 1. Settle item 1 first. Until `PlacementInvalid` is enforced or 9.2 is amended, a single-core run
