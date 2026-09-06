@@ -43,6 +43,12 @@ pub fn percpu_init(boot_info: &BootInfo) {
 
 pub fn init(boot_info: &BootInfo) {
     core::init(boot_info);
+    // Core 0's LAPIC id, published UNCONDITIONALLY - before the branch below, because the
+    // single-core arm skips `start_all_aps` and that is where x86 used to do this. A core marked
+    // ready whose identity is still an unwritten 0 is worse than one that is absent: callers ask
+    // `is_ready` first, get true, and then trust the 0. See `publish_bsp_lapic_id`.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::ap_boot::publish_bsp_lapic_id();
     #[cfg(feature = "single-core")]
     {
         let _ = boot_info;

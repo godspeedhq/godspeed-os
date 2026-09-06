@@ -6,6 +6,32 @@
 //! address via `MpInfo::bootstrap` - no INIT+SIPI trampoline required.
 
 use limine::mp::{MpGotoFunction, MpInfo};
+/// Publish the BSP's own LAPIC id as core 0's, and as the fallback destination.
+///
+/// This work used to happen ONLY inside `start_all_aps`, which a `single-core` build never calls - so
+/// on that build `CORE_LAPIC_ID[0]` kept its initial 0 for the life of the machine while the BSP's real
+/// id was whatever the silicon said. aarch64 has always published core 0 unconditionally
+/// (`set_core_lapic_id(0, 0)`); x86 buried it in AP startup, so removing the APs removed it too.
+///
+/// What that broke: `pci_msi_vector` aims a device's MSI at the core its driver is pinned to, and on a
+/// single-core boot that core IS core 0 - so `is_ready(0)` is true, the BSP fallback is never reached,
+/// and the destination came from this unwritten 0. On the T630, whose BSP is LAPIC id 16, every MSI was
+/// addressed to a core that does not answer: `0 MSI` for the life of the boot, with every stage of the
+/// setup reporting success. The EHCI was unaffected because it routes INTx through `bsp_lapic_id()`
+/// directly, and QEMU was unaffected because its BSP really is id 0 - so the wrong value was
+/// accidentally right on the only machine the tests run on.
+///
+/// Read from the LAPIC's own ID register rather than the boot protocol: it is the hardware's answer,
+/// it needs no response struct, and on this path we are unambiguously running on the BSP.
+pub fn publish_bsp_lapic_id() {
+    // SAFETY: called on the BSP from `smp::init`, after `init_local_apic` and after the per-core
+    // arenas exist (`smp::percpu_init` runs earlier in `main`).
+    let id = unsafe { super::boot::get_lapic_id() };
+    crate::smp::core::set_core_lapic_id(0, id);
+    super::ioapic::set_bsp_lapic_id(id as u8);
+    crate::kprintln!("smp: BSP is LAPIC id {} (core 0)", id);
+}
+
 
 /// Start all non-BSP cores and wait for them to reach `mark_ready`.
 ///
