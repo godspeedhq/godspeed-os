@@ -51,6 +51,7 @@ direction.
 | [6](06-kernel-ring-not-drainable.md) | No syscall exposes the kernel's 16 KiB log ring to userspace | Feature | `events log` completeness |
 | [7](07-events-remote-sink.md) | `events persist start <url>` - ship a capture off-box | Feature | - |
 | [8](08-d3-assignment-vs-reenumeration.md) | D3: the assignment/re-enumeration split, and "cost 2" | Design decision | the D3 gate |
+| [9](09-constrained-targets-and-sizing.md) | Constrained targets: boot-size the arenas (~22 MiB of .bss), and what really blocks a microcontroller | Design question | any small-memory port |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
