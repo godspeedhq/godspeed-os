@@ -7094,7 +7094,7 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
 ///
 /// Split from `trace` on a real boundary rather than a preference: every view here reads the `events`
 /// service, and every view in `cmd_trace` reads the LIVE KERNEL. They shared one dispatcher because
-/// that was convenient, not because they were the same command - and `events deps fs` was the tell,
+/// that was convenient, not because they were the same command - and `trace deps fs` was the tell,
 /// since `deps` never touches this service at all. The doc has called them mechanism B and mechanism A
 /// throughout.
 fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
@@ -7124,7 +7124,7 @@ fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
         // The live-state views live under `trace`, and saying so is worth more than a bare "unknown":
-        // a reader who typed `events deps fs` has the right question and the wrong command.
+        // a reader who typed `trace deps fs` has the right question and the wrong command.
         "blocked" | "chain" | "deps" | "endpoint" | "endpoints" => {
             ctx.console_writeln_fmt(format_args!(
                 "events {}: that reads LIVE kernel state, so it is `trace {}`. `events` shows what the sink RECORDED.",
@@ -7432,7 +7432,7 @@ fn trace_op_cell(t: &mut Table, peer: &[u8], op: u8) -> Value {
     t.intern(&b[..n])
 }
 
-/// `events deps <service>` - what a service is WIRED to call, and what it has actually called.
+/// `trace deps <service>` - what a service is WIRED to call, and what it has actually called.
 ///
 /// # Why this is built from capabilities and not from a contract
 ///
@@ -7456,7 +7456,7 @@ fn trace_op_cell(t: &mut Table, peer: &[u8], op: u8) -> Value {
 #[inline(never)]
 fn build_deps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
     if name.is_empty() {
-        ctx.console_writeln("usage: events deps <service>");
+        ctx.console_writeln("usage: trace deps <service>");
         return None;
     }
     let slot = match slot_of(ctx, name) {
@@ -7579,7 +7579,7 @@ fn build_deps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
     Some(t)
 }
 
-/// One level of `events deps`, appended to `t` at `depth` under `parent`.
+/// One level of `trace deps`, appended to `t` at `depth` under `parent`.
 ///
 /// Split from the root call so the walk can RECUR without the root's ring pass being redone at every
 /// level: the observed counts come from a single scan of the event table, which the caller does once
@@ -7613,7 +7613,7 @@ fn deps_level(ctx: &ServiceContext, t: &mut Table, parent: &[u8], depth: u64,
                     // endpoint, and a reply capability targets the caller's REPLY-only endpoint - so a
                     // cap that resolves to no live task is, in practice, a return address. Bare
                     // `endpoint#119` made a reader stop and decode an id that means nothing to them;
-                    // `reply#119` says what it is AND keeps the id, which `events endpoint 119` can
+                    // `reply#119` says what it is AND keeps the id, which `trace endpoint 119` can
                     // answer. A number is only noise when it is a dead end.
                     let mut nb = [0u8; 24];
                     let mut q = 0usize;
@@ -7635,7 +7635,7 @@ fn deps_level(ctx: &ServiceContext, t: &mut Table, parent: &[u8], depth: u64,
         //
         // This was a global "seen" set, and it was wrong: `block-driver` is a direct peer of the shell
         // AND a peer of `fs`, so once it was drawn under the shell it could never be drawn under `fs`,
-        // and `events deps shell` showed `fs  24 calls` with nothing beneath it. That is precisely the
+        // and `trace deps shell` showed `fs  24 calls` with nothing beneath it. That is precisely the
         // transitive reach the tree exists to show, deleted by an over-eager guard.
         //
         // A node MAY appear under several parents - a dependency graph is a DAG and that is what a DAG
@@ -7677,7 +7677,7 @@ fn deps_level(ctx: &ServiceContext, t: &mut Table, parent: &[u8], depth: u64,
 /// is `shell -> fs -> block-driver`, which is the whole storage stack; a fourth has never existed
 /// here. Both limits are visible in the output rather than silently applied - see `trace_deps`.
 ///
-/// 48 edges, not 24: at 24 the notice fired on EVERY `events deps shell`, and a bound that always
+/// 48 edges, not 24: at 24 the notice fired on EVERY `trace deps shell`, and a bound that always
 /// trips is a bound set too low - it stops being information and becomes furniture the reader learns
 /// to ignore, which is worse than no notice at all.
 const DEPS_MAX_DEPTH: u64 = 3;
@@ -7885,14 +7885,14 @@ fn deps_draw(ctx: &ServiceContext, t: &Table, parent: &[u8], prefix: &mut [u8; 4
     }
 }
 
-/// `events endpoints` - every live task's endpoint, the map from names to the ids.
+/// `trace endpoints` - every live task's endpoint, the map from names to the ids.
 ///
 /// The missing fourth source. Ids arrive from `caps <service>` (as `endpoint#N`), from `trace
-/// blocked`'s `awaiting` column and from `events deps`' reply list - all of which hand you ONE id in
+/// blocked`'s `awaiting` column and from `trace deps`' reply list - all of which hand you ONE id in
 /// context. None of them answers "what endpoints exist", so the map from a service name to its number
-/// had to be assembled by hand before `events endpoint <id>` could be used deliberately.
+/// had to be assembled by hand before `trace endpoint <id>` could be used deliberately.
 ///
-/// A record source like every other view, so it filters and pipes: `events endpoints | where
+/// A record source like every other view, so it filters and pipes: `trace endpoints | where
 /// name contains fs`, `| to json`.
 ///
 /// Only PRIMARY endpoints appear, because that is what the kernel reports per task. A reply-only
@@ -7914,7 +7914,7 @@ fn build_endpoints_table(ctx: &ServiceContext) -> Table {
     t
 }
 
-/// `events endpoints` on the console.
+/// `trace endpoints` on the console.
 fn trace_endpoints(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = build_endpoints_table(ctx);
     if t.nrows() == 0 {
@@ -7922,7 +7922,7 @@ fn trace_endpoints(ctx: &ServiceContext) -> Result<(), ShellError> {
         return Ok(());
     }
     ctx.console_writeln("--------------------------------- legend ---------------------------------");
-    ctx.console_writeln("endpoint  the id to pass to `events endpoint <id>`; queue = messages waiting");
+    ctx.console_writeln("endpoint  the id to pass to `trace endpoint <id>`; queue = messages waiting");
     ctx.console_writeln("only PRIMARY endpoints - a reply mailbox has no name, hence reply#NNN");
     ctx.console_writeln("------------------------------ live endpoints -----------------------------");
     let mut o = Out::Console;
@@ -7930,9 +7930,9 @@ fn trace_endpoints(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `events endpoint <id>` - what an endpoint is, and WHO CAN REACH IT.
+/// `trace endpoint <id>` - what an endpoint is, and WHO CAN REACH IT.
 ///
-/// The inverse of `events deps`, and the question the capability model makes worth asking: `deps` says
+/// The inverse of `trace deps`, and the question the capability model makes worth asking: `deps` says
 /// who a service calls, this says who holds authority over a given endpoint. There was no way to ask
 /// it before - `caps <service>` answers one holder at a time, and you cannot enumerate holders from a
 /// resource.
@@ -7947,7 +7947,7 @@ fn trace_endpoint(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     let id: u64 = match arg.trim().trim_start_matches('#').parse() {
         Ok(v) => v,
         Err(_) => {
-            ctx.console_writeln("trace endpoint: needs an endpoint id, e.g. `events endpoint 119`");
+            ctx.console_writeln("trace endpoint: needs an endpoint id, e.g. `trace endpoint 119`");
             return Err(ShellError::Unknown);
         }
     };
@@ -8003,7 +8003,7 @@ fn trace_endpoint_holders(ctx: &ServiceContext, id: u64) -> Result<(), ShellErro
     Ok(())
 }
 
-/// `events deps <service>` on the console: the dependency graph, drawn as a tree.
+/// `trace deps <service>` on the console: the dependency graph, drawn as a tree.
 ///
 /// # A tree and a record stream are the same data
 ///
@@ -8012,9 +8012,9 @@ fn trace_endpoint_holders(ctx: &ServiceContext, id: u64) -> Result<(), ShellErro
 /// renderings, exactly as `events ipc` does for its grid, its pager and its pipe. Neither form is a
 /// lossy summary of the other, which is what makes it safe to have both:
 ///
-///   events deps shell                      -> the tree
-///   events deps shell | where peer=fs      -> the edges into fs
-///   events deps shell | to json            -> the graph, machine-readable
+///   trace deps shell                      -> the tree
+///   trace deps shell | where peer=fs      -> the edges into fs
+///   trace deps shell | to json            -> the graph, machine-readable
 fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     let t = match build_deps_table(ctx, name) {
         Some(t) => t,
@@ -8047,7 +8047,7 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     deps_draw(ctx, &t, name.as_bytes(), &mut [0u8; 48], 0, 0, &mut anc, 1);
 
     // Reply addresses, reported ONCE rather than as a node under every service. Nothing is hidden -
-    // they are rows in the table and `events deps <svc> | to grid` shows them - but they are return
+    // they are rows in the table and `trace deps <svc> | to grid` shows them - but they are return
     // addresses, not dependencies, and the tree is for the dependencies.
     // COUNT, and point at the view that lists them. This used to print the ids inline, and at ten of
     // them the line was already a paragraph - and worse, it lied twice: a 96-byte id buffer silently
@@ -8060,7 +8060,7 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     for r in 0..t.nrows() { if t.cell_bytes(r, 2).starts_with(b"reply#") { replies += 1; } }
     if replies > 0 {
         ctx.console_writeln_fmt(format_args!(
-            "({} reply address(es) hidden - `events deps {} | where peer contains reply` lists them)",
+            "({} reply address(es) hidden - `trace deps {} | where peer contains reply` lists them)",
             replies, name));
     }
     // The walk is bounded (26.6), and a bound reached in silence is a lie about completeness.
@@ -8769,7 +8769,7 @@ fn trace_block_kind(state: u8, awaits: u64) -> &'static str {
     }
 }
 
-/// `events blocked` - every task blocked on another task, as a record table (so it pipes).
+/// `trace blocked` - every task blocked on another task, as a record table (so it pipes).
 fn trace_blocked(ctx: &ServiceContext) -> Result<(), ShellError> {
     let mut t = Table::new(&["slot", "name", "blocked", "awaiting", "held_by"]);
     let mut n = 0u32;
@@ -8805,7 +8805,7 @@ fn trace_blocked(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `events chain <name|slot>` - who a task is stuck behind right now, as a tree.
+/// `trace chain <name|slot>` - who a task is stuck behind right now, as a tree.
 ///
 /// Walks `awaited endpoint -> owning task -> what IT awaits`. Bounded two ways, because a stuck system
 /// is precisely where an unbounded walk would hang: a depth cap, and a repeat-visit check that names
