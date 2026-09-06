@@ -420,7 +420,7 @@ Method: cold least-capable-model probes - two grokability cold-reads (comprehens
 Audit-1's fix areas) + one seeded cold-review on an **untested cluster** (memory/allocation,
 temporal/boot-order, unbounded) in a `prefetch` candidate PR. Purpose: confirm Audit-1's fixes are
 legible to a cold model, and probe a cluster Audit 1's reviews did not cover. Run as part of the
-2026-07-15 full-trilogy audit (`audit-report/2026-07-15.md`).
+2026-07-15 full-trilogy audit (`audits/2026-07-15-full-trilogy-report.md`).
 
 **Result: 0 HIGH, 0 MED, 1 LOW. Audit-1's fixes are confirmed legible, and the field guide works.**
 

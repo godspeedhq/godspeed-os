@@ -1,6 +1,6 @@
 # Who owns a service: images, authority, discovery, trust
 
-**Status:** step A BUILT and hardware-verified on `feat/supervisor-owns-images`. Steps C, D and 2 are
+**Status:** step A BUILT and hardware-verified; MERGED (released in v0.13.0). Steps C, D and 2 are
 design, agreed in discussion, not yet built.
 **Merge bar (stated by the project owner):** this branch does not merge to `main` until the supervisor
 actually owns the ELF images and the catalogue is out of the kernel. Step A alone does not earn it.

@@ -259,12 +259,33 @@ os/
   audits/                # append-only EVIDENCE, not documentation
     unsafe-audit.md      #   every unsafe block; CI checks it matches source
     kernel-audit.md  security-audit.md  userspace-audit.md  documentation-audit.md
+    2026-07-15-full-trilogy-report.md  #   a dated run of all of them at once
 
   tests/
     qemu/
       identity/            # identity test suite (§22)
       harness/             # shared test infrastructure
       perf/                # performance benchmarks (§22 B1-B10) - 10/10 ✅
+
+  scripts/               # THE ENFORCEMENT LAYER, and the non-x86 build paths
+    commandments.py      #   the Ten Commandments, mechanised where they can be
+    commandments_redteam.py #  probes that BREAK each check, so a dead check is caught
+    contract_check.py    #   every contract matches its kernel service_config
+    unsafe_check.py      #   the unsafe audit matches the source
+    doc_refs.py          #   no doc points at a file that does not exist
+    arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
+
+  utilities/             # the SPEC for every shell utility, one file each (48)
+    0_conventions.md     #   the 13 rules every utility obeys
+  website/               # the published book (mdBook); pages `{{#include}}` the
+                         #   sources above, so a doc and its page cannot drift
+  backlog/               # open items - recorded rather than closed (§26.7)
+  boot/                  # per-board boot config (pi2/, pi4/)
+  contracts/schema/      # the JSON Schema a service contract is validated against
+  examples/              # 12 worked services
+  milestones/            # what was achieved and when; ALMANAC.md is the chronicle
+  bugs/                  # long-form investigations of four specific hardware bugs
+  editors/               # syntax files for the gsh shell language
 ```
 
 ---
