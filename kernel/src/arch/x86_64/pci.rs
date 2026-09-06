@@ -527,6 +527,26 @@ pub fn ehci_bios_handoff() {
         let cap_id = cap & 0xFF;
         if cap_id == 0x01 {
             // USBLEGSUP at `ptr`: bit16 = HC BIOS Owned, bit24 = HC OS Owned.
+            //
+            // SILENCE THE FIRMWARE FIRST, THEN NEGOTIATE. Claiming OS ownership is how the protocol
+            // NOTIFIES the firmware to let go - by raising an SMI. On a machine with cores to spare
+            // that is invisible: the SMM handler runs and the OS carries on elsewhere. On a SINGLE
+            // core it is fatal, and it was measured being fatal here: step logging through this
+            // function on a single-core T630 printed
+            //
+            //     ehci-handoff: [E] USBLEGSUP@0xa0=0x00010001; about to WRITE OS-owned
+            //
+            // and never reached the next line. Bit 16 set says the BIOS owns the controller; the
+            // write that tells it so is where the machine stopped, then sat until a hardware
+            // watchdog reset it ~13 s later. Every earlier symptom in this hunt - the reboot loop,
+            // the varying death points - was that hang plus that watchdog.
+            //
+            // USBLEGCTLSTS (ptr+4) is the firmware's SMI ENABLE set for this controller. Zeroing it
+            // first means the ownership handshake cannot raise one, so the negotiation below is safe
+            // on a machine with nowhere to run an SMI. It is also simply correct: an OS taking a
+            // controller has no use for the firmware's SMIs on it either way.
+            config_write32(bus, dev, func, ptr + 4, 0);
+
             if cap & (1 << 16) != 0 {
                 // Claim OS ownership and wait for the firmware to release.
                 config_write32(bus, dev, func, ptr, cap | (1 << 24));
@@ -543,14 +563,26 @@ pub fn ehci_bios_handoff() {
                     }
                     core::hint::spin_loop();
                 }
+                // TAKE IT ANYWAY if the firmware did not answer. With its SMIs already disabled
+                // above, the firmware may never notice the request - so waiting for a courteous
+                // release can time out on a machine that is otherwise fine. Clearing bit 16
+                // ourselves is what a host OS does at this point; the alternative is handing the
+                // controller to a driver while something else still believes it owns it, which is
+                // the co-ownership this whole change exists to end.
+                if !ok {
+                    let v = config_read32(bus, dev, func, ptr);
+                    config_write32(bus, dev, func, ptr, (v & !(1 << 16)) | (1 << 24));
+                }
                 crate::kprintln!(
-                    "ehci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x})",
-                    ptr, ok as u8, cap
+                    "ehci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x}){}",
+                    ptr, ok as u8, cap,
+                    if ok { "" } else { " - FORCED after timeout" }
                 );
             } else {
                 crate::kprintln!("ehci-handoff: already OS-owned (USBLEGSUP={:#010x})", cap);
             }
-            // Disable all firmware SMIs on this controller (USBLEGCTLSTS at ptr+4).
+            // Re-assert the SMI disable. Cheap, and the firmware may have rewritten it while it
+            // still believed it owned the controller.
             config_write32(bus, dev, func, ptr + 4, 0);
             return;
         }

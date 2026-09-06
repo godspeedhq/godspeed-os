@@ -39,7 +39,35 @@ platform goes down. Same defect on both - only the single-core case has no slack
 This also explains the earlier confusion cleanly: removing `ehci` made single-core pass 459/0 through
 100 chaos rounds, because nothing then touched the BIOS-owned controller.
 
-## FIXED - the handoff already existed, and was never called
+## THE ACTUAL FATAL INSTRUCTION, measured
+
+Step logging through the handoff on a single-core T630 printed:
+
+```
+ehci-handoff: [A] entered
+ehci-handoff: [B] bdf=0x0090 mmio=0xfeb6c000; about to MAP MMIO
+ehci-handoff: [C] MMIO mapped; HCCPARAMS=0x0000a076
+ehci-handoff: [D] eecp=0xa0
+ehci-handoff: [E] USBLEGSUP@0xa0=0x00010001; about to WRITE OS-owned   <- LAST LINE
+```
+
+`[F]` never printed. **Writing the OS-Owned bit is what stops the machine**, and USBLEGSUP =
+`0x00010001` says why: bit 16 (HC BIOS Owned) is set, so the firmware owns the controller - and that
+write is precisely how the protocol NOTIFIES it, by raising an SMI. On a machine with spare cores the
+SMM handler runs and the OS carries on elsewhere; on one core there is nowhere to run it.
+
+It also settles what the failure IS. The ~13.4 s gap before every reset was identical across runs -
+that is a hardware watchdog resetting a HUNG machine, not a spontaneous reset. Every earlier symptom
+in this hunt - the reboot loop, the wandering death points - was this hang plus that watchdog.
+
+**The fix: silence the firmware's SMIs BEFORE negotiating.** `USBLEGCTLSTS` (eecp+4) is the SMI
+enable set for this controller; zeroing it first means the ownership handshake cannot raise one. The
+code did this AFTER the handshake, so it never got there. And if the firmware then never answers -
+likely, since it can no longer be notified - ownership is TAKEN by clearing bit 16 directly, which is
+what a host OS does at that point. The alternative is handing a driver a controller something else
+still believes it owns, which is the co-ownership this whole change exists to end.
+
+## The handoff already existed, and was never called
 
 `kernel/src/arch/x86_64/pci::ehci_bios_handoff()` implements the whole EHCI 2.1.7 procedure: claim
 the OS-Owned semaphore in USBLEGSUP, wait (time-bounded) for the firmware to release BIOS-Owned,
