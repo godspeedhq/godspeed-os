@@ -6,6 +6,53 @@ already designed for the analogous problem one layer down.
 slow; move the same keyboard to the **EHCI** and it is fast again. Reproducible by hot-plugging
 between the two controllers in either direction.
 
+## MEASURED, and it is NOT the hub probes
+
+The driver's own 60 s heartbeat, with the keyboard on an xHCI port, single-core T630:
+
+```
+xhci: alive - t=..., 592 passes (2 fast/592 idle), work 76ms (serve 1 drain 0 hub 73),
+      probes 0/0 ok 0 late, 0 MSI, 0 msg, 1 HID, disk no, 0 dropped
+```
+
+- **`probes 0/0`** - no hub probe ever completed. The theory this file opened with was wrong.
+- **`0 MSI`, across five minutes and 592 passes** - the driver has received NO INTERRUPTS AT ALL,
+  though MSI is programmed (`msi: class 0x0c0330 BDF 0x0080 -> vector 0x30`, matching the granted
+  vector 48).
+- **~120 passes per 60 s ~= 2 Hz.** The loop wakes about twice a second.
+- `work 76ms` in five minutes: the driver is not busy, it is asleep.
+
+So the driver is running entirely on its fallback, which it describes as *"polling at the 10ms tick
+alongside interrupts (input latency floor)"* - and that floor is not 10 ms. `IDLE_WAIT_MS = 5`
+converts to `cycles_to_ticks(...) = 1` tick, and a tick is one `scan_timed_wakes()` call on the BSP
+timer. Measured, that tick is arriving at ~2 Hz, so one tick is ~500 ms. **A keyboard serviced twice
+a second is the lag.**
+
+`ehci` is unaffected for a reason that now makes sense: it receives real interrupts (`legacy INTx
+routed via IOAPIC ... vector=0x29`), so it wakes on the keystroke itself and never depends on the
+tick. Same keyboard, same core, different wake source - which is exactly what hot-plugging between
+the two controllers demonstrates.
+
+## Two separate defects, either survivable alone
+
+1. **xHCI MSI never fires on this machine.** The destination logic looks right - `usb_irq_dest_lapic`
+   falls back to the BSP LAPIC when the driver's contracted core is not ready, which is the
+   single-core case - so the fault is further down and NOT yet located.
+2. **The "10 ms polling floor" is ~500 ms.** Whatever causes (1), this is independently wrong: the
+   BSP tick drives every `ctx.sleep()` wake in the system, and at ~2 Hz every sleeping service in
+   the machine is 50x slower to wake than its code says. Fixing this alone would bound typing
+   latency to a tick, with or without interrupts.
+
+(2) is the more valuable fix: it is not USB-specific, it affects every service that sleeps, and it is
+measurable without hardware once the tick rate is exposed. It may also be the same family as the
+recorded BSP idle-wedge (a core halting onto a consumed one-shot deadline) - the idle path is where
+a single core differs, and it is the path that re-arms this timer.
+
+## Superseded: the hub-probe theory
+
+Kept because the reasoning is still sound about what hub probes COST, and because it is a fair record
+of a theory that measurement refuted - `probes 0/0` says they were not even running.
+
 ## What it is
 
 `services/xhci/src/main.rs` documents it precisely, and the comment predates this observation:
