@@ -254,10 +254,18 @@ static RESOLVE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// subsequent emission forever: it never sent, so it never saw a send failure, so it never reached the
 /// reacquire path that exists precisely to recover from a restarted sink.
 ///
-/// Observed on the T630: `fs` respawned 0.5 s after `events` did, published SIX metric rows before the
-/// chaos storm and exactly ZERO for the remaining life of the machine. Silent, permanent, and
-/// invisible except as a missing row - which is the one thing `msgs.received` exists to rule out
-/// (a service with no row is indistinguishable from a dead one).
+/// The damage would be silent and permanent, invisible except as a missing row - which is the one
+/// thing `msgs.received` exists to rule out, since a service with no row is indistinguishable from a
+/// dead one.
+///
+/// HONESTY ABOUT WHAT THIS DID AND DID NOT FIX. This was written while chasing a T630 run where `fs`
+/// published six metric rows before a chaos storm and none afterwards, and the latch looked like the
+/// cause. It was not: `events` restarted 0.5 s BEFORE `fs` there, so `fs` resolved successfully and
+/// never latched at all. That run was the capless-publisher bug (`metric`/`trace_emit` never ASKING
+/// for a cap) on top of the kernel dropping the peer declaration. This change stands on its own
+/// merits - a permanent answer to a transient condition is wrong however rarely it fires - but it is
+/// not the fix that closed that failure, and saying otherwise would leave the next reader chasing a
+/// cause that was already ruled out.
 #[inline]
 pub fn set_sink_slot(slot: u32) {
     let prev = TRACER_SLOT.swap(slot, Ordering::Relaxed);

@@ -80,6 +80,22 @@ const US: u8 = 0x1f;
 const PEER_OUT: usize = 12;
 const NEWLINE: [u8; 1] = [10];
 
+/// Reply to the request currently being served.
+///
+/// EVERY reply carries the OP IT ANSWERS at byte 1, and that is not decoration. The kernel matches a
+/// reply to a `call` by WHICH ENDPOINT SENT IT (`dequeue_matching(sender_ep)`), not by which call it
+/// answers - so two consecutive requests to the same peer are indistinguishable, and any stray or
+/// late message from that peer is consumed by the NEXT call. `events persist status` read as a
+/// one-byte "short status" three times because a stale `[REC_OK]` from an earlier start/stop landed
+/// in a later status call.
+///
+/// The echoed op makes that detectable at the caller: a reply that answers a different question is
+/// refused instead of parsed. `fs` carries a correlation tag for exactly this reason after exactly
+/// this class of bug; this is the same fix in the shape this protocol needs.
+fn reply_op(ctx: &ServiceContext, op: u8, status: u8) {
+    reply(ctx, &[status, op]);
+}
+
 fn reply(ctx: &ServiceContext, out: &[u8]) {
     if let Some(cap) = ctx.take_pending_cap() {
         let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(out));
@@ -494,13 +510,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let incoming = if preparing { ctx.try_recv() } else { ctx.recv_timeout(wait) };
         if let Some(msg) = incoming {
             let p = msg.payload_bytes();
+            // The op being answered, echoed into every reply so a caller can tell this reply from a
+            // stale one (see `reply_op`). 0xFF for an unrecognised request, which answers nothing.
+            let op_code = p.first().copied().unwrap_or(0xFF);
             match p.first().copied() {
                 Some(REC_OP_START) if p.len() >= 11 => {
                     let want = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
                     let total = if want == 0 { DEFAULT_CAPACITY } else { want };
                     let plen = (p[9] as usize).min(PATH_MAX);
                     if p.len() < 10 + plen + 1 {
-                        reply(&ctx, &[REC_ERR]);
+                        reply_op(&ctx, op_code, REC_ERR);
                         continue;
                     }
                     cap = Capture::new();
@@ -524,7 +543,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // blocked on an unbounded amount of device I/O.
                     if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes()) {
                         ctx.log("recorder: could not create the capture file - is there a filesystem?");
-                        reply(&ctx, &[REC_ERR]);
+                        reply_op(&ctx, op_code, REC_ERR);
                         continue;
                     }
                     cap.on = true;
@@ -532,42 +551,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     ctx.log_fmt(format_args!(
                         "recorder: capturing to {} pieces of {} KiB ({} KiB total)",
                         PIECES, cap.capacity / 1024, total / 1024));
-                    reply(&ctx, &[REC_OK]);
+                    reply_op(&ctx, op_code, REC_OK);
                 }
                 Some(REC_OP_STOP) => {
                     if cap.on {
                         finish(&ctx, &mut cap, b"stopped");
                     }
-                    reply(&ctx, &[REC_OK]);
+                    reply_op(&ctx, op_code, REC_OK);
                 }
                 Some(REC_OP_STATUS) => {
                     let mut out = [0u8; 80 + PATH_MAX];
                     out[0] = REC_OK;
-                    out[1] = cap.on as u8;
-                    out[2] = cap.full as u8;
-                    out[3..11].copy_from_slice(&cap.lines.to_le_bytes());
-                    out[11..19].copy_from_slice(&cap.written.to_le_bytes());
-                    out[19..27].copy_from_slice(&cap.lost.to_le_bytes());
-                    out[27..35].copy_from_slice(&cap.capacity.to_le_bytes());
-                    out[35..43].copy_from_slice(&cap.rotations.to_le_bytes());
+                    out[1] = REC_OP_STATUS;   // answers-this-question tag; see `reply_op`
+                    out[2] = cap.on as u8;
+                    out[3] = cap.full as u8;
+                    out[4..12].copy_from_slice(&cap.lines.to_le_bytes());
+                    out[12..20].copy_from_slice(&cap.written.to_le_bytes());
+                    out[20..28].copy_from_slice(&cap.lost.to_le_bytes());
+                    out[28..36].copy_from_slice(&cap.capacity.to_le_bytes());
+                    out[36..44].copy_from_slice(&cap.rotations.to_le_bytes());
                     // MEASURED, not requested. Elapsed seconds and lifetime bytes let the reader work
                     // out the real fill rate and therefore what the capture actually covers - which is
                     // the only honest answer, because a duration asked for is a prediction about how
                     // chatty the machine will be and the machine decides that.
                     let now = ctx.epoch_secs_monotonic() as u64;
                     let elapsed = now.saturating_sub(cap.started_at);
-                    out[43..51].copy_from_slice(&elapsed.to_le_bytes());
-                    out[51..59].copy_from_slice(&cap.total_written.to_le_bytes());
-                    out[59..67].copy_from_slice(&(PIECES as u64).to_le_bytes());
+                    out[44..52].copy_from_slice(&elapsed.to_le_bytes());
+                    out[52..60].copy_from_slice(&cap.total_written.to_le_bytes());
+                    out[60..68].copy_from_slice(&(PIECES as u64).to_le_bytes());
                     // How far the pre-fill has got. A capture that is still PREPARING is not idle and
                     // is not recording, and saying so is the difference between "it is working on it"
                     // and "it silently did nothing".
-                    out[67..75].copy_from_slice(&cap.filled.to_le_bytes());
-                    out[75] = cap.plen as u8;
-                    out[76..76 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
-                    reply(&ctx, &out[..76 + cap.plen]);
+                    out[68..76].copy_from_slice(&cap.filled.to_le_bytes());
+                    out[76] = cap.plen as u8;
+                    out[77..77 + cap.plen].copy_from_slice(&cap.path[..cap.plen]);
+                    reply(&ctx, &out[..77 + cap.plen]);
                 }
-                _ => reply(&ctx, &[REC_ERR]),
+                _ => reply(&ctx, &[REC_ERR, 0xFF]),
             }
         }
         if cap.on {

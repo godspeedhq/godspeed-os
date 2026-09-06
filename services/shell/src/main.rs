@@ -8158,30 +8158,48 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
         return Some(t);
     }
     let _ = ctx.reacquire_by_name("recorder");
-    let r = match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STATUS]), 8) {
-        Some(r) => r,
-        None => {
-            ctx.console_writeln("events persist: recorder did not answer");
+    // ASK, AND CHECK THE ANSWER ANSWERS THIS QUESTION. The kernel matches a reply to a `call` by
+    // which ENDPOINT sent it, not by which call it answers, so a stale message from the recorder -
+    // a `[REC_OK]` from an earlier start/stop that arrived late - is handed to the next call instead.
+    // That is what "short status" was, three times: a one-byte acknowledgement parsed as a status.
+    //
+    // Every recorder reply now carries the op it answers at byte 1. A reply for a different op means
+    // the queue held a straggler, and the RIGHT reply is behind it - so ask once more rather than
+    // reporting a failure that is really a queue artefact. One retry, not a loop: if the second
+    // answer is also wrong, something is genuinely out of step and that must be said, not hidden.
+    let mut attempt = 0;
+    let b = loop {
+        let r = match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STATUS]), 8) {
+            Some(r) => r,
+            None => {
+                ctx.console_writeln("events persist: recorder did not answer");
+                return None;
+            }
+        };
+        let p = r.payload_bytes();
+        if p.len() >= 2 && p[1] != REC_OP_STATUS && attempt == 0 {
+            attempt += 1;
+            continue;
+        }
+        if p.len() < 77 || p[1] != REC_OP_STATUS {
+            ctx.console_writeln("events persist: the recorder answered a different request - try again");
             return None;
         }
+        break r;
     };
-    let b = r.payload_bytes();
-    if b.len() < 76 {
-        ctx.console_writeln("events persist: short status");
-        return None;
-    }
-    let on = b[1] != 0;
-    let full = b[2] != 0;
-    let lines = u64::from_le_bytes([b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10]]);
-    let bytes = u64::from_le_bytes([b[11], b[12], b[13], b[14], b[15], b[16], b[17], b[18]]);
-    let lost = u64::from_le_bytes([b[19], b[20], b[21], b[22], b[23], b[24], b[25], b[26]]);
-    let capbytes = u64::from_le_bytes([b[27], b[28], b[29], b[30], b[31], b[32], b[33], b[34]]);
-    let rotations = u64::from_le_bytes([b[35], b[36], b[37], b[38], b[39], b[40], b[41], b[42]]);
-    let elapsed = u64::from_le_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]]);
-    let lifetime = u64::from_le_bytes([b[51], b[52], b[53], b[54], b[55], b[56], b[57], b[58]]);
-    let pieces = u64::from_le_bytes([b[59], b[60], b[61], b[62], b[63], b[64], b[65], b[66]]).max(1);
-    let filled = u64::from_le_bytes([b[67], b[68], b[69], b[70], b[71], b[72], b[73], b[74]]);
-    let pl = (b[75] as usize).min(b.len().saturating_sub(76));
+    let b = b.payload_bytes();
+    let on = b[2] != 0;
+    let full = b[3] != 0;
+    let lines = u64::from_le_bytes([b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]]);
+    let bytes = u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]);
+    let lost = u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]);
+    let capbytes = u64::from_le_bytes([b[28], b[29], b[30], b[31], b[32], b[33], b[34], b[35]]);
+    let rotations = u64::from_le_bytes([b[36], b[37], b[38], b[39], b[40], b[41], b[42], b[43]]);
+    let elapsed = u64::from_le_bytes([b[44], b[45], b[46], b[47], b[48], b[49], b[50], b[51]]);
+    let lifetime = u64::from_le_bytes([b[52], b[53], b[54], b[55], b[56], b[57], b[58], b[59]]);
+    let pieces = u64::from_le_bytes([b[60], b[61], b[62], b[63], b[64], b[65], b[66], b[67]]).max(1);
+    let filled = u64::from_le_bytes([b[68], b[69], b[70], b[71], b[72], b[73], b[74], b[75]]);
+    let pl = (b[76] as usize).min(b.len().saturating_sub(77));
 
     // COVERAGE IS MEASURED, NEVER THE NUMBER THAT WAS ASKED FOR. A duration is a prediction about how
     // chatty the machine will be, and the machine decides that - so the rate comes from what has
@@ -8212,7 +8230,7 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     } else {
         b"idle".as_slice()
     });
-    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[76..76 + pl]) };
+    let path = if pl == 0 { t.intern(b"-") } else { t.intern(&b[77..77 + pl]) };
     let covers = t.intern(&cov[..covn]);
     let _ = bytes;
     t.add_row(&[
@@ -8257,7 +8275,11 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Resul
     req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
     let n = fo + 1 + fl;
     match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&req[..n]), 12) {
-        Some(r) if r.payload_bytes().first() == Some(&REC_OK) => {
+        // The op tag must say START, for the same reason `status` checks it: a stale reply from
+        // the recorder is handed to whichever call asks next, and accepting one here would report a
+        // capture started that never was.
+        Some(r) if r.payload_bytes().first() == Some(&REC_OK)
+            && r.payload_bytes().get(1) == Some(&REC_OP_START) => {
             if filter.is_empty() {
                 ctx.console_writeln_fmt(format_args!("events persist: capturing everything to {}", path));
             } else {
@@ -8499,6 +8521,10 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             }
             let _ = ctx.reacquire_by_name("recorder");
             match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STOP]), 8) {
+                // Deliberately NOT tag-checked, unlike `start` and `status`: stop's outcome does not
+                // depend on the payload (the request was delivered either way), and if a straggler
+                // is consumed here the real reply is absorbed by the retry in `status`. Checking it
+                // would add a failure path for a case that is already handled one layer over.
                 Some(_) => {
                     // AN EXPLICIT STOP STAYS STOPPED. Leaving the marker would make the one command
                     // that means "enough" the one that did not take.

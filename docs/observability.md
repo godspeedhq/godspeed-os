@@ -754,3 +754,44 @@ out of ring 0.
 
 C.2's actual constraint - *"the kernel publishes; the metrics service interprets"* - is exactly right
 and is preserved here. Only the transport changes: a drained ring rather than an endpoint.
+
+---
+
+## 13. What a publisher owes the sink after the sink dies (found on hardware, 2026-09-06)
+
+The sink is restartable and its three stores are volatile, which the sections above treat as settled.
+What was NOT thought through is the other side of that: what a PUBLISHER has to do when the thing it
+publishes to is replaced under it. Four separate defects lived in that gap, each hidden by the one
+before it, and all four presented identically - a row that simply was not there.
+
+1. **Reacquire, then drop the sample anyway.** `metric()` reacquired the sink on send failure and
+   discarded the event that triggered it. 14.3 says reacquire AND retry; this did half, so the sink
+   missed a full publish interval every time it restarted.
+2. **A missed resolve latching forever.** `u32::MAX` was read as "this service holds no sink cap" - a
+   permanent fact - when it is also what a service sees if the sink is mid-restart at its first
+   emission. It then returned early on every emission for life.
+3. **The kernel dropping the DECLARATION.** A service spawned in the milliseconds its peer was down
+   was recorded as not declaring that peer at all, so `AcquireSendCap` refused it forever. This one
+   was not observability-specific: it cost `fs` its `block-driver` and produced 113 failures in one
+   run, with storage reported unavailable while `block-driver` sat idle beside it.
+4. **A capless publisher never ASKING.** `find_send_slot` only inspects caps a service already holds,
+   so a service that started with none resolved to MAX and returned early - and the reacquire that
+   would have fixed it sat behind a send failure, which never happened because the send never did.
+
+The shape they share is worth naming, because it is not specific to metrics: **a recovery path that
+only runs on failure cannot recover a component that never gets far enough to fail.** Every one of
+these was silent, and each looked exactly like a healthy quiet service.
+
+The rule that falls out, for anything that publishes to a restartable peer:
+
+- resolve LAZILY and RETRY a failed resolve, bounded - never latch a miss;
+- when resolution finds nothing, ASK (the declaration authorises it) rather than waiting for a
+  failure that a non-existent send cannot produce;
+- on reacquire, RE-ESTABLISH what the new instance never saw, rather than waiting out an interval;
+- and report each distinct failure once, named - "not registered" and "cap table full" need opposite
+  responses and only one of them is terminal.
+
+Instrumentation note, since it cost a hardware round-trip: one of these reports was added with its
+call site missing, so the run came back "0 late resolves" and that zero was read as evidence. **A
+missing instrument is indistinguishable from a healthy system.** Verify the call site exists, not just
+that the helper compiles.

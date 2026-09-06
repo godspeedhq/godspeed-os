@@ -208,6 +208,13 @@ indistinguishable from dead** - which is the one question this metric exists to 
 `age_s` it separates the two faults nothing else in the system separates: a `block-driver` still
 receiving and failing, versus one whose count last moved forty seconds ago.
 
+There is a THIRD trigger, for the same reason: the first message after the **sink itself** comes back.
+`events` holds its table in memory, so a restart starts it empty with no knowledge of any service, and
+waiting out the interval leaves that service unrepresented for up to 63 more messages. On one that
+only receives when someone else does I/O - `block-driver` waits on `fs` - that is however long the
+machine stays quiet, and it read as dead the whole time. Republishing on reacquire is the metric half
+of "reacquire *and re-establish*" (CLAUDE.md 14.3).
+
 **Attribution depends on `ctx.trace_as`, and silently failed without it.** A service that never
 declares its name publishes under a BLANK owner - and since the key is `(owner, metric)`, *every*
 undeclared service collides into one row with its counters interleaving. That is exactly how it was
@@ -294,7 +301,12 @@ trace: the ring lives in the `events` service - the kernel records nothing.
 #### Who is traced at all
 
 Only exchanges made through the SDK's request/reply calls, by services whose contract grants
-`ipc_send = ["events"]`. Today that is `fs` and `shell`. Tracing is authority: visible in
+`ipc_send = ["events"]`. Today that is fourteen services - every internal one that talks to a peer:
+`block-driver`, `console`, `control`, `dwc2`, `ehci`, `events`, `fs`, `hw-enumerator`, `net-stack`,
+`nic-driver`, `recorder`, `shell`, `time`, `xhci`. It was `fs` and `shell` alone when the ring
+shipped, and the difference is the point of `trace_as`: a service that does not declare its name
+publishes under a BLANK owner, and since the key is `(owner, name)` every undeclared service collides
+into one row. Tracing is authority: visible in
 `caps <service>`, revocable, and absent by default - not a global switch. A service holding no such
 capability emits nothing, at a cost of one relaxed atomic load.
 

@@ -88,7 +88,7 @@ the file held only the malformed header - and the assertion failed for exactly t
 assertion that can be satisfied by something other than what it names is not pinning anything; both now
 assert the whole line.
 
-## OPEN: `events persist status` occasionally reads as a short reply
+## FIXED: `events persist status` occasionally read as a short reply (correlation tag)
 
 Seen TWICE now, both in QEMU, each time not reproducing on the next run (2026-09-05, 2026-09-06):
 
@@ -110,7 +110,23 @@ returned short, exactly as the first time. Consecutive identical requests, one g
 is what a reply stream offset by one looks like, which fits the late-reply hypothesis better than a
 malformed status ever could.
 
-Recorded rather than fixed, per 26.7: it is one observation, the mechanism is unproven, and the fix
+**Root-caused on the third sighting, and it was not the recorder.** `dequeue_matching(sender_ep)` in
+`kernel/src/ipc/routing.rs` matches a reply to a `call` by WHICH ENDPOINT SENT IT - not by which call
+it answers. Two consecutive requests to the same peer are therefore indistinguishable, and a stray or
+late message from that peer is handed to the NEXT call. A one-byte `[REC_OK]` from an earlier
+start/stop is exactly the right size to be parsed as a truncated status, which is why the shape was
+identical every time: one status call good, the next short, the one after good again.
+
+The fix is the one `fs` already uses after the same class of bug: **every recorder reply carries the
+op it answers**, so a caller can tell this reply from a stale one. `status` retries ONCE on a
+mismatch (the right reply is behind the straggler) and reports loudly if the second is wrong too;
+`start` refuses a reply that does not answer START. Verified across repeated runs with the artefact
+counter at zero.
+
+The kernel is unchanged: matching by sender is a reasonable primitive, and correlating a protocol's
+own requests is the protocol's job. That is what a tag IS.
+
+Superseded note, kept because it is how the diagnosis went: it is one observation, the mechanism is unproven, and the fix
 would touch the reply-cap lifetime that every service's request/reply rides on. Reproducing it under
 instrumentation comes first. Consequence while it stands: a `status` read can be refused loudly - it
 prints and returns None, never a wrong number.

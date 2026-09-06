@@ -69,6 +69,18 @@ Stateless in the sense that matters: the supervisor respawns it on death (§6.2)
 a re-init, not a resume (§14.2), and nothing depends on the history. What survives underneath is
 serial and the kernel ring.
 
+**But the PUBLISHERS have work to do when this service restarts, and getting that wrong was invisible.**
+A restarted sink has never heard of any service, and every publisher is holding a cap to the dead
+instance. Four separate defects lived in that gap - a reacquire that dropped the sample that triggered
+it, a missed resolve latching for the life of the service, the kernel dropping the peer DECLARATION
+when the sink was down at a service's spawn, and a capless publisher that never ASKED for a cap because
+the reacquire sat behind a send failure that a never-sent message cannot produce. All four presented
+identically: a row that simply was not there, which is indistinguishable from a dead service.
+
+The publisher side now resolves lazily and retries a miss (bounded), asks the kernel when it holds no
+cap, retries the sample after reacquiring, and republishes `msgs.received` on the first message after
+the sink comes back. `docs/observability.md` §13 is the full account and the rule it generalises to.
+
 ## Still not implemented
 
 `ctx.drain_kernel_ring_buffer()` is a **no-op stub** and no syscall exposes the kernel's 16 KiB ring to
