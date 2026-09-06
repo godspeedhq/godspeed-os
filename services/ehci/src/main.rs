@@ -92,13 +92,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Stop the controller if the BIOS left it running, then wait for it to halt.
     let cmd = mmio.read32(op + OP_USBCMD);
     mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
-    if !wait(&mmio, op + OP_USBSTS, STS_HCHALTED, true) {
+    if !wait(&ctx, &mmio, op + OP_USBSTS, STS_HCHALTED, true) {
         ctx.log("ehci: WARN - controller did not halt (BIOS may still own it; E2b handoff needed)");
     }
 
     // Reset: set HCRESET and wait for the controller to clear it.
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_HCRESET);
-    if !wait(&mmio, op + OP_USBCMD, CMD_HCRESET, false) {
+    if !wait(&ctx, &mmio, op + OP_USBCMD, CMD_HCRESET, false) {
         ctx.log("ehci: WARN - HCRESET did not complete (E2b handoff needed); idling");
         idle_draining(&ctx);
     }
@@ -107,7 +107,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Route all ports to the EHCI (not to companion controllers) and run.
     mmio.write32(op + OP_CONFIGFLAG, 1);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_RS);
-    if wait(&mmio, op + OP_USBSTS, STS_HCHALTED, false) {
+    if wait(&ctx, &mmio, op + OP_USBSTS, STS_HCHALTED, false) {
         ctx.log("ehci: controller running");
     } else {
         ctx.log("ehci: WARN - controller did not leave halted state after run");
@@ -156,7 +156,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         delay_cycles(&ctx, RESET_HOLD_CYCLES); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
         // End reset.
         mmio.write32(off, mmio.read32(off) & !PORTSC_W1C & !PORTSC_RESET);
-        wait(&mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
+        wait(&ctx, &mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
         delay_cycles(&ctx, RECOVERY_CYCLES);   // reset-recovery settle (~10 ms)
 
         let psc = mmio.read32(off);
@@ -243,7 +243,7 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 /// error/timeout (with the qTD tokens logged). The async schedule stays enabled
 /// across calls; the single QH is idle between them.
 fn control(
-    _ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
@@ -312,15 +312,15 @@ fn control(
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
     if mmio.read32(op + OP_USBSTS) & STS_ASS != 0 {
         mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) & !CMD_ASE);
-        wait(mmio, op + OP_USBSTS, STS_ASS, false);
+        wait(ctx, mmio, op + OP_USBSTS, STS_ASS, false);
     }
     mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    wait(ctx, mmio, op + OP_USBSTS, STS_ASS, true);
     // Doorbell: set IAAD, wait for the controller to set IAA (bounded - if the
     // controller is wedged it simply won't fire and we proceed), then clear it.
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_IAAD);
-    wait(mmio, op + OP_USBSTS, STS_IAA, true);
+    wait(ctx, mmio, op + OP_USBSTS, STS_IAA, true);
     mmio.write32(op + OP_USBSTS, STS_IAA); // RW1C: acknowledge the advance
 
     // Wait for the STATUS qTD to retire.
@@ -329,8 +329,8 @@ fn control(
     // The truth is still the ACTIVE bit going clear; the clock only bounds how long we keep believing
     // it might.
     let mut done = false;
-    let start = _ctx.read_tsc();
-    while _ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
         if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
     }
     let t_setup  = dma.read32(QTD_SETUP + 0x08);
@@ -760,12 +760,12 @@ fn poll_devices(
     // ASYNCLISTADDR changed only while the async schedule is disabled), then run it.
     if mmio.read32(op + OP_USBSTS) & STS_ASS != 0 {
         mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) & !CMD_ASE);
-        wait(mmio, op + OP_USBSTS, STS_ASS, false);
+        wait(ctx, mmio, op + OP_USBSTS, STS_ASS, false);
     }
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
     mmio.write32(op + OP_ASYNCLISTADDR, dma.phys_at(POLL_BASE) as u32 & !0x1F);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    wait(ctx, mmio, op + OP_USBSTS, STS_ASS, true);
 
     // E2 (interrupt-driven, §12): enable the controller's interrupts. The interrupt qTDs
     // already carry IOC, so a completed report sets USBSTS.USBINT and the controller asserts
@@ -964,16 +964,34 @@ const PORTSC_OWNER:  u32 = 1 << 13; // Port Owner (1 = handed to a companion)
 const PORTSC_W1C:    u32 = (1 << 1) | (1 << 3) | (1 << 5);
 
 /// Poll a 32-bit register until `mask` is set (`want_set=true`) or clear
-/// (`false`), bounded. Returns true if the condition was met, false on timeout.
-fn wait(mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, want_set: bool) -> bool {
-    const MAX: u32 = 2_000_000;
-    let mut i = 0u32;
-    while i < MAX {
-        let set = mmio.read32(off) & mask != 0;
-        if set == want_set {
+/// (`false`), bounded BY TIME. Returns true if the condition was met, false on timeout.
+///
+/// **A COUNT IS NOT A DURATION.** This was `while i < 2_000_000` with no yield: an iteration bound,
+/// which bounds nothing in wall-clock and means a different timeout on every machine - each turn is
+/// an UNCACHED MMIO read across PCIe, so the same 2,000,000 is milliseconds on one box and most of a
+/// second on another. Commandment VIII asks for a wait on truth with a real deadline, and 26.6 asks
+/// every wait to be able to state its own bound; a loop counter can state neither.
+///
+/// It also never yielded. On a MULTI-CORE machine that is merely rude - this driver has a core to
+/// itself and the rest of the system runs elsewhere. On a SINGLE-CORE machine it is one service
+/// spinning on the only core the machine has, for however long 2,000,000 PCIe reads happen to take,
+/// while every other service waits. The 10 ms quantum still preempts it, so this is not a hang - but
+/// "the scheduler will eventually take it away" is not a substitute for a driver that hands the core
+/// back when it has nothing to do.
+fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, want_set: bool) -> bool {
+    // Generous, because a controller coming out of BIOS ownership can be slow, and a timeout that
+    // fires early turns a working controller into a reported fault.
+    const TIMEOUT_MS: u64 = 250;
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TIMEOUT_MS));
+    loop {
+        if (mmio.read32(off) & mask != 0) == want_set {
             return true;
         }
-        i += 1;
+        if ctx.read_tsc() >= deadline {
+            return false;
+        }
+        // Hand the core back between polls. The register is changed by HARDWARE, not by anything
+        // this service could compute, so spinning on it buys nothing that yielding does not.
+        ctx.yield_cpu();
     }
-    false
 }

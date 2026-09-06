@@ -84,7 +84,12 @@ pub fn mark_ready(core_id: u32) {
 /// core stopped where, on a machine that came up short) belongs in a separate line the arch adds, not
 /// in a different spelling of the shared one.
 pub fn report_cores_ready() {
-    crate::kprintln!("smp: {} cores ready", ready_count());
+    // "1 core ready", not "1 cores ready". A single-core boot is a SUPPORTED configuration (§11.3
+    // says so, and a machine whose APs all fail to start reaches it by accident), so this is a line
+    // people will read on a real machine rather than a corner case nobody sees. A log that cannot
+    // count its own subject invites the reader to wonder what else it is approximating.
+    let n = ready_count();
+    crate::kprintln!("smp: {} core{} ready", n, if n == 1 { "" } else { "s" });
 }
 
 pub fn ready_count() -> u32 {
