@@ -104,7 +104,11 @@ def facts():
 # CLAUDE.md's dated amendment blocks (handled by the historical-line filter below).
 DOCS = ["CLAUDE.md", "README.md", "CONTRIBUTING.md", "GETTING_STARTED.md"]
 DOC_GLOBS = ["docs/*.md", "utilities/*.md", "services/*/CLAUDE.md", "kernel/src/**/CLAUDE.md",
-             "sdk/rust/CLAUDE.md", "osdev/CLAUDE.md", "tests/**/CLAUDE.md", "backlog/*.md"]
+             "sdk/rust/CLAUDE.md", "osdev/CLAUDE.md", "tests/**/CLAUDE.md", "backlog/*.md",
+             # The PUBLISHED site. Most of its pages are `{{#include}}` views of the files above and
+             # cannot drift by construction - but four are written for the site and have no source to
+             # be a view OF, so they are exactly where a restated number goes stale unwatched.
+             "website/src/*.md"]
 
 # A SECTION REFERENCE IS NOT A VALUE. On this script's first run `queue depth (§8.5)` captured "8"
 # and a `0-16` range captured "0" - two false alarms out of two findings. A checker that cries wolf

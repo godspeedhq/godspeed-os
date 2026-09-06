@@ -274,6 +274,7 @@ os/
     unsafe_check.py      #   the unsafe audit matches the source
     doc_refs.py          #   no doc points at a file that does not exist
     facts_check.py       #   a number a doc restates matches the code that owns it
+    site_check.py        #   the 4 hand-written site pages still match the repository
     arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
 
   utilities/             # the SPEC for every shell utility, one file each (48)

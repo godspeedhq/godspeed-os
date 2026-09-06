@@ -63,6 +63,9 @@ jobs:
       - name: Fact check (a number a doc restates must match the code that owns it)
         run: python3 scripts/facts_check.py
 
+      - name: Site check (the hand-written pages still describe the real repository)
+        run: python3 scripts/site_check.py
+
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py
 
