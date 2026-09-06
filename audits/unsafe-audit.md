@@ -2440,7 +2440,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
 | arch/s390x/mod.rs | 20 | permitted |
-| arch/x86_64/ap_boot.rs | 2 | permitted |
+| arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 2 | permitted |
@@ -2558,6 +2558,13 @@ Unsafe in this file: AP trampoline entry, AP boot identity mapping, and calling
 `ap_main` after the long-mode switch. All three are sound because the trampoline
 runs before any Rust invariants apply; the stack is valid; identity mapping holds
 for the trampoline duration and is torn down by the kernel immediately after.
+
+A fourth (`publish_bsp_lapic_id`) reads the local APIC's own ID register via
+`boot::get_lapic_id`. Sound because the function is called from `smp::init`, which
+runs on the BSP after `init_local_apic` has mapped and initialised the APIC (the
+`get_lapic_id` safety contract) and after `smp::percpu_init` has allocated the
+per-core arenas it then writes. It is a single volatile MMIO read of a fixed,
+already-mapped register and stores no pointer.
 
 ---
 
