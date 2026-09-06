@@ -118,6 +118,11 @@ def main():
     profile = "release" if args.release else "debug"
     rel = ["--release"] if args.release else []
     kfeatures = args.feature
+    # ADDITIVE, not a replacement. `--feature single-core` used to SUBSTITUTE for the boot-path
+    # feature, producing a kernel with no `arm-supervisor` - which builds fine and boots into
+    # nothing. The boot path is not optional, so anything passed rides WITH it.
+    if "arm-supervisor" not in kfeatures and "arm-sched" not in kfeatures:
+        kfeatures = "arm-supervisor," + kfeatures
 
     # 0. THE COMMANDMENTS GATE.
     #

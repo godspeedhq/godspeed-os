@@ -24,7 +24,14 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     // Bring the other three A7s online BEFORE spawning services, so the supervisor's `spawn_on(pong, 1)`
     // finds core 1 ready and pong actually runs there (real cross-core IPC), instead of falling back to
     // core 0. The APs come up idle in the neutral scheduler and pick up work once it is placed on them.
+    // Gated with the same flag that sizes the per-core arenas in `smp::percpu_init`. If only one
+    // of the two were gated they would disagree: arenas for one core while three more are released
+    // to run on them, which is worse than either choice alone.
+    #[cfg(not(feature = "single-core"))]
     super::smp_bringup();
+    #[cfg(feature = "single-core")]
+    pl011_write(b"smp: SINGLE-CORE BUILD - the other A7s are never released (backlog/02)
+");
 
     pl011_write(b"sched-supervisor: the kernel's ONE direct spawn - the supervisor...\r\n");
     // The kernel's one direct spawn (§11.1). Panics if it fails (TCB, §6.2/§11.3) - but on the Pi 2

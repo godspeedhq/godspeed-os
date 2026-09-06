@@ -70,14 +70,37 @@ That is the aarch64 lesson enforced mechanically - *a flag that selects between 
 non-compliant kernel leaves the violation one build away*. The check was right, the flag was
 reverted, and the test is built out of what already exists instead:
 
-| machine | how | new kernel surface |
-|---------|-----|--------------------|
-| **Pi 4** | `py scripts/pi4_build.py --release --single-core` - builds WITHOUT the already-pinned `pi4-smp`, so the other three cores are never released | none |
-| **x86 (QEMU)** | `cargo run -p osdev -- run --smp 1` | none |
-| **x86 (T630 / Wyse)** | disable the extra cores in BIOS/UEFI setup | none |
-| **Pi 2** | not available yet - `ap_count()` is hard-coded to 3 in `arch/arm/mod.rs` with no feature over it | would need a change |
+| machine | how |
+|---------|-----|
+| **x86** | `KERNEL_FEATURES=single-core cargo run -p osdev -- image` |
+| **Pi 2** | `py scripts/arm_build.py --release --feature single-core` |
+| **Pi 4** | `py scripts/pi4_build.py --release --single-core` (omits the already-pinned `pi4-smp`) |
+| any, QEMU only | `cargo run -p osdev -- run --smp 1` - no build change needed |
 
-Verified on the Pi 4 image: `smp: core 0 ready`, and every service spawns on core 0.
+**Check the log before trusting any run.** A single-core kernel says so on the way up:
+
+```
+smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/02)
+smp: 1 cores ready
+```
+
+and the image itself carries the string, so `grep -ac "SINGLE-CORE BUILD" build/os-usb.img` tells
+you what you are about to flash. That check exists because two hardware runs were wasted without
+it: the first image predated the feature, and a QEMU run was made against a kernel `osdev run` had
+quietly rebuilt without it.
+
+### Why a kernel feature after all
+
+The first attempt was refused by `scripts/commandments.py` (Commandment I, kernel feature flags are
+pinned) and the external routes were tried first. They do not exist: the **Wyse 5070 firmware has
+no core-count setting**, and **Limine's protocol has no core limit** - the APs come from the
+kernel's own `MpRequest`, so nothing outside the kernel can withhold them. QEMU's `-smp 1` covers
+QEMU alone.
+
+So it is pinned in `COMMANDMENTS.baseline.toml` with that reasoning. It ADDS no kernel
+responsibility: it removes the AP-start call and pins the arena count at 1, reaching the state
+11.3 already defines. Default builds are byte-identical to before - verified by booting one and
+watching it come up on four cores with services on 1, 2 and 3.
 
 ## Next steps, in order
 

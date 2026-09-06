@@ -41,6 +41,15 @@ dependencies = [
 # path, a service the kernel spawns itself. Test-only features count - a build the kernel can be put
 # into is a build someone can ship.
 features = [
+# ONE CORE on a machine that has more, for testing. Admitted because it does not add a kernel
+# responsibility - it REMOVES the AP-start call and pins the per-core arena count at 1, reaching a
+# state §11.3 already defines ("if zero APs come up, system runs as single-core"). `pi4-smp` below
+# was pinned for the same purpose on one arch; this is that, arch-neutral.
+#
+# Pinned rather than done outside the kernel because there is no outside way on the hardware: the
+# Wyse 5070 firmware has no core-count setting and Limine's protocol has no core limit - the APs
+# come from the kernel's own MpRequest. QEMU `-smp 1` covers QEMU only.
+"single-core",
 # §22 Tests 2 and 3 (capability enforcement, IPC routing), pre-scheduler. Pinned because this
 # feature REMOVES code from a shipping kernel rather than adding any: the tests used to run in every
 # boot, where they could panic the machine on an assertion and left ResourceId(0xDEAD/0xDEAF/0xABCD)

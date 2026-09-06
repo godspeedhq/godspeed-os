@@ -26,6 +26,10 @@ use crate::arch::imp::BootInfo;
 /// fixed `[_; MAX_CORES]` array any more.
 pub fn percpu_init(boot_info: &BootInfo) {
     let _ = boot_info;
+    // SINGLE-CORE BUILD: size every per-core arena for the BSP alone. See kernel/Cargo.toml.
+    #[cfg(feature = "single-core")]
+    let n = 1;
+    #[cfg(not(feature = "single-core"))]
     let n = crate::arch::imp::ap_count() + 1; // BSP + every AP Limine enumerated (live count)
     percpu::set_num_cores(n);
     ipi::init_arenas(n);
@@ -39,6 +43,15 @@ pub fn percpu_init(boot_info: &BootInfo) {
 
 pub fn init(boot_info: &BootInfo) {
     core::init(boot_info);
+    #[cfg(feature = "single-core")]
+    {
+        let _ = boot_info;
+        // SAID LOUDLY. A machine quietly running on a quarter of its cores is exactly what an
+        // operator must not have to infer (invariant 12), and it is the first thing to check in a
+        // log before drawing any conclusion from the run.
+        crate::kprintln!("smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/02)");
+    }
+    #[cfg(not(feature = "single-core"))]
     // SAFETY: BSP APIC is already initialised in arch::imp::init_timer.
     unsafe { crate::arch::imp::ap_boot::start_all_aps(boot_info) };
 }

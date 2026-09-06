@@ -102,6 +102,21 @@ pi4-demo-services = []
 # boots reach a shell on four cores and a carnage run survives it. Still a separate feature so a
 # single-core image remains one flag away if a hardware fault ever needs bisecting against it.
 pi4-smp = []
+# ONE CORE, ON A MACHINE THAT HAS MORE. Arch-neutral: x86, arm32 and aarch64 alike.
+#
+# Not a new configuration - §11.3 already states the system runs single-core when zero APs come up.
+# This forces that existing case on hardware whose APs would otherwise start, so it can be TESTED
+# rather than assumed, and `pi4-smp` above already exists for precisely this reason ("a single-core
+# image remains one flag away").
+#
+# It is here rather than done externally because there is NO external way on two of the three
+# machines: the Wyse 5070's firmware exposes no core-count setting, and Limine's protocol has no
+# core limit - the APs come from the kernel's own MpRequest. QEMU's `-smp 1` covers only QEMU.
+#
+# Why: scheduling and liveness problems have been answered over time by moving a service to another
+# core, which is a workaround that depends on a second core existing to absorb the fault. This takes
+# the absorber away so they fail honestly. See backlog/02.
+single-core = []
 # Hand the Pi 4's GENET ethernet MAC to the `nic-driver` SERVICE, and take it out of the kernel.
 #
 # `kernel/src/arch/aarch64/genet.rs` is a ~1500-line ethernet driver living in ring 0, which is a
