@@ -905,6 +905,46 @@ fn name_alive(ctx: &ServiceContext, name: &str) -> bool {
     false
 }
 
+/// Wait until `name` has finished starting up - it is BLOCKED ON RECV, which for a driver means its
+/// controller bring-up is done and it has reached its serving loop. Bounded; returns false on timeout.
+///
+/// WHY THIS EXISTS: two USB host controllers must not be reset AT THE SAME TIME on this platform.
+/// The xHCI reset asserts CNR (Controller Not Ready), during which software must not touch the
+/// controller's operational registers - `services/xhci/src/main.rs` records that violating this
+/// "WEDGED THE PCI BUS - freezing every core" on the Wyse. The xHCI driver obeys that for its OWN
+/// accesses. What it cannot do is stop ANOTHER USB driver working the same bus inside that window.
+///
+/// On a multi-core machine the window is short in wall-clock: the driver spins on its own core,
+/// uninterrupted. On a SINGLE core the same 500 ms budget is chopped into 10 ms quanta shared with
+/// every other task, so the window stretches by orders of magnitude and `ehci` is GUARANTEED to be
+/// scheduled inside it. That is why the T630 reboot-looped on one core and is fine on four: not a
+/// different fault, the same race with a window wide enough to hit every time.
+///
+/// A TRUTH SIGNAL, NOT A DELAY (Commandment VIII). "Sleep 300 ms and hope" is the shape this project
+/// refuses: it is wrong on a slower machine and wasteful on a faster one. Blocked-on-recv is the
+/// driver itself saying it has nothing left to do.
+fn wait_until_serving(ctx: &ServiceContext, name: &str, max_secs: i64) -> bool {
+    const BLOCKED_ON_RECV: u8 = 2;
+    let deadline = ctx.epoch_secs_monotonic() + max_secs;
+    loop {
+        let mut seen = false;
+        for slot in 0..256u32 {
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 4 { continue; } // 4 = Dead
+            if st.name_str() == name {
+                seen = true;
+                if st.state == BLOCKED_ON_RECV { return true; }
+                break;
+            }
+        }
+        // Gone entirely (spawn failed, or it died during bring-up): nothing to wait for. Say so by
+        // returning false rather than spinning out the whole deadline on a service that is not there.
+        if !seen { return false; }
+        if ctx.epoch_secs_monotonic() >= deadline { return false; }
+        ctx.yield_cpu();
+    }
+}
+
 /// Respawn one managed service WIRED to its peers (block-driver before fs before shell; nic before net).
 fn respawn_managed(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool {
     match name {
@@ -1315,6 +1355,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     if ctx.ehci_present() {
+        // ONE USB CONTROLLER RESET AT A TIME. `xhci` asserts CNR during its reset, and this platform
+        // wedges its PCI bus if the bus is worked while a host controller is Not Ready - see
+        // `wait_until_serving`. Waiting for xhci to reach its serving loop makes the two bring-ups
+        // sequential instead of overlapped.
+        //
+        // It costs nothing on a healthy multi-core boot, where xhci is already blocked by the time
+        // we get here and this returns immediately. It is what keeps a SINGLE-CORE machine alive,
+        // where xhci's reset window stretches across dozens of quanta and `ehci` would otherwise be
+        // scheduled right into the middle of it.
+        //
+        // Bounded, and a timeout is not fatal: `ehci` starts anyway and says so. A driver that never
+        // starts is a keyboard that never works, which is worse than a race that might not fire -
+        // and staying silent about having given up is worse than both (26.7).
+        if !wait_until_serving(&ctx, "xhci", 10) {
+            ctx.log("supervisor: xhci did not reach its serving loop - starting ehci anyway (the two                      controller resets may overlap)");
+        }
         // Adopt if already running, as above. `ehci_present()` still gates whether it should exist
         // at all; this only decides spawn-versus-adopt once it should.
         ensure_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
