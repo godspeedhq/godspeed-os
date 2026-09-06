@@ -1,5 +1,24 @@
 # 12. xHCI hub probes block the input loop - typing lags on a single core
 
+> **RESOLVED 2026-09-07.** Root cause was neither the hub probes this file opened with nor the
+> polling fallback that first masked the symptom: **core 0's LAPIC id was published only inside
+> `start_all_aps`, which a `single-core` build never calls.** `CORE_LAPIC_ID[0]` therefore stayed 0
+> while the T630's BSP is id 16, so every MSI aimed at the driver's own core went to a core that does
+> not answer. Fixed in 091d9b41 (publish it in `smp::init`, before the branch that starts APs).
+>
+> Verified on the T630 booted single-core: `smp: BSP is LAPIC id 16`, `dest_apic=16`,
+> `irq: FIRST delivery of vector 0x30`, `xhci: waking on interrupts (MSI)`, no fallback engaged,
+> `MSI=178`, and the driver's pace back from ~98 wakes/sec to ~8.7.
+>
+> Two hid it: QEMU's BSP really IS id 0, so the wrong value was accidentally right on the only
+> machine the suite runs on; and a multi-core boot takes the other branch entirely. It could only
+> exist on the configuration nobody ran until single-core support was added - which is the whole
+> argument of backlog/02, demonstrated rather than asserted.
+>
+> Kept, not deleted: the reasoning below is a fair record of a theory measurement refuted, and §26.7
+> says a refuted theory is recorded rather than tidied away. Read it as history.
+
+
 **Severity:** user-visible latency, not a fault. Known, partially mitigated, and the real fix is
 already designed for the analogous problem one layer down.
 **Observed:** 2026-09-06, T630 single core. Typing on a keyboard behind the **xHCI** is noticeably
