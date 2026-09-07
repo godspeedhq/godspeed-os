@@ -11,6 +11,7 @@ pub mod fdt;
 pub mod sbi;
 pub mod sv39;
 pub mod trap;
+pub mod usermode;
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
 
@@ -429,6 +430,12 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         }
     }
 
+    // THE FIRST CODE ON THIS ISA THAT IS NOT THE KERNEL. Runs here because it needs everything
+    // above it: paging on (so USER permissions exist to honour), the trap vector installed (so the
+    // way back in leads somewhere), and the tick running (so a timer interrupt taken FROM user mode
+    // is exercised too, rather than left as the one path nothing has entered).
+    usermode::selftest();
+
     // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
     //
     // A guard never observed firing is not evidence - and this one is invisible when it works, so
@@ -806,7 +813,33 @@ pub mod page_tables {
         // SAFETY: `sfence.vma` with an address operand invalidates translations for that page only.
         unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) addr, options(nostack)) };
     }
-    pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> { unimplemented!() }
+    /// Map one page into the table `satp` is currently using, and make the change visible.
+    ///
+    /// The active root rather than a caller-supplied one, because the caller that needs this is
+    /// adding a page to the space it is already running in. Refuses if translation is off: there is
+    /// no active table to add to, and inventing one silently would be the worst kind of success.
+    ///
+    /// # Safety
+    /// `phys` must be a frame the caller owns, and `virt` an address the caller is entitled to
+    /// claim. Mapping over something in use is refused by the walk rather than silently allowed,
+    /// but mapping a frame that is already someone else's cannot be seen from here.
+    pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+        let root = read_page_table_base();
+        if root == 0 {
+            return Err(MapError::NotMapped);
+        }
+        let bits = super::sv39::flags_to_pte_bits(flags);
+        super::sv39::map_page(root, virt, phys, bits).map_err(|e| match e {
+            super::sv39::MapFail::NoFrame => MapError::FrameAllocFailed,
+            super::sv39::MapFail::AlreadyMapped => MapError::AlreadyMapped,
+            super::sv39::MapFail::NotMapped => MapError::NotMapped,
+        })?;
+        // A fresh mapping still needs the fence: a walk that previously found nothing here may have
+        // cached that absence, and on RISC-V a negative TLB entry is permitted.
+        // SAFETY: an address-scoped `sfence.vma` for the page just mapped.
+        unsafe { invalidate_tlb_page(virt) };
+        Ok(())
+    }
     pub fn entry_for_va(virt: u64) -> Option<u64> {
         let root = read_page_table_base();
         if root == 0 {
@@ -1153,10 +1186,15 @@ static TICK_INTERVAL: AtomicUsize = AtomicUsize::new(0);
 /// without setting a new one re-enters immediately and forever. That live lock presents as a machine
 /// which boots and then does nothing, with no fault to report - which is why it is worth naming here
 /// rather than discovering.
-fn timer_tick(_frame: &mut trap::TrapFrame) {
+fn timer_tick(frame: &mut trap::TrapFrame) {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
     sbi::set_timer(sbi::time().wrapping_add(interval));
+
+    // A tick taken while user mode was running is the preemption path, and the user-mode selftest is
+    // the only thing that currently notices. Offered AFTER the next deadline is set, so the machine
+    // is never left without one whatever the hook decides to do with the frame.
+    usermode::on_timer_tick(frame);
 
     // The first few, then every hundredth: enough to prove the tick is alive and periodic without
     // a console that scrolls forever. A quantum is 10 ms, so every hundredth is once a second.

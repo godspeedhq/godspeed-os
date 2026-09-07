@@ -384,6 +384,7 @@ PCI_CFG            = 16
 "riscv64/sbi.rs"              = "clock"
 "riscv64/sv39.rs"             = "mmu"
 "riscv64/trap.rs"             = "interrupts"
+"riscv64/usermode.rs"         = "usermode"
 "riscv64/mod.rs"              = "arch-entry"
 "s390x/mod.rs"                = "arch-entry"
 "x86_64/ap_boot.rs"           = "boot"

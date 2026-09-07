@@ -1,21 +1,54 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! S-mode trap vector - what turns a fault from silence into a sentence.
+//! S-mode trap vector - what turns a fault from silence into a sentence, and the one door user mode
+//! comes back through.
 //!
 //! Until `stvec` is set, a fault in S-mode has nowhere to go. On this hardware that means the
 //! machine stops with no output, which is the worst failure this project recognises: invariant 12
 //! asks for loud failure, and an unhandled trap is the loudest thing a CPU can do reported as the
 //! quietest thing a log can show.
 //!
-//! This is deliberately a REPORTER, not yet a recovery path. It decodes the cause, prints it with
-//! the faulting PC and address, and halts. Killing the offending TASK instead of the machine needs
-//! a task to kill - which needs `spawn_supervisor`, which is what this unblocks - so the honest
-//! order is: make faults visible first, then make them survivable.
+//! This is deliberately a REPORTER for anything it does not recognise: it decodes the cause, prints
+//! it with the faulting PC and address, and halts. Killing the offending TASK instead of the machine
+//! needs a task to kill - which needs `spawn_supervisor` - so the honest order is: make faults
+//! visible first, then make them survivable.
 //!
 //! `stvec` holds MODE in its low two bits, so the handler address must be four-byte aligned and
 //! mode 0 (direct: every cause enters at the same place). Vectored mode exists and buys nothing
 //! while there is one handler.
+//!
+//! **`sscratch` is the kernel-stack latch, and it is what makes user mode possible.** A trap taken
+//! from U-mode must not push its frame onto the USER stack: the user chose that pointer, and it may
+//! be unmapped, unaligned, or aimed at something the kernel is about to read back. The architectural
+//! answer is the one register a trap handler may use before it has a stack - `sscratch` - under a
+//! single discipline held everywhere in this file:
+//!
+//! > **`sscratch` holds this hart's kernel stack pointer while U-mode runs, and ZERO while the
+//! > kernel runs.**
+//!
+//! One `csrrw` then swaps and tests in the same instruction, so entry costs a swap and a branch and
+//! needs no scratch register at all. Zeroing it on the way in matters as much as loading it on the
+//! way out: a fault INSIDE the handler must take the kernel path, or it would "swap in" a stack it
+//! is already standing on and overwrite the frame it is building.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+
+/// `sstatus.SPP` - the privilege the trap came FROM. 0 is user, 1 is supervisor.
+///
+/// This bit is written by HARDWARE at every trap and cannot be forged by the code that trapped,
+/// which is what makes it evidence rather than a claim: it is how `usermode` proves its stub really
+/// ran unprivileged, and how the epilogue below knows whether to re-arm `sscratch`.
+pub const SSTATUS_SPP: u64 = 1 << 8;
+
+/// Exception cause: an `ecall` executed in user mode.
+pub const CAUSE_ECALL_U: u64 = 8;
+/// Exception cause: a load that had no valid translation.
+pub const CAUSE_LOAD_PAGE_FAULT: u64 = 13;
+
+/// Register numbers this kernel refers to by name, rather than by the index the ABI happens to use.
+pub const REG_SP: usize = 2;
+pub const REG_A0: usize = 10;
+pub const REG_A2: usize = 12;
+pub const REG_A7: usize = 17;
 
 /// Set once a fault has been reported, so a fault INSIDE the reporter cannot recurse forever.
 ///
@@ -53,15 +86,30 @@ fn cause_name(code: u64, interrupt: bool) -> &'static str {
     }
 }
 
-/// Every integer register, as the entry stub laid them out.
+/// Every integer register, as the entry stub laid them out, plus the two CSRs that decide where and
+/// how execution resumes.
 ///
 /// Indexed by register number so the assembly is a straight `sd x{i}, 8*i(sp)` and the two halves
 /// cannot drift apart. `x[0]` is the hardwired zero register and is never written; it is kept in
 /// the array only so the indices mean what they say.
+///
+/// `sepc` and `sstatus` are FIELDS, not live CSRs, so a handler redirects execution by editing the
+/// frame rather than by writing a control register behind the epilogue's back. That is what lets
+/// `usermode` turn one `ecall` into a return to the kernel: it sets the resume address, sets `SPP`
+/// to supervisor, and points `x[2]` at the kernel stack it saved - three ordinary stores, and the
+/// epilogue below does the rest.
 #[repr(C)]
 pub struct TrapFrame {
     pub x: [u64; 32],
     pub sepc: u64,
+    pub sstatus: u64,
+}
+
+impl TrapFrame {
+    /// True when this trap was taken from user mode, per the hardware-written `SPP`.
+    pub fn from_user(&self) -> bool {
+        self.sstatus & SSTATUS_SPP == 0
+    }
 }
 
 /// Rust side of a trap.
@@ -92,60 +140,88 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    // The user-mode selftest, and only while it is running: the `ecall` its stub uses to hand
+    // control back, and the one deliberate fault it makes on the way. Both are refused outright
+    // once the selftest is over, so neither is a door a real task could later walk through.
+    if !interrupt && super::usermode::claim_trap(frame, code, stval) {
+        return;
+    }
+
     if REPORTING.swap(true, Ordering::Relaxed) {
         // A fault inside the reporter. Stop rather than recurse: on a machine whose console is what
         // faulted, recursion shows up as a hang or an endless partial line.
         super::halt();
     }
 
-    super::print_str("
-riscv64: TRAP - ");
+    super::print_str("\nriscv64: TRAP - ");
     super::print_str(cause_name(code, interrupt));
-    super::print_str("
-  scause ");
+    // WHICH PRIVILEGE FAULTED is the first question asked of any fault once user mode exists, and
+    // the answer is already in the frame. Printing it costs a branch and saves the guess.
+    super::print_str(if frame.from_user() { " (from USER mode)" } else { "" });
+    super::print_str("\n  scause ");
     super::print_hex(scause);
     super::print_str("  sepc ");
     super::print_hex(frame.sepc);
     super::print_str("  stval ");
     super::print_hex(stval);
-    super::print_str("
-");
+    super::print_str("\n");
     // `stval` carries the faulting ADDRESS for a page or access fault and the offending INSTRUCTION
     // for an illegal-instruction trap, so it is printed raw and named by the cause rather than
     // labelled something it might not be.
-    super::print_str("riscv64: halted - faults are not yet survivable (no task to kill)
-");
+    super::print_str("riscv64: halted - faults are not yet survivable (no task to kill)\n");
     super::halt();
 }
 
-/// Bytes of stack a trap frame occupies: 32 registers plus `sepc`, rounded to keep the stack
-/// 16-byte aligned as the ABI requires.
-const FRAME_BYTES: usize = 34 * 8;
+/// Bytes of stack a trap frame occupies. Deliberately larger than the struct so `sp` stays 16-byte
+/// aligned, as the RISC-V ABI requires at a call - and `trap_dispatch` is a call.
+const FRAME_BYTES: usize = 288;
+const _: () = assert!(core::mem::size_of::<TrapFrame>() <= FRAME_BYTES);
+const _: () = assert!(FRAME_BYTES % 16 == 0);
 
-/// Trap entry: save everything, dispatch, restore, return.
+/// Byte offsets of the two CSR fields, so the assembly below and `TrapFrame` cannot drift.
+const OFF_SEPC: usize = 32 * 8;
+const OFF_SSTATUS: usize = 33 * 8;
+
+/// Trap entry: land on a kernel stack, save everything, dispatch, restore, return.
+///
+/// **The stack comes first, and it comes from `sscratch`.** `csrrw sp, sscratch, sp` swaps the two
+/// in one instruction: `sp` becomes what `sscratch` held (this hart's kernel stack if the trap came
+/// from U-mode, zero if it came from the kernel) and `sscratch` becomes the interrupted `sp`. A
+/// single `bnez` then separates the two cases without a scratch register - which matters, because at
+/// this instant there is no register free to use and no stack to spill one onto.
 ///
 /// SAVES ALL 31 WRITABLE REGISTERS, not just the caller-saved ones. The interrupted code is not a
 /// caller - it did not agree to any calling convention with this handler and may be at any
 /// instruction - so "the compiler will have spilled what it needed" is not available here. A
 /// callee-saved register clobbered by the dispatcher would corrupt code that never called it, at a
-/// point arbitrarily far away.
+/// point arbitrarily far away. From U-mode the same rule is a SECURITY property rather than a
+/// correctness one: the kernel must hand back every register exactly as it found it.
 ///
-/// `sepc` is saved and restored explicitly: it holds where to resume, and a nested trap (or a
-/// dispatcher that faults) would otherwise overwrite it before `sret` reads it.
-///
-/// The frame lives on the CURRENT stack, which is sound while every trap is taken in S-mode with a
-/// valid kernel stack. When user mode arrives this needs `sscratch` to swap stacks first, because a
-/// user trap must not push onto a user stack - that is a real change and it belongs with the commit
-/// that introduces user mode rather than being half-built now.
+/// `sepc` and `sstatus` are saved and restored explicitly. `sepc` holds where to resume; `sstatus`
+/// holds `SPP`, which decides WHICH PRIVILEGE it resumes in. Both are fields the dispatcher may
+/// edit, which is how a trap becomes a control transfer rather than only a return.
 #[unsafe(naked)]
 unsafe extern "C" fn trap_entry() -> ! {
     core::arch::naked_asm!(
         ".p2align 2",
+        // Swap in the kernel stack, if this trap came from user mode.
+        "csrrw sp, sscratch, sp",
+        "bnez  sp, 1f",
+        // Zero came back, so the kernel was already running and `sscratch` held nothing. The
+        // interrupted `sp` is the one we just parked there; take it back.
+        "csrr  sp, sscratch",
+        "1:",
         "addi sp, sp, -{frame}",
-        // t0 first, so it can be used to compute the original stack pointer.
+        // t0 first, so it can be the scratch for everything below.
         "sd x5, 40(sp)",
-        "addi x5, sp, {frame}",
+        // The interrupted stack pointer is in `sscratch` in BOTH cases, which is why the two paths
+        // above converge here rather than each saving their own.
+        "csrr x5, sscratch",
         "sd x5, 16(sp)",
+        // We are the kernel now. A nested trap must take the kernel path above, so the latch reads
+        // zero for as long as kernel code is running. Nothing between the swap and this write can
+        // trap: interrupts are off by hardware on entry, and these are register moves.
+        "csrw sscratch, zero",
         "sd x1, 8(sp)",
         "sd x3, 24(sp)",
         "sd x4, 32(sp)",
@@ -176,15 +252,28 @@ unsafe extern "C" fn trap_entry() -> ! {
         "sd x30, 240(sp)",
         "sd x31, 248(sp)",
         "csrr x5, sepc",
-        "sd x5, 256(sp)",
+        "sd x5, {sepc}(sp)",
+        "csrr x5, sstatus",
+        "sd x5, {sstatus}(sp)",
         // The frame IS the argument: a0 points at what was just saved.
         "mv a0, sp",
         "call {dispatch}",
-        // Resume. `sepc` is restored from the frame so a handler may redirect execution by editing
-        // it - which is how a survivable fault will eventually skip or replace a faulting
-        // instruction rather than only reporting it.
-        "ld x5, 256(sp)",
+        // Resume. Both CSRs come back from the frame, so a handler may redirect execution by
+        // editing `sepc` and may change the privilege it resumes in by editing `SPP` - which is
+        // exactly how the user-mode selftest returns to the kernel from a user `ecall`.
+        "ld x5, {sstatus}(sp)",
+        "csrw sstatus, x5",
+        "ld x5, {sepc}(sp)",
         "csrw sepc, x5",
+        // Re-arm the latch if and only if we are going back to user mode: `sp + frame` is where the
+        // kernel stack stood on entry, which is where the NEXT user trap must land. Returning to
+        // S-mode leaves it zero, per the discipline at the top of this file.
+        "ld x5, {sstatus}(sp)",
+        "andi x5, x5, {spp}",
+        "bnez x5, 2f",
+        "addi x5, sp, {frame}",
+        "csrw sscratch, x5",
+        "2:",
         "ld x1, 8(sp)",
         "ld x3, 24(sp)",
         "ld x4, 32(sp)",
@@ -214,30 +303,48 @@ unsafe extern "C" fn trap_entry() -> ! {
         "ld x29, 232(sp)",
         "ld x30, 240(sp)",
         "ld x31, 248(sp)",
-        // t0 last: it was the scratch for everything above.
+        // t0 second to last: it was the scratch for everything above. Then the stack pointer itself,
+        // read out of the frame it is still addressing - which is why it can only go last.
         "ld x5, 40(sp)",
-        "addi sp, sp, {frame}",
+        "ld x2, 16(sp)",
         "sret",
         frame = const FRAME_BYTES,
+        sepc = const OFF_SEPC,
+        sstatus = const OFF_SSTATUS,
+        spp = const SSTATUS_SPP,
         dispatch = sym trap_dispatch,
     )
 }
 
-/// Point `stvec` at the entry stub.
+/// Point `stvec` at the entry stub, and establish the `sscratch` discipline.
 ///
 /// Returns false rather than installing a handler the hardware would reinterpret: `stvec` steals
 /// the low two bits for MODE, Rust has no stable way to align a function, and a misaligned address
 /// would become a different mode with a truncated target - discovered only by a fault, which is the
 /// thing this exists to catch. Checked rather than assumed for that reason.
+///
+/// **`sscratch` is zeroed here, and that is not tidiness.** Its reset value is not architecturally
+/// specified, and the firmware beneath us runs in M-mode with its own `mscratch`, so nothing has
+/// promised to leave this register alone. If it held anything non-zero the FIRST S-mode trap would
+/// read it as "a user trap, here is your kernel stack" and build a frame at an address nobody chose.
+/// QEMU hands over a zeroed register and would never show this; the emulator supplying the value you
+/// assumed is how the whole class of bug hides.
 pub fn init() -> bool {
-    let addr = trap_entry as usize;
+    let addr = trap_entry as *const () as usize;
     if addr & 0x3 != 0 {
         return false;
     }
     // SAFETY: a real code address in the kernel image, proven above to have its low two bits clear,
-    // so MODE is 0 (direct) and the address is not truncated.
+    // so MODE is 0 (direct) and the address is not truncated. Zeroing `sscratch` establishes the
+    // invariant the entry stub relies on, and is done before the vector so no trap can observe the
+    // register between the two writes.
     unsafe {
-        core::arch::asm!("csrw stvec, {}", in(reg) addr, options(nostack));
+        core::arch::asm!(
+            "csrw sscratch, zero",
+            "csrw stvec, {}",
+            in(reg) addr,
+            options(nostack)
+        );
     }
     true
 }
