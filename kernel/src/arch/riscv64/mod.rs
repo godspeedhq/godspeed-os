@@ -9,10 +9,73 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-// ============================ Boot bring-up (QEMU `virt`, S-mode via OpenSBI) ============================
-// QEMU riscv `virt` UART is an NS16550 at 0x1000_0000; writing the transmit-hold register (offset 0) sends
-// a byte (QEMU accepts it directly, like early x86 COM1 output).
-const UART_THR: *mut u8 = 0x1000_0000 as *mut u8;
+// ============================ Boot bring-up (S-mode via OpenSBI) ============================
+// The 16550 sits at 0x1000_0000 on BOTH QEMU `virt` and the StarFive JH7110, which is luck rather
+// than design and the only reason one banner prints on both.
+//
+// WHAT DIFFERS IS THE REGISTER LAYOUT, and it cost the board its first sixteen characters. The
+// transmit-hold register is at offset 0 either way, so writing bytes blind appeared to work - until
+// hardware, where output stopped at EXACTLY 16 characters, twice, at the same byte. Sixteen is the
+// 16550's transmit FIFO depth: we filled it and every byte after was dropped on the floor. QEMU
+// accepts bytes as fast as they are written and has no FIFO to overrun, so it could not have shown
+// this. The fix is to wait for the transmitter, which is Commandment VIII in its smallest possible
+// form: wait on TRUTH (the THRE bit), never on time.
+//
+// The layouts, read out of the board's own device tree rather than guessed:
+//   QEMU `virt`   ns16550a          reg-shift 0, byte registers   -> LSR at +0x05
+//   JH7110        snps,dw-apb-uart  reg-shift 2, 32-bit registers -> LSR at +0x14
+// A `reg-shift` of 2 means the registers are four bytes apart, so every register except the one at
+// offset 0 moves. That is why THR worked and LSR would not have.
+//
+// Selected by the `visionfive` feature for now. This goes away when the FDT parser lands: U-Boot
+// already hands us a device tree in `a1` that states the base, the shift and the width, and reading
+// it is strictly better than a build-time switch.
+
+/// QEMU `virt`: NS16550, registers one byte apart.
+#[cfg(not(feature = "visionfive"))]
+mod uart {
+    pub const BASE: usize = 0x1000_0000;
+    /// SAFETY: fixed MMIO on a mapping the firmware left identity-mapped; volatile byte access.
+    #[inline]
+    pub fn lsr() -> u8 { unsafe { ((BASE + 5) as *const u8).read_volatile() } }
+    /// SAFETY: as above; offset 0 is the transmit-hold register.
+    #[inline]
+    pub fn thr(b: u8) { unsafe { (BASE as *mut u8).write_volatile(b) } }
+}
+
+/// StarFive JH7110: Synopsys DesignWare APB UART, `reg-shift = 2`, `reg-io-width = 4`.
+#[cfg(feature = "visionfive")]
+mod uart {
+    pub const BASE: usize = 0x1000_0000;
+    /// SAFETY: fixed MMIO; the device tree declares 32-bit access, so a 32-bit read is the correct
+    /// width and a byte read of the same address would not be.
+    #[inline]
+    pub fn lsr() -> u8 { unsafe { ((BASE + (5 << 2)) as *const u32).read_volatile() as u8 } }
+    /// SAFETY: as above; offset 0 is the transmit-hold register at any `reg-shift`.
+    #[inline]
+    pub fn thr(b: u8) { unsafe { (BASE as *mut u32).write_volatile(b as u32) } }
+}
+
+/// LSR bit 5: transmit holding register empty.
+const LSR_THRE: u8 = 1 << 5;
+
+/// Send one byte, waiting for the transmitter rather than for a delay.
+///
+/// The spin is BOUNDED. A wrong LSR address would otherwise never report ready and would hang the
+/// boot before anything had been printed - a silent hang being strictly worse than dropped output,
+/// which is the failure this function exists to fix. Past the bound it writes anyway: on a UART that
+/// is genuinely wedged the byte is lost either way, and a partial banner still tells a reader that
+/// the kernel reached this line.
+fn putc(b: u8) {
+    let mut spins: u32 = 0;
+    while uart::lsr() & LSR_THRE == 0 {
+        spins += 1;
+        if spins > 200_000 {
+            break;
+        }
+    }
+    uart::thr(b);
+}
 
 /// ELF entry - OpenSBI (QEMU default firmware) jumps here in S-mode at 0x8020_0000 (a0=hartid, a1=dtb).
 /// Only the boot hart arrives (OpenSBI parks the rest via HSM). Set the stack, zero BSS, call Rust. No
@@ -75,12 +138,11 @@ extern "C" fn riscv_boot_main() -> ! {
     for &b in b"
 GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a THIRD arch.
 " {
-        // SAFETY: UART_THR is QEMU virt NS16550 transmit register.
-        unsafe { UART_THR.write_volatile(b); }
+        putc(b);
     }
     for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies. halting.
 " {
-        unsafe { UART_THR.write_volatile(b); }
+        putc(b);
     }
     loop {
         unsafe { core::arch::asm!("wfi"); }
@@ -192,8 +254,8 @@ pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
 // ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
-pub fn serial_write_byte(b: u8) { unsafe { UART_THR.write_volatile(b); } }
-pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { UART_THR.write_volatile(b); } } }
+pub fn serial_write_byte(b: u8) { putc(b); }
+pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { putc(b); } }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
 pub fn set_console_echo(on: bool) {}
 pub fn claim_console_foreground(task_slot: u32) {}
