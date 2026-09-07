@@ -102,6 +102,20 @@ pi4-demo-services = []
 # boots reach a shell on four cores and a carnage run survives it. Still a separate feature so a
 # single-core image remains one flag away if a hardware fault ever needs bisecting against it.
 pi4-smp = []
+# Link the riscv64 kernel for the StarFive VisionFive 2 Lite instead of QEMU `virt`.
+#
+# ONE NUMBER: the load address. QEMU puts RAM at 0x8000_0000 and OpenSBI enters at 0x8020_0000; the
+# JH7110 puts RAM at 0x4000_0000 and enters at 0x4020_0000 (read off the board's own OpenSBI banner
+# and confirmed by the vendor image's `kernel_addr_r`). Nothing else changes - not even the UART,
+# which sits at 0x1000_0000 on both.
+#
+# A feature rather than a runtime check because the address is fixed at LINK time; a kernel cannot
+# relocate itself before it has run. This is the same split `pi4` already makes on aarch64, for the
+# same reason, and it is a different thing from the `single-core` flag that was deleted: that one
+# forced a state the same binary could already reach, where two SoCs with different RAM bases cannot
+# share one non-relocatable image. The honest fix that would remove it is a position-independent
+# kernel, which is real work and is recorded in backlog/14 rather than pretended at.
+visionfive = []
 # Hand the Pi 4's GENET ethernet MAC to the `nic-driver` SERVICE, and take it out of the kernel.
 #
 # `kernel/src/arch/aarch64/genet.rs` is a ~1500-line ethernet driver living in ring 0, which is a

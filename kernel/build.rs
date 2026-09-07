@@ -60,8 +60,17 @@ fn main() {
     }
     let kernel_ld_riscv64 = workspace.join("kernel").join("kernel-riscv64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_riscv64.display());
+    let kernel_ld_riscv64_vf = workspace.join("kernel").join("kernel-riscv64-visionfive.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_riscv64_vf.display());
     if target == "riscv64imac-unknown-none-elf" {
-        println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv64.display());
+        // Same split as aarch64's `pi4`: QEMU `virt` loads at 0x8020_0000, the VisionFive board at
+        // 0x4020_0000. One number, two machines, and nothing else differs.
+        let script = if std::env::var("CARGO_FEATURE_VISIONFIVE").is_ok() {
+            &kernel_ld_riscv64_vf
+        } else {
+            &kernel_ld_riscv64
+        };
+        println!("cargo:rustc-link-arg=-T{}", script.display());
     }
     let kernel_ld_arm = workspace.join("kernel").join("kernel-arm.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_arm.display());

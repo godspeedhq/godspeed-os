@@ -81,7 +81,22 @@ features = [
     "pi4-supervisor",
     "test-bad-elf",
     "test-bad-elf-brutal",
-    "test-bad-supervisor"
+    "test-bad-supervisor",
+# Link the riscv64 kernel for the StarFive VisionFive 2 Lite instead of QEMU `virt`. Admitted because
+# it adds NO kernel responsibility and changes exactly one number: the load address. QEMU enters the
+# kernel at 0x8020_0000, the JH7110 at 0x4020_0000 - both read off the board's own OpenSBI banner and
+# confirmed by the vendor image's `kernel_addr_r`. Not even the UART differs (0x1000_0000 on both).
+#
+# Pinned rather than done outside the kernel because a load address is fixed at LINK time: a kernel
+# cannot relocate itself before it has run, so there is no runtime check that could replace it.
+# `pi4` above is the same split on aarch64 for the same reason.
+#
+# NOT the `single-core` case. That flag forced a state the same binary could already reach, which is
+# why it was deleted once it had found its bug. Two SoCs with different RAM bases cannot share one
+# non-relocatable image, so this is a real difference rather than a forced one. The change that would
+# retire it is a position-independent kernel - real work, recorded in backlog/14 rather than pretended
+# at. If that lands, this pin goes.
+    "visionfive"
 ]
 
 # DEBT, NOT AN ALLOWANCE. This list may only ever SHRINK. Kernel responsibility does not expand, so

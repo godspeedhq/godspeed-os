@@ -39,6 +39,83 @@ BootROM -> U-Boot SPL -> OpenSBI (M-mode) + U-Boot -> kernel (S-MODE)
 - **The device tree is not optional.** On the Pi we hard-coded peripheral bases; here the machine
   describes itself, and the UART, PLIC, CLINT and memory map all come from the FDT in `a1`.
 
+## MEASURED ON THE REAL BOARD (2026-09-07, VisionFive 2 Lite, full boot to a Debian login)
+
+Read off the board's own serial log and its vendor image, not from documentation. Where QEMU `virt`
+and this board differ, the difference is the interesting column - each one is a place where code that
+works in QEMU is silently wrong on hardware.
+
+| | QEMU `virt` | VisionFive 2 Lite | |
+|---|---|---|---|
+| UART | 0x1000_0000, 16550 | **0x1000_0000, 16550A, IRQ 44** | MATCHES - our hard-coded address is right |
+| Kernel entry | 0x8020_0000 | **0x4020_0000** | we link at the wrong address |
+| RAM base | 0x8000_0000 | 0x4000_0000 | |
+| Boot hart | 0 | **1** | hart 0 is the S7 monitor core; the U74s are 1-4 |
+| Hart count | 1 (as run) | 5 | |
+| Timer | 10 MHz | **4 MHz** (aclint-mtimer) | cannot be a constant |
+| OpenSBI | v1.8.1 | v1.2, SBI 1.0 | older than QEMU's - do not assume new SBI calls |
+| FDT (`a1`) | QEMU-supplied | **0x4220_0000** | |
+
+**The dangerous one is the boot hart.** `Boot HART ID: 1`. Code that assumes "hart 0 is the boot
+hart" is natural, and QEMU never punishes it because its boot hart IS 0. That is the same shape as
+the x86 LAPIC-id bug: an environment where the wrong value happens to be right. Take the hart id from
+`a0`, never from an assumption.
+
+The lucky one is the UART: the JH7110 puts UART0 where QEMU does, and it is the same 16550 family, so
+the existing banner will print on hardware unchanged. That was the main risk and it evaporated.
+
+## How a kernel is actually loaded on this board
+
+From the vendor image's own ESP (partition 3, FAT16, 100 MB - readable from Windows):
+
+```
+/extlinux/extlinux.conf     label -> linux /vmlinuz-...  initrd ...  fdtdir /dtbs/...
+/uEnv_Lite.txt              kernel_addr_r=0x40200000   fdt_addr_r=0x46000000
+                            fdtfile=starfive/jh7110s-starfive-visionfive-2-lite.dtb
+/dtbs/6.12.5-starfive/...   45 device trees + overlays
+```
+
+So GodspeedOS goes on as **a file copy onto a FAT partition** plus an `extlinux.conf` label - no card
+rewrite, no Linux host needed. `kernel_addr_r=0x40200000` independently confirms the load address.
+
+## Putting it on the board
+
+    py scripts/riscv_build.py --release --visionfive   ->  build/godspeed-riscv64-visionfive.img
+
+A flat binary linked at 0x4020_0000. `booti` loads an image, not an ELF; the ELF only works for
+QEMU's `-kernel` because QEMU parses it.
+
+**Fastest first light - the U-Boot prompt, no card edits.** Interrupt autoboot, then load and jump.
+This is the loop worth using while the kernel is one banner long: seconds per try, and a mistake
+costs nothing.
+
+```
+=> fatload mmc 0:3 0x40200000 godspeed-riscv64-visionfive.img
+=> booti 0x40200000 - ${fdt_addr_r}
+```
+
+**Or persistently**, by adding a label to `/extlinux/extlinux.conf` on the ESP (partition 3, FAT16,
+writable from Windows once `diskpart` assigns it a letter - Windows hides EFI System Partitions from
+Explorer by default, which is why no drive letter appears):
+
+```
+label godspeed
+        menu label GodspeedOS riscv64
+        linux /godspeed-riscv64-visionfive.img
+        fdtdir /dtbs/6.12.5-starfive
+```
+
+Leave `default l0` alone so a power cycle still lands in Debian. Do not make GodspeedOS the default
+until it does something worth booting into.
+
+**What to expect on success:** the banner and a halt. That is the entire kernel today. The value is
+that it proves the chain end to end on real silicon - link address, flat image, U-Boot handoff,
+S-mode entry, and the UART - which is exactly the set of assumptions that cannot be tested in QEMU.
+
+**If it is silent**, the load address is the first suspect, then the FDT argument. The banner writes
+to 0x1000_0000 directly and does not depend on the FDT, so a silent board means it never reached
+`_start` rather than that it failed later.
+
 ## What is stubbed, in the order it probably wants doing
 
 1. **Read the FDT.** Everything else needs it, and it removes the last hard-coded address (the 16550
