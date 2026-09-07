@@ -1088,6 +1088,10 @@ fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, 
     // fires early turns a working controller into a reported fault.
     const TIMEOUT_MS: u64 = 250;
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TIMEOUT_MS));
+    // How long to busy-yield before parking between polls. Covers the common case (hardware answers
+    // in a millisecond or two) without holding the core through a timeout that is not going to end.
+    const SPIN_MS: u64 = 2;
+    let spin_until = ctx.read_tsc().wrapping_add(ctx.duration_cycles(SPIN_MS));
     loop {
         if (mmio.read32(off) & mask != 0) == want_set {
             return true;
@@ -1095,8 +1099,27 @@ fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, 
         if ctx.read_tsc() >= deadline {
             return false;
         }
-        // Hand the core back between polls. The register is changed by HARDWARE, not by anything
-        // this service could compute, so spinning on it buys nothing that yielding does not.
-        ctx.yield_cpu();
+        // YIELD BRIEFLY, THEN PARK. The register is changed by HARDWARE, not by anything this service
+        // could compute, so spinning on it buys nothing - but `yield_cpu` does not stop consuming the
+        // core either. It leaves the task RUNNABLE, so a single-core scheduler hands it straight back
+        // and the loop runs flat out for the whole timeout.
+        //
+        // That is invisible while the hardware answers quickly, which is every path this function was
+        // written for. It stops being invisible when the hardware does NOT answer: pull the device and
+        // the rescan loop asks each hub port for its status, every one of those control transfers
+        // waits out the full 250 ms, and the driver holds the core continuously. `observe` shows
+        // `ehci` at 100% unplugged and 0% the moment it is plugged back in - the cable is the switch,
+        // which is what says the cost is here and not in the paced poll.
+        //
+        // So: keep yielding for the first few milliseconds, because a controller bit that is about to
+        // flip usually flips within one or two, and sleeping through that would slow every
+        // enumeration. After that the answer is evidently not imminent, and a 10 ms park costs at
+        // most one quantum of extra latency on an operation already measured in tens of milliseconds
+        // - while cutting thousands of yields down to about two dozen polls.
+        if ctx.read_tsc() >= spin_until {
+            ctx.sleep_ms(1);   // floors to one scheduler quantum
+        } else {
+            ctx.yield_cpu();
+        }
     }
 }
