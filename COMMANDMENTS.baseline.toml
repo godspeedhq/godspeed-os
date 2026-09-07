@@ -83,7 +83,14 @@ features = [
     "test-bad-elf-brutal",
     "test-bad-supervisor",
 # Link the riscv64 kernel for the StarFive VisionFive 2 Lite instead of QEMU `virt`. Admitted because
-# it adds NO kernel responsibility and changes exactly one number: the load address. QEMU enters the
+# it adds NO kernel responsibility and changes exactly one number: the load address.
+#
+# NARROWED 2026-09-07. It briefly also picked the UART's register layout, which was a board fact in
+# the kernel and is now read from the device tree instead - the same binary logic reports
+# `shift 0 width 1` on QEMU and `shift 2 width 4` on the JH7110 without being told which it is on.
+# What remains is only the link address, and that one genuinely cannot be discovered at runtime: a
+# non-relocatable kernel must be placed before it can run. The change that retires the pin entirely
+# is a position-independent kernel (backlog/14). QEMU enters the
 # kernel at 0x8020_0000, the JH7110 at 0x4020_0000 - both read off the board's own OpenSBI banner and
 # confirmed by the vendor image's `kernel_addr_r`. Not even the UART differs (0x1000_0000 on both).
 #

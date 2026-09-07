@@ -9,7 +9,7 @@
 
 pub mod fdt;
 
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
 
 // ============================ Boot bring-up (S-mode via OpenSBI) ============================
 // The 16550 sits at 0x1000_0000 on BOTH QEMU `virt` and the StarFive JH7110, which is luck rather
@@ -29,33 +29,72 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 // A `reg-shift` of 2 means the registers are four bytes apart, so every register except the one at
 // offset 0 moves. That is why THR worked and LSR would not have.
 //
-// Selected by the `visionfive` feature for now. This goes away when the FDT parser lands: U-Boot
-// already hands us a device tree in `a1` that states the base, the shift and the width, and reading
-// it is strictly better than a build-time switch.
+// THIS IS NO LONGER A BUILD-TIME CHOICE. It was, briefly, behind a `visionfive` feature; the device
+// tree states the base, the shift and the width, so the kernel reads them instead of being told.
+// The feature still exists but now selects ONE thing and nothing else: the LINK ADDRESS, which
+// cannot be discovered at runtime because a non-relocatable kernel has to be placed before it runs.
 
-/// QEMU `virt`: NS16550, registers one byte apart.
-#[cfg(not(feature = "visionfive"))]
-mod uart {
-    pub const BASE: usize = 0x1000_0000;
-    /// SAFETY: fixed MMIO on a mapping the firmware left identity-mapped; volatile byte access.
-    #[inline]
-    pub fn lsr() -> u8 { unsafe { ((BASE + 5) as *const u8).read_volatile() } }
-    /// SAFETY: as above; offset 0 is the transmit-hold register.
-    #[inline]
-    pub fn thr(b: u8) { unsafe { (BASE as *mut u8).write_volatile(b) } }
+/// The UART, as the MACHINE describes it - not as a build flag asserts it.
+///
+/// This replaces a `visionfive` feature that picked the register layout at compile time. The layout
+/// is a fact about the hardware, the device tree states it, and a kernel that is TOLD which board it
+/// is on is exactly what this port is trying not to be. Two machines, one binary's worth of logic:
+///
+///     QEMU `virt`   ns16550a          reg-shift 0, byte registers
+///     JH7110        snps,dw-apb-uart  reg-shift 2, 32-bit registers
+///
+/// Written once, before the first character is printed, and read-only afterwards. Boot is
+/// single-threaded at that point - one hart, no interrupts enabled - so `Relaxed` is honest here
+/// rather than merely cheap.
+static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
+static UART_SHIFT: AtomicU32 = AtomicU32::new(0);
+static UART_WIDTH: AtomicU32 = AtomicU32::new(1);
+
+/// Point the console at the UART the device tree describes.
+///
+/// The DEFAULTS ABOVE ARE A DELIBERATE FALLBACK, not a guess at the board: offset 0 is the transmit
+/// register at ANY `reg-shift`, so a kernel that cannot read its device tree can still say so. It
+/// will be slow - the LSR poll reads the wrong address and times out per character - but a slow
+/// error message beats a silent hang, which is the whole argument of invariant 12.
+fn uart_configure(base: u64, shift: u32, width: u32) {
+    UART_BASE.store(base as usize, Ordering::Relaxed);
+    UART_SHIFT.store(shift, Ordering::Relaxed);
+    UART_WIDTH.store(width, Ordering::Relaxed);
 }
 
-/// StarFive JH7110: Synopsys DesignWare APB UART, `reg-shift = 2`, `reg-io-width = 4`.
-#[cfg(feature = "visionfive")]
-mod uart {
-    pub const BASE: usize = 0x1000_0000;
-    /// SAFETY: fixed MMIO; the device tree declares 32-bit access, so a 32-bit read is the correct
-    /// width and a byte read of the same address would not be.
-    #[inline]
-    pub fn lsr() -> u8 { unsafe { ((BASE + (5 << 2)) as *const u32).read_volatile() as u8 } }
-    /// SAFETY: as above; offset 0 is the transmit-hold register at any `reg-shift`.
-    #[inline]
-    pub fn thr(b: u8) { unsafe { (BASE as *mut u32).write_volatile(b as u32) } }
+#[inline]
+fn uart_reg(index: usize) -> usize {
+    UART_BASE.load(Ordering::Relaxed)
+        + (index << (UART_SHIFT.load(Ordering::Relaxed) as usize))
+}
+
+/// Line status register. Read at the width the tree declares: a 32-bit register read as a byte
+/// returns the right lane on a little-endian machine, but reading a byte-wide one as 32 bits does
+/// not, so the width is honoured rather than assumed.
+#[inline]
+fn uart_lsr() -> u8 {
+    let addr = uart_reg(5);
+    // SAFETY: MMIO the firmware left mapped, at the address and width the device tree declares.
+    unsafe {
+        if UART_WIDTH.load(Ordering::Relaxed) >= 4 {
+            (addr as *const u32).read_volatile() as u8
+        } else {
+            (addr as *const u8).read_volatile()
+        }
+    }
+}
+
+#[inline]
+fn uart_thr(b: u8) {
+    let addr = uart_reg(0);
+    // SAFETY: as above; index 0 is the transmit-hold register at every `reg-shift`.
+    unsafe {
+        if UART_WIDTH.load(Ordering::Relaxed) >= 4 {
+            (addr as *mut u32).write_volatile(b as u32);
+        } else {
+            (addr as *mut u8).write_volatile(b);
+        }
+    }
 }
 
 /// LSR bit 5: transmit holding register empty.
@@ -70,13 +109,13 @@ const LSR_THRE: u8 = 1 << 5;
 /// the kernel reached this line.
 fn putc(b: u8) {
     let mut spins: u32 = 0;
-    while uart::lsr() & LSR_THRE == 0 {
+    while uart_lsr() & LSR_THRE == 0 {
         spins += 1;
         if spins > 200_000 {
             break;
         }
     }
-    uart::thr(b);
+    uart_thr(b);
 }
 
 /// ELF entry - OpenSBI (QEMU default firmware) jumps here in S-mode at 0x8020_0000 (a0=hartid, a1=dtb).
@@ -147,6 +186,23 @@ pub unsafe extern "C" fn _start() -> ! {
 /// trap that cost a day on x86, where the BSP's APIC id was assumed to be 0 and QEMU happened to
 /// agree - so it is taken from the register here rather than inferred anywhere.
 extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
+    // PARSE BEFORE PRINTING. The device tree states where the UART is and how its registers are
+    // laid out, so reading it first is what lets the banner print correctly on a machine nobody
+    // compiled for. Doing it the other way round is why a build flag existed at all.
+    //
+    // SAFETY: `fdt` is the pointer the boot protocol placed in `a1`; `from_ptr` validates the magic
+    // before trusting anything and yields None for a pointer that is not a device tree.
+    let tree = unsafe { fdt::Fdt::from_ptr(fdt) };
+    if let Some(t) = tree.as_ref() {
+        let mut props = [None, None];
+        if let Some(u) = t
+            .find_compatible("snps,dw-apb-uart", &["reg-shift", "reg-io-width"], &mut props)
+            .or_else(|| t.find_compatible("ns16550a", &["reg-shift", "reg-io-width"], &mut props))
+        {
+            uart_configure(u.base, props[0].unwrap_or(0), props[1].unwrap_or(1));
+        }
+    }
+
     for &b in b"
 GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a THIRD arch.
 " {
@@ -160,9 +216,6 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     print_dec(hartid as u64);
     print_str(", fdt at ");
     print_hex(fdt as u64);
-    // SAFETY: `fdt` is the pointer the boot protocol placed in `a1`; `from_ptr` checks the magic
-    // before trusting anything and yields None for a pointer that is not a device tree.
-    let tree = unsafe { fdt::Fdt::from_ptr(fdt) };
     let Some(tree) = tree else {
         print_str(" (NO FDT MAGIC - device tree not usable)
 ");

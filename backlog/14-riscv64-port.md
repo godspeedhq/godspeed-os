@@ -140,6 +140,38 @@ S-mode entry, and the UART - which is exactly the set of assumptions that cannot
 to 0x1000_0000 directly and does not depend on the FDT, so a silent board means it never reached
 `_start` rather than that it failed later.
 
+## Confirmed on hardware, and one new trap
+
+The parser, unchanged, on two machines:
+
+| | QEMU `virt` | VisionFive 2 Lite |
+|---|---|---|
+| ram | 0x8000_0000 + 256 MiB | 0x4000_0000 + **8192 MiB** |
+| usable harts | 1, highest id 0 | **4**, highest id 4 |
+| timebase | 10 MHz | 4 MHz |
+| uart | 0x1000_0000 shift 0 width 1 | 0x1000_0000 shift **2** width **4** |
+| plic | 0xc00_0000 | 0xc00_0000 |
+
+**8192 MiB settles the argument for parsing.** The DTB FILE in the vendor image declares
+`/memory@40000000` as 4 GiB. U-Boot patches the node from what the SPL detected, so the runtime blob
+says 8. Constants taken from that file, or from any datasheet, would have sized the machine at half
+and been PLAUSIBLY wrong - the failure mode that survives review.
+
+**4 usable harts rather than the 5 OpenSBI counts** is `status = "okay"` doing its job: hart 0 is the
+S7 monitor core and the tree marks it `disabled`, so it is excluded with no board knowledge in the
+kernel at all.
+
+**NEW TRAP: `boot_cpuid_phys` IS WRONG ON THIS BOARD.** The FDT header field reads 0; `a0` says the
+boot hart is 1, and OpenSBI's own banner agrees (`Boot HART ID : 1`). U-Boot appears not to update
+the field when it hands the tree on. So:
+
+> **Take the boot hart from `a0`. Never from the device tree header.**
+
+That is the third member of one family now - the x86 BSP whose APIC id was assumed 0, "hart 0 is the
+boot hart", and now a header field that says 0 while the register says 1. Each is a place where the
+plausible value is zero and zero is what an unset field already contains. The kernel prints both, so
+a disagreement is visible rather than latent.
+
 ## Verification reference: what the FDT parser must PRODUCE
 
 **These are not constants to hard-code.** The whole point of the parser is that the kernel asks the
