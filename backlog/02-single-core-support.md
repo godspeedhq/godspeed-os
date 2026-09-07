@@ -59,13 +59,22 @@ So this is not a new feature request. It is checking a promise the document alre
 
 ## What it did NOT show, and must not be read as showing
 
+*(Written after the first 180 s QEMU boot. All three were answered by the hardware runs recorded in
+the CLOSED banner above - the storage stack, chaos, and the soak were each exercised on one core on
+every machine. Kept because what a first result does NOT show is the most useful thing to write down
+at the time, and because the answers only count as answers against the questions as they were asked.)*
+
 - **`fs` never started, and that is the BUILD, not single-core.** This was the identity build,
   which is probe-heavy and carries no `fs`. A single-core test of the storage stack has not been
-  run at all yet.
+  run at all yet. -> ANSWERED: bare-metal single-core runs on all four machines exercise the full
+  storage stack; `selfcheck` covers the filesystem and passed 0-fail on every one.
 - 180 s is a window, not a soak. Starvation and priority inversion are exactly the faults that need
-  longer than that to show.
+  longer than that to show. -> ANSWERED at a longer window: selfcheck + 100 chaos rounds + hot-plug
+  + selfcheck per machine, 0 wedges and 0 panics. Not a 24-hour soak, which remains untried on one
+  core.
 - No chaos was run single-core. `chaos max-carnage` on one core is the interesting case, because
-  every kill and respawn now contends with the shell for the same quantum.
+  every kill and respawn now contends with the shell for the same quantum. -> ANSWERED: 100 rounds
+  on each of the four machines, single-core and multi-core alike.
 
 ## What the contracts currently pin
 
@@ -82,9 +91,14 @@ placement only when they have a real reason". Whatever the answers, they should 
 the contracts as comments, because right now the reason for `ehci -> core 3` is not recorded
 anywhere.
 
-## How to actually run it (branch `test/single-core`)
+## How it WAS run (historical - the flag no longer exists)
 
-**No new kernel feature, deliberately.** The first attempt added `single-core` to
+*(The `single-core` feature was deleted when this item closed; see the banner above. The commands
+below no longer work and are kept only to record how the hardware runs were produced. To exercise
+the single-core path today: chaos test **C1B** (`osdev test chaos`) boots QEMU with one core, and any
+machine that genuinely has one core reaches the same path by reporting one core.)*
+
+**No new kernel feature, deliberately - at first.** The first attempt added `single-core` to
 `kernel/Cargo.toml` and the enforcement layer refused it:
 
 ```
@@ -95,27 +109,34 @@ Commandment I - kernel feature flags are pinned
 ```
 
 That is the aarch64 lesson enforced mechanically - *a flag that selects between a compliant and a
-non-compliant kernel leaves the violation one build away*. The check was right, the flag was
-reverted, and the test is built out of what already exists instead:
+non-compliant kernel leaves the violation one build away*. The flag was later admitted deliberately,
+with a written rationale in `COMMANDMENTS.baseline.toml`, because there was no external way to force
+the state on two of the three machines - and then **removed again** once it had found its bug, on
+exactly the reasoning the check had raised in the first place. The check was right both times.
 
-| machine | how |
-|---------|-----|
+| machine | how (no longer available) |
+|---------|---------------------------|
 | **x86** | `KERNEL_FEATURES=single-core cargo run -p osdev -- image` |
 | **Pi 2** | `py scripts/arm_build.py --release --feature single-core` |
-| **Pi 4** | `py scripts/pi4_build.py --release --single-core` (omits the already-pinned `pi4-smp`) |
-| any, QEMU only | `cargo run -p osdev -- run --smp 1` - no build change needed |
+| **Pi 4** | `py scripts/pi4_build.py --release --single-core` (omitted the already-pinned `pi4-smp`) |
+| any, QEMU only | `cargo run -p osdev -- run --smp 1` - **still works**, needs no build change |
 
-**Check the log before trusting any run.** A single-core kernel says so on the way up:
+**Checking the log (historical).** While the flag existed, a single-core kernel announced itself:
 
 ```
 smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/02)
 smp: 1 cores ready
 ```
 
-and the image itself carries the string, so `grep -ac "SINGLE-CORE BUILD" build/os-usb.img` tells
-you what you are about to flash. That check exists because two hardware runs were wasted without
-it: the first image predated the feature, and a QEMU run was made against a kernel `osdev run` had
-quietly rebuilt without it.
+and the image carried the string, so `grep -ac "SINGLE-CORE BUILD" build/os-usb.img` said what you
+were about to flash. That check existed because two hardware runs were wasted without it: the first
+image predated the feature, and a QEMU run was made against a kernel `osdev run` had quietly rebuilt
+without it.
+
+**Neither line exists now.** The announcement went with the flag, and the core count reads
+`smp: 1 core ready` - singular, fixed while this item was open, because a log that cannot count its
+own subject invites a reader to wonder what else it is approximating. What replaces the image-grep is
+better than it: there is only one image, so there is nothing to check.
 
 ### Why a kernel feature after all
 
@@ -125,12 +146,20 @@ no core-count setting**, and **Limine's protocol has no core limit** - the APs c
 kernel's own `MpRequest`, so nothing outside the kernel can withhold them. QEMU's `-smp 1` covers
 QEMU alone.
 
-So it is pinned in `COMMANDMENTS.baseline.toml` with that reasoning. It ADDS no kernel
-responsibility: it removes the AP-start call and pins the arena count at 1, reaching the state
-11.3 already defines. Default builds are byte-identical to before - verified by booting one and
-watching it come up on four cores with services on 1, 2 and 3.
+So it WAS pinned in `COMMANDMENTS.baseline.toml` with that reasoning. It added no kernel
+responsibility: it removed the AP-start call and pinned the arena count at 1, reaching the state
+11.3 already defines. Default builds stayed byte-identical - verified by booting one and watching it
+come up on four cores with services on 1, 2 and 3.
 
-## RESULT: it works, on both architectures tested
+**And then it was removed, on the same reasoning the check had raised.** A pin is a licence to ship a
+second kernel, and the argument for holding one is only as good as the job it is doing. Once the flag
+had found its bug (the LAPIC id, see the banner) that job was over, and what remained was a
+configuration to build, ship and regress-test forever. The coverage moved to chaos test **C1B**, which
+boots QEMU with one core - so the property is pinned by a test rather than by a build, and the
+enforcement layer has one less flag to carry. `scripts/commandments.py` was right to refuse it, right
+to accept it with a rationale, and right that it should not outlive the rationale.
+
+## RESULT: it works, on four machines and three architectures
 
 **Raspberry Pi 4 (aarch64), 2026-09-06:** 450/0 x3, 100 rounds of Maximum Carnage, 611 kills, 500
 floods, zero panics, zero liveness wedges. Cost: **1.6x slower for 4x fewer cores** - a selfcheck

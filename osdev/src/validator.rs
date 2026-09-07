@@ -632,6 +632,16 @@ static CHAOS_TESTS: &[TestSpec] = &[
     },
     // The single-core boot, pinned as a TEST rather than as a build configuration.
     //
+    // DELIBERATELY OVERLAPS `BC1`, which boots with one core too. I added this without noticing BC1
+    // existed, which is its own small lesson - but both are kept, for one reason: BC1 lives in the
+    // BRUTAL suite, which only runs when named (`osdev test chaos-brutal`), and it had been broken
+    // since the kernel's core-count pluralisation was fixed without anyone finding out. This one is
+    // in the suite that runs by default.
+    //
+    // A property that concealed a real kernel bug for the life of the x86 port - core 0's LAPIC id
+    // published only inside AP startup - is worth one 30-second boot in the path people actually
+    // take. If these two are ever consolidated, keep the one in the DEFAULT suite.
+    //
     // This replaces the `single-core` kernel feature, which was deleted once it had done its job
     // (backlog/02). That flag forced the state on hardware that has more cores; this asserts the
     // state §11.3 actually defines - "if zero APs come up, system runs as single-core" - by giving
@@ -713,10 +723,14 @@ static CHAOS_TESTS: &[TestSpec] = &[
 
 static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
     TestSpec {
+        // Singular. This read "1 cores ready" and was BROKEN from the moment the kernel's
+        // pluralisation was fixed - and nothing said so, because this suite only runs when asked for
+        // by name (`osdev test chaos-brutal`). A test that is not in the default path is a test that
+        // can rot silently; found by a docs-and-comments audit, not by a run.
         id: "BC1", name: "degraded_smp_1_core", spec_ref: "§22 Brutal Chaos BC1",
         kind: TestKind::DegradedSmp {
             smp:          1,
-            expect:       &["smp: 1 cores ready", "supervisor: ready"],
+            expect:       &["smp: 1 core ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 30,
         },

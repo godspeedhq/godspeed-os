@@ -805,16 +805,24 @@ fn poll_devices(
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
-    // WORK TIME, not pass count. `observe` charges CPU by sampling on the scheduler tick, so a task
-    // that wakes on EVERY tick is observed running every time it is looked at and reads as ~100%
-    // however little it actually does. This driver's poll floor is one tick, which is exactly the
-    // resonance case - and the history fits it: a 10 ms pace read 100%, a 250 ms deadline read 0%,
-    // and an accidental 1 ms deadline read 100% again. None of those distinguishes a busy driver
-    // from a cheaply-sampled one.
+    // WORK TIME, not pass count - and it settled an argument that reasoning could not.
     //
-    // So measure the work instead of inferring it, the way `xhci: alive` does. If `work` is a few
-    // milliseconds per minute the 100% is a sampling artefact and the driver is idle; if it is tens
-    // of seconds, the cost is real and belongs to whatever the pass is doing.
+    // `observe` reported this driver at 100%, and the theory offered for it was that its CPU figure
+    // is SAMPLED on the scheduler tick, so a task waking on every tick is observed running every
+    // time it is looked at. The poll floor is one tick, so that fits, and the history fits too: a
+    // 10 ms pace read 100%, a 250 ms deadline read 0%, an accidental 1 ms deadline read 100% again.
+    //
+    // THE THEORY WAS WRONG, and this counter is what proved it. With a device attached the driver
+    // measures ~35 ms of work per 60 s - 0.058% of a core - at 93 passes/sec, so the plugged-in case
+    // really is idle. Unplug the device and `observe` reads 100% and STAYS there until it is plugged
+    // back in; the cable is the switch, which no sampling artefact would care about. The cost is
+    // real and it is on the unplug path (backlog/13).
+    //
+    // Kept, and kept prominent, because a number that is argued about is a number nobody trusts: two
+    // characterisations of this symptom were published from readings that were never established to
+    // be comparable, and only the measurement ended it. The gap that remains is that this counter
+    // lives inside `poll_devices`, so the UNPLUGGED path - the one that misbehaves - still reports
+    // nothing.
     let mut passes: u64 = 0;
     let mut work_cycles: u64 = 0;
     let mut last_beat = ctx.read_tsc();

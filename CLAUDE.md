@@ -275,6 +275,12 @@ os/
     doc_refs.py          #   no doc points at a file that does not exist
     facts_check.py       #   a number a doc restates matches the code that owns it
     site_check.py        #   the 4 hand-written site pages still match the repository
+    arch_boundary_check.py #  neutral layers reach hardware ONLY through the `arch::imp` seam
+    dash_check.py        #   no em/en dashes anywhere (§21)
+    service_embed_check.py #  every managed service is really embedded in the image
+    embed_order_check.py #   the supervisor is newer than the services it embeds
+    stack_fit_check.py   #   a service's frames fit the stack it is given (§26.6.1)
+    test_report.py       #   collate a suite run into a report
     arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
 
   utilities/             # the SPEC for every shell utility, one file each (48)

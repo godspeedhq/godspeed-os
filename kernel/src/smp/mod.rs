@@ -26,7 +26,9 @@ use crate::arch::imp::BootInfo;
 /// fixed `[_; MAX_CORES]` array any more.
 pub fn percpu_init(boot_info: &BootInfo) {
     let _ = boot_info;
-    // SINGLE-CORE BUILD: size every per-core arena for the BSP alone. See kernel/Cargo.toml.
+    // Size every per-core arena from the LIVE core count the machine reports. A machine with one
+    // core gets arenas for one; the same binary on four gets four. There is no build that decides
+    // this - that flag existed, found its bug, and was deleted (backlog/02).
     let n = crate::arch::imp::ap_count() + 1; // BSP + every AP Limine enumerated (live count)
     percpu::set_num_cores(n);
     ipi::init_arenas(n);

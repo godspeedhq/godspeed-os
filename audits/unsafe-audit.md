@@ -526,6 +526,11 @@ than an error.
 Six consecutive QEMU boots now reach a shell on four cores, and `chaos max-carnage` survives 6 rounds /
 18 kills with the kernel alive. Enabled by default; the feature remains separate so a single-core image
 is one flag away if a hardware fault ever needs bisecting against it.
+*(Correction, 2026-09-07: no longer true THROUGH THE BUILD SCRIPT. `pi4_build.py --features` became
+ADDITIVE - it prepends `pi4,pi4-smp` to whatever is passed - so the script cannot produce a build
+without `pi4-smp`; that now needs a direct `cargo` invocation. The `--single-core` option that did it
+was removed with the `single-core` feature (backlog/02), on the reasoning that one artefact should
+boot on any core count. The feature itself still exists and is still pinned.)*
 
 No new `unsafe`.
 
