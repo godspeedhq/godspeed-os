@@ -98,7 +98,7 @@ fn main() {
     let is_s390x = target == "s390x-unknown-none-softfloat";
     let is_riscv32 = target == "riscv32imac-unknown-none-elf";
     let is_arm = target == "armv7a-none-eabi";
-    let use_placeholder = is_riscv64 || is_loongarch64 || is_s390x || is_riscv32 || is_arm || is_aarch64;
+    let use_placeholder = is_loongarch64 || is_s390x || is_riscv32 || is_arm || is_aarch64 || is_riscv64;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
@@ -223,6 +223,21 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         .join("aarch64-unknown-none")
         .join(&profile);
 
+    // RISC-V 64 (StarFive VisionFive 2 Lite, and QEMU `virt`). The kernel embeds exactly ONE image -
+    // the supervisor - because that is the only `SVC_*_ELF` arch-neutral kernel code references; the
+    // other three are ARM bring-up scaffolding. Everything else the system runs is embedded by the
+    // SUPERVISOR (`docs/service-ownership.md`), which is why this list is one entry and not twenty.
+    //
+    // Listed rather than "embed it if the file is there", for the reason the ARM and AArch64 blocks
+    // above spell out twice: a missing binary and an unported service look identical on disk, and
+    // silently accepting the first turns the second into `LoadFailed(TooSmall)` at boot - which reads
+    // like a corrupt image rather than a build-list omission.
+    let riscv64_built: &[&str] = &["supervisor"];
+    let riscv64_dir = workspace
+        .join("target")
+        .join("riscv64imac-unknown-none-elf")
+        .join(&profile);
+
     for (env_name, bin_name) in services {
         let elf = if is_arm {
             // A ported ARM service if its binary exists; otherwise the placeholder.
@@ -232,6 +247,11 @@ const ARM_ONLY: &[&str] = &["dwc2"];
             // A ported AArch64 service if its binary exists; otherwise the placeholder.
             let a64_bin = aarch64_dir.join(bin_name);
             if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
+        } else if is_riscv64 {
+            // The RISC-V supervisor if it has been built; otherwise the placeholder, so the kernel
+            // still links for the boundary test even when no userspace has been cross-compiled.
+            let rv_bin = riscv64_dir.join(bin_name);
+            if riscv64_built.contains(bin_name) && rv_bin.exists() { rv_bin } else { placeholder.clone() }
         } else if use_placeholder {
             placeholder.clone()
         } else if ARM_ONLY.contains(bin_name) {

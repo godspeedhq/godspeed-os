@@ -112,6 +112,60 @@ pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     ret
 }
 
+/// RISC-V 64: `ecall`, with the syscall number in `a7` and arguments in `a0`-`a2`.
+///
+/// The platform's own convention, which is what the kernel's `ecall` entry answers
+/// (`arch/riscv64/syscall.rs`): number in `a7`, three arguments in `a0`-`a2`, result back in `a0`.
+/// Unlike AArch64 there is no register to argue about - `a7` is where every RISC-V ABI in existence
+/// puts a syscall number, including SBI, so nothing else can be holding a live value there.
+///
+/// **Nothing is truncated.** The registers are 64-bit, so a `u64` argument passes whole and the
+/// `i64` result comes back in one register. The class of bug the 32-bit ARM path must guard against
+/// - an LBA or a tick count aliasing once it exceeds 32 bits - does not arise here.
+///
+/// **`nostack` is correct, and it is correct because of `sscratch`.** The trap lands on the task's
+/// KERNEL stack, swapped in by the trap entry, so the user stack is untouched across the call. That
+/// is a property the kernel establishes rather than one the instruction guarantees; if that latch
+/// were ever removed the option would become a lie, which is why it is named here.
+///
+/// The caller-saved set is declared clobbered even though this kernel's trap entry currently saves
+/// and restores ALL 31 registers. Relying on that would make the SDK depend on an implementation
+/// detail of one handler rather than on the ABI, and a future fast path that saved less would break
+/// services silently rather than at the seam.
+///
+/// # Safety
+/// Caller must pass valid arguments for the given syscall number.
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: `ecall` from U-mode raises an environment-call exception, which the kernel's trap
+    // vector routes to the syscall dispatcher; it services the call and returns with `a0` holding
+    // the result. Every caller-saved register is declared clobbered rather than assumed to survive.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") nr,
+            inout("a0") a0 => ret,
+            inout("a1") a1 => _,
+            inout("a2") a2 => _,
+            lateout("a3") _,
+            lateout("a4") _,
+            lateout("a5") _,
+            lateout("a6") _,
+            lateout("t0") _,
+            lateout("t1") _,
+            lateout("t2") _,
+            lateout("t3") _,
+            lateout("t4") _,
+            lateout("t5") _,
+            lateout("t6") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {

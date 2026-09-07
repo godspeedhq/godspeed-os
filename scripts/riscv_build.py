@@ -15,15 +15,43 @@ Two machines, one arch. QEMU `virt` enters the kernel at 0x8020_0000; the StarFi
 enters at 0x4020_0000. `--visionfive` selects the board linker script and emits a FLAT BINARY, which
 is what U-Boot's `booti` loads - an ELF is fine for QEMU's `-kernel` and useless to U-Boot.
 
+USERSPACE IS BUILT HERE TOO, and in the right order. The kernel embeds ONE image - the supervisor -
+and the supervisor embeds every service it spawns, so a supervisor built before the services it
+carries embeds STALE ones. That is not a hypothetical: it shipped on both Pi ports and made several
+"confirmations" tests of code that was not running. `embed_order_check.py` is the guard, and it only
+guards a path that runs it.
+
+RELEASE, for userspace, always. A debug service carries frames many times larger than its user stack
+- the arm32 port found this as `fs` crash-looping on a 503 KiB `service_main` frame against a 256 KiB
+stack - and a debug supervisor embedding debug services is 40 MB of `.rodata`. `--release` is
+therefore forced for the userspace half regardless of what the kernel half is built as.
+
 Usage:
     py scripts/riscv_build.py [--release] [--features F]     QEMU `virt` (ELF)
     py scripts/riscv_build.py --release --visionfive         the board  (flat .img)
+    py scripts/riscv_build.py --release --no-userspace       kernel only (placeholder supervisor)
 """
 
 import os, shutil, subprocess, sys
 
 ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGET = "riscv64imac-unknown-none-elf"
+
+
+# Every service the SUPERVISOR embeds, which is what its own `build.rs` demands be on disk before it
+# will link. Not a subset: the supervisor's list is the source of truth, and a missing entry there is
+# a hard panic rather than a placeholder, so this list either matches it or the build stops.
+#
+# `probe` is absent deliberately, and for the same reason it is absent on ARM: it is the adversarial
+# test service, and the SDK's fault primitives it calls (`fault_noncanonical_read`,
+# `fault_divide_by_zero`) are x86 instructions. The supervisor is therefore built with `bare-metal`,
+# which is the feature that drops `probe` from its embedded set - the same posture a real board takes
+# anyway, since a bare-metal image ships no adversary (§4.4).
+SERVICES = [
+    "events", "recorder", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
+    "ping", "pong", "greet", "upper", "roster", "counter", "reply-server", "asker",
+    "resource-server", "holder", "block-driver", "fs", "nic-driver", "net-stack",
+]
 
 
 def run(cmd, **kw):
@@ -65,13 +93,35 @@ def main():
         feats = ["--features", ",".join(want)]
 
     gates()
+
+    # Userspace FIRST, and in dependency order: every service, then the supervisor that embeds them,
+    # then the kernel that embeds the supervisor. Building the other way round embeds whatever was
+    # last on disk, which is the stale-image trap this comment exists to prevent.
+    if "--no-userspace" not in sys.argv:
+        for svc in SERVICES:
+            run(["cargo", "build", "-p", svc, "--target", TARGET, "--release"])
+        run(["cargo", "build", "-p", "supervisor", "--target", TARGET, "--release",
+             "--features", "bare-metal"])
+        sup = os.path.join(ROOT, "target", TARGET, "release", "supervisor")
+        if not os.path.exists(sup):
+            sys.exit("supervisor did not build; the kernel would silently embed a placeholder")
+        print("OK  userspace: %d services + supervisor (%d bytes)" % (len(SERVICES), os.path.getsize(sup)))
+
     run(["cargo", "build", "-p", "kernel", "--target", TARGET] + feats + rel)
 
     elf = os.path.join(ROOT, "target", TARGET, prof, "kernel")
     if not os.path.exists(elf):
         sys.exit("kernel ELF not found at %s" % elf)
+    # A kernel that embedded the PLACEHOLDER instead of the supervisor links, boots, and fails at
+    # `spawn_supervisor` with `LoadFailed(TooSmall)` - which reads like a corrupt binary rather than a
+    # build-order mistake. The size difference is unmistakable, so it is stated here rather than
+    # discovered there.
+    ksize = os.path.getsize(elf)
     print("OK  %s  (%d bytes, target=%s, profile=%s%s)"
-          % (elf, os.path.getsize(elf), TARGET, prof, ", board=visionfive" if board else ""))
+          % (elf, ksize, TARGET, prof, ", board=visionfive" if board else ""))
+    if "--no-userspace" not in sys.argv and ksize < 1_000_000:
+        print("WARNING: the kernel is small enough that it probably embedded the PLACEHOLDER")
+        print("         supervisor rather than the real one. Check kernel/build.rs `riscv64_built`.")
 
     if not board:
         print("Boot in QEMU:  py scripts/riscv_run.py%s" % (" --release" if rel else ""))

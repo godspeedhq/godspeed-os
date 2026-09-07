@@ -456,6 +456,15 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     usermode::selftest();
     usermode::task_selftest();
 
+    // THE KERNEL'S ONE DIRECT SPAWN. Everything above is scaffolding proving a mechanism; this is the
+    // first time neutral kernel code is asked to do the real thing on this ISA - parse a 2 MB ELF,
+    // build an address space for it, and make a task out of it. Loud on failure by construction: a
+    // boot-time supervisor spawn failure is a panic (§11.3), so there is no quiet way for this to
+    // half-work.
+    crate::task::spawn_supervisor();
+    print_str("riscv64: returned from spawn_supervisor
+");
+
     // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
     //
     // A guard never observed firing is not evidence - and this one is invisible when it works, so
