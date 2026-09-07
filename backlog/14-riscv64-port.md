@@ -140,6 +140,38 @@ S-mode entry, and the UART - which is exactly the set of assumptions that cannot
 to 0x1000_0000 directly and does not depend on the FDT, so a silent board means it never reached
 `_start` rather than that it failed later.
 
+## Verification reference: what the FDT parser must PRODUCE
+
+**These are not constants to hard-code.** The whole point of the parser is that the kernel asks the
+machine instead of being told which board it is on. They are recorded so a parser can be checked
+against something, and because two independent sources agreeing is worth more than either alone: the
+board's own Debian boot log, and the DTB shipped in the vendor image.
+
+| fact | device tree | Linux on the board |
+|------|-------------|--------------------|
+| RAM base | `/memory@40000000` base 0x4000_0000 | `DRAM: 8 GiB` |
+| PLIC | `/soc/interrupt-controller@c000000`, `sifive,plic-1.0.0`, 0x4000000 long | `riscv-plic: interrupt-controller@c000000: 136 interrupts, 9 contexts` |
+| CLINT | `/soc/timer@2000000`, `sifive,clint0` | `clint: timer@2000000` (Linux then declines it) |
+| UART0 | `/soc/serial@10000000`, `snps,dw-apb-uart`, reg-shift 2, io-width 4, irq 32 | `ttyS0 at MMIO 0x10000000 (irq = 44) is a 16550A` |
+| timebase | `aclint-mtimer @ 4000000Hz` (OpenSBI) | `sched_clock: 64 bits at 4MHz, resolution 250ns` |
+| harts | `cpu@0` = `sifive,s7`, **`status = disabled`**; `cpu@1..4` = `sifive,u74-mc` | `CPU with hartid=0 is not available`; `Brought up 4 CPUs` |
+
+**The device tree already says not to use hart 0** - `status = "disabled"` on the S7 monitor core. So
+"do not assume the boot hart" is not a special case to remember; it falls out of reading `status`
+honestly. An arch that enumerates harts from the FDT gets the right answer without knowing it is a
+JH7110.
+
+**AND THE FILE ON DISK IS NOT THE TREE WE ARE GIVEN.** The DTB in the vendor image declares
+`/memory@40000000` with size 0x1_0000_0000 (4 GiB); the board has 8 GiB and U-Boot says so
+(`LPDDR4: 8G`). U-Boot PATCHES the memory node from what the SPL detected before passing it on. So a
+parser that reads the runtime pointer in `a1` learns the truth, and one that trusts a DTB from disk
+would size RAM at half the machine. This is the single strongest argument for parsing the FDT rather
+than shipping constants, and it was found by comparing the two rather than by reasoning.
+
+Also worth carrying forward: OpenSBI on this board reports `Boot HART ISA Extensions : none`, where
+QEMU lists `sstc`. So the timer must go through an SBI call rather than the Sstc extension - another
+place where the emulator offers a capability the hardware does not.
+
 ## What is stubbed, in the order it probably wants doing
 
 1. **Read the FDT.** Everything else needs it, and it removes the last hard-coded address (the 16550
