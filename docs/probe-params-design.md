@@ -1,6 +1,6 @@
 # Probe parameters at spawn: taking 193 policy rows out of the kernel
 
-**Status:** BUILT, on `feat/supervisor-owns-images`. The pin moved 221 -> 29 and
+**Status:** BUILT and MERGED (released in v0.13.0). The pin moved 221 -> 29 and
 `kernel/src/task/mod.rs` lost 2,317 lines.
 **Scope:** test probes only. Real services are untouched by this step.
 

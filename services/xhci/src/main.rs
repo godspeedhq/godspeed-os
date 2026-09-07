@@ -3639,12 +3639,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // was the one that halted. Same ring, same rule, and now the same code shape.
         let mut disk_hub_cur = disk.as_ref().map(|d| d.hub_off).unwrap_or(0);
         let mut disk_hub_pcs = 1u32;
-        let mut quiet_waits: u32 = 0;
         // One-shot latches so the mode is stated once each way, not on every pass.
         let mut poll_noted = false;
         let mut irq_noted = false;
         // Set only when a wait actually ended in a delivered event.
         let mut irq_seen = false;
+        // PROOF that interrupts are not delivering this machine's HID input, and therefore that the
+        // input latency floor has to be polled for. Set when a report is harvested on a pass that no
+        // interrupt woke - i.e. we slept the full deadline and the keystroke was sitting there. That
+        // is an OBSERVATION, not an inference: had the interrupt delivered it, the wait would have
+        // returned early carrying the vector.
+        //
+        // Why it is needed at all: the deadline below dropped to `HUB_POLL_MS` (500 ms) for an idle
+        // bound HID on the strength of "with interrupts genuinely arriving, a report WAKES us". On a
+        // machine where they do not arrive, that assumption costs half a second per keystroke - the
+        // T630 booted single-core types at 2 Hz with `0 MSI` in its own heartbeat. The file's older
+        // rule was "A BOUND HID means the short deadline, full stop - interrupts or not", which is
+        // correct but pays ~100 wakes/sec everywhere. This keeps the fast floor where it is EARNED
+        // and the slow one where interrupts are doing the job, and decides by measurement.
+        let mut hid_needs_poll = false;
+        let mut hid_poll_noted = false;
+        // Was THIS pass woken by an interrupt? Declared out here because the harvest sites are far
+        // below the wait and `is_irq` does not reach them.
+        let mut irq_this_pass = false;
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
@@ -3884,7 +3901,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // that "MSI not reaching us" and made normal idle read as a broken feature.
                 // What matters is whether the interrupt line ever worked, which the companion
                 // message states from an observed delivery.
-                ctx.log("xhci: polling at the 10ms tick alongside interrupts (input latency floor)");
+                ctx.log("xhci: HID bound - waking on interrupts, hub watchdog at 500ms");
                 poll_noted = true;
             }
             // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
@@ -3893,6 +3910,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // received an interrupt, and the later fallback line read as "MSI worked then stopped".
             // It had never started. A diagnostic that reports an ASSUMPTION as an observation is
             // worse than none: it cost a whole debugging round pointed at the wrong mechanism.
+            if hid_needs_poll && !hid_poll_noted {
+                // Not a warning: the driver has RECOVERED the latency, and says so with the reason.
+                // Without this line a machine at the fast floor and a machine at the slow one look
+                // identical in the log, which is how the 500 ms floor survived being shipped.
+                ctx.log("xhci: a HID report arrived with no interrupt - polling input at the 10ms tick (interrupts are not covering this controller's HID)");
+                hid_poll_noted = true;
+            }
             if irq_seen && !irq_noted {
                 ctx.log("xhci: waking on interrupts (MSI) - not polling");
                 irq_noted = true;
@@ -3939,9 +3963,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ~28 ms per wait) matches NEITHER the 10 ms repeat branch (100/sec) nor the 500 ms idle
             // branch (2/sec), and only 5.6 wakes/sec come from messages. Reading the code cannot say
             // which; counting can.
-            if repeat_armed { fast_waits = fast_waits.saturating_add(1); }
+            // Counted from the deadline ACTUALLY TAKEN, not from `repeat_armed` alone. Splitting on
+            // `repeat_armed` was right while it was the only fast branch; with the polling floor added
+            // it charged ~92 wakes/sec to "idle", and the T630 log read `5690 idle` for a driver
+            // running flat out at the tick. An instrument that reports the wrong mode is how a 500 ms
+            // input floor went unnoticed in the first place - it does not get to happen twice.
+            let wake_fast = repeat_armed || (polling && hid_needs_poll);
+            if wake_fast { fast_waits = fast_waits.saturating_add(1); }
             else { idle_waits = idle_waits.saturating_add(1); }
-            let deadline = if repeat_armed {
+            //
+            // `hid_needs_poll` is the third branch, and it is the one that makes this correct on a
+            // machine whose interrupts never arrive. The two above it are both right ONLY while the
+            // controller is actually raising MSIs for HID completions: `repeat_armed` covers a held
+            // key (which emits no new USB traffic, so no interrupt can drive the repeat), and the
+            // idle branch assumes a keystroke will wake us early. Where that assumption is false the
+            // idle branch IS the keystroke path, and 500 ms of it is the lag a user reports as "the
+            // typing went slow after I moved the keyboard to the xHCI port".
+            //
+            // So it is not assumed either way. The driver watches whether a report ever turns up on
+            // a pass no interrupt woke, and if one does it stops relying on interrupts for input
+            // from then on. Interrupt-driven boards never set it and keep the 2-wakes/sec idle that
+            // the power work bought; boards where MSI is silent - or is delivered but not for HID -
+            // pay one slow keystroke, once, and are at the tick floor forever after.
+            let deadline = if wake_fast {
                 base
             } else if polling {
                 ctx.duration_cycles(HUB_POLL_MS)
@@ -3977,6 +4021,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 woke.as_ref().is_some_and(|m| m.payload_bytes() == [v])
             });
             if is_irq { msi_count = msi_count.saturating_add(1); }
+            // Assigned, not or-ed: this is a property of the pass, and it must CLEAR on a timeout.
+            irq_this_pass = is_irq;
             // Woken by a message that is NOT an interrupt - i.e. a block request, or anything else
             // addressed to this endpoint. Counted because the arithmetic says something is: the idle
             // deadline is HUB_POLL_MS (2 wakes/sec) and MSI runs ~5/sec, yet the loop turns ~39
@@ -4000,7 +4046,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
             }
-            if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
             if is_irq { irq_seen = true; }
             if let Some(m) = woke {
                 if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
@@ -4094,6 +4139,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
                             deliver_hid_report(&ctx, &dma, d, &devs, &mut kb_last,
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
+                            if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
                             need_queue[d] = true;
                         } else if devs[..ndev].iter().any(|h| h.hub_slot == slot_id) {
                             // A hub's completion, dequeued here with no probe waiting - it arrived
@@ -4720,6 +4766,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if devs[k].slot < 32 && eaten.have & (1 << devs[k].slot) != 0 {
                         deliver_hid_report(&ctx, &dma, k, &devs, &mut kb_last,
                                            &mut kb_rep, &mut kb_caps, &mut mouse);
+                        if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
                         need_queue[k] = true;
                     }
                 }

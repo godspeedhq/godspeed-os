@@ -36,6 +36,7 @@ there and why, so when in doubt, open the one nearest the code you are editing.
 | Add or change a test | `tests/CLAUDE.md`, then the category under `tests/qemu/` |
 | Know the full law and the instant-reject list | [`CLAUDE.md`](CLAUDE.md) (the constitution; section 21 is the reject list) |
 | Check my change against the anti-patterns before I open a PR | [`docs/anti-patterns.md`](docs/anti-patterns.md) - the field guide to constitutional violations, each paired with the correct pattern |
+| Find something to work on, or check a bug is not already known | [`backlog/`](backlog/README.md) - open items, each with its evidence, what is RULED OUT, and the next step |
 
 ## Building and testing
 

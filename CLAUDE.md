@@ -259,12 +259,41 @@ os/
   audits/                # append-only EVIDENCE, not documentation
     unsafe-audit.md      #   every unsafe block; CI checks it matches source
     kernel-audit.md  security-audit.md  userspace-audit.md  documentation-audit.md
+    2026-07-15-full-trilogy-report.md  #   a dated run of all of them at once
 
   tests/
     qemu/
       identity/            # identity test suite (§22)
       harness/             # shared test infrastructure
       perf/                # performance benchmarks (§22 B1-B10) - 10/10 ✅
+
+  scripts/               # THE ENFORCEMENT LAYER, and the non-x86 build paths
+    commandments.py      #   the Ten Commandments, mechanised where they can be
+    commandments_redteam.py #  probes that BREAK each check, so a dead check is caught
+    contract_check.py    #   every contract matches its kernel service_config
+    unsafe_check.py      #   the unsafe audit matches the source
+    doc_refs.py          #   no doc points at a file that does not exist
+    facts_check.py       #   a number a doc restates matches the code that owns it
+    site_check.py        #   the 4 hand-written site pages still match the repository
+    arch_boundary_check.py #  neutral layers reach hardware ONLY through the `arch::imp` seam
+    dash_check.py        #   no em/en dashes anywhere (§21)
+    service_embed_check.py #  every managed service is really embedded in the image
+    embed_order_check.py #   the supervisor is newer than the services it embeds
+    stack_fit_check.py   #   a service's frames fit the stack it is given (§26.6.1)
+    test_report.py       #   collate a suite run into a report
+    arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
+
+  utilities/             # the SPEC for every shell utility, one file each (48)
+    0_conventions.md     #   the 13 rules every utility obeys
+  website/               # the published book (mdBook); pages `{{#include}}` the
+                         #   sources above, so a doc and its page cannot drift
+  backlog/               # open items - recorded rather than closed (§26.7)
+  boot/                  # per-board boot config (pi2/, pi4/)
+  contracts/schema/      # the JSON Schema a service contract is validated against
+  examples/              # 12 worked services
+  milestones/            # what was achieved and when; ALMANAC.md is the chronicle
+  bugs/                  # long-form investigations of four specific hardware bugs
+  editors/               # syntax files for the gsh shell language
 ```
 
 ---
@@ -1481,7 +1510,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 ```text
   ┌─────────────────────────────────────────────────────────────────────┐
   │  Foundation - must pass before anything else                        │
-  │  Identity (§22) - Tests 1-11 ✅ - Constitutional invariants        │
+  │  Identity (§22) - Tests 1-15 ✅ - Constitutional invariants        │
   └──────────────────────┬──────────────────────────────────────────────┘
           ┌──────────────┴─────────────────┐
           ▼                                ▼

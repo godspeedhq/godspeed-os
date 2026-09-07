@@ -26,6 +26,9 @@ use crate::arch::imp::BootInfo;
 /// fixed `[_; MAX_CORES]` array any more.
 pub fn percpu_init(boot_info: &BootInfo) {
     let _ = boot_info;
+    // Size every per-core arena from the LIVE core count the machine reports. A machine with one
+    // core gets arenas for one; the same binary on four gets four. There is no build that decides
+    // this - that flag existed, found its bug, and was deleted (backlog/02).
     let n = crate::arch::imp::ap_count() + 1; // BSP + every AP Limine enumerated (live count)
     percpu::set_num_cores(n);
     ipi::init_arenas(n);
@@ -39,6 +42,13 @@ pub fn percpu_init(boot_info: &BootInfo) {
 
 pub fn init(boot_info: &BootInfo) {
     core::init(boot_info);
+    // Core 0's LAPIC id, published BEFORE any AP starts. On x86 this used to happen inside
+    // `start_all_aps`, so a boot that started no APs never did it at all and core 0's identity
+    // stayed an unwritten 0 - which is worse than absent, because callers ask `is_ready` first, get
+    // true, and then trust the zero. See `publish_bsp_lapic_id`.
+    crate::arch::imp::publish_bsp_lapic_id();
+    // Start whatever APs the machine reports. A machine with none reaches the single-core path by
+    // REPORTING none (11.3), not by being built differently - one artefact, every core count.
     // SAFETY: BSP APIC is already initialised in arch::imp::init_timer.
     unsafe { crate::arch::imp::ap_boot::start_all_aps(boot_info) };
 }

@@ -13,9 +13,14 @@ kernel itself.
 
 ## Where to start
 
-This site is a rendered view of the project's own documents. Nothing here is written twice: each
-page below pulls the real file straight from the repository, so the site can never drift from the
-source (that is [Commandment III](commandments.md) applied to the docs themselves).
+This site is a rendered view of the project's own documents. Seventy of its seventy-four pages -
+including every one linked below - are a two-line stub that pulls the real file straight from the
+repository, so they cannot drift from the source (that is [Commandment III](commandments.md) applied
+to the docs themselves). The four exceptions are written for the site because they have no file to be
+a view of: this page, the [Gallery](gallery.md), the [Services](services.md) tour and the
+[Utilities](utilities.md) index. Those four are checked against the repository on every build
+instead - that a utility has a row, that a service's peers match its contract - because prose someone
+wrote is prose that can go stale.
 
 - **[The Ten Commandments](commandments.md)** - the human-readable distillation of the whole
   design. Ten laws that bound every decision. Start here.

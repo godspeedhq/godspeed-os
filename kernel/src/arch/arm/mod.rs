@@ -1275,6 +1275,16 @@ pub fn usb_disk_flush() -> bool { false }
 /// No-op: this arch counts every IRQ in `irq::arm_irq_dispatch`, which sees them all.
 pub fn note_irq(_vector: u32) {}
 
+/// Publish this core's identity for interrupt-destination programming, once, at `smp::init`.
+///
+/// Part of the `arch::imp` seam because the neutral scheduler needs it done BEFORE the branch that
+/// decides whether to start APs - on x86 the work used to live inside AP startup, so a single-core
+/// build skipped it and every fallback MSI was addressed to core 0's unwritten id.
+///
+/// ARM publishes each core's id from its own bring-up (`set_core_lapic_id(core_id, core_id)`),
+/// unconditionally and independently of AP startup, so there is nothing left to do here.
+pub fn publish_bsp_lapic_id() {}
+
 pub fn core_irq_debug(core: u32) -> (u32, u32) {
     irq::core_irq_debug(core)
 }

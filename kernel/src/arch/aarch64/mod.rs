@@ -1319,6 +1319,16 @@ pub fn usb_disk_flush() -> bool { false }
 /// No-op: this arch counts every IRQ in its own dispatcher, not on the timer path.
 pub fn note_irq(_vector: u32) {}
 
+/// Publish this core's identity for interrupt-destination programming, once, at `smp::init`.
+///
+/// Part of the `arch::imp` seam because the neutral scheduler needs it done BEFORE the branch that
+/// decides whether to start APs - on x86 the work used to live inside AP startup, so a single-core
+/// build skipped it and every fallback MSI was addressed to core 0's unwritten id.
+///
+/// AArch64 publishes core 0 unconditionally at boot (`set_core_lapic_id(0, 0)`), which is the
+/// thing x86 was missing, so there is nothing left to do here.
+pub fn publish_bsp_lapic_id() {}
+
 pub fn core_irq_debug(core: u32) -> (u32, u32) {
     exceptions::core_irq_debug(core)
 }

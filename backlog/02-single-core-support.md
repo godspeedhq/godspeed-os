@@ -1,5 +1,33 @@
 # 2. GodspeedOS on ONE core - does it actually work, and what has been hiding behind SMP?
 
+> **CLOSED 2026-09-07. It works, and the build flag that proved it has been REMOVED.**
+>
+> Verified on all four machines - HP T630 (AMD), Wyse 5070 (Intel), Pi 4 (aarch64), Pi 2 (arm32) -
+> each with selfcheck, a 100-round chaos storm and hot-plug: 0 failures, 0 kernel panics, 0 liveness
+> wedges.
+>
+> **It found the bug it was written to find.** Core 0's LAPIC id was published only inside
+> `start_all_aps`, so a boot that started no APs never published it and every interrupt aimed at a
+> driver's own core went to APIC id 0. On the T630, whose BSP is id 16, that cost the xHCI every
+> interrupt it should have had (500 ms per keystroke) and made the EHCI's busy-poll load-bearing
+> (100% of a core). Two symptoms, one cause, invisible to every test because QEMU's BSP really is 0 -
+> the wrong value was accidentally right on the only machine CI runs on. Fixed in 091d9b41.
+>
+> **The flag is gone because its job is done, and because a flag is a second artefact.** The premise
+> was always that §11.3 defines this state anyway ("if zero APs come up, system runs as single-core")
+> and the flag only FORCED it on hardware that has more cores. Keeping it would leave a second kernel
+> configuration to build, ship and regress-test forever, in exchange for a diagnostic that has already
+> reported. The precedent is in the constitution: the `xhci-userspace` flags were deleted once the
+> userspace driver was proven, on the reasoning that a flag selecting between two kernels leaves the
+> other one build away.
+>
+> One artefact boots on one core or many. A machine with one core reaches that path by REPORTING one
+> core, not by being built differently - which is the property that was actually wanted here.
+>
+> The residual findings are `backlog/13` (EHCI holds a core while a device is unplugged; xHCI
+> `Enable Slot` timeouts). Neither is single-core-specific and neither costs a test failure.
+
+
 **Severity:** feature, and an audit of everything "put it on another core" ever settled.
 **Status:** first experiment run 2026-09-06. It BOOTS. What that proves is narrower than it looks.
 
@@ -31,13 +59,22 @@ So this is not a new feature request. It is checking a promise the document alre
 
 ## What it did NOT show, and must not be read as showing
 
+*(Written after the first 180 s QEMU boot. All three were answered by the hardware runs recorded in
+the CLOSED banner above - the storage stack, chaos, and the soak were each exercised on one core on
+every machine. Kept because what a first result does NOT show is the most useful thing to write down
+at the time, and because the answers only count as answers against the questions as they were asked.)*
+
 - **`fs` never started, and that is the BUILD, not single-core.** This was the identity build,
   which is probe-heavy and carries no `fs`. A single-core test of the storage stack has not been
-  run at all yet.
+  run at all yet. -> ANSWERED: bare-metal single-core runs on all four machines exercise the full
+  storage stack; `selfcheck` covers the filesystem and passed 0-fail on every one.
 - 180 s is a window, not a soak. Starvation and priority inversion are exactly the faults that need
-  longer than that to show.
+  longer than that to show. -> ANSWERED at a longer window: selfcheck + 100 chaos rounds + hot-plug
+  + selfcheck per machine, 0 wedges and 0 panics. Not a 24-hour soak, which remains untried on one
+  core.
 - No chaos was run single-core. `chaos max-carnage` on one core is the interesting case, because
-  every kill and respawn now contends with the shell for the same quantum.
+  every kill and respawn now contends with the shell for the same quantum. -> ANSWERED: 100 rounds
+  on each of the four machines, single-core and multi-core alike.
 
 ## What the contracts currently pin
 
@@ -53,6 +90,155 @@ workaround that happened to help?** 9.2's own guidance is "contract authors shou
 placement only when they have a real reason". Whatever the answers, they should be written into
 the contracts as comments, because right now the reason for `ehci -> core 3` is not recorded
 anywhere.
+
+## How it WAS run (historical - the flag no longer exists)
+
+*(The `single-core` feature was deleted when this item closed; see the banner above. The commands
+below no longer work and are kept only to record how the hardware runs were produced. To exercise
+the single-core path today: chaos test **C1B** (`osdev test chaos`) boots QEMU with one core, and any
+machine that genuinely has one core reaches the same path by reporting one core.)*
+
+**No new kernel feature, deliberately - at first.** The first attempt added `single-core` to
+`kernel/Cargo.toml` and the enforcement layer refused it:
+
+```
+Commandment I - kernel feature flags are pinned
+  new kernel feature 'single-core': a switch on what the kernel IS, which can add a
+  responsibility no other pin sees
+  An exemption is legitimate ONLY if a CLAUDE.md amendment already accepts it.
+```
+
+That is the aarch64 lesson enforced mechanically - *a flag that selects between a compliant and a
+non-compliant kernel leaves the violation one build away*. The flag was later admitted deliberately,
+with a written rationale in `COMMANDMENTS.baseline.toml`, because there was no external way to force
+the state on two of the three machines - and then **removed again** once it had found its bug, on
+exactly the reasoning the check had raised in the first place. The check was right both times.
+
+| machine | how (no longer available) |
+|---------|---------------------------|
+| **x86** | `KERNEL_FEATURES=single-core cargo run -p osdev -- image` |
+| **Pi 2** | `py scripts/arm_build.py --release --feature single-core` |
+| **Pi 4** | `py scripts/pi4_build.py --release --single-core` (omitted the already-pinned `pi4-smp`) |
+| any, QEMU only | `cargo run -p osdev -- run --smp 1` - **still works**, needs no build change |
+
+**Checking the log (historical).** While the flag existed, a single-core kernel announced itself:
+
+```
+smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/02)
+smp: 1 cores ready
+```
+
+and the image carried the string, so `grep -ac "SINGLE-CORE BUILD" build/os-usb.img` said what you
+were about to flash. That check existed because two hardware runs were wasted without it: the first
+image predated the feature, and a QEMU run was made against a kernel `osdev run` had quietly rebuilt
+without it.
+
+**Neither line exists now.** The announcement went with the flag, and the core count reads
+`smp: 1 core ready` - singular, fixed while this item was open, because a log that cannot count its
+own subject invites a reader to wonder what else it is approximating. What replaces the image-grep is
+better than it: there is only one image, so there is nothing to check.
+
+### Why a kernel feature after all
+
+The first attempt was refused by `scripts/commandments.py` (Commandment I, kernel feature flags are
+pinned) and the external routes were tried first. They do not exist: the **Wyse 5070 firmware has
+no core-count setting**, and **Limine's protocol has no core limit** - the APs come from the
+kernel's own `MpRequest`, so nothing outside the kernel can withhold them. QEMU's `-smp 1` covers
+QEMU alone.
+
+So it WAS pinned in `COMMANDMENTS.baseline.toml` with that reasoning. It added no kernel
+responsibility: it removed the AP-start call and pinned the arena count at 1, reaching the state
+11.3 already defines. Default builds stayed byte-identical - verified by booting one and watching it
+come up on four cores with services on 1, 2 and 3.
+
+**And then it was removed, on the same reasoning the check had raised.** A pin is a licence to ship a
+second kernel, and the argument for holding one is only as good as the job it is doing. Once the flag
+had found its bug (the LAPIC id, see the banner) that job was over, and what remained was a
+configuration to build, ship and regress-test forever. The coverage moved to chaos test **C1B**, which
+boots QEMU with one core - so the property is pinned by a test rather than by a build, and the
+enforcement layer has one less flag to carry. `scripts/commandments.py` was right to refuse it, right
+to accept it with a rationale, and right that it should not outlive the rationale.
+
+## RESULT: it works, on four machines and three architectures
+
+**Raspberry Pi 4 (aarch64), 2026-09-06:** 450/0 x3, 100 rounds of Maximum Carnage, 611 kills, 500
+floods, zero panics, zero liveness wedges. Cost: **1.6x slower for 4x fewer cores** - a selfcheck
+took 43 s against 26 s on four. Predictable degradation, no correctness cliff.
+
+**HP T630 (x86_64, AMD), 2026-09-06:** 460/0 x3 through selfcheck + 100 chaos rounds + selfcheck +
+hotplug, zero panics, zero wedges, zero silent resets - **with `ehci` running**, once the EHCI BIOS
+handoff was fixed (backlog/11).
+
+**Raspberry Pi 2 (arm32), 2026-09-06:** 452/0 x3 through the same sweep. The most demanding of the
+four for this question: storage, keyboard AND networking all ride one `dwc2` controller with no
+companion, so if "USB on one core" were a general problem this is where it would have shown. It did
+not.
+
+**Dell Wyse 5070 (x86_64, Intel), 2026-09-06:** 459/0 x3. Also the control that proved the T630's
+fault was EHCI-specific rather than single-core-general: this machine reports `no EHCI controller
+(PCI scan)` and was clean from the first run.
+
+**ALL FOUR MACHINES PASS.** Three instruction sets, four USB topologies, one core each.
+
+So the question this item was raised to answer is answered: **the architecture does not depend on
+having spare cores to spread a problem across.** Where a scheduling or liveness fault had previously
+been "fixed" by moving a service to another core, removing the second core did not bring it back.
+195 distinct services and 729 spawns coexisted on one core in the QEMU identity build without a wedge.
+
+## What single-core FOUND, which is the other half of the point
+
+**1. A count-is-not-a-duration bug in `ehci` (fixed, 35b335e1).** `wait()` was `while i < 2_000_000`
+with no yield - an iteration bound bounds nothing in wall-clock, since each turn is an uncached MMIO
+read across PCIe. On four cores the driver has a core to itself and it merely looks rude; on one core
+it is a service spinning on the only core the machine has. Now a 250 ms deadline with `yield_cpu`
+between polls, matching the pattern `xhci` already used.
+
+**2. `PlacementInvalid` is never constructed (backlog/01).** Every service ran on core 0 whatever its
+contract asked for. That defect was found by this experiment on its first boot.
+
+**3. ROOT-CAUSED (now backlog/11): `ehci` resets a controller the BIOS still owns.** The step
+logging named the exact fatal instruction - the `HCRESET` write - and the registers showed the
+firmware actively running the controller (`RS=1`, periodic schedule live) with a USBLEGSUP capability
+present at `eecp=0xa0` that this driver has never honoured. An SMI is serviced on the core that
+raised it, so four cores absorb it and one core does not. Full treatment and the options in
+[`11-ehci-bios-handoff.md`](11-ehci-bios-handoff.md). Original notes below, kept because the ruling
+out is still useful:
+
+**3a. The symptom as first observed.** Two distinct symptoms, both silent
+resets with no panic - which is a PCI bus wedge, not a software fault. The same signature is already
+documented in `services/xhci/src/main.rs`: an operational-register access mid-reset "WEDGED THE PCI
+BUS - freezing every core... the log died between `halted` and `done`".
+
+  - **With `ehci` spawned:** the machine reboot-loops during USB bring-up. Three boots, dying at a
+    varying point in the xHCI reset - `reset: entering` once, `reset: halted` twice.
+  - **With `ehci` NOT spawned:** it boots, and selfcheck plus 100 chaos rounds pass clean (driven
+    from serial). Typing on the USB keyboard reboots it; typing on serial does not.
+
+    **That second symptom is an ARTIFACT OF THE BISECT, not a single-core finding**, and the
+    correction matters more than the observation. The T630's back sockets are wired to the EHCI
+    controller, not the xHCI - `services/ehci/src/main.rs` says so in its own header, and the run
+    confirms it: `xhci: no HID keyboard/mouse on any port`, all eight ports `connected=0`. Removing
+    the `ehci` service removed the driver for the controller the keyboard is plugged into, so the
+    firmware's legacy USB keyboard emulation still owned it. Every keystroke then enters a BIOS SMM
+    handler that does DMA on a device behind an IOMMU we have since switched on (`translation ON`),
+    for a controller whose BIOS ownership handoff this driver has never performed (`eecp=0xa0` is
+    present; the code calls handoff future work). A silent platform reset is an unsurprising outcome.
+
+    So the bisect answered its question - `ehci` IS implicated in symptom one - and introduced a
+    second symptom of its own. It says nothing about the xHCI HID path, which never saw a device.
+
+  RULED OUT, so nobody re-derives them: not `ehci` interleaving during xhci's CNR window (`spin()`
+  does not yield, so nothing else runs there); not an uninitialised schedule pointer (HCRESET
+  completes cleanly, and the schedules are disabled after it); not a regression (the T630 is fine
+  multi-core). NOT explained: why one core differs at all, when four cores run both drivers genuinely
+  simultaneously, which should be worse. Three theories were tried and none survived.
+
+  A correlation was tested, rejected, and then RE-READ correctly. `observe-now` being killed appeared
+  before two reboots but was killed five times, so it is not causal - that much was right. What the
+  rejection missed is WHY it correlated at all: `observe` is a full-screen view you quit with a
+  KEYPRESS, so its death usually follows a keystroke. The two are both downstream of the real
+  variable, which the operator had identified from the start. A correlation that fails is worth one
+  more question - what are these two things both downstream of - before it is filed away.
 
 ## Next steps, in order
 

@@ -118,17 +118,47 @@ fn fs_call(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8]) -> bool {
     }
     req[off..off + tail.len()].copy_from_slice(tail);
     let n = off + tail.len();
-    match ctx.request_with_reply_deadline("fs", &Message::from_bytes(&req[..n]), 5) {
-        // THE REPLY IS [tag, status], NOT [status]. `fs` echoes the correlation tag back as byte 0,
-        // which is what lets a caller recognise its own reply among the requests it is serving. Reading
-        // byte 0 as the status made every successful write look like a failure - the file was created
-        // and the service reported "could not create the capture file", which is the worst kind of
-        // wrong because both halves are convincing.
-        Some(r) => {
-            let b = r.payload_bytes();
-            b.first() == Some(&FS_TAG) && b.get(1) == Some(&FS_OK)
+    // REACQUIRE `fs` IF THE SEND FAILS, because `fs` restarts and this service does not.
+    //
+    // The recorder is spawned on demand and deliberately never restarted (services/CLAUDE.md), so it
+    // outlives its dependency: chaos restarts `fs` underneath a live recorder, the cap it holds goes
+    // stale, and every later request fails against an endpoint that no longer exists. §14.3 puts the
+    // obligation on the CLIENT - reacquire by name and retry - and this one did not, so it reported
+    // "could not create the capture file - is there a filesystem?" while `fs` sat there mounted and
+    // serving. That message is true about the cap and badly misleading about the system.
+    //
+    // `request_with_reply_deadline` cannot express this: it returns `Option`, so a dead endpoint and
+    // an expired deadline are both `None`. Retrying on that would retry timeouts too, which is the
+    // failure mode the `_call_err` variant exists to prevent - the same distinction `nic-driver`
+    // draws for `dwc2`, for the same reason, after the same symptom.
+    //
+    // ONE retry, not a loop: an `fs` that is genuinely gone must surface as a failure rather than as
+    // a request that never returns.
+    let msg = Message::from_bytes(&req[..n]);
+    // THE REPLY IS [tag, status], NOT [status]. `fs` echoes the correlation tag back as byte 0,
+    // which is what lets a caller recognise its own reply among the requests it is serving. Reading
+    // byte 0 as the status made every successful write look like a failure - the file was created
+    // and the service reported "could not create the capture file", which is the worst kind of
+    // wrong because both halves are convincing.
+    let ok = |r: &Message| {
+        let b = r.payload_bytes();
+        b.first() == Some(&FS_TAG) && b.get(1) == Some(&FS_OK)
+    };
+    match ctx.request_with_reply_call_err("fs", &msg, 5) {
+        Ok(Some(r)) => ok(&r),
+        Ok(None) => false,                    // deadline: fs is alive but slow. Do NOT retry.
+        Err(_) => {
+            // Send failed - the endpoint is dead, which is what a restart looks like from here.
+            if !ctx.reacquire_by_name("fs") {
+                return false;
+            }
+            // Loud, because a silent recovery is how the stale cap went unnoticed at all.
+            ctx.log("recorder: fs had restarted - reacquired it by name and retried");
+            match ctx.request_with_reply_call_err("fs", &msg, 5) {
+                Ok(Some(r)) => ok(&r),
+                _ => false,
+            }
         }
-        None => false,
     }
 }
 
@@ -405,9 +435,29 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
     let mut req = [0u8; 9];
     req[0] = EV_OP_LOGS;
     req[1..9].copy_from_slice(&cap.cursor.to_le_bytes());
-    let r = match ctx.request_with_reply_deadline("events", &Message::from_bytes(&req), 3) {
-        Some(r) => r,
-        None => return, // events is busy or gone; the next tick tries again
+    // Same stale-peer obligation as the `fs` path above, and the same reason: `events` is restartable
+    // (chaos kills it by name) while this service is never restarted, so it outlives its peers. A
+    // recorder that keeps draining a dead endpoint records NOTHING and says nothing about it - the
+    // capture just stops growing, which is the silent failure §26.7 forbids and the hardest kind to
+    // notice in a file that already exists.
+    //
+    // The distinction matters here too: `Ok(None)` is a busy `events` and the next tick retries,
+    // which is correct and must NOT reacquire. `Err` is a dead endpoint, which never recovers on its
+    // own.
+    let msg = Message::from_bytes(&req);
+    let r = match ctx.request_with_reply_call_err("events", &msg, 3) {
+        Ok(Some(r)) => r,
+        Ok(None) => return, // events is busy; the next tick tries again
+        Err(_) => {
+            if !ctx.reacquire_by_name("events") {
+                return;
+            }
+            ctx.log("recorder: events had restarted - reacquired it by name and retried");
+            match ctx.request_with_reply_call_err("events", &msg, 3) {
+                Ok(Some(r)) => r,
+                _ => return,
+            }
+        }
     };
     let b = r.payload_bytes();
     if b.len() < EV_HDR {

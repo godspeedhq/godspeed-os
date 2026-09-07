@@ -92,13 +92,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Stop the controller if the BIOS left it running, then wait for it to halt.
     let cmd = mmio.read32(op + OP_USBCMD);
     mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
-    if !wait(&mmio, op + OP_USBSTS, STS_HCHALTED, true) {
+    if !wait(&ctx, &mmio, op + OP_USBSTS, STS_HCHALTED, true) {
         ctx.log("ehci: WARN - controller did not halt (BIOS may still own it; E2b handoff needed)");
     }
 
     // Reset: set HCRESET and wait for the controller to clear it.
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_HCRESET);
-    if !wait(&mmio, op + OP_USBCMD, CMD_HCRESET, false) {
+    if !wait(&ctx, &mmio, op + OP_USBCMD, CMD_HCRESET, false) {
         ctx.log("ehci: WARN - HCRESET did not complete (E2b handoff needed); idling");
         idle_draining(&ctx);
     }
@@ -107,7 +107,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Route all ports to the EHCI (not to companion controllers) and run.
     mmio.write32(op + OP_CONFIGFLAG, 1);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_RS);
-    if wait(&mmio, op + OP_USBSTS, STS_HCHALTED, false) {
+    if wait(&ctx, &mmio, op + OP_USBSTS, STS_HCHALTED, false) {
         ctx.log("ehci: controller running");
     } else {
         ctx.log("ehci: WARN - controller did not leave halted state after run");
@@ -156,7 +156,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         delay_cycles(&ctx, RESET_HOLD_CYCLES); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
         // End reset.
         mmio.write32(off, mmio.read32(off) & !PORTSC_W1C & !PORTSC_RESET);
-        wait(&mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
+        wait(&ctx, &mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
         delay_cycles(&ctx, RECOVERY_CYCLES);   // reset-recovery settle (~10 ms)
 
         let psc = mmio.read32(off);
@@ -201,6 +201,8 @@ const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 // qTD token bits.
 /// C8-1: how long a control transfer may take before we stop waiting. A DURATION, not a read count.
 const CTRL_XFER_CYCLES: u64 = 2_000_000_000;
+/// One-shot guard for the control-transfer timeout notice.
+static TIMED_OUT_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
@@ -243,7 +245,7 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 /// error/timeout (with the qTD tokens logged). The async schedule stays enabled
 /// across calls; the single QH is idle between them.
 fn control(
-    _ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
@@ -312,15 +314,15 @@ fn control(
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
     if mmio.read32(op + OP_USBSTS) & STS_ASS != 0 {
         mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) & !CMD_ASE);
-        wait(mmio, op + OP_USBSTS, STS_ASS, false);
+        wait(ctx, mmio, op + OP_USBSTS, STS_ASS, false);
     }
     mmio.write32(op + OP_ASYNCLISTADDR, qh_phys & !0x1F);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    wait(ctx, mmio, op + OP_USBSTS, STS_ASS, true);
     // Doorbell: set IAAD, wait for the controller to set IAA (bounded - if the
     // controller is wedged it simply won't fire and we proceed), then clear it.
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_IAAD);
-    wait(mmio, op + OP_USBSTS, STS_IAA, true);
+    wait(ctx, mmio, op + OP_USBSTS, STS_IAA, true);
     mmio.write32(op + OP_USBSTS, STS_IAA); // RW1C: acknowledge the advance
 
     // Wait for the STATUS qTD to retire.
@@ -329,9 +331,34 @@ fn control(
     // The truth is still the ACTIVE bit going clear; the clock only bounds how long we keep believing
     // it might.
     let mut done = false;
-    let start = _ctx.read_tsc();
-    while _ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
+    let start = ctx.read_tsc();
+    // YIELD BRIEFLY, THEN PARK - the transfer completes in DMA memory, so waiting costs nothing but
+    // the core, and this loop had no yield and no sleep at all.
+    //
+    // `CTRL_XFER_CYCLES` is ~1 SECOND at 2 GHz, and it is spent in full whenever the transfer does not
+    // complete. That is the unplugged case exactly: `wait_for_connection` asks each hub port for its
+    // status every 50 ms, every one of those control transfers runs the whole budget, and the driver
+    // holds the core continuously. `observe` reads `ehci` at 100% unplugged and 0% plugged in - the
+    // cable is the switch. Two earlier fixes (`delay_cycles`, then `wait`) were the same shape one
+    // and two layers further out, and neither was on this path: a control transfer completes on a
+    // qTD bit in DMA, so it never reaches `wait`, which polls MMIO.
+    //
+    // A transfer that is going to succeed completes in about a millisecond, so the first 2 ms are
+    // still spun and the fast path is unchanged. Past that it is either slow or never coming, and
+    // 10 ms of park costs nothing that matters against a one-second budget.
+    let spin_until = start.wrapping_add(ctx.duration_cycles(2));
+    while ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
         if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
+        if ctx.read_tsc() >= spin_until {
+            ctx.sleep_ms(1);   // floors to one scheduler quantum
+        }
+    }
+    // Say so ONCE. A transfer that burns the full budget is the difference between a driver that is
+    // waiting and one that is eating the machine, and nothing in the log distinguished them - which
+    // is why this took three attempts to place. Bounded to one line so an unplugged hub cannot
+    // flood.
+    if !done && !TIMED_OUT_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        ctx.log("ehci: a control transfer ran out its full budget (device gone?) - parking between polls");
     }
     let t_setup  = dma.read32(QTD_SETUP + 0x08);
     let t_data   = if data_len > 0 { dma.read32(QTD_DATA + 0x08) } else { 0 };
@@ -760,12 +787,12 @@ fn poll_devices(
     // ASYNCLISTADDR changed only while the async schedule is disabled), then run it.
     if mmio.read32(op + OP_USBSTS) & STS_ASS != 0 {
         mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) & !CMD_ASE);
-        wait(mmio, op + OP_USBSTS, STS_ASS, false);
+        wait(ctx, mmio, op + OP_USBSTS, STS_ASS, false);
     }
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
     mmio.write32(op + OP_ASYNCLISTADDR, dma.phys_at(POLL_BASE) as u32 & !0x1F);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
-    wait(mmio, op + OP_USBSTS, STS_ASS, true);
+    wait(ctx, mmio, op + OP_USBSTS, STS_ASS, true);
 
     // E2 (interrupt-driven, §12): enable the controller's interrupts. The interrupt qTDs
     // already carry IOC, so a completed report sets USBSTS.USBINT and the controller asserts
@@ -778,6 +805,32 @@ fn poll_devices(
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
+    // WORK TIME, not pass count - and it settled an argument that reasoning could not.
+    //
+    // `observe` reported this driver at 100%, and the theory offered for it was that its CPU figure
+    // is SAMPLED on the scheduler tick, so a task waking on every tick is observed running every
+    // time it is looked at. The poll floor is one tick, so that fits, and the history fits too: a
+    // 10 ms pace read 100%, a 250 ms deadline read 0%, an accidental 1 ms deadline read 100% again.
+    //
+    // THE THEORY WAS WRONG, and this counter is what proved it. With a device attached the driver
+    // measures ~35 ms of work per 60 s - 0.058% of a core - at 93 passes/sec, so the plugged-in case
+    // really is idle. Unplug the device and `observe` reads 100% and STAYS there until it is plugged
+    // back in; the cable is the switch, which no sampling artefact would care about. The cost is
+    // real and it is on the unplug path (backlog/13).
+    //
+    // Kept, and kept prominent, because a number that is argued about is a number nobody trusts: two
+    // characterisations of this symptom were published from readings that were never established to
+    // be comparable, and only the measurement ended it. The gap that remains is that this counter
+    // lives inside `poll_devices`, so the UNPLUGGED path - the one that misbehaves - still reports
+    // nothing.
+    let mut passes: u64 = 0;
+    let mut work_cycles: u64 = 0;
+    let mut last_beat = ctx.read_tsc();
+    // Was the current pass woken by our INTx? Set from the wait, read where a report is harvested.
+    let mut irq_this_pass = false;
+    // Proof that interrupts are not covering HID here, so the tick floor must be polled for.
+    let mut hid_needs_poll = false;
+    let mut hid_poll_noted = false;
     let mut sts_logged = false;                          // log when USBSTS first shows USBINT
     // Typematic auto-repeat, timed in TSC cycles (read_tsc is hardware-proven to advance, unlike
     // the coarse kernel tick), CALIBRATED to this machine's TSC rate so ~300 ms initial / ~50 ms
@@ -787,6 +840,7 @@ fn poll_devices(
     let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
+        let work_t0 = ctx.read_tsc();
         for i in 0..n {
             let qh = POLL_BASE + i * POLL_STRIDE;
             let qtd = qh + 0x40;
@@ -813,6 +867,7 @@ fn poll_devices(
                     // `reboot` (§6.4).
                     ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
                 } else {
+                    if !irq_this_pass { hid_needs_poll = true; }
                     godspeed_sdk::hid::decode_keyboard(
                         &rep, &mut kb_last, &mut kb_rep, &mut kb_caps, ctx.read_tsc(),
                         |ch| ctx.console_push(ch),
@@ -883,7 +938,56 @@ fn poll_devices(
         // Residual to watch: a boot-protocol report is a state SNAPSHOT, so a press+release
         // completed entirely inside one interval could be missed. Human presses last far longer
         // than 10 ms, but fast typing is the thing to check on hardware.
-        ctx.sleep(POLL_SLEEP_CYCLES);
+        //
+        // BLOCK ON THE INTERRUPT, with the poll interval as the deadline rather than the pace.
+        //
+        // The paragraph above this one says the controller's INTx "will not drive a block-and-wake
+        // loop, so the driver must keep its own self-driven re-arm". That was TRUE when it was
+        // written and is not true now, and the difference is measured rather than argued: this
+        // driver's INTx was routed to `bsp_lapic_id()`, which returned an unpublished 0 on every
+        // boot, so on a machine whose BSP is LAPIC id 16 the interrupt was delivered nowhere. The
+        // kernel now publishes core 0's real id and the T630's own log reports
+        // `irq: FIRST delivery of vector 0x29 on core 0 (routed: yes)` - the interrupt arrives, and
+        // it arrives at THIS endpoint.
+        //
+        // So the wait is no longer a pace to be kept. `recv_timeout` returns EARLY on the interrupt
+        // and otherwise at the deadline, which makes the deadline a hot-plug watchdog instead of a
+        // 100-times-a-second heartbeat. Same worst-case latency, and the core can actually halt
+        // between keystrokes - the property the `sleep` above was reaching for and could not have,
+        // because a task that must re-arm itself is never absent from the run queue for long.
+        //
+        // The message is DISCARDED deliberately: the only thing that arrives here is the kernel's
+        // IRQ notification, and its content carries nothing this loop needs - the work is driven by
+        // reading the controller's status at the top of the pass, exactly as before. What changed is
+        // what wakes us, not what we do when woken.
+        // A report that turned up on a pass no interrupt woke means interrupts are NOT covering HID
+        // completions on this controller, whatever the setup reported. The xHCI shipped a 500 ms idle
+        // on precisely that assumption and cost half a second per keystroke on the machine where it
+        // was false; the same mistake is not worth making twice in one day, in the same shape, in the
+        // driver next door. Proof, not assumption: one such report and the deadline drops to the tick
+        // floor for good.
+        let deadline = if hid_needs_poll {
+            ctx.duration_cycles(POLL_FLOOR_MS)
+        } else {
+            ctx.duration_cycles(POLL_DEADLINE_MS)
+        };
+        if hid_needs_poll && !hid_poll_noted {
+            ctx.log("ehci: a HID report arrived with no interrupt - polling input at the 10ms tick");
+            hid_poll_noted = true;
+        }
+        passes = passes.wrapping_add(1);
+        work_cycles = work_cycles.wrapping_add(ctx.read_tsc().wrapping_sub(work_t0));
+        if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(60_000) {
+            last_beat = ctx.read_tsc();
+            ctx.log_fmt(format_args!(
+                "ehci: alive - {} passes, work {}ms, polling {}",
+                passes, work_cycles / ctx.duration_cycles(1).max(1),
+                if hid_needs_poll { "yes (interrupt does not cover HID)" } else { "no (interrupt-driven)" }));
+        }
+        let woke = ctx.recv_timeout(deadline);
+        // Was this pass woken by our INTx, or did the deadline simply expire? The notification is a
+        // one-byte payload equal to the vector, exactly as the xHCI identifies its MSI.
+        irq_this_pass = woke.as_ref().is_some_and(|m| m.payload_bytes() == [EHCI_INT_VECTOR]);
     }
 }
 
@@ -912,6 +1016,22 @@ fn notify(ctx: &ServiceContext, msg: &str) {
 /// always satisfied even if the TSC runs faster.
 fn delay_cycles(ctx: &ServiceContext, cycles: u64) {
     let start = ctx.read_tsc();
+    // PARK FOR THE BULK, then top up. This was a bare `while read_tsc() < deadline {}` - a hard spin
+    // holding the core for the WHOLE delay, with no yield and no sleep.
+    //
+    // It is only a few of these per plug event, so it hid completely while a device was attached: the
+    // driver's own heartbeat measures 35 ms of work per 60 s there, 0.058% of a core. UNPLUG the
+    // device and the rescan loop runs continuously, and each turn spends `DEBOUNCE_CYCLES` (~50 ms)
+    // plus `RESET_HOLD_CYCLES` (~100 ms) spinning - which is `observe` reporting `ehci` at 100% with
+    // nothing plugged in, and back to 0% the moment the device returns. Both halves of that were
+    // observed on the T630, and the second is what ruled out the measurement artefact I had assumed.
+    //
+    // The top-up spin stays because the CONTRACT is a MINIMUM: USB 2.0 7.1.7.5 wants the reset held
+    // at least 50 ms, and `sleep` granularity is a whole scheduler quantum which can round DOWN when
+    // the TSC is uncalibrated. So sleep for the requested span, then spin out whatever is left. On a
+    // calibrated machine the remainder is under one quantum and usually zero; the spin becomes the
+    // exception rather than the mechanism, and the hardware guarantee is unchanged.
+    ctx.sleep(cycles);
     while ctx.read_tsc().wrapping_sub(start) < cycles {}
 }
 /// ~100 ms at 2 GHz - comfortably over the 50 ms minimum reset hold.
@@ -937,6 +1057,26 @@ const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 /// Granularity is one scheduler quantum, so any non-zero value means "one quantum": ~10 ms now that
 /// the APIC timer is PIT-calibrated, which is also the keyboard's own bInterval.
 const POLL_SLEEP_CYCLES: u64 = 1;
+/// Input polling floor in MILLISECONDS, for when the interrupt is proven not to cover HID.
+///
+/// SEPARATE FROM `POLL_SLEEP_CYCLES` BECAUSE THE UNITS ARE DIFFERENT, and nothing but hardware can
+/// tell them apart: `ctx.sleep` takes CYCLES and `ctx.duration_cycles` takes MILLISECONDS, both as a
+/// bare `u64`. Passing the cycle constant to the millisecond function asked for a 1 ms deadline
+/// instead of the 10 ms tick floor this comment claimed - about a thousand wakes a second, which
+/// `observe` reported as `ehci` at 100% of the core while the log looked entirely healthy.
+///
+/// 10 ms because that is both the scheduler's quantum and the keyboard's bInterval: the controller
+/// has at most one fresh report to hand over per pass, so this paces to the hardware's own rate
+/// rather than outrunning it. Asking for less does not produce more reports, only more wakes.
+const POLL_FLOOR_MS: u64 = 10;
+/// Deadline for the interrupt-driven main wait, in milliseconds.
+///
+/// This is a WATCHDOG, not a pace. The controller's INTx wakes the loop when a transfer completes,
+/// so this bounds only how long the driver can go without noticing something an interrupt cannot
+/// report - a device appearing or vanishing on a root port, which is read from PORTSC rather than
+/// signalled. It is deliberately far longer than the old one-tick pace: 100 wakes a second was the
+/// cost of having no wake source at all, and there is one now.
+const POLL_DEADLINE_MS: u64 = 250;
 
 /// How often to re-read the hub ports while waiting for something to be plugged in.
 ///
@@ -964,16 +1104,57 @@ const PORTSC_OWNER:  u32 = 1 << 13; // Port Owner (1 = handed to a companion)
 const PORTSC_W1C:    u32 = (1 << 1) | (1 << 3) | (1 << 5);
 
 /// Poll a 32-bit register until `mask` is set (`want_set=true`) or clear
-/// (`false`), bounded. Returns true if the condition was met, false on timeout.
-fn wait(mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, want_set: bool) -> bool {
-    const MAX: u32 = 2_000_000;
-    let mut i = 0u32;
-    while i < MAX {
-        let set = mmio.read32(off) & mask != 0;
-        if set == want_set {
+/// (`false`), bounded BY TIME. Returns true if the condition was met, false on timeout.
+///
+/// **A COUNT IS NOT A DURATION.** This was `while i < 2_000_000` with no yield: an iteration bound,
+/// which bounds nothing in wall-clock and means a different timeout on every machine - each turn is
+/// an UNCACHED MMIO read across PCIe, so the same 2,000,000 is milliseconds on one box and most of a
+/// second on another. Commandment VIII asks for a wait on truth with a real deadline, and 26.6 asks
+/// every wait to be able to state its own bound; a loop counter can state neither.
+///
+/// It also never yielded. On a MULTI-CORE machine that is merely rude - this driver has a core to
+/// itself and the rest of the system runs elsewhere. On a SINGLE-CORE machine it is one service
+/// spinning on the only core the machine has, for however long 2,000,000 PCIe reads happen to take,
+/// while every other service waits. The 10 ms quantum still preempts it, so this is not a hang - but
+/// "the scheduler will eventually take it away" is not a substitute for a driver that hands the core
+/// back when it has nothing to do.
+fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, want_set: bool) -> bool {
+    // Generous, because a controller coming out of BIOS ownership can be slow, and a timeout that
+    // fires early turns a working controller into a reported fault.
+    const TIMEOUT_MS: u64 = 250;
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TIMEOUT_MS));
+    // How long to busy-yield before parking between polls. Covers the common case (hardware answers
+    // in a millisecond or two) without holding the core through a timeout that is not going to end.
+    const SPIN_MS: u64 = 2;
+    let spin_until = ctx.read_tsc().wrapping_add(ctx.duration_cycles(SPIN_MS));
+    loop {
+        if (mmio.read32(off) & mask != 0) == want_set {
             return true;
         }
-        i += 1;
+        if ctx.read_tsc() >= deadline {
+            return false;
+        }
+        // YIELD BRIEFLY, THEN PARK. The register is changed by HARDWARE, not by anything this service
+        // could compute, so spinning on it buys nothing - but `yield_cpu` does not stop consuming the
+        // core either. It leaves the task RUNNABLE, so a single-core scheduler hands it straight back
+        // and the loop runs flat out for the whole timeout.
+        //
+        // That is invisible while the hardware answers quickly, which is every path this function was
+        // written for. It stops being invisible when the hardware does NOT answer: pull the device and
+        // the rescan loop asks each hub port for its status, every one of those control transfers
+        // waits out the full 250 ms, and the driver holds the core continuously. `observe` shows
+        // `ehci` at 100% unplugged and 0% the moment it is plugged back in - the cable is the switch,
+        // which is what says the cost is here and not in the paced poll.
+        //
+        // So: keep yielding for the first few milliseconds, because a controller bit that is about to
+        // flip usually flips within one or two, and sleeping through that would slow every
+        // enumeration. After that the answer is evidently not imminent, and a 10 ms park costs at
+        // most one quantum of extra latency on an operation already measured in tens of milliseconds
+        // - while cutting thousands of yields down to about two dozen polls.
+        if ctx.read_tsc() >= spin_until {
+            ctx.sleep_ms(1);   // floors to one scheduler quantum
+        } else {
+            ctx.yield_cpu();
+        }
     }
-    false
 }

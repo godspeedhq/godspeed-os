@@ -468,10 +468,17 @@ pub fn set_power_d0(bdf: u32) {
 /// userspace `ehci` driver cannot reach, so the kernel must do it. Idempotent;
 /// no-op if no EHCI, no extended caps, or no USB Legacy Support capability.
 ///
-/// Retained but not currently called: EHCI is left in IOMMU passthrough (firmware
-/// co-owns it, the configuration the back-port keyboard works in), so it is not
-/// handed off. Re-enable when EHCI confinement is revisited.
-#[allow(dead_code)]
+/// CALLED at the EHCI MMIO grant (`task::spawn_service_with_image`), before the driver runs.
+///
+/// It was retained-but-uncalled for a while, on the reasoning that EHCI is left in IOMMU
+/// passthrough and firmware co-ownership was "the configuration the back-port keyboard works in".
+/// That held until a SINGLE-CORE machine tried it: co-ownership means the driver's HCRESET resets a
+/// controller the firmware is actively using, the firmware takes an SMI, and an SMI is serviced on
+/// the core that raised it. With four cores the OS survives on the others; with one there is
+/// nowhere else to run and the platform resets. The co-ownership was never safe - it was survivable.
+///
+/// And it is not needed: the `ehci` SERVICE drives that keyboard itself (HID decode, key repeat,
+/// Ctrl+Alt+Del), so nothing depends on the firmware continuing to poll it.
 pub fn ehci_bios_handoff() {
     let Some(dev) = ehci() else { return };
     let mmio = dev.bar[0];
@@ -520,6 +527,26 @@ pub fn ehci_bios_handoff() {
         let cap_id = cap & 0xFF;
         if cap_id == 0x01 {
             // USBLEGSUP at `ptr`: bit16 = HC BIOS Owned, bit24 = HC OS Owned.
+            //
+            // SILENCE THE FIRMWARE FIRST, THEN NEGOTIATE. Claiming OS ownership is how the protocol
+            // NOTIFIES the firmware to let go - by raising an SMI. On a machine with cores to spare
+            // that is invisible: the SMM handler runs and the OS carries on elsewhere. On a SINGLE
+            // core it is fatal, and it was measured being fatal here: step logging through this
+            // function on a single-core T630 printed
+            //
+            //     ehci-handoff: [E] USBLEGSUP@0xa0=0x00010001; about to WRITE OS-owned
+            //
+            // and never reached the next line. Bit 16 set says the BIOS owns the controller; the
+            // write that tells it so is where the machine stopped, then sat until a hardware
+            // watchdog reset it ~13 s later. Every earlier symptom in this hunt - the reboot loop,
+            // the varying death points - was that hang plus that watchdog.
+            //
+            // USBLEGCTLSTS (ptr+4) is the firmware's SMI ENABLE set for this controller. Zeroing it
+            // first means the ownership handshake cannot raise one, so the negotiation below is safe
+            // on a machine with nowhere to run an SMI. It is also simply correct: an OS taking a
+            // controller has no use for the firmware's SMIs on it either way.
+            config_write32(bus, dev, func, ptr + 4, 0);
+
             if cap & (1 << 16) != 0 {
                 // Claim OS ownership and wait for the firmware to release.
                 config_write32(bus, dev, func, ptr, cap | (1 << 24));
@@ -536,14 +563,26 @@ pub fn ehci_bios_handoff() {
                     }
                     core::hint::spin_loop();
                 }
+                // TAKE IT ANYWAY if the firmware did not answer. With its SMIs already disabled
+                // above, the firmware may never notice the request - so waiting for a courteous
+                // release can time out on a machine that is otherwise fine. Clearing bit 16
+                // ourselves is what a host OS does at this point; the alternative is handing the
+                // controller to a driver while something else still believes it owns it, which is
+                // the co-ownership this whole change exists to end.
+                if !ok {
+                    let v = config_read32(bus, dev, func, ptr);
+                    config_write32(bus, dev, func, ptr, (v & !(1 << 16)) | (1 << 24));
+                }
                 crate::kprintln!(
-                    "ehci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x})",
-                    ptr, ok as u8, cap
+                    "ehci-handoff: USBLEGSUP@{:#x} OS-owned, BIOS released={} (was {:#010x}){}",
+                    ptr, ok as u8, cap,
+                    if ok { "" } else { " - FORCED after timeout" }
                 );
             } else {
                 crate::kprintln!("ehci-handoff: already OS-owned (USBLEGSUP={:#010x})", cap);
             }
-            // Disable all firmware SMIs on this controller (USBLEGCTLSTS at ptr+4).
+            // Re-assert the SMI disable. Cheap, and the firmware may have rewritten it while it
+            // still believed it owned the controller.
             config_write32(bus, dev, func, ptr + 4, 0);
             return;
         }
@@ -751,13 +790,41 @@ pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
             } else {
                 config_write32(bus, dev, func, cap + 0x08, vector as u32);      // data
             }
+            // UNMASK THE VECTOR. Message Control bit 8 says the function implements per-vector
+            // masking, and when it does, the Mask Bits register gates delivery INDEPENDENTLY of the
+            // enable bit: a masked vector is programmed, enabled, and silently undeliverable.
+            //
+            // The register was never written here, so whatever state firmware left it in was
+            // inherited. That is not a safe thing to inherit on this class of device - the BIOS owns
+            // the USB controllers for legacy keyboard emulation and hands them over mid-flight (see
+            // `ehci_bios_handoff`), so it is entirely entitled to have masked the vector on its way
+            // out. The T630's xHCI is the machine's only MSI device and reports `0 MSI` across ten
+            // thousand driver passes while every stage of the setup claims success; a mask bit left
+            // set produces precisely that, and nothing in the log could have shown it.
+            //
+            // Offsets shift with the address width: data is at +0x0C (64-bit) or +0x08 (32-bit), and
+            // Mask Bits is the dword after it.
+            let pvm = ctrl & (1 << 8) != 0;
+            let mask_off = if is_64 { cap + 0x10 } else { cap + 0x0C };
+            let mask_before = if pvm { config_read32(bus, dev, func, mask_off) } else { 0 };
+            if pvm {
+                config_write32(bus, dev, func, mask_off, 0);
+            }
             // Enable MSI (ctrl bit 0); Multiple Message Enable = 0 (bits[6:4]) → 1 vector.
             let new_ctrl = (ctrl & !(0x7u16 << 4)) | 1;
             let new_hdr = (hdr & 0x0000_FFFF) | ((new_ctrl as u32) << 16);
             config_write32(bus, dev, func, cap, new_hdr);
+            // READ BACK, and say what the hardware actually holds - not what we asked it to hold.
+            // The previous version of this line reported the WRITE and stopped there, so a device
+            // that accepted the write and delivered nothing looked identical to one that worked. A
+            // whole boot was spent unable to tell whether a fix had even landed; that is the gap this
+            // closes, and it is worth more than the fix above if the fix turns out to be wrong.
+            let ctrl_after = (config_read32(bus, dev, func, cap) >> 16) as u16;
+            let mask_after = if pvm { config_read32(bus, dev, func, mask_off) } else { 0 };
             crate::kprintln!(
-                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr)",
-                bus, dev, func, vector, if is_64 { 64 } else { 32 }
+                "pci: MSI enabled on {:02x}:{:02x}.{} vector={:#x} ({}-bit addr) ctrl={:#06x}->{:#06x} pvm={} mask={:#x}->{:#x} dest_apic={}",
+                bus, dev, func, vector, if is_64 { 64 } else { 32 },
+                ctrl, ctrl_after, if pvm { "yes" } else { "no" }, mask_before, mask_after, dest_apic
             );
             return true;
         }

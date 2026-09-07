@@ -24,9 +24,6 @@ const MAX_IRQ: usize = 256;
 /// `arch/arm/irq.rs::HIRES`. Same shape, same fix, found by the check that shape produced.
 static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
 
-/// One-shot guard for the EHCI deliver() diagnostic (logs the first EHCI IRQ + its core).
-static EHCI_DELIVER_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// Register a driver endpoint to receive interrupts for `irq`.
 /// Called at spawn time when the kernel processes a `hw_interrupt` capability.
@@ -119,16 +116,37 @@ pub fn unregister(irq: u8) {
 /// # Safety
 /// Called from interrupt context with IF=0. The APIC EOI is sent unconditionally
 /// at the end; missing the EOI would leave the IRQ line permanently masked.
+/// One bit per IDT vector: has `deliver` ever run for it? Read and set by the one-shot above.
+static VECTOR_SEEN: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
 pub unsafe fn deliver(irq: u8) {
-    // One-shot diagnostic: confirm the IDT actually receives the EHCI vector and on which core
-    // (the EHCI's legacy INTx delivery has been the hard part on the T630). Logged once.
-    if irq == crate::arch::imp::interrupts::EHCI_MSI_VECTOR
-        && !EHCI_DELIVER_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed)
+    // FIRST delivery of each vector, logged once - generalised from the EHCI-only one-shot this
+    // replaces, because the question it answered for the EHCI is the one now being asked of the xHCI
+    // and there was no reason it should ever have been asked about one device only.
+    //
+    // It exists to split a failure nothing else in the kernel can split. When a driver reports no
+    // interrupts, either the CPU never took the vector (not arriving - device, APIC or fabric) or it
+    // took it and the notification did not reach the driver (routing). Disjoint fixes, identical
+    // symptoms. On the T630 three theories were spent guessing between them - the IOMMU's IntCtl, a
+    // masked MSI vector, and a destination APIC id that was never published. Two were wrong and the
+    // third was a real defect that was not this machine's cause. All three guessed at the SENDING
+    // end, because nothing observed the receiving end.
+    //
+    // Bounded: one line per distinct vector for the life of the boot, 256 maximum, in practice a
+    // handful. `fetch_or` returns the previous word, so the test is one atomic.
     {
-        crate::kprintln!(
-            "ehci: kernel deliver() vector={:#x} on core {}",
-            irq, crate::task::scheduler::current_core_id()
-        );
+        use core::sync::atomic::Ordering;
+        let w = (irq >> 6) as usize;
+        let b = 1u64 << (irq & 63);
+        if VECTOR_SEEN[w].fetch_or(b, Ordering::Relaxed) & b == 0 {
+            let routed = IRQ_TABLE.lock_irq()[irq as usize].is_some();
+            crate::kprintln!(
+                "irq: FIRST delivery of vector {:#x} on core {} (routed: {})",
+                irq, crate::task::scheduler::current_core_id(),
+                if routed { "yes" } else { "NO - discarded" }
+            );
+        }
     }
     // For a level-triggered IOAPIC route (legacy INTx, e.g. the EHCI), mask the source now so
     // it does not re-fire while the userspace driver handles it (the line stays asserted until

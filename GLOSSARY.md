@@ -176,6 +176,10 @@ section 24; these are the abbreviations you meet while reading the code.
 
 ### CPU, interrupts, and time
 
+- **ARM** - Advanced RISC Machines: the instruction set family GodspeedOS runs on besides x86_64.
+  Two ports exist and they are genuinely different machines, not one with a flag: **arm32** (ARMv7-A,
+  Raspberry Pi 2, four Cortex-A7 cores) and **AArch64** (ARMv8-A, Raspberry Pi 4). Each brings its
+  own boot path, its own USB host controller, and its own timer.
 - **APIC** - Advanced Programmable Interrupt Controller. The interrupt hardware the kernel drives for
   timers and inter-core signalling.
 - **LAPIC** - the **local** APIC, one per core. Owns that core's timer and receives its interrupts.

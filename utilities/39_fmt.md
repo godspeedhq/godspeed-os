@@ -1,6 +1,6 @@
 # Utility: `fmt` - format a script to the GodspeedOS standard
 
-**Status:** **BUILT on `feat/gsh-fmt`** - the `.gsh` formatter, one canonical layout, non-negotiable,
+**Status:** **BUILT and MERGED** - the `.gsh` formatter, one canonical layout, non-negotiable,
 applied in place. STREAMING (no file-size cap), semantics-preserving, and idempotent. Pinned by
 `osdev test files` (207/0), `osdev test fmt-demo` (6/0 - jar before/after, a medium multi-flush file,
 and a **10 MB** file formatted with `fmt check` = `Ok`), and `osdev test fmt-idem` (format-twice diff
