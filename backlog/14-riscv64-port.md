@@ -232,7 +232,7 @@ SDK are untouched by this port.
 
 ## What QEMU could not have caught, and what that cost
 
-Five differences so far, each invisible in the emulator by construction. They are listed together
+Six differences so far, each invisible in the emulator by construction. They are listed together
 because the pattern is more useful than any one of them: an emulator supplies DEFAULTS, and a default
 that happens to match an assumption HIDES it rather than testing it.
 
@@ -245,9 +245,44 @@ that happens to match an assumption HIDES it rather than testing it.
    is why THR worked and LSR would not have.
 5. **`svadu`.** QEMU maintains the Accessed and Dirty bits in hardware; this board does not, so a leaf
    mapped with `A = 0` faults on first touch there and works perfectly in the emulator.
+6. **`sscratch`'s reset value.** Not architecturally specified, and the firmware beneath runs on
+   `mscratch`, so nothing has promised to leave it alone. The trap entry reads it to decide whether it
+   is standing on a kernel stack, so a non-zero value at the first S-mode trap would build a frame at
+   an address nobody chose. QEMU hands over a zeroed register - the assumption and the default agree,
+   which is exactly the shape of the other five. Zeroed at `trap::init` rather than assumed.
+   FOUND BY WRITING IT DOWN, not by a failure, which is the only cheap way any of these get found.
 
 And one that is not QEMU's fault at all: the FDT header's `boot_cpuid_phys` reads 0 on this board while
 `a0` and OpenSBI both say hart 1. Take the boot hart from the register, never from the tree.
+
+## User mode, and what it still does not have
+
+Reached 2026-09-07: code runs in U-mode on this ISA, cannot read a kernel page, and is preempted out
+by the timer. `arch/riscv64/usermode.rs`, in the same shape as `arch/arm/usermode.rs` deliberately -
+the RISC-V spelling differs, the increment does not.
+
+The three claims are hardware's own answers rather than the kernel's: `sstatus.SPP == 0` at the
+stub's `ecall` (written by hardware at every trap, unforgeable from U-mode); a load of a kernel
+address refused by the MMU; and two timer interrupts taken while unprivileged. Two rather than one,
+because one proves a tick can be taken from user mode and only the second proves the trap epilogue
+put the `sscratch` latch back - a kernel that re-armed it wrongly passes at one tick and corrupts a
+stack at two.
+
+ARM proved its isolation half with `ATS1CPUR`, a non-faulting unprivileged translation probe. RISC-V
+has no such instruction, so the honest equivalent is the real access, refused by the real MMU, with
+the kernel insisting on the exact address it handed over before it forgives the fault.
+
+WHAT IS NOT DONE, and what `spawn_supervisor` still needs:
+
+- **Per-task address spaces.** The selftest maps its user pages into the ACTIVE root, not a fresh
+  one, because a second root would test whether the kernel survives a `satp` switch AND whether
+  U-mode works, and only the second was that increment. `switch_context` is where the first belongs.
+- **A syscall path.** `ecall` from U-mode currently reaches one gated selftest hook and otherwise the
+  reporter. Routing it to the neutral `syscall::dispatch` is the next real seam member.
+- **`sscratch` is per-hart, and there is one hart.** It is written by `enter_user` on whatever hart
+  runs it; SMP needs it set per hart at that hart's own bring-up.
+- **A fault is still fatal.** The reporter names the privilege it came from now, which is the first
+  question anyone asks, but there is still no task to kill instead of the machine.
 
 ## What is stubbed, in the order it probably wants doing
 
