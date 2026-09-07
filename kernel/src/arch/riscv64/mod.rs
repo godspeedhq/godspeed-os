@@ -7,6 +7,8 @@
 
 #![allow(unused_variables, dead_code)]
 
+pub mod fdt;
+
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 // ============================ Boot bring-up (S-mode via OpenSBI) ============================
@@ -158,24 +160,89 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     print_dec(hartid as u64);
     print_str(", fdt at ");
     print_hex(fdt as u64);
-    let ok = fdt_total_size(fdt);
-    match ok {
-        Some(n) => {
-            print_str(" (valid, ");
-            print_dec(n as u64);
-            print_str(" bytes)
+    // SAFETY: `fdt` is the pointer the boot protocol placed in `a1`; `from_ptr` checks the magic
+    // before trusting anything and yields None for a pointer that is not a device tree.
+    let tree = unsafe { fdt::Fdt::from_ptr(fdt) };
+    let Some(tree) = tree else {
+        print_str(" (NO FDT MAGIC - device tree not usable)
 ");
-        }
-        None => print_str(" (NO FDT MAGIC - device tree not usable)
-"),
+        halt();
+    };
+    print_str(" (valid, ");
+    print_dec(tree.total_size() as u64);
+    print_str(" bytes)
+");
+
+    // Everything below is READ FROM THE MACHINE. No address here is a constant, which is the whole
+    // point: the same code says different, correct things on QEMU `virt` and on the JH7110.
+    if let Some(m) = tree.memory() {
+        print_str("riscv64: ram ");
+        print_hex(m.base);
+        print_str(" + ");
+        print_dec(m.size / (1024 * 1024));
+        print_str(" MiB
+");
+    }
+
+    let (harts, max_hart) = tree.usable_harts();
+    print_str("riscv64: ");
+    print_dec(harts as u64);
+    print_str(" usable hart(s), highest id ");
+    print_dec(max_hart as u64);
+    if let Some(c) = tree.boot_cpuid() {
+        print_str(", fdt says boot cpu ");
+        print_dec(c as u64);
+    }
+    print_str("
+");
+
+    if let Some(hz) = tree.timebase_frequency() {
+        print_str("riscv64: timebase ");
+        print_dec(hz as u64);
+        print_str(" Hz
+");
+    }
+
+    // The UART, by PROGRAMMING MODEL rather than by address. Two compatibles because two machines
+    // implement two different 16550s - which is a driver supporting its hardware, not an arch
+    // knowing which board it is on.
+    let mut props = [None, None];
+    let uart = tree
+        .find_compatible("snps,dw-apb-uart", &["reg-shift", "reg-io-width"], &mut props)
+        .or_else(|| tree.find_compatible("ns16550a", &["reg-shift", "reg-io-width"], &mut props));
+    if let Some(u) = uart {
+        print_str("riscv64: uart ");
+        print_hex(u.base);
+        print_str(" shift ");
+        print_dec(props[0].unwrap_or(0) as u64);
+        print_str(" width ");
+        print_dec(props[1].unwrap_or(1) as u64);
+        print_str("
+");
+    }
+
+    let mut none = [];
+    if let Some(p) = tree.find_compatible("riscv,plic0", &[], &mut none)
+        .or_else(|| tree.find_compatible("sifive,plic-1.0.0", &[], &mut none))
+    {
+        print_str("riscv64: plic ");
+        print_hex(p.base);
+        print_str("
+");
     }
 
     for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies. halting.
 " {
         putc(b);
     }
+    halt();
+}
+
+/// Stop this hart. Not a panic: there is nothing above the arch layer yet to report to.
+fn halt() -> ! {
     loop {
-        unsafe { core::arch::asm!("wfi"); }
+        // SAFETY: `wfi` is architecturally a hint; waking spuriously simply re-enters the loop.
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
