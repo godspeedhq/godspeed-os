@@ -870,6 +870,33 @@ impl ServiceContext {
     /// Costs a service with no `events` cap one relaxed add and a not-taken branch; `events` itself
     /// holds no send cap to itself, so its own publish resolves to `u32::MAX` and returns - the same
     /// cut that stops it tracing its own sends. No recursion is possible.
+    /// Publish `msgs.received = 0` the first time this service WAITS for a message.
+    ///
+    /// The third case of the same bug the comment above records twice. Publishing on the first
+    /// message covers a service that is quiet; republishing on a sink change covers a sink that
+    /// restarted. Neither covers a SERVICE that restarted and has not been spoken to since - and that
+    /// is the ordinary state of `block-driver` after a chaos storm, because nothing sends to it until
+    /// somebody does disk I/O. Observed on the Wyse: 1917 log lines between
+    /// `supervisor: block-driver restarted` and a metrics query that found no row for it, with zero
+    /// messages received in between. The selfcheck caught it as
+    /// `where owner contains block-driver | assert contains msgs.received`.
+    ///
+    /// A row that is absent reads as dead, which is the exact question this metric exists to answer -
+    /// so an idle live service must have one.
+    ///
+    /// THE ZERO IS EARNED, which is the only kind worth printing: the service is running, it has
+    /// entered its receive loop, and it has genuinely received nothing. That is a fact about the
+    /// system, not a placeholder standing in for one. Emitted once per instance, from the wait rather
+    /// than from startup, because reaching the wait is what proves the service got as far as serving.
+    #[inline]
+    fn note_listening(&self) {
+        static ANNOUNCED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            self.metric("msgs.received", 0);
+        }
+    }
+
     #[inline]
     fn count_recv(&self) {
         static SERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -892,6 +919,7 @@ impl ServiceContext {
     }
 
     pub fn recv(&self) -> Message {
+        self.note_listening();
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC {
             panic!("recv: corrupt ServiceContext (bad magic) - the kernel handed us an unusable context");
@@ -910,6 +938,7 @@ impl ServiceContext {
     /// message was waiting, `None` if the queue is empty. A busy-polling driver uses this
     /// to drain interrupt events (§12) each loop iteration without blocking.
     pub fn try_recv(&self) -> Option<Message> {
+        self.note_listening();
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
@@ -926,6 +955,7 @@ impl ServiceContext {
     /// `#[inline(always)]` for the same reason as `await_slice`: it returns a 4 KiB `Message` by
     /// value, so as a separate frame it costs 4 KiB of stack on every caller.
     pub fn recv_timeout(&self, timeout_cycles: u64) -> Option<Message> {
+        self.note_listening();
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
