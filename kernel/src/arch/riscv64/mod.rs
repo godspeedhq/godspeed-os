@@ -134,18 +134,103 @@ pub unsafe extern "C" fn _start() -> ! {
 
 /// Rust side of boot. Milestone: write to the 16550 UART and halt. Later: Sv39 MMU, S-mode trap vector
 /// (stvec) for ecall/faults/IRQ, PLIC/CLINT, SBI HSM for SMP - toward the neutral `kernel_main`.
-extern "C" fn riscv_boot_main() -> ! {
+/// Boot hart id and device tree, exactly as the firmware left them.
+///
+/// `_start` never touches `a0` or `a1` - it writes `sp`, `t0` and `t1` only - so the two arguments
+/// the RISC-V boot protocol puts there are still live at the `call`, and taking them as parameters is
+/// enough to receive them. No asm change, no scratch space, nothing to keep in step.
+///
+/// TAKE THE HART ID, NEVER ASSUME IT. On QEMU `virt` the boot hart is 0 and every "hart 0" shortcut
+/// looks correct; on the JH7110 it is hart 1, because hart 0 is the S7 monitor core. That is the same
+/// trap that cost a day on x86, where the BSP's APIC id was assumed to be 0 and QEMU happened to
+/// agree - so it is taken from the register here rather than inferred anywhere.
+extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
     for &b in b"
 GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a THIRD arch.
 " {
         putc(b);
     }
+    // Report what the firmware handed us, and CHECK the device tree rather than trusting the
+    // pointer. A magic mismatch means the FDT is not where `a1` says, and every address read out of
+    // it afterwards would be garbage pointed at real hardware - the kind of failure that presents as
+    // an unexplained hang rather than as a wrong number.
+    print_str("riscv64: boot hart ");
+    print_dec(hartid as u64);
+    print_str(", fdt at ");
+    print_hex(fdt as u64);
+    let ok = fdt_total_size(fdt);
+    match ok {
+        Some(n) => {
+            print_str(" (valid, ");
+            print_dec(n as u64);
+            print_str(" bytes)
+");
+        }
+        None => print_str(" (NO FDT MAGIC - device tree not usable)
+"),
+    }
+
     for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies. halting.
 " {
         putc(b);
     }
     loop {
         unsafe { core::arch::asm!("wfi"); }
+    }
+}
+
+
+/// FDT header magic and total size, or `None` if `p` does not point at a device tree.
+///
+/// Big-endian by specification, on a little-endian machine, so every field needs swapping - a fact
+/// worth stating because reading one field the wrong way round yields a plausible-looking number.
+fn fdt_total_size(p: *const u8) -> Option<u32> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: reading 8 bytes at the pointer the boot protocol supplied in `a1`. If it is not an
+    // FDT the magic check below rejects it before anything acts on the contents.
+    let (magic, total) = unsafe {
+        (
+            u32::from_be((p as *const u32).read_volatile()),
+            u32::from_be((p as *const u32).add(1).read_volatile()),
+        )
+    };
+    if magic == 0xd00d_feed { Some(total) } else { None }
+}
+
+fn print_str(s: &str) {
+    for &b in s.as_bytes() {
+        putc(b);
+    }
+}
+
+fn print_dec(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if v == 0 {
+        putc(b'0');
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &b in &buf[i..] {
+        putc(b);
+    }
+}
+
+fn print_hex(v: u64) {
+    print_str("0x");
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let n = ((v >> (shift * 4)) & 0xf) as u8;
+        if n != 0 || started || shift == 0 {
+            started = true;
+            putc(if n < 10 { b'0' + n } else { b'a' + n - 10 });
+        }
     }
 }
 

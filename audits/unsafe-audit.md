@@ -1290,6 +1290,7 @@ matching the x86/ARM implementations so a real port inherits the obligation rath
 | `arch/aarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. The boot path was also reworked for the Pi 4 (EL2 -> EL1 drop, BCM2711 PL011 at 0xFE201000, a bounded TXFF wait) but that is net-neutral on the count: `CurrentEL` read and the UART poll replace the old unguarded byte writes. |
 | `arch/loongarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
 | `arch/riscv64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/riscv64/mod.rs` | 25 -> 26 (+1) | 2026-09-07: `fdt_total_size` reads the device-tree header at the pointer the RISC-V boot protocol supplies in `a1`. Sound because it reads exactly 8 bytes, volatile, and acts on NOTHING until the magic matches 0xd00dfeed - a pointer that is not an FDT is rejected before any field is trusted. `arch/` is a permitted layer (§18.1), so this needs no amendment, only recording. Found by `scripts/unsafe_check.py` REFUSING the build, which is the gate doing its job. |
 | `arch/riscv32/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
 | `arch/s390x/mod.rs` | 18 -> 20 (+2) | The two `unsafe fn` page-table stubs. |
 
@@ -2443,7 +2444,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mod.rs | 53 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
-| arch/riscv64/mod.rs | 25 | permitted |
+| arch/riscv64/mod.rs | 26 | permitted |
 | arch/s390x/mod.rs | 20 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
