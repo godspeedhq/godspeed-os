@@ -8,6 +8,7 @@
 #![allow(unused_variables, dead_code)]
 
 pub mod fdt;
+pub mod sbi;
 pub mod sv39;
 pub mod trap;
 
@@ -371,6 +372,35 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     } else {
         print_str("riscv64: TRAP VECTOR REFUSED - handler address is not 4-byte aligned
 ");
+    }
+
+    // What the firmware beneath us offers. Probed rather than assumed: the two machines disagree
+    // about their own capabilities, and calling into a missing extension is how a boot goes quiet.
+    {
+        let (maj, min) = sbi::spec_version();
+        print_str("riscv64: sbi v");
+        print_dec(maj);
+        print_str(".");
+        print_dec(min);
+        print_str(", timer extension ");
+        let has_timer = sbi::probe(sbi::EXT_TIME);
+        print_str(if has_timer { "present" } else { "ABSENT" });
+        print_str("
+");
+
+        // Reading `time` is the first thing this port does that the FIRMWARE can refuse: it is
+        // permitted from S-mode only if `mcounteren` allows it. If it refuses, the trap vector
+        // installed above reports an illegal instruction by name - which is precisely why the
+        // vector was built before the timer rather than after.
+        let t0 = sbi::time();
+        let t1 = sbi::time();
+        print_str("riscv64: time csr readable, ticks ");
+        print_dec(t0);
+        print_str(" -> ");
+        print_dec(t1);
+        print_str(if t1 > t0 { "  (advancing)
+" } else { "  (NOT ADVANCING)
+" });
     }
 
     for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies.
