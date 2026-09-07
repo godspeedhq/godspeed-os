@@ -9,6 +9,7 @@
 
 pub mod fdt;
 pub mod sv39;
+pub mod trap;
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
 
@@ -362,10 +363,44 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
 "),
     }
 
-    for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies. halting.
+    // Install the trap vector as early as there is a UART to report through. Everything before
+    // this line faults silently; everything after it names itself.
+    if trap::init() {
+        print_str("riscv64: trap vector installed - faults will report
+");
+    } else {
+        print_str("riscv64: TRAP VECTOR REFUSED - handler address is not 4-byte aligned
+");
+    }
+
+    for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies.
 " {
         putc(b);
     }
+
+    // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
+    //
+    // A guard never observed firing is not evidence - and this one is invisible when it works, so
+    // "stvec installed" says only that a CSR was written. The kernel has nothing left to do here
+    // and was about to halt, so a deliberate fault costs nothing and proves on EVERY boot, on
+    // every machine, that a fault now produces a sentence instead of silence.
+    //
+    // 0x20_0000_0000 is 128 GiB: canonical for Sv39 (bit 38 clear, so the upper bits must be too)
+    // and far beyond the identity map, which reaches 3 GiB on QEMU and 9 on the board. A load there
+    // is a clean load page fault rather than the misaligned-address exception a non-canonical
+    // address would raise, so the cause the handler prints is the one being tested.
+    //
+    // THIS GOES AWAY the moment the kernel has real work after this point.
+    print_str("riscv64: deliberately faulting to prove the trap vector reports
+");
+    // SAFETY: the address is intentionally unmapped. That IS the test - the read must fault, and
+    // the handler it enters does not return.
+    unsafe {
+        let _ = (0x20_0000_0000u64 as *const u64).read_volatile();
+    }
+
+    print_str("riscv64: NO TRAP - the fault did not fire, the vector is not working
+");
     halt();
 }
 
