@@ -630,6 +630,29 @@ static CHAOS_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    // The single-core boot, pinned as a TEST rather than as a build configuration.
+    //
+    // This replaces the `single-core` kernel feature, which was deleted once it had done its job
+    // (backlog/02). That flag forced the state on hardware that has more cores; this asserts the
+    // state §11.3 actually defines - "if zero APs come up, system runs as single-core" - by giving
+    // QEMU one core and checking the machine reaches steady state on it.
+    //
+    // It is here rather than nowhere because deleting the flag would otherwise delete the coverage
+    // with it, and the bug that flag found lived exactly here: core 0's LAPIC id was published only
+    // inside `start_all_aps`, so a boot that starts no APs skipped it entirely. A property proven
+    // once on hardware and then left untested regresses quietly.
+    //
+    // "1 core ready", singular - the pluralisation is part of what is pinned, because a log that
+    // cannot count its own subject is the kind of small wrongness that makes a reader doubt the rest.
+    TestSpec {
+        id: "C1B", name: "single_core_boot", spec_ref: "§22 Chaos C1 / §11.3",
+        kind: TestKind::DegradedSmp {
+            smp:          1,
+            expect:       &["smp: 1 core ready", "supervisor: ready"],
+            fail_on:      &["KERNEL PANIC"],
+            timeout_secs: 30,
+        },
+    },
     TestSpec {
         id: "C2", name: "non_tcb_fault_system_continues", spec_ref: "§22 Chaos C2",
         kind: TestKind::WatchSerial {
