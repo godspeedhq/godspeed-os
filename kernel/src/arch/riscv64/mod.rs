@@ -22,6 +22,36 @@ const UART_THR: *mut u8 = 0x1000_0000 as *mut u8;
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        // ---- RISC-V Linux Image header, 64 bytes ----------------------------------------
+        // U-Boot's `booti` REFUSES an image without it: the VisionFive printed
+        // "Bad Linux RISCV Image magic!" after loading all 4279 bytes correctly. QEMU never
+        // asked, because `-kernel` is handed an ELF and reads the entry from its header - so
+        // this is a requirement of the BOOT PROTOCOL, not of the silicon, and it could only
+        // ever have shown up on hardware.
+        //
+        // Layout is Documentation/riscv/boot-image-header.rst. The first field is executable:
+        // it jumps over the rest, so `_start` remains the entry on every path and the QEMU
+        // boot is unaffected.
+        //
+        // `norvc` around the jump because the header is a fixed layout: with compressed
+        // instructions enabled `j` assembles to 2 bytes, every field after it shifts by two,
+        // and the magic lands somewhere U-Boot does not look.
+        ".option push",
+        ".option norvc",
+        "j    99f",                  // code0: jump past the header
+        ".word 0",                   // code1
+        ".option pop",
+        ".dword 0x200000",           // text_offset: where we expect to be loaded past RAM base
+        ".dword __image_size",       // image_size: how much U-Boot must keep clear for us
+        ".dword 0",                  // flags: LE, 4 KiB pages
+        ".word  2",                  // version 0.2
+        ".word  0",                  // res1
+        ".dword 0",                  // res2
+        ".dword 0",                  // magic: deprecated, must be zero
+        ".word  0x05435352",         // magic2: "RSC" + 0x05
+        ".word  0",                  // res3
+        "99:",
+        // ---------------------------------------------------------------------------------
         "la   sp, __stack_top",
         "la   t0, __bss_start",
         "la   t1, __bss_end",

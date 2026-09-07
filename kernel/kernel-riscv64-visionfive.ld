@@ -32,5 +32,11 @@ SECTIONS {
     . += 0x80000;
     __stack_top = .;
 
+    /* Total span the loader must keep clear for us, for the Image header's `image_size`.
+       Measured from the load address to the end of the stack, so it covers text, rodata,
+       data, bss AND the boot stack - a loader that placed something at __stack_top - 8
+       would corrupt us before the first push. */
+    __image_size = . - 0x40200000;
+
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.eh_frame_hdr) *(.riscv.attributes) }
 }

@@ -1,5 +1,29 @@
 # 14. RISC-V 64 port - what exists, what it runs on, and what is next
 
+> **HARDWARE BOOT ACHIEVED 2026-09-07.** GodspeedOS runs on the StarFive VisionFive 2 Lite:
+> `Starting kernel ...` from U-Boot, then our own banner out of the JH7110's 16550. Fourth
+> architecture, real silicon.
+>
+> Three things had to be fixed, and two of them QEMU could not have found:
+> 1. **Load address.** Linked at QEMU's 0x8020_0000; the board enters at 0x4020_0000
+>    (`kernel-riscv64-visionfive.ld`, `visionfive` feature).
+> 2. **Flat binary.** `booti` loads an image, not an ELF.
+> 3. **RISC-V Image header.** `booti` refused the image outright - `Bad Linux RISCV Image magic!` -
+>    after reading all 4279 bytes correctly. QEMU never asked because `-kernel` takes an ELF and
+>    reads the entry from its header. A property of the BOOT PROTOCOL, not the silicon.
+>    The jump at the head of it is wrapped in `.option norvc`: compressed instructions make `j` two
+>    bytes, every field behind it shifts, and the magic lands where U-Boot does not look.
+>
+> Also learned on the card, not from documentation: **the bootloader is in the board's SPI flash**
+> (`Trying to boot from SPI`), so an SD card needs only to carry a kernel. One FAT32 partition is
+> enough - and it must sit in **MBR slot 3**, because this U-Boot's SPI-resident environment has
+> `mmc 0:3` baked in from the vendor layout. Moving the 16-byte partition entry from slot 1 to slot 3
+> is enough; no filesystem data moves.
+>
+> Next is the FDT parser: U-Boot already hands us a valid device tree at 0x4600_0000, and reading it
+> is what ends the hard-coded UART address and unblocks Sv39, the trap vector and the timer.
+
+
 **Severity:** feature, in progress. The target board is a StarFive **VisionFive 2** class machine
 (JH7110); QEMU `virt` is the primary development target and will remain so for the early work.
 **Status:** 2026-09-07 - the kernel BUILDS for `riscv64imac-unknown-none-elf` and BOOTS under QEMU

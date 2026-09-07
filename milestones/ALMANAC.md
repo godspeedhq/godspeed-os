@@ -1133,6 +1133,52 @@ corollary is kinder than it sounds: the BSP had been able to halt onto a dead ti
 the port, and only became visible when a change stopped userspace spinning long enough for the core
 to idle. The bug was never created. Something merely stopped hiding it.
 
+## 2026-09-07 - The day the emulator's luck ran out
+
+GodspeedOS booted on a fourth architecture. `Starting kernel ...` and then our own banner, out of a
+16550 on a StarFive JH7110, from a kernel U-Boot loaded off an SD card. What made the day worth
+writing down is not that it worked. It is that everything which went wrong first was something QEMU
+was structurally incapable of telling me, and that three of them were the same mistake.
+
+The kernel would not load at all: `Bad Linux RISCV Image magic!` after U-Boot had read all 4279 bytes
+perfectly. `booti` requires a 64-byte header that Linux defines and a flat binary must carry. QEMU had
+never asked for it, because `-kernel` is handed an ELF and takes the entry point from the ELF header,
+while `booti` is handed a raw image and has nowhere else to look. The difference was in the BOOT
+PROTOCOL, not the silicon, so no amount of emulator testing could have surfaced it. And when I wrote
+the header, the jump at its front had to be wrapped in `.option norvc`: with compressed instructions
+on, `j` assembles to two bytes, every field behind it shifts, and the magic lands somewhere U-Boot
+does not read.
+
+Before that, the board disagreed with the emulator about nearly everything the port had assumed. RAM
+at 0x4000_0000 rather than 0x8000_0000, so the kernel was linked to an address the loader would never
+jump to. A 4 MHz timer where QEMU runs 10. OpenSBI v1.2 against QEMU's v1.8. And the boot hart is
+**hart 1**, because hart 0 is the JH7110's monitor core. Only the UART agreed, at 0x1000_0000, which
+was luck rather than design and the single reason the banner printed unchanged.
+
+That week I had already spent a day on an x86 bug of exactly this shape. Core 0's local APIC id was
+published only inside AP startup, so a single-core boot never published it and every interrupt was
+addressed to APIC id 0. It was invisible to the whole suite because QEMU's boot processor really IS
+id 0: the wrong value was accidentally right on the only machine CI runs. Now the same trap was
+waiting one architecture over, in "hart 0 is the boot hart" - natural, universally true in the
+emulator, and false on the first real board I tried.
+
+I also spent hours solving the wrong problem. The card could not be mounted on Windows, so I fought
+`diskpart`, `Set-Partition` and `wsl --mount` in turn, and every one refused. The user asked why we
+were making it hard, and whether wiping the card would do. It would, and the reason was in the board's
+own boot log all along: `Trying to boot from SPI`. The bootloader lives in the board's flash, not on
+the card, so the card only ever needed to carry a kernel, and a single partition Windows would happily
+letter was enough. I had been reading that log for other facts for two days.
+
+**What I came to understand:** an emulator does not merely omit hardware, it supplies DEFAULTS, and a
+default that happens to match your assumption hides the assumption instead of testing it. Zero is the
+dangerous one, because zero is what an untested field already contains: APIC id 0, hart 0, an entry
+point read from a header that a real loader will not read. So the question to ask of a green emulator
+run is not "did it pass" but "which of my assumptions did this environment happen to satisfy", and the
+answer is worth writing down before the hardware arrives rather than after it disagrees. The corollary
+is why the first hardware boot should be the smallest thing that can possibly fail: five assumptions
+died in one afternoon, and each one announced itself by name only because there was nothing else in
+the kernel for them to hide behind.
+
 ## The Named Bugs - the teachers
 
 Some bugs are worth naming, because a name turns a failure into shorthand. Years from now someone
