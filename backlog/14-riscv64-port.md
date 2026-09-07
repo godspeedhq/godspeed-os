@@ -204,6 +204,51 @@ Also worth carrying forward: OpenSBI on this board reports `Boot HART ISA Extens
 QEMU lists `sstc`. So the timer must go through an SBI call rather than the Sstc extension - another
 place where the emulator offers a capability the hardware does not.
 
+## Where the port actually is (2026-09-07, end of first day on hardware)
+
+Everything below is verified on BOTH QEMU `virt` and the VisionFive 2 Lite, with the values differing
+between them because they are read from the machine rather than compiled in.
+
+| | QEMU `virt` | VisionFive 2 Lite |
+|---|---|---|
+| boot hart | 0 | **1** (hart 0 is a disabled S7 monitor core) |
+| RAM | 0x8000_0000 + 256 MiB | 0x4000_0000 + **8192 MiB** |
+| usable harts | 1 | **4** of the 5 OpenSBI counts |
+| UART | ns16550a, shift 0, width 1 | snps,dw-apb-uart, shift **2**, width **4** |
+| timebase | 10 MHz | **4 MHz** |
+| SBI | v3.0 (OpenSBI 1.8) | **v1.0** (OpenSBI 1.2) |
+| identity map | to 0xc000_0000 | to **0x2_4000_0000** |
+
+**Neutral subsystems running unchanged:** the frame allocator (`memory::init`), per-core arenas
+(`smp::percpu_init`), the capability table, and IPC routing. Their log lines are the neutral kernel's
+own, not this arch's.
+
+**Arch-side, working:** FDT parsing, a real `BootInfo` with firmware and device tree carved out, Sv39
+paging (4 KiB pages plus 1 GiB identity leaves), an S-mode trap vector that names its faults, SBI, and
+a 10 ms scheduler tick with full context save and resume.
+
+**Still zero changes outside `kernel/src/arch/riscv64/`** - the neutral kernel, the services and the
+SDK are untouched by this port.
+
+## What QEMU could not have caught, and what that cost
+
+Five differences so far, each invisible in the emulator by construction. They are listed together
+because the pattern is more useful than any one of them: an emulator supplies DEFAULTS, and a default
+that happens to match an assumption HIDES it rather than testing it.
+
+1. **Load address.** QEMU 0x8020_0000, board 0x4020_0000. Linked wrong, jumped past entirely.
+2. **The RISC-V Image header.** `booti` refuses a flat binary without it; QEMU `-kernel` takes an ELF
+   and reads the entry from its header, so it never asks. A property of the BOOT PROTOCOL.
+3. **The 16550 transmit FIFO.** Output stopped at exactly 16 characters, twice. QEMU accepts bytes as
+   fast as they are written and has no FIFO to overrun.
+4. **`reg-shift = 2`.** The DesignWare UART puts every register except offset 0 somewhere else - which
+   is why THR worked and LSR would not have.
+5. **`svadu`.** QEMU maintains the Accessed and Dirty bits in hardware; this board does not, so a leaf
+   mapped with `A = 0` faults on first touch there and works perfectly in the emulator.
+
+And one that is not QEMU's fault at all: the FDT header's `boot_cpuid_phys` reads 0 on this board while
+`a0` and OpenSBI both say hart 1. Take the boot hart from the register, never from the tree.
+
 ## What is stubbed, in the order it probably wants doing
 
 1. **Read the FDT.** Everything else needs it, and it removes the last hard-coded address (the 16550
