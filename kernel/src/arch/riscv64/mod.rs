@@ -284,6 +284,49 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
 ");
     }
 
+    // What the FIRMWARE says is off limits, reported separately from the map it feeds. Printed
+    // because an empty list is a fact worth seeing: it means nothing but our own bookkeeping is
+    // protecting the memory OpenSBI is running from.
+    {
+        let mut r = [fdt::Reg { base: 0, size: 0 }; 8];
+        let n = tree.reservations(&mut r);
+        print_str("riscv64: firmware reserved ");
+        print_dec(n as u64);
+        print_str(" region(s)");
+        for e in &r[..n] {
+            print_str(" ");
+            print_hex(e.base);
+            print_str("+");
+            print_hex(e.size);
+        }
+        print_str("
+");
+    }
+
+    // The memory map the neutral kernel will be handed, printed before it is used. An allocator
+    // given a wrong map fails LATER and somewhere else, so the map is stated where it is built.
+    match build_boot_info(&tree, fdt) {
+        Some(bi) => {
+            for r in bi.memory_map {
+                print_str("riscv64: mem ");
+                print_hex(r.base);
+                print_str("..");
+                print_hex(r.base + r.len);
+                print_str(match r.kind {
+                    MemoryKind::Usable => "  usable",
+                    MemoryKind::KernelImage => "  kernel",
+                    _ => "  reserved",
+                });
+                print_str(" (");
+                print_dec(r.len / 1024);
+                print_str(" KiB)
+");
+            }
+        }
+        None => print_str("riscv64: could not build a memory map from the device tree
+"),
+    }
+
     for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies. halting.
 " {
         putc(b);
@@ -794,4 +837,136 @@ pub mod ioapic {
 // ---------------------------------------------------------------------------
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
+}
+
+// ============================ BootInfo, built from the machine ============================
+//
+// The neutral kernel's boot sequence starts with `memory::init(boot_info)`, so a real `BootInfo` is
+// the first thing standing between this port and shared code running on it. Every field below is
+// either read from the device tree or taken from the link - none is a constant, which is what lets
+// the same logic describe QEMU's 256 MiB at 0x8000_0000 and the board's 8 GiB at 0x4000_0000.
+
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
+/// Regions handed to the frame allocator. FIXED, no heap (§26.6.1): a machine that describes more
+/// banks than this simply has the extra ones ignored, which is a bounded loss the boot reports,
+/// rather than an allocation that can fail halfway through bring-up.
+const MAX_REGIONS: usize = 16;
+static mut REGIONS: [MemoryRegion; MAX_REGIONS] = [MemoryRegion {
+    base: 0,
+    len: 0,
+    kind: MemoryKind::Reserved,
+}; MAX_REGIONS];
+
+/// Describe memory to the neutral kernel: what RAM exists, minus what is already spoken for.
+///
+/// THREE THINGS MUST NOT BE HANDED OUT and each would fail differently if it were. The kernel image
+/// itself, because allocating it returns frames we are executing from. The boot stack, which is why
+/// `__kernel_end` sits past `__stack_top` rather than at the end of `.bss`. And the device tree,
+/// because the firmware placed it in RAM and nothing else marks it - overwrite it and every fact
+/// this port depends on becomes garbage, at a point far from the write.
+fn build_boot_info(tree: &fdt::Fdt, fdt_ptr: *const u8) -> Option<BootInfo> {
+    let ram = tree.memory()?;
+    let k_start = (&raw const __kernel_start) as u64;
+    let k_end = (&raw const __kernel_end) as u64;
+
+    // The device tree's own extent, rounded out to whole pages so a partial page is never reused.
+    let fdt_start = (fdt_ptr as u64) & !0xfff;
+    let fdt_end = ((fdt_ptr as u64) + tree.total_size() as u64 + 0xfff) & !0xfff;
+
+    let mut n = 0usize;
+    let mut push = |base: u64, len: u64, kind: MemoryKind| {
+        if len > 0 && n < MAX_REGIONS {
+            // SAFETY: single-threaded boot, before any other hart is started; this static is
+            // written once here and only read afterwards.
+            unsafe { REGIONS[n] = MemoryRegion { base, len, kind } };
+            n += 1;
+        }
+    };
+
+    // Everything that must be carved out of RAM, gathered before any of it is used.
+    //
+    // THE FIRMWARE'S OWN RESERVATIONS ARE THE ONE THAT BITES. OpenSBI runs in M-mode from RAM and
+    // lists itself in the FDT reservation block - 0x8000_0000 on QEMU, 0x4000_0000 on the JH7110 -
+    // and nothing else in the tree marks it. A first version of this function omitted them and
+    // cheerfully described the firmware's memory as usable; the frame allocator would have handed
+    // out the code we make SBI calls into, and the failure would have surfaced far from the write.
+    let mut resv = [fdt::Reg { base: 0, size: 0 }; 8];
+    let nres = tree.reservations(&mut resv);
+
+    const MAX_CUTS: usize = 12;
+    let mut cuts = [(0u64, 0u64, MemoryKind::Reserved); MAX_CUTS];
+    let mut ncuts = 0usize;
+    let mut add_cut = |start: u64, end: u64, kind: MemoryKind, cuts: &mut [(u64, u64, MemoryKind); MAX_CUTS], n: &mut usize| {
+        if end > start && *n < MAX_CUTS {
+            cuts[*n] = (start, end, kind);
+            *n += 1;
+        }
+    };
+    // EVERYTHING BELOW THE KERNEL IS RESERVED, and this is a deliberate refusal to guess rather
+    // than a measurement. The firmware runs from RAM: OpenSBI sits at 0x8000_0000 on QEMU and
+    // 0x4000_0000 on the JH7110, immediately below where the kernel is loaded. Nothing tells us its
+    // extent - QEMU's OpenSBI reserves ZERO regions in the FDT, which the boot line above reports,
+    // so the mechanism that exists for exactly this says nothing.
+    //
+    // The costs are wildly asymmetric. Being conservative loses the 2 MiB the Image header's
+    // `text_offset` already says we are placed past; being wrong hands the frame allocator the code
+    // we make SBI calls into, and the corruption surfaces far from the write. So an unprovable
+    // region is reserved, never usable. If a machine ever describes that space properly, this
+    // becomes dead weight rather than a bug - which is the right way round.
+    add_cut(ram.base, k_start, MemoryKind::Reserved, &mut cuts, &mut ncuts);
+    add_cut(k_start, k_end, MemoryKind::KernelImage, &mut cuts, &mut ncuts);
+    add_cut(fdt_start, fdt_end, MemoryKind::Reserved, &mut cuts, &mut ncuts);
+    for r in &resv[..nres] {
+        let s = r.base & !0xfff;
+        let e = (r.base.saturating_add(r.size).saturating_add(0xfff)) & !0xfff;
+        add_cut(s, e, MemoryKind::Reserved, &mut cuts, &mut ncuts);
+    }
+
+    // Sort by start. An insertion sort over at most twelve entries, because the walk below assumes
+    // address order and a fixed tiny array does not justify anything cleverer (§26.13).
+    for i in 1..ncuts {
+        let mut j = i;
+        while j > 0 && cuts[j - 1].0 > cuts[j].0 {
+            cuts.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+
+    // Walk RAM once, cutting out each reserved span in address order. Done by comparison rather
+    // than by assuming a layout: the kernel sits at the bottom of RAM on the board and the device
+    // tree above it, but nothing guarantees either.
+    let ram_end = ram.base.saturating_add(ram.size);
+    let mut cur = ram.base;
+    for (start, end, kind) in cuts[..ncuts].iter().copied() {
+        let start = start.max(ram.base).min(ram_end);
+        let end = end.max(ram.base).min(ram_end);
+        if end <= start {
+            continue;
+        }
+        if start > cur {
+            push(cur, start - cur, MemoryKind::Usable);
+        }
+        push(start, end - start, kind);
+        cur = cur.max(end);
+    }
+    if ram_end > cur {
+        push(cur, ram_end - cur, MemoryKind::Usable);
+    }
+
+    // SAFETY: as above - written once during single-threaded boot, read-only from here.
+    let map: &'static [MemoryRegion] = unsafe { &*core::ptr::addr_of!(REGIONS[..n]) };
+    Some(BootInfo {
+        memory_map: map,
+        kernel_phys_start: k_start,
+        kernel_phys_end: k_end,
+        // IDENTITY-MAPPED FOR NOW: S-mode entry runs with `satp` still zero, so virtual equals
+        // physical and the direct-map offset is nothing. This becomes a real offset when Sv39 is
+        // set up, and it is a field rather than an assumption precisely so that change is one line.
+        hhdm_offset: 0,
+        rsdp_addr: 0,
+    })
 }

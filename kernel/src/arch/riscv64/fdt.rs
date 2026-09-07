@@ -107,6 +107,33 @@ impl<'a> Fdt<'a> {
         Some(Fdt { blob, off_struct, off_strings })
     }
 
+    /// The memory reservation block: spans the firmware says must NOT be reused.
+    ///
+    /// This is not decoration. OpenSBI runs in M-mode from RAM and lists ITSELF here - on QEMU at
+    /// 0x8000_0000, on the JH7110 at 0x4000_0000 - and nothing else in the tree marks it. A frame
+    /// allocator handed that memory would allocate the firmware it is running under, and the failure
+    /// would surface far from the write as an SBI call into rewritten code.
+    ///
+    /// Format is a list of (address, size) big-endian u64 pairs, terminated by a zero pair. Bounded
+    /// by `max` entries and by the blob, so a corrupt list cannot spin.
+    pub fn reservations(&self, out: &mut [Reg]) -> usize {
+        let Some(off) = be32(self.blob, 16) else { return 0 };
+        let mut off = off as usize;
+        let mut n = 0;
+        while n < out.len() {
+            let (Some(addr), Some(size)) = (be64(self.blob, off), be64(self.blob, off + 8)) else {
+                break;
+            };
+            if addr == 0 && size == 0 {
+                break; // the terminator
+            }
+            out[n] = Reg { base: addr, size };
+            n += 1;
+            off += 16;
+        }
+        n
+    }
+
     pub fn total_size(&self) -> usize {
         self.blob.len()
     }

@@ -6,6 +6,11 @@ ENTRY(_start)
 SECTIONS {
     . = 0x80200000;
 
+    /* The kernel's own span, so the frame allocator can refuse to hand out the memory it is
+       running from. Taken from the link, never from a constant: the two boards load at different
+       addresses and the allocator must not need to know which one it is on. */
+    __kernel_start = .;
+
     .text : ALIGN(0x1000) {
         KEEP(*(.text.boot))
         *(.text .text.*)
@@ -22,6 +27,9 @@ SECTIONS {
     . = ALIGN(16);
     . += 0x80000;
     __stack_top = .;
+    /* End of everything the image occupies, INCLUDING the boot stack. A frame allocator handed a
+       smaller span would cheerfully allocate the stack out from under the caller. */
+    __kernel_end = .;
 
     /* Total span the loader must keep clear for us, for the Image header's `image_size`.
        Measured from the load address to the end of the stack, so it covers text, rodata,
