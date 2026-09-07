@@ -1,4 +1,4 @@
-# 13. EHCI unplug CPU burst, and xHCI `Enable Slot` timeouts
+# 13. EHCI holds a core while a device is unplugged, and xHCI `Enable Slot` timeouts
 
 **Severity:** cosmetic-to-minor. Neither costs a test failure on any machine; both are pre-existing and
 predate the single-core work.
@@ -6,10 +6,29 @@ predate the single-core work.
 
 ## A. `ehci` burns a core for a few seconds after a device is unplugged
 
-`observe` reports `ehci` at 100% immediately after unplugging, dropping to 0% within about three
-seconds. The core total tracks it exactly (100%, 100%, 20%, 18%, 19%), so this is real CPU and not a
-sampling artefact - it is simply BRIEF, which is what the first reports of it missed. The user recalls
-the same behaviour from months before this branch, and nothing in the single-core work touches it.
+`observe` reports `ehci` at 100% for as long as the device stays unplugged, and 0% the moment it is
+plugged back in. The core total agrees frame for frame, so this is real CPU:
+
+```
+ehci=100%  core=100%   53s      <- unplugged, sustained across every frame
+ehci=100%  core=100%   54s ... 57s
+ehci=100%  core=20%    58s      <- transition
+ehci=0%    core=18%    59s      <- device replugged
+```
+
+The user recalls the same behaviour from months before this branch, and nothing in the single-core
+work touches it.
+
+**Two wrong readings were published about this before the above; both are recorded because the way
+they were reached is the thing to avoid.** First, "a task cannot use 100% of a core that is 53% busy,
+so the instrument is lying" - the 53% frame was captured while the connector was PARTIALLY INSERTED,
+a physical state that is neither plugged nor unplugged, so it was never comparable. Second, "it is a
+3-second burst that settles" - that came from pairing an `ehci` row list with a `core` line list from
+two separate greps, without checking the rows were from the same frame. Paired in file order they
+agree exactly, and the drop is the REPLUG, not a decay.
+
+Both errors have the same shape: a story built from readings that were never established to be
+comparable. The instrument was consistent throughout; the pairing was not.
 
 Not the cause, though all three were real and are fixed:
 
@@ -23,7 +42,7 @@ Not the cause, though all three were real and are fixed:
   yields 2 ms then parks, and logs once when a transfer runs out its budget.
 
 Those three are worth keeping on their own merits - each one held a core with no yield or no sleep -
-but the burst survives them, so the remaining cost is somewhere else on the unplug path. What is known:
+but the 100% survives all three, so the remaining cost is somewhere else on the unplug path. What is known:
 the rescan loop is NOT spinning (5 port-census cycles in a minute, so `sleep_ms(HOTPLUG_POLL_MS)` is
 working), and the hub's own control transfers SUCCEED while the keyboard is the thing unplugged.
 
