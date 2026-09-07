@@ -255,6 +255,61 @@ that happens to match an assumption HIDES it rather than testing it.
 And one that is not QEMU's fault at all: the FDT header's `boot_cpuid_phys` reads 0 on this board while
 `a0` and OpenSBI both say hart 1. Take the boot hart from the register, never from the tree.
 
+## USERSPACE RUNS (2026-09-07, QEMU) - and what the board has NOT seen yet
+
+`supervisor: ready`, nine services in the name-cap map, `fs` serving the file API, `net-stack`
+serving its client API, the shell at a prompt. Two minutes: zero panics, zero wedges, zero faults,
+ten spawns. Everything degrades where the hardware is absent - no AHCI disk, no e1000, no xHCI/EHCI -
+and says so rather than hanging.
+
+**Board-verified up to `usertask PASS` and the supervisor LOAD. Everything from `entering the
+scheduler` onward has only run in QEMU.** That is the whole of the running userspace, and it is the
+first thing to try in the morning.
+
+Three bugs got it there, and the shape of each is worth more than the fix:
+
+1. **`wait_for_interrupt` implemented its NAME, not its contract.** The neutral idle path's own
+   comment says it "issues only `sti`" - its job is to UNMASK, not to halt. A `wfi` that does not
+   unmask masks once and never unmasks: the timer stops and the machine dies with nothing to report.
+   The order `wfi` then `csrs sstatus, SIE` is race-free, because `wfi` wakes on a pending interrupt
+   regardless of `SIE`.
+2. **A whole-gigapage clone destroyed what it was cloning for**, because the kernel's identity map
+   and userspace overlap here (kernel from zero, services at 0x400000, both in gigapage 0).
+3. **The clone read the LIVE root, not the kernel's.** A spawn is a syscall made by a task, so
+   `finalize_service_address_space` cloned from the SUPERVISOR when the supervisor spawned anything -
+   and the supervisor reaches the low gigabyte through a pointer table, which a leaf-copying clone
+   skips. Every service it spawned got RAM but no UART.
+
+**`qemu -d int` found the third one in a line after four rounds of reasoning got it wrong three
+times.** `load_page_fault ... tval:0x0000000010000005`, repeating - the UART's LSR, in a loop,
+silent because the thing that wanted to print was the fault handler. Reach for it earlier: a silent
+hang with no output is exactly the case where the emulator can see what the kernel cannot say. The
+fault reporter now prints the live PTE for any page fault, so the next one is a log line instead.
+
+### What to try on the board, in order
+
+1. Boot it. Expect the QEMU sequence: `boot hart is 1`, the five selftests, `supervisor: ready`, then
+   the shell prompt. The board has a real 4 MHz timebase against QEMU's 10 MHz, so the quantum and
+   idle re-arm arithmetic is exercised at a different rate for the first time.
+2. Type at the shell. It says `input driver not announced yet - prompting anyway`, and on this board
+   input would come from the same 16550 the kernel prints through - `uart_rx_pop` and friends are
+   still stubs, so KEYS WILL NOT REACH IT YET. That is the next piece of work, not a bug to chase.
+3. `xhci` spawn FAILS on this port and the log says so - there is no PCI on the VisionFive and the
+   service is x86/aarch64-shaped. Expected, and it does not stop the boot.
+
+### What is still stubbed, now that the shape is clear
+
+- **Console input.** `uart_rx_pop`, `uart_rx_poll`, `input_ready`, `console_push_byte` are no-ops, so
+  the shell prompts and cannot be typed at. The 16550 the kernel writes is right there; this is a
+  receive path and an interrupt, not a new subsystem.
+- **PLIC.** No device interrupts are routed to userspace, so no driver service can be interrupt-driven
+  (12).
+- **SMP.** One hart. `ap_count()` reports what the device tree found, and SBI HSM would start the
+  rest; `get_lapic_id` returns the BOOT hart's id and would need to be a `tp` read first.
+- **A fault is still fatal.** The reporter names the privilege and now the PTE, but there is no kill
+  path, so a faulting task halts the machine instead of dying. This is the single biggest gap between
+  this port and the others, and it is what `uaccess`'s pre-walk exists to work around.
+
 ## The kernel is INSIDE the user address range on this port, so a range check proves nothing
 
 x86 validates a syscall pointer with a range check against `USER_END`, and that check rejects a
