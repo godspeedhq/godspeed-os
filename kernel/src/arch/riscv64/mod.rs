@@ -352,6 +352,11 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             // report it. So the tables are built and read back while addressing is still identity
             // and a bug is merely a wrong number.
             sv39_selftest();
+
+            // THE STEP THAT CAN GO SILENT. Everything after `csrw satp` runs through the table
+            // built here, including the instruction fetch immediately following it, so the printing
+            // is arranged so that WHICH LINE IS LAST tells you what failed.
+            enable_paging(&bi);
         }
         None => print_str("riscv64: could not build a memory map from the device tree
 "),
@@ -989,6 +994,64 @@ fn sv39_selftest() {
     print_str(" unmap=");
     print_str(if ok_unmap { "ok" } else { "BAD" });
     print_str("
+");
+}
+
+
+/// Build the kernel's own address space and turn translation on.
+///
+/// Identity, via 1 GiB leaves, covering everything from zero to the top of RAM - so the kernel's
+/// code, its stack, the frame allocator's bitmaps, the page tables themselves, the device tree, the
+/// UART and the PLIC are all reachable at the addresses they already have. Enabling translation
+/// then changes no address that is currently in flight, which is the only version of this step that
+/// can be debugged afterwards.
+///
+/// The three prints are the instrument. If the machine stops after "building" the table could not
+/// be allocated or filled; after "enabling" the write itself faulted; and reaching "on" means
+/// translation is live and the UART is still reachable through it. Silence with no line at all
+/// would mean the fault came before any of this, which is a different bug entirely.
+fn enable_paging(bi: &BootInfo) {
+    let Some(root) = sv39::new_root() else {
+        print_str("riscv64: paging FAILED - no frame for the root table
+");
+        return;
+    };
+
+    // Where RAM ends, from the map that was built from the device tree. Rounded UP to a gigabyte so
+    // the final partial leaf still covers the top of memory rather than stopping short of it.
+    let mut top: u64 = 0;
+    for r in bi.memory_map {
+        top = top.max(r.base.saturating_add(r.len));
+    }
+    let top = (top + ((1 << 30) - 1)) & !((1u64 << 30) - 1);
+
+    // Kernel access, every permission: this single map covers code, data, stack and MMIO, and
+    // splitting it into properly-permissioned regions is a later change with its own risks. `U` is
+    // NOT set - nothing here is reachable from user mode, which is the one permission that would be
+    // a security property rather than a convenience.
+    let bits = sv39::PTE_V | sv39::PTE_R | sv39::PTE_W | sv39::PTE_X | sv39::PTE_A | sv39::PTE_D;
+
+    print_str("riscv64: building identity map to ");
+    print_hex(top);
+    print_str("
+");
+    if sv39::identity_map_gigapages(root, top, bits).is_err() {
+        print_str("riscv64: paging FAILED - could not fill the root table
+");
+        return;
+    }
+
+    print_str("riscv64: enabling paging, satp root ");
+    print_hex(root);
+    print_str("
+");
+    // SAFETY: the table built above maps every address identically from zero to the top of RAM,
+    // which includes the instruction stream executing this write and the stack it runs on. The
+    // fence inside `write_page_table_base` discards translations from before the change.
+    unsafe { page_tables::write_page_table_base(root) };
+
+    // Reaching here means the UART was reachable THROUGH the new table, not merely before it.
+    print_str("riscv64: paging on, sv39 active
 ");
 }
 

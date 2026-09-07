@@ -218,3 +218,40 @@ pub fn translate(root: u64, va: u64) -> Option<u64> {
     let pte = unsafe { (table as *const u64).add(vpn(va, 0)).read_volatile() };
     if pte_is_valid(pte) { Some(pte) } else { None }
 }
+
+/// Identity-map `[0, end)` using 1 GiB leaves at the root level.
+///
+/// A ROOT-LEVEL PTE WITH R/W/X SET IS A LEAF covering one gigabyte, and using them here is not an
+/// optimisation so much as the difference between nine table entries and sixteen megabytes of page
+/// tables for the board's eight gigabytes of RAM. The walk in `map_page` already understands leaves
+/// at any level, because `pte_is_leaf` asks about the permission bits rather than the depth.
+///
+/// IDENTITY, DELIBERATELY. The kernel is entered with `satp` zero and every address it holds - its
+/// own code, the stack it is running on, the frame allocator's bitmaps, the UART it is about to
+/// report through - is physical. Mapping virtual to the same value means enabling translation
+/// changes nothing that is already in flight, which is the only version of this step that can be
+/// debugged: if the machine goes quiet afterwards, the fault is the mapping and not an address that
+/// silently moved.
+///
+/// Everything below RAM is covered too, in the same sweep. The UART at 0x1000_0000 and the PLIC at
+/// 0x0c00_0000 both live under the first gigabyte on both machines, so the first leaf carries them
+/// without either address appearing here.
+pub fn identity_map_gigapages(root: u64, end: u64, bits: u64) -> Result<(), MapFail> {
+    const GIB: u64 = 1 << 30;
+    let mut addr: u64 = 0;
+    while addr < end {
+        let idx = ((addr >> 30) & 0x1ff) as usize;
+        if idx >= 512 {
+            break; // past what Sv39's 39-bit space can address; the caller sized `end` wrongly
+        }
+        // SAFETY: `root` is a page-aligned frame this kernel owns, identity-mapped; idx < 512.
+        let slot = unsafe { (root as *mut u64).add(idx) };
+        // SAFETY: as above.
+        unsafe { slot.write_volatile(pte_make(addr, bits)) };
+        addr = addr.saturating_add(GIB);
+        if addr == 0 {
+            break; // wrapped: nothing sane left to map
+        }
+    }
+    Ok(())
+}

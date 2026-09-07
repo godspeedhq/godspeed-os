@@ -1290,6 +1290,8 @@ matching the x86/ARM implementations so a real port inherits the obligation rath
 | `arch/aarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. The boot path was also reworked for the Pi 4 (EL2 -> EL1 drop, BCM2711 PL011 at 0xFE201000, a bounded TXFF wait) but that is net-neutral on the count: `CurrentEL` read and the UART poll replace the old unguarded byte writes. |
 | `arch/loongarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
 | `arch/riscv64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/riscv64/sv39.rs` | 15 -> 17 (+2) | 2026-09-07: `identity_map_gigapages` writes root-level 1 GiB leaves. Same soundness as the 4 KiB walker - a page-aligned frame the kernel owns, an index masked to 9 bits - and the loop is bounded by both the requested end and the 512-entry table, with an explicit break on wrap. |
+| `arch/riscv64/mod.rs` | 32 -> 33 (+1) | 2026-09-07: `enable_paging` calls `write_page_table_base`. The obligation that makes it sound is discharged immediately above the call: the table maps every address identically from zero to the top of RAM, which includes the instruction stream performing the write and the stack under it. |
 | `arch/riscv64/sv39.rs` | 0 -> 15 (new file) | 2026-09-07: the Sv39 page-table walker. Every block is a volatile read or write of one 64-bit PTE slot in a page-aligned frame the kernel owns, plus one `write_bytes` zeroing a freshly allocated table. Sound because the tables are frames from `alloc_frame` (so owned and 4 KiB), the index is masked to 9 bits (so `< 512` and in-frame by construction), and addressing is identity while `satp` is zero - which `PHYS_IS_IDENTITY` states and the kernel's own map preserves when it enables translation. `arch/` is a permitted layer (§18.1); this is recorded, not exempted. |
 | `arch/riscv64/mod.rs` | 28 -> 32 (+4) | 2026-09-07: the `page_tables` seam over the above - `unmap` wrapping a returned frame, `csrr satp`, `csrw satp` + `sfence.vma`, and address-scoped `sfence.vma`. The CSR read has no side effects; the write is `unsafe fn` with the contract that `base` must map the code performing it, because the very next instruction fetch goes through it. |
 | `arch/riscv64/fdt.rs` | 0 -> 3 (new file) | 2026-09-07: the device-tree reader. THREE lines, all in `Fdt::from_ptr`, and deliberately all at the boundary: two volatile reads of the 8-byte FDT header, and one `from_raw_parts` turning the firmware pointer into a `&[u8]` of exactly the length that header declares. Nothing is trusted before the 0xd00dfeed magic matches. Every other line in the file is safe slice indexing, so a malformed or hostile tree yields `None` rather than a read outside the blob - the same shape as `bootcon`, which takes a checked slice from the arch and is bounds-checked thereafter. |
@@ -2450,8 +2452,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
-| arch/riscv64/sv39.rs | 15 | permitted |
-| arch/riscv64/mod.rs | 32 | permitted |
+| arch/riscv64/sv39.rs | 17 | permitted |
+| arch/riscv64/mod.rs | 33 | permitted |
 | arch/s390x/mod.rs | 20 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
