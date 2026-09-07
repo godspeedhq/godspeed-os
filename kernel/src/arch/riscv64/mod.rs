@@ -8,6 +8,7 @@
 #![allow(unused_variables, dead_code)]
 
 pub mod fdt;
+pub mod sv39;
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
 
@@ -344,6 +345,13 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             crate::ipc::init();
             print_str("riscv64: capability table and ipc routing initialised
 ");
+
+            // EXERCISE THE WALKER BEFORE TRUSTING IT WITH `satp`. Writing that register is the one
+            // step where a mistake gives no output at all: translation changes under the program
+            // counter, and a wrong table faults on the next instruction fetch with nothing left to
+            // report it. So the tables are built and read back while addressing is still identity
+            // and a bug is merely a wrong number.
+            sv39_selftest();
         }
         None => print_str("riscv64: could not build a memory map from the device tree
 "),
@@ -637,9 +645,24 @@ pub mod page_tables {
 
     pub struct PageTable { root: u64 }
     impl PageTable {
-        pub fn new() -> Result<Self, MapError> { unimplemented!() }
-        pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> { unimplemented!() }
-        pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> { unimplemented!() }
+        pub fn new() -> Result<Self, MapError> {
+            let root = super::sv39::new_root().ok_or(MapError::FrameAllocFailed)?;
+            Ok(PageTable { root })
+        }
+        pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> {
+            let bits = super::sv39::flags_to_pte_bits(flags.bits());
+            super::sv39::map_page(self.root, virt.0, phys.0, bits).map_err(|e| match e {
+                super::sv39::MapFail::NoFrame => MapError::FrameAllocFailed,
+                super::sv39::MapFail::AlreadyMapped => MapError::AlreadyMapped,
+                super::sv39::MapFail::NotMapped => MapError::NotMapped,
+            })
+        }
+        pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> {
+            let phys = super::sv39::unmap_page(self.root, virt.0).map_err(|_| MapError::NotMapped)?;
+            // SAFETY: the frame came from a leaf PTE this table owned, so it is page-aligned and is
+            // now unreferenced by it - which is exactly the contract `from_phys` asks for.
+            Ok(unsafe { super::sv39::frame_of(phys) })
+        }
         pub fn cr3_value(&self) -> u64 { self.root }
         pub fn into_cr3(self) -> u64 { self.root }
     }
@@ -661,11 +684,45 @@ pub mod page_tables {
     pub const BOOTLOADER_PLACED_TABLES: bool = false;
     pub fn get_hhdm_offset() -> u64 { 0 }
     pub unsafe fn set_hhdm_offset(offset: u64) {}
-    pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1
-    pub unsafe fn write_page_table_base(base: u64) {}
-    pub unsafe fn invalidate_tlb_page(addr: u64) {}          // TLBI VAE1
+    pub fn read_page_table_base() -> u64 {
+        let satp: u64;
+        // SAFETY: reading a CSR has no side effects.
+        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp, options(nomem, nostack)) };
+        // The neutral kernel wants a physical ROOT ADDRESS, not the register's encoding, so the PPN
+        // is shifted back. Handing it the raw `satp` would put the MODE nibble in the high bits of
+        // what callers treat as an address.
+        (satp & 0x0fff_ffff_ffff) << 12
+    }
+    /// # Safety
+    /// `base` must be the physical address of a valid Sv39 root table that maps at least the code
+    /// executing this write, or the very next instruction fetch faults.
+    pub unsafe fn write_page_table_base(base: u64) {
+        // SAFETY: contract delegated to the caller above. The fence AFTER the write is not optional:
+        // `satp` takes effect immediately, but stale TLB entries from the previous space would
+        // otherwise still satisfy translations that no longer exist.
+        unsafe {
+            core::arch::asm!(
+                "csrw satp, {}",
+                "sfence.vma",
+                in(reg) super::sv39::satp_value(base),
+                options(nostack)
+            );
+        }
+    }
+    /// # Safety
+    /// Architecturally always safe; `unsafe` to match the seam every arch implements.
+    pub unsafe fn invalidate_tlb_page(addr: u64) {
+        // SAFETY: `sfence.vma` with an address operand invalidates translations for that page only.
+        unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) addr, options(nostack)) };
+    }
     pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> { unimplemented!() }
-    pub fn entry_for_va(virt: u64) -> Option<u64> { None }
+    pub fn entry_for_va(virt: u64) -> Option<u64> {
+        let root = read_page_table_base();
+        if root == 0 {
+            return None; // translation is off: there is no entry to report, which is not an error
+        }
+        super::sv39::translate(root, virt)
+    }
     pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
     pub fn harden_hhdm_nx() {}
     pub unsafe fn reclaim_user_frames(cr3: u64) -> usize { 0 }
@@ -881,6 +938,58 @@ pub mod ioapic {
 // ---------------------------------------------------------------------------
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
+}
+
+
+/// Build a page table, map a page, read it back, unmap it. Reports a wrong number rather than
+/// causing a fault, because it runs while translation is still off.
+///
+/// Checks the two rules that are easy to get wrong and hard to see: that a WRITABLE mapping is also
+/// READABLE (`W` without `R` is a reserved encoding), and that `A`/`D` are set by software (the
+/// JH7110 has no `svadu`, so a leaf without them faults on first touch there and works in QEMU).
+fn sv39_selftest() {
+    use crate::arch::imp::page_tables::{PageFlags, PageTable, VirtAddr};
+    use crate::memory::frame::PhysAddr;
+
+    let Ok(mut pt) = PageTable::new() else {
+        print_str("riscv64: sv39 SELFTEST FAILED - no frame for a root table
+");
+        return;
+    };
+    // A virtual address in the user half, far from anything this kernel maps, and a physical frame
+    // we know exists: the page the kernel itself starts on.
+    let va = VirtAddr(0x0000_0010_0000_0000);
+    let pa = PhysAddr((&raw const __kernel_start) as u64);
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER;
+
+    if pt.map(va, pa, flags).is_err() {
+        print_str("riscv64: sv39 SELFTEST FAILED - map
+");
+        return;
+    }
+    let Some(pte) = sv39::translate(pt.cr3_value(), va.0) else {
+        print_str("riscv64: sv39 SELFTEST FAILED - mapped page does not translate
+");
+        return;
+    };
+    let ok_addr = sv39::pte_phys(pte) == pa.0;
+    let ok_rw = pte & sv39::PTE_R != 0 && pte & sv39::PTE_W != 0;
+    let ok_ad = pte & sv39::PTE_A != 0 && pte & sv39::PTE_D != 0;
+    let ok_user = pte & sv39::PTE_U != 0;
+    let ok_unmap = pt.unmap(va).is_ok() && sv39::translate(pt.cr3_value(), va.0).is_none();
+
+    print_str("riscv64: sv39 selftest addr=");
+    print_str(if ok_addr { "ok" } else { "BAD" });
+    print_str(" rw=");
+    print_str(if ok_rw { "ok" } else { "BAD" });
+    print_str(" a/d=");
+    print_str(if ok_ad { "ok" } else { "BAD" });
+    print_str(" user=");
+    print_str(if ok_user { "ok" } else { "BAD" });
+    print_str(" unmap=");
+    print_str(if ok_unmap { "ok" } else { "BAD" });
+    print_str("
+");
 }
 
 // ============================ BootInfo, built from the machine ============================
