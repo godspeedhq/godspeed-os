@@ -322,6 +322,12 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
                 print_str(" KiB)
 ");
             }
+
+            // THE FIRST NEUTRAL SUBSYSTEM TO RUN ON THIS ARCH. `memory::init` is shared code - the
+            // same frame allocator x86, arm and aarch64 use - and it is reached here by handing it
+            // facts, not by teaching it anything. Everything it needs came from the device tree or
+            // the link, so nothing inside it knows which machine it is on.
+            crate::memory::init(&bi);
         }
         None => print_str("riscv64: could not build a memory map from the device tree
 "),
@@ -609,7 +615,16 @@ pub mod page_tables {
         pub fn into_cr3(self) -> u64 { self.root }
     }
 
-    pub const PHYS_IS_IDENTITY: bool = false;
+    /// Physical addresses are directly usable as virtual ones.
+    ///
+    /// TRUE, and it is a statement about where this port currently IS, not a permanent property.
+    /// OpenSBI enters S-mode with `satp` zero, so translation is off and VA equals PA. The neutral
+    /// allocator asks because a zero HHDM offset means "nobody set it" on an arch with a
+    /// higher-half map and "correct" on one without, and it panics rather than guess between them -
+    /// which is the right behaviour and is why this constant has to be honest.
+    ///
+    /// This becomes `false`, with a real `hhdm_offset`, the moment Sv39 maps the kernel high.
+    pub const PHYS_IS_IDENTITY: bool = true;
 
     /// No bootloader placed page tables for this port - the kernel builds its own, in `.bss` inside the
     /// kernel image, which the memory map already excludes from usable RAM. So there is nothing for
