@@ -255,6 +255,33 @@ that happens to match an assumption HIDES it rather than testing it.
 And one that is not QEMU's fault at all: the FDT header's `boot_cpuid_phys` reads 0 on this board while
 `a0` and OpenSBI both say hart 1. Take the boot hart from the register, never from the tree.
 
+## `sstatus.SUM` makes a missing `sscratch` latch a SILENT HANG, not a wrong answer
+
+Two isolation rules meet here, and the combination is worth knowing before it is met by accident.
+
+`sscratch` holds the kernel stack while U-mode runs, so a trap from user mode builds its frame on a
+kernel stack rather than on whatever the user left in `sp` (`arch/riscv64/trap.rs`). Remove that latch
+and the frame goes on the USER stack instead - which sounds like a correctness bug with a wrong value
+at the end of it.
+
+It is not. A user stack is mapped `U`, and **S-mode may not write a `U` page while `sstatus.SUM` is
+clear** - which it is, by default, and this port never sets it. So the FIRST STORE of the trap entry
+faults. That fault re-enters the trap entry, which stores again, and faults again. An unrecoverable
+loop, before any handler runs, before `REPORTING` is consulted, before a single character is emitted.
+
+Confirmed on 2026-09-07 by deleting `csrw sscratch, sp` from `user_entry_trampoline`: the boot stops
+at the user-task selftest with NO output at all - not a `BAD`, not a trap report, nothing. The
+prediction had been `own-kernel-stack=BAD`.
+
+Two consequences:
+
+- **No software check can catch a MISSING latch.** The machine is gone before any code observes it.
+  What the `own-kernel-stack` check is actually for is a latch pointing at the WRONG stack, which does
+  not fault and would otherwise surface much later as one task quietly corrupting another's.
+- **`SUM` will have to be set, deliberately and narrowly, when the kernel first reads a user pointer**
+  (`uaccess::read_user_bytes` is the seam member that will need it). Setting it for the whole kernel
+  would silently remove the protection this failure just demonstrated is real.
+
 ## Sv39's address space has a HOLE in the middle, and the arithmetic will not tell you
 
 An Sv39 virtual address is 39 bits SIGN-EXTENDED: bits 63:38 must all equal bit 38. So the usable

@@ -443,6 +443,7 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     context_switch::address_space_selftest();
 
     usermode::selftest();
+    usermode::task_selftest();
 
     // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
     //

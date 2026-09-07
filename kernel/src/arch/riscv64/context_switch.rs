@@ -108,11 +108,10 @@ impl TaskContext {
     /// KERNEL stack - the stack a later timer interrupt builds its trap frame on, which is what makes
     /// a running user task preemptible, and the value the trampoline latches into `sscratch`.
     ///
-    /// **UNEXERCISED.** Nothing spawns a user task on this arch yet, so this constructor and its
-    /// trampoline have never run. They are written rather than stubbed because a stub in the seam
-    /// returns a context that is wrong in a way nothing reports; this is at least wrong in a way the
-    /// first spawn will report. Recorded here rather than claimed working (§26.7). The mechanism it
-    /// mirrors - `usermode::enter_user` - IS proven on hardware.
+    /// Exercised by `usermode::task_selftest`, which switches into a user task in an address space
+    /// of its own and is answered by an `ecall` that switches back out of the trap handler - the
+    /// shape a blocking syscall has. What is still NOT exercised is a task reached through the
+    /// neutral scheduler rather than by a direct `switch_context`, which is `spawn_supervisor`.
     ///
     /// # Safety
     /// `kernel_stack_top` must point to writable memory owned by this task. `user_entry` must be
@@ -157,7 +156,10 @@ unsafe extern "C" fn first_entry_trampoline() -> ! {
 /// than on the user's own stack - the discipline `trap.rs` documents. `SPP` cleared is the privilege
 /// drop; `SPIE` set is what leaves supervisor interrupts enabled once the kernel is re-entered.
 ///
-/// UNEXERCISED, for the reason `new_user` gives.
+/// The `csrw sscratch, sp` is not a nicety. Without it a trap from this task builds its frame on the
+/// USER stack, which is a `U` page, which S-mode may not write while `sstatus.SUM` is clear - so the
+/// trap entry's first store faults, re-enters, and faults again. Silent, unrecoverable, before any
+/// handler runs. Demonstrated by deleting the line; see `usermode::task_selftest`.
 #[unsafe(naked)]
 unsafe extern "C" fn user_entry_trampoline() -> ! {
     core::arch::naked_asm!(

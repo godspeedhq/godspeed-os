@@ -161,6 +161,14 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     // Every other `ecall` from user mode is a SYSCALL. This is the line that makes the trap vector a
     // gateway rather than only a reporter: from here a task asks the kernel for something and is
     // answered, instead of the machine stopping to describe what it did.
+    // The user-TASK selftest, gated separately and equally narrowly. It is offered before the
+    // syscall path for the same reason as above: while it is armed its magic number is its own, and
+    // once it is not, the number is an ordinary unknown syscall. This one never returns when it
+    // fires - it switches away, the way a blocking syscall does.
+    if !interrupt && super::usermode::claim_task_trap(frame, code) {
+        return;
+    }
+
     if !interrupt && code == CAUSE_ECALL_U {
         super::syscall::dispatch(frame);
         return;

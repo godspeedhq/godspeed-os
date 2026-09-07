@@ -49,7 +49,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use super::sv39;
 use super::syscall::{echo, ECHO_ARGS_1, ECHO_ARGS_2};
 use super::trap::{
-    TrapFrame, CAUSE_ECALL_U, CAUSE_LOAD_PAGE_FAULT, REG_A7, REG_S0, REG_S1, REG_S2, REG_S3, REG_S4,
+    TrapFrame, CAUSE_ECALL_U, CAUSE_LOAD_PAGE_FAULT, REG_A2, REG_A7, REG_S0, REG_S1, REG_S2, REG_S3,
+    REG_S4,
     REG_SP, SSTATUS_SPP,
 };
 
@@ -487,5 +488,246 @@ pub fn selftest() {
         print_str("riscv64: usermode PASS - ran in U-mode, USER pages honoured, kernel refused, syscalls answered, preempted twice\n");
     } else {
         print_str("riscv64: usermode FAIL - see the line above\n");
+    }
+}
+
+// ============================ user task, in its own address space ============================
+//
+// THE JOIN. Everything above proved one half at a time: `selftest` runs user mode in the KERNEL's
+// address space, and `context_switch::address_space_selftest` runs a task in its own space but in
+// S-mode. Neither is what a service is. This is both at once, and it is the shape `spawn_supervisor`
+// will have:
+//
+//   switch_context installs the task's `satp` and lands on `user_entry_trampoline`
+//     -> trampoline latches the task's KERNEL stack in `sscratch`, clears SPP, `sret`s
+//       -> user code runs, unprivileged, in a space of its own
+//         -> `ecall` traps to S-mode, onto the task's kernel stack
+//           -> the handler switches back to the scheduler
+//
+// That last step is deliberately a CONTEXT SWITCH out of the trap handler, not a frame edit. A frame
+// edit is what `selftest` does because it has no task to be; a real blocking syscall returns into
+// kernel code on the task's own kernel stack and switches away from there, leaving the trap frame in
+// place so a later switch back resumes the handler and returns to user mode through the epilogue.
+// Doing it that way here means the mechanism is exercised in the shape it will actually be used.
+//
+// Four claims:
+//
+//   ran unprivileged   `SPP == 0` at the `ecall`, as before - hardware's record, not the kernel's.
+//   own address space  the live `satp` inside the trap handler is the TASK's root, not the kernel's.
+//                      Read in the handler rather than in the task, because that also proves a trap
+//                      taken from a task's own space lands somewhere the kernel is still mapped.
+//   user stack works   a store and load through a `U|W` page mapped only in that root.
+//   own kernel stack   the trap frame sits inside the frame this test allocated for the task, which
+//                      is the evidence that `user_entry_trampoline` latched `sscratch`.
+//
+// **What happens without that latch is worth knowing, because it is not a wrong value - it is a dead
+// machine.** Removing `csrw sscratch, sp` from the trampoline was expected to give
+// `own-kernel-stack=BAD`; it gives NO OUTPUT AT ALL, and the boot stops at this test. The reason is
+// a second isolation rule meeting the first: with the latch gone the trap entry builds its frame on
+// the USER stack, and that page is mapped `U` - which S-mode may not write while `sstatus.SUM` is
+// clear, and it is clear. So the first store of the trap entry faults, which re-enters the trap
+// entry, which stores again. An unrecoverable fault loop, silent, before any handler runs.
+//
+// So this check is not what catches a MISSING latch (nothing in software could - the machine is gone
+// before any code observes it). What it catches is a latch pointing at the WRONG stack, which does
+// not fault and would otherwise be found much later as one task quietly corrupting another.
+
+/// The magic the user TASK raises. A fourth number, distinct from the three above, so a mistake in
+/// one selftest cannot be answered by another's handler.
+const MAGIC_TASK: u64 = 0x5555_0004;
+
+/// Sentinel the task stores through its user stack and hands back in `a2`.
+const TASK_SENTINEL: u64 = 0x2718_2818_2845_9045;
+
+/// Virtual addresses for the task's user pages. Different from the ones `selftest` uses, because
+/// both sets exist at once in different roots and reusing an address would make a mix-up invisible.
+/// Both are in Sv39's low half, well under the 256 GiB ceiling (`sv39::va_is_canonical`).
+const TASK_CODE_VA: u64 = 0x0000_0028_0000_0000;
+const TASK_STACK_VA: u64 = 0x0000_0028_0000_1000;
+
+core::arch::global_asm!(
+    ".section .rodata.rv_user_task_stub,\"a\"",
+    ".option push",
+    ".option norvc",
+    ".balign 4",
+    ".globl __rv_user_task_stub",
+    "__rv_user_task_stub:",
+    "li   a1, {sentinel}",
+    "sd   a1, -8(sp)",
+    "ld   a2, -8(sp)",
+    "li   a7, {magic}",
+    "ecall",
+    "99:",
+    "j    99b",
+    ".globl __rv_user_task_stub_end",
+    "__rv_user_task_stub_end:",
+    ".option pop",
+    ".previous",
+    sentinel = const TASK_SENTINEL,
+    magic = const MAGIC_TASK,
+);
+
+unsafe extern "C" {
+    static __rv_user_task_stub: u8;
+    static __rv_user_task_stub_end: u8;
+}
+
+static TASK_ARMED: AtomicBool = AtomicBool::new(false);
+static TASK_CTX_ROOT: AtomicU64 = AtomicU64::new(0);
+static TASK_KSTACK: AtomicU64 = AtomicU64::new(0);
+static TASK_SAW_SATP: AtomicU64 = AtomicU64::new(0);
+static TASK_SAW_SENTINEL: AtomicU64 = AtomicU64::new(0);
+static TASK_FRAME_ADDR: AtomicU64 = AtomicU64::new(0);
+static TASK_RAN_USER: AtomicBool = AtomicBool::new(false);
+
+static mut TASK_CTX: super::context_switch::TaskContext = super::context_switch::TaskContext::ZERO;
+static mut TASK_BOOT_CTX: super::context_switch::TaskContext =
+    super::context_switch::TaskContext::ZERO;
+
+/// Offered every user `ecall` while the task selftest is armed. Never returns when it fires: it
+/// switches back to the boot context, abandoning the trap frame on the task's kernel stack exactly
+/// as a blocking syscall would leave it for a later resume.
+pub(super) fn claim_task_trap(frame: &mut TrapFrame, code: u64) -> bool {
+    if !TASK_ARMED.load(Ordering::Acquire)
+        || code != CAUSE_ECALL_U
+        || frame.x[REG_A7] != MAGIC_TASK
+        || !frame.from_user()
+    {
+        return false;
+    }
+    TASK_RAN_USER.store(true, Ordering::Relaxed);
+    TASK_SAW_SATP.store(super::page_tables::read_page_table_base(), Ordering::Relaxed);
+    TASK_SAW_SENTINEL.store(frame.x[REG_A2], Ordering::Relaxed);
+    TASK_FRAME_ADDR.store(frame as *const TrapFrame as u64, Ordering::Relaxed);
+
+    // Leave user mode the way a scheduler does. This does not return: nothing switches back into
+    // this task, so the trap frame under us is simply never resumed.
+    // SAFETY: `TASK_BOOT_CTX` was filled by the switch that started this task, and carries the
+    // kernel's root, so the switch restores the kernel address space on the way out.
+    unsafe {
+        super::context_switch::switch_context(&raw mut TASK_CTX, &raw const TASK_BOOT_CTX)
+    };
+    true
+}
+
+/// Run one user task in an address space of its own.
+pub fn task_selftest() {
+    use crate::memory::allocator::{alloc_frame, free_frame};
+    use super::context_switch::TaskContext;
+    use super::page_tables::PageFlags;
+    use super::{print_hex, print_str};
+
+    let kernel_root = super::page_tables::read_page_table_base();
+    if kernel_root == 0 {
+        print_str("riscv64: usertask SKIPPED - paging is not on\n");
+        return;
+    }
+
+    let (Some(root), Some(code), Some(ustack), Some(kstack)) =
+        (sv39::new_root(), alloc_frame(), alloc_frame(), alloc_frame())
+    else {
+        print_str("riscv64: usertask FAIL - no frames for a root, code, user stack and kernel stack\n");
+        return;
+    };
+    let (code_pa, ustack_pa, kstack_pa) =
+        (code.phys_addr().0, ustack.phys_addr().0, kstack.phys_addr().0);
+
+    // The kernel's mapping first, or the switch that installs this root stops the machine.
+    // SAFETY: `root` is a fresh zeroed root this function owns.
+    unsafe { super::page_tables::finalize_service_address_space(root) };
+
+    let stub = (&raw const __rv_user_task_stub) as usize;
+    let stub_len = (&raw const __rv_user_task_stub_end) as usize - stub;
+    if stub_len == 0 || stub_len > 4096 {
+        print_str("riscv64: usertask FAIL - the stub does not fit a page\n");
+        return;
+    }
+    // SAFETY: `code_pa` is a fresh frame this function owns, identity-mapped, so writing at its
+    // physical address is writing the page. The source is bounded by the two symbols the assembler
+    // emitted around the stub, and the regions cannot overlap.
+    unsafe { core::ptr::copy_nonoverlapping(stub as *const u8, code_pa as *mut u8, stub_len) };
+    // SAFETY: `fence.i` makes instructions written as data visible to a fetch. No operands, no
+    // memory effects. QEMU does not need it and this board does.
+    unsafe { core::arch::asm!("fence", "fence.i", options(nostack)) };
+
+    let code_flags = PageFlags::PRESENT | PageFlags::USER;
+    let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+    let mapped = sv39::map_page(
+        root,
+        TASK_CODE_VA,
+        code_pa,
+        sv39::flags_to_pte_bits(code_flags.bits()),
+    )
+    .is_ok()
+        && sv39::map_page(
+            root,
+            TASK_STACK_VA,
+            ustack_pa,
+            sv39::flags_to_pte_bits(stack_flags.bits()),
+        )
+        .is_ok();
+    if !mapped {
+        print_str("riscv64: usertask FAIL - could not map the task's user pages\n");
+        return;
+    }
+
+    TASK_CTX_ROOT.store(root, Ordering::Relaxed);
+    TASK_KSTACK.store(kstack_pa, Ordering::Relaxed);
+    // SAFETY: a fresh kernel-stack frame this function owns; user entry and stack mapped
+    // user-accessible in `root`, which the switch installs before the trampoline runs.
+    unsafe {
+        TASK_CTX = TaskContext::new_user(
+            (kstack_pa + 4096) as *mut u8,
+            TASK_CODE_VA,
+            TASK_STACK_VA + 4096,
+            root,
+        );
+        TASK_BOOT_CTX.cr3 = kernel_root;
+    }
+
+    TASK_ARMED.store(true, Ordering::SeqCst);
+    let was = super::interrupts::local_irq_save();
+    // SAFETY: `TASK_CTX` is primed by `new_user` with a real user entry, its own user and kernel
+    // stacks, and a root that carries the kernel's mapping as well as the task's.
+    unsafe {
+        super::context_switch::switch_context(&raw mut TASK_BOOT_CTX, &raw const TASK_CTX)
+    };
+    super::interrupts::local_irq_restore(was);
+    TASK_ARMED.store(false, Ordering::SeqCst);
+
+    let ran = TASK_RAN_USER.load(Ordering::Relaxed);
+    let own_space = TASK_SAW_SATP.load(Ordering::Relaxed) == root;
+    let stack_ok = TASK_SAW_SENTINEL.load(Ordering::Relaxed) == TASK_SENTINEL;
+    let frame = TASK_FRAME_ADDR.load(Ordering::Relaxed);
+    let kstack_ok = frame >= kstack_pa && frame < kstack_pa + 4096;
+
+    print_str("riscv64: usertask ran=");
+    print_str(if ran { "ok" } else { "BAD" });
+    print_str(" own-address-space=");
+    print_str(if own_space { "ok" } else { "BAD" });
+    print_str(" user-stack=");
+    print_str(if stack_ok { "ok" } else { "BAD" });
+    print_str(" own-kernel-stack=");
+    print_str(if kstack_ok { "ok" } else { "BAD" });
+    print_str(" root ");
+    print_hex(root);
+    print_str("\n");
+
+    // SAFETY: the task is abandoned and nothing can resume it - its context is a local static no
+    // scheduler knows about, and `satp` is back on the kernel root. Its four frames are this
+    // function's own, and the root's tables go back through the seam's free path.
+    unsafe {
+        super::page_tables::free_page_table_root(root);
+        free_frame(sv39::frame_of(code_pa));
+        free_frame(sv39::frame_of(ustack_pa));
+        free_frame(sv39::frame_of(kstack_pa));
+    }
+
+    if ran && own_space && stack_ok && kstack_ok {
+        print_str(
+            "riscv64: usertask PASS - unprivileged, in its own address space, on its own kernel stack\n",
+        );
+    } else {
+        print_str("riscv64: usertask FAIL - see the line above\n");
     }
 }
