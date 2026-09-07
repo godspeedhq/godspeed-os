@@ -45,10 +45,21 @@ pub const CAUSE_ECALL_U: u64 = 8;
 pub const CAUSE_LOAD_PAGE_FAULT: u64 = 13;
 
 /// Register numbers this kernel refers to by name, rather than by the index the ABI happens to use.
+///
+/// `a0`-`a2` and `a7` are the syscall ABI (arguments and number, result back in `a0`). `s0`-`s4` are
+/// callee-saved, which is why the boot selftest's user stub parks its evidence there: they are the
+/// registers a `ecall` is guaranteed not to disturb, so a value placed in one before a syscall is
+/// still there after it.
 pub const REG_SP: usize = 2;
+pub const REG_S0: usize = 8;
+pub const REG_S1: usize = 9;
 pub const REG_A0: usize = 10;
+pub const REG_A1: usize = 11;
 pub const REG_A2: usize = 12;
 pub const REG_A7: usize = 17;
+pub const REG_S2: usize = 18;
+pub const REG_S3: usize = 19;
+pub const REG_S4: usize = 20;
 
 /// Set once a fault has been reported, so a fault INSIDE the reporter cannot recurse forever.
 ///
@@ -144,6 +155,14 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     // control back, and the one deliberate fault it makes on the way. Both are refused outright
     // once the selftest is over, so neither is a door a real task could later walk through.
     if !interrupt && super::usermode::claim_trap(frame, code, stval) {
+        return;
+    }
+
+    // Every other `ecall` from user mode is a SYSCALL. This is the line that makes the trap vector a
+    // gateway rather than only a reporter: from here a task asks the kernel for something and is
+    // answered, instead of the machine stopping to describe what it did.
+    if !interrupt && code == CAUSE_ECALL_U {
+        super::syscall::dispatch(frame);
         return;
     }
 

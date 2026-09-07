@@ -28,6 +28,11 @@
 //! over, records the denial and steps over the instruction. A caught fault is weaker-looking than a
 //! probe and is in fact the stronger evidence: it is the real access, refused by the real MMU.
 //!
+//! **The syscall path is exercised from HERE, from real user mode.** The ARM32 port proved its `svc`
+//! entry by issuing the instruction from kernel mode, because user mode did not exist yet when that
+//! increment landed. It does here, so the stub issues three `ecall`s of its own and the evidence is
+//! about the actual privilege transition rather than a rehearsal of it (`syscall.rs`).
+//!
 //! **Getting back out** without a scheduler: `enter_user` saves the kernel's callee-saved registers
 //! and `sp` before it drops privilege, and the magic `ecall` is answered by EDITING THE TRAP FRAME -
 //! resume address into `sepc`, `SPP` set to supervisor, saved stack into `x[2]`. The ordinary trap
@@ -42,8 +47,10 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::sv39;
+use super::syscall::{echo, ECHO_ARGS_1, ECHO_ARGS_2};
 use super::trap::{
-    TrapFrame, CAUSE_ECALL_U, CAUSE_LOAD_PAGE_FAULT, REG_A0, REG_A2, REG_A7, REG_SP, SSTATUS_SPP,
+    TrapFrame, CAUSE_ECALL_U, CAUSE_LOAD_PAGE_FAULT, REG_A7, REG_S0, REG_S1, REG_S2, REG_S3, REG_S4,
+    REG_SP, SSTATUS_SPP,
 };
 
 /// `sstatus.SPIE` - the interrupt-enable to restore on `sret`. Set before entering U-mode so that
@@ -109,17 +116,25 @@ static PROBE_VA: AtomicU64 = AtomicU64::new(0);
 static RAN_UNPRIVILEGED: AtomicBool = AtomicBool::new(false);
 static STORE_ROUNDTRIP: AtomicBool = AtomicBool::new(false);
 static KERNEL_DENIED: AtomicBool = AtomicBool::new(false);
+static SYSCALLS_OK: AtomicBool = AtomicBool::new(false);
 
 // The user stub itself: position-independent instructions, assembled into rodata and COPIED into a
 // user page rather than executed where they sit. `.option norvc` forbids compressed instructions so
 // every one of them is exactly four bytes - which is what lets the kernel step over the deliberate
 // fault by adding 4 to `sepc` and know it landed on an instruction boundary.
 //
+//   mv s4, a0       keep the probe address: a0 is about to be a syscall argument register.
 //   sd a0, -8(sp)   a user page mapped writable must accept a store. `-8` rather than `0` because
 //                   the stack pointer is handed in at the END of the page, and one byte past it is
 //                   a different page that is not mapped.
-//   ld a2, -8(sp)   ... and give it back, so the kernel can check the value survived.
-//   ld a1, 0(a0)    a0 holds a KERNEL address. This MUST fault; the kernel steps over it.
+//   ld s3, -8(sp)   ... and give it back, parked in a callee-saved register so a syscall cannot
+//                   disturb it before the kernel reads it.
+//   ld a1, 0(s4)    s4 holds a KERNEL address. This MUST fault; the kernel steps over it.
+//   <3 x ecall>     the syscall path, exercised from REAL user mode rather than from the kernel:
+//                   two echoes with different arguments (all three must survive the transition, and
+//                   the second proves the path is re-entrant) and one number the kernel does not
+//                   know, whose -1 proves the NEUTRAL dispatcher was entered and returned. Results
+//                   land in s0, s1, s2 - callee-saved, so each survives the calls after it.
 //   li a7, MAGIC_RAN
 //   ecall           hand the evidence over. The kernel RESUMES us at the next instruction.
 //   <spin>          wait to be preempted. This is the point of the second half: a timer interrupt
@@ -134,9 +149,29 @@ core::arch::global_asm!(
     ".balign 4",
     ".globl __rv_user_stub",
     "__rv_user_stub:",
+    "mv   s4, a0",
     "sd   a0, -8(sp)",
-    "ld   a2, -8(sp)",
-    "ld   a1, 0(a0)",
+    "ld   s3, -8(sp)",
+    "ld   a1, 0(s4)",
+    // Syscall entry, from user mode. Distinct argument sets so a dropped or shifted argument shows
+    // up as a wrong digit in the position that names which one.
+    "li   a7, {echo}",
+    "li   a0, {one_a0}",
+    "li   a1, {one_a1}",
+    "li   a2, {one_a2}",
+    "ecall",
+    "mv   s0, a0",
+    "li   a7, {echo}",
+    "li   a0, {two_a0}",
+    "li   a1, {two_a1}",
+    "li   a2, {two_a2}",
+    "ecall",
+    "mv   s1, a0",
+    // A number the kernel does not implement, so this one goes all the way to the NEUTRAL dispatcher
+    // and comes back with its rejection rather than being answered here.
+    "li   a7, {unknown}",
+    "ecall",
+    "mv   s2, a0",
     "li   a7, {ran}",
     "ecall",
     "li   t0, {spin}",
@@ -154,6 +189,14 @@ core::arch::global_asm!(
     ran = const MAGIC_RAN,
     stuck = const MAGIC_STUCK,
     spin = const SPIN_BOUND,
+    echo = const super::syscall::ECHO_NUMBER,
+    unknown = const super::syscall::UNKNOWN_NUMBER,
+    one_a0 = const super::syscall::ECHO_ARGS_1[0],
+    one_a1 = const super::syscall::ECHO_ARGS_1[1],
+    one_a2 = const super::syscall::ECHO_ARGS_1[2],
+    two_a0 = const super::syscall::ECHO_ARGS_2[0],
+    two_a1 = const super::syscall::ECHO_ARGS_2[1],
+    two_a2 = const super::syscall::ECHO_ARGS_2[2],
 );
 
 unsafe extern "C" {
@@ -234,6 +277,15 @@ unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, probe_va: u64) {
     )
 }
 
+/// Whether the boot selftest is running.
+///
+/// ONE flag, asked by everything that needs to know - the magic syscalls here and the echo in
+/// `syscall.rs`. Two gates meaning the same thing is two things to get wrong, and the one that gets
+/// left armed is a door into the kernel from user mode.
+pub(super) fn selftest_armed() -> bool {
+    ARMED.load(Ordering::Acquire)
+}
+
 /// Hand control back to `enter_user`'s caller by EDITING THE TRAP FRAME.
 ///
 /// Three stores and the ordinary epilogue does the transfer: `sepc` says where to land, `SPP` says
@@ -278,7 +330,19 @@ pub(super) fn claim_trap(frame: &mut TrapFrame, code: u64, stval: u64) -> bool {
         // through the user stack. Stepping over the `ecall` and returning is a user-mode resume,
         // which is the direction a handler that only ever reports never takes.
         RAN_UNPRIVILEGED.store(true, Ordering::Relaxed);
-        STORE_ROUNDTRIP.store(frame.x[REG_A2] == frame.x[REG_A0], Ordering::Relaxed);
+        // `s3` is what came back off the user stack, `s4` is what was written to it. Both are
+        // callee-saved, so the three syscalls in between could not have disturbed them.
+        STORE_ROUNDTRIP.store(frame.x[REG_S3] == frame.x[REG_S4], Ordering::Relaxed);
+        // The three syscall results, each a different claim: arguments survived (twice, with
+        // different values, so a stuck register cannot pass both), and the NEUTRAL dispatcher was
+        // entered and rejected a number it does not know.
+        let (one, two) = (ECHO_ARGS_1, ECHO_ARGS_2);
+        SYSCALLS_OK.store(
+            frame.x[REG_S0] as i64 == echo(one[0], one[1], one[2])
+                && frame.x[REG_S1] as i64 == echo(two[0], two[1], two[2])
+                && frame.x[REG_S2] as i64 == -1,
+            Ordering::Relaxed,
+        );
         frame.sepc = frame.sepc.wrapping_add(4);
         return true;
     }
@@ -382,6 +446,7 @@ pub fn selftest() {
     let ran = RAN_UNPRIVILEGED.load(Ordering::Relaxed);
     let stored = STORE_ROUNDTRIP.load(Ordering::Relaxed);
     let denied = KERNEL_DENIED.load(Ordering::Relaxed);
+    let syscalls = SYSCALLS_OK.load(Ordering::Relaxed);
     let ticks = USER_TICKS.load(Ordering::Relaxed);
     let preempted = ticks >= 2;
 
@@ -391,6 +456,8 @@ pub fn selftest() {
     print_str(if stored { "ok" } else { "BAD" });
     print_str(" kernel-page-denied=");
     print_str(if denied { "ok" } else { "BAD" });
+    print_str(" syscall=");
+    print_str(if syscalls { "ok" } else { "BAD" });
     print_str(" preempted=");
     super::print_dec(ticks);
     print_str(if preempted { " ok" } else { " BAD" });
@@ -416,8 +483,8 @@ pub fn selftest() {
         }
     }
 
-    if ran && stored && denied && preempted && unmapped {
-        print_str("riscv64: usermode PASS - ran in U-mode, USER pages honoured, kernel refused, preempted twice\n");
+    if ran && stored && denied && syscalls && preempted && unmapped {
+        print_str("riscv64: usermode PASS - ran in U-mode, USER pages honoured, kernel refused, syscalls answered, preempted twice\n");
     } else {
         print_str("riscv64: usermode FAIL - see the line above\n");
     }

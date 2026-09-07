@@ -10,6 +10,7 @@
 pub mod fdt;
 pub mod sbi;
 pub mod sv39;
+pub mod syscall;
 pub mod trap;
 pub mod usermode;
 
