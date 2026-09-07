@@ -981,6 +981,22 @@ fn notify(ctx: &ServiceContext, msg: &str) {
 /// always satisfied even if the TSC runs faster.
 fn delay_cycles(ctx: &ServiceContext, cycles: u64) {
     let start = ctx.read_tsc();
+    // PARK FOR THE BULK, then top up. This was a bare `while read_tsc() < deadline {}` - a hard spin
+    // holding the core for the WHOLE delay, with no yield and no sleep.
+    //
+    // It is only a few of these per plug event, so it hid completely while a device was attached: the
+    // driver's own heartbeat measures 35 ms of work per 60 s there, 0.058% of a core. UNPLUG the
+    // device and the rescan loop runs continuously, and each turn spends `DEBOUNCE_CYCLES` (~50 ms)
+    // plus `RESET_HOLD_CYCLES` (~100 ms) spinning - which is `observe` reporting `ehci` at 100% with
+    // nothing plugged in, and back to 0% the moment the device returns. Both halves of that were
+    // observed on the T630, and the second is what ruled out the measurement artefact I had assumed.
+    //
+    // The top-up spin stays because the CONTRACT is a MINIMUM: USB 2.0 7.1.7.5 wants the reset held
+    // at least 50 ms, and `sleep` granularity is a whole scheduler quantum which can round DOWN when
+    // the TSC is uncalibrated. So sleep for the requested span, then spin out whatever is left. On a
+    // calibrated machine the remainder is under one quantum and usually zero; the spin becomes the
+    // exception rather than the mechanism, and the hardware guarantee is unchanged.
+    ctx.sleep(cycles);
     while ctx.read_tsc().wrapping_sub(start) < cycles {}
 }
 /// ~100 ms at 2 GHz - comfortably over the 50 ms minimum reset hold.
