@@ -27,9 +27,6 @@ use crate::arch::imp::BootInfo;
 pub fn percpu_init(boot_info: &BootInfo) {
     let _ = boot_info;
     // SINGLE-CORE BUILD: size every per-core arena for the BSP alone. See kernel/Cargo.toml.
-    #[cfg(feature = "single-core")]
-    let n = 1;
-    #[cfg(not(feature = "single-core"))]
     let n = crate::arch::imp::ap_count() + 1; // BSP + every AP Limine enumerated (live count)
     percpu::set_num_cores(n);
     ipi::init_arenas(n);
@@ -43,21 +40,13 @@ pub fn percpu_init(boot_info: &BootInfo) {
 
 pub fn init(boot_info: &BootInfo) {
     core::init(boot_info);
-    // Core 0's LAPIC id, published UNCONDITIONALLY - before the branch below, because the
-    // single-core arm skips `start_all_aps` and that is where x86 used to do this. A core marked
-    // ready whose identity is still an unwritten 0 is worse than one that is absent: callers ask
-    // `is_ready` first, get true, and then trust the 0. See `publish_bsp_lapic_id`.
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::ap_boot::publish_bsp_lapic_id();
-    #[cfg(feature = "single-core")]
-    {
-        let _ = boot_info;
-        // SAID LOUDLY. A machine quietly running on a quarter of its cores is exactly what an
-        // operator must not have to infer (invariant 12), and it is the first thing to check in a
-        // log before drawing any conclusion from the run.
-        crate::kprintln!("smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/02)");
-    }
-    #[cfg(not(feature = "single-core"))]
+    // Core 0's LAPIC id, published BEFORE any AP starts. On x86 this used to happen inside
+    // `start_all_aps`, so a boot that started no APs never did it at all and core 0's identity
+    // stayed an unwritten 0 - which is worse than absent, because callers ask `is_ready` first, get
+    // true, and then trust the zero. See `publish_bsp_lapic_id`.
+    crate::arch::imp::publish_bsp_lapic_id();
+    // Start whatever APs the machine reports. A machine with none reaches the single-core path by
+    // REPORTING none (11.3), not by being built differently - one artefact, every core count.
     // SAFETY: BSP APIC is already initialised in arch::imp::init_timer.
     unsafe { crate::arch::imp::ap_boot::start_all_aps(boot_info) };
 }

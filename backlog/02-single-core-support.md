@@ -1,5 +1,33 @@
 # 2. GodspeedOS on ONE core - does it actually work, and what has been hiding behind SMP?
 
+> **CLOSED 2026-09-07. It works, and the build flag that proved it has been REMOVED.**
+>
+> Verified on all four machines - HP T630 (AMD), Wyse 5070 (Intel), Pi 4 (aarch64), Pi 2 (arm32) -
+> each with selfcheck, a 100-round chaos storm and hot-plug: 0 failures, 0 kernel panics, 0 liveness
+> wedges.
+>
+> **It found the bug it was written to find.** Core 0's LAPIC id was published only inside
+> `start_all_aps`, so a boot that started no APs never published it and every interrupt aimed at a
+> driver's own core went to APIC id 0. On the T630, whose BSP is id 16, that cost the xHCI every
+> interrupt it should have had (500 ms per keystroke) and made the EHCI's busy-poll load-bearing
+> (100% of a core). Two symptoms, one cause, invisible to every test because QEMU's BSP really is 0 -
+> the wrong value was accidentally right on the only machine CI runs on. Fixed in 091d9b41.
+>
+> **The flag is gone because its job is done, and because a flag is a second artefact.** The premise
+> was always that §11.3 defines this state anyway ("if zero APs come up, system runs as single-core")
+> and the flag only FORCED it on hardware that has more cores. Keeping it would leave a second kernel
+> configuration to build, ship and regress-test forever, in exchange for a diagnostic that has already
+> reported. The precedent is in the constitution: the `xhci-userspace` flags were deleted once the
+> userspace driver was proven, on the reasoning that a flag selecting between two kernels leaves the
+> other one build away.
+>
+> One artefact boots on one core or many. A machine with one core reaches that path by REPORTING one
+> core, not by being built differently - which is the property that was actually wanted here.
+>
+> The residual findings are `backlog/13` (EHCI holds a core while a device is unplugged; xHCI
+> `Enable Slot` timeouts). Neither is single-core-specific and neither costs a test failure.
+
+
 **Severity:** feature, and an audit of everything "put it on another core" ever settled.
 **Status:** first experiment run 2026-09-06. It BOOTS. What that proves is narrower than it looks.
 
