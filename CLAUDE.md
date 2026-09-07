@@ -276,6 +276,7 @@ os/
     facts_check.py       #   a number a doc restates matches the code that owns it
     site_check.py        #   the 4 hand-written site pages still match the repository
     arch_boundary_check.py #  neutral layers reach hardware ONLY through the `arch::imp` seam
+    arch_seam_check.py   #   ...and every arch ANSWERS every member of it (the other direction)
     dash_check.py        #   no em/en dashes anywhere (§21)
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds

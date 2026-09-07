@@ -134,7 +134,7 @@ def main():
     # Failing the BUILD rather than warning is deliberate. A warning scrolls past above a successful
     # image; a build that refuses to produce one cannot be ignored, and cannot ship.
     for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
-                  "arch_boundary_check.py", "contract_check.py"):
+                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py"):
         r = subprocess.run([sys.executable, os.path.join("scripts", check)],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
@@ -143,7 +143,7 @@ def main():
             raise SystemExit(
                 "\nBUILD REFUSED: %s failed. Fix the violation, or amend CLAUDE.md and cite\n"
                 "the amendment - those are the only two ways past this, by design." % check)
-    print("commandments + dash + unsafe + arch-boundary + contracts: pass")
+    print("commandments + dash + unsafe + arch-boundary + arch-seam + contracts: pass")
 
     # 1. Cross-compile every ARM-ported service to armv7 so build.rs can embed them.
     #    The Pi 2 is a bare-metal target (no QEMU control port), so the supervisor is built with its

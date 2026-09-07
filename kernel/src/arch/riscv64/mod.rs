@@ -305,6 +305,12 @@ pub mod syscall_entry {
 
 // ---------------------------------------------------------------------------
 pub mod interrupts {
+    /// MSI vector pool. Empty: RISC-V delivers device interrupts through the PLIC by wire, and MSI
+    /// (via AIA/IMSIC) is a separate controller this port does not have yet. A zero-length pool means
+    /// the neutral allocator hands out nothing rather than handing out vectors nobody routes.
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
+
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     pub fn enable_interrupts() {}                            // msr daifclr
@@ -377,6 +383,54 @@ pub mod rtc {
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
 
+// PCI seam. QEMU `virt` DOES have a PCIe host bridge (ECAM at 0x3000_0000, described in the FDT), and
+// the VisionFive 2 has one too - so unlike arm32 this is a stub by STAGE, not by platform. Everything
+// answers "nothing here", which is honest for a kernel that has not yet read the device tree: it
+// reports no devices rather than guessing at fixed addresses.
+//
+// Ported from `arch/arm`'s no-PCI seam so the surface matches exactly. Filling it in means walking the
+// FDT for `pci-host-ecam-generic` and enumerating from there - the arch's own work, not the neutral
+// kernel's, which is the whole point of this boundary.
+// ---------------------------------------------------------------------------
+// Seam members the neutral kernel grew after this stub was written.
+//
+// Every one of these is a compile error, not a runtime one, which is the boundary working: the neutral
+// layers may only reach hardware through `arch::imp`, so a new member is felt by every arch at once.
+// What it did NOT do is TELL anyone - nothing builds this target, so the stub rotted silently until
+// someone tried. Wiring riscv64 into a build path is therefore worth more than any single body below.
+// ---------------------------------------------------------------------------
+
+/// Interrupt vector taken by this core, and the last one seen. Stubbed until the PLIC is real.
+pub fn note_irq(_vector: u32) {}
+pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
+
+/// Publish the boot hart's identity before any secondary starts.
+///
+/// Nothing to do here YET, and for a reason worth stating rather than leaving as an empty body: on
+/// RISC-V the hart id arrives in `a0` at entry rather than being read back from an interrupt
+/// controller, so there is no equivalent of the x86 bug this exists to prevent (a core marked ready
+/// whose identity was never written). When SMP lands, the boot hart records its id here.
+pub fn publish_bsp_lapic_id() {}
+
+/// PCI config read. See the `pci` module: no bus is enumerated until the FDT is parsed.
+pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+
+/// Bytes emitted by the panic-path serial writer that bypasses the lock.
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
+/// Copy from a user address into kernel memory, refusing anything not mapped to the caller.
+///
+/// Returns false until S-mode user pages exist. Refusing is the safe direction: a caller that cannot
+/// read user memory fails its syscall, where a caller that wrongly SUCCEEDS reads someone else's.
+pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
+
+/// Is a driver's DMA arena mapped uncached? True until Sv39 attributes are wired, because assuming
+/// COHERENT when it is not gives a driver silently stale descriptors - the failure that cannot be
+/// debugged from a log.
+pub const DMA_ARENA_UNCACHED: bool = true;
+/// Virtual base at which a driver's DMA arena is mapped.
+pub const DRIVER_DMA_VA: u64 = 0x7000_0000;
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
@@ -387,12 +441,38 @@ pub mod pci {
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
+
+    // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
+    /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
+    /// ARM32 HAS NO PCI AT ALL - the DWC2 is soldered to the BCM283x and there is no bus to walk.
+    /// So this is not "unimplemented", it is EMPTY BY CONSTRUCTION: no class code can ever match,
+    /// and every driver on this port names a non-PCI kind (`HwClass::Dwc2`). One slot, because the
+    /// array it sizes must exist and nothing will ever fill it.
+    pub const MAX_DEVICES: usize = 1;
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}
     pub fn set_power_d0(bdf: u32) {}
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
     pub fn program_xhci_msi() -> bool { false }
     pub fn program_ehci_msi() -> bool { false }
     pub fn route_ehci_intx() {}
