@@ -10,6 +10,7 @@
 pub mod fdt;
 pub mod sbi;
 pub mod sv39;
+pub mod context_switch;
 pub mod syscall;
 pub mod trap;
 pub mod usermode;
@@ -435,6 +436,11 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     // above it: paging on (so USER permissions exist to honour), the trap vector installed (so the
     // way back in leads somewhere), and the tick running (so a timer interrupt taken FROM user mode
     // is exercised too, rather than left as the one path nothing has entered).
+    // The context switch, before user mode: it is the mechanism a scheduler is, and proving it on
+    // two KERNEL tasks isolates the register half from the MMU half. Both tasks share the kernel's
+    // one address space, so nothing here depends on a `satp` switch working.
+    context_switch::selftest();
+
     usermode::selftest();
 
     // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
@@ -879,11 +885,63 @@ pub mod interrupts {
 
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
-    pub fn enable_interrupts() {}                            // msr daifclr
-    pub fn disable_interrupts() {}                           // msr daifset
-    pub fn local_irq_save() -> bool { false }                // mrs DAIF
-    pub fn local_irq_restore(was_enabled: bool) {}
-    pub fn wait_for_interrupt() {}                           // wfi
+    /// `sstatus.SIE` - the one bit that admits interrupts at all while the kernel is running.
+    ///
+    /// It governs S-mode only. Running in U-MODE, supervisor interrupts are enabled regardless of
+    /// this bit, which is what makes a user task preemptible without the kernel arranging anything -
+    /// and is why masking here cannot be used to protect a critical section from a user task.
+    const SSTATUS_SIE: u64 = 1 << 1;
+
+    pub fn enable_interrupts() {
+        // SAFETY: setting `sstatus.SIE`. Sound because `stvec` is installed before the timer is
+        // started, so there is always somewhere for an admitted interrupt to go.
+        unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) SSTATUS_SIE, options(nostack)) };
+    }
+
+    pub fn disable_interrupts() {
+        // SAFETY: clearing `sstatus.SIE`. An interrupt raised while it is clear is held pending by
+        // the hardware rather than lost, so this defers rather than discards.
+        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) SSTATUS_SIE, options(nostack)) };
+    }
+
+    /// Mask interrupts and report whether they had been enabled, in ONE instruction.
+    ///
+    /// `csrrc` reads the old value and clears the given bits atomically. Reading and then clearing
+    /// as two instructions would leave a window in which an interrupt is taken after the caller has
+    /// already decided it was masking, and the handler would return into a critical section the
+    /// caller believes it is protecting.
+    pub fn local_irq_save() -> bool {
+        let old: u64;
+        // SAFETY: an atomic read-and-clear of `sstatus.SIE`, with no other effect.
+        unsafe {
+            core::arch::asm!(
+                "csrrc {0}, sstatus, {1}",
+                out(reg) old, in(reg) SSTATUS_SIE,
+                options(nostack)
+            )
+        };
+        old & SSTATUS_SIE != 0
+    }
+
+    /// Undo `local_irq_save`. Restores rather than enables: a nested save must not turn interrupts
+    /// on inside an outer section that had them off.
+    pub fn local_irq_restore(was_enabled: bool) {
+        if was_enabled {
+            enable_interrupts();
+        }
+    }
+
+    /// Halt this hart until an interrupt is pending.
+    ///
+    /// `wfi` is a HINT: an implementation may return immediately, and QEMU sometimes does. So it is
+    /// only ever correct inside a loop that re-checks the condition it is waiting for, which is how
+    /// the neutral idle loop uses it. It also wakes on a pending interrupt even when `sstatus.SIE`
+    /// is clear, which is what closes the lost-wakeup window the idle path cares about.
+    pub fn wait_for_interrupt() {
+        // SAFETY: `wfi` has no memory effects and cannot fault in S-mode when `mstatus.TW` is clear,
+        // which it is under OpenSBI. If the firmware did trap it, the trap vector names it.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
 /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
 /// halt to unmask and halt in one indivisible step?
 ///
@@ -912,27 +970,6 @@ pub mod interrupts {
 }
 
 // ---------------------------------------------------------------------------
-pub mod context_switch {
-    // AArch64: callee-saved x19-x28, fp/lr, sp + the page-table base. Field names kept x86-ish for the
-    // stub compile; a real port renames them (and `cr3` in the neutral scheduler is a leak to address).
-    #[repr(C)]
-    pub struct TaskContext {
-        pub rbx: u64, pub rbp: u64, pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
-        pub rip: u64, pub rsp: u64, pub cr3: u64,
-    }
-    impl TaskContext {
-        /// All-zero context. Neutral code builds zero contexts via this, naming no register.
-        pub const ZERO: Self = Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0 };
-
-        pub unsafe fn new_kernel(entry: unsafe extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: entry as u64, rsp: stack_top as u64, cr3 }
-        }
-        pub unsafe fn new_user(kernel_stack_top: *mut u8, user_entry: u64, user_stack_top: u64, cr3: u64) -> Self {
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: user_entry, rsp: kernel_stack_top as u64, cr3 }
-        }
-    }
-    pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {}
-}
 
 // ---------------------------------------------------------------------------
 pub mod rtc {
