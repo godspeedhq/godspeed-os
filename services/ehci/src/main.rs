@@ -201,6 +201,8 @@ const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 // qTD token bits.
 /// C8-1: how long a control transfer may take before we stop waiting. A DURATION, not a read count.
 const CTRL_XFER_CYCLES: u64 = 2_000_000_000;
+/// One-shot guard for the control-transfer timeout notice.
+static TIMED_OUT_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
@@ -330,8 +332,33 @@ fn control(
     // it might.
     let mut done = false;
     let start = ctx.read_tsc();
+    // YIELD BRIEFLY, THEN PARK - the transfer completes in DMA memory, so waiting costs nothing but
+    // the core, and this loop had no yield and no sleep at all.
+    //
+    // `CTRL_XFER_CYCLES` is ~1 SECOND at 2 GHz, and it is spent in full whenever the transfer does not
+    // complete. That is the unplugged case exactly: `wait_for_connection` asks each hub port for its
+    // status every 50 ms, every one of those control transfers runs the whole budget, and the driver
+    // holds the core continuously. `observe` reads `ehci` at 100% unplugged and 0% plugged in - the
+    // cable is the switch. Two earlier fixes (`delay_cycles`, then `wait`) were the same shape one
+    // and two layers further out, and neither was on this path: a control transfer completes on a
+    // qTD bit in DMA, so it never reaches `wait`, which polls MMIO.
+    //
+    // A transfer that is going to succeed completes in about a millisecond, so the first 2 ms are
+    // still spun and the fast path is unchanged. Past that it is either slow or never coming, and
+    // 10 ms of park costs nothing that matters against a one-second budget.
+    let spin_until = start.wrapping_add(ctx.duration_cycles(2));
     while ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
         if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
+        if ctx.read_tsc() >= spin_until {
+            ctx.sleep_ms(1);   // floors to one scheduler quantum
+        }
+    }
+    // Say so ONCE. A transfer that burns the full budget is the difference between a driver that is
+    // waiting and one that is eating the machine, and nothing in the log distinguished them - which
+    // is why this took three attempts to place. Bounded to one line so an unplugged hub cannot
+    // flood.
+    if !done && !TIMED_OUT_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        ctx.log("ehci: a control transfer ran out its full budget (device gone?) - parking between polls");
     }
     let t_setup  = dma.read32(QTD_SETUP + 0x08);
     let t_data   = if data_len > 0 { dma.read32(QTD_DATA + 0x08) } else { 0 };
