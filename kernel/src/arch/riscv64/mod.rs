@@ -252,7 +252,8 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     print_str("
 ");
 
-    if let Some(hz) = tree.timebase_frequency() {
+    let tree_hz = tree.timebase_frequency();
+    if let Some(hz) = tree_hz {
         print_str("riscv64: timebase ");
         print_dec(hz as u64);
         print_str(" Hz
@@ -406,6 +407,26 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies.
 " {
         putc(b);
+    }
+
+    // Start the scheduler tick at the rate the MACHINE reports, then let it run. The deliberate
+    // fault below is what ends the boot, so the ticks in between prove the timer is periodic
+    // rather than a single interrupt that happened to arrive.
+    if let Some(hz) = tree_hz {
+        if start_timer(hz) {
+            print_str("riscv64: timer started, 10ms quantum from a ");
+            print_dec(hz as u64);
+            print_str(" Hz timebase
+");
+            // Spin briefly so several ticks land before the fault ends the boot. A count, not a
+            // duration - it is bounded and its only job is to let interrupts arrive.
+            for _ in 0..40_000_000u64 {
+                core::hint::spin_loop();
+            }
+        } else {
+            print_str("riscv64: TIMER REFUSED - no TIME extension or set_timer failed
+");
+        }
     }
 
     // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
@@ -1118,6 +1139,53 @@ fn enable_paging(bi: &BootInfo) {
     // Reaching here means the UART was reachable THROUGH the new table, not merely before it.
     print_str("riscv64: paging on, sv39 active
 ");
+}
+
+
+/// Ticks counted since the timer was started, and the interval between them.
+static TICKS: AtomicUsize = AtomicUsize::new(0);
+static TICK_INTERVAL: AtomicUsize = AtomicUsize::new(0);
+
+/// One scheduler tick.
+///
+/// ACKNOWLEDGED BY SCHEDULING THE NEXT ONE. There is no "clear" bit for the supervisor timer: the
+/// interrupt is asserted for as long as the deadline is in the past, so a handler that returns
+/// without setting a new one re-enters immediately and forever. That live lock presents as a machine
+/// which boots and then does nothing, with no fault to report - which is why it is worth naming here
+/// rather than discovering.
+fn timer_tick(_frame: &mut trap::TrapFrame) {
+    let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
+    sbi::set_timer(sbi::time().wrapping_add(interval));
+
+    // The first few, then every hundredth: enough to prove the tick is alive and periodic without
+    // a console that scrolls forever. A quantum is 10 ms, so every hundredth is once a second.
+    if n <= 3 || n % 100 == 0 {
+        print_str("riscv64: tick ");
+        print_dec(n as u64);
+        print_str("
+");
+    }
+}
+
+/// Start the scheduler tick, at the quantum the constitution specifies.
+///
+/// The interval is derived from the machine's own `timebase-frequency` rather than a constant: QEMU
+/// counts at 10 MHz and the JH7110 at 4, so any fixed number would be a 2.5x error on one of them -
+/// a scheduler running at the wrong speed, which is the kind of wrong that looks like working.
+fn start_timer(hz: u32) -> bool {
+    if hz == 0 || !sbi::probe(sbi::EXT_TIME) {
+        return false;
+    }
+    // 10 ms, per CLAUDE.md 9.1. Written as a division of the machine's rate so the QUANTUM is the
+    // constant and the tick count is derived, rather than the other way round.
+    let interval = (hz as usize) / 100;
+    TICK_INTERVAL.store(interval, Ordering::Relaxed);
+    if !sbi::set_timer(sbi::time().wrapping_add(interval as u64)) {
+        return false;
+    }
+    trap::enable_timer_interrupts();
+    true
 }
 
 // ============================ BootInfo, built from the machine ============================

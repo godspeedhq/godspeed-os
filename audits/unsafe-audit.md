@@ -1291,6 +1291,7 @@ matching the x86/ARM implementations so a real port inherits the obligation rath
 | `arch/loongarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
 | `arch/riscv64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
 | `arch/riscv64/sbi.rs` | 0 -> 6 (new file) | 2026-09-07: calls into the firmware this kernel runs UNDER. One `ecall` (the SBI calling convention: extension in a7, function in a6, two-word return), one `time` CSR read, and the wrappers over them. `ecall` is memory-safe by construction - it traps to M-mode and returns - and the primitive is `unsafe` because WHICH firmware routine runs depends entirely on the extension and function asked for, with the legacy shutdown call a single number away from harmless ones. Extensions are probed before use rather than assumed, so a missing one is reported rather than called into. |
+| `arch/riscv64/trap.rs` | 4 -> 6 (+2) | 2026-09-07: the context-saving trap entry and the two interrupt-enable bits. The stub saves all 31 writable registers plus `sepc` on the current stack and restores them before `sret` - all 31 rather than the caller-saved set, because the interrupted code is not a caller and agreed to no convention with the handler. `enable_timer_interrupts` sets `sie.STIE` and `sstatus.SIE`, sound because `stvec` is installed first: enabling before that would give the first tick nowhere to go. |
 | `arch/riscv64/trap.rs` | 0 -> 4 (new file) | 2026-09-07: the S-mode trap vector. Three CSR reads with no side effects (`scause`, `sepc`, `stval`), the naked entry stub, and the `csrw stvec` that installs it. The install is guarded by a runtime alignment check rather than an assumption: `stvec` steals the low two bits for MODE, so a misaligned handler would be silently reinterpreted, and Rust has no stable way to align a function. |
 | `arch/riscv64/sv39.rs` | 15 -> 17 (+2) | 2026-09-07: `identity_map_gigapages` writes root-level 1 GiB leaves. Same soundness as the 4 KiB walker - a page-aligned frame the kernel owns, an index masked to 9 bits - and the loop is bounded by both the requested end and the 512-entry table, with an explicit break on wrap. |
 | `arch/riscv64/mod.rs` | 33 -> 34 (+1) | 2026-09-07: a DELIBERATE read of an unmapped address, to prove the trap vector reports rather than trusting that installing it worked. Sound in the only sense that matters here: the read is guaranteed to fault, that is the entire purpose, and the handler it enters does not return. Removed when the kernel has real work after this point. |
@@ -2457,7 +2458,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/fdt.rs | 3 | permitted |
 | arch/riscv64/sbi.rs | 6 | permitted |
 | arch/riscv64/sv39.rs | 17 | permitted |
-| arch/riscv64/trap.rs | 4 | permitted |
+| arch/riscv64/trap.rs | 6 | permitted |
 | arch/riscv64/mod.rs | 34 | permitted |
 | arch/s390x/mod.rs | 20 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
