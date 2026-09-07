@@ -192,6 +192,9 @@ pub unsafe extern "C" fn _start() -> ! {
 /// trap that cost a day on x86, where the BSP's APIC id was assumed to be 0 and QEMU happened to
 /// agree - so it is taken from the register here rather than inferred anywhere.
 extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
+    // Recorded before anything can want it. `a0` is the only place this is true: the device tree
+    // disagrees on this board, and there is no interrupt controller to read it back from.
+    BOOT_HART.store(hartid as u32, Ordering::Relaxed);
     // PARSE BEFORE PRINTING. The device tree states where the UART is and how its registers are
     // laid out, so reading it first is what lets the banner print correctly on a machine nobody
     // compiled for. Doing it the other way round is why a build flag existed at all.
@@ -346,6 +349,14 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             print_dec((ap_count() + 1) as u64);
             print_str(" core(s)
 ");
+
+            // Publish this hart's id now the per-core arenas exist, so `current_core_id()` resolves
+            // through a value the machine reported rather than through a default. The board boots on
+            // hart 1, so the default would name a hart the kernel is not running on. The lookup
+            // still falls through to core 0 rather than MATCHING, because no core is marked ready
+            // until there is a scheduler - correct for one hart, and the line to revisit when SBI
+            // HSM starts the others.
+            publish_bsp_lapic_id();
 
             crate::capability::init();
             crate::ipc::init();
@@ -574,6 +585,15 @@ pub enum MemoryKind {
 /// single-core boot is a supported configuration (§11.3) rather than an error.
 static USABLE_HARTS: AtomicU32 = AtomicU32::new(1);
 
+/// The hart this kernel was entered on, taken from `a0` at `_start`.
+///
+/// **NOT ZERO ON REAL HARDWARE.** The VisionFive 2 Lite boots on hart 1 - hart 0 is the S7 monitor
+/// core - while QEMU `virt` boots on hart 0. So the emulator's value is exactly the one an
+/// assumption would have picked, and a kernel that assumed it would work in QEMU and address the
+/// wrong core on the board. The FDT header's `boot_cpuid_phys` is no help either: it reads 0 on this
+/// board while `a0` and OpenSBI both say 1. The register is the only truth.
+static BOOT_HART: AtomicU32 = AtomicU32::new(0);
+
 pub fn ap_count() -> usize {
     (USABLE_HARTS.load(Ordering::Relaxed).saturating_sub(1)) as usize
 }
@@ -630,7 +650,9 @@ pub fn usb_disk_absent() -> bool { true }
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
 pub fn net_info() -> Option<([u8; 6], bool)> { None }
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{
+    copy_user_to_kernel, read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes,
+};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
@@ -687,7 +709,17 @@ pub mod boot {
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}
     pub unsafe fn apic_send_eoi() {}
-    pub unsafe fn get_lapic_id() -> u32 { 0 }
+    /// The id of the hart this call is running on.
+    ///
+    /// # Safety
+    /// Architecturally always safe; `unsafe` to match the seam every arch implements.
+    pub unsafe fn get_lapic_id() -> u32 {
+        // Single hart for now, so the boot hart's id IS this hart's id. When SBI HSM starts the
+        // others, each will need its own - `tp` is the conventional place to keep it, set by that
+        // hart's own entry, and this becomes a `tp` read. Written down because returning the BOOT
+        // hart's id from a secondary hart would be wrong in exactly the way a default is wrong.
+        super::BOOT_HART.load(core::sync::atomic::Ordering::Relaxed)
+    }
     pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
     pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
@@ -886,19 +918,18 @@ pub mod page_tables {
 }
 
 // ---------------------------------------------------------------------------
-pub mod syscall_entry {
-    #[repr(C)]
-    pub struct PerCoreSyscallData { pub user_rsp: u64, pub kernel_rsp: u64 }
+pub mod uaccess;
 
-    pub const USER_END: u64 = 0x0000_8000_0000_0000;
-    pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
-    pub fn init_percore_syscall_arena(n: usize) {}
-    pub fn init_percore_arenas(n: usize) {}
-    pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
-    pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
-    pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
-    pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
-    pub fn read_cycle_counter() -> u64 { 0 }                 // CNTPCT_EL0
+/// The syscall-entry surface, which is the same set of primitives seen from the other side of the
+/// seam. Both paths are real names the neutral kernel uses - `arch::imp::read_user_bytes` from the
+/// dispatcher, `arch::imp::syscall_entry::syscall_slot` from the scheduler - so both answer, from
+/// one implementation.
+pub mod syscall_entry {
+    pub use super::uaccess::{
+        copy_user_to_kernel, init_percore_arenas, init_percore_syscall_arena, read_cycle_counter,
+        read_user_bytes, syscall_slot, validate_user_ptr, write_user_bytes, PerCoreSyscallData,
+        USER_END,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +1070,22 @@ pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
 /// RISC-V the hart id arrives in `a0` at entry rather than being read back from an interrupt
 /// controller, so there is no equivalent of the x86 bug this exists to prevent (a core marked ready
 /// whose identity was never written). When SMP lands, the boot hart records its id here.
-pub fn publish_bsp_lapic_id() {}
+/// Publish the boot hart's id so `smp::core::lapic_to_core_id` can map it to core 0.
+///
+/// x86 needs this because the id must be read back from an interrupt controller and, until it is
+/// published, every lookup answers with a default that happens to be right on one machine and wrong
+/// on the next - which is the bug this function was added to fix there. RISC-V gets the id handed to
+/// it in a register instead, so the READ cannot go wrong; the PUBLISH still can, and must happen for
+/// the same reason. On this board the boot hart is 1, so an unpublished id means `current_core_id()`
+/// resolves a hart the kernel is not running on.
+pub fn publish_bsp_lapic_id() {
+    let id = BOOT_HART.load(Ordering::Relaxed);
+    crate::smp::core::set_core_lapic_id(0, id);
+    print_str("riscv64: boot hart is ");
+    print_dec(id as u64);
+    print_str(" (core 0)
+");
+}
 
 /// PCI config read. See the `pci` module: no bus is enumerated until the FDT is parsed.
 pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
@@ -1051,7 +1097,6 @@ pub fn serial_unlocked_emit_count() -> u64 { 0 }
 ///
 /// Returns false until S-mode user pages exist. Refusing is the safe direction: a caller that cannot
 /// read user memory fails its syscall, where a caller that wrongly SUCCEEDS reads someone else's.
-pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
 
 /// Is a driver's DMA arena mapped uncached? True until Sv39 attributes are wired, because assuming
 /// COHERENT when it is not gives a driver silently stale descriptors - the failure that cannot be

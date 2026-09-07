@@ -255,6 +255,31 @@ that happens to match an assumption HIDES it rather than testing it.
 And one that is not QEMU's fault at all: the FDT header's `boot_cpuid_phys` reads 0 on this board while
 `a0` and OpenSBI both say hart 1. Take the boot hart from the register, never from the tree.
 
+## The kernel is INSIDE the user address range on this port, so a range check proves nothing
+
+x86 validates a syscall pointer with a range check against `USER_END`, and that check rejects a
+kernel address. It is easy to read that as the check doing the work. It is not: x86's kernel lives
+higher-half, so the rejection is a property of the LAYOUT, and it does not travel with the code.
+
+This kernel is IDENTITY-MAPPED LOW - 0x8020_0000 on QEMU, 0x4020_0000 on the board - which is
+squarely inside the user half. So `validate_user_ptr(&__kernel_start, 8)` answers **true**, and is
+right to: that is a perfectly legal user virtual address, and a task may legitimately have its own
+page mapped there in its own space. Found on 2026-09-07 by asserting the x86 property and watching
+`deny-kernel-ptr=BAD`.
+
+**The `U` bit is the entire boundary here.** Every copy in `arch/riscv64/uaccess.rs` therefore walks
+the live page table and refuses a page without `U`, and the selftest asserts BOTH halves - the range
+check passes for the kernel's own address, and the read is refused anyway - so a future change that
+made the range check reject it cannot silently turn that claim into a test of nothing.
+
+Both halves of the walk were then proved load-bearing by deleting them:
+
+- Drop the `U` check: `deny-kernel-ptr=BAD`. The kernel reads its own memory on behalf of a user
+  pointer, which is the shape of a privilege escalation rather than a crash.
+- Drop the `W` check: the kernel FAULTS - `store/AMO page fault` at the task's read-only code page -
+  and halts, because there is no kill path yet. Which is exactly why the walk happens BEFORE the copy
+  on this port rather than the fault being caught during it, as x86 does.
+
 ## `sstatus.SUM` makes a missing `sscratch` latch a SILENT HANG, not a wrong answer
 
 Two isolation rules meet here, and the combination is worth knowing before it is met by accident.

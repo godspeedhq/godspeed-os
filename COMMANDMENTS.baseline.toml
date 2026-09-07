@@ -387,6 +387,7 @@ PCI_CFG            = 16
 "riscv64/syscall.rs"          = "syscall-entry"
 "riscv64/trap.rs"             = "interrupts"
 "riscv64/usermode.rs"         = "usermode"
+"riscv64/uaccess.rs"          = "uaccess"
 "riscv64/mod.rs"              = "arch-entry"
 "s390x/mod.rs"                = "arch-entry"
 "x86_64/ap_boot.rs"           = "boot"

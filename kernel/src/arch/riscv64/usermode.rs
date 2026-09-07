@@ -580,6 +580,73 @@ static TASK_SAW_SENTINEL: AtomicU64 = AtomicU64::new(0);
 static TASK_FRAME_ADDR: AtomicU64 = AtomicU64::new(0);
 static TASK_RAN_USER: AtomicBool = AtomicBool::new(false);
 
+/// The five `uaccess` claims, gathered while the task's address space is the live one - which is the
+/// only moment they can be asked, because a user pointer means nothing outside it.
+static UA_READ: AtomicBool = AtomicBool::new(false);
+static UA_WRITE: AtomicBool = AtomicBool::new(false);
+static UA_DENY_KERNEL: AtomicBool = AtomicBool::new(false);
+static UA_DENY_UNMAPPED: AtomicBool = AtomicBool::new(false);
+static UA_DENY_RO_WRITE: AtomicBool = AtomicBool::new(false);
+
+/// Exercise `uaccess` against a REAL user address space, from inside a trap taken from a real user
+/// task. Nothing else can do this honestly: a user pointer is only meaningful while the space that
+/// defines it is installed, and `sstatus.SUM` only matters when the page is genuinely marked `U`.
+///
+/// Five claims, and three of them are DENIALS. A copy routine that works is half a copy routine; the
+/// half that matters is the one that refuses.
+fn check_uaccess() {
+    use super::uaccess::{read_user_bytes, validate_user_ptr, write_user_bytes};
+
+    // The stub left the sentinel at the top of its user stack. Reading it back proves the whole
+    // path: range check, page walk, `SUM` window, copy into the per-core scratch.
+    let sp_top = TASK_STACK_VA + 4096;
+    if let Some(bytes) = read_user_bytes(sp_top - 8, 8) {
+        let mut v = [0u8; 8];
+        v.copy_from_slice(bytes);
+        UA_READ.store(u64::from_le_bytes(v) == TASK_SENTINEL, Ordering::Relaxed);
+    }
+
+    // Write into the user stack and read it back through the same machinery.
+    const PATTERN: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+    if write_user_bytes(sp_top - 32, &PATTERN) {
+        if let Some(back) = read_user_bytes(sp_top - 32, 8) {
+            UA_WRITE.store(back == PATTERN, Ordering::Relaxed);
+        }
+    }
+
+    // A KERNEL address must not become readable just because a syscall argument named it.
+    //
+    // **And on THIS arch the range check cannot say so.** The kernel is identity-mapped low -
+    // 0x8020_0000 on QEMU, 0x4020_0000 on the board - which is squarely inside the user half, so
+    // `validate_user_ptr` answers TRUE for it and is right to: that address is a perfectly legal
+    // user address, and a task may legitimately have its own page mapped there in its own space.
+    // x86's identical check rejects a kernel pointer only because its kernel lives higher-half; the
+    // check is a property of that layout, not of the idea. Borrowing it and assuming the rejection
+    // came with it would be importing their model (§26.14).
+    //
+    // What actually separates the two here is the `U` BIT, checked by the walk. So the claim is
+    // stated against the thing that protects: the range check passes, and the read is refused
+    // anyway. Both halves are asserted, because a future change that made the range check reject
+    // this address would silently turn this into a test of nothing.
+    let kernel_addr = (&raw const super::__kernel_start) as u64;
+    let in_range = validate_user_ptr(kernel_addr, 8);
+    let refused = read_user_bytes(kernel_addr, 8).is_none();
+    UA_DENY_KERNEL.store(in_range && refused, Ordering::Relaxed);
+
+    // A user address in range but NOT MAPPED. This is what the walk exists for: refused rather than
+    // faulted, which is what lets a kernel with no kill path survive a bad pointer at all.
+    UA_DENY_UNMAPPED.store(
+        read_user_bytes(TASK_CODE_VA + 0x10_0000, 8).is_none(),
+        Ordering::Relaxed,
+    );
+
+    // The task's CODE page is mapped `U|R|X` and NOT writable. A read must succeed and a write must
+    // be refused, so the walk is checking the permission it was asked about rather than presence.
+    let ro_read_ok = read_user_bytes(TASK_CODE_VA, 8).is_some();
+    let ro_write_refused = !write_user_bytes(TASK_CODE_VA, &PATTERN);
+    UA_DENY_RO_WRITE.store(ro_read_ok && ro_write_refused, Ordering::Relaxed);
+}
+
 static mut TASK_CTX: super::context_switch::TaskContext = super::context_switch::TaskContext::ZERO;
 static mut TASK_BOOT_CTX: super::context_switch::TaskContext =
     super::context_switch::TaskContext::ZERO;
@@ -599,6 +666,7 @@ pub(super) fn claim_task_trap(frame: &mut TrapFrame, code: u64) -> bool {
     TASK_SAW_SATP.store(super::page_tables::read_page_table_base(), Ordering::Relaxed);
     TASK_SAW_SENTINEL.store(frame.x[REG_A2], Ordering::Relaxed);
     TASK_FRAME_ADDR.store(frame as *const TrapFrame as u64, Ordering::Relaxed);
+    check_uaccess();
 
     // Leave user mode the way a scheduler does. This does not return: nothing switches back into
     // this task, so the trap frame under us is simply never resumed.
@@ -713,6 +781,24 @@ pub fn task_selftest() {
     print_hex(root);
     print_str("\n");
 
+    let ua = [
+        ("read", UA_READ.load(Ordering::Relaxed)),
+        ("write", UA_WRITE.load(Ordering::Relaxed)),
+        ("deny-kernel-ptr", UA_DENY_KERNEL.load(Ordering::Relaxed)),
+        ("deny-unmapped", UA_DENY_UNMAPPED.load(Ordering::Relaxed)),
+        ("deny-write-to-ro", UA_DENY_RO_WRITE.load(Ordering::Relaxed)),
+    ];
+    print_str("riscv64: uaccess");
+    let mut uaccess_ok = true;
+    for (name, ok) in ua {
+        print_str(" ");
+        print_str(name);
+        print_str("=");
+        print_str(if ok { "ok" } else { "BAD" });
+        uaccess_ok &= ok;
+    }
+    print_str("\n");
+
     // SAFETY: the task is abandoned and nothing can resume it - its context is a local static no
     // scheduler knows about, and `satp` is back on the kernel root. Its four frames are this
     // function's own, and the root's tables go back through the seam's free path.
@@ -723,7 +809,7 @@ pub fn task_selftest() {
         free_frame(sv39::frame_of(kstack_pa));
     }
 
-    if ran && own_space && stack_ok && kstack_ok {
+    if ran && own_space && stack_ok && kstack_ok && uaccess_ok {
         print_str(
             "riscv64: usertask PASS - unprivileged, in its own address space, on its own kernel stack\n",
         );
