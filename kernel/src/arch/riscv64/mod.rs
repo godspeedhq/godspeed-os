@@ -440,6 +440,7 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     // two KERNEL tasks isolates the register half from the MMU half. Both tasks share the kernel's
     // one address space, so nothing here depends on a `satp` switch working.
     context_switch::selftest();
+    context_switch::address_space_selftest();
 
     usermode::selftest();
 
@@ -708,18 +709,36 @@ pub fn fb_commit(
 
 pub mod page_tables {
 
-    /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
-    /// identity mapping into it.
+    /// Arch hook run once a service's address space is built. x86 needs nothing; ARM and RISC-V
+    /// clone the kernel identity mapping into it.
+    ///
+    /// WITHOUT THIS A TASK CANNOT BE SWITCHED TO. The instant `switch_context` writes `satp`, the
+    /// kernel is executing through the new table - the very next instruction fetch, the stack under
+    /// it, and the trap vector a fault would need. A root that maps only the task's own pages is a
+    /// machine that stops, with nothing left able to say why.
     ///
     /// # Safety
-    /// `_root` must be a page-table root this task owns.
-    pub unsafe fn finalize_service_address_space(_root: u64) {}
+    /// `root` must be a page-table root this task owns.
+    pub unsafe fn finalize_service_address_space(root: u64) {
+        let kernel_root = read_page_table_base();
+        if kernel_root == 0 || root == 0 {
+            return; // translation is off, or no root: nothing to inherit and nowhere to put it
+        }
+        super::sv39::clone_leaf_roots(root, kernel_root);
+    }
 
     /// Free a task's page-table root and the structure below it, at task death.
     ///
     /// # Safety
-    /// `_root` must belong to a task already marked Dead, after a TLB shootdown.
-    pub unsafe fn free_page_table_root(_root: u64) {}
+    /// `root` must belong to a task already marked Dead, after a TLB shootdown, and must not be the
+    /// address space currently in `satp`.
+    pub unsafe fn free_page_table_root(root: u64) {
+        if root == 0 {
+            return;
+        }
+        // SAFETY: contract delegated to the caller above.
+        unsafe { super::sv39::free_table_tree(root) };
+    }
 
     use crate::memory::frame::{Frame, PhysAddr};
 
@@ -760,6 +779,9 @@ pub mod page_tables {
                 super::sv39::MapFail::NoFrame => MapError::FrameAllocFailed,
                 super::sv39::MapFail::AlreadyMapped => MapError::AlreadyMapped,
                 super::sv39::MapFail::NotMapped => MapError::NotMapped,
+                // The seam has no word for "that address cannot exist"; the nearest true thing is
+                // that it is not mapped, and never could be.
+                super::sv39::MapFail::NotCanonical => MapError::NotMapped,
             })
         }
         pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> {
@@ -840,6 +862,9 @@ pub mod page_tables {
             super::sv39::MapFail::NoFrame => MapError::FrameAllocFailed,
             super::sv39::MapFail::AlreadyMapped => MapError::AlreadyMapped,
             super::sv39::MapFail::NotMapped => MapError::NotMapped,
+            // The seam has no word for "that address cannot exist"; the nearest true thing is that
+            // it is not mapped, and never could be.
+            super::sv39::MapFail::NotCanonical => MapError::NotMapped,
         })?;
         // A fresh mapping still needs the fence: a walk that previously found nothing here may have
         // cached that absence, and on RISC-V a negative TLB entry is permitted.

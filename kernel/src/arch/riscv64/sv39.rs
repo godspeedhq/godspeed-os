@@ -40,6 +40,27 @@ pub enum MapFail {
     NoFrame,
     AlreadyMapped,
     NotMapped,
+    /// The address cannot exist in Sv39. See `va_is_canonical`.
+    NotCanonical,
+}
+
+/// Can this virtual address exist at all under Sv39?
+///
+/// **Sv39 addresses are 39 bits SIGN-EXTENDED**, so bits 63:38 must all equal bit 38. The usable
+/// space is therefore two halves, not one run: `0 .. 256 GiB` and `0xFFFF_FFC0_0000_0000 .. `. An
+/// address in between is rejected by the hardware BEFORE translation, as a page fault, whatever the
+/// tables say.
+///
+/// This is worth a check rather than a comment because the arithmetic lies to you. A root index is
+/// nine bits, so index 256 is a perfectly good table slot and `map_page` will happily fill it - but
+/// it is the first index of the HIGH half, reached at `0xFFFF_FFC0_0000_0000`, not at 256 GiB. Map
+/// something there by computing "256 GiB" and the walk succeeds, the entry is correct, and the
+/// access still faults, at an address that looks like the one you asked for. Refusing here turns
+/// that into an error at the map, where the mistake is.
+#[inline]
+pub fn va_is_canonical(va: u64) -> bool {
+    let top = va >> 38; // bits 63:38, twenty-six of them
+    top == 0 || top == 0x3ff_ffff
 }
 
 /// A PTE is a POINTER to the next level when none of R, W or X is set, and a LEAF when any is. That
@@ -142,6 +163,9 @@ pub unsafe fn frame_of(phys: u64) -> Frame {
 /// Refuses rather than overwriting an existing leaf. A silent remap is how two owners come to
 /// believe they hold the same page, and the second writer wins invisibly.
 pub fn map_page(root: u64, va: u64, pa: u64, bits: u64) -> Result<(), MapFail> {
+    if !va_is_canonical(va) {
+        return Err(MapFail::NotCanonical);
+    }
     let mut table = root;
     for lvl in (1..=2).rev() {
         // SAFETY: `table` is a page-aligned frame this kernel owns, identity-mapped; idx < 512.
@@ -179,6 +203,9 @@ pub fn map_page(root: u64, va: u64, pa: u64, bits: u64) -> Result<(), MapFail> {
 /// `sfence.vma` for a table nobody is using is a wasted fence rather than a correctness bug -
 /// whereas skipping one for the active table is the opposite.
 pub fn unmap_page(root: u64, va: u64) -> Result<u64, MapFail> {
+    if !va_is_canonical(va) {
+        return Err(MapFail::NotCanonical);
+    }
     let mut table = root;
     for lvl in (1..=2).rev() {
         // SAFETY: `table` is a page-aligned frame this kernel owns, identity-mapped.
@@ -202,6 +229,9 @@ pub fn unmap_page(root: u64, va: u64) -> Result<u64, MapFail> {
 
 /// The leaf PTE for `va`, if one exists.
 pub fn translate(root: u64, va: u64) -> Option<u64> {
+    if !va_is_canonical(va) {
+        return None; // cannot exist, so nothing translates it
+    }
     let mut table = root;
     for lvl in (1..=2).rev() {
         // SAFETY: `table` is a page-aligned frame this kernel owns, identity-mapped.
@@ -254,4 +284,75 @@ pub fn identity_map_gigapages(root: u64, end: u64, bits: u64) -> Result<(), MapF
         }
     }
     Ok(())
+}
+
+/// Copy the kernel's identity mapping into a new address space.
+///
+/// **Only the LEAF entries of the root, and that is a load-bearing restriction.** A task's root ends
+/// up holding the kernel's gigapage leaves by VALUE plus whatever pointer entries the task creates
+/// for itself, so the two are trivially separable: anything reachable through a POINTER entry in a
+/// task root was built by that task, which is what lets `free_table_tree` reclaim a dead task's
+/// tables without walking into the kernel's.
+///
+/// The consequence is stated rather than hidden: a kernel mapping made through a pointer entry - a
+/// 4 KiB page in the kernel root rather than a gigapage - would NOT be inherited by a task. Today the
+/// kernel's own map is gigapage leaves only (`identity_map_gigapages`), so nothing is lost. If that
+/// stops being true, this stops being correct, and the failure would be a task faulting on a kernel
+/// address that works everywhere else.
+///
+/// A clone is also a SNAPSHOT: a later change to the kernel root does not reach a task root that was
+/// built before it. x86 shares the kernel half by pointing at the same tables and does not have this
+/// property. It is fine here because the kernel's map is fixed once paging is on, and it is written
+/// down because the day that changes this is where the bug will be.
+pub fn clone_leaf_roots(dst: u64, src: u64) -> usize {
+    let mut copied = 0;
+    for idx in 0..512 {
+        // SAFETY: both are page-aligned root tables this kernel owns, identity-mapped; idx < 512.
+        let pte = unsafe { (src as *const u64).add(idx).read_volatile() };
+        if pte_is_valid(pte) && pte_is_leaf(pte) {
+            // SAFETY: as above.
+            unsafe { (dst as *mut u64).add(idx).write_volatile(pte) };
+            copied += 1;
+        }
+    }
+    copied
+}
+
+/// Free every table BELOW a root, then the root itself, and report how many frames came back.
+///
+/// Walks only POINTER entries, never leaves. A leaf at any level names a frame the task was given
+/// rather than a table it was built out of, and freeing those is the caller's business (the frames
+/// have owners; the tables do not). Combined with `clone_leaf_roots`, that is exactly why the
+/// kernel's inherited gigapages survive a task's death: they are leaves, so this never follows them.
+///
+/// # Safety
+/// `root` must be a root table belonging to a task that is finished with it, and must not be the
+/// live `satp` root - freeing the address space you are executing in is not detectable from here.
+pub unsafe fn free_table_tree(root: u64) -> usize {
+    let mut freed = 0;
+    for i2 in 0..512 {
+        // SAFETY: `root` is a page-aligned table this kernel owns, identity-mapped; i2 < 512.
+        let l1 = unsafe { (root as *const u64).add(i2).read_volatile() };
+        if !pte_is_valid(l1) || pte_is_leaf(l1) {
+            continue;
+        }
+        let t1 = pte_phys(l1);
+        for i1 in 0..512 {
+            // SAFETY: `t1` came from a pointer PTE this kernel wrote, so it is a table it owns.
+            let l0 = unsafe { (t1 as *const u64).add(i1).read_volatile() };
+            if !pte_is_valid(l0) || pte_is_leaf(l0) {
+                continue;
+            }
+            // SAFETY: as above; the level-0 table is unreferenced once its parent entry goes.
+            unsafe { crate::memory::allocator::free_frame(frame_of(pte_phys(l0))) };
+            freed += 1;
+        }
+        // SAFETY: every entry below it has been dealt with, and nothing else points at it.
+        unsafe { crate::memory::allocator::free_frame(frame_of(t1)) };
+        freed += 1;
+    }
+    // SAFETY: contract delegated to the caller - the root belongs to a task that is finished and is
+    // not the live one.
+    unsafe { crate::memory::allocator::free_frame(frame_of(root)) };
+    freed + 1
 }

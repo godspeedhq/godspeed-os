@@ -418,3 +418,151 @@ pub fn selftest() {
         print_str("riscv64: ctxsw FAIL - see the line above\n");
     }
 }
+
+// ============================ per-task address space selftest ============================
+//
+// The switch's OTHER half. Everything above ran with `cr3` zero, so the `satp` write and its fence
+// never executed - a whole branch of `switch_context`, written and unrun. This runs it.
+//
+// Four claims, and the last is the one that matters:
+//
+//   satp installed     the task read back the root it was given, not the kernel's. Checked FIRST, so
+//                      a switch that failed to install it reports rather than faulting on the next
+//                      line and taking the machine down with a message about the wrong thing.
+//   private page seen  a page mapped ONLY in the task's root is readable from the task. That is the
+//                      inherited kernel map and the task's own map both working, in one read.
+//   satp restored      switching back put the kernel's root in place, so boot did not continue in a
+//                      space that is about to be freed.
+//   NOT in the kernel  the same address does not translate in the kernel's root. This is invariant 2
+//                      for this ISA: not "a task has a page table" but "a task has a page table the
+//                      rest of the system cannot see through".
+
+/// Where the private page lives: above every gigapage the kernel maps, and clear of the two other
+/// high addresses this boot uses (192 GiB for the user pages, 128 GiB for the fault probe). Three
+/// tests sharing one address would be three tests measuring each other.
+///
+/// 224 GiB, and the ceiling is the point: **Sv39's positive half ends at 256 GiB**, because an
+/// address is 39 bits sign-extended. This started at 256 GiB exactly, which is one past the end -
+/// the mapping was written into root index 256, which is a real slot but belongs to the HIGH half,
+/// and the read faulted at an address that looked exactly like the one that had been mapped.
+/// `sv39::va_is_canonical` now refuses that at the map rather than letting it fault at the use.
+const PRIVATE_VA: u64 = 0x0000_0038_0000_0000;
+/// Written into the private frame and read back by the task. Arbitrary, but not zero or all-ones:
+/// both are what unmapped or uninitialised memory tends to read as.
+const PRIVATE_SENTINEL: u64 = 0x5a5a_c3c3_0f0f_1234;
+
+static mut C_CTX: TaskContext = TaskContext::ZERO;
+static mut BOOT2_CTX: TaskContext = TaskContext::ZERO;
+static C_ROOT: AtomicU64 = AtomicU64::new(0);
+static C_SAW_SATP: AtomicU64 = AtomicU64::new(0);
+static C_SAW_VALUE: AtomicU64 = AtomicU64::new(0);
+
+/// The task that runs in its own address space.
+unsafe extern "C" fn task_c() -> ! {
+    let live = super::page_tables::read_page_table_base();
+    C_SAW_SATP.store(live, Ordering::Relaxed);
+
+    // Only dereference the private address once the root is confirmed. Reading it under the WRONG
+    // root is a page fault, and a fault here would halt the machine while reporting a load fault at
+    // an address that means nothing to a reader - burying the actual finding, which is that the
+    // switch did not install the table.
+    if live == C_ROOT.load(Ordering::Relaxed) {
+        // SAFETY: `PRIVATE_VA` is mapped read-write in exactly this address space, which the check
+        // above confirms is the live one, and the frame behind it was written before the switch.
+        C_SAW_VALUE.store(unsafe { (PRIVATE_VA as *const u64).read_volatile() }, Ordering::Relaxed);
+    }
+
+    // SAFETY: `BOOT2_CTX` was filled by the switch that started this task. Its `cr3` is the kernel
+    // root, so the switch installs it on the way back - which is the third claim.
+    unsafe { switch_context(&raw mut C_CTX, &raw const BOOT2_CTX) };
+    super::print_str("riscv64: addrspace TASK C RESUMED AFTER HANDING BACK\n");
+    super::halt()
+}
+
+/// Prove a task can run in an address space of its own.
+pub fn address_space_selftest() {
+    use crate::memory::allocator::{alloc_frame, free_frame};
+    use super::sv39;
+    use super::{print_hex, print_str};
+
+    let kernel_root = super::page_tables::read_page_table_base();
+    if kernel_root == 0 {
+        print_str("riscv64: addrspace SKIPPED - translation is off\n");
+        return;
+    }
+
+    let (Some(root), Some(stack), Some(page)) = (sv39::new_root(), alloc_frame(), alloc_frame())
+    else {
+        print_str("riscv64: addrspace FAIL - no frames for a root, a stack and a page\n");
+        return;
+    };
+    let stack_pa = stack.phys_addr().0;
+    let page_pa = page.phys_addr().0;
+
+    // The kernel's own mapping goes in first. Everything after the switch - including any timer
+    // interrupt taken while the task runs - executes through this table.
+    // SAFETY: `root` is a fresh zeroed root this function owns.
+    unsafe { super::page_tables::finalize_service_address_space(root) };
+
+    // SAFETY: the frame is identity-mapped and freshly ours, so writing at its physical address is
+    // writing the page the mapping below will point at.
+    unsafe { (page_pa as *mut u64).write_volatile(PRIVATE_SENTINEL) };
+
+    // Kernel permissions, no USER bit: this is a task's PRIVATE page, not a userspace one. The point
+    // being tested is the address SPACE, and mixing in a privilege question would make a failure
+    // ambiguous between the two.
+    let bits = sv39::PTE_V | sv39::PTE_R | sv39::PTE_W | sv39::PTE_A | sv39::PTE_D;
+    if sv39::map_page(root, PRIVATE_VA, page_pa, bits).is_err() {
+        print_str("riscv64: addrspace FAIL - could not map the private page\n");
+        return;
+    }
+
+    C_ROOT.store(root, Ordering::Relaxed);
+    // SAFETY: a fresh stack frame this function owns, a real diverging entry point, and a root that
+    // now carries both the kernel's mapping and the task's own.
+    unsafe { C_CTX = TaskContext::new_kernel(task_c, (stack_pa + 4096) as *mut u8, root) };
+    // The boot context must carry the KERNEL root, or the switch back would leave `satp` pointing at
+    // an address space this function is about to free.
+    // SAFETY: writing a static this hart alone touches, before the switch reads it.
+    unsafe { BOOT2_CTX.cr3 = kernel_root };
+
+    let was = super::interrupts::local_irq_save();
+    // SAFETY: `C_CTX` is primed with a real entry, its own stack, and a root that maps the kernel.
+    unsafe { switch_context(&raw mut BOOT2_CTX, &raw const C_CTX) };
+    super::interrupts::local_irq_restore(was);
+
+    let installed = C_SAW_SATP.load(Ordering::Relaxed) == root;
+    let saw = C_SAW_VALUE.load(Ordering::Relaxed) == PRIVATE_SENTINEL;
+    let restored = super::page_tables::read_page_table_base() == kernel_root;
+    let isolated = sv39::translate(kernel_root, PRIVATE_VA).is_none();
+
+    print_str("riscv64: addrspace satp-installed=");
+    print_str(if installed { "ok" } else { "BAD" });
+    print_str(" private-page-seen=");
+    print_str(if saw { "ok" } else { "BAD" });
+    print_str(" satp-restored=");
+    print_str(if restored { "ok" } else { "BAD" });
+    print_str(" invisible-to-kernel=");
+    print_str(if isolated { "ok" } else { "BAD" });
+    print_str(" root ");
+    print_hex(root);
+    print_str("\n");
+
+    // Reclaim. The root goes back through the seam's own free path, which is the other half of
+    // `finalize_service_address_space` and is equally untested until something calls it.
+    // SAFETY: task C is finished and suspended forever, `satp` is back on the kernel root (checked
+    // above), and the sentinel frame and stack are this function's own.
+    unsafe {
+        super::page_tables::free_page_table_root(root);
+        free_frame(sv39::frame_of(page_pa));
+        free_frame(sv39::frame_of(stack_pa));
+    }
+
+    if installed && saw && restored && isolated {
+        print_str(
+            "riscv64: addrspace PASS - a task ran in its own address space, invisible to the kernel's\n",
+        );
+    } else {
+        print_str("riscv64: addrspace FAIL - see the line above\n");
+    }
+}

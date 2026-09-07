@@ -255,6 +255,32 @@ that happens to match an assumption HIDES it rather than testing it.
 And one that is not QEMU's fault at all: the FDT header's `boot_cpuid_phys` reads 0 on this board while
 `a0` and OpenSBI both say hart 1. Take the boot hart from the register, never from the tree.
 
+## Sv39's address space has a HOLE in the middle, and the arithmetic will not tell you
+
+An Sv39 virtual address is 39 bits SIGN-EXTENDED: bits 63:38 must all equal bit 38. So the usable
+space is two halves with a gap between them, not one run from zero:
+
+```
+0x0000_0000_0000_0000 .. 0x0000_003F_FFFF_FFFF     the low half, 256 GiB
+                  <a hole nothing can address>
+0xFFFF_FFC0_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF     the high half
+```
+
+**A root index is nine bits, so index 256 is a perfectly good table slot - and it is the first index
+of the HIGH half, not "256 GiB".** Computing a test address as 256 GiB (0x40_0000_0000) therefore
+lands in root index 256, the walker fills it correctly, `translate` reads it back correctly, and the
+access still faults - at an address that looks exactly like the one that was mapped. That happened
+here on 2026-09-07 with the per-task address-space test, and it cost one boot: `stval 0x4000000000`,
+a load page fault on a page whose PTE was demonstrably present.
+
+Nothing about this is visible in the index arithmetic, which is why `sv39::va_is_canonical` now
+refuses a non-canonical address at `map_page`, `unmap_page` and `translate` rather than letting it
+fault at the use. Proved by putting the bad address back: the boot now prints `could not map the
+private page` and CONTINUES, instead of halting on a fault about the wrong thing.
+
+The three high addresses this boot uses are all in the low half and clear of each other: 128 GiB the
+trap-vector fault probe, 192 GiB the user pages, 224 GiB the private task page.
+
 ## User mode, and what it still does not have
 
 Reached 2026-09-07: code runs in U-mode on this ISA, cannot read a kernel page, and is preempted out
@@ -274,9 +300,9 @@ the kernel insisting on the exact address it handed over before it forgives the 
 
 WHAT IS NOT DONE, and what `spawn_supervisor` still needs:
 
-- **Per-task address spaces.** The selftest maps its user pages into the ACTIVE root, not a fresh
-  one, because a second root would test whether the kernel survives a `satp` switch AND whether
-  U-mode works, and only the second was that increment. `switch_context` is where the first belongs.
+- **Per-task address spaces** exist now (`context_switch::address_space_selftest`), but USER mode has
+  not been run in one. The user-mode selftest still maps into the ACTIVE root, so "a task in U-mode,
+  in its own address space" is the two halves not yet joined. Joining them is `spawn_supervisor`.
 - **A syscall path.** `ecall` from U-mode currently reaches one gated selftest hook and otherwise the
   reporter. Routing it to the neutral `syscall::dispatch` is the next real seam member.
 - **`sscratch` is per-hart, and there is one hart.** It is written by `enter_user` on whatever hart
