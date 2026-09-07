@@ -323,11 +323,27 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
 ");
             }
 
+            USABLE_HARTS.store(harts.max(1), Ordering::Relaxed);
+
             // THE FIRST NEUTRAL SUBSYSTEM TO RUN ON THIS ARCH. `memory::init` is shared code - the
             // same frame allocator x86, arm and aarch64 use - and it is reached here by handing it
             // facts, not by teaching it anything. Everything it needs came from the device tree or
             // the link, so nothing inside it knows which machine it is on.
             crate::memory::init(&bi);
+
+            // Keep walking `kernel_main`'s own sequence. Each of these is shared code that needs
+            // nothing from the MMU, so they run now rather than waiting behind Sv39 - and each one
+            // that works is a subsystem this arch did not have to be taught.
+            crate::smp::percpu_init(&bi);
+            print_str("riscv64: percpu arenas sized for ");
+            print_dec((ap_count() + 1) as u64);
+            print_str(" core(s)
+");
+
+            crate::capability::init();
+            crate::ipc::init();
+            print_str("riscv64: capability table and ipc routing initialised
+");
         }
         None => print_str("riscv64: could not build a memory map from the device tree
 "),
@@ -432,10 +448,23 @@ pub enum MemoryKind {
 }
 
 // ---- Lifecycle ----
-pub fn ap_count() -> usize { 0 }
-pub fn init(boot_info: &BootInfo) { unimplemented!("aarch64::init") }
-pub fn init_timer() { unimplemented!("aarch64::init_timer") }
-pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
+/// How many harts besides this one the machine says are usable.
+///
+/// FROM THE DEVICE TREE, not from a constant and not from OpenSBI's count. OpenSBI reports five on
+/// the JH7110; the tree marks one of them `disabled` (an S7 monitor core), so four are ours and
+/// three are APs. Reading `status` is what makes that distinction without the kernel knowing what a
+/// JH7110 is - see `fdt::usable_harts`.
+///
+/// Zero until the tree has been read, which is honest: before that we genuinely do not know, and a
+/// single-core boot is a supported configuration (§11.3) rather than an error.
+static USABLE_HARTS: AtomicU32 = AtomicU32::new(1);
+
+pub fn ap_count() -> usize {
+    (USABLE_HARTS.load(Ordering::Relaxed).saturating_sub(1)) as usize
+}
+pub fn init(boot_info: &BootInfo) { unimplemented!("riscv64::init") }
+pub fn init_timer() { unimplemented!("riscv64::init_timer") }
+pub fn ap_init(core_id: u32) { unimplemented!("riscv64::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
@@ -491,7 +520,7 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
-pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
+pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("riscv64::switch_to_boot_stack") }
 
 /// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (RISC-V, ELFCLASS64).
 /// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
