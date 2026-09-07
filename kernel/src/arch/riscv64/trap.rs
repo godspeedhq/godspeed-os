@@ -191,6 +191,30 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     super::print_hex(frame.sepc);
     super::print_str("  stval ");
     super::print_hex(stval);
+    // WHAT THE PAGE TABLE ACTUALLY SAYS about the faulting address. A page fault has three quite
+    // different causes that look identical in `scause` - nothing mapped, mapped without the
+    // permission the access needed, or mapped without `U` for a user access - and the PTE separates
+    // them in one line. Guessing between them costs a boot each time.
+    if !interrupt && matches!(code, 12 | 13 | 15) {
+        super::print_str("\n  pte ");
+        match super::page_tables::entry_for_va(stval) {
+            Some(pte) => {
+                super::print_hex(pte);
+                super::print_str(if pte & super::sv39::PTE_V != 0 { " V" } else { " -" });
+                super::print_str(if pte & super::sv39::PTE_R != 0 { "R" } else { "-" });
+                super::print_str(if pte & super::sv39::PTE_W != 0 { "W" } else { "-" });
+                super::print_str(if pte & super::sv39::PTE_X != 0 { "X" } else { "-" });
+                super::print_str(if pte & super::sv39::PTE_U != 0 { "U" } else { "-" });
+                super::print_str(if pte & super::sv39::PTE_A != 0 { "A" } else { "-" });
+                super::print_str(if pte & super::sv39::PTE_D != 0 { "D" } else { "-" });
+                super::print_str("  phys ");
+                super::print_hex(super::sv39::pte_phys(pte));
+            }
+            None => super::print_str("NONE - nothing maps that address in the live table"),
+        }
+        super::print_str("  satp-root ");
+        super::print_hex(super::page_tables::read_page_table_base());
+    }
     super::print_str("\n");
     // `stval` carries the faulting ADDRESS for a page or access fault and the offending INSTRUCTION
     // for an illegal-instruction trap, so it is printed raw and named by the cause rather than

@@ -461,34 +461,28 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     // build an address space for it, and make a task out of it. Loud on failure by construction: a
     // boot-time supervisor spawn failure is a panic (§11.3), so there is no quiet way for this to
     // half-work.
+    // Per-core scheduler arenas, then this core's identity, then READY - in that order, because
+    // `lapic_to_core_id` matches only a core that has been marked ready, and `spawn_supervisor`
+    // places its task on core 0 through that mapping.
+    crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
+    crate::smp::core::mark_ready(0);
+
     crate::task::spawn_supervisor();
-    print_str("riscv64: returned from spawn_supervisor
-");
 
-    // PROVE THE TRAP VECTOR FIRES, rather than trusting that installing it worked.
-    //
-    // A guard never observed firing is not evidence - and this one is invisible when it works, so
-    // "stvec installed" says only that a CSR was written. The kernel has nothing left to do here
-    // and was about to halt, so a deliberate fault costs nothing and proves on EVERY boot, on
-    // every machine, that a fault now produces a sentence instead of silence.
-    //
-    // 0x20_0000_0000 is 128 GiB: canonical for Sv39 (bit 38 clear, so the upper bits must be too)
-    // and far beyond the identity map, which reaches 3 GiB on QEMU and 9 on the board. A load there
-    // is a clean load page fault rather than the misaligned-address exception a non-canonical
-    // address would raise, so the cause the handler prints is the one being tested.
-    //
-    // THIS GOES AWAY the moment the kernel has real work after this point.
-    print_str("riscv64: deliberately faulting to prove the trap vector reports
-");
-    // SAFETY: the address is intentionally unmapped. That IS the test - the read must fault, and
-    // the handler it enters does not return.
-    unsafe {
-        let _ = (0x20_0000_0000u64 as *const u64).read_volatile();
-    }
+    // HAND THE CORE OVER. Every tick from here is a preemption point rather than the boot's own,
+    // and `run` does not return.
+    print_str("riscv64: entering the scheduler\n");
+    NEUTRAL_SCHED.store(true, Ordering::Relaxed);
+    crate::task::scheduler::run(0)
 
-    print_str("riscv64: NO TRAP - the fault did not fire, the vector is not working
-");
-    halt();
+    // THE DELIBERATE TRAP-VECTOR FAULT USED TO LIVE HERE, and its own comment said it would go the
+    // moment the kernel had real work after this point. That moment is this line: `run` does not
+    // return, so the fault was unreachable, and an unreachable proof is not one.
+    //
+    // Nothing is lost. The vector is still proved on EVERY boot, by a fault that is now part of a
+    // real test rather than staged for its own sake: `usermode::selftest` has its user stub load a
+    // kernel address, and the handler catching that fault is the same handler this block existed to
+    // exercise.
 }
 
 /// Stop this hart. Not a panic: there is nothing above the arch layer yet to report to.
@@ -712,10 +706,42 @@ pub mod boot {
     /// its idle `wait_for_interrupt`: slow the timer while a core sleeps, restore the quantum on wake.
     /// A no-op here is CORRECT for a stub - the tick simply never slows - and a real port implements
     /// them on its own timer (generic timer on ARM, CLINT/mtimecmp on RISC-V).
-    pub fn rearm_idle_timer() {}
-    pub fn rearm_quantum_timer() {}
+    /// Re-arm at the IDLE rate: about a second, instead of the 10 ms quantum.
+    ///
+    /// A core with nothing to run still has to wake often enough to be seen as alive by the
+    /// cross-core wedge watchdog and to re-poll its run queue for a lost wake, so the tick is SLOWED
+    /// rather than stopped. Stopping it would make an idle core and a wedged one look identical.
+    pub fn rearm_idle_timer() {
+        let hz = super::TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
+        if hz != 0 {
+            super::sbi::set_timer(super::sbi::time().wrapping_add(hz));
+        }
+    }
+
+    /// Re-arm at the 10 ms scheduler quantum (CLAUDE.md 9.1).
+    ///
+    /// There is no periodic mode to fall back on: the supervisor timer fires when `time` passes the
+    /// deadline and then stays asserted, so every tick MUST set the next one or the machine
+    /// live-locks in the handler. This is the same call the tick itself makes; it exists separately
+    /// because the scheduler re-arms on LEAVING idle, before it has taken a tick to do it in.
+    pub fn rearm_quantum_timer() {
+        let interval = super::TICK_INTERVAL.load(Ordering::Relaxed) as u64;
+        if interval != 0 {
+            super::sbi::set_timer(super::sbi::time().wrapping_add(interval));
+        }
+    }
+
     pub fn audit_wx() {}
-    pub fn tsc_ticks_per_quantum() -> u64 { 0 }
+
+    /// Ticks of the machine's monotonic counter in one 10 ms quantum.
+    ///
+    /// Named for x86's TSC and NOT counting cycles: `read_cycle_counter` on this arch reads `time`,
+    /// which advances at the device tree's `timebase-frequency` - 10 MHz on QEMU, 4 MHz on the
+    /// VisionFive. Both halves of every duration the neutral kernel computes come from that same
+    /// counter, so they agree; what they are not is cycles.
+    pub fn tsc_ticks_per_quantum() -> u64 {
+        super::TICK_INTERVAL.load(Ordering::Relaxed) as u64
+    }
     pub unsafe fn rearm_tsc_deadline() {}
     pub unsafe fn apic_send_eoi() {}
     /// The id of the hart this call is running on.
@@ -731,7 +757,24 @@ pub mod boot {
     }
     pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
     pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
-    pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
+    /// x86 tells the HARDWARE where a ring-3 interrupt lands by writing `TSS.rsp0`. The RISC-V
+    /// equivalent is `sscratch` - and writing it here would be WRONG.
+    ///
+    /// `sscratch` must read zero for as long as kernel code is running (`trap.rs`), because that is
+    /// how the trap entry knows it is already on a kernel stack. The scheduler calls this while the
+    /// kernel is running, so writing the task's stack pointer now would mean a trap taken between
+    /// here and the return to user mode swaps in a stack it is ALREADY standing on, and builds its
+    /// frame over the one it is using.
+    ///
+    /// The latch is armed at the only correct moment instead: the trap epilogue arms it when it is
+    /// about to return to user mode, and `user_entry_trampoline` arms it for a task's first entry.
+    /// Empty here is the answer, not a stub.
+    ///
+    /// # Safety
+    /// Nothing to do, so nothing to get wrong; `unsafe` to match the seam every arch implements.
+    pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
+        let _ = (core_id, rsp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -762,11 +805,13 @@ pub mod page_tables {
     /// # Safety
     /// `root` must be a page-table root this task owns.
     pub unsafe fn finalize_service_address_space(root: u64) {
-        let kernel_root = read_page_table_base();
+        // The KERNEL's root, not the live one. This runs inside a spawn, and a spawn is a syscall
+        // made by a task, so the live root belongs to whoever asked - see `KERNEL_ROOT`.
+        let kernel_root = super::KERNEL_ROOT.load(core::sync::atomic::Ordering::Relaxed);
         if kernel_root == 0 || root == 0 {
-            return; // translation is off, or no root: nothing to inherit and nowhere to put it
+            return; // paging is not on yet, or no root: nothing to inherit and nowhere to put it
         }
-        super::sv39::clone_leaf_roots(root, kernel_root);
+        super::sv39::clone_kernel_map(root, kernel_root);
     }
 
     /// Free a task's page-table root and the structure below it, at task death.
@@ -997,16 +1042,36 @@ pub mod interrupts {
         }
     }
 
-    /// Halt this hart until an interrupt is pending.
+    /// Sleep until an interrupt arrives, and RE-ENABLE INTERRUPTS on the way out.
     ///
-    /// `wfi` is a HINT: an implementation may return immediately, and QEMU sometimes does. So it is
-    /// only ever correct inside a loop that re-checks the condition it is waiting for, which is how
-    /// the neutral idle loop uses it. It also wakes on a pending interrupt even when `sstatus.SIE`
-    /// is clear, which is what closes the lost-wakeup window the idle path cares about.
+    /// **The name says halt; the contract says `sti`.** The neutral idle path masks interrupts,
+    /// re-checks its run queue under the mask, and then calls this - and its own comment states the
+    /// obligation plainly: "no ready tasks; re-enable interrupts and loop. `wait_for_interrupt`
+    /// issues only `sti`". Implementing the NAME and not the contract is a core that masks once and
+    /// never unmasks: the timer stops, the scheduler idles forever, and the machine is dead with no
+    /// fault to report. That is exactly what happened the first time the supervisor was scheduled -
+    /// it spawned two services and then took one more tick in forty seconds.
+    ///
+    /// Order matters and this one is race-free. `wfi` wakes when an ENABLED interrupt becomes
+    /// pending REGARDLESS of `sstatus.SIE`, so sleeping first and unmasking second cannot lose a
+    /// wake: an interrupt that arrived before the `wfi` leaves it already pending and `wfi` returns
+    /// at once, and one that arrives during it wakes the hart. Unmasking after is what delivers it.
+    /// Unmasking FIRST would reopen the window the neutral path masked to close.
+    ///
+    /// `wfi` is also architecturally a HINT that may return at any time, which is sound here for the
+    /// same reason it is sound anywhere: the caller is a loop that re-checks its condition.
     pub fn wait_for_interrupt() {
-        // SAFETY: `wfi` has no memory effects and cannot fault in S-mode when `mstatus.TW` is clear,
-        // which it is under OpenSBI. If the firmware did trap it, the trap vector names it.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        // SAFETY: `wfi` has no memory effects and is permitted in S-mode while `mstatus.TW` is
+        // clear, which it is under OpenSBI; if firmware did trap it, the trap vector names it. The
+        // `csrs` then sets `sstatus.SIE`, which is this function's actual job.
+        unsafe {
+            core::arch::asm!(
+                "wfi",
+                "csrs sstatus, {sie}",
+                sie = in(reg) SSTATUS_SIE,
+                options(nostack)
+            )
+        };
     }
 /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
 /// halt to unmask and halt in one indivisible step?
@@ -1028,9 +1093,22 @@ pub mod interrupts {
 /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
 /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
 /// narrower window; it is recorded here rather than silently left (26.7).
-    pub fn idle_mask_before_halt() -> bool { false }
+    /// **YES** - and for the same reason x86 says yes, reached differently.
+    ///
+    /// The idle loop masks interrupts, re-checks for work, and halts, relying on the halt not to
+    /// sleep through an interrupt raised in that window. On RISC-V `wfi` resumes when an enabled
+    /// interrupt becomes PENDING regardless of `sstatus.SIE` - the specification says so explicitly -
+    /// so an interrupt raised after the re-check is latched and `wfi` returns immediately; the
+    /// handler then runs once `SIE` is restored.
+    ///
+    /// ARM answers no because its idle path does real work that needs interrupts enabled. This one
+    /// does nothing but wait, so there is no such obligation.
+    pub fn idle_mask_before_halt() -> bool { true }
 
-    pub fn idle_can_halt() -> bool { false }
+    /// Whether the idle loop may halt at all. Yes: `wfi` is the whole mechanism, and it is safe here
+    /// because it is only ever executed inside a loop that re-checks its condition - `wfi` is
+    /// architecturally a HINT and an implementation may return from it at any time.
+    pub fn idle_can_halt() -> bool { true }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}
 }
@@ -1287,6 +1365,10 @@ fn enable_paging(bi: &BootInfo) {
     // fence inside `write_page_table_base` discards translations from before the change.
     unsafe { page_tables::write_page_table_base(root) };
 
+    // The one root every service's address space is built from. Recorded HERE, at the moment it
+    // becomes the kernel's map, rather than read back later from a `satp` that may belong to a task.
+    KERNEL_ROOT.store(root, Ordering::Relaxed);
+
     // Reaching here means the UART was reachable THROUGH the new table, not merely before it.
     print_str("riscv64: paging on, sv39 active
 ");
@@ -1296,6 +1378,27 @@ fn enable_paging(bi: &BootInfo) {
 /// Ticks counted since the timer was started, and the interval between them.
 static TICKS: AtomicUsize = AtomicUsize::new(0);
 static TICK_INTERVAL: AtomicUsize = AtomicUsize::new(0);
+/// The machine's monotonic counter rate, from the device tree. Kept because the idle tick is
+/// expressed in SECONDS while the quantum is expressed in milliseconds, and deriving one from the
+/// other needs the rate rather than a ratio.
+static TIMEBASE_HZ: AtomicU32 = AtomicU32::new(0);
+/// Set once the neutral scheduler owns this core. Until then the tick is the boot's own; after it,
+/// every tick is a preemption point and belongs to `scheduler::timer_tick_from_irq`.
+static NEUTRAL_SCHED: AtomicBool = AtomicBool::new(false);
+
+/// The KERNEL's own Sv39 root, recorded when paging is enabled.
+///
+/// **Not "whatever `satp` currently holds".** A service's address space is built by
+/// `finalize_service_address_space`, which runs inside the spawn - and a spawn is a SYSCALL, made by
+/// a task, with that task's root live. Cloning from the live root worked for the supervisor (spawned
+/// by the kernel, from the kernel's root) and silently broke every service the supervisor spawned:
+/// the supervisor's root reaches the low gigabyte through a POINTER table, because its own text sits
+/// at 0x400000, and a clone that copies root-level LEAVES skips a pointer. So the new service
+/// inherited RAM but not the UART or the PLIC, and the first line the kernel tried to log on its
+/// behalf faulted on 0x1000_0005 - forever, silently, because the fault handler is what wanted to
+/// print. QEMU's `-d int` named it in one line after reasoning had not.
+static KERNEL_ROOT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
 
 /// One scheduler tick.
 ///
@@ -1314,13 +1417,25 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
     // is never left without one whatever the hook decides to do with the frame.
     usermode::on_timer_tick(frame);
 
-    // The first few, then every hundredth: enough to prove the tick is alive and periodic without
-    // a console that scrolls forever. A quantum is 10 ms, so every hundredth is once a second.
+    // ONCE THE SCHEDULER OWNS THE CORE, A TICK IS A PREEMPTION POINT and belongs to neutral code.
+    // `timer_tick_from_irq` may switch away from the interrupted task; when something switches back,
+    // it RETURNS here, this function returns, and the trap epilogue restores the frame and resumes
+    // the task. That works because the frame is on the task's own kernel stack, which the context
+    // switch saves and restores as `sp` - which is the whole reason the `sscratch` latch had to exist
+    // before this line could.
+    if NEUTRAL_SCHED.load(Ordering::Relaxed) {
+        // SAFETY: the neutral preemption entry, reached only from this handler, with interrupts
+        // masked by the trap and running on the interrupted task's kernel stack - the same contract
+        // the ARM port's call site documents, met the same way.
+        unsafe { crate::task::scheduler::timer_tick_from_irq(0, 0, 0) };
+        return;
+    }
+
+    // Before that: the boot's own tick, printed sparsely enough to prove it is alive and periodic.
     if n <= 3 || n % 100 == 0 {
         print_str("riscv64: tick ");
         print_dec(n as u64);
-        print_str("
-");
+        print_str("\n");
     }
 }
 
@@ -1337,6 +1452,7 @@ fn start_timer(hz: u32) -> bool {
     // constant and the tick count is derived, rather than the other way round.
     let interval = (hz as usize) / 100;
     TICK_INTERVAL.store(interval, Ordering::Relaxed);
+    TIMEBASE_HZ.store(hz, Ordering::Relaxed);
     if !sbi::set_timer(sbi::time().wrapping_add(interval as u64)) {
         return false;
     }

@@ -286,36 +286,78 @@ pub fn identity_map_gigapages(root: u64, end: u64, bits: u64) -> Result<(), MapF
     Ok(())
 }
 
-/// Copy the kernel's identity mapping into a new address space.
+/// Copy the kernel's identity mapping into a new address space, WITHOUT disturbing what the task
+/// already has there.
 ///
-/// **Only the LEAF entries of the root, and that is a load-bearing restriction.** A task's root ends
-/// up holding the kernel's gigapage leaves by VALUE plus whatever pointer entries the task creates
-/// for itself, so the two are trivially separable: anything reachable through a POINTER entry in a
-/// task root was built by that task, which is what lets `free_table_tree` reclaim a dead task's
-/// tables without walking into the kernel's.
+/// **The kernel's map and userspace OVERLAP on this port, and that is the whole difficulty.** x86
+/// puts the kernel higher-half, so a task's mappings and the kernel's cannot collide and the kernel
+/// half can be shared by copying top-level entries wholesale. Here the kernel is identity-mapped
+/// from zero and a service links at 0x400000, so both live inside the FIRST gigapage. Copying that
+/// gigapage in wholesale replaces the loader's mapping of the service's own text with a kernel leaf
+/// that has no `U` bit - and the task faults on its first instruction fetch, at an address that IS
+/// mapped, by a PTE it never asked for. That is exactly what happened the first time the supervisor
+/// was scheduled: `instruction page fault ... pte 0xcf VRWX-AD phys 0x0`, the identity gigapage
+/// answering for a user address.
 ///
-/// The consequence is stated rather than hidden: a kernel mapping made through a pointer entry - a
-/// 4 KiB page in the kernel root rather than a gigapage - would NOT be inherited by a task. Today the
-/// kernel's own map is gigapage leaves only (`identity_map_gigapages`), so nothing is lost. If that
-/// stops being true, this stops being correct, and the failure would be a task faulting on a kernel
-/// address that works everywhere else.
+/// So the copy is done at whatever granularity avoids the task, slot by slot:
 ///
-/// A clone is also a SNAPSHOT: a later change to the kernel root does not reach a task root that was
-/// built before it. x86 shares the kernel half by pointing at the same tables and does not have this
-/// property. It is fine here because the kernel's map is fixed once paging is on, and it is written
-/// down because the day that changes this is where the bug will be.
-pub fn clone_leaf_roots(dst: u64, src: u64) -> usize {
-    let mut copied = 0;
-    for idx in 0..512 {
+/// - **Empty root slot** - take the kernel's gigapage whole. One entry, nothing to avoid.
+/// - **Task already has a leaf** - leave it alone. The task owns that gigabyte.
+/// - **Task has a pointer table** - descend and fill only the 2 MiB slots it has NOT claimed. The
+///   kernel gets the rest of that gigabyte, which is how the UART at 0x1000_0000 and the PLIC at
+///   0x0c00_0000 stay reachable while a service whose text sits at 0x400000 is running. Losing them
+///   would mean losing the console from inside the trap handler, which is the one place it is most
+///   needed.
+///
+/// The permission bits come from the KERNEL's own leaf, so `U` is never set on anything this copies:
+/// the task inherits the kernel's map as kernel memory, unreachable from user mode, which is the
+/// point.
+///
+/// A clone is still a SNAPSHOT: a later change to the kernel root does not reach a task root built
+/// before it. That is fine because the kernel's map is fixed once paging is on, and it is written
+/// down because the day that stops being true, this is where the bug will be.
+pub fn clone_kernel_map(dst: u64, src: u64) -> usize {
+    const GIB_SLOT_SHIFT: u32 = 30;
+    const MIB2_SHIFT: u32 = 21;
+    let mut filled = 0;
+    for idx in 0..512usize {
         // SAFETY: both are page-aligned root tables this kernel owns, identity-mapped; idx < 512.
-        let pte = unsafe { (src as *const u64).add(idx).read_volatile() };
-        if pte_is_valid(pte) && pte_is_leaf(pte) {
-            // SAFETY: as above.
-            unsafe { (dst as *mut u64).add(idx).write_volatile(pte) };
-            copied += 1;
+        let k = unsafe { (src as *const u64).add(idx).read_volatile() };
+        if !pte_is_valid(k) || !pte_is_leaf(k) {
+            continue; // the kernel maps this gigabyte through a table, or not at all
+        }
+        // SAFETY: as above.
+        let d = unsafe { (dst as *const u64).add(idx).read_volatile() };
+
+        if !pte_is_valid(d) {
+            // SAFETY: as above. Nothing of the task's lives here, so the gigapage goes in whole.
+            unsafe { (dst as *mut u64).add(idx).write_volatile(k) };
+            filled += 1;
+            continue;
+        }
+        if pte_is_leaf(d) {
+            continue; // the task owns this whole gigabyte; it was not ours to give
+        }
+
+        // The task has 4 KiB mappings somewhere in this gigabyte. Give it the kernel's map at 2 MiB
+        // granularity everywhere it has not already claimed, so neither loses anything.
+        let table = pte_phys(d);
+        let bits = k & (PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D); // never `U`
+        let base = (idx as u64) << GIB_SLOT_SHIFT;
+        for j in 0..512usize {
+            // SAFETY: `table` came from a pointer PTE this kernel wrote, so it is a 4 KiB table it
+            // owns; j < 512.
+            let e = unsafe { (table as *const u64).add(j).read_volatile() };
+            if pte_is_valid(e) {
+                continue; // the task's own mapping, at any granularity: leave it exactly as it is
+            }
+            let pa = base + ((j as u64) << MIB2_SHIFT);
+            // SAFETY: as above. A 2 MiB leaf at level 1, identity, with the kernel's own permissions.
+            unsafe { (table as *mut u64).add(j).write_volatile(pte_make(pa, bits)) };
+            filled += 1;
         }
     }
-    copied
+    filled
 }
 
 /// Free every table BELOW a root, then the root itself, and report how many frames came back.
