@@ -778,6 +778,19 @@ fn poll_devices(
     let mut toggle = [0u32; MAX_HID];
     let mut err = [0u32; MAX_HID];                        // consecutive errored completions
     let mut kb_last = [0u8; 6];                           // keyboard edge-detection state
+    // WORK TIME, not pass count. `observe` charges CPU by sampling on the scheduler tick, so a task
+    // that wakes on EVERY tick is observed running every time it is looked at and reads as ~100%
+    // however little it actually does. This driver's poll floor is one tick, which is exactly the
+    // resonance case - and the history fits it: a 10 ms pace read 100%, a 250 ms deadline read 0%,
+    // and an accidental 1 ms deadline read 100% again. None of those distinguishes a busy driver
+    // from a cheaply-sampled one.
+    //
+    // So measure the work instead of inferring it, the way `xhci: alive` does. If `work` is a few
+    // milliseconds per minute the 100% is a sampling artefact and the driver is idle; if it is tens
+    // of seconds, the cost is real and belongs to whatever the pass is doing.
+    let mut passes: u64 = 0;
+    let mut work_cycles: u64 = 0;
+    let mut last_beat = ctx.read_tsc();
     // Was the current pass woken by our INTx? Set from the wait, read where a report is harvested.
     let mut irq_this_pass = false;
     // Proof that interrupts are not covering HID here, so the tick floor must be polled for.
@@ -792,6 +805,7 @@ fn poll_devices(
     let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
+        let work_t0 = ctx.read_tsc();
         for i in 0..n {
             let qh = POLL_BASE + i * POLL_STRIDE;
             let qtd = qh + 0x40;
@@ -918,13 +932,22 @@ fn poll_devices(
         // driver next door. Proof, not assumption: one such report and the deadline drops to the tick
         // floor for good.
         let deadline = if hid_needs_poll {
-            ctx.duration_cycles(POLL_SLEEP_CYCLES)
+            ctx.duration_cycles(POLL_FLOOR_MS)
         } else {
             ctx.duration_cycles(POLL_DEADLINE_MS)
         };
         if hid_needs_poll && !hid_poll_noted {
             ctx.log("ehci: a HID report arrived with no interrupt - polling input at the 10ms tick");
             hid_poll_noted = true;
+        }
+        passes = passes.wrapping_add(1);
+        work_cycles = work_cycles.wrapping_add(ctx.read_tsc().wrapping_sub(work_t0));
+        if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(60_000) {
+            last_beat = ctx.read_tsc();
+            ctx.log_fmt(format_args!(
+                "ehci: alive - {} passes, work {}ms, polling {}",
+                passes, work_cycles / ctx.duration_cycles(1).max(1),
+                if hid_needs_poll { "yes (interrupt does not cover HID)" } else { "no (interrupt-driven)" }));
         }
         let woke = ctx.recv_timeout(deadline);
         // Was this pass woken by our INTx, or did the deadline simply expire? The notification is a
@@ -983,6 +1006,18 @@ const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 /// Granularity is one scheduler quantum, so any non-zero value means "one quantum": ~10 ms now that
 /// the APIC timer is PIT-calibrated, which is also the keyboard's own bInterval.
 const POLL_SLEEP_CYCLES: u64 = 1;
+/// Input polling floor in MILLISECONDS, for when the interrupt is proven not to cover HID.
+///
+/// SEPARATE FROM `POLL_SLEEP_CYCLES` BECAUSE THE UNITS ARE DIFFERENT, and nothing but hardware can
+/// tell them apart: `ctx.sleep` takes CYCLES and `ctx.duration_cycles` takes MILLISECONDS, both as a
+/// bare `u64`. Passing the cycle constant to the millisecond function asked for a 1 ms deadline
+/// instead of the 10 ms tick floor this comment claimed - about a thousand wakes a second, which
+/// `observe` reported as `ehci` at 100% of the core while the log looked entirely healthy.
+///
+/// 10 ms because that is both the scheduler's quantum and the keyboard's bInterval: the controller
+/// has at most one fresh report to hand over per pass, so this paces to the hardware's own rate
+/// rather than outrunning it. Asking for less does not produce more reports, only more wakes.
+const POLL_FLOOR_MS: u64 = 10;
 /// Deadline for the interrupt-driven main wait, in milliseconds.
 ///
 /// This is a WATCHDOG, not a pace. The controller's INTx wakes the loop when a transfer completes,
