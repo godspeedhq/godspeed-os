@@ -120,7 +120,12 @@ def main():
         f.write(out)
     print(out[-2000:] if out else "(no output)")
     print("\nserial captured to %s (%d bytes)" % (a.log, len(out)))
-    if "GodspeedOS riscv64" not in out:
+    # The NEUTRAL banner, not a phrase this port invented. It used to look for "GodspeedOS riscv64",
+    # which was the arch's own home-made opening line - so the harness was pinned to the very thing
+    # that made this port's boot read differently from every other one, and it failed the moment that
+    # line was replaced by the shared `banner()`. A gate should check the thing that must be true, and
+    # what must be true is that the kernel identified itself the way every port does.
+    if "GodspeedOS" not in out or "riscv64" not in out:
         sys.exit("FAIL: the kernel banner never appeared - it did not reach S-mode.")
     print("OK  the kernel reached S-mode and drove the UART.")
 

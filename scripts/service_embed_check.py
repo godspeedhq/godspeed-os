@@ -51,6 +51,14 @@ ARCH_EXEMPT = {
         "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
     },
+    "riscv64": {
+        "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
+                "whose host half is an xHCI",
+        "dwc2": "arm32-only (Pi 2) USB host driver",
+        "hw-enumerator": "its authority is legacy PCI CF8/CFC PORT I/O, which this ISA does not "
+                         "have - configuration space here is memory-mapped ECAM and the kernel "
+                         "reads it directly. The same reason the ARM ports are exempt.",
+    },
 }
 
 NAME = chr(34) + "([a-z0-9" + chr(45) + "]+)" + chr(34)

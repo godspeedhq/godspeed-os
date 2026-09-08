@@ -42,6 +42,12 @@ fn main() {
         "x86_64"  => &["xhci", "ehci"],
         "arm"     => &["dwc2"],
         "aarch64" => &["xhci"],
+        // The VisionFive 2's USB is a Cadence USB3 controller on the SoC bus, and its host half IS an
+        // xHCI - so the same driver that runs on a PC card and on the Pi 4's VL805 runs here, which is
+        // the whole point of the class the kernel resolves. This arm was absent, and an absent arm
+        // falls to the empty list: the supervisor shipped with no image, and `spawn xhci FAILED` was
+        // never about the controller at all.
+        "riscv64" => &["xhci"],
         _         => &[],
     };
 

@@ -201,8 +201,8 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 static CONSOLE_ELF: &[u8] = include_bytes!(env!("SVC_CONSOLE_ELF"));
 static NIC_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_NIC_DRIVER_ELF"));
 // The USB host drivers exist only where their controller does (see `build.rs`, which embeds exactly
-// these): xhci+ehci on a PC, dwc2 on the Pi 2, xhci on the Pi 4.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+// these): xhci+ehci on a PC, dwc2 on the Pi 2, xhci on the Pi 4, xhci on the VisionFive 2.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
 static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
 #[cfg(target_arch = "x86_64")]
 static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
@@ -424,7 +424,27 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::DWC2),
 ];
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm")))]
+/// The VisionFive 2's USB host is a Cadence USB3 controller on the SoC bus, and its host half IS an
+/// xHCI - the same driver as the PC card and the Pi 4's VL805, which is exactly what the hardware
+/// CLASS is for: the kernel resolves "an xHCI controller and where it starts" and the driver never
+/// learns whether it arrived on a bus.
+///
+/// Plain `XHCI` rather than the x86 `pci_irq` form, because there is nothing to route a vector to:
+/// this port has no interrupt controller yet, so the driver polls - which it is built to do. Asking
+/// for an interrupt that can never arrive is the failure invariant 12 exists to prevent.
+#[cfg(target_arch = "riscv64")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 2, &["events"],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::XHCI),
+];
+/// Any other architecture holds no USB image, and an EMPTY list is why `spawn xhci FAILED` survived
+/// three separate fixes: the kernel found the controller, the build list named the service, the embed
+/// list named the arch - and this table still said there was nothing to spawn. Four places had to
+/// agree, and each one was silent about the others.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm",
+              target_arch = "riscv64")))]
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[];
 
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
