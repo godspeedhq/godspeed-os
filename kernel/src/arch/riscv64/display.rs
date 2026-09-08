@@ -33,6 +33,8 @@ static VOUTCRG_BASE: AtomicU64 = AtomicU64::new(0);
 /// only, and only by the diagnostic at the end of this file.
 static SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 static DSSCTRL_BASE: AtomicU64 = AtomicU64::new(0);
+/// The Inno HDMI transmitter.
+static HDMI_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Registers, from `jh71xx-pmu.c`.
 const SW_TURN_ON_POWER: usize = 0x0c;
@@ -64,6 +66,10 @@ pub(super) fn set_pmu_base(base: u64) {
 pub(super) fn set_crg_bases(syscrg: u64, voutcrg: u64) {
     SYSCRG_BASE.store(syscrg, Ordering::Relaxed);
     VOUTCRG_BASE.store(voutcrg, Ordering::Relaxed);
+}
+
+pub(super) fn set_hdmi_base(base: u64) {
+    HDMI_BASE.store(base, Ordering::Relaxed);
 }
 
 pub(super) fn set_syscon_bases(syscon: u64, dssctrl: u64) {
@@ -622,37 +628,53 @@ fn paint_test_pattern(fb: &mut [u8]) {
     }
 }
 
+/// The controller's own interrupt latch, in the FIRST register window. Reading it clears it.
+const AQ_INTR_ACKNOWLEDGE: usize = 0x0010;
+const AQ_INTR_ENBL: usize = 0x0014;
+
 /// Is the controller actually scanning out, and at what rate?
 ///
-/// **The one measurement a successful write cannot fake.** Every register above accepts a value
-/// whether or not a pixel clock is running; the scan-position register lives in the pixel clock's own
-/// domain, so it moves only if the controller is genuinely producing a raster. Watching the line
-/// number wrap counts whole frames, which is the mode's refresh rate - a number that is either 60 or
-/// tells us precisely how wrong the timing is.
+/// **This asks the frame-end latch, not the scan-position register, and the difference cost a board
+/// boot.** `DC_DISPLAY_CURRENT_LOCATION` is documented, is at the offset the driver says, and reads
+/// zero forever on this revision - so the first version of this function reported `0 frames per
+/// second` about a controller that was scanning perfectly well. A register that reads zero is not
+/// evidence of anything; a register that CHANGES is. The latch here sets a bit per display at the end
+/// of every frame and clears when read, so counting reads that saw a bit counts frames.
 ///
-/// Bounded by the machine's own counter, so a display that never scans reports zero rather than
-/// hanging the boot.
-fn scanout_rate() -> (u32, u32, u32) {
+/// The rate is computed from the machine's counter BETWEEN THE FIRST AND LAST EVENT, not from the
+/// width of the polling window. Dividing a count by the window assumes the loop is fast enough to
+/// have caught every event, which is exactly the assumption a wrong answer would hide; timing the
+/// interval between two events it definitely saw does not.
+///
+/// Returns hundredths of a hertz, so 60.00 and 59.94 are different numbers rather than both "60".
+fn scanout_rate(top: u64) -> (u32, u32, u32) {
+    mmio_write(top, AQ_INTR_ENBL, 0xf);
     let hz = super::timebase_hz() as u64;
-    // A fifth of a second: twelve frames at 60 Hz, which is enough to divide back to a rate with
-    // one-frame resolution and short enough that a dead display costs the boot nothing.
-    let window = if hz == 0 { 2_000_000 } else { hz / 5 };
-    let first = dc_read(DC_DISPLAY_CURRENT_LOCATION);
+    let window = if hz == 0 { 10_000_000 } else { hz };
 
     let start = super::sbi::time();
-    let mut last = (first >> 16) & 0xffff;
+    let mut first_at = 0u64;
+    let mut last_at = 0u64;
     let mut frames = 0u32;
+    let mut seen = 0u32;
     while super::sbi::time().wrapping_sub(start) < window {
-        let y = (dc_read(DC_DISPLAY_CURRENT_LOCATION) >> 16) & 0xffff;
-        // A wrap back to the top of the raster is one frame. Counting wraps rather than reading a
-        // frame counter means this works without knowing anything else about the register.
-        if y < last {
+        if mmio_read(top, AQ_INTR_ACKNOWLEDGE) & 0xf != 0 {
+            let now = super::sbi::time();
+            seen |= mmio_read(top, AQ_INTR_ACKNOWLEDGE) | 1;
+            if frames == 0 {
+                first_at = now;
+            }
+            last_at = now;
             frames += 1;
         }
-        last = y;
     }
 
-    (first, dc_read(DC_DISPLAY_CURRENT_LOCATION), frames * 5)
+    let centihz = if frames < 2 || last_at <= first_at || hz == 0 {
+        0
+    } else {
+        (((frames - 1) as u64 * 100 * hz) / (last_at - first_at)) as u32
+    };
+    (frames, centihz, seen)
 }
 
 /// Program the display controller for 1080p60 and prove it is scanning out.
@@ -833,21 +855,33 @@ pub fn mode_set() -> bool {
     }
     super::print_str("\n");
 
-    let (first, second, hz) = scanout_rate();
-    super::print_str("riscv64: display - scan position ");
-    super::print_hex(first as u64);
-    super::print_str(" -> ");
-    super::print_hex(second as u64);
-    super::print_str(", ");
-    super::print_dec(hz as u64);
-    super::print_str(" frames per second\n");
-
-    if hz == 0 {
+    report_scanout(top, "after the mode set");
+    let (frames, _, _) = scanout_rate(top);
+    if frames == 0 {
         super::print_str("riscv64: display - the controller is NOT scanning out\n");
         return false;
     }
-    super::print_str("riscv64: display - scanning 1920x1080; the transmitter is what is left\n");
     true
+}
+
+/// One line saying whether frames are happening and how fast, tagged with when it was asked.
+fn report_scanout(top: u64, when: &str) {
+    let (frames, centihz, seen) = scanout_rate(top);
+    super::print_str("riscv64: display - ");
+    super::print_str(when);
+    super::print_str(": ");
+    super::print_dec(frames as u64);
+    super::print_str(" frames in 1s, ");
+    super::print_dec((centihz / 100) as u64);
+    super::print_str(".");
+    let frac = centihz % 100;
+    if frac < 10 {
+        super::print_str("0");
+    }
+    super::print_dec(frac as u64);
+    super::print_str(" Hz, latch bits ");
+    super::print_hex(seen as u64);
+    super::print_str("\n");
 }
 
 // ==================== the clock tree, when the raster does not run ====================
@@ -865,10 +899,6 @@ const PLL2_FRAC: usize = 0x30;
 const PLL2_PREDIV: usize = 0x34;
 /// The crystal every PLL on this SoC multiplies up.
 const OSC_HZ: u64 = 24_000_000;
-
-/// The controller's own interrupt latch, in the FIRST register window. Reading it clears it.
-const AQ_INTR_ACKNOWLEDGE: usize = 0x0010;
-const AQ_INTR_ENBL: usize = 0x0014;
 
 /// What PLL2 is actually generating, worked out from its own registers.
 ///
@@ -949,33 +979,227 @@ pub fn diagnose() {
         super::print_str("\n");
     }
 
-    // A SECOND OPINION ON THE SAME QUESTION, from a different register in a different window. The
-    // controller latches a bit per display when a frame ends, and reading the latch clears it. If
-    // this sees bits while the scan-position register sits at zero, the raster IS running and my
-    // instrument was the broken thing - a mistake this project has made before and one that is
-    // cheaper to rule out than to argue about.
     if top != 0 {
-        mmio_write(top, AQ_INTR_ENBL, 0xf);
-        let hz = super::timebase_hz() as u64;
-        let window = if hz == 0 { 2_000_000 } else { hz / 5 };
-        let start = super::sbi::time();
-        let mut seen = 0u32;
-        let mut hits = 0u32;
-        while super::sbi::time().wrapping_sub(start) < window {
-            let ack = mmio_read(top, AQ_INTR_ACKNOWLEDGE);
-            if ack != 0 {
-                seen |= ack;
-                hits += 1;
-            }
-        }
-        super::print_str("riscv64: display - frame interrupts in 200 ms: ");
-        super::print_dec(hits as u64);
-        super::print_str(", bits ");
-        super::print_hex(seen as u64);
-        super::print_str("; scan position display0=");
-        super::print_hex(dc_read(DC_DISPLAY_CURRENT_LOCATION) as u64);
-        super::print_str(" display1=");
-        super::print_hex(dc_read(DC_DISPLAY_CURRENT_LOCATION + 4) as u64);
-        super::print_str("\n");
+        report_scanout(top, "while diagnosing");
     }
+}
+
+// ============================ stage five: the HDMI transmitter ============================
+//
+// The controller is producing a raster; this is what puts it on a wire. Facts from StarFive's
+// `inno_hdmi.c` and `inno_hdmi.h`, read as an executable datasheet (§26.14) - the PLL coefficients,
+// the power-up order and the magic values are the silicon's requirements and several of them mean
+// nothing outside it. What is not borrowed is the shape: Linux drives this as a DRM encoder with
+// runtime power management, an I2C adapter for EDID, a hot-plug interrupt and an audio path. Here it
+// is one mode, brought up once, with no EDID read and no hot-plug - the kernel needs a picture to
+// print on, and asking the television what it would prefer is a conversation for a service to have.
+//
+// **The pixel clock changes hands here.** Stage four ran the controller off an internal divider so
+// that it could be tested with the transmitter still dark. That was always temporary: on this SoC the
+// transmitter's PLL generates the pixel clock and feeds it BACK to the controller, which is why the
+// device tree lists `hdmitx0_pixelclk` as one of the controller's inputs and why the vendor driver
+// selects it for the HDMI display. So once the transmitter's PLL reports lock, the controller is
+// re-pointed at it and the two run from one clock by construction rather than by two dividers
+// agreeing.
+
+/// Every register in this block is one byte wide at a four-byte stride, so the driver's `0x1a0` is
+/// 0x680 into the window. Offsets are kept in the driver's numbering for the same reason the display
+/// controller's are: so a line here can be compared with the line it came from.
+fn hdmi_write(off: usize, val: u32) {
+    mmio_write(HDMI_BASE.load(Ordering::Relaxed), off * 4, val);
+}
+
+fn hdmi_read(off: usize) -> u32 {
+    mmio_read(HDMI_BASE.load(Ordering::Relaxed), off * 4) & 0xff
+}
+
+/// The reset the video-out generator holds this block in. Its own, separate from the display
+/// controller's three.
+const VOUTRST_HDMI_TX: u32 = 9;
+
+/// System control, and the video timing block.
+const HDMI_SYS_CTRL: usize = 0x00;
+const HDMI_VIDEO_TIMING_CTL: usize = 0x08;
+const HDMI_VIDEO_EXT_HTOTAL_L: usize = 0x09;
+const HDMI_VIDEO_EXT_HBLANK_L: usize = 0x0b;
+const HDMI_VIDEO_EXT_HDELAY_L: usize = 0x0d;
+const HDMI_VIDEO_EXT_HDURATION_L: usize = 0x0f;
+const HDMI_VIDEO_EXT_VTOTAL_L: usize = 0x11;
+const HDMI_VIDEO_EXT_VBLANK: usize = 0x13;
+const HDMI_VIDEO_EXT_VDELAY: usize = 0x14;
+const HDMI_VIDEO_EXT_VDURATION: usize = 0x15;
+
+/// The PHY's own register bank, above 0x100. These have no names in the vendor header either - the
+/// driver writes them by number, and the numbers are the interface.
+const PHY_PRE_PLL_LOCK: usize = 0x1a9;
+const PHY_POST_PLL_LOCK: usize = 0x1af;
+
+/// The PLL coefficients for a 148.5 MHz pixel clock and the same TMDS rate, taken from the two tables
+/// in `inno_hdmi.c` at the row marked `1080p 60`. They are a solved simultaneous equation for this
+/// PHY, not something to derive: the pre-PLL row is
+/// `{148500000, 148500000, 1, 99, 1, 1, 1, 1, 2, 2, 2, 0, 0}` and the post-PLL row is
+/// `{148500000, 1, 20, 1, 3, 3}`.
+const PRE_PREDIV: u32 = 1;
+const PRE_FBDIV: u32 = 99;
+const PRE_TMDS_DIV_A: u32 = 1;
+const PRE_TMDS_DIV_B: u32 = 1;
+const PRE_TMDS_DIV_C: u32 = 1;
+const PRE_PCLK_DIV_A: u32 = 1;
+const PRE_PCLK_DIV_B: u32 = 2;
+const PRE_PCLK_DIV_C: u32 = 2;
+const PRE_PCLK_DIV_D: u32 = 2;
+const POST_PREDIV: u32 = 1;
+const POST_FBDIV: u32 = 20;
+const POST_POSTDIV: u32 = 1;
+
+/// Wait, BOUNDED, for a PHY lock bit.
+///
+/// The reference driver spins on these two bits with no bound at all - `while (!(readb(0x1a9) & 1));`
+/// - which is a design this kernel cannot copy: a PLL that never locks would take the machine with
+/// it, silently, before a single service started. Same bit, same meaning, an answer either way.
+fn wait_lock(off: usize, name: &str) -> bool {
+    let hz = super::timebase_hz() as u64;
+    // A tenth of a second. A PLL locks in microseconds; this is long enough that a slow one is not
+    // called broken and short enough that a broken one costs the boot nothing.
+    let deadline = super::sbi::time().wrapping_add(if hz == 0 { 1_000_000 } else { hz / 10 });
+    while super::sbi::time() < deadline {
+        if hdmi_read(off) & 1 != 0 {
+            return true;
+        }
+    }
+    super::print_str("riscv64: display - HDMI PLL did not lock: ");
+    super::print_str(name);
+    super::print_str("\n");
+    false
+}
+
+/// Program the transmitter's two PLLs for the mode's pixel clock.
+///
+/// The order is the driver's and matters: register 0x1a0 is written 1 first and 0 last, which brackets
+/// the whole configuration - the PLL is held while its coefficients change and released once. Writing
+/// 0x1aa twice is not a mistake in the reference and is not one here: the first write is the "being
+/// configured" value and the second is the working one, chosen by whether the post-divider is in use.
+fn config_pll() {
+    hdmi_write(0x1a0, 0x01);
+    hdmi_write(0x1aa, 0x0f);
+    hdmi_write(0x1a1, PRE_PREDIV);
+    hdmi_write(0x1a2, 0xf0 | (PRE_FBDIV >> 8));
+    hdmi_write(0x1a3, PRE_FBDIV & 0xff);
+    hdmi_write(0x1a4, (PRE_TMDS_DIV_A << 4) | (PRE_TMDS_DIV_B << 2) | PRE_TMDS_DIV_C);
+    hdmi_write(0x1a5, (PRE_PCLK_DIV_B << 5) | PRE_PCLK_DIV_A);
+    hdmi_write(0x1a6, (PRE_PCLK_DIV_C << 5) | PRE_PCLK_DIV_D);
+    hdmi_write(0x1ab, POST_PREDIV);
+    hdmi_write(0x1ac, POST_FBDIV & 0xff);
+    // The post-divider is enabled for this rate, so these two carry its divisor and the matching
+    // control value rather than the disabled pair (0x00 and 0x02).
+    hdmi_write(0x1ad, POST_POSTDIV);
+    hdmi_write(0x1aa, 0x0e);
+    hdmi_write(0x1a0, 0x00);
+}
+
+/// The mode, told to the transmitter in its own terms.
+///
+/// It wants the same raster the controller is producing but expressed as totals and back porches
+/// rather than absolute positions, which is why each of these is a subtraction rather than a constant:
+/// stating them twice, once per block, is how a mismatch becomes a mistake in one place instead of
+/// two numbers that must be kept equal by hand.
+fn config_video_timing() {
+    let pairs: [(usize, u32); 5] = [
+        (HDMI_VIDEO_EXT_HTOTAL_L, H_TOTAL),
+        (HDMI_VIDEO_EXT_HBLANK_L, H_TOTAL - H_ACTIVE),
+        (HDMI_VIDEO_EXT_HDELAY_L, H_TOTAL - H_SYNC_START),
+        (HDMI_VIDEO_EXT_HDURATION_L, H_SYNC_END - H_SYNC_START),
+        (HDMI_VIDEO_EXT_VTOTAL_L, V_TOTAL),
+    ];
+    for (off, v) in pairs {
+        hdmi_write(off, v & 0xff);
+        hdmi_write(off + 1, (v >> 8) & 0xff);
+    }
+    // The vertical back porch, sync offset and sync width are single bytes: a 1080p frame's are 45,
+    // 41 and 5, all of which fit, and the transmitter provides no high half for them.
+    hdmi_write(HDMI_VIDEO_EXT_VBLANK, V_TOTAL - V_ACTIVE);
+    hdmi_write(HDMI_VIDEO_EXT_VDELAY, V_TOTAL - V_SYNC_START);
+    hdmi_write(HDMI_VIDEO_EXT_VDURATION, V_SYNC_END - V_SYNC_START);
+
+    // Bit 0 says the timing comes from the registers above rather than from an internal mode table,
+    // and bits 2 and 3 are the two sync polarities - positive for this mode, as the controller was
+    // told. Bit 1 would be interlace.
+    hdmi_write(HDMI_VIDEO_TIMING_CTL, 1 | (1 << 2) | (1 << 3));
+}
+
+/// Bring the transmitter up and hand it the raster.
+pub fn hdmi_on() -> bool {
+    let hdmi = HDMI_BASE.load(Ordering::Relaxed);
+    let vout = VOUTCRG_BASE.load(Ordering::Relaxed);
+    if hdmi == 0 || vout == 0 {
+        super::print_str("riscv64: display - no HDMI transmitter in the device tree\n");
+        return false;
+    }
+
+    // Its own reset, released now that its three clocks are running. Stage two enabled those and
+    // deliberately left this held, because a block out of reset with nothing driving it is a block
+    // that can be found in a state nobody chose.
+    if !reset_deassert(vout, VOUTCRG_RESET_ASSERT, VOUTCRG_RESET_STATUS, VOUTRST_HDMI_TX) {
+        super::print_str("riscv64: display - HDMI transmitter reset did not release\n");
+        return false;
+    }
+
+    // Two writes the driver makes before anything else, whose meaning is not in any header: bit 2 of
+    // 0x1b0, and 0xf into 0x1cc. Recorded as borrowed rather than explained, which is the honest state
+    // of knowledge about them (§26.14).
+    hdmi_write(0x1b0, hdmi_read(0x1b0) | 0x04);
+    hdmi_write(0x1cc, 0x0f);
+
+    config_pll();
+    if !wait_lock(PHY_PRE_PLL_LOCK, "pre") || !wait_lock(PHY_POST_PLL_LOCK, "post") {
+        return false;
+    }
+    super::print_str("riscv64: display - HDMI PLLs locked\n");
+
+    hdmi_write(0x1b4, 0x07); // the PHY's regulator
+    hdmi_write(0x1be, 0x71); // the serializer
+    // The driver adjusts the transmitter's drive strength per video mode to keep the eye diagram
+    // open; these are its values for 1080p60 (CEA mode 16).
+    hdmi_write(0x1bf, 0x02);
+    hdmi_write(0x1c0, 0x22);
+
+    // Configure the video path with the output stage OFF, then switch it on - so nothing half-formed
+    // ever reaches the cable.
+    hdmi_write(0x00, 0x63);
+    config_video_timing();
+    hdmi_write(0x00, 0x61);
+    hdmi_write(0x1b2, 0x8f); // the TMDS driver
+
+    // The driver's last act: strobe register 0xce low then high, which restarts the video path with
+    // everything above in place.
+    hdmi_write(0xce, 0x00);
+    hdmi_write(0xce, 0x01);
+
+    super::print_str("riscv64: display - HDMI transmitter on: sys=");
+    super::print_hex(hdmi_read(HDMI_SYS_CTRL) as u64);
+    super::print_str(" timing=");
+    super::print_hex(hdmi_read(HDMI_VIDEO_TIMING_CTL) as u64);
+    super::print_str(" phy=");
+    super::print_hex(hdmi_read(0x1b2) as u64);
+    super::print_str("\n");
+
+    // AND NOW THE PIXEL CLOCK CHANGES HANDS. Parent 1 of the controller's pixel-clock mux is
+    // `hdmitx0_pixelclk`, which is what the PLL just locked is generating; the device tree calls it a
+    // fixed 297 MHz clock only because a device tree has no way to say "the transmitter decides".
+    // Doing this after lock rather than before is the whole reason stage four ran off a divider.
+    const MUX_MASK: u32 = 0x0f << 24;
+    let v = mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4);
+    mmio_write(vout, VOUTCLK_DC8200_PIX0 * 4, (v & !MUX_MASK) | (1 << 24) | CLK_ENABLE);
+    super::print_str("riscv64: display - pixel clock re-pointed at the transmitter: pix0=");
+    super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4) as u64);
+    super::print_str("\n");
+
+    // Did the raster survive the change of clock? If it did not, the transmitter's pixel clock is not
+    // reaching the controller and the answer is to put the divider back - which is a fact worth one
+    // line rather than a dark screen with no explanation.
+    let top = DC_BASE.load(Ordering::Relaxed);
+    if top != 0 {
+        report_scanout(top, "after the transmitter");
+    }
+    true
 }

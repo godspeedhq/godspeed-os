@@ -628,7 +628,13 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             let mut w6: [Option<u32>; 0] = [];
             let dss = tree.find_compatible("starfive,jh7110-dssctrl", &[], &mut w6).map(|r| r.base);
             display::set_syscon_bases(syscon.unwrap_or(0), dss.unwrap_or(0));
-            if !display::mode_set() {
+            let mut w7: [Option<u32>; 0] = [];
+            if let Some(reg) = tree.find_compatible("starfive,jh7110-hdmi", &[], &mut w7) {
+                display::set_hdmi_base(reg.base);
+            }
+            if display::mode_set() {
+                display::hdmi_on();
+            } else {
                 display::diagnose();
             }
         }
