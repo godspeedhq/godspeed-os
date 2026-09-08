@@ -307,7 +307,13 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // block-driver reaches the disk THROUGH A USB HOST-CONTROLLER SERVICE on both ARM targets:
     // `xhci` on aarch64, `dwc2` on arm32. On x86 it drives AHCI directly and needs NO such peer.
     //
-    // ALL THREE ARMS MATTER, and this row is why. Moving it out of the kernel flattened a
+    // THE VISIONFIVE 2 JOINS THE aarch64 ARM: no SATA, no PCI, and a working `xhci` service whose
+    // controller is on the SoC bus rather than a card. Left in the bare `&["events"]` arm it would
+    // reproduce the Pi 2 failure below exactly - a send cap to nothing, `request_with_reply`
+    // returning None instantly, 0 sectors, `ls` broken - with the disk enumerated and bound the
+    // whole time.
+    //
+    // ALL FOUR ARMS MATTER, and this row is why. Moving it out of the kernel flattened a
     // three-way `#[cfg]` into a bare `&["xhci"]`, which is right only on aarch64. The Pi 2 then had
     // a send cap to a service that does not exist there and none to `dwc2`, so
     // `request_with_reply("dwc2", ..)` found no send slot and returned None INSTANTLY: 0 sectors, no
@@ -317,7 +323,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // WITH the thing it warns about.
     ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      if cfg!(target_arch = "arm") { 2 } else { 1 },
-     if cfg!(target_arch = "arm") { &["dwc2", "events"] } else if cfg!(target_arch = "aarch64") { &["xhci", "events"] } else { &["events"] },
+     if cfg!(target_arch = "arm") { &["dwc2", "events"] } else if cfg!(target_arch = "aarch64") { &["xhci", "events"] } else if cfg!(target_arch = "riscv64") { &["xhci", "events"] } else { &["events"] },
      0, 0,
      // NAMED BY THE BUS, not by the kernel (step D1). 0x010601 is the industry-standard PCI class
      // code for an AHCI SATA controller - class 0x01 mass storage, subclass 0x06 SATA, prog-if 0x01
