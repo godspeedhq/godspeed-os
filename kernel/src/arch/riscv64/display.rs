@@ -504,6 +504,8 @@ const DC_FRAMEBUFFER_TOP_LEFT: usize = 0x24d8;
 const DC_FRAMEBUFFER_BOTTOM_RIGHT: usize = 0x24e0;
 const DC_FRAMEBUFFER_BG_COLOR: usize = 0x1528;
 const DC_FRAMEBUFFER_CLEAR_VALUE: usize = 0x1a18;
+/// The plane's RGB-to-RGB colour matrix, five registers holding nine 16-bit coefficients.
+const DC_FRAMEBUFFER_RGBTORGB_COEF0: usize = 0x1e20;
 const DC_FRAMEBUFFER_SRC_GLOBAL_COLOR: usize = 0x2500;
 const DC_FRAMEBUFFER_DST_GLOBAL_COLOR: usize = 0x2508;
 const DC_FRAMEBUFFER_BLEND_CONFIG: usize = 0x2510;
@@ -893,7 +895,40 @@ pub fn mode_set() -> bool {
     // to scan. Bit 5 is the de-gamma table, off. Bit 13 enables the plane; bits 18:16 are its
     // stacking order and bit 19 says which display it belongs to - both zero, for the bottom of
     // display 0. Bit 12 stays clear here and is set once at the end.
-    // THE PLANE IS TURNED OFF, and this is the test the last one should have been.
+    // THE PLANE'S COLOUR MATRIX, and this is why the screen was black.
+    //
+    // Every pixel a plane emits passes through a three-by-three RGB-to-RGB matrix, and its
+    // coefficients come up as ZERO. A zero matrix maps every colour to black - so the plane was
+    // faithfully compositing, at the right size, in the right format, from the right address, and
+    // multiplying all of it by nothing.
+    //
+    // The reason it took eight boots to find is worth writing down. The driver loads this in its
+    // per-layer initialisation next to a scaling-filter table, and I skipped both with the reasoning
+    // "we are not scaling and not converting colour spaces, so neither can matter". That was true of
+    // the filter and false of the matrix, and the difference is that a filter coefficient of zero
+    // means "do not filter" while a matrix of zeros means "output black". A disabled feature and a
+    // zeroed one are not the same thing, and hardware defaults are only safe to skip when the default
+    // is the identity - which for a matrix it never is.
+    //
+    // It also explains the one result that looked impossible: the display background reached the
+    // screen while the plane's own hardware clear did not. The background is generated AFTER the
+    // plane pipeline and never meets the matrix; the clear colour is generated before it and does.
+    //
+    // The values are the driver's own table, kept rather than replaced with an identity. They are a
+    // gamut conversion in Q14, which is a divergence worth naming (26.14): the identity would be
+    // 16384 and every coefficient here is smaller, so the vendor's numbers are known to be in range
+    // on this silicon and an out-of-range coefficient would wrap back to the black this is fixing.
+    // A slight gamut shift on a text console is not worth that risk.
+    const RGB2RGB: [u32; 9] = [10279, 5395, 709, 1132, 15065, 187, 269, 1442, 14674];
+    for i in 0..4usize {
+        dc_write(
+            DC_FRAMEBUFFER_RGBTORGB_COEF0 + i * 8,
+            RGB2RGB[i * 2] | (RGB2RGB[i * 2 + 1] << 16),
+        );
+    }
+    dc_write(DC_FRAMEBUFFER_RGBTORGB_COEF0 + 32, RGB2RGB[8]);
+
+    // The plane is enabled again - the test that turned it off has done its job.
     //
     // Asking whether the background colour appeared was meaningless while the plane was enabled,
     // opaque and covering the whole screen: the background is what shows where NO plane covers, so it
@@ -909,12 +944,8 @@ pub fn mode_set() -> bool {
     // search moves off the plane entirely.
     dc_modify(
         DC_FRAMEBUFFER_CONFIG_EX,
-        1 << 6,
+        (1 << 6) | (1 << 13),
         (1 << 1) | (1 << 5) | (1 << 8) | (1 << 13) | (0x07 << 16) | (1 << 19),
-    );
-    super::print_str(
-        "riscv64: display - PLANE OFF: the screen should be ORANGE if the controller emits pixels at all
-",
     );
 
     // Re-arm the shadow bank, so anything written from here on takes effect on a frame boundary
