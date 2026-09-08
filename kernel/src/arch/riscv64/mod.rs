@@ -1044,6 +1044,23 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     mirror_to_screen(s);
 }
 
+/// Everything printed before there was a screen to print it on.
+///
+/// **The display cannot come up first, and this is what the screen would otherwise lose.** Bringing
+/// it up needs the frame allocator, which needs the memory map, which needs the device tree - so a
+/// hundred lines about the machine's own discovery are already on the serial line before there is
+/// anywhere else to put them, and the television used to join the boot part-way through, at the first
+/// timer tick. Holding them costs sixteen kilobytes of always-allocated memory and buys a screen that
+/// shows the whole boot rather than the end of it.
+///
+/// Bounded by construction: a fixed array that stops accepting when full, so a boot that talks more
+/// than expected loses the tail of the replay rather than growing anything. The kernel ring buffer is
+/// not an alternative - the arch's own `print_str` writes the UART directly and never enters it, and
+/// draining it here would take it from the `events` service, which is the one thing it is for.
+const EARLY_LOG_BYTES: usize = 16 * 1024;
+static mut EARLY_LOG: [u8; EARLY_LOG_BYTES] = [0; EARLY_LOG_BYTES];
+static EARLY_LOG_LEN: AtomicUsize = AtomicUsize::new(0);
+
 /// Set once the display is up and the boot console owns the framebuffer. Until then every byte in
 /// the boot goes to serial alone, which is what makes this safe to call from the very first line.
 static SCREEN_READY: AtomicBool = AtomicBool::new(false);
@@ -1053,6 +1070,17 @@ static SCREEN_READY: AtomicBool = AtomicBool::new(false);
 static PAINTING: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn screen_ready() {
+    // Replay first, then arm - so the boot the screen shows starts where the boot started rather than
+    // wherever the display happened to finish coming up.
+    let n = EARLY_LOG_LEN.load(Ordering::Relaxed);
+    if n > 0 {
+        // SAFETY: `n` bytes were written into this array by `mirror_to_screen` and nothing has
+        // written it since; the screen is not armed yet, so no other writer is in the array.
+        let held = unsafe {
+            core::slice::from_raw_parts(core::ptr::addr_of!(EARLY_LOG).cast::<u8>(), n)
+        };
+        crate::bootcon::put_bytes(held);
+    }
     SCREEN_READY.store(true, Ordering::Release);
 }
 
@@ -1062,13 +1090,30 @@ pub(super) fn screen_ready() {
 /// the display gets the boot log, the panic message and a service's log lines without any of them
 /// knowing a screen exists.
 fn mirror_to_screen(s: &[u8]) {
-    if !SCREEN_READY.load(Ordering::Acquire) {
-        return;
-    }
+    // The same flag guards both halves, so a byte is either kept for later or drawn now, never both
+    // and never torn between two cores.
     if PAINTING.swap(true, Ordering::Acquire) {
         return;
     }
-    crate::bootcon::put_bytes(s);
+    if SCREEN_READY.load(Ordering::Acquire) {
+        crate::bootcon::put_bytes(s);
+    } else {
+        let n = EARLY_LOG_LEN.load(Ordering::Relaxed);
+        let room = EARLY_LOG_BYTES - n;
+        let take = if s.len() < room { s.len() } else { room };
+        if take > 0 {
+            // SAFETY: exclusive while `PAINTING` is held, and `take` is clamped to the space left in
+            // the array, so the copy cannot reach past it.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    s.as_ptr(),
+                    core::ptr::addr_of_mut!(EARLY_LOG).cast::<u8>().add(n),
+                    take,
+                );
+            }
+            EARLY_LOG_LEN.store(n + take, Ordering::Relaxed);
+        }
+    }
     PAINTING.store(false, Ordering::Release);
 }
 /// Console output for a SERVICE - the path the shell's prompt and its echo take.

@@ -681,7 +681,10 @@ const AQ_INTR_ENBL: usize = 0x0014;
 fn scanout_rate(top: u64) -> (u32, u32, u32) {
     mmio_write(top, AQ_INTR_ENBL, 0xf);
     let hz = super::timebase_hz() as u64;
-    let window = if hz == 0 { 10_000_000 } else { hz };
+    // A TENTH of a second, not a whole one. While the display was being brought up this window was a
+    // second, three times over, and three seconds is a large part of the boot the television used to
+    // miss; six frames is plenty to say whether a raster exists and to time the gap between two.
+    let window = if hz == 0 { 1_000_000 } else { hz / 10 };
 
     let start = super::sbi::time();
     let mut first_at = 0u64;
@@ -1013,7 +1016,7 @@ fn report_scanout(top: u64, when: &str) {
     super::print_str(when);
     super::print_str(": ");
     super::print_dec(frames as u64);
-    super::print_str(" frames in 1s, ");
+    super::print_str(" frames in 100ms, ");
     super::print_dec((centihz / 100) as u64);
     super::print_str(".");
     let frac = centihz % 100;
@@ -1344,7 +1347,7 @@ fn report_input_vsync() {
     hdmi_write(HDMI_INTERRUPT_STATUS1, HDMI_INT_ACTIVE_VSYNC);
 
     let hz = super::timebase_hz() as u64;
-    let window = if hz == 0 { 10_000_000 } else { hz };
+    let window = if hz == 0 { 1_000_000 } else { hz / 10 };
     let start = super::sbi::time();
     let mut first_at = 0u64;
     let mut last_at = 0u64;
@@ -1371,7 +1374,7 @@ fn report_input_vsync() {
     };
     super::print_str("riscv64: display - vertical syncs INTO the transmitter: ");
     super::print_dec(count as u64);
-    super::print_str(" in 1s, ");
+    super::print_str(" in 100ms, ");
     super::print_dec((centihz / 100) as u64);
     super::print_str(".");
     let frac = centihz % 100;
