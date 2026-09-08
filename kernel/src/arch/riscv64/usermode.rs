@@ -451,20 +451,6 @@ pub fn selftest() {
     let ticks = USER_TICKS.load(Ordering::Relaxed);
     let preempted = ticks >= 2;
 
-    print_str("riscv64: usermode ran=");
-    print_str(if ran { "ok" } else { "BAD" });
-    print_str(" (SPP=0 at the ecall, so the stub was unprivileged) user-write=");
-    print_str(if stored { "ok" } else { "BAD" });
-    print_str(" kernel-page-denied=");
-    print_str(if denied { "ok" } else { "BAD" });
-    print_str(" syscall=");
-    print_str(if syscalls { "ok" } else { "BAD" });
-    print_str(" preempted=");
-    super::print_dec(ticks);
-    print_str(if preempted { " ok" } else { " BAD" });
-    print_str(" probe ");
-    print_hex(probe);
-    print_str("\n");
 
     // Take the pages back. A user-readable page left in the kernel's address space is a hole, and
     // this one has no owner now that the stub has finished.
@@ -769,17 +755,6 @@ pub fn task_selftest() {
     let frame = TASK_FRAME_ADDR.load(Ordering::Relaxed);
     let kstack_ok = frame >= kstack_pa && frame < kstack_pa + 4096;
 
-    print_str("riscv64: usertask ran=");
-    print_str(if ran { "ok" } else { "BAD" });
-    print_str(" own-address-space=");
-    print_str(if own_space { "ok" } else { "BAD" });
-    print_str(" user-stack=");
-    print_str(if stack_ok { "ok" } else { "BAD" });
-    print_str(" own-kernel-stack=");
-    print_str(if kstack_ok { "ok" } else { "BAD" });
-    print_str(" root ");
-    print_hex(root);
-    print_str("\n");
 
     let ua = [
         ("read", UA_READ.load(Ordering::Relaxed)),

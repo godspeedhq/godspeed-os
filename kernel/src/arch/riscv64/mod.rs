@@ -769,10 +769,6 @@ riscv64: S-mode entered, 16550 UART alive
 " });
     }
 
-    for &b in b"riscv64: neutral kernel linked; arch/riscv64 stubs pending real bodies.
-" {
-        putc(b);
-    }
 
     // Start the scheduler tick at the rate the MACHINE reports, then let it run. The deliberate
     // fault below is what ends the boot, so the ticks in between prove the timer is periodic
@@ -2769,7 +2765,11 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
     }
 
     // Before that: the boot's own tick, printed sparsely enough to prove it is alive and periodic.
-    if n <= 3 || n % 100 == 0 {
+    // ONCE, not five times. These counted ticks were how the boot proved its timer was periodic
+    // rather than a single interrupt that happened to arrive - a real question before there was a
+    // scheduler, and answered permanently by the fact that one now runs. Five lines of a
+    // forty-eight row console is a tenth of the screen spent saying the clock still works.
+    if n == 1 {
         print_str("riscv64: tick ");
         print_dec(n as u64);
         print_str("\n");

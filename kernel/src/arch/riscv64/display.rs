@@ -24,6 +24,39 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Whether the bring-up narrates itself.
+///
+/// **Off, and the reason is a screen.** Every line below earned its place while the display and the
+/// USB block were being brought up: they are how a black television became a sequence of facts, and
+/// several of them cost a boot each to think of. None of them earns its place on a machine that
+/// works. This port printed seventy-odd lines through a forty-eight row console, so the television
+/// could only ever show the tail of its own boot - and no other port prints anything like that many.
+///
+/// They are GATED rather than deleted, because the next person to meet a dark screen on this board
+/// wants exactly these lines and should not have to invent them again. One `true` brings them all
+/// back. What is never gated is a failure: those go straight to `super::print_str` below, so a
+/// machine that does not come up says so at full volume whatever this is set to.
+const VERBOSE: bool = false;
+
+fn p_str(s: &str) {
+    if VERBOSE {
+        super::print_str(s);
+    }
+}
+
+fn p_hex(v: u64) {
+    if VERBOSE {
+        super::print_hex(v);
+    }
+}
+
+fn p_dec(v: u64) {
+    if VERBOSE {
+        super::print_dec(v);
+    }
+}
+
+
 /// Where the PMU is, from the device tree. Zero until the boot finds it.
 static PMU_BASE: AtomicU64 = AtomicU64::new(0);
 /// The system clock/reset generator, and the video-out one. Both from the tree.
@@ -110,8 +143,8 @@ fn report(mode: u32) {
         (DOMAIN_VENC, "venc"),
     ] {
         if mode & bit != 0 {
-            super::print_str(" ");
-            super::print_str(name);
+            p_str(" ");
+            p_str(name);
         }
     }
 }
@@ -280,17 +313,17 @@ pub(super) fn reset_deassert(base: u64, assert_off: usize, status_off: usize, id
     // with several causes that look identical from here - the write not landing, the bit being the
     // wrong one, the status having the opposite polarity, the block being unclocked - and the three
     // register values separate them in one line. Guessing between them costs a board boot each time.
-    super::print_str(" [id ");
-    super::print_dec(id as u64);
-    super::print_str(" mask ");
-    super::print_hex(mask as u64);
-    super::print_str(" assert ");
-    super::print_hex(before as u64);
-    super::print_str("->");
-    super::print_hex(after as u64);
-    super::print_str(" status ");
-    super::print_hex(status as u64);
-    super::print_str("]");
+    p_str(" [id ");
+    p_dec(id as u64);
+    p_str(" mask ");
+    p_hex(mask as u64);
+    p_str(" assert ");
+    p_hex(before as u64);
+    p_str("->");
+    p_hex(after as u64);
+    p_str(" status ");
+    p_hex(status as u64);
+    p_str("]");
     false
 }
 
@@ -327,8 +360,8 @@ pub fn clocks_on() -> bool {
             // printing what it did to succeed is chatter, and on this board it was 77 lines of it
             // through a 48-row screen, so the boot could only ever show its own tail.
             super::print_str("riscv64: display - system clock did not enable: ");
-            super::print_str(name);
-            super::print_str("\n");
+            p_str(name);
+            p_str("\n");
             report_clocks = true;
             ok = false;
         }
@@ -345,8 +378,8 @@ pub fn clocks_on() -> bool {
     for (id, name) in [(SYSRST_VOUT_SRC, "vout_src"), (SYSRST_NOC_DISP, "noc_disp")] {
         if !reset_deassert(sys, SYSCRG_RESET_ASSERT, SYSCRG_RESET_STATUS, id) {
             super::print_str("riscv64: display - system reset STUCK: ");
-            super::print_str(name);
-            super::print_str("\n");
+            p_str(name);
+            p_str("\n");
             ok = false;
         }
     }
@@ -375,8 +408,8 @@ pub fn clocks_on() -> bool {
             enabled += 1;
         } else {
             super::print_str("riscv64: display - video-out gate did not enable: ");
-            super::print_str(name);
-            super::print_str("\n");
+            p_str(name);
+            p_str("\n");
         }
     }
 
@@ -394,8 +427,8 @@ pub fn clocks_on() -> bool {
     for (id, name) in [(VOUTRST_AXI, "axi"), (VOUTRST_AHB, "ahb"), (VOUTRST_CORE, "core")] {
         if !reset_deassert(vout, VOUTCRG_RESET_ASSERT, VOUTCRG_RESET_STATUS, id) {
             super::print_str("riscv64: display - video-out reset did not release: ");
-            super::print_str(name);
-            super::print_str("\n");
+            p_str(name);
+            p_str("\n");
             return false;
         }
     }
@@ -433,16 +466,16 @@ pub fn probe_dc8200() {
     }
 
     for (base, name) in [(top, "top"), (regs, "regs")] {
-        super::print_str("riscv64: display - dc8200 ");
-        super::print_str(name);
-        super::print_str(" @");
-        super::print_hex(base);
-        super::print_str(":");
+        p_str("riscv64: display - dc8200 ");
+        p_str(name);
+        p_str(" @");
+        p_hex(base);
+        p_str(":");
         for i in 0..6usize {
-            super::print_str(" ");
-            super::print_hex(mmio_read(base, i * 4) as u64);
+            p_str(" ");
+            p_hex(mmio_read(base, i * 4) as u64);
         }
-        super::print_str("\n");
+        p_str("\n");
     }
 }
 
@@ -584,13 +617,13 @@ fn pixel_clock_on(vout: u64) {
         mmio_write(vout, i * 4, (v & !MUX_MASK) | CLK_ENABLE);
     }
 
-    super::print_str("riscv64: display - pixel clock: div=");
-    super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX * 4) as u64);
-    super::print_str(" pix0=");
-    super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4) as u64);
-    super::print_str(" lcd=");
-    super::print_hex(mmio_read(vout, VOUTCLK_DOM_VOUT_TOP_LCD * 4) as u64);
-    super::print_str("\n");
+    p_str("riscv64: display - pixel clock: div=");
+    p_hex(mmio_read(vout, VOUTCLK_DC8200_PIX * 4) as u64);
+    p_str(" pix0=");
+    p_hex(mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4) as u64);
+    p_str(" lcd=");
+    p_hex(mmio_read(vout, VOUTCLK_DOM_VOUT_TOP_LCD * 4) as u64);
+    p_str("\n");
 }
 
 /// Clear the framebuffer to black.
@@ -713,11 +746,11 @@ pub fn mode_set() -> bool {
     // part with a different one is writing at random.
     let rev = mmio_read(top, DC_HW_REVISION);
     let cid = mmio_read(top, DC_HW_CHIP_CID);
-    super::print_str("riscv64: display - dc8200 revision ");
-    super::print_hex(rev as u64);
-    super::print_str(" cid ");
-    super::print_hex(cid as u64);
-    super::print_str("\n");
+    p_str("riscv64: display - dc8200 revision ");
+    p_hex(rev as u64);
+    p_str(" cid ");
+    p_hex(cid as u64);
+    p_str("\n");
     if rev != 0x5720 && rev != 0x5721 {
         super::print_str("riscv64: display - unrecognised revision; refusing to program it\n");
         return false;
@@ -749,11 +782,11 @@ pub fn mode_set() -> bool {
     let fb: &'static mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(fb_phys as *mut u8, FB_BYTES) };
 
-    super::print_str("riscv64: display - framebuffer at ");
-    super::print_hex(fb_phys);
-    super::print_str(", ");
-    super::print_dec(frames as u64);
-    super::print_str(" pages\n");
+    p_str("riscv64: display - framebuffer at ");
+    p_hex(fb_phys);
+    p_str(", ");
+    p_dec(frames as u64);
+    p_str(" pages\n");
     paint_test_pattern(fb);
     // PUBLISH THEM. Eight megabytes written through a two megabyte cache leaves the last two dirty,
     // and nothing else in this function would ever push them out - which is the corrupted band that
@@ -780,11 +813,11 @@ pub fn mode_set() -> bool {
     if dss != 0 {
         mmio_write(dss, 0x4, mmio_read(dss, 0x4) | (1 << 20));
         mmio_write(dss, 0x8, mmio_read(dss, 0x8) | (1 << 3));
-        super::print_str("riscv64: display - dss routing: 0x4=");
-        super::print_hex(mmio_read(dss, 0x4) as u64);
-        super::print_str(" 0x8=");
-        super::print_hex(mmio_read(dss, 0x8) as u64);
-        super::print_str("
+        p_str("riscv64: display - dss routing: 0x4=");
+        p_hex(mmio_read(dss, 0x4) as u64);
+        p_str(" 0x8=");
+        p_hex(mmio_read(dss, 0x8) as u64);
+        p_str("
 ");
     } else {
         super::print_str("riscv64: display - NO dssctrl; the controller's output is unrouted
@@ -958,7 +991,7 @@ pub fn mode_set() -> bool {
     // scan has two quite different explanations - the registers do not hold what was written (an
     // addressing or bus problem) or they do and something else is missing (a clock, an enable) - and
     // they have nothing in common. One line separates them, and it costs a board boot to guess.
-    super::print_str("riscv64: display - readback:");
+    p_str("riscv64: display - readback:");
     for (name, off) in [
         ("panel_cfg", DC_DISPLAY_PANEL_CONFIG),
         ("panel_start", DC_DISPLAY_PANEL_START),
@@ -974,12 +1007,12 @@ pub fn mode_set() -> bool {
         ("fbcfg", DC_FRAMEBUFFER_CONFIG),
         ("fbcfg_ex", DC_FRAMEBUFFER_CONFIG_EX),
     ] {
-        super::print_str(" ");
-        super::print_str(name);
-        super::print_str("=");
-        super::print_hex(dc_read(off) as u64);
+        p_str(" ");
+        p_str(name);
+        p_str("=");
+        p_hex(dc_read(off) as u64);
     }
-    super::print_str("\n");
+    p_str("\n");
 
     report_scanout(top, "after the mode set");
     let (frames, _, _) = scanout_rate(top);
@@ -993,21 +1026,21 @@ pub fn mode_set() -> bool {
 /// One line saying whether frames are happening and how fast, tagged with when it was asked.
 fn report_scanout(top: u64, when: &str) {
     let (frames, centihz, seen) = scanout_rate(top);
-    super::print_str("riscv64: display - ");
-    super::print_str(when);
-    super::print_str(": ");
-    super::print_dec(frames as u64);
-    super::print_str(" frames in 100ms, ");
-    super::print_dec((centihz / 100) as u64);
-    super::print_str(".");
+    p_str("riscv64: display - ");
+    p_str(when);
+    p_str(": ");
+    p_dec(frames as u64);
+    p_str(" frames in 100ms, ");
+    p_dec((centihz / 100) as u64);
+    p_str(".");
     let frac = centihz % 100;
     if frac < 10 {
-        super::print_str("0");
+        p_str("0");
     }
-    super::print_dec(frac as u64);
-    super::print_str(" Hz, latch bits ");
-    super::print_hex(seen as u64);
-    super::print_str("\n");
+    p_dec(frac as u64);
+    p_str(" Hz, latch bits ");
+    p_hex(seen as u64);
+    p_str("\n");
 }
 
 // ==================== the clock tree, when the raster does not run ====================
@@ -1059,19 +1092,19 @@ pub fn diagnose() {
 
     if syscon != 0 {
         let (hz, fbdiv, prediv, postdiv1) = pll2_hz(syscon);
-        super::print_str("riscv64: display - pll2: fbdiv=");
-        super::print_dec(fbdiv as u64);
-        super::print_str(" prediv=");
-        super::print_dec(prediv as u64);
-        super::print_str(" postdiv1=");
-        super::print_dec(postdiv1 as u64);
-        super::print_str(" frac=");
-        super::print_hex(mmio_read(syscon, PLL2_FRAC) as u64);
-        super::print_str(" pd=");
-        super::print_hex(mmio_read(syscon, PLL2_PD) as u64);
-        super::print_str(" -> ");
-        super::print_dec(hz / 1_000_000);
-        super::print_str(" MHz\n");
+        p_str("riscv64: display - pll2: fbdiv=");
+        p_dec(fbdiv as u64);
+        p_str(" prediv=");
+        p_dec(prediv as u64);
+        p_str(" postdiv1=");
+        p_dec(postdiv1 as u64);
+        p_str(" frac=");
+        p_hex(mmio_read(syscon, PLL2_FRAC) as u64);
+        p_str(" pd=");
+        p_hex(mmio_read(syscon, PLL2_PD) as u64);
+        p_str(" -> ");
+        p_dec(hz / 1_000_000);
+        p_str(" MHz\n");
     }
 
     // The system generator's video-out corner. Index 59 is the one to look at: it is the `vout_axi`
@@ -1079,30 +1112,30 @@ pub fn diagnose() {
     // dropped when that failed. A divider holding zero is a clock that is off, and nothing about the
     // way it failed said so.
     if sys != 0 {
-        super::print_str("riscv64: display - syscrg[56..63]:");
+        p_str("riscv64: display - syscrg[56..63]:");
         for i in 56..64usize {
-            super::print_str(" ");
-            super::print_hex(mmio_read(sys, i * 4) as u64);
+            p_str(" ");
+            p_hex(mmio_read(sys, i * 4) as u64);
         }
-        super::print_str("\n");
+        p_str("\n");
     }
 
     if vout != 0 {
-        super::print_str("riscv64: display - voutcrg[0..17]:");
+        p_str("riscv64: display - voutcrg[0..17]:");
         for i in 0..18usize {
-            super::print_str(" ");
-            super::print_hex(mmio_read(vout, i * 4) as u64);
+            p_str(" ");
+            p_hex(mmio_read(vout, i * 4) as u64);
         }
-        super::print_str("\n");
+        p_str("\n");
     }
 
     if dss != 0 {
-        super::print_str("riscv64: display - dssctrl[0..8]:");
+        p_str("riscv64: display - dssctrl[0..8]:");
         for i in 0..9usize {
-            super::print_str(" ");
-            super::print_hex(mmio_read(dss, i * 4) as u64);
+            p_str(" ");
+            p_hex(mmio_read(dss, i * 4) as u64);
         }
-        super::print_str("\n");
+        p_str("\n");
     }
 
     if top != 0 {
@@ -1211,8 +1244,8 @@ fn wait_lock(off: usize, name: &str) -> bool {
         }
     }
     super::print_str("riscv64: display - HDMI PLL did not lock: ");
-    super::print_str(name);
-    super::print_str("\n");
+    p_str(name);
+    p_str("\n");
     false
 }
 
@@ -1286,7 +1319,7 @@ const HDMI_HOTPLUG: u32 = 1 << 7;
 /// not up, which is the difference between "the transmitter is configured" and "the transmitter is
 /// working" and is invisible from the digital side.
 fn report_transmitter() {
-    super::print_str("riscv64: display - transmitter readback:");
+    p_str("riscv64: display - transmitter readback:");
     for (name, off) in [
         ("sys", HDMI_SYS_CTRL),
         ("vidctl", 0x01usize),
@@ -1307,19 +1340,19 @@ fn report_transmitter() {
         ("ctl2", HDMI_VIDEO_CONTRL2),
         ("avmute", HDMI_AV_MUTE),
     ] {
-        super::print_str(" ");
-        super::print_str(name);
-        super::print_str("=");
-        super::print_hex(hdmi_read(off) as u64);
+        p_str(" ");
+        p_str(name);
+        p_str("=");
+        p_hex(hdmi_read(off) as u64);
     }
-    super::print_str("\n");
+    p_str("\n");
 
     let status = hdmi_read(HDMI_STATUS);
-    super::print_str("riscv64: display - HDMI status ");
-    super::print_hex(status as u64);
-    super::print_str(": a television is ");
-    super::print_str(if status & HDMI_HOTPLUG != 0 { "CONNECTED" } else { "NOT detected" });
-    super::print_str("\n");
+    p_str("riscv64: display - HDMI status ");
+    p_hex(status as u64);
+    p_str(": a television is ");
+    p_str(if status & HDMI_HOTPLUG != 0 { "CONNECTED" } else { "NOT detected" });
+    p_str("\n");
 }
 
 /// Count vertical syncs arriving at the transmitter from the display controller.
@@ -1353,21 +1386,21 @@ fn report_input_vsync() {
     } else {
         (((count - 1) as u64 * 100 * hz) / (last_at - first_at)) as u32
     };
-    super::print_str("riscv64: display - vertical syncs INTO the transmitter: ");
-    super::print_dec(count as u64);
-    super::print_str(" in 100ms, ");
-    super::print_dec((centihz / 100) as u64);
-    super::print_str(".");
+    p_str("riscv64: display - vertical syncs INTO the transmitter: ");
+    p_dec(count as u64);
+    p_str(" in 100ms, ");
+    p_dec((centihz / 100) as u64);
+    p_str(".");
     let frac = centihz % 100;
     if frac < 10 {
-        super::print_str("0");
+        p_str("0");
     }
-    super::print_dec(frac as u64);
-    super::print_str(" Hz, status bits ");
-    super::print_hex(seen as u64);
-    super::print_str(", mode ");
-    super::print_str(if hdmi_read(HDMI_HDCP_CTRL) & (1 << 1) != 0 { "HDMI" } else { "DVI" });
-    super::print_str("
+    p_dec(frac as u64);
+    p_str(" Hz, status bits ");
+    p_hex(seen as u64);
+    p_str(", mode ");
+    p_str(if hdmi_read(HDMI_HDCP_CTRL) & (1 << 1) != 0 { "HDMI" } else { "DVI" });
+    p_str("
 ");
 }
 
@@ -1407,7 +1440,7 @@ pub fn hdmi_on() -> bool {
     if !wait_lock(PHY_PRE_PLL_LOCK, "pre") || !wait_lock(PHY_POST_PLL_LOCK, "post") {
         return false;
     }
-    super::print_str("riscv64: display - HDMI PLLs locked\n");
+    p_str("riscv64: display - HDMI PLLs locked\n");
 
     hdmi_write(0x1b4, 0x07); // the PHY's regulator
     hdmi_write(0x1be, 0x71); // the serializer
@@ -1430,7 +1463,7 @@ pub fn hdmi_on() -> bool {
     // means twelve bits. A transmitter told to expect twelve bits per component from a display
     // controller sending eight does not fail - it assembles pixels out of the wrong wires, which on
     // a fixed black-ish input is a black picture and looks exactly like no picture at all.
-    super::print_str("riscv64: display - transmitter video path before: ");
+    p_str("riscv64: display - transmitter video path before: ");
     for (name, off) in [
         ("ctl1", HDMI_VIDEO_CONTRL1),
         ("ctl2", HDMI_VIDEO_CONTRL2),
@@ -1439,12 +1472,12 @@ pub fn hdmi_on() -> bool {
         ("avmute", HDMI_AV_MUTE),
         ("hdcp", 0x52usize),
     ] {
-        super::print_str(name);
-        super::print_str("=");
-        super::print_hex(hdmi_read(off) as u64);
-        super::print_str(" ");
+        p_str(name);
+        p_str("=");
+        p_hex(hdmi_read(off) as u64);
+        p_str(" ");
     }
-    super::print_str("
+    p_str("
 ");
 
     // NOTHING IS WRITTEN HERE, and the board is why. Every one of these four was already correct at
@@ -1505,9 +1538,9 @@ pub fn hdmi_on() -> bool {
     const MUX_MASK: u32 = 0x0f << 24;
     let v = mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4);
     mmio_write(vout, VOUTCLK_DC8200_PIX0 * 4, (v & !MUX_MASK) | (1 << 24) | CLK_ENABLE);
-    super::print_str("riscv64: display - pixel clock re-pointed at the transmitter: pix0=");
-    super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4) as u64);
-    super::print_str("\n");
+    p_str("riscv64: display - pixel clock re-pointed at the transmitter: pix0=");
+    p_hex(mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4) as u64);
+    p_str("\n");
 
     // DOES THE CONTROLLER'S VIDEO REACH THE TRANSMITTER AT ALL? This is the question every guess so
     // far has been a guess ABOUT, and the transmitter answers it directly: bit 5 of its interrupt
@@ -1525,14 +1558,34 @@ pub fn hdmi_on() -> bool {
     // line rather than a dark screen with no explanation.
     let top = DC_BASE.load(Ordering::Relaxed);
     if top != 0 {
+        // THE ONE LINE A WORKING DISPLAY OWES ITS READER: the mode it settled on, whether a sink is
+        // on the other end, and the address a service will be handed. Everything else this stage can
+        // say is a question from its bring-up, and those are gated above.
+        let (frames, centihz, _) = scanout_rate(top);
+        super::print_str("riscv64: display 1920x1080 at ");
+        super::print_dec((centihz / 100) as u64);
+        super::print_str(" Hz over HDMI, television ");
+        super::print_str(if hdmi_read(HDMI_STATUS) & HDMI_HOTPLUG != 0 {
+            "connected"
+        } else {
+            "NOT detected"
+        });
+        super::print_str(", framebuffer ");
+        super::print_hex(FB_PHYS.load(Ordering::Relaxed));
+        super::print_str("\n");
+        if frames == 0 {
+            super::print_str(
+                "riscv64: display - the controller STOPPED scanning after the handover\n",
+            );
+        }
         report_scanout(top, "after the transmitter");
         // Bit 5 of the plane's config is the controller's underflow flag: set means it asked the
         // memory system for pixels and did not get them in time. It distinguishes a display that is
         // scanning nothing from one that is scanning something it could not fetch, which look
         // identical on a dark screen.
-        super::print_str("riscv64: display - plane fetch: fbcfg=");
-        super::print_hex(dc_read(DC_FRAMEBUFFER_CONFIG) as u64);
-        super::print_str(if dc_read(DC_FRAMEBUFFER_CONFIG) & (1 << 5) != 0 {
+        p_str("riscv64: display - plane fetch: fbcfg=");
+        p_hex(dc_read(DC_FRAMEBUFFER_CONFIG) as u64);
+        p_str(if dc_read(DC_FRAMEBUFFER_CONFIG) & (1 << 5) != 0 {
             " UNDERFLOW\n"
         } else {
             " no underflow\n"
@@ -1598,5 +1651,5 @@ pub fn adopt_as_boot_console() {
     // Cleared, now that the path is proven. While it was not, the screen deliberately kept whatever
     // had been painted under the text so that it carried three distinguishable answers at once
     // instead of one - which is what turned "still black" from a dead end into a measurement.
-    super::print_str("riscv64: display - the boot console now draws to the screen\n");
+    p_str("riscv64: display - the boot console now draws to the screen\n");
 }

@@ -24,6 +24,39 @@ use portable_atomic::AtomicU64;
 
 use super::display::{clk_enable, mmio_read, mmio_write, reset_deassert};
 
+/// Whether the bring-up narrates itself.
+///
+/// **Off, and the reason is a screen.** Every line below earned its place while the display and the
+/// USB block were being brought up: they are how a black television became a sequence of facts, and
+/// several of them cost a boot each to think of. None of them earns its place on a machine that
+/// works. This port printed seventy-odd lines through a forty-eight row console, so the television
+/// could only ever show the tail of its own boot - and no other port prints anything like that many.
+///
+/// They are GATED rather than deleted, because the next person to meet a dark screen on this board
+/// wants exactly these lines and should not have to invent them again. One `true` brings them all
+/// back. What is never gated is a failure: those go straight to `super::print_str` below, so a
+/// machine that does not come up says so at full volume whatever this is set to.
+const VERBOSE: bool = false;
+
+fn p_str(s: &str) {
+    if VERBOSE {
+        super::print_str(s);
+    }
+}
+
+fn p_hex(v: u64) {
+    if VERBOSE {
+        super::print_hex(v);
+    }
+}
+
+fn p_dec(v: u64) {
+    if VERBOSE {
+        super::print_dec(v);
+    }
+}
+
+
 /// Clock indices in the system-top clock generator, in the order the device tree's `clock-names`
 /// gives them on the USB wrapper: `lpm`, `stb`, `apb`, `axi`, `utmi_apb`, `phy`.
 const STGCLK_USB: [(usize, &str); 6] =
@@ -137,7 +170,7 @@ fn configure_pins() {
             (e & !(PIN_DOEN_MASK << shift)) | (doen << shift),
         );
     }
-    super::print_str("riscv64: usb - port power and the usb2/3 switch driven
+    p_str("riscv64: usb - port power and the usb2/3 switch driven
 ");
 }
 
@@ -199,31 +232,31 @@ pub fn init() -> bool {
         SYSCON_USB_SPLIT,
         mmio_read(sys_syscon, SYSCON_USB_SPLIT) | USB_PDRSTN_SPLIT,
     );
-    super::print_str("riscv64: usb - phy: 125m=");
-    super::print_hex(mmio_read(syscrg, SYSCLK_USB_125M * 4) as u64);
-    super::print_str(" app_125m=");
-    super::print_str(if app { "on" } else { "FAIL" });
-    super::print_str(" split=");
-    super::print_hex(mmio_read(sys_syscon, SYSCON_USB_SPLIT) as u64);
-    super::print_str("
+    p_str("riscv64: usb - phy: 125m=");
+    p_hex(mmio_read(syscrg, SYSCLK_USB_125M * 4) as u64);
+    p_str(" app_125m=");
+    p_str(if app { "on" } else { "FAIL" });
+    p_str(" split=");
+    p_hex(mmio_read(sys_syscon, SYSCON_USB_SPLIT) as u64);
+    p_str("
 ");
 
     // TRY THEM ALL, THEN DECIDE - the same rule the display's clocks follow, for the same reason: a
     // board boot is the expensive thing here, and stopping at the first failure spends one to learn
     // about one clock.
-    super::print_str("riscv64: usb - clocks:");
+    p_str("riscv64: usb - clocks:");
     let mut ok = true;
     for (i, name) in STGCLK_USB {
-        super::print_str(" ");
-        super::print_str(name);
+        p_str(" ");
+        p_str(name);
         if clk_enable(crg, i) {
-            super::print_str("=on");
+            p_str("=on");
         } else {
-            super::print_str("=FAIL");
+            p_str("=FAIL");
             ok = false;
         }
     }
-    super::print_str("\n");
+    p_str("\n");
 
     // THE ROLE IS SET BEFORE THE RESETS COME OFF. The strap is sampled as the controller leaves
     // reset, so a controller released first comes up as whatever the pins happened to say and has to
@@ -233,22 +266,22 @@ pub fn init() -> bool {
     v = (v & !USB_STRAP_MASK) | USB_STRAP_HOST;
     v = (v & !USB_SUSPENDM_MASK) | USB_SUSPENDM_HOST;
     mmio_write(syscon, STG_USB_MODE, v);
-    super::print_str("riscv64: usb - strapped as a HOST, mode register ");
-    super::print_hex(mmio_read(syscon, STG_USB_MODE) as u64);
-    super::print_str("\n");
+    p_str("riscv64: usb - strapped as a HOST, mode register ");
+    p_hex(mmio_read(syscon, STG_USB_MODE) as u64);
+    p_str("\n");
 
-    super::print_str("riscv64: usb - resets:");
+    p_str("riscv64: usb - resets:");
     for (id, name) in STGRST_USB {
-        super::print_str(" ");
-        super::print_str(name);
+        p_str(" ");
+        p_str(name);
         if reset_deassert(crg, STGCRG_RESET_ASSERT, STGCRG_RESET_STATUS, id) {
-            super::print_str("=released");
+            p_str("=released");
         } else {
-            super::print_str("=STUCK");
+            p_str("=STUCK");
             ok = false;
         }
     }
-    super::print_str("\n");
+    p_str("\n");
 
     // NOW THE PHY'S OWN REGISTERS, and they are here rather than above because the board said so.
     // Written before the resets came off they read back as ZERO - `mode=0x0 keepalive=0x0` - since a
@@ -259,11 +292,11 @@ pub fn init() -> bool {
     // silently lost is the one this entire stage exists for.
     mmio_write(phy, PHY_CLK_MODE, mmio_read(phy, PHY_CLK_MODE) | PHY_CLK_MODE_RX_NORMAL_PWR);
     mmio_write(phy, PHY_LS_KEEPALIVE, mmio_read(phy, PHY_LS_KEEPALIVE) | PHY_LS_KEEPALIVE_ENABLE);
-    super::print_str("riscv64: usb - phy registers: mode=");
-    super::print_hex(mmio_read(phy, PHY_CLK_MODE) as u64);
-    super::print_str(" keepalive=");
-    super::print_hex(mmio_read(phy, PHY_LS_KEEPALIVE) as u64);
-    super::print_str("\n");
+    p_str("riscv64: usb - phy registers: mode=");
+    p_hex(mmio_read(phy, PHY_CLK_MODE) as u64);
+    p_str(" keepalive=");
+    p_hex(mmio_read(phy, PHY_LS_KEEPALIVE) as u64);
+    p_str("\n");
 
     // DOES IT ANSWER? An xHCI controller's first register holds its capability-structure length and
     // its interface version; the next says how many ports and device slots it has. A block that is

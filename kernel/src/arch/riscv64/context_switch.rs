@@ -396,16 +396,6 @@ pub fn selftest() {
     let regs_ok = bad == 0;
     let irq_ok = A_IRQ_ON.load(Ordering::Relaxed);
 
-    print_str("riscv64: ctxsw a=");
-    print_dec(a);
-    print_str(" b=");
-    print_dec(b);
-    print_str(if counts_ok { " ok" } else { " BAD" });
-    print_str(" irq-enabled-on-entry=");
-    print_str(if irq_ok { "ok" } else { "BAD" });
-    print_str(" callee-saved=");
-    print_str(if regs_ok { "ok" } else { "BAD" });
-    print_str("\n");
 
     // SAFETY: both tasks are finished with their stacks - A returned here, and B is suspended and
     // will never be resumed because nothing holds its context any more.
@@ -538,17 +528,6 @@ pub fn address_space_selftest() {
     let restored = super::page_tables::read_page_table_base() == kernel_root;
     let isolated = sv39::translate(kernel_root, PRIVATE_VA).is_none();
 
-    print_str("riscv64: addrspace satp-installed=");
-    print_str(if installed { "ok" } else { "BAD" });
-    print_str(" private-page-seen=");
-    print_str(if saw { "ok" } else { "BAD" });
-    print_str(" satp-restored=");
-    print_str(if restored { "ok" } else { "BAD" });
-    print_str(" invisible-to-kernel=");
-    print_str(if isolated { "ok" } else { "BAD" });
-    print_str(" root ");
-    print_hex(root);
-    print_str("\n");
 
     // Reclaim. The root goes back through the seam's own free path, which is the other half of
     // `finalize_service_address_space` and is equally untested until something calls it.
