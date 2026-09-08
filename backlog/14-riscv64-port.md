@@ -389,6 +389,23 @@ signature afterwards.** That is a restructure of a driver that is hardware-prove
 doing deliberately with a way to test it on x86 too, not squeezed in for an emulator. And it serves
 QEMU alone: this board has no SATA, so AHCI will never be its storage.
 
+**And the board answered the PCI question on 2026-09-08:**
+
+```
+riscv64: no pci-host-ecam-generic in the device tree - no PCI
+riscv64: cycle counter readable (rdcycle) - userspace cycle budgets mean what they say
+```
+
+So AHCI can never be this board's storage, and the ECAM work is QEMU-only in practice. The JH7110
+DOES have PCIe controllers, but behind `starfive,jh7110-pcie` - a controller-specific binding with its
+own reset, clock and link-training sequence - not the generic one Linux and this code match on. That
+is a driver, not a property of the tree, and it is a separate project from storage.
+
+The cycle counter is the happier half: `rdcycle` is readable on this board too, so the fix that made
+cycle-denominated waits mean what they say is real on silicon and not an emulator convenience. That
+was the uncertain one - `mcounteren.CY` under OpenSBI v1.2 could have gone either way, which is why it
+is probed rather than assumed.
+
 **What the board would need instead**, and neither is small:
 
 - **SD/eMMC** is a HAZARD, not an option, for the same reason it is on the Pi: the card is the boot
