@@ -309,6 +309,54 @@ impl<'a> Fdt<'a> {
         hz
     }
 
+    /// The ids of every hart the tree says is USABLE, written into `out`, returning how many.
+    ///
+    /// The IDS, not a count and a maximum. Starting a hart needs its number, and on this board the
+    /// numbers are not `0..n`: hart 0 is an S7 monitor core marked `disabled` and the four U74s are
+    /// 1 through 4. Deriving ids from a count would try to start hart 0 - a different core design,
+    /// which the tree explicitly excludes - and skip hart 4 entirely. "Do not assume hart 0" stops
+    /// being a rule to remember only if the ids are read rather than inferred.
+    ///
+    /// Bounded by the caller's array: a machine reporting more harts than fit gets the first `out.len()`
+    /// and the count says how many were taken, so nothing is allocated and nothing overflows.
+    pub fn usable_hart_ids(&self, out: &mut [u32]) -> usize {
+        let mut n = 0usize;
+        let mut cur_id: Option<u32> = None;
+        let mut cur_ok = true;
+        let mut cur_node = "";
+
+        // A `cpu@` node's properties arrive one at a time, so an id is only known to be usable once
+        // the NEXT node begins (or the walk ends) - which is what "banking" the previous one means.
+        let mut bank = |id: Option<u32>, ok: bool, n: &mut usize, out: &mut [u32]| {
+            if let (Some(id), true) = (id, ok) {
+                if *n < out.len() {
+                    out[*n] = id;
+                    *n += 1;
+                }
+            }
+        };
+
+        self.walk(|node, prop, val, _, _| {
+            if !node.starts_with("cpu@") {
+                return false;
+            }
+            if node != cur_node {
+                bank(cur_id, cur_ok, &mut n, out);
+                cur_node = node;
+                cur_id = None;
+                cur_ok = true;
+            }
+            if prop == "reg" {
+                cur_id = be32(val, 0);
+            } else if prop == "status" {
+                cur_ok = val.split(|&c| c == 0).next() == Some(b"okay");
+            }
+            false
+        });
+        bank(cur_id, cur_ok, &mut n, out);
+        n
+    }
+
     /// How many harts the tree says are USABLE, and the highest id among them.
     ///
     /// A `cpu@` node whose `status` is not "okay" is skipped, and that one rule is what keeps this

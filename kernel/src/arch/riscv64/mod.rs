@@ -289,6 +289,11 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
     // Recorded before anything can want it. `a0` is the only place this is true: the device tree
     // disagrees on this board, and there is no interrupt controller to read it back from.
     BOOT_HART.store(hartid as u32, Ordering::Relaxed);
+    // This hart's own identity, in the place every hart keeps it. Set here rather than in `_start`
+    // so there is one line that does it for the boot hart and one for a secondary, each next to the
+    // code that knows the id - and `get_lapic_id` reads the same register on both.
+    // SAFETY: writing `tp` on a kernel with no thread-local storage, before anything reads it.
+    unsafe { core::arch::asm!("mv tp, {}", in(reg) hartid as u64, options(nomem, nostack)) };
     // PARSE BEFORE PRINTING. The device tree states where the UART is and how its registers are
     // laid out, so reading it first is what lets the banner print correctly on a machine nobody
     // compiled for. Doing it the other way round is why a build flag existed at all.
@@ -409,7 +414,10 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
 
     // The memory map the neutral kernel will be handed, printed before it is used. An allocator
     // given a wrong map fails LATER and somewhere else, so the map is stated where it is built.
-    match build_boot_info(&tree, fdt) {
+    // Bound BEFORE the match so it outlives it: the secondary harts are started much later, once the
+    // scheduler's arenas exist, and `start_all_aps` takes the same `BootInfo` every arch's does.
+    let boot_info = build_boot_info(&tree, fdt);
+    match boot_info {
         Some(bi) => {
             for r in bi.memory_map {
                 print_str("riscv64: mem ");
@@ -428,6 +436,22 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             }
 
             USABLE_HARTS.store(harts.max(1), Ordering::Relaxed);
+            // The IDs, not just how many. `hart_start` needs a number, and on this board they are
+            // 1..4 with hart 0 disabled, so counting would name the wrong harts.
+            {
+                let mut ids = [0u32; 8];
+                let n = tree.usable_hart_ids(&mut ids);
+                HART_COUNT.store(n as u32, Ordering::Relaxed);
+                for (i, id) in ids.iter().enumerate().take(n) {
+                    HART_IDS[i].store(*id, Ordering::Relaxed);
+                }
+                print_str("riscv64: usable harts");
+                for id in ids.iter().take(n) {
+                    print_str(" ");
+                    print_dec(*id as u64);
+                }
+                print_str("\n");
+            }
 
             // THE FIRST NEUTRAL SUBSYSTEM TO RUN ON THIS ARCH. `memory::init` is shared code - the
             // same frame allocator x86, arm and aarch64 use - and it is reached here by handing it
@@ -439,17 +463,17 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             // nothing from the MMU, so they run now rather than waiting behind Sv39 - and each one
             // that works is a subsystem this arch did not have to be taught.
             crate::smp::percpu_init(&bi);
+            // This arch's own per-core arena, sized from the same live count. It carries the vector
+            // an SBI IPI cannot.
+            IPI_PENDING.init_with(ap_count() + 1, |_| AtomicU32::new(0));
             print_str("riscv64: percpu arenas sized for ");
             print_dec((ap_count() + 1) as u64);
             print_str(" core(s)
 ");
 
             // Publish this hart's id now the per-core arenas exist, so `current_core_id()` resolves
-            // through a value the machine reported rather than through a default. The board boots on
-            // hart 1, so the default would name a hart the kernel is not running on. The lookup
-            // still falls through to core 0 rather than MATCHING, because no core is marked ready
-            // until there is a scheduler - correct for one hart, and the line to revisit when SBI
-            // HSM starts the others.
+            // through a value the machine reported rather than a default. The board boots on hart 1,
+            // so a default would name a hart the kernel is not running on.
             publish_bsp_lapic_id();
 
             crate::capability::init();
@@ -561,6 +585,18 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
     crate::smp::core::mark_ready(0);
 
+    // RELEASE THE OTHER HARTS, once everything they touch on arrival exists: the kernel's address
+    // space, the per-core arenas, the scheduler's tables and this core's own readiness. A hart
+    // started before any of those reads them half-built, and the failure is a silent one on a core
+    // with no console. Interrupts are enabled here so an arriving hart's first IPI has somewhere to
+    // go; software interrupts are admitted on this hart for the same reason.
+    trap::enable_software_interrupts();
+    // SAFETY: the boot hart, once, with every structure a secondary reads on arrival already built.
+    if let Some(bi) = boot_info.as_ref() {
+        // SAFETY: the boot hart, once, with every structure a secondary reads on arrival built.
+        unsafe { ap_boot::start_all_aps(bi) };
+    }
+
     crate::task::spawn_supervisor();
 
     // HAND THE CORE OVER. Every tick from here is a preemption point rather than the boot's own,
@@ -644,6 +680,7 @@ fn print_hex(v: u64) {
 
 // ---- Boot info (shape shared with x86; a real port fills it from the DTB / UEFI) ----
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct BootInfo {
     pub memory_map: &'static [MemoryRegion],
     pub kernel_phys_start: u64,
@@ -690,6 +727,46 @@ static USABLE_HARTS: AtomicU32 = AtomicU32::new(1);
 /// wrong core on the board. The FDT header's `boot_cpuid_phys` is no help either: it reads 0 on this
 /// board while `a0` and OpenSBI both say 1. The register is the only truth.
 static BOOT_HART: AtomicU32 = AtomicU32::new(0);
+
+/// The usable hart ids the device tree reported, and how many.
+///
+/// The IDS, because `hart_start` needs a number and on this board the numbers are 1..4 - hart 0 is
+/// a disabled S7 monitor core. A count would say "four harts" and an index would name the wrong ones.
+static HART_IDS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+static HART_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Which core id each hart answers to, indexed by hart id.
+///
+/// **A hart cannot look this up.** `lapic_to_core_id` only matches a core already marked READY, and
+/// a hart cannot mark itself ready until it knows which core it is - so asking is circular, and the
+/// lookup's fall-through to 0 makes the circle silent rather than an error: every secondary reported
+/// itself "ready as core 0", four harts scribbled on one core's scheduler state, and the first
+/// service to run died of a capability error that had nothing to do with capabilities.
+///
+/// ARM does not need this because MPIDR tells a core its own number. RISC-V has no such register in
+/// S-mode, so the assignment is made by the hart that does the starting and read by the hart that
+/// was started. Told, not derived.
+const MAX_HART_ID: usize = 8;
+static HART_TO_CORE: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(u32::MAX) }; MAX_HART_ID];
+
+/// Record that `hart` is `core`. Ignores a hart id past the table rather than writing out of bounds;
+/// `start_all_aps` refuses to start such a hart, so the pair stays consistent.
+fn set_hart_core(hart: u32, core: u32) {
+    if (hart as usize) < MAX_HART_ID {
+        HART_TO_CORE[hart as usize].store(core, Ordering::Release);
+    }
+}
+
+/// The core id assigned to `hart`, or `None` if nothing assigned one.
+fn hart_core(hart: u32) -> Option<u32> {
+    if (hart as usize) >= MAX_HART_ID {
+        return None;
+    }
+    match HART_TO_CORE[hart as usize].load(Ordering::Acquire) {
+        u32::MAX => None,
+        c => Some(c),
+    }
+}
 
 pub fn ap_count() -> usize {
     (USABLE_HARTS.load(Ordering::Relaxed).saturating_sub(1)) as usize
@@ -885,14 +962,47 @@ pub mod boot {
     /// # Safety
     /// Architecturally always safe; `unsafe` to match the seam every arch implements.
     pub unsafe fn get_lapic_id() -> u32 {
-        // Single hart for now, so the boot hart's id IS this hart's id. When SBI HSM starts the
-        // others, each will need its own - `tp` is the conventional place to keep it, set by that
-        // hart's own entry, and this becomes a `tp` read. Written down because returning the BOOT
-        // hart's id from a secondary hart would be wrong in exactly the way a default is wrong.
-        super::BOOT_HART.load(core::sync::atomic::Ordering::Relaxed)
+        // `tp`, which each hart sets to its own id at its own entry. RISC-V has no register that
+        // reads back "which hart am I" - `mhartid` is M-mode only - so the id arrives in `a0` once,
+        // at entry, and must be PARKED somewhere per-hart or it is lost. `tp` is the conventional
+        // place, and it is free here because a kernel with no thread-local storage never uses it
+        // (rustc reserves it, so it is never allocated for anything else either).
+        let id: u64;
+        // SAFETY: reading a general register with no side effects.
+        unsafe { core::arch::asm!("mv {}, tp", out(reg) id, options(nomem, nostack)) };
+        id as u32
     }
-    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
+    /// Poke one hart with a vector.
+    ///
+    /// Two steps and the order matters: RECORD the vector, then send. A hart that takes the
+    /// interrupt before the bit is set would find nothing to do and the vector would be lost.
+    ///
+    /// # Safety
+    /// Architecturally safe; `unsafe` to match the seam every arch implements.
+    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {
+        let core = crate::smp::core::lapic_to_core_id(lapic_id) as usize;
+        if core < crate::smp::percpu::num_cores() && super::IPI_PENDING.initialised() {
+            super::IPI_PENDING.get(core).fetch_or(super::ipi_bit(vector), Ordering::Release);
+        }
+        super::sbi::send_ipi(1u64 << (lapic_id as u64 & 63), (lapic_id as u64) & !63);
+    }
+
+    /// Poke every hart but this one.
+    ///
+    /// # Safety
+    /// Architecturally safe; `unsafe` to match the seam every arch implements.
+    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
+        // SAFETY: reading this hart's own id.
+        let me = unsafe { get_lapic_id() };
+        for core in 0..crate::smp::percpu::num_cores() {
+            let hart = crate::smp::core::core_lapic_id(core as u32);
+            if hart == me {
+                continue;
+            }
+            // SAFETY: as `send_ipi_to_lapic`.
+            unsafe { send_ipi_to_lapic(hart, vector) };
+        }
+    }
     /// x86 tells the HARDWARE where a ring-3 interrupt lands by writing `TSS.rsp0`. The RISC-V
     /// equivalent is `sscratch` - and writing it here would be WRONG.
     ///
@@ -1352,6 +1462,7 @@ pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
 pub fn publish_bsp_lapic_id() {
     let id = BOOT_HART.load(Ordering::Relaxed);
     crate::smp::core::set_core_lapic_id(0, id);
+    set_hart_core(id, 0);
     print_str("riscv64: boot hart is ");
     print_dec(id as u64);
     print_str(" (core 0)
@@ -1441,7 +1552,118 @@ pub mod ioapic {
 
 // ---------------------------------------------------------------------------
 pub mod ap_boot {
-    pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
+    use super::*;
+
+    /// Where a secondary hart begins, in the state the firmware leaves it: `satp` zero, no stack, no
+    /// trap vector, `a0` its hart id and `a1` whatever `hart_start` was given as `opaque`.
+    ///
+    /// It has to repeat the work `_start` did, because HSM releases a hart rather than cloning one.
+    /// Naked, and only three instructions of it: a stack must exist before Rust runs, and the id must
+    /// be parked in `tp` before anything asks which hart this is.
+    #[unsafe(naked)]
+    unsafe extern "C" fn ap_entry() -> ! {
+        core::arch::naked_asm!(
+            "mv tp, a0",   // this hart's identity, where `get_lapic_id` looks for it
+            "mv sp, a1",   // the stack `start_all_aps` reserved for it
+            "j  {main}",
+            main = sym ap_main,
+        )
+    }
+
+    /// The Rust half of a secondary hart's bring-up: install the kernel's address space and trap
+    /// vector, then join the scheduler.
+    ///
+    /// ORDER IS THE WHOLE THING. `satp` first, because everything after it - the trap vector's own
+    /// address, the per-core arenas, the scheduler's tables - is only reachable through the kernel's
+    /// map. `stvec` second, so the first fault after that has somewhere to go. Only then does this
+    /// hart say it is ready, because `mark_ready` is what makes other cores start routing work to it.
+    extern "C" fn ap_main(hartid: usize) -> ! {
+        let root = KERNEL_ROOT.load(Ordering::Relaxed);
+        if root == 0 {
+            // The boot hart has not finished building the kernel's map. Nothing this hart can do is
+            // safe, and it cannot report - so park it rather than run without an address space.
+            halt();
+        }
+        // SAFETY: the kernel's own root, built by the boot hart and unchanged since; it maps this
+        // code, this hart's stack (a static in the kernel image) and the trap vector.
+        unsafe { page_tables::write_page_table_base(root) };
+
+        if !trap::init() {
+            // No vector: a fault here would be silent. Say so through the UART, which the map above
+            // makes reachable, and stop this hart rather than run it blind.
+            print_str("riscv64: AP trap vector REFUSED - parking this hart\n");
+            halt();
+        }
+
+        // The core id this hart was ASSIGNED before it was started. Asking `lapic_to_core_id` here
+        // cannot work - see `HART_TO_CORE` - and its answer would be a plausible, wrong 0.
+        let Some(core_id) = hart_core(hartid as u32) else {
+            print_str("riscv64: hart started with no core assignment - parking it\n");
+            halt();
+        };
+        // This hart's own tick. Each hart arms its own `stimecmp` through SBI - there is no shared
+        // periodic timer to inherit - so a hart that skipped this would idle forever.
+        start_timer_this_hart();
+        // Software interrupts too: an IPI is how another core wakes this one, and `sie.SSIE` is what
+        // admits it.
+        trap::enable_software_interrupts();
+
+        crate::smp::core::mark_ready(core_id);
+        crate::kprintln!("smp: hart {} ready as core {}", hartid, core_id);
+        crate::task::scheduler::run(core_id)
+    }
+
+    /// Release every usable hart but this one.
+    ///
+    /// One firmware call each, and no trampoline: SBI HSM is what x86's real-mode `ap_boot` is for.
+    /// A hart that the firmware refuses is REPORTED and skipped - the system continues on the cores
+    /// that did come up (11.3), which is the same rule x86 follows when an AP does not answer.
+    ///
+    /// # Safety
+    /// Must run once, on the boot hart, after the kernel's address space and the per-core arenas
+    /// exist - the harts it starts read both immediately.
+    pub unsafe fn start_all_aps(_boot_info: &BootInfo) {
+        let me = BOOT_HART.load(Ordering::Relaxed);
+        let mut started = 0usize;
+        let n = HART_COUNT.load(Ordering::Relaxed) as usize;
+        for i in 0..n.min(AP_MAX + 1) {
+            let hart = HART_IDS[i].load(Ordering::Relaxed);
+            if hart == me {
+                continue;
+            }
+            if started >= AP_MAX {
+                crate::kprintln!("smp: more harts than reserved stacks ({}) - hart {} not started",
+                                 AP_MAX, hart);
+                break;
+            }
+            // Each secondary gets its own slice of the stack arena. `&raw` rather than a reference,
+            // so no `&mut` to a static is ever created.
+            let base = (&raw mut AP_STACKS) as usize + started * AP_STACK_BYTES;
+            let top = (base + AP_STACK_BYTES) & !0xf;
+            // The core id this hart will answer to, published BEFORE it starts: it calls
+            // `lapic_to_core_id` almost immediately, and an unpublished id would resolve to core 0 -
+            // two harts believing they are the same core, which is the x86 bug this project already
+            // has a name for.
+            if hart as usize >= MAX_HART_ID {
+                crate::kprintln!("smp: hart {} is past the id table - not started", hart);
+                continue;
+            }
+            let core = (started + 1) as u32;
+            // BOTH directions, and both BEFORE the hart runs: the neutral core->hart map so
+            // `lapic_to_core_id` resolves once this hart is ready, and this arch's hart->core map so
+            // the hart can learn which core it is in the first place.
+            crate::smp::core::set_core_lapic_id(core, hart);
+            set_hart_core(hart, core);
+            if sbi::hart_start(hart as u64, ap_entry as *const () as u64, top as u64) {
+                started += 1;
+            } else {
+                crate::kprintln!("smp: firmware refused to start hart {} - continuing without it", hart);
+            }
+        }
+        if started == 0 {
+            crate::kprintln!("smp: no secondary harts started - running single-core");
+        }
+    }
 }
 
 
@@ -1577,6 +1799,33 @@ static NEUTRAL_SCHED: AtomicBool = AtomicBool::new(false);
 /// which the machine can answer on its own.
 static BOOT_TIME: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
+/// Which IPI vectors are pending for each core, one bit per vector.
+///
+/// **RISC-V's IPI carries no vector.** An APIC interrupt says which of 256 things happened; SBI's
+/// `send_ipi` says only "someone poked you". So the vector travels out of band: the sender sets a
+/// bit here for the target and then pokes it, and the receiver drains whatever it finds. A MASK and
+/// not a single value, because two senders can arrive between one hart's poke and its handler, and
+/// the second must not overwrite the first - which would lose a TLB shootdown and leave its
+/// initiator spinning on an acknowledgement that never comes.
+static IPI_PENDING: crate::smp::percpu::PerCore<AtomicU32> = crate::smp::percpu::PerCore::new();
+
+/// Bit position for a vector in `IPI_PENDING`. The three neutral vectors are 0xF0..0xF2.
+#[inline]
+fn ipi_bit(vector: u8) -> u32 {
+    1u32 << (vector & 0x0f)
+}
+
+/// Kernel stacks for the secondary harts, and how far into them each one starts.
+///
+/// A fixed arena rather than an allocation per hart, sized off the source: four secondaries at
+/// 32 KiB each. A hart whose stack could not be found does not start, which is a reported failure
+/// rather than one that runs with a stack pointer nobody chose.
+const AP_STACK_BYTES: usize = 32 * 1024;
+const AP_MAX: usize = 4;
+#[repr(align(16))]
+struct ApStacks([u8; AP_STACK_BYTES * AP_MAX]);
+static mut AP_STACKS: ApStacks = ApStacks([0; AP_STACK_BYTES * AP_MAX]);
+
 /// The KERNEL's own Sv39 root, recorded when paging is enabled.
 ///
 /// **Not "whatever `satp` currently holds".** A service's address space is built by
@@ -1627,6 +1876,57 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
         print_str("riscv64: tick ");
         print_dec(n as u64);
         print_str("\n");
+    }
+}
+
+/// Clear this hart's pending software interrupt.
+///
+/// `sip.SSIP` is writable from S-mode on any SBI 1.0 platform, which is what makes the IPI
+/// acknowledgeable without another firmware call.
+fn clear_software_interrupt() {
+    // SAFETY: clearing one bit of `sip`, which acknowledges an interrupt already taken.
+    unsafe {
+        core::arch::asm!("csrc sip, {ssip}", ssip = in(reg) 1u64 << 1, options(nostack));
+    }
+}
+
+/// Run whatever vectors were left for this core, then leave the mask empty.
+///
+/// `swap(0)` rather than read-then-clear: a sender adding a vector between the two would have it
+/// erased. Taking the whole mask atomically means the worst case is a vector handled twice, which
+/// every one of them tolerates, rather than one dropped, which none of them do.
+fn drain_ipis() {
+    if !IPI_PENDING.initialised() {
+        return;
+    }
+    // SAFETY: reading this hart's own id.
+    let core = crate::smp::core::lapic_to_core_id(unsafe { boot::get_lapic_id() }) as usize;
+    if core >= crate::smp::percpu::num_cores() {
+        return;
+    }
+    let pending = IPI_PENDING.get(core).swap(0, Ordering::Acquire);
+    for vector in [
+        crate::smp::ipi::vectors::WAKE_RECEIVER,
+        crate::smp::ipi::vectors::TLB_SHOOTDOWN,
+        crate::smp::ipi::vectors::SCHEDULER_TICK,
+    ] {
+        if pending & ipi_bit(vector) != 0 {
+            // SAFETY: the neutral IPI handler, called with interrupts masked by the trap and on this
+            // hart's kernel stack - the same context every other port's IPI stub provides.
+            unsafe { crate::smp::ipi::ipi_handler(vector) };
+        }
+    }
+}
+
+/// Arm THIS hart's tick at the quantum already established by the boot hart.
+///
+/// Every hart owns its own `stimecmp` - there is no shared periodic source to inherit - so a
+/// secondary that skipped this would never be preempted and would idle forever with work queued.
+fn start_timer_this_hart() {
+    let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
+    if interval != 0 {
+        sbi::set_timer(sbi::time().wrapping_add(interval));
+        trap::enable_timer_interrupts();
     }
 }
 

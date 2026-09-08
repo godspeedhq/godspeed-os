@@ -149,6 +149,20 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     let interrupt = scause >> 63 != 0;
     let code = scause & 0x7fff_ffff_ffff_ffff;
 
+    if interrupt && code == 1 {
+        // A SUPERVISOR SOFTWARE INTERRUPT: another hart poked this one. It carries no vector - SBI's
+        // `send_ipi` says only "someone poked you" - so the vectors were left in this core's pending
+        // mask and are drained here.
+        //
+        // The pending bit in `sip` is cleared FIRST. Clearing it after would race with a sender who
+        // set a new vector in between: the bit would be wiped while the mask still held work, and the
+        // hart would not be interrupted again to notice. Clearing first can only cause a spurious
+        // wake, which costs a loop and is always safe.
+        super::clear_software_interrupt();
+        super::drain_ipis();
+        return;
+    }
+
     if interrupt && code == 5 {
         // Supervisor timer. Acknowledged by SCHEDULING THE NEXT ONE: there is no "clear" bit for
         // it, and leaving the deadline in the past re-raises the interrupt immediately - a live
@@ -449,6 +463,18 @@ pub fn init() -> bool {
 /// Two enables, and both are needed: `sie.STIE` admits the timer specifically, `sstatus.SIE` admits
 /// interrupts at all. Setting one without the other is a machine that either never ticks or ticks
 /// for everything.
+/// Admit inter-processor interrupts on this hart.
+///
+/// Separate from the timer because the two are needed at different moments: the boot hart wants the
+/// timer long before any other hart exists, and a secondary wants both the instant it starts.
+pub fn enable_software_interrupts() {
+    // SAFETY: setting `sie.SSIE`. Sound because `stvec` is installed before any hart enables this -
+    // an IPI admitted with no vector installed would have nowhere to go.
+    unsafe {
+        core::arch::asm!("csrs sie, {ssie}", ssie = in(reg) 1u64 << 1, options(nostack));
+    }
+}
+
 pub fn enable_timer_interrupts() {
     // SAFETY: setting the two enable bits. Sound because `stvec` is already installed - doing this
     // first would mean the first tick had nowhere to go.

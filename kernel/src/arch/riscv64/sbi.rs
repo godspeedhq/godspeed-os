@@ -24,6 +24,24 @@ const FID_PROBE_EXTENSION: u64 = 3;
 pub const EXT_TIME: u64 = 0x5449_4D45;
 const FID_SET_TIMER: u64 = 0;
 
+/// Hart State Management ("HSM"), which is how a secondary hart is STARTED on RISC-V.
+///
+/// There is no trampoline to write and no INIT/SIPI dance to time. OpenSBI parks every hart but the
+/// boot one, and this asks it to release a named hart at a named address - so the whole of x86's
+/// `ap_boot.rs` real-mode trampoline is replaced by one firmware call. What the firmware will NOT do
+/// is set up that hart's stack, page table or trap vector; those arrive in the same state the boot
+/// hart did, which is why the AP entry has to repeat the work `_start` does.
+pub const EXT_HSM: u64 = 0x0048_534D;
+const FID_HART_START: u64 = 0;
+
+/// Inter-processor interrupts ("sPI").
+///
+/// **The IPI carries no vector**, unlike an APIC's, so it says only "someone poked you". The vector
+/// has to travel out of band, which is what the per-core pending mask in `arch/riscv64/mod.rs` is
+/// for. Named here because it is the difference that shapes the receiving side.
+pub const EXT_IPI: u64 = 0x0073_5049;
+const FID_SEND_IPI: u64 = 0;
+
 /// Result of an SBI call: a firmware error code and a value.
 pub struct SbiRet {
     pub error: i64,
@@ -91,4 +109,58 @@ pub fn time() -> u64 {
     // the trap vector reports the answer if it is not.
     unsafe { core::arch::asm!("csrr {}, time", out(reg) t, options(nomem, nostack)) };
     t
+}
+
+/// Ask the firmware to start `hartid` at `start_addr`, with `opaque` handed to it in `a1`.
+///
+/// Returns false on any firmware error - hart already started, invalid address, extension absent -
+/// rather than assuming success, because a hart that never starts is otherwise indistinguishable
+/// from one that started and hung, and those have opposite fixes.
+///
+/// `start_addr` is a PHYSICAL address: the hart begins with `satp` zero, exactly as the boot hart
+/// did, so it is not running under the kernel's page table until it installs it itself.
+pub fn hart_start(hartid: u64, start_addr: u64, opaque: u64) -> bool {
+    if !probe(EXT_HSM) {
+        return false;
+    }
+    // SAFETY: HSM function 0 (HART_START) with a real hart id and a physical entry address in this
+    // kernel's image. It cannot affect the calling hart.
+    let r = unsafe { call3(EXT_HSM, FID_HART_START, hartid, start_addr, opaque) };
+    r.error == 0
+}
+
+/// Send an interrupt to every hart selected by `mask`, based at `mask_base`.
+///
+/// Returns false if the firmware refuses or the extension is absent, so a lost wake is reported
+/// rather than assumed delivered.
+pub fn send_ipi(mask: u64, mask_base: u64) -> bool {
+    if !probe(EXT_IPI) {
+        return false;
+    }
+    // SAFETY: IPI function 0 (SEND_IPI). It raises a supervisor software interrupt on the selected
+    // harts and does nothing else.
+    let r = unsafe { call(EXT_IPI, FID_SEND_IPI, mask, mask_base) };
+    r.error == 0
+}
+
+/// Three-argument SBI call, for the one extension that needs a third.
+///
+/// # Safety
+/// Same contract as `call`: the firmware routine invoked is decided entirely by `eid`/`fid`.
+pub unsafe fn call3(eid: u64, fid: u64, a0: u64, a1: u64, a2: u64) -> SbiRet {
+    let (err, val): (i64, i64);
+    // SAFETY: contract delegated to the caller above; the register assignment is the SBI calling
+    // convention, which passes arguments in a0.. and returns (error, value) in a0/a1.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") a0 as i64 => err,
+            inlateout("a1") a1 as i64 => val,
+            in("a2") a2,
+            in("a6") fid,
+            in("a7") eid,
+            options(nostack)
+        );
+    }
+    SbiRet { error: err, value: val }
 }
