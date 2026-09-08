@@ -300,6 +300,29 @@ Everything above ran on the VisionFive 2 Lite, in two sittings, with ZERO faults
 - `xhci` spawn FAILS and says so: no PCI on this board, and the service is x86/aarch64-shaped.
   Expected, and it does not stop the boot.
 
+### HARDWARE-VERIFIED, end to end (2026-09-08, VisionFive 2 Lite)
+
+Everything below has now run on the board, not only in QEMU:
+
+```
+riscv64: usable harts 1 2 3 4
+riscv64: boot hart is 1 (core 0)
+smp: hart 2 ready as core 1 / hart 3 as core 2 / hart 4 as core 3
+cores: 4
+chaos max-carnage all-services 10:
+  total: 10 rounds, 53 kills, 43 flooded, 10 mem-pressure, 10 spawns. kernel: alive.
+  kernel: supervisor died   (x3, each respawned by the kernel)
+  supervisor: adopted running events / fs / shell / nic-driver / net-stack
+```
+
+Zero kernel panics, zero wedges, zero kernel faults. The supervisor being killed and the KERNEL
+respawning it - which then ADOPTS the still-running services instead of duplicating them - is
+CLAUDE.md Test 15 holding here: the unkillable set is `{kernel}` alone on this ISA too.
+
+**The hart ids mattered on the day.** QEMU numbers its harts 0..3, so inferring them from a count
+works there by luck; this board numbers them 1..4 with hart 0 a disabled S7 monitor core. Reading the
+ids from the device tree is what made the first four-core boot work rather than the second.
+
 ### SMP, and the three things this ISA does not hand you (2026-09-08)
 
 Four harts, four cores, services scheduled across them. SBI HSM replaces the whole of x86's

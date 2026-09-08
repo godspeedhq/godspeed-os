@@ -1179,6 +1179,56 @@ is why the first hardware boot should be the smallest thing that can possibly fa
 died in one afternoon, and each one announced itself by name only because there was nothing else in
 the kernel for them to hide behind.
 
+## 2026-09-08 - The day a borrowed mechanism brought someone else's memory map
+
+GodspeedOS became a system on RISC-V today rather than a kernel that boots: four harts, ten services,
+a shell that answers, a fault that kills a task instead of the machine, and its own chaos suite run to
+completion on real silicon - 53 kills across ten rounds, the supervisor itself killed three times and
+respawned by the kernel, which then adopted the services still running rather than duplicating them.
+
+None of that is the thing worth writing down. This is: **four separate bugs today were the same fact
+about this machine, and I reached for x86's shape first every time.**
+
+On x86 the kernel lives higher-half. Userspace is low, the kernel is high, and nothing in the code
+says so - it is a property of the LAYOUT, invisible at every call site that depends on it. On RISC-V
+this kernel is identity-mapped from zero and a service links at 0x400000, so the two share an address
+range. Every place x86 had quietly been using "which half" as the boundary, I inherited a check that
+compiled, ran, and answered wrongly:
+
+- The syscall-pointer check rejects a kernel address on x86 because of where the kernel is. Here it
+  answers *true* for the kernel's own code - correctly, since a task may legitimately map its own page
+  at that virtual address.
+- Building a task's address space by copying top-level entries works on x86 because the halves cannot
+  collide. Here it replaced the supervisor's own text with a kernel mapping, and the first thing the
+  first service ever did was fault on an address that WAS mapped, by an entry it never asked for.
+- Reclaiming a dead task by walking "the low half" is the same assumption a third time. Here it would
+  hand the kernel's UART mapping back to the frame allocator.
+
+In all three the answer is the same and it is not an index: the `U` bit. One fact about the port,
+three places it decides everything, and it took three separate failures to see it was one fact.
+Section 26.14 already says to borrow the silicon's requirement and never the other system's model.
+What I had not understood is that a memory map is part of that model even when no line of code
+mentions it. Portable code can carry an unportable assumption in complete silence, because the
+assumption lives in the addresses rather than in the instructions.
+
+And the fourth was yesterday's lesson wearing a different hat. A hart asked which core it was; the
+lookup requires the core to be marked ready, a hart cannot be ready before it knows its core, and the
+function **falls through to 0**. So all four harts reported themselves core 0, four of them wrote on
+one core's scheduler state, and the first service died of a capability error that had nothing to do
+with capabilities. Zero again: not absent, not an error - a plausible answer, from a function with no
+way to say "I do not know".
+
+A quieter version of the same thing cost several hundred restarts. `reclaim_user_frames` was a stub
+returning 0, and the kill path PRINTS what it returns. `freed 0 frames` reads as *this task had
+nothing*; it meant *nothing was reclaimed*. A service faulting in a restart loop leaked its whole
+address space every cycle, and the machine died of an allocation failure a long way from the cause.
+
+**What I came to understand:** a stub that returns a NUMBER is not neutral, and neither is a lookup
+that falls through to one. Absence has to be expressible - `None`, an error, a refusal - or every
+caller downstream treats a placeholder as data and the failure surfaces somewhere it cannot be traced
+back from. And when porting, the code that compiles unchanged is exactly the code to distrust: it
+brought its author's address space with it, and that is the part no compiler checks.
+
 ## The Named Bugs - the teachers
 
 Some bugs are worth naming, because a name turns a failure into shorthand. Years from now someone
