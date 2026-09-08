@@ -612,12 +612,26 @@ fn pixel_clock_on(vout: u64) {
     super::print_str("\n");
 }
 
+/// Clear the framebuffer to black.
+///
+/// **This used to paint eight colour bars, and they did their job.** While the screen was dark they
+/// were the only thing that could have distinguished a wrong channel order from no picture at all,
+/// which is a mistake the serial console cannot see. Now that there is a picture the bars are just
+/// something to look at before the boot log arrives, and a machine that starts by showing a test
+/// pattern is telling the user about its own bring-up rather than about itself.
+fn paint_test_pattern(fb: &mut [u8]) {
+    for b in fb.iter_mut() {
+        *b = 0;
+    }
+}
+
 /// Fill the framebuffer with eight colour bars.
 ///
 /// Not decoration: it is the only thing that can tell us, from across the room, which byte of a pixel
 /// is which. Text would prove the controller is scanning; bars in the wrong order would prove the
 /// channel shifts are wrong, and that is a mistake the serial console cannot see.
-fn paint_test_pattern(fb: &mut [u8]) {
+#[allow(dead_code)]
+fn paint_colour_bars(fb: &mut [u8]) {
     // Written with the top byte set even though the format now ignores it: a colour that is opaque
     // in its own bytes cannot be made invisible by a register somewhere else, and the first version
     // of these bars was invisible for exactly that reason.
@@ -1593,10 +1607,9 @@ pub fn adopt_as_boot_console() {
     // Only NOW does the serial path start mirroring: a byte painted before `bootcon::init` would be
     // drawn through a console that has no framebuffer yet.
     super::screen_ready();
-    // DELIBERATELY NOT CLEARED. The colour bars painted before the mode set stay under the text, so
-    // the screen carries three distinguishable answers instead of one: bars with text on them means
-    // the whole path works; bars alone means the console is not drawing; a black but LIT screen means
-    // the controller is scanning memory it cannot really see, which is what a cache-coherence problem
-    // looks like from the sofa. Once the path is proven this goes back to a clean screen.
+    crate::bootcon::clear_and_home();
+    // Cleared, now that the path is proven. While it was not, the screen deliberately kept whatever
+    // had been painted under the text so that it carried three distinguishable answers at once
+    // instead of one - which is what turned "still black" from a dead end into a measurement.
     super::print_str("riscv64: display - the boot console now draws to the screen\n");
 }
