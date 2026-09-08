@@ -109,6 +109,50 @@ fn uart_thr(b: u8) {
     }
 }
 
+/// Held across a whole string so two harts cannot interleave their output.
+///
+/// **Four cores turned the log into a hazard.** With one hart, `print_str` looping over `putc` was
+/// fine by construction. With four, a line from one hart lands inside a line from another, character
+/// by character - observed the first time all four came up:
+///
+/// ```text
+/// srimpsc:v h64ar: t en3 tereriadngy  tashe c sorche e2d
+/// ```
+///
+/// which is `smp: hart 3 ready as core 2` and `riscv64: entering the scheduler` woven together. That
+/// is worse than ugly. The log is the primary instrument on this port - there is no debugger and no
+/// display - and this project has already had a spliced line make a test REPORT PASS on output that
+/// was not what the test produced. An instrument that corrupts what it measures is the worst kind.
+///
+/// The neutral logger already stages a whole message and flushes it once for exactly this reason, so
+/// what was missing was only this side of the bargain: the arch taking the lock ONCE for the string
+/// rather than per byte. Per-byte locking would still let two lines interleave in the gaps.
+static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Spins before giving up and writing anyway.
+///
+/// **Bounded, and it proceeds on expiry rather than waiting.** A hart that dies holding this lock
+/// must not silence the machine - the output that would be lost is exactly the output explaining why
+/// it died. So a contended writer eventually writes regardless, accepting a spliced line in the case
+/// where the alternative is no line at all. Same trade x86 makes, for the same reason.
+const SERIAL_LOCK_SPIN_CAP: u32 = 2_000_000;
+
+/// Take the lock if it can be had within the bound. Returns whether it was.
+fn serial_lock_acquire() -> bool {
+    let mut t = 0u32;
+    while t < SERIAL_LOCK_SPIN_CAP {
+        if SERIAL_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        core::hint::spin_loop();
+        t += 1;
+    }
+    false
+}
+
 /// LSR bit 5: transmit holding register empty.
 const LSR_THRE: u8 = 1 << 5;
 
@@ -697,10 +741,10 @@ fn fdt_total_size(p: *const u8) -> Option<u32> {
     if magic == 0xd00d_feed { Some(total) } else { None }
 }
 
+/// The boot's own output, through the same one-hold path as everything else - so a boot line and a
+/// service's log line cannot interleave either.
 fn print_str(s: &str) {
-    for &b in s.as_bytes() {
-        putc(b);
-    }
+    serial_write_bytes_lockfree(s.as_bytes());
 }
 
 fn print_dec(mut v: u64) {
@@ -902,8 +946,31 @@ pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
 // ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
-pub fn serial_write_byte(b: u8) { putc(b); }
-pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { putc(b); } }
+/// One byte, under the lock. Used for single characters; a whole message goes through the function
+/// below so it cannot be split.
+pub fn serial_write_byte(b: u8) {
+    let got = serial_lock_acquire();
+    putc(b);
+    if got {
+        SERIAL_LOCK.store(false, Ordering::Release);
+    }
+}
+
+/// A whole string, in ONE lock hold.
+///
+/// The name says lock-free and the neutral logger's comment says "a single `SERIAL_LOCK` hold" - the
+/// second is the contract. It means free of the KERNEL's locks, not of this one: the arch is the only
+/// place that knows the device is a single shared resource, so serialising it is this function's job
+/// and doing it per byte would leave exactly the gaps two harts interleave through.
+pub fn serial_write_bytes_lockfree(s: &[u8]) {
+    let got = serial_lock_acquire();
+    for &b in s {
+        putc(b);
+    }
+    if got {
+        SERIAL_LOCK.store(false, Ordering::Release);
+    }
+}
 /// Console output for a SERVICE - the path the shell's prompt and its echo take.
 ///
 /// The kernel's own `kprintln` reaches the UART through `serial_write_byte`, which is why boot output
