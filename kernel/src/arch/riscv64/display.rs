@@ -243,10 +243,19 @@ fn reset_deassert(base: u64, assert_off: usize, status_off: usize, id: u32) -> b
 
     let hz = super::timebase_hz() as u64;
     let deadline = super::sbi::time().wrapping_add(if hz == 0 { 100_000 } else { hz / 100 });
+    // DEASSERTED IS THE BIT SET, not clear. The reference driver computes its completion value as
+    // `done = 0` and then, for a deassert, `done ^= mask` - so it waits for the status bit to be
+    // ONE. Reading it as zero-means-released inverts the test, and the board said so precisely:
+    // `assert 0xe7e7fe00->0xe7e7f600 status 0x180009ff` - the write had landed, the status bit was
+    // set, and both resets had in fact released while this waited out its bound calling them stuck.
+    //
+    // The status words being mostly ONES is the same fact from the other side: nearly everything on
+    // a running SoC is out of reset, which is impossible to read as "asserted" once you notice the
+    // machine is running.
     let mut status = 0u32;
     while super::sbi::time() < deadline {
         status = mmio_read(base, status_off + word);
-        if status & mask == 0 {
+        if status & mask == mask {
             return true;
         }
     }
