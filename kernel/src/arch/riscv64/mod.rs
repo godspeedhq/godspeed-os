@@ -1297,6 +1297,16 @@ pub(super) fn ccache_init(base: u64, zero_dev: u64) {
     CCACHE_BYTES_PER_WAY.store(banks * sets * block, Ordering::Relaxed);
     CCACHE_MAX_WAY.store(max_way, Ordering::Relaxed);
 
+    // TIME IT ONCE, because everything after this is a judgement about how often the flush can be
+    // afforded, and that judgement should not rest on a guess. The first pass is also the warm-up,
+    // so the one that is timed is the second.
+    ccache_flush_all();
+    let t0 = sbi::time();
+    ccache_flush_all();
+    let ticks = sbi::time().wrapping_sub(t0);
+    let rate = TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
+    CCACHE_FLUSH_US.store(if rate == 0 { 0 } else { ticks * 1_000_000 / rate }, Ordering::Relaxed);
+
     print_str("riscv64: last-level cache ");
     print_dec(banks * sets * ways * block / 1024);
     print_str(" KiB, ");
@@ -1305,7 +1315,48 @@ pub(super) fn ccache_init(base: u64, zero_dev: u64) {
     print_dec(max_way + 1);
     print_str(" enabled), ");
     print_dec(block);
-    print_str(" byte lines - flushable\n");
+    print_str(" byte lines, a full flush costs ");
+    print_dec(CCACHE_FLUSH_US.load(Ordering::Relaxed));
+    print_str(" us\n");
+}
+
+/// How long one whole-cache flush takes, in microseconds. MEASURED at boot, because the publish rate
+/// below is a trade against it and a trade against a guess is not a trade.
+static CCACHE_FLUSH_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// Ticks since the framebuffer was last published.
+static FB_PUBLISH_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
+/// One publish every this many 10 ms ticks - twenty times a second, which is faster than a terminal
+/// needs in order to feel immediate.
+const FB_PUBLISH_TICKS: usize = 5;
+
+/// Publish the framebuffer on behalf of whoever is drawing on it.
+///
+/// **This exists because this SoC cannot give USERSPACE a coherent framebuffer, and once the screen
+/// has been granted away the kernel is the only thing left that can fix it.** Every other port
+/// answers this by mapping the framebuffer NON-CACHEABLE into the `console` service - that is what
+/// `task/mod.rs` says it does and what the ARM ports do - and a page-based memory type is precisely
+/// what this part does not have. `Svpbmt` is absent from its ISA and there is no other way to say it,
+/// so the service's writes land in a write-back cache the display controller cannot see into and the
+/// screen shows whatever was in memory before.
+///
+/// The kernel's own drawing does not need this: `fb_commit` publishes after every rectangle. This is
+/// only for the period after the grant, when the writer is a service that neither knows nor should
+/// know that this machine has a cache with an opinion about its pixels.
+///
+/// The cost is real and is stated rather than hidden (26.4): a full flush, twenty times a second,
+/// emptying a two megabyte cache that everything else on the machine was using. The rate is a
+/// deliberate trade and the flush's measured cost is printed at boot so it can be checked.
+fn publish_framebuffer_on_tick() {
+    if CCACHE_BASE.load(Ordering::Relaxed) == 0 || !display::framebuffer_is_live() {
+        return;
+    }
+    let n = FB_PUBLISH_COUNTDOWN.load(Ordering::Relaxed);
+    if n + 1 < FB_PUBLISH_TICKS {
+        FB_PUBLISH_COUNTDOWN.store(n + 1, Ordering::Relaxed);
+        return;
+    }
+    FB_PUBLISH_COUNTDOWN.store(0, Ordering::Relaxed);
+    ccache_flush_all();
 }
 
 /// Push every dirty line in the last-level cache out to memory.
@@ -2534,6 +2585,8 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
     // the task. That works because the frame is on the task's own kernel stack, which the context
     // switch saves and restores as `sp` - which is the whole reason the `sscratch` latch had to exist
     // before this line could.
+    publish_framebuffer_on_tick();
+
     if NEUTRAL_SCHED.load(Ordering::Relaxed) {
         // SAFETY: the neutral preemption entry, reached only from this handler, with interrupts
         // masked by the trap and running on the interrupted task's kernel stack - the same contract

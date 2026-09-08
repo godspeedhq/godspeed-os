@@ -757,6 +757,10 @@ pub fn mode_set() -> bool {
     super::print_dec(frames as u64);
     super::print_str(" pages\n");
     paint_test_pattern(fb);
+    // PUBLISH THEM. Eight megabytes written through a two megabyte cache leaves the last two dirty,
+    // and nothing else in this function would ever push them out - which is the corrupted band that
+    // was on the television, in the part of the screen written last.
+    super::fb_commit(0, 0, 0, 0, 0, 0, 0);
 
     pixel_clock_on(vout);
 
@@ -1540,6 +1544,17 @@ pub fn hdmi_on() -> bool {
 }
 
 // ============================ stage six: text on the screen ============================
+
+/// Whether there is a live framebuffer at all.
+///
+/// The periodic publish is gated on this rather than on WHO owns the screen, deliberately. Knowing
+/// that the `console` service has taken the grant would need a hook in neutral code, and it would buy
+/// only the boot's few seconds of redundant flushing - during which the kernel's own `fb_commit` is
+/// already publishing after every rectangle anyway. A simpler condition that is sometimes redundant
+/// beats a precise one that reaches outside this directory to be told the truth.
+pub(super) fn framebuffer_is_live() -> bool {
+    FB_PHYS.load(Ordering::Relaxed) != 0
+}
 
 /// Give the framebuffer to the kernel's boot/panic console.
 ///
