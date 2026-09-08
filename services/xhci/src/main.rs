@@ -3758,10 +3758,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // ours that is wrong. The cycle state comes with it, which matters just as much: a cursor in
         // the right place with the wrong cycle bit is a TRB the controller will not execute either.
         let (mut disk_hub_cur, mut disk_hub_pcs) = match disk.as_ref() {
-            Some(d) => match ep0_hw_dequeue(&dma, d.hub_dev as usize, ctx_size, EP0_RING_BYTES) {
-                Some((off, cyc)) => (off, cyc),
-                None => (d.hub_off, 1u32),
-            },
+            Some(d) => {
+                let hw = ep0_hw_dequeue(&dma, d.hub_dev as usize, ctx_size, EP0_RING_BYTES);
+                ctx.log_fmt(format_args!(
+                    "xhci: [cursor] disk hub_dev {} recorded {:#x}, hardware {}",
+                    d.hub_dev,
+                    d.hub_off,
+                    match hw {
+                        Some((off, _)) => off,
+                        None => usize::MAX,
+                    }
+                ));
+                match hw {
+                    Some((off, cyc)) => (off, cyc),
+                    None => (d.hub_off, 1u32),
+                }
+            }
             None => (0usize, 1u32),
         };
         // One-shot latches so the mode is stated once each way, not on every pass.
@@ -3799,13 +3811,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Same rule as the disk's cursor above: the controller's TR Dequeue Pointer if it will
             // give one, our recorded `hub_off` only as a fallback. This is the HID half of the same
             // bug - the probes that stopped being answered are these.
-            match ep0_hw_dequeue(&dma, devs[d].hub_dev as usize, ctx_size, EP0_RING_BYTES) {
+            //
+            // SAY WHAT THE HARDWARE SAID, once per pass. Reading the dequeue pointer did not unfreeze
+            // the probe counter, and there are three quite different reasons that could be - the read
+            // returned nothing and we fell back to the same wrong number; it returned the same number,
+            // so the cursor was never the fault; or it returned a DIFFERENT number and the probes
+            // still stall, which moves the fault off the cursor entirely. Those have different fixes
+            // and no way to tell them apart from outside, which is how this bug has survived since
+            // August.
+            let hw = ep0_hw_dequeue(&dma, devs[d].hub_dev as usize, ctx_size, EP0_RING_BYTES);
+            match hw {
                 Some((off, cyc)) => {
                     hub_cur[d] = off;
                     hub_pcs[d] = cyc;
                 }
                 None => hub_cur[d] = devs[d].hub_off,
             }
+            ctx.log_fmt(format_args!(
+                "xhci: [cursor] hid {} hub_dev {} recorded {:#x}, hardware {}",
+                d,
+                devs[d].hub_dev,
+                devs[d].hub_off,
+                match hw {
+                    Some((off, cyc)) => {
+                        let _ = cyc;
+                        off
+                    }
+                    None => usize::MAX,
+                }
+            ));
         }
         // Two HIDs behind the SAME hub (a keyboard AND a mouse on one back-port hub) share that hub's
         // ONE EP0 control ring, so their downstream GET_STATUS polls MUST advance ONE monotonic cursor -
