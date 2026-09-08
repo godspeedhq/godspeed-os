@@ -551,6 +551,15 @@ const PROBE_ANSWER_MS: u64 = 10;
 /// unbounded drain running forever, and while it runs the USB poll loop is NOT polling: the keyboard
 /// stops. The event drain in this file already carries this exact bound and this exact reasoning;
 /// the message drain is the same shape with a different producer, and was missing it.
+/// How long to let the root ports settle after starting the controller before believing a census
+/// that says nothing is attached.
+///
+/// Two hundred milliseconds: the USB 2.0 spec allows a hundred for a port to report a connection
+/// after power is valid, and this is after a controller reset rather than a cold power-up, so double
+/// it and stop. It is a bound on a WAIT, not a guess at a duration - the loop returns the instant any
+/// port reports a connection, so the only machine that pays it in full is one with nothing plugged in.
+const ROOT_PORT_SETTLE_MS: u64 = 200;
+
 const MSG_DRAIN_MAX: u32 = 256;
 
 // 10, cut from 50, because the budget is spent WAITING FOR AN ANSWER THAT DOES NOT COME.
@@ -3285,6 +3294,38 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ev_idx = 0usize;
         let mut ev_cycle = 1u32;
         let mut cmd_idx = 0usize;
+
+        // --- LET THE ROOT PORTS SETTLE BEFORE BELIEVING THEM ---
+        //
+        // A root port does not report a connection the instant the controller starts. It leaves reset
+        // in RxDetect and takes tens of milliseconds to see what is attached, so a census sampled
+        // immediately after `CMD_RS` reads zero on a port that has a device soldered to it.
+        //
+        // **That is a real fault, not a cosmetic one, and it is asymmetric in a way that hid it.** On
+        // the VisionFive 2, whose four USB-A sockets hang off a hub soldered to the board, the boot
+        // census read `connected=0` on both root ports and the driver recovered six hundred
+        // milliseconds later - but the census after a HOT-UNPLUG read zero in the same millisecond as
+        // the reset that preceded it, concluded the machine had no USB at all, and went to "waiting
+        // for a connection" with a hub physically attached that it had just decided was not there.
+        // The keyboard never came back, and neither did the USB disk.
+        //
+        // Bounded, and it only costs anything when there is nothing to find: it returns the moment any
+        // port reports a connection, so a machine with a device attached pays a few milliseconds and a
+        // machine with none pays the full wait once per pass rather than mis-reporting instantly. A
+        // port that is genuinely empty still reads zero at the end, and the census below still says so.
+        {
+            let any_connected = || {
+                (1..=max_ports).any(|p| {
+                    mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0
+                })
+            };
+            let t0 = ctx.read_tsc();
+            while !any_connected()
+                && ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(ROOT_PORT_SETTLE_MS)
+            {
+                ctx.sleep(ctx.duration_cycles(1));
+            }
+        }
 
         // --- Port census (diagnostic) ---
         // Log EVERY root-hub port's PORTSC, connected or not, before binding. This
