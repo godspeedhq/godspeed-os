@@ -502,6 +502,9 @@ const DC_FRAMEBUFFER_WATER_MARK: usize = 0x1ce8;
 const DC_FRAMEBUFFER_CONFIG_EX: usize = 0x1cc0;
 const DC_FRAMEBUFFER_TOP_LEFT: usize = 0x24d8;
 const DC_FRAMEBUFFER_BOTTOM_RIGHT: usize = 0x24e0;
+const DC_FRAMEBUFFER_SRC_GLOBAL_COLOR: usize = 0x2500;
+const DC_FRAMEBUFFER_DST_GLOBAL_COLOR: usize = 0x2508;
+const DC_FRAMEBUFFER_BLEND_CONFIG: usize = 0x2510;
 
 const DC_DISPLAY_DITHER_CONFIG: usize = 0x1410;
 const DC_DISPLAY_PANEL_CONFIG: usize = 0x1418;
@@ -514,10 +517,17 @@ const DC_DISPLAY_DPI_CONFIG: usize = 0x14b8;
 const DC_DISPLAY_PANEL_START: usize = 0x1ccc;
 const DC_DISPLAY_DP_CONFIG: usize = 0x1cd0;
 
-/// Pixel format 6 in the controller's table: 8 bits each of alpha, red, green and blue, in that order
-/// within a 32-bit word - so a little-endian `u32` written as `0x00RR_GGBB` puts blue at the low
-/// byte, which is the same layout the boot console already speaks on every other port.
-const FORMAT_A8R8G8B8: u32 = 6;
+/// Pixel format 5 in the controller's table: an IGNORED byte, then 8 bits each of red, green and
+/// blue, so a little-endian `u32` written as `0xRRGGBB` puts blue at the low byte - the layout the
+/// boot console already speaks on every other port.
+///
+/// **Format 6 is the same layout with the top byte read as ALPHA, and choosing it is why the screen
+/// was black.** The kernel's console writes red, green and blue and leaves the fourth byte alone, so
+/// every pixel it draws carries alpha zero - fully transparent. The controller composited exactly
+/// what it was told to and showed the background colour, which is black, on a display that was
+/// scanning perfectly at 60 Hz into a television that had been reporting itself connected all along.
+/// Nothing was broken; the picture was invisible on purpose.
+const FORMAT_X8R8G8B8: u32 = 5;
 /// The pixel interface: 5 is 24-bit RGB, which is what an HDMI transmitter wants.
 const DPI_RGB888: u32 = 5;
 /// The SAME choice in the display-port config register, which numbers its formats differently: 2
@@ -604,15 +614,18 @@ fn pixel_clock_on(vout: u64) {
 /// is which. Text would prove the controller is scanning; bars in the wrong order would prove the
 /// channel shifts are wrong, and that is a mistake the serial console cannot see.
 fn paint_test_pattern(fb: &mut [u8]) {
+    // Written with the top byte set even though the format now ignores it: a colour that is opaque
+    // in its own bytes cannot be made invisible by a register somewhere else, and the first version
+    // of these bars was invisible for exactly that reason.
     const BARS: [u32; 8] = [
-        0x00ff_ffff, // white
-        0x00ff_ff00, // yellow
-        0x0000_ffff, // cyan
-        0x0000_ff00, // green
-        0x00ff_00ff, // magenta
-        0x00ff_0000, // red
-        0x0000_00ff, // blue
-        0x0000_0000, // black
+        0xffff_ffff, // white
+        0xffff_ff00, // yellow
+        0xff00_ffff, // cyan
+        0xff00_ff00, // green
+        0xffff_00ff, // magenta
+        0xffff_0000, // red
+        0xff00_00ff, // blue
+        0xff00_0000, // black
     ];
     let bar_w = H_ACTIVE as usize / BARS.len();
     for y in 0..V_ACTIVE as usize {
@@ -803,13 +816,23 @@ pub fn mode_set() -> bool {
     dc_write(DC_FRAMEBUFFER_TOP_LEFT, 0);
     dc_write(DC_FRAMEBUFFER_BOTTOM_RIGHT, H_ACTIVE | (V_ACTIVE << 15));
 
+    // THE PLANE IS OPAQUE, said three times because there are three ways to say it and the reset
+    // state of all three is "invisible". The driver writes the blend registers on every commit and
+    // never leaves them at reset; leaving them there means a global alpha of ZERO, which composites
+    // the plane away no matter what its pixels contain. `0x3548` is the driver's value for the mode
+    // that ignores per-pixel alpha and uses the global one, and the global one is now 0xff - so
+    // neither the pixels' fourth byte nor the blend unit can make the picture disappear again.
+    dc_write(DC_FRAMEBUFFER_SRC_GLOBAL_COLOR, 0xff << 24);
+    dc_write(DC_FRAMEBUFFER_DST_GLOBAL_COLOR, 0xff << 24);
+    dc_write(DC_FRAMEBUFFER_BLEND_CONFIG, 0x3548);
+
     // Format, and everything alongside it switched off explicitly: no swizzle, no tiling, no YUV, no
     // rotation, no hardware clear, no scaling. The clear masks are the driver's, kept whole rather
     // than trimmed to the fields being set, because what they buy is that this register ends in a
     // known state whatever it held before.
     dc_modify(
         DC_FRAMEBUFFER_CONFIG,
-        FORMAT_A8R8G8B8 << 26,
+        FORMAT_X8R8G8B8 << 26,
         (0x1f << 26) | (1 << 25) | (0x03 << 23) | (1 << 22) | (0x1f << 17) | (0x07 << 14)
             | (0x07 << 11) | (1 << 8),
     );
