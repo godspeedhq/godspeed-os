@@ -1102,6 +1102,13 @@ const HDMI_VIDEO_CONTRL2: usize = 0x02;
 const HDMI_VIDEO_CONTRL: usize = 0x03;
 const HDMI_VIDEO_CONTRL3: usize = 0x04;
 const HDMI_AV_MUTE: usize = 0x05;
+/// Whether the transmitter signals HDMI or plain DVI. Bit 1 set is HDMI.
+const HDMI_HDCP_CTRL: usize = 0x52;
+/// The transmitter's own interrupt latch. Bit 5 of the status is ACTIVE VSYNC - the transmitter
+/// telling us it saw a vertical sync arrive FROM THE DISPLAY CONTROLLER. Write a one to clear.
+const HDMI_INTERRUPT_MASK1: usize = 0xc0;
+const HDMI_INTERRUPT_STATUS1: usize = 0xc1;
+const HDMI_INT_ACTIVE_VSYNC: u32 = 1 << 5;
 const HDMI_VIDEO_TIMING_CTL: usize = 0x08;
 const HDMI_VIDEO_EXT_HTOTAL_L: usize = 0x09;
 const HDMI_VIDEO_EXT_HBLANK_L: usize = 0x0b;
@@ -1262,6 +1269,55 @@ fn report_transmitter() {
     super::print_str("\n");
 }
 
+/// Count vertical syncs arriving at the transmitter from the display controller.
+fn report_input_vsync() {
+    hdmi_write(HDMI_INTERRUPT_MASK1, HDMI_INT_ACTIVE_VSYNC);
+    hdmi_write(HDMI_INTERRUPT_STATUS1, HDMI_INT_ACTIVE_VSYNC);
+
+    let hz = super::timebase_hz() as u64;
+    let window = if hz == 0 { 10_000_000 } else { hz };
+    let start = super::sbi::time();
+    let mut first_at = 0u64;
+    let mut last_at = 0u64;
+    let mut seen = 0u32;
+    let mut count = 0u32;
+    while super::sbi::time().wrapping_sub(start) < window {
+        let st = hdmi_read(HDMI_INTERRUPT_STATUS1);
+        if st & HDMI_INT_ACTIVE_VSYNC != 0 {
+            let now = super::sbi::time();
+            seen |= st;
+            hdmi_write(HDMI_INTERRUPT_STATUS1, HDMI_INT_ACTIVE_VSYNC);
+            if count == 0 {
+                first_at = now;
+            }
+            last_at = now;
+            count += 1;
+        }
+    }
+
+    let centihz = if count < 2 || last_at <= first_at || hz == 0 {
+        0
+    } else {
+        (((count - 1) as u64 * 100 * hz) / (last_at - first_at)) as u32
+    };
+    super::print_str("riscv64: display - vertical syncs INTO the transmitter: ");
+    super::print_dec(count as u64);
+    super::print_str(" in 1s, ");
+    super::print_dec((centihz / 100) as u64);
+    super::print_str(".");
+    let frac = centihz % 100;
+    if frac < 10 {
+        super::print_str("0");
+    }
+    super::print_dec(frac as u64);
+    super::print_str(" Hz, status bits ");
+    super::print_hex(seen as u64);
+    super::print_str(", mode ");
+    super::print_str(if hdmi_read(HDMI_HDCP_CTRL) & (1 << 1) != 0 { "HDMI" } else { "DVI" });
+    super::print_str("
+");
+}
+
 /// Bring the transmitter up and hand it the raster.
 pub fn hdmi_on() -> bool {
     let hdmi = HDMI_BASE.load(Ordering::Relaxed);
@@ -1350,6 +1406,15 @@ pub fn hdmi_on() -> bool {
     hdmi_write(0x00, 0x61);
     hdmi_write(0x1b2, 0x8f); // the TMDS driver
 
+    // PLAIN DVI RATHER THAN HDMI, deliberately, and only until there is a picture. Bit 1 of the HDCP
+    // control register selects between them and its reset value on this part is HDMI - which obliges
+    // the transmitter to send infoframes describing the picture, and this driver sends none. A sink
+    // handed HDMI signalling with no AVI infoframe is within its rights to show nothing, and several
+    // do. DVI has no infoframes at all and is the most permissive thing a transmitter can be, so it
+    // removes a whole class of "the television decided not to" from the search. If this is what makes
+    // the picture appear, the fix is to send a proper infoframe, not to stay in DVI.
+    hdmi_write(HDMI_HDCP_CTRL, hdmi_read(HDMI_HDCP_CTRL) & !(1 << 1));
+
     // The driver's last act: strobe register 0xce low then high, which restarts the video path with
     // everything above in place.
     hdmi_write(0xce, 0x00);
@@ -1367,6 +1432,17 @@ pub fn hdmi_on() -> bool {
     super::print_str("riscv64: display - pixel clock re-pointed at the transmitter: pix0=");
     super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX0 * 4) as u64);
     super::print_str("\n");
+
+    // DOES THE CONTROLLER'S VIDEO REACH THE TRANSMITTER AT ALL? This is the question every guess so
+    // far has been a guess ABOUT, and the transmitter answers it directly: bit 5 of its interrupt
+    // status latches when a vertical sync arrives on its input. Sixty of those a second means the
+    // controller's video is arriving and the fault is in the transmitter's output; none means the two
+    // blocks are not connected and nothing done to the transmitter can matter.
+    //
+    // Same shape as the frame counter that settled the controller: enable the source, poll the latch,
+    // clear it by writing the bit back, and time the interval between the first and last rather than
+    // dividing by the window.
+    report_input_vsync();
 
     // Did the raster survive the change of clock? If it did not, the transmitter's pixel clock is not
     // reaching the controller and the answer is to put the divider back - which is a fact worth one
