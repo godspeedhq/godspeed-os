@@ -300,6 +300,40 @@ Everything above ran on the VisionFive 2 Lite, in two sittings, with ZERO faults
 - `xhci` spawn FAILS and says so: no PCI on this board, and the service is x86/aarch64-shaped.
   Expected, and it does not stop the boot.
 
+### SMP, and the three things this ISA does not hand you (2026-09-08)
+
+Four harts, four cores, services scheduled across them. SBI HSM replaces the whole of x86's
+real-mode trampoline: one firmware call releases a named hart at a named address. What it does NOT
+do is give that hart a stack, an address space or a trap vector - it arrives exactly as the boot hart
+did - so the AP entry repeats `_start`'s work, in the only order that survives: `satp`, then `stvec`,
+then ready.
+
+Each of these cost a boot, and each is a fact about RISC-V rather than about this kernel:
+
+1. **SBI extension ids are ASCII-packed, and "HSM" is THREE characters** - `0x48534D`, not
+   `0x48534D00`. The probe failed and the boot printed `firmware refused to start hart 1` three
+   times, which is the loud-failure design earning its keep: a wrong constant produced a sentence.
+2. **There is no S-mode register that says which hart you are.** `mhartid` is M-mode only. The id
+   arrives in `a0` once and is lost unless parked per-hart; `tp` is where, and it is free because a
+   kernel with no thread-local storage never touches it.
+3. **A hart cannot look up which CORE it is, and the lookup lies rather than failing.**
+   `lapic_to_core_id` matches only a core already marked READY - and a hart cannot mark itself ready
+   until it knows which core it is. Circular, and the fall-through to 0 makes it SILENT: all four
+   harts reported `ready as core 0`, four harts scribbled on one core's scheduler state, and the
+   first service to start died of `CapError(CapInsufficientRights)` - a capability error caused by
+   nothing to do with capabilities. ARM never meets this because MPIDR tells a core its own number.
+   The assignment is now made by the starter and read by the started: told, not derived.
+
+**And the IPI carries no vector.** An APIC interrupt says which of 256 things happened; SBI's
+`send_ipi` says only "someone poked you". The vector travels out of band in a per-core pending MASK -
+a mask and not a value, because two senders can arrive between one hart's poke and its handler, and
+the second must not overwrite the first, which would lose a TLB shootdown and leave its initiator
+spinning on an acknowledgement that never comes. `sip.SSIP` is cleared BEFORE the drain, so a vector
+set in between costs a spurious wake rather than a lost one.
+
+Hart IDS come from the device tree, never from a count: on this board they are 1..4 with hart 0 a
+disabled S7 monitor core, so counting would try to start a different core design and skip hart 4.
+
 ### What is still stubbed, now that the shape is clear
 
 - **STORAGE, on any RISC-V machine.** `block-driver` looks for an AHCI controller; QEMU `virt` offers
@@ -311,16 +345,16 @@ Everything above ran on the VisionFive 2 Lite, in two sittings, with ZERO faults
   full run belongs on the board.
 - **PLIC.** No device interrupts are routed to userspace, so no driver service can be interrupt-driven
   (12).
-- **SMP.** One hart. `ap_count()` reports what the device tree found, and SBI HSM would start the
-  rest; `get_lapic_id` returns the BOOT hart's id and would need to be a `tp` read first.
 - **The idle tick is deliberately NOT slowed** (`boot::rearm_idle_timer` re-arms at the quantum, not
   at ~1 s). With no PLIC there is no RX interrupt, so the timer tick is the only thing that drains the
   UART and wakes a shell blocked in `ConsoleRead` - which makes the idle tick the keystroke latency. A
   second between key and echo is not a slow system, it is a broken one. This is the first thing to
   revert when the PLIC lands, and it is the reason to want it.
-- **A fault is still fatal.** The reporter names the privilege and now the PTE, but there is no kill
-  path, so a faulting task halts the machine instead of dying. This is the single biggest gap between
-  this port and the others, and it is what `uaccess`'s pre-walk exists to work around.
+- **TLB shootdown across cores is UNPROVEN.** The IPI path delivers the vector and the neutral
+  handler runs, but nothing has yet forced a cross-core shootdown and watched it acknowledge. The
+  neutral kill path elides it for a pinned task, and `switch_context` fences on every address-space
+  change, so the pinned model is covered - what is untested is an unmap that broadcasts. Worth
+  forcing deliberately rather than waiting to meet it.
 
 ## The kernel is INSIDE the user address range on this port, so a range check proves nothing
 

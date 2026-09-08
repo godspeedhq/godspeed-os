@@ -60,7 +60,7 @@ def type_at_shell(cmd, a):
             time.sleep(a.chardelay)
         time.sleep(a.settle)
 
-    time.sleep(1.0)
+    time.sleep(1.0 + a.after)
     try:
         p.kill()
     except Exception:
@@ -77,6 +77,9 @@ def main():
     ap.add_argument("--log", default=os.path.join("build", "riscv_serial.log"))
     ap.add_argument("--cmd", action="append", default=[],
                     help="type a line at the shell, once it is up (repeatable)")
+    ap.add_argument("--after", type=float, default=0.0,
+                    help="extra seconds to wait after the LAST typed line - for a command that runs "
+                         "long after its confirmation, like a chaos storm")
     ap.add_argument("--settle", type=float, default=8.0,
                     help="seconds to wait after each typed line for its output")
     ap.add_argument("--chardelay", type=float, default=0.02,
