@@ -950,17 +950,23 @@ pub mod page_tables {
         super::sv39::clone_kernel_map(root, kernel_root);
     }
 
-    /// Free a task's page-table root and the structure below it, at task death.
+    /// Free a dead task's page-table ROOT - just the root.
+    ///
+    /// The structure below it was already freed by `reclaim_user_frames`; this is the last frame, and
+    /// it is separate because a task that kills ITSELF is still executing in that address space when
+    /// the rest goes. The neutral kill path defers this one until the core has switched away, which
+    /// is why it is its own call and not the tail of the walk.
     ///
     /// # Safety
     /// `root` must belong to a task already marked Dead, after a TLB shootdown, and must not be the
     /// address space currently in `satp`.
     pub unsafe fn free_page_table_root(root: u64) {
-        if root == 0 {
+        if root == 0 || !crate::memory::allocator::phys_in_ram(root) {
             return;
         }
-        // SAFETY: contract delegated to the caller above.
-        unsafe { super::sv39::free_table_tree(root) };
+        // SAFETY: contract delegated to the caller above; the frame is a root table this kernel
+        // allocated, and nothing walks it any more.
+        unsafe { crate::memory::allocator::free_frame(super::sv39::frame_of(root)) };
     }
 
     use crate::memory::frame::{Frame, PhysAddr};
@@ -1104,7 +1110,24 @@ pub mod page_tables {
     }
     pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
     pub fn harden_hhdm_nx() {}
-    pub unsafe fn reclaim_user_frames(cr3: u64) -> usize { 0 }
+    /// Give a dead task's pages and page tables back to the allocator, and report how many frames
+    /// that was.
+    ///
+    /// Returning ZERO from a stub is not neutral: the kill path prints the count, so `freed 0 frames`
+    /// read as "this task had nothing" when it meant "nothing was reclaimed". A service that faults
+    /// and restarts in a loop then leaks its whole address space per cycle, and the machine dies of
+    /// `FrameAllocFailed` several hundred restarts later - a long way from the cause. Observed
+    /// exactly that way: 709 fault-restart cycles, then out of memory.
+    ///
+    /// # Safety
+    /// `cr3` must be a Dead task's root that no core will load again.
+    pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
+        if cr3 == 0 {
+            return 0;
+        }
+        // SAFETY: contract delegated to the caller above.
+        unsafe { super::sv39::reclaim_user(cr3) }
+    }
 }
 
 // ---------------------------------------------------------------------------

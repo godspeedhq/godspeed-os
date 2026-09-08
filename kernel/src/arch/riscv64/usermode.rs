@@ -799,17 +799,29 @@ pub fn task_selftest() {
     }
     print_str("\n");
 
+    // Reclaim through the SEAM'S OWN PATH, which is what a dying task uses - so this selftest
+    // exercises the reclaim as well as the entry. `reclaim_user_frames` takes the code and
+    // user-stack pages (they carry `U`, which is how it tells a task's pages from the kernel's)
+    // and the tables built to reach them; the root and the KERNEL stack are separate, because
+    // neither is a `U` page in this space. Freeing code and stack by hand as well would be a
+    // double free - which is why the explicit frees that were here are gone.
     // SAFETY: the task is abandoned and nothing can resume it - its context is a local static no
-    // scheduler knows about, and `satp` is back on the kernel root. Its four frames are this
-    // function's own, and the root's tables go back through the seam's free path.
-    unsafe {
+    // scheduler knows about, and `satp` is back on the kernel root.
+    let reclaimed = unsafe {
+        let n = super::page_tables::reclaim_user_frames(root);
         super::page_tables::free_page_table_root(root);
-        free_frame(sv39::frame_of(code_pa));
-        free_frame(sv39::frame_of(ustack_pa));
         free_frame(sv39::frame_of(kstack_pa));
-    }
+        n
+    };
+    // Two user pages, plus the tables that reached them. Reported rather than assumed: a reclaim
+    // that silently answers zero is exactly what let a fault-restart loop leak an address space
+    // per cycle until the machine died of `FrameAllocFailed` several hundred restarts later.
+    let reclaim_ok = reclaimed >= 2;
+    print_str("riscv64: usertask reclaimed ");
+    super::print_dec(reclaimed as u64);
+    print_str(if reclaim_ok { " frame(s) ok\n" } else { " frame(s) BAD\n" });
 
-    if ran && own_space && stack_ok && kstack_ok && uaccess_ok {
+    if ran && own_space && stack_ok && kstack_ok && uaccess_ok && reclaim_ok {
         print_str(
             "riscv64: usertask PASS - unprivileged, in its own address space, on its own kernel stack\n",
         );

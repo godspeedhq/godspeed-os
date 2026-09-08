@@ -360,41 +360,78 @@ pub fn clone_kernel_map(dst: u64, src: u64) -> usize {
     filled
 }
 
-/// Free every table BELOW a root, then the root itself, and report how many frames came back.
+/// Free a dead task's own pages and the tables it built - but NOT the root, and NOT anything the
+/// kernel lent it.
 ///
-/// Walks only POINTER entries, never leaves. A leaf at any level names a frame the task was given
-/// rather than a table it was built out of, and freeing those is the caller's business (the frames
-/// have owners; the tables do not). Combined with `clone_leaf_roots`, that is exactly why the
-/// kernel's inherited gigapages survive a task's death: they are leaves, so this never follows them.
+/// **`U` is the discriminator, because on this port nothing else is.** x86 reclaims by walking only
+/// the low half of its top-level table: its kernel is higher-half, so "user" and "kernel" are
+/// separable by INDEX. Here the kernel is identity-mapped from zero and a service links at 0x400000,
+/// so the two share table entries and an index says nothing. What does say something is the bit that
+/// defines the boundary everywhere else on this port: `clone_kernel_map` never sets `U` on anything
+/// it lends, so a leaf with `U` is the task's and a leaf without it is on loan.
+///
+/// A leaf at LEVEL 1 is therefore always the kernel's: `map_page` only ever creates 4 KiB leaves, and
+/// the 2 MiB leaves exist solely because `clone_kernel_map` put them there. Skipping them is what
+/// stops a dying task handing the kernel's own UART mapping back to the frame allocator.
+///
+/// Every physical address is checked against RAM before it is dereferenced or freed. A corrupt or
+/// stale entry pointing outside RAM would otherwise be walked through the identity map and fault the
+/// KERNEL - the exact shape of the `max-carnage` fault x86's `phys_in_ram` guard was added for - and
+/// freeing one would corrupt the frame bitmap with an address the allocator never issued.
+///
+/// The ROOT is deliberately left alone. Its owner may still be the live `satp` when a task kills
+/// itself, so the caller frees it separately once nothing is executing in that space
+/// (`free_page_table_root`).
 ///
 /// # Safety
-/// `root` must be a root table belonging to a task that is finished with it, and must not be the
-/// live `satp` root - freeing the address space you are executing in is not detectable from here.
-pub unsafe fn free_table_tree(root: u64) -> usize {
-    let mut freed = 0;
-    for i2 in 0..512 {
+/// `root` must belong to a task already marked Dead, whose frames no other core can reach.
+pub unsafe fn reclaim_user(root: u64) -> usize {
+    use crate::memory::allocator::{free_frame, phys_in_ram};
+    let mut freed = 0usize;
+    if !phys_in_ram(root) {
+        return 0;
+    }
+    for i2 in 0..512usize {
         // SAFETY: `root` is a page-aligned table this kernel owns, identity-mapped; i2 < 512.
         let l1 = unsafe { (root as *const u64).add(i2).read_volatile() };
         if !pte_is_valid(l1) || pte_is_leaf(l1) {
-            continue;
+            continue; // empty, or a gigapage the kernel lent this task
         }
         let t1 = pte_phys(l1);
-        for i1 in 0..512 {
+        if !phys_in_ram(t1) {
+            continue; // a stale or corrupt pointer: do not walk into it
+        }
+        for i1 in 0..512usize {
             // SAFETY: `t1` came from a pointer PTE this kernel wrote, so it is a table it owns.
             let l0 = unsafe { (t1 as *const u64).add(i1).read_volatile() };
             if !pte_is_valid(l0) || pte_is_leaf(l0) {
+                continue; // a 2 MiB leaf is the kernel's, always - see the note above
+            }
+            let t0 = pte_phys(l0);
+            if !phys_in_ram(t0) {
                 continue;
             }
-            // SAFETY: as above; the level-0 table is unreferenced once its parent entry goes.
-            unsafe { crate::memory::allocator::free_frame(frame_of(pte_phys(l0))) };
+            for i0 in 0..512usize {
+                // SAFETY: `t0` is a level-0 table this kernel wrote.
+                let e = unsafe { (t0 as *const u64).add(i0).read_volatile() };
+                if !pte_is_valid(e) || e & PTE_U == 0 {
+                    continue; // not this task's page
+                }
+                let pa = pte_phys(e);
+                if !phys_in_ram(pa) {
+                    continue; // MMIO granted to a driver, or a corrupt entry: never ours to free
+                }
+                // SAFETY: a 4 KiB user page of a task that is Dead and unreachable, inside RAM.
+                unsafe { free_frame(frame_of(pa)) };
+                freed += 1;
+            }
+            // SAFETY: every entry below it has been dealt with and nothing points at it now.
+            unsafe { free_frame(frame_of(t0)) };
             freed += 1;
         }
-        // SAFETY: every entry below it has been dealt with, and nothing else points at it.
-        unsafe { crate::memory::allocator::free_frame(frame_of(t1)) };
+        // SAFETY: as above, one level up.
+        unsafe { free_frame(frame_of(t1)) };
         freed += 1;
     }
-    // SAFETY: contract delegated to the caller - the root belongs to a task that is finished and is
-    // not the live one.
-    unsafe { crate::memory::allocator::free_frame(frame_of(root)) };
-    freed + 1
+    freed
 }

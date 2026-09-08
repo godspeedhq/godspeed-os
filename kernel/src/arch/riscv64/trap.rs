@@ -7,10 +7,16 @@
 //! asks for loud failure, and an unhandled trap is the loudest thing a CPU can do reported as the
 //! quietest thing a log can show.
 //!
-//! This is deliberately a REPORTER for anything it does not recognise: it decodes the cause, prints
-//! it with the faulting PC and address, and halts. Killing the offending TASK instead of the machine
-//! needs a task to kill - which needs `spawn_supervisor` - so the honest order is: make faults
-//! visible first, then make them survivable.
+//! **A fault from USER mode kills the task; a fault in the KERNEL halts the machine.** The hardware
+//! decides which, and cannot be argued with: `sstatus.SPP` records the privilege the trap came from.
+//! A faulting service has a name, an owner and a supervisor that will restart it, so killing it is
+//! both possible and correct - "a service dies, the system continues" has to hold for a FAULT and
+//! not only for a deliberate kill, because a fault is the case nobody planned for. A faulting KERNEL
+//! has none of that: the thing that faulted is the thing that would do the killing, so it stops
+//! loudly instead.
+//!
+//! This file was a pure REPORTER until there was a task to kill, which is the honest order: make
+//! faults visible first, then make them survivable.
 //!
 //! `stvec` holds MODE in its low two bits, so the handler address must be four-byte aligned and
 //! mode 0 (direct: every cause enters at the same place). Vectored mode exists and buys nothing
@@ -174,17 +180,57 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    // A FAULT. What happens next is the difference between a bug that kills a SERVICE and a bug that
+    // kills the MACHINE, and the hardware has already said which one this is: `SPP` records the
+    // privilege the trap came from, and it cannot be forged by the code that trapped.
+    if !interrupt && frame.from_user() {
+        // A user task faulted. It has a name, an owner and a supervisor that will restart it, so the
+        // honest response is to kill IT - not to stop the machine on its behalf. This is the property
+        // every other port has and this one did not, and it is what `4.4`'s restartability rests on:
+        // "a service dies, the system continues" has to be true of a FAULT and not only of a
+        // deliberate kill, because a fault is the case nobody planned for.
+        report_fault(frame, scause, code, stval, true);
+        crate::task::kill_current();
+        // `kill_current` marks the task Dead and reschedules, so it does not come back for a corpse.
+        // If it somehow does, halting beats returning into a task that no longer exists.
+        super::print_str("riscv64: kill_current RETURNED for a dead task - halting rather than resuming it\n");
+        super::halt();
+    }
+
+    // A KERNEL fault, or an interrupt nothing claimed. There is no task to kill: the thing that
+    // faulted IS the thing that would do the killing, so the only honest move is to stop loudly.
     if REPORTING.swap(true, Ordering::Relaxed) {
         // A fault inside the reporter. Stop rather than recurse: on a machine whose console is what
         // faulted, recursion shows up as a hang or an endless partial line.
         super::halt();
     }
+    report_fault(frame, scause, code, stval, false);
+    super::print_str("riscv64: halted - the KERNEL faulted, so there is nothing left to kill instead\n");
+    super::halt();
+}
 
+/// Describe a fault: what, where, from which privilege, and what the page table actually says.
+///
+/// Shared by both outcomes so a killed task and a halted kernel are reported in the same words - a
+/// diagnosis should not depend on which of the two happened to occur.
+fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user: bool) {
+    let interrupt = scause >> 63 != 0;
     super::print_str("\nriscv64: TRAP - ");
     super::print_str(cause_name(code, interrupt));
-    // WHICH PRIVILEGE FAULTED is the first question asked of any fault once user mode exists, and
-    // the answer is already in the frame. Printing it costs a branch and saves the guess.
-    super::print_str(if frame.from_user() { " (from USER mode)" } else { "" });
+    if from_user {
+        // NAME the task, do not just number it. Slots are RECYCLED: a service killed and respawned
+        // during a chaos run lands in whatever slot is free, so "slot 1" means one binary at boot and
+        // a different one ten seconds later. Reporting only the slot sent an entire ARM diagnosis
+        // after the wrong ELF. The name is the stable identity (invariant 11); the slot is only where
+        // it happens to be living.
+        let slot = crate::task::scheduler::current_task_slot();
+        super::print_str(" in USER task '");
+        let name = crate::task::scheduler::task_stat(slot).name;
+        super::print_str(name);
+        super::print_str("' (slot ");
+        super::print_dec(slot as u64);
+        super::print_str(")");
+    }
     super::print_str("\n  scause ");
     super::print_hex(scause);
     super::print_str("  sepc ");
@@ -216,11 +262,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         super::print_hex(super::page_tables::read_page_table_base());
     }
     super::print_str("\n");
-    // `stval` carries the faulting ADDRESS for a page or access fault and the offending INSTRUCTION
-    // for an illegal-instruction trap, so it is printed raw and named by the cause rather than
-    // labelled something it might not be.
-    super::print_str("riscv64: halted - faults are not yet survivable (no task to kill)\n");
-    super::halt();
+    if from_user {
+        super::print_str("riscv64: killing it; the kernel continues\n");
+    }
 }
 
 /// Bytes of stack a trap frame occupies. Deliberately larger than the struct so `sp` stays 16-byte

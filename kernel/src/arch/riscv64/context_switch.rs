@@ -555,6 +555,7 @@ pub fn address_space_selftest() {
     // SAFETY: task C is finished and suspended forever, `satp` is back on the kernel root (checked
     // above), and the sentinel frame and stack are this function's own.
     unsafe {
+        super::page_tables::reclaim_user_frames(root);
         super::page_tables::free_page_table_root(root);
         free_frame(sv39::frame_of(page_pa));
         free_frame(sv39::frame_of(stack_pa));
