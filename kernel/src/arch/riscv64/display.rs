@@ -170,9 +170,15 @@ const SYSCRG_RESET_STATUS: usize = 0x308;
 const VOUTCRG_RESET_ASSERT: usize = 0x48;
 const VOUTCRG_RESET_STATUS: usize = 0x4c;
 
-/// The system clocks the video-out block hangs off, from `starfive,jh7110-crg.h`.
+/// The system clocks the video-out block hangs off.
+///
+/// **Exactly the four the DEVICE TREE names, and no more.** The first version also enabled index 59
+/// (`VOUT_AXI`), which exists in the SoC's clock list and is not among the ones the display node asks
+/// for - and the board said so on the first boot: `system clock did not enable: vout_axi`, before
+/// anything else could be learned. The header tells you which clocks the CHIP has; only the device
+/// tree says which ones THIS block needs, and a plausible extra turned a working stage into a
+/// failing one.
 const SYSCLK_VOUT_SRC: usize = 58;
-const SYSCLK_VOUT_AXI: usize = 59;
 const SYSCLK_NOC_BUS_DISP_AXI: usize = 60;
 const SYSCLK_VOUT_TOP_AHB: usize = 61;
 const SYSCLK_VOUT_TOP_AXI: usize = 62;
@@ -259,22 +265,28 @@ pub fn clocks_on() -> bool {
         return false;
     }
 
-    super::print_str("riscv64: display - enabling system clocks for vout\n");
+    // TRY THEM ALL, THEN DECIDE. Stopping at the first failure costs a whole board boot to learn
+    // about one clock, and a boot is the expensive thing here - so every result is reported and
+    // the verdict comes after. An enable is a write and a read-back; once the domain is powered,
+    // attempting the rest costs nothing and tells us everything.
+    super::print_str("riscv64: display - system clocks:");
     let mut ok = true;
     for (i, name) in [
         (SYSCLK_VOUT_SRC, "vout_src"),
-        (SYSCLK_VOUT_AXI, "vout_axi"),
         (SYSCLK_NOC_BUS_DISP_AXI, "noc_disp"),
         (SYSCLK_VOUT_TOP_AHB, "vout_ahb"),
         (SYSCLK_VOUT_TOP_AXI, "vout_top_axi"),
     ] {
-        if !clk_enable(sys, i) {
-            super::print_str("riscv64: display - system clock did not enable: ");
-            super::print_str(name);
-            super::print_str("\n");
+        super::print_str(" ");
+        super::print_str(name);
+        if clk_enable(sys, i) {
+            super::print_str("=on");
+        } else {
+            super::print_str("=FAIL");
             ok = false;
         }
     }
+    super::print_str("\n");
     if !ok {
         return false;
     }
@@ -291,28 +303,31 @@ pub fn clocks_on() -> bool {
 
     // Only NOW is the video-out generator reachable: its registers are inside the block the clocks
     // and resets above just brought up.
-    super::print_str("riscv64: display - enabling video-out clocks\n");
+    super::print_str("riscv64: display - video-out clocks:");
     let mut enabled = 0;
-    for i in [
-        VOUTCLK_APB,
-        VOUTCLK_DC8200_PIX,
-        VOUTCLK_DC8200_AXI,
-        VOUTCLK_DC8200_CORE,
-        VOUTCLK_DC8200_AHB,
-        VOUTCLK_DC8200_PIX0,
-        VOUTCLK_DC8200_PIX1,
-        VOUTCLK_DOM_VOUT_TOP_LCD,
-        VOUTCLK_HDMI_TX_MCLK,
-        VOUTCLK_HDMI_TX_BCLK,
-        VOUTCLK_HDMI_TX_SYS,
+    for (i, name) in [
+        (VOUTCLK_APB, "apb"),
+        (VOUTCLK_DC8200_PIX, "pix"),
+        (VOUTCLK_DC8200_AXI, "axi"),
+        (VOUTCLK_DC8200_CORE, "core"),
+        (VOUTCLK_DC8200_AHB, "ahb"),
+        (VOUTCLK_DC8200_PIX0, "pix0"),
+        (VOUTCLK_DC8200_PIX1, "pix1"),
+        (VOUTCLK_DOM_VOUT_TOP_LCD, "lcd"),
+        (VOUTCLK_HDMI_TX_MCLK, "hdmi_mclk"),
+        (VOUTCLK_HDMI_TX_BCLK, "hdmi_bclk"),
+        (VOUTCLK_HDMI_TX_SYS, "hdmi_sys"),
     ] {
+        super::print_str(" ");
+        super::print_str(name);
         if clk_enable(vout, i) {
+            super::print_str("=on");
             enabled += 1;
+        } else {
+            super::print_str("=FAIL");
         }
     }
-    super::print_str("riscv64: display - ");
-    super::print_dec(enabled);
-    super::print_str(" of 11 video-out clocks report enabled\n");
+    super::print_str("\n");
     if enabled == 0 {
         // Not one enable bit stuck. The block is not answering, which means it is not really powered
         // or not really clocked - and going on to write display timings into it would be writing
