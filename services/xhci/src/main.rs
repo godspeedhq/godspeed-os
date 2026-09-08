@@ -3333,6 +3333,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // off the EHCI controller, which this driver does not drive.
         for p in 1..=max_ports {
             let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
+            // An EMPTY port has nothing left to condemn. The poll loop already clears the poison when
+            // it watches a device leave; doing it here as well means a port observed empty at the top
+            // of any pass gets its clean slate too, without depending on which loop happened to be
+            // running when the device was pulled.
+            if psc & PORT_CCS == 0 && p < 64 {
+                poisoned &= !(1u64 << p);
+            }
             topo.note(&ctx, 0, p, Some(psc & PORT_CCS != 0));
             ctx.log_fmt(format_args!(
                 "xhci: port census {}/{}: PORTSC={:#010x} connected={} enabled={} speed={}",
@@ -3600,6 +3607,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 announce = true; // whatever we bind on the re-walk is a real plug event
                 continue 'reenum;
+            }
+            // A PASS THAT BOUND NOTHING CLEARS EVERY POISON, and this is a deadlock fix rather than
+            // a tidy-up.
+            //
+            // `poisoned` lives OUTSIDE `'reenum` so a port that wedges the controller stays skipped
+            // across re-inits - which is right. But the only place that ever CLEARED it was the poll
+            // loop, and the poll loop is only reached once at least one device is bound. So a port
+            // poisoned while nothing else is attached can never be un-poisoned: no device binds
+            // because the port is skipped, and the port is skipped because no device binds.
+            //
+            // On the VisionFive 2 that is permanent, because its four sockets hang off a hub soldered
+            // to the board: the hub IS root port 1, it never disconnects, and unplugging a keyboard
+            // behind it changes no root port at all. Once that port was poisoned the controller was
+            // dead until the next power cycle - which is exactly what the board did.
+            //
+            // The bound exists to stop retrying a device that will not come up while good ones work.
+            // When NOTHING works, skipping every port guarantees the thing it was written to prevent,
+            // so the honest response is to let them all try again. It costs a re-init per pass, once
+            // per second, on a controller that is otherwise doing nothing at all.
+            if poisoned != 0 {
+                ctx.log("xhci: nothing bound on any port - clearing every port poison and retrying");
+                poisoned = 0;
             }
             ctx.log("xhci: no HID keyboard/mouse on any port - waiting for a connection");
             wait_for_port(&ctx, &mmio, op, max_ports);
