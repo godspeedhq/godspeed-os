@@ -237,16 +237,35 @@ fn clk_enable(base: u64, index: usize) -> bool {
 fn reset_deassert(base: u64, assert_off: usize, status_off: usize, id: u32) -> bool {
     let word = (id / 32) as usize * 4;
     let mask = 1u32 << (id % 32);
-    let v = mmio_read(base, assert_off + word);
-    mmio_write(base, assert_off + word, v & !mask);
+    let before = mmio_read(base, assert_off + word);
+    mmio_write(base, assert_off + word, before & !mask);
+    let after = mmio_read(base, assert_off + word);
 
     let hz = super::timebase_hz() as u64;
     let deadline = super::sbi::time().wrapping_add(if hz == 0 { 100_000 } else { hz / 100 });
+    let mut status = 0u32;
     while super::sbi::time() < deadline {
-        if mmio_read(base, status_off + word) & mask == 0 {
+        status = mmio_read(base, status_off + word);
+        if status & mask == 0 {
             return true;
         }
     }
+
+    // SAY WHAT THE HARDWARE HELD, not just that the wait expired. "Did not release" is a symptom
+    // with several causes that look identical from here - the write not landing, the bit being the
+    // wrong one, the status having the opposite polarity, the block being unclocked - and the three
+    // register values separate them in one line. Guessing between them costs a board boot each time.
+    super::print_str(" [id ");
+    super::print_dec(id as u64);
+    super::print_str(" mask ");
+    super::print_hex(mask as u64);
+    super::print_str(" assert ");
+    super::print_hex(before as u64);
+    super::print_str("->");
+    super::print_hex(after as u64);
+    super::print_str(" status ");
+    super::print_hex(status as u64);
+    super::print_str("]");
     false
 }
 
@@ -291,14 +310,27 @@ pub fn clocks_on() -> bool {
         return false;
     }
 
-    super::print_str("riscv64: display - releasing system resets\n");
+    // BOTH, then decide - same reason as the clocks. Both live in the system generator, which is
+    // outside the VOUT domain and answering, so attempting the second after the first fails costs
+    // nothing and doubles what one boot tells us.
+    super::print_str("riscv64: display - system resets:");
+    let mut ok = true;
     for (id, name) in [(SYSRST_VOUT_SRC, "vout_src"), (SYSRST_NOC_DISP, "noc_disp")] {
-        if !reset_deassert(sys, SYSCRG_RESET_ASSERT, SYSCRG_RESET_STATUS, id) {
-            super::print_str("riscv64: display - system reset did not release: ");
-            super::print_str(name);
-            super::print_str("\n");
-            return false;
+        super::print_str(" ");
+        super::print_str(name);
+        if reset_deassert(sys, SYSCRG_RESET_ASSERT, SYSCRG_RESET_STATUS, id) {
+            super::print_str("=released");
+        } else {
+            super::print_str("=STUCK");
+            ok = false;
         }
+    }
+    super::print_str("\n");
+    if !ok {
+        // Do NOT go on to touch the video-out generator. Its registers are behind the reset that
+        // did not release, and a read there is a transaction with nothing to answer it.
+        super::print_str("riscv64: display - stopping: the video-out block is still held in reset\n");
+        return false;
     }
 
     // Only NOW is the video-out generator reachable: its registers are inside the block the clocks
