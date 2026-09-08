@@ -53,14 +53,43 @@ const USB_STRAP_HOST: u32 = 1 << 17;
 const USB_SUSPENDM_MASK: u32 = 1 << 19;
 const USB_SUSPENDM_HOST: u32 = 1 << 19;
 
+/// The PHY, and the two clocks that feed it.
+///
+/// **The controller's registers do not answer until the PHY's reference clock runs**, which is not
+/// obvious from either driver and cost a boot to learn: the first version enabled the wrapper's six
+/// clocks, released its five resets, and then hung the machine dead on the first read of the xHCI
+/// window - a bus transaction with nothing to answer it. The wrapper's `apb` and `axi` clock the path
+/// TO the controller; the controller's own domain runs on the 125 MHz reference the PHY provides.
+const PHY_CLK_MODE: usize = 0x00;
+const PHY_CLK_MODE_RX_NORMAL_PWR: u32 = 1 << 1;
+const PHY_LS_KEEPALIVE: usize = 0x04;
+const PHY_LS_KEEPALIVE_ENABLE: u32 = 1 << 4;
+/// `usb_125m` is a plain DIVIDER off PLL0 in the system generator, with no enable bit - the same
+/// category of register that made the display's `apb=FAIL` look like a hardware fault. PLL0 runs at
+/// 1000 MHz, so 125 MHz is a divisor of eight.
+const SYSCLK_USB_125M: usize = 0x5f;
+const USB_125M_DIVISOR: u32 = 8;
+/// `app_125m` in the system-top generator, which IS a gate.
+const STGCLK_APP_125M: usize = 6;
+/// In the SYSTEM syscon - a different one from the system-top syscon that holds the role strap, and
+/// missing it is missing the wire between the USB 2.0 PHY and the controller.
+const SYSCON_USB_SPLIT: usize = 0x18;
+const USB_PDRSTN_SPLIT: u32 = 1 << 17;
+
 static STGCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static STG_SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 static XHCI_BASE: AtomicU64 = AtomicU64::new(0);
+static SYSCRG_BASE: AtomicU64 = AtomicU64::new(0);
+static SYS_SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
+static PHY_BASE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64) {
+pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64, syscrg: u64, sys_syscon: u64, phy: u64) {
     STGCRG_BASE.store(stgcrg, Ordering::Relaxed);
     STG_SYSCON_BASE.store(syscon, Ordering::Relaxed);
     XHCI_BASE.store(xhci, Ordering::Relaxed);
+    SYSCRG_BASE.store(syscrg, Ordering::Relaxed);
+    SYS_SYSCON_BASE.store(sys_syscon, Ordering::Relaxed);
+    PHY_BASE.store(phy, Ordering::Relaxed);
 }
 
 /// Where the xHCI register window is, or zero if there is no controller to offer.
@@ -88,6 +117,42 @@ pub fn init() -> bool {
         XHCI_BASE.store(0, Ordering::Relaxed);
         return false;
     }
+
+    // THE PHY FIRST, which is a deliberate divergence from the reference and the reason is a boot.
+    // Linux brings the wrapper up in its glue driver and the PHY later, when the controller core
+    // probes and asks for it; done in that order here the machine hung dead on the first register
+    // read, because the controller's own clock domain runs on the PHY's reference and a read into an
+    // unclocked domain is a transaction nothing completes. So the PHY runs before the controller is
+    // allowed out of reset.
+    let syscrg = SYSCRG_BASE.load(Ordering::Relaxed);
+    let sys_syscon = SYS_SYSCON_BASE.load(Ordering::Relaxed);
+    let phy = PHY_BASE.load(Ordering::Relaxed);
+    if syscrg == 0 || sys_syscon == 0 || phy == 0 {
+        super::print_str("riscv64: usb - no PHY in the device tree; not touching the controller\n");
+        XHCI_BASE.store(0, Ordering::Relaxed);
+        return false;
+    }
+    mmio_write(syscrg, SYSCLK_USB_125M * 4, USB_125M_DIVISOR);
+    let app = clk_enable(crg, STGCLK_APP_125M);
+    mmio_write(phy, PHY_CLK_MODE, mmio_read(phy, PHY_CLK_MODE) | PHY_CLK_MODE_RX_NORMAL_PWR);
+    mmio_write(phy, PHY_LS_KEEPALIVE, mmio_read(phy, PHY_LS_KEEPALIVE) | PHY_LS_KEEPALIVE_ENABLE);
+    mmio_write(
+        sys_syscon,
+        SYSCON_USB_SPLIT,
+        mmio_read(sys_syscon, SYSCON_USB_SPLIT) | USB_PDRSTN_SPLIT,
+    );
+    super::print_str("riscv64: usb - phy: 125m=");
+    super::print_hex(mmio_read(syscrg, SYSCLK_USB_125M * 4) as u64);
+    super::print_str(" app_125m=");
+    super::print_str(if app { "on" } else { "FAIL" });
+    super::print_str(" mode=");
+    super::print_hex(mmio_read(phy, PHY_CLK_MODE) as u64);
+    super::print_str(" keepalive=");
+    super::print_hex(mmio_read(phy, PHY_LS_KEEPALIVE) as u64);
+    super::print_str(" split=");
+    super::print_hex(mmio_read(sys_syscon, SYSCON_USB_SPLIT) as u64);
+    super::print_str("
+");
 
     // TRY THEM ALL, THEN DECIDE - the same rule the display's clocks follow, for the same reason: a
     // board boot is the expensive thing here, and stopping at the first failure spends one to learn
@@ -136,6 +201,11 @@ pub fn init() -> bool {
     // powered, clocked and out of reset returns a small length and a version of 0x0100 or better. One
     // that is not returns all-ones or all-zeros, and those are exactly the values that would let a
     // driver start and then fail somewhere unrelated.
+    // SAID BEFORE IT IS DONE, because this read is the one thing here that can take the machine with
+    // it. An access into a domain whose clock is not running does not fault on this interconnect - it
+    // stalls, forever, with no output and nothing to look at. The line below is what turned last
+    // boot's silent black screen into a fact about which instruction did it.
+    super::print_str("riscv64: usb - reading the controller's capability registers\n");
     let cap = mmio_read(xhci, 0x00);
     let hcsparams1 = mmio_read(xhci, 0x04);
     super::print_str("riscv64: usb - xhci @");

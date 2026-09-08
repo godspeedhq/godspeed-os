@@ -675,7 +675,7 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
                 .map(|r| r.base)
                 .unwrap_or(0);
             let mut w9: [Option<u32>; 0] = [];
-            let syscon = tree
+            let stg_syscon = tree
                 .find_compatible("starfive,jh7110-stg-syscon", &[], &mut w9)
                 .map(|r| r.base)
                 .unwrap_or(0);
@@ -700,19 +700,31 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
                     }
                 }
             }
-            usb::set_bases(crg, syscon, xhci);
-            usb::init();
+            let mut w10: [Option<u32>; 0] = [];
+            let phy = tree
+                .find_compatible("starfive,jh7110-usb-phy", &[], &mut w10)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            usb::set_bases(crg, stg_syscon, xhci, sys.unwrap_or(0), syscon.unwrap_or(0), phy);
         }
 
         if display::mode_set() {
-                if display::hdmi_on() {
-                    // The framebuffer is live and on a wire: hand it to the kernel's boot console so
-                    // everything printed from here appears on the screen as well as the serial line.
-                    display::adopt_as_boot_console();
-                }
-            } else {
-                display::diagnose();
+            if display::hdmi_on() {
+                // The framebuffer is live and on a wire: hand it to the kernel's boot console so
+                // everything printed from here appears on the screen as well as the serial line.
+                display::adopt_as_boot_console();
             }
+        } else {
+            display::diagnose();
+        }
+
+        // THE USB CONTROLLER LAST, and the ordering is the lesson from the boot it cost. Reading an
+        // unclocked window on this interconnect does not fault - it stalls, with no output at all, so
+        // the machine stopped dead and the television stayed black. Running it after the display
+        // means the same stall now leaves the entire boot log on the screen AND on the serial line,
+        // ending with the line that says what was about to be read. That is the difference between a
+        // failure and a mystery, and it costs nothing but a position in the boot.
+        usb::init();
         }
     }
 
