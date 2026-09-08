@@ -132,12 +132,7 @@ pub fn power_on_vout() -> bool {
         return false;
     };
 
-    super::print_str("riscv64: power domains on:");
-    report(mode);
-    super::print_str("\n");
-
     if mode & DOMAIN_VOUT != 0 {
-        super::print_str("riscv64: display - VOUT already powered\n");
         return true;
     }
 
@@ -154,9 +149,6 @@ pub fn power_on_vout() -> bool {
     while super::sbi::time() < deadline {
         if let Some(m) = read(CURR_POWER_MODE) {
             if m & DOMAIN_VOUT != 0 {
-                super::print_str("riscv64: display - VOUT powered on, domains now:");
-                report(m);
-                super::print_str("\n");
                 return true;
             }
         }
@@ -321,24 +313,27 @@ pub fn clocks_on() -> bool {
     // about one clock, and a boot is the expensive thing here - so every result is reported and
     // the verdict comes after. An enable is a write and a read-back; once the domain is powered,
     // attempting the rest costs nothing and tells us everything.
-    super::print_str("riscv64: display - system clocks:");
     let mut ok = true;
+    let mut report_clocks = false;
     for (i, name) in [
         (SYSCLK_VOUT_SRC, "vout_src"),
         (SYSCLK_NOC_BUS_DISP_AXI, "noc_disp"),
         (SYSCLK_VOUT_TOP_AHB, "vout_ahb"),
         (SYSCLK_VOUT_TOP_AXI, "vout_top_axi"),
     ] {
-        super::print_str(" ");
-        super::print_str(name);
-        if clk_enable(sys, i) {
-            super::print_str("=on");
-        } else {
-            super::print_str("=FAIL");
+        if !clk_enable(sys, i) {
+            // SILENT WHEN IT WORKS, LOUD WHEN IT DOES NOT. Each of these lines earned its place while
+            // the display was being brought up and none of them earns it now: a working machine
+            // printing what it did to succeed is chatter, and on this board it was 77 lines of it
+            // through a 48-row screen, so the boot could only ever show its own tail.
+            super::print_str("riscv64: display - system clock did not enable: ");
+            super::print_str(name);
+            super::print_str("\n");
+            report_clocks = true;
             ok = false;
         }
     }
-    super::print_str("\n");
+    let _ = report_clocks;
     if !ok {
         return false;
     }
@@ -346,19 +341,15 @@ pub fn clocks_on() -> bool {
     // BOTH, then decide - same reason as the clocks. Both live in the system generator, which is
     // outside the VOUT domain and answering, so attempting the second after the first fails costs
     // nothing and doubles what one boot tells us.
-    super::print_str("riscv64: display - system resets:");
     let mut ok = true;
     for (id, name) in [(SYSRST_VOUT_SRC, "vout_src"), (SYSRST_NOC_DISP, "noc_disp")] {
-        super::print_str(" ");
-        super::print_str(name);
-        if reset_deassert(sys, SYSCRG_RESET_ASSERT, SYSCRG_RESET_STATUS, id) {
-            super::print_str("=released");
-        } else {
-            super::print_str("=STUCK");
+        if !reset_deassert(sys, SYSCRG_RESET_ASSERT, SYSCRG_RESET_STATUS, id) {
+            super::print_str("riscv64: display - system reset STUCK: ");
+            super::print_str(name);
+            super::print_str("\n");
             ok = false;
         }
     }
-    super::print_str("\n");
     if !ok {
         // Do NOT go on to touch the video-out generator. Its registers are behind the reset that
         // did not release, and a read there is a transaction with nothing to answer it.
@@ -368,7 +359,6 @@ pub fn clocks_on() -> bool {
 
     // Only NOW is the video-out generator reachable: its registers are inside the block the clocks
     // and resets above just brought up.
-    super::print_str("riscv64: display - video-out gates:");
     let mut enabled = 0;
     for (i, name) in [
         (VOUTCLK_DC8200_AXI, "axi"),
@@ -381,24 +371,17 @@ pub fn clocks_on() -> bool {
         (VOUTCLK_HDMI_TX_BCLK, "hdmi_bclk"),
         (VOUTCLK_HDMI_TX_SYS, "hdmi_sys"),
     ] {
-        super::print_str(" ");
-        super::print_str(name);
         if clk_enable(vout, i) {
-            super::print_str("=on");
             enabled += 1;
         } else {
-            super::print_str("=FAIL");
+            super::print_str("riscv64: display - video-out gate did not enable: ");
+            super::print_str(name);
+            super::print_str("\n");
         }
     }
-    super::print_str("\n");
 
     // The dividers, READ rather than enabled - what they already hold is what the pixel clock
     // currently is, and that is the number the mode stage has to work from.
-    super::print_str("riscv64: display - dividers: apb=");
-    super::print_hex(mmio_read(vout, VOUTCLK_APB * 4) as u64);
-    super::print_str(" dc8200_pix=");
-    super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX * 4) as u64);
-    super::print_str("\n");
 
     if enabled == 0 {
         // Not one enable bit stuck. The block is not answering, which means it is not really powered
@@ -408,7 +391,6 @@ pub fn clocks_on() -> bool {
         return false;
     }
 
-    super::print_str("riscv64: display - releasing video-out resets\n");
     for (id, name) in [(VOUTRST_AXI, "axi"), (VOUTRST_AHB, "ahb"), (VOUTRST_CORE, "core")] {
         if !reset_deassert(vout, VOUTCRG_RESET_ASSERT, VOUTCRG_RESET_STATUS, id) {
             super::print_str("riscv64: display - video-out reset did not release: ");
@@ -418,7 +400,6 @@ pub fn clocks_on() -> bool {
         }
     }
 
-    super::print_str("riscv64: display - VOUT powered, clocked and out of reset\n");
     true
 }
 

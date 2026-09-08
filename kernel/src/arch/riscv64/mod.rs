@@ -358,7 +358,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
     }
 
     for &b in b"
-GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a THIRD arch.
+riscv64: S-mode entered, 16550 UART alive
 " {
         putc(b);
     }
@@ -402,6 +402,14 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     }
     print_str("
 ");
+
+    // THE FOURTH BOOT PATH. `banner()` is the neutral kernel's identity line, and its own comment
+    // says who calls it: "`kernel_main` on x86, and the two ARM `*_boot_main`s... three call sites
+    // because there are three boot paths". There are four. This port brings the machine up itself and
+    // never reaches `kernel_main`, so it opened with a line of its own invention and every log from it
+    // began differently from every other board's - which is exactly the divergence `banner` exists to
+    // prevent, arriving through the one route the comment did not anticipate.
+    crate::banner();
 
     let tree_hz = tree.timebase_frequency();
     if let Some(hz) = tree_hz {
@@ -816,6 +824,20 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     if let Some(bi) = boot_info.as_ref() {
         // SAFETY: the boot hart, once, with every structure a secondary reads on arrival built.
         unsafe { ap_boot::start_all_aps(bi) };
+    }
+
+    // WAIT FOR THEM BEFORE COUNTING THEM. `start_all_aps` asks the firmware to start each hart and
+    // returns; the harts mark themselves ready some microseconds later, so counting immediately
+    // reported `1 core ready` on a machine that was about to have four - a true statement about the
+    // wrong instant. Bounded, so a hart that never arrives costs a tenth of a second and is then
+    // simply not counted, which is what CLAUDE.md 11.3 says a boot does about a core that fails.
+    {
+        let want = HART_COUNT.load(Ordering::Relaxed) as u32;
+        let hz = TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
+        let deadline = sbi::time().wrapping_add(if hz == 0 { 400_000 } else { hz / 10 });
+        while crate::smp::core::ready_count() < want && sbi::time() < deadline {
+            core::hint::spin_loop();
+        }
     }
 
     // THE ONE CANONICAL SENTENCE, and this port was not saying it. `report_cores_ready` exists in the
