@@ -702,6 +702,7 @@ fn scanout_rate(top: u64) -> (u32, u32, u32) {
 pub fn mode_set() -> bool {
     let top = DC_BASE.load(Ordering::Relaxed);
     let vout = VOUTCRG_BASE.load(Ordering::Relaxed);
+    let dss = DSSCTRL_BASE.load(Ordering::Relaxed);
     if top == 0 || DC_REGS.load(Ordering::Relaxed) == 0 || vout == 0 {
         super::print_str("riscv64: display - no dc8200 to program\n");
         return false;
@@ -756,6 +757,35 @@ pub fn mode_set() -> bool {
     paint_test_pattern(fb);
 
     pixel_clock_on(vout);
+
+    // THE DISPLAY SUB-SYSTEM CONTROLLER, which is what carries the controller's pixels to the
+    // transmitter. These two writes are the reason the screen was black, and the reason I did not
+    // make them the first time is worth writing down: the driver makes them TWICE, and only one of
+    // the two is behind a build flag.
+    //
+    // In `dc_init` they sit under `CONFIG_DRM_I2C_NXP_TDA998X` and `CONFIG_STARFIVE_DSI` - an
+    // external HDMI chip and a MIPI panel, neither of which is this board - so reading that call site
+    // and stopping was reading the code as saying "not for you". In `vs_dc_enable`, the function that
+    // actually runs on every mode set, the same two lines appear with NO condition at all. One
+    // driver, one pair of registers, two call sites, opposite conclusions.
+    //
+    // The board had already said so and I had not listened: the diagnostic printed
+    // `dssctrl[0..8]: 0x0 0xb0000 0x0 ...` two boots ago - bit 20 of the first clear, bit 3 of the
+    // second clear - and I read past it because I believed those bits belonged to hardware that is
+    // not on this board.
+    if dss != 0 {
+        mmio_write(dss, 0x4, mmio_read(dss, 0x4) | (1 << 20));
+        mmio_write(dss, 0x8, mmio_read(dss, 0x8) | (1 << 3));
+        super::print_str("riscv64: display - dss routing: 0x4=");
+        super::print_hex(mmio_read(dss, 0x4) as u64);
+        super::print_str(" 0x8=");
+        super::print_hex(mmio_read(dss, 0x8) as u64);
+        super::print_str("
+");
+    } else {
+        super::print_str("riscv64: display - NO dssctrl; the controller's output is unrouted
+");
+    }
 
     // The controller's own initialisation, from the vendor driver's per-panel loop.
     dc_write(DC_DISPLAY_PANEL_CONFIG, 0x111);
@@ -1308,16 +1338,13 @@ pub fn hdmi_on() -> bool {
     super::print_str("
 ");
 
-    // Eight bits per component in, RGB out, no colour-space conversion anywhere, full range, and the
-    // start-of-frame generator left to the external timing that is already programmed.
-    hdmi_write(HDMI_VIDEO_CONTRL1, (0 << 1) | 1); // SDR RGB444 in, DE from the controller's pin
-    hdmi_write(HDMI_VIDEO_CONTRL2, (0 << 6) | (3 << 4) | 0);
-    hdmi_write(HDMI_VIDEO_CONTRL, (0 << 7) | 1); // auto CSC off, no C0/C2 swap
-    hdmi_write(HDMI_VIDEO_CONTRL3, (1 << 4) | (1 << 3) | (1 << 2)); // depth not indicated, SOF off, full range
-    // And UNMUTE. Bit 7 clears a latched AVMUTE, bits 1 and 0 are the audio and video mute
-    // themselves. A transmitter holding video mute emits a perfectly valid signal carrying black,
-    // which is indistinguishable from a broken picture and is exactly what this television shows.
-    hdmi_write(HDMI_AV_MUTE, 1 << 7);
+    // NOTHING IS WRITTEN HERE, and the board is why. Every one of these four was already correct at
+    // reset - `ctl1=0x1 ctl2=0x34 ctl=0x1 ctl3=0x8 avmute=0x0`, which is eight bits per component in,
+    // RGB out, no conversion, and NOT muted - so the theory that StarFive's driver was relying on a
+    // wrong default was simply wrong. Writing them anyway cleared two bits that are in no header
+    // mask, and the television went from a steady black picture to a flickering one: a change I made
+    // that made it worse, kept here as a note rather than as code. The readback above stays, because
+    // it is what established this.
 
     config_video_timing();
     hdmi_write(0x00, 0x61);
