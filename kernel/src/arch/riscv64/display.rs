@@ -1065,8 +1065,13 @@ fn hdmi_read(off: usize) -> u32 {
 /// controller's three.
 const VOUTRST_HDMI_TX: u32 = 9;
 
-/// System control, and the video timing block.
+/// System control, and the video path in front of the timing block.
 const HDMI_SYS_CTRL: usize = 0x00;
+const HDMI_VIDEO_CONTRL1: usize = 0x01;
+const HDMI_VIDEO_CONTRL2: usize = 0x02;
+const HDMI_VIDEO_CONTRL: usize = 0x03;
+const HDMI_VIDEO_CONTRL3: usize = 0x04;
+const HDMI_AV_MUTE: usize = 0x05;
 const HDMI_VIDEO_TIMING_CTL: usize = 0x08;
 const HDMI_VIDEO_EXT_HTOTAL_L: usize = 0x09;
 const HDMI_VIDEO_EXT_HBLANK_L: usize = 0x0b;
@@ -1209,6 +1214,8 @@ fn report_transmitter() {
         ("tmds", 0x1b2),
         ("drive_bf", 0x1bf),
         ("drive_c0", 0x1c0),
+        ("ctl2", HDMI_VIDEO_CONTRL2),
+        ("avmute", HDMI_AV_MUTE),
     ] {
         super::print_str(" ");
         super::print_str(name);
@@ -1273,6 +1280,45 @@ pub fn hdmi_on() -> bool {
     // Configure the video path with the output stage OFF, then switch it on - so nothing half-formed
     // ever reaches the cable.
     hdmi_write(0x00, 0x63);
+
+    // WHAT THE PIXELS COMING IN ARE, AND WHETHER THE OUTPUT IS MUTED. StarFive's driver writes none
+    // of these four and relies on their reset values; Rockchip's driver for the SAME Innosilicon
+    // transmitter, with the same register map, writes all four on every mode set. Their reset values
+    // are printed below, because if this is the fault then the log names it rather than leaving a
+    // working screen with four new writes and no idea which one mattered.
+    //
+    // The suspicious one is the input width. `VIDEO_INPUT_8BITS` is the value 3; the field's ZERO
+    // means twelve bits. A transmitter told to expect twelve bits per component from a display
+    // controller sending eight does not fail - it assembles pixels out of the wrong wires, which on
+    // a fixed black-ish input is a black picture and looks exactly like no picture at all.
+    super::print_str("riscv64: display - transmitter video path before: ");
+    for (name, off) in [
+        ("ctl1", HDMI_VIDEO_CONTRL1),
+        ("ctl2", HDMI_VIDEO_CONTRL2),
+        ("ctl", HDMI_VIDEO_CONTRL),
+        ("ctl3", HDMI_VIDEO_CONTRL3),
+        ("avmute", HDMI_AV_MUTE),
+        ("hdcp", 0x52usize),
+    ] {
+        super::print_str(name);
+        super::print_str("=");
+        super::print_hex(hdmi_read(off) as u64);
+        super::print_str(" ");
+    }
+    super::print_str("
+");
+
+    // Eight bits per component in, RGB out, no colour-space conversion anywhere, full range, and the
+    // start-of-frame generator left to the external timing that is already programmed.
+    hdmi_write(HDMI_VIDEO_CONTRL1, (0 << 1) | 1); // SDR RGB444 in, DE from the controller's pin
+    hdmi_write(HDMI_VIDEO_CONTRL2, (0 << 6) | (3 << 4) | 0);
+    hdmi_write(HDMI_VIDEO_CONTRL, (0 << 7) | 1); // auto CSC off, no C0/C2 swap
+    hdmi_write(HDMI_VIDEO_CONTRL3, (1 << 4) | (1 << 3) | (1 << 2)); // depth not indicated, SOF off, full range
+    // And UNMUTE. Bit 7 clears a latched AVMUTE, bits 1 and 0 are the audio and video mute
+    // themselves. A transmitter holding video mute emits a perfectly valid signal carrying black,
+    // which is indistinguishable from a broken picture and is exactly what this television shows.
+    hdmi_write(HDMI_AV_MUTE, 1 << 7);
+
     config_video_timing();
     hdmi_write(0x00, 0x61);
     hdmi_write(0x1b2, 0x8f); // the TMDS driver
