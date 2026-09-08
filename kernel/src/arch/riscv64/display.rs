@@ -1203,3 +1203,46 @@ pub fn hdmi_on() -> bool {
     }
     true
 }
+
+// ============================ stage six: text on the screen ============================
+
+/// Give the framebuffer to the kernel's boot/panic console.
+///
+/// **Nothing about the font or the colours is decided here, and that is the point.** `bootcon` owns
+/// the glyphs, the palette and the layout on every port; what an architecture owes it is one
+/// `FbParams` - the memory, its physical base, the geometry, and where each colour channel sits in a
+/// pixel - and one `fb_commit`. So this port gets the same text, in the same font, in the same
+/// colours as the others without a line of code that knows what a character is. That is the whole
+/// claim of the arch seam, and a display is the place it is easiest to break by writing "just a small
+/// renderer" instead.
+///
+/// The channel shifts are the controller's pixel format restated: A8R8G8B8 packs alpha, red, green
+/// and blue from the top of a 32-bit word down, so red sits at bit 16, green at 8 and blue at 0.
+pub fn adopt_as_boot_console() {
+    let phys = FB_PHYS.load(Ordering::Relaxed);
+    if phys == 0 {
+        return;
+    }
+    // SAFETY: the same run of frames `mode_set` reserved and handed to the display controller,
+    // permanently removed from the allocator so nothing else can ever be given it, inside the
+    // kernel's identity map. The controller reads it and the console writes it; there is no third
+    // owner, and the console's writes are bounds-checked slice writes from here on.
+    let mem: &'static mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, FB_BYTES) };
+    crate::bootcon::init(crate::bootcon::FbParams {
+        mem,
+        phys,
+        pitch: FB_STRIDE as usize,
+        bpp: 4,
+        width: H_ACTIVE as usize,
+        height: V_ACTIVE as usize,
+        r_shift: 16,
+        g_shift: 8,
+        b_shift: 0,
+    });
+    // Only NOW does the serial path start mirroring: a byte painted before `bootcon::init` would be
+    // drawn through a console that has no framebuffer yet.
+    super::screen_ready();
+    crate::bootcon::clear_and_home();
+    super::print_str("riscv64: display - the boot console now draws to the screen\n");
+}

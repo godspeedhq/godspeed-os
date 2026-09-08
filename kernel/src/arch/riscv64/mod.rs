@@ -404,10 +404,17 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
 
     let tree_hz = tree.timebase_frequency();
     if let Some(hz) = tree_hz {
+        // RECORD IT HERE, not when the scheduler tick starts several hundred lines below. Every
+        // bounded wait between this point and there - the power domain, each reset, each PLL lock,
+        // and the frame counter that measures the display - asks `timebase_hz()` for the machine's
+        // rate, and until this store they were all being answered ZERO. The waits survived it on
+        // their fallback constants; the frame counter did not, and reported `0.00 Hz` about a
+        // display running at exactly 60. A rate read from the device tree is a fact the moment it is
+        // read, and holding it back until the timer starts made it a fact only for the timer.
+        TIMEBASE_HZ.store(hz, Ordering::Relaxed);
         print_str("riscv64: timebase ");
         print_dec(hz as u64);
-        print_str(" Hz
-");
+        print_str(" Hz\n");
     }
 
     // The UART, by PROGRAMMING MODEL rather than by address. Two compatibles because two machines
@@ -633,7 +640,11 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
                 display::set_hdmi_base(reg.base);
             }
             if display::mode_set() {
-                display::hdmi_on();
+                if display::hdmi_on() {
+                    // The framebuffer is live and on a wire: hand it to the kernel's boot console so
+                    // everything printed from here appears on the screen as well as the serial line.
+                    display::adopt_as_boot_console();
+                }
             } else {
                 display::diagnose();
             }
@@ -1005,6 +1016,35 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     if got {
         SERIAL_LOCK.store(false, Ordering::Release);
     }
+    mirror_to_screen(s);
+}
+
+/// Set once the display is up and the boot console owns the framebuffer. Until then every byte in
+/// the boot goes to serial alone, which is what makes this safe to call from the very first line.
+static SCREEN_READY: AtomicBool = AtomicBool::new(false);
+/// Held while a core is painting. A second core writing at the same time gets its bytes on the serial
+/// line and skips the screen rather than interleaving glyphs into a half-drawn one - the same trade
+/// the ARM port makes, and for the same reason: serial already has the complete text.
+static PAINTING: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn screen_ready() {
+    SCREEN_READY.store(true, Ordering::Release);
+}
+
+/// Put the same bytes on the screen that just went to the serial line.
+///
+/// The kernel has ONE output path and this is a second sink on it, not a second path - which is why
+/// the display gets the boot log, the panic message and a service's log lines without any of them
+/// knowing a screen exists.
+fn mirror_to_screen(s: &[u8]) {
+    if !SCREEN_READY.load(Ordering::Acquire) {
+        return;
+    }
+    if PAINTING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    crate::bootcon::put_bytes(s);
+    PAINTING.store(false, Ordering::Release);
 }
 /// Console output for a SERVICE - the path the shell's prompt and its echo take.
 ///
@@ -1013,11 +1053,21 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// routed through the `console` service and back down to here, and while this was empty the shell
 /// prompted into nothing. The symptom was a system that booted perfectly and showed no prompt.
 ///
-/// `to_fb` selects the framebuffer as well, and is ignored: this port has no display, so serial is
-/// not one of two sinks but the only one.
+/// `to_fb` selects the framebuffer as well. It is honoured now that there is one: the serial write
+/// mirrors to the screen on its own, so a caller that does NOT want the screen has to be given a path
+/// that skips it rather than one that cannot reach it.
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
-    let _ = to_fb;
-    serial_write_bytes_lockfree(s);
+    if to_fb {
+        serial_write_bytes_lockfree(s);
+        return;
+    }
+    let got = serial_lock_acquire();
+    for &b in s {
+        putc(b);
+    }
+    if got {
+        SERIAL_LOCK.store(false, Ordering::Release);
+    }
 }
 pub fn set_console_echo(on: bool) { let _ = on; }
 pub fn claim_console_foreground(task_slot: u32) {}
@@ -1188,11 +1238,28 @@ pub fn note_user_task(_slot: usize) {}
 // The kernel's boot/panic floor owes each arch one item (see `crate::bootcon`). No framebuffer is
 // mapped on this stub, so the console never initialises and every entry point no-ops.
 
-/// Publish a written rectangle. Nothing to publish yet.
+/// Publish a written rectangle so the display controller's next scan reads it.
+///
+/// The framebuffer is ordinary cacheable RAM on this port - there is no page-based memory type to
+/// mark it otherwise, since this part implements neither `Svpbmt` nor `Zicbom` (its device tree lists
+/// neither, and its ISA string is `rv64imafdc_zba_zbb`). So what this owes is ORDERING: a `fence`
+/// that makes the pixel writes visible to other masters before the controller's next fetch. That is
+/// the correct and complete answer on a machine whose DMA is coherent, and this one's device tree
+/// says it is - no node is marked `dma-noncoherent` and several are explicitly `dma-coherent`.
+///
+/// **If that turns out to be wrong, this is where it shows, and this port cannot fix it here.** A
+/// non-coherent framebuffer would need a cache clean, and S-mode on this silicon has no instruction
+/// that performs one: the SiFive flush is M-mode only and `Zicbom` is absent. The honest options
+/// would then be an SBI-vendor call or a non-cacheable mapping, both of which are real work rather
+/// than a constant - recorded here rather than assumed away (26.7).
 pub fn fb_commit(
     _base: usize, _pitch: usize, _bpp: usize,
     _x: usize, _y: usize, _w: usize, _h: usize,
-) {}
+) {
+    // SAFETY: a memory fence has no operands and no side effect beyond ordering. `rw, rw` is the
+    // full barrier - every earlier load and store before every later one.
+    unsafe { core::arch::asm!("fence rw, rw", options(nostack, preserves_flags)) };
+}
 
 pub mod page_tables {
 
