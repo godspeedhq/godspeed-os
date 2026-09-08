@@ -607,8 +607,18 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         let mut w3: [Option<u32>; 0] = [];
         let vout = tree.find_compatible("starfive,jh7110-voutcrg", &[], &mut w3).map(|r| r.base);
         display::set_crg_bases(sys.unwrap_or(0), vout.unwrap_or(0));
-        if display::power_on_vout() {
-            display::clocks_on();
+        // The display controller's register windows, so stage three can ask whether it answers. The
+        // node lists three ranges; the first two are the controller, the third is the PMU it uses to
+        // switch its own power domain - which is stage one's job, not this one's.
+        let mut w4: [Option<u32>; 0] = [];
+        if let Some(reg) = tree.find_compatible("starfive,jh7110-dc8200", &[], &mut w4) {
+            // `find_compatible` hands back the FIRST range; the second is 0x800 further on, which is
+            // where the controller proper lives (the tree says 0x2940_0000+0x100 then
+            // 0x2940_0800+0x2000).
+            display::set_dc_bases(reg.base, reg.base + 0x800);
+        }
+        if display::power_on_vout() && display::clocks_on() {
+            display::probe_dc8200();
         }
     }
 

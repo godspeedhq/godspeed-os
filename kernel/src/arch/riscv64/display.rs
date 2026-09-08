@@ -188,6 +188,15 @@ const SYSRST_VOUT_SRC: u32 = 0x2b;
 const SYSRST_NOC_DISP: u32 = 0x1a;
 
 /// Video-out clocks. The display controller needs its four; the HDMI transmitter needs its three.
+/// **These two are DIVIDERS, not gates.** `JH71X0__DIV(APB, "apb", 8, ...)` and
+/// `JH71X0__DIV(DC8200_PIX, "dc8200_pix", 63, ...)`: their registers hold a divisor in the low bits
+/// and have no enable bit at all, so writing bit 31 and reading it back reports nothing and always
+/// would have. The board called them `apb=FAIL pix=FAIL` while the other nine came up, which is the
+/// clock table saying "you have asked a divider whether it is switched on".
+///
+/// They are not cosmetic. `dc8200_pix` divides `vout_src` down to the PIXEL CLOCK, and the mode this
+/// display eventually runs at is that divisor - so what they hold is read and reported here, and
+/// setting them belongs with the stage that chooses a mode.
 const VOUTCLK_APB: usize = 0;
 const VOUTCLK_DC8200_PIX: usize = 1;
 const VOUTCLK_DC8200_AXI: usize = 4;
@@ -344,11 +353,9 @@ pub fn clocks_on() -> bool {
 
     // Only NOW is the video-out generator reachable: its registers are inside the block the clocks
     // and resets above just brought up.
-    super::print_str("riscv64: display - video-out clocks:");
+    super::print_str("riscv64: display - video-out gates:");
     let mut enabled = 0;
     for (i, name) in [
-        (VOUTCLK_APB, "apb"),
-        (VOUTCLK_DC8200_PIX, "pix"),
         (VOUTCLK_DC8200_AXI, "axi"),
         (VOUTCLK_DC8200_CORE, "core"),
         (VOUTCLK_DC8200_AHB, "ahb"),
@@ -369,6 +376,15 @@ pub fn clocks_on() -> bool {
         }
     }
     super::print_str("\n");
+
+    // The dividers, READ rather than enabled - what they already hold is what the pixel clock
+    // currently is, and that is the number the mode stage has to work from.
+    super::print_str("riscv64: display - dividers: apb=");
+    super::print_hex(mmio_read(vout, VOUTCLK_APB * 4) as u64);
+    super::print_str(" dc8200_pix=");
+    super::print_hex(mmio_read(vout, VOUTCLK_DC8200_PIX * 4) as u64);
+    super::print_str("\n");
+
     if enabled == 0 {
         // Not one enable bit stuck. The block is not answering, which means it is not really powered
         // or not really clocked - and going on to write display timings into it would be writing
@@ -389,4 +405,47 @@ pub fn clocks_on() -> bool {
 
     super::print_str("riscv64: display - VOUT powered, clocked and out of reset\n");
     true
+}
+
+// ============================ stage three: does the DC8200 answer? ============================
+
+/// Where the display controller's two register windows are, from the device tree.
+static DC_BASE: AtomicU64 = AtomicU64::new(0);
+static DC_REGS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn set_dc_bases(top: u64, regs: u64) {
+    DC_BASE.store(top, Ordering::Relaxed);
+    DC_REGS.store(regs, Ordering::Relaxed);
+}
+
+/// Read the first few words of each of the display controller's register windows.
+///
+/// **A deliberately ignorant probe, and that is the point.** Programming the DC8200 needs its
+/// register map, which is in a vendor tree rather than mainline; but proving it ANSWERS needs no
+/// register map at all. A block that is powered, clocked and out of reset returns varied values; one
+/// that is not returns all-ones, all-zeros, or nothing at all. That is the question this stage asks,
+/// and it is worth asking on its own because every later stage is written against the assumption.
+///
+/// Reads only. Nothing here can change the state of anything, which is what makes it safe to run
+/// before the register map is understood.
+pub fn probe_dc8200() {
+    let top = DC_BASE.load(Ordering::Relaxed);
+    let regs = DC_REGS.load(Ordering::Relaxed);
+    if top == 0 || regs == 0 {
+        super::print_str("riscv64: display - no dc8200 in the device tree\n");
+        return;
+    }
+
+    for (base, name) in [(top, "top"), (regs, "regs")] {
+        super::print_str("riscv64: display - dc8200 ");
+        super::print_str(name);
+        super::print_str(" @");
+        super::print_hex(base);
+        super::print_str(":");
+        for i in 0..6usize {
+            super::print_str(" ");
+            super::print_hex(mmio_read(base, i * 4) as u64);
+        }
+        super::print_str("\n");
+    }
 }
