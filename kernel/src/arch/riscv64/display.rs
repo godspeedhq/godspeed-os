@@ -1109,6 +1109,11 @@ const HDMI_HDCP_CTRL: usize = 0x52;
 const HDMI_INTERRUPT_MASK1: usize = 0xc0;
 const HDMI_INTERRUPT_STATUS1: usize = 0xc1;
 const HDMI_INT_ACTIVE_VSYNC: u32 = 1 << 5;
+/// The transmitter's OWN colour-bar generator. The vendor header names it and no driver in the tree
+/// uses it, so its bit layout is unknown - which is why it is written with every bit set and read
+/// back: bits a part does not implement read zero, so the value that comes back says how wide the
+/// register really is as well as whether the write landed.
+const HDMI_COLORBAR: usize = 0xc9;
 const HDMI_VIDEO_TIMING_CTL: usize = 0x08;
 const HDMI_VIDEO_EXT_HTOTAL_L: usize = 0x09;
 const HDMI_VIDEO_EXT_HBLANK_L: usize = 0x0b;
@@ -1414,6 +1419,29 @@ pub fn hdmi_on() -> bool {
     // removes a whole class of "the television decided not to" from the search. If this is what makes
     // the picture appear, the fix is to send a proper infoframe, not to stay in DVI.
     hdmi_write(HDMI_HDCP_CTRL, hdmi_read(HDMI_HDCP_CTRL) & !(1 << 1));
+
+    // THE TRANSMITTER PAINTS ITS OWN PICTURE, and this is the one test nothing upstream can confound.
+    //
+    // What is known now: the controller scans at 59.99 Hz, its vertical syncs arrive at the
+    // transmitter at 59.99 Hz, the television is connected and syncing, both PLLs are locked and the
+    // output stage holds every value written to it. The sync path works end to end and only the pixel
+    // DATA is black - and both of the two colours the controller can produce without touching memory
+    // came out black too, which should have been impossible if the controller's pixels were reaching
+    // the screen at all.
+    //
+    // So the question is no longer which register is wrong; it is which SIDE the fault is on. This
+    // generator sits after the transmitter's video input and before its output, so it bypasses the
+    // controller completely. Bars on the screen mean the transmitter, the cable and the television
+    // are faultless and every remaining problem is in the controller's pixel data. No bars mean the
+    // transmitter's output stage is not painting at all, and everything I have been adjusting on the
+    // controller for four boots is irrelevant.
+    //
+    // Either answer retires half the search. That is worth a boot in a way that another guess is not.
+    hdmi_write(HDMI_COLORBAR, 0xff);
+    super::print_str("riscv64: display - transmitter colour bar requested, register reads ");
+    super::print_hex(hdmi_read(HDMI_COLORBAR) as u64);
+    super::print_str("
+");
 
     // The driver's last act: strobe register 0xce low then high, which restarts the video path with
     // everything above in place.
