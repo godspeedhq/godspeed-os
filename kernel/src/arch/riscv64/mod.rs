@@ -601,6 +601,24 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
 
     probe_rdcycle();
 
+    // The last-level cache, and the window used to flush it. Both come from the cache controller's
+    // own node: its first range is the registers and its second is a memory window that reads zeros
+    // and exists solely to be written through. Wanted before the display, because the display is
+    // what needs it.
+    if let Some(reg) = tree.find_compatible_prop("starfive,jh7110-ccache", "reg") {
+        // Two address/size pairs of two cells each, big-endian: registers first, zero device second.
+        if reg.len() >= 32 {
+            let cell = |i: usize| -> u64 {
+                let mut v = 0u64;
+                for b in 0..8 {
+                    v = (v << 8) | reg[i * 8 + b] as u64;
+                }
+                v
+            };
+            ccache_init(cell(0), cell(2));
+        }
+    }
+
     // THE DISPLAY, first stage: the power domain everything else in VOUT sits behind. Nothing here
     // touches the display controller - reading an unpowered domain is a transaction with nothing to
     // answer it, not a zero - so this asks the always-on PMU instead, which is safe at any time.
@@ -1238,20 +1256,127 @@ pub fn note_user_task(_slot: usize) {}
 // The kernel's boot/panic floor owes each arch one item (see `crate::bootcon`). No framebuffer is
 // mapped on this stub, so the console never initialises and every entry point no-ops.
 
+/// The last-level cache, and the memory window used to flush it. Zero until the boot finds them.
+static CCACHE_BASE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static CCACHE_ZERO_DEV: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// Bytes per way and the highest line index within one, worked out from the cache's own config
+/// register rather than from constants, because a constant here would be a different cache on the
+/// next part.
+static CCACHE_BYTES_PER_WAY: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static CCACHE_MAX_WAY: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Registers, from Linux's `drivers/cache/sifive_ccache.c`.
+const CCACHE_CONFIG: usize = 0x00;
+const CCACHE_WAYENABLE: usize = 0x08;
+const CCACHE_WAYMASK_BASE: usize = 0x800;
+const CCACHE_MASTERS: usize = 32;
+const CCACHE_ALL_WAYS: u64 = 0xffff;
+
+/// Work out the cache's shape and remember where to reach it.
+///
+/// Called once at boot with the two addresses the device tree gives the cache controller: its
+/// registers, and a 32 MiB window that reads as zeros and exists for no purpose except this.
+pub(super) fn ccache_init(base: u64, zero_dev: u64) {
+    if base == 0 || zero_dev == 0 {
+        return;
+    }
+    // SAFETY: an MMIO register the device tree describes, inside the identity map, read-only here.
+    let cfg = unsafe { ((base as usize + CCACHE_CONFIG) as *const u32).read_volatile() };
+    let banks = (cfg & 0xff) as u64;
+    let ways = ((cfg >> 8) & 0xff) as u64;
+    let sets = 1u64 << ((cfg >> 16) & 0xff);
+    let block = 1u64 << ((cfg >> 24) & 0xff);
+    if banks == 0 || ways == 0 || block == 0 {
+        return;
+    }
+    // SAFETY: as above.
+    let max_way = unsafe { ((base as usize + CCACHE_WAYENABLE) as *const u32).read_volatile() } as u64;
+
+    CCACHE_BASE.store(base, Ordering::Relaxed);
+    CCACHE_ZERO_DEV.store(zero_dev, Ordering::Relaxed);
+    CCACHE_BYTES_PER_WAY.store(banks * sets * block, Ordering::Relaxed);
+    CCACHE_MAX_WAY.store(max_way, Ordering::Relaxed);
+
+    print_str("riscv64: last-level cache ");
+    print_dec(banks * sets * ways * block / 1024);
+    print_str(" KiB, ");
+    print_dec(ways);
+    print_str(" ways (");
+    print_dec(max_way + 1);
+    print_str(" enabled), ");
+    print_dec(block);
+    print_str(" byte lines - flushable\n");
+}
+
+/// Push every dirty line in the last-level cache out to memory.
+///
+/// **This part cannot flush by address, and that is a property of the silicon rather than a choice.**
+/// The cache controller defines a flush-by-physical-address register and Linux's driver for it
+/// defines the offset - and never uses it, because on this SoC it does not work. What the vendor
+/// driver does instead is the only mechanism there is: for each way in turn, restrict every bus
+/// master to that one way, then write a way's worth of zeros through a memory window that exists for
+/// this purpose, which forces every line in that way to be allocated afresh and its old contents
+/// written back. Sixteen ways of two thousand lines is about thirty-three thousand stores.
+///
+/// So a whole-cache flush is the only granularity available, and `fb_commit`'s rectangle is
+/// information this hardware cannot use. That is recorded rather than hidden: the cost is the same
+/// for one character as for the whole screen.
+///
+/// The RISC-V ISA has nothing to offer here either - this part implements neither `Zicbom` (cache
+/// block operations) nor `Svpbmt` (a non-cacheable page attribute), so there is no portable way to
+/// do this and no way to avoid needing to.
+fn ccache_flush_all() {
+    let base = CCACHE_BASE.load(Ordering::Relaxed) as usize;
+    let zero = CCACHE_ZERO_DEV.load(Ordering::Relaxed) as usize;
+    let per_way = CCACHE_BYTES_PER_WAY.load(Ordering::Relaxed) as usize;
+    let max_way = CCACHE_MAX_WAY.load(Ordering::Relaxed) as usize;
+    if base == 0 || zero == 0 || per_way == 0 {
+        return;
+    }
+    const LINE: usize = 64;
+
+    // SAFETY: two MMIO windows the device tree describes, both inside the identity map, written
+    // exactly as the vendor driver writes them. The way-mask registers are restored to "all ways" on
+    // the way out, including if the loop is entered zero times, so no path leaves the cache confined
+    // to one way - which would be a machine that still works and is sixteen times smaller.
+    unsafe {
+        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+        for way in 0..=max_way {
+            let mask = 1u64 << way;
+            for m in 0..CCACHE_MASTERS {
+                ((base + CCACHE_WAYMASK_BASE + m * 8) as *mut u64).write_volatile(mask);
+            }
+            let line_base = zero + way * per_way;
+            let mut off = 0usize;
+            while off < per_way {
+                ((line_base + off) as *mut u64).write_volatile(0);
+                off += LINE;
+            }
+            core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+        }
+        for m in 0..CCACHE_MASTERS {
+            ((base + CCACHE_WAYMASK_BASE + m * 8) as *mut u64).write_volatile(CCACHE_ALL_WAYS);
+        }
+        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+    }
+}
+
 /// Publish a written rectangle so the display controller's next scan reads it.
 ///
-/// The framebuffer is ordinary cacheable RAM on this port - there is no page-based memory type to
-/// mark it otherwise, since this part implements neither `Svpbmt` nor `Zicbom` (its device tree lists
-/// neither, and its ISA string is `rv64imafdc_zba_zbb`). So what this owes is ORDERING: a `fence`
-/// that makes the pixel writes visible to other masters before the controller's next fetch. That is
-/// the correct and complete answer on a machine whose DMA is coherent, and this one's device tree
-/// says it is - no node is marked `dma-noncoherent` and several are explicitly `dma-coherent`.
+/// **It did turn out to be wrong, and the television said so.** This used to be a bare `fence`, on
+/// the reasoning that the framebuffer is ordinary cacheable RAM, that ordering is all a coherent
+/// machine needs, and that this board's device tree marks nothing `dma-noncoherent`. The picture came
+/// up as colour bars with a corrupted band across them - which is precisely the shape of the mistake:
+/// eight megabytes written through a two megabyte cache pushes most of itself out on the way, and
+/// what is left dirty is the last part written. The device tree's silence was not a claim of
+/// coherence; it was silence, and I read it as evidence.
 ///
-/// **If that turns out to be wrong, this is where it shows, and this port cannot fix it here.** A
-/// non-coherent framebuffer would need a cache clean, and S-mode on this silicon has no instruction
-/// that performs one: the SiFive flush is M-mode only and `Zicbom` is absent. The honest options
-/// would then be an SBI-vendor call or a non-cacheable mapping, both of which are real work rather
-/// than a constant - recorded here rather than assumed away (26.7).
+/// So this owes ordering AND a writeback. The RISC-V ISA offers nothing for the second - this part
+/// implements neither `Zicbom` nor `Svpbmt`, so there is no cache-block operation and no way to mark
+/// the pages non-cacheable - and the cache's own flush-by-address register does not work on this SoC.
+/// What is left is `ccache_flush_all`, which is a WHOLE-CACHE flush; the rectangle this function is
+/// handed is information the hardware cannot use, and the cost is the same for one character as for
+/// the entire screen.
 pub fn fb_commit(
     _base: usize, _pitch: usize, _bpp: usize,
     _x: usize, _y: usize, _w: usize, _h: usize,
@@ -1259,6 +1384,7 @@ pub fn fb_commit(
     // SAFETY: a memory fence has no operands and no side effect beyond ordering. `rw, rw` is the
     // full barrier - every earlier load and store before every later one.
     unsafe { core::arch::asm!("fence rw, rw", options(nostack, preserves_flags)) };
+    ccache_flush_all();
 }
 
 pub mod page_tables {
