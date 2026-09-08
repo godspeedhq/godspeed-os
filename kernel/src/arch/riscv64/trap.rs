@@ -171,6 +171,14 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    // The boot's deliberate `rdcycle`, and only while the probe is executing it. Armed for one
+    // instruction, so an illegal instruction anywhere else still halts loudly.
+    if !interrupt && code == 2 && !frame.from_user() && super::claim_rdcycle_probe() {
+        // `csrr` has no compressed encoding, so four bytes is exactly the probe's instruction.
+        frame.sepc = frame.sepc.wrapping_add(4);
+        return;
+    }
+
     // The user-mode selftest, and only while it is running: the `ecall` its stub uses to hand
     // control back, and the one deliberate fault it makes on the way. Both are refused outright
     // once the selftest is over, so neither is a door a real task could later walk through.

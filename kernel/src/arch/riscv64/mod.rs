@@ -476,6 +476,46 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             // so a default would name a hart the kernel is not running on.
             publish_bsp_lapic_id();
 
+            // PCI Express, if this machine has any. The window's base comes from the tree, never
+            // from a constant: QEMU `virt` puts it at 0x3000_0000 and a board will not, and a
+            // hard-coded base is the mistake this port has already paid for three times.
+            {
+                let mut want: [Option<u32>; 0] = [];
+                if let Some(reg) = tree.find_compatible("pci-host-ecam-generic", &[], &mut want) {
+                    pci::set_ecam(reg.base, reg.size);
+                    // The 32-bit memory window the bridge forwards, from `ranges`: triplets of
+                    // <child 3 cells><parent 2><size 2>, where the top byte of the first child cell
+                    // says which space it is. 0x02 is 32-bit memory, which is the one a BAR here can
+                    // live in. Parsed where the meaning is known rather than in the tree reader.
+                    if let Some(r) = tree.find_compatible_prop("pci-host-ecam-generic", "ranges") {
+                        let mut off = 0usize;
+                        while off + 28 <= r.len() {
+                            let flags = u32::from_be_bytes([r[off], r[off+1], r[off+2], r[off+3]]);
+                            let space = (flags >> 24) & 0x03;
+                            let parent = u64::from_be_bytes([
+                                r[off+12], r[off+13], r[off+14], r[off+15],
+                                r[off+16], r[off+17], r[off+18], r[off+19]]);
+                            let size = u64::from_be_bytes([
+                                r[off+20], r[off+21], r[off+22], r[off+23],
+                                r[off+24], r[off+25], r[off+26], r[off+27]]);
+                            if space == 0x02 {
+                                pci::set_mem_window(parent, size);
+                                print_str("riscv64: pci mem window ");
+                                print_hex(parent);
+                                print_str("+");
+                                print_hex(size);
+                                print_str("\n");
+                                break;
+                            }
+                            off += 28;
+                        }
+                    }
+                } else {
+                    print_str("riscv64: no pci-host-ecam-generic in the device tree - no PCI\n");
+                }
+            }
+            pci::init();
+
             crate::capability::init();
             crate::ipc::init();
             print_str("riscv64: capability table and ipc routing initialised
@@ -506,6 +546,8 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         print_str("riscv64: TRAP VECTOR REFUSED - handler address is not 4-byte aligned
 ");
     }
+
+    probe_rdcycle();
 
     // What the firmware beneath us offers. Probed rather than assumed: the two machines disagree
     // about their own capabilities, and calling into a missing extension is how a boot goes quiet.
@@ -1488,18 +1530,73 @@ pub const DMA_ARENA_UNCACHED: bool = true;
 pub const DRIVER_DMA_VA: u64 = 0x7000_0000;
 
 pub mod pci {
-    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+    //! PCI Express, reached through ECAM.
+    //!
+    //! **There is no port I/O on this ISA.** x86 walks the bus through the CF8/CFC address and data
+    //! ports; RISC-V has no `in`/`out` instruction and no I/O space at all, so configuration space is
+    //! MEMORY, mapped as a flat window: bus, device and function are bits of an address rather than a
+    //! value written to a port. That is the whole difference, and it makes this the simpler of the
+    //! two - one `read_volatile` where x86 needs a write then a read, with no lock between them.
+    //!
+    //! The window's base is READ FROM THE DEVICE TREE, never assumed. QEMU `virt` happens to put it
+    //! at 0x3000_0000; a board will put it somewhere else, and a hard-coded base is the class of
+    //! mistake this port has already paid for three times (the load address, the UART shift, the boot
+    //! hart). The tree names it `pci-host-ecam-generic`, which is the same generic binding Linux
+    //! matches on, so nothing here knows which machine it is on.
+
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
     use portable_atomic::AtomicU64;
 
-    /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
-    /// treat it as "this machine has no PCI ethernet controller", which is true.
-    pub fn ehci() -> Option<PciDevice> { None }
-    pub fn xhci() -> Option<PciDevice> { None }
-    pub fn nic() -> Option<PciDevice> { None }
-    pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
+    /// Base of the ECAM window, and how large it is. Zero means "no PCI on this machine", which is a
+    /// true and common answer - the VisionFive's device tree may not describe one at all.
+    static ECAM_BASE: AtomicU64 = AtomicU64::new(0);
+    static ECAM_SIZE: AtomicU64 = AtomicU64::new(0);
 
-    // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
-    /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.
+    /// Tell this module where configuration space lives. Called once, from the boot, with what the
+    /// device tree said.
+    pub(super) fn set_ecam(base: u64, size: u64) {
+        ECAM_BASE.store(base, Ordering::Relaxed);
+        ECAM_SIZE.store(size, Ordering::Relaxed);
+    }
+
+    /// A bus/device/function triple packed the way the rest of the kernel passes it: `bus << 8 | dev
+    /// << 3 | func`, which is x86's `bdf`. Kept identical so the neutral spawn path, which carries a
+    /// `bdf` around without interpreting it, needs no change.
+    #[inline]
+    fn ecam_addr(bdf: u32, off: u16) -> Option<usize> {
+        let base = ECAM_BASE.load(Ordering::Relaxed);
+        if base == 0 {
+            return None;
+        }
+        let bus = (bdf >> 8) & 0xff;
+        let dev = (bdf >> 3) & 0x1f;
+        let func = bdf & 0x7;
+        // ECAM: bus[27:20] device[19:15] function[14:12] offset[11:0].
+        let offset = ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12)
+            | ((off as u64) & 0xfff);
+        if offset >= ECAM_SIZE.load(Ordering::Relaxed) {
+            return None; // past the window the tree described: not ours to touch
+        }
+        Some((base + offset) as usize)
+    }
+
+    /// Read one configuration-space register.
+    pub fn cfg_read32(bdf: u32, off: u16) -> Option<u32> {
+        let addr = ecam_addr(bdf, off & !3)?;
+        // SAFETY: an address inside the ECAM window the device tree described, 4-byte aligned.
+        // Configuration reads have no side effects on a conforming device.
+        Some(unsafe { (addr as *const u32).read_volatile() })
+    }
+
+    /// Write one configuration-space register.
+    fn cfg_write32(bdf: u32, off: u16, val: u32) {
+        if let Some(addr) = ecam_addr(bdf, off & !3) {
+            // SAFETY: as above. The caller is enabling a device this kernel owns.
+            unsafe { (addr as *mut u32).write_volatile(val) };
+        }
+    }
+
+    // ---- The generic device table. Same shape on every arch so the spawn path stays neutral. ----
     #[derive(Clone, Copy)]
     pub struct PciDevice {
         pub index: usize,
@@ -1510,21 +1607,288 @@ pub mod pci {
         pub vendor: u16,
         pub device: u16,
     }
-    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
-    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
-    /// ARM32 HAS NO PCI AT ALL - the DWC2 is soldered to the BCM283x and there is no bus to walk.
-    /// So this is not "unimplemented", it is EMPTY BY CONSTRUCTION: no class code can ever match,
-    /// and every driver on this port names a non-PCI kind (`HwClass::Dwc2`). One slot, because the
-    /// array it sizes must exist and nothing will ever fill it.
-    pub const MAX_DEVICES: usize = 1;
-    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
 
-    pub fn init() {}
-    pub fn clear_bus_master(bdf: u32) {}
-    pub fn set_bus_master(bdf: u32) {}
-    pub fn set_power_d0(bdf: u32) {}
+    /// A ceiling readable off the source (26.6.1). QEMU `virt` presents a handful; a board with more
+    /// than this many is reported rather than silently truncated.
+    pub const MAX_DEVICES: usize = 32;
+    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+    static DEVICES: [DeviceCell; MAX_DEVICES] = [const { DeviceCell::new() }; MAX_DEVICES];
+
+    /// One table slot, as atomics rather than a `static mut`, so the table needs no `unsafe`. It is
+    /// written once during boot enumeration and read for the life of the machine.
+    struct DeviceCell {
+        bdf: AtomicU32,
+        class_code: AtomicU32,
+        bar: [AtomicU64; 6],
+        irq_line: AtomicU8,
+        vendor: AtomicU32,
+        device: AtomicU32,
+    }
+
+    impl DeviceCell {
+        const fn new() -> Self {
+            DeviceCell {
+                bdf: AtomicU32::new(0),
+                class_code: AtomicU32::new(0),
+                bar: [const { AtomicU64::new(0) }; 6],
+                irq_line: AtomicU8::new(0),
+                vendor: AtomicU32::new(0),
+                device: AtomicU32::new(0),
+            }
+        }
+    }
+
+    pub fn device_at(n: usize) -> Option<PciDevice> {
+        if n >= DEVICE_COUNT.load(Ordering::Acquire) as usize {
+            return None;
+        }
+        let c = &DEVICES[n];
+        let mut bar = [0u64; 6];
+        for (i, b) in bar.iter_mut().enumerate() {
+            *b = c.bar[i].load(Ordering::Relaxed);
+        }
+        Some(PciDevice {
+            index: n,
+            bdf: c.bdf.load(Ordering::Relaxed),
+            class_code: c.class_code.load(Ordering::Relaxed),
+            bar,
+            irq_line: c.irq_line.load(Ordering::Relaxed),
+            vendor: c.vendor.load(Ordering::Relaxed) as u16,
+            device: c.device.load(Ordering::Relaxed) as u16,
+        })
+    }
+
+    /// The first device whose 24-bit class/subclass/prog-if matches.
+    pub fn find_by_class(class_code: u32) -> Option<PciDevice> {
+        (0..DEVICE_COUNT.load(Ordering::Acquire) as usize)
+            .filter_map(device_at)
+            .find(|d| d.class_code == class_code)
+    }
+
+    pub fn ehci() -> Option<PciDevice> { find_by_class(0x0c_03_20) }
+    pub fn xhci() -> Option<PciDevice> { find_by_class(0x0c_03_30) }
+    pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
+
+    /// The first MEMORY BAR, with its flag bits removed and a 64-bit BAR joined to its upper half.
+    ///
+    /// A BAR's low bits are type flags, not address: bit 0 selects I/O versus memory, bits 2:1 give
+    /// the width. Returning the raw register would hand a driver an address a few bytes off, which
+    /// maps and then fails in a way that looks like a broken device.
+    pub fn first_memory_bar(d: &PciDevice) -> u64 {
+        let mut i = 0;
+        while i < 6 {
+            let raw = d.bar[i];
+            if raw == 0 {
+                i += 1;
+                continue;
+            }
+            if raw & 1 != 0 {
+                i += 1; // an I/O BAR, which this ISA cannot address at all
+                continue;
+            }
+            let sixty_four = (raw >> 1) & 0x3 == 0x2;
+            let addr = raw & !0xf;
+            return if sixty_four && i + 1 < 6 {
+                addr | (d.bar[i + 1] << 32)
+            } else {
+                addr
+            };
+        }
+        0
+    }
+
+    /// The 32-bit memory window the host bridge forwards, and the next free address in it.
+    ///
+    /// **Nothing has assigned these BARs.** On a PC the firmware does it before the kernel runs; here
+    /// OpenSBI does not, so every BAR reads back zero and a driver handed one would map address zero
+    /// and find nothing. Linux assigns them itself from the bridge's `ranges`, and so does this.
+    static MEM32_BASE: AtomicU64 = AtomicU64::new(0);
+    static MEM32_END: AtomicU64 = AtomicU64::new(0);
+    static MEM32_NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Record the bridge's 32-bit memory window, from the tree's `ranges`.
+    pub(super) fn set_mem_window(base: u64, size: u64) {
+        MEM32_BASE.store(base, Ordering::Relaxed);
+        MEM32_END.store(base.saturating_add(size), Ordering::Relaxed);
+        MEM32_NEXT.store(base, Ordering::Relaxed);
+    }
+
+    /// Carve `size` bytes out of the window, aligned as a BAR requires (to its own size).
+    fn alloc_mem(size: u64) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
+        let end = MEM32_END.load(Ordering::Relaxed);
+        let mut at = MEM32_NEXT.load(Ordering::Relaxed);
+        at = (at + size - 1) & !(size - 1); // a BAR must be aligned to its own size
+        if at.saturating_add(size) > end {
+            return None;
+        }
+        MEM32_NEXT.store(at + size, Ordering::Relaxed);
+        Some(at)
+    }
+
+    /// Size and place one device's BARs, and report each one's type.
+    ///
+    /// **The type is in the PROBE, not in the current value.** An unassigned BAR reads back zero on
+    /// every bit including bit 0, so asking "is bit 0 set" of the value already there says "memory"
+    /// about an I/O BAR just as confidently as about a real one. Firmware has assigned nothing here,
+    /// so every BAR looks like memory - and the first version of this put a memory address into an
+    /// AHCI controller's legacy I/O BAR0 and then handed that address to the driver as if it were the
+    /// register window. The type only exists once all-ones has been written and read back.
+    ///
+    /// Returns the six BAR values to record, with **zero for an I/O BAR** - deliberately, and for the
+    /// same reason x86 does it: "the first non-zero BAR" is then the register window on every device
+    /// without the kernel being told which device it is looking at. An AHCI controller keeps its
+    /// registers in BAR5 and its legacy IDE ports in BAR0-4; an xHCI uses BAR0. One rule, no table of
+    /// exceptions.
+    fn assign_bars(bdf: u32) -> [u64; 6] {
+        let mut out = [0u64; 6];
+        let mut i = 0usize;
+        while i < 6 {
+            let off = 0x10 + (i as u16) * 4;
+            let Some(orig) = cfg_read32(bdf, off) else { return out };
+            cfg_write32(bdf, off, 0xffff_ffff);
+            let probe = cfg_read32(bdf, off).unwrap_or(0);
+            cfg_write32(bdf, off, orig);
+            if probe == 0 {
+                i += 1;
+                continue; // not implemented
+            }
+            if probe & 1 != 0 {
+                // An I/O BAR. This ISA has no I/O space at all, so it is left unassigned and recorded
+                // as zero - which is what makes `first_memory_bar` correct by construction.
+                i += 1;
+                continue;
+            }
+            let sixty_four = (probe >> 1) & 0x3 == 0x2;
+            let mask = probe & !0xf;
+            if mask == 0 {
+                i += if sixty_four { 2 } else { 1 };
+                continue;
+            }
+            let size = (!(mask as u64) & 0xffff_ffff).wrapping_add(1);
+            match alloc_mem(size) {
+                Some(addr) => {
+                    cfg_write32(bdf, off, (addr as u32) | (probe & 0xf));
+                    if sixty_four {
+                        cfg_write32(bdf, off + 4, (addr >> 32) as u32);
+                    }
+                    out[i] = addr | ((probe & 0xf) as u64);
+                }
+                None => {
+                    super::print_str("riscv64: pci - no room in the memory window for a BAR\n");
+                }
+            }
+            i += if sixty_four { 2 } else { 1 };
+        }
+        out
+    }
+
+    /// Walk every bus, device and function, and record what answers.
+    ///
+    /// Bounded twice over: by the ECAM window the tree described, and by `MAX_DEVICES`. A machine
+    /// with more devices than the table holds is REPORTED rather than quietly truncated - a driver
+    /// missing because its device fell off the end of a table is a bug that looks like absent
+    /// hardware.
+    pub fn init() {
+        if ECAM_BASE.load(Ordering::Relaxed) == 0 {
+            return; // no PCI on this machine, which is a true answer and not a failure
+        }
+        let mut n = 0usize;
+        let mut overflowed = false;
+        'buses: for bus in 0..256u32 {
+            for dev in 0..32u32 {
+                for func in 0..8u32 {
+                    let bdf = (bus << 8) | (dev << 3) | func;
+                    let Some(id) = cfg_read32(bdf, 0) else { continue };
+                    let vendor = id & 0xffff;
+                    if vendor == 0xffff {
+                        // Nothing here. Function 0 absent means the whole device is absent, which is
+                        // what makes a full walk affordable.
+                        if func == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if n >= MAX_DEVICES {
+                        overflowed = true;
+                        break 'buses;
+                    }
+                    // PLACE the BARs before reading them back. Nothing else has: the table would
+                    // otherwise record six zeros and hand a driver address zero.
+                    let bars = assign_bars(bdf);
+                    let class = cfg_read32(bdf, 0x08).unwrap_or(0) >> 8;
+                    let irq = (cfg_read32(bdf, 0x3c).unwrap_or(0) & 0xff) as u8;
+                    let c = &DEVICES[n];
+                    c.bdf.store(bdf, Ordering::Relaxed);
+                    c.class_code.store(class, Ordering::Relaxed);
+                    c.vendor.store(vendor, Ordering::Relaxed);
+                    c.device.store((id >> 16) & 0xffff, Ordering::Relaxed);
+                    c.irq_line.store(irq, Ordering::Relaxed);
+                    for b in 0..6usize {
+                        c.bar[b].store(bars[b], Ordering::Relaxed);
+                    }
+                    n += 1;
+                    // A single-function device says so in its header type; asking its other seven
+                    // functions is harmless but pointless.
+                    if func == 0 && cfg_read32(bdf, 0x0c).unwrap_or(0) & 0x0080_0000 == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        DEVICE_COUNT.store(n as u32, Ordering::Release);
+        super::print_str("riscv64: pci ecam at ");
+        super::print_hex(ECAM_BASE.load(Ordering::Relaxed));
+        super::print_str(", ");
+        super::print_dec(n as u64);
+        super::print_str(" device(s)");
+        if overflowed {
+            super::print_str(" - TABLE FULL, some not enumerated");
+        }
+        super::print_str("\n");
+        for i in 0..n {
+            if let Some(d) = device_at(i) {
+                super::print_str("riscv64:   bdf ");
+                super::print_hex(d.bdf as u64);
+                super::print_str(" class ");
+                super::print_hex(d.class_code as u64);
+                super::print_str(" ");
+                super::print_hex(d.vendor as u64);
+                super::print_str(":");
+                super::print_hex(d.device as u64);
+                super::print_str(" bar0 ");
+                super::print_hex(first_memory_bar(&d));
+                super::print_str("\n");
+            }
+        }
+    }
+
+    /// Command register bit 2: allow this device to originate DMA. Without it a bus-mastering
+    /// controller reads and writes nothing and reports no error - it simply never transfers.
+    pub fn set_bus_master(bdf: u32) {
+        if let Some(cmd) = cfg_read32(bdf, 0x04) {
+            cfg_write32(bdf, 0x04, cmd | (1 << 2) | (1 << 1));
+        }
+    }
+
+    pub fn clear_bus_master(bdf: u32) {
+        if let Some(cmd) = cfg_read32(bdf, 0x04) {
+            cfg_write32(bdf, 0x04, cmd & !(1 << 2));
+        }
+    }
+
+    /// Power state D0. QEMU's devices come up in D0 and this port has no board device that does not,
+    /// so this is a no-op that exists to answer the seam rather than a step being skipped.
+    pub fn set_power_d0(_bdf: u32) {}
+
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
+
+    /// MSI and MSI-X need an interrupt controller to deliver INTO, and this port has no PLIC yet.
+    /// Refusing is the honest answer: a driver that is told its MSI was programmed and then never
+    /// receives one waits forever, which is the failure mode invariant 12 exists to prevent.
     pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
@@ -1877,6 +2241,55 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
         print_dec(n as u64);
         print_str("\n");
     }
+}
+
+/// Is `cycle` readable from S-mode on this machine? Answered by the boot probe, not assumed.
+static RDCYCLE_OK: AtomicBool = AtomicBool::new(false);
+/// Set only while the probe's own instruction is executing, so the trap handler knows that one
+/// illegal instruction is expected and everything else still halts.
+static RDCYCLE_PROBING: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn rdcycle_available() -> bool {
+    RDCYCLE_OK.load(Ordering::Relaxed)
+}
+
+/// Called from the trap handler for an illegal instruction. Returns true if it was the probe's.
+pub(super) fn claim_rdcycle_probe() -> bool {
+    RDCYCLE_PROBING.swap(false, Ordering::AcqRel)
+}
+
+/// Find out whether this machine lets S-mode read the cycle counter, by trying it.
+///
+/// **Asking is the only way.** `cycle` is readable only if M-mode set `mcounteren.CY`, there is no
+/// bit to read that says so, and getting it wrong is an illegal-instruction trap rather than a zero.
+/// The firmware's own banner lists `zicntr` among the ISA extensions, which says the counter EXISTS,
+/// not that this privilege level may read it.
+///
+/// So the instruction is executed deliberately, with the handler told to expect exactly one of them -
+/// the same shape as the user-mode selftest's deliberate page fault, and armed just as narrowly. If
+/// it faults, the handler steps over it and the flag stays false; if it returns, the flag is set.
+fn probe_rdcycle() {
+    RDCYCLE_PROBING.store(true, Ordering::Release);
+    let c: u64;
+    // SAFETY: this is the probe. Either it reads a counter with no side effects, or it raises an
+    // illegal instruction that `claim_rdcycle_probe` steps over - and `csrr` has no compressed
+    // encoding, so the four bytes the handler skips are exactly this instruction.
+    unsafe { core::arch::asm!("csrr {}, cycle", out(reg) c, options(nomem, nostack)) };
+    // Reaching here means no trap was taken. `claim_rdcycle_probe` would have cleared the flag if one
+    // had been, so a still-set flag is the proof.
+    if RDCYCLE_PROBING.swap(false, Ordering::AcqRel) {
+        RDCYCLE_OK.store(true, Ordering::Release);
+    }
+    let _ = c;
+    print_str("riscv64: cycle counter ");
+    if RDCYCLE_OK.load(Ordering::Relaxed) {
+        print_str("readable (rdcycle) - userspace cycle budgets mean what they say");
+    } else {
+        print_str("NOT readable from S-mode; falling back to `time`, which is ");
+        print_dec(TIMEBASE_HZ.load(Ordering::Relaxed) as u64);
+        print_str(" Hz - cycle-denominated waits will be far longer than intended");
+    }
+    print_str("\n");
 }
 
 /// Clear this hart's pending software interrupt.

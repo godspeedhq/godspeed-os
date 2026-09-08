@@ -267,6 +267,31 @@ impl<'a> Fdt<'a> {
         reg
     }
 
+    /// The raw bytes of one property of the first node matching `compat`.
+    ///
+    /// Raw, because some properties are not a number: a PCI host's `ranges` is a list of
+    /// seven-cell triplets whose meaning depends on flag bits inside the first cell, and decoding it
+    /// belongs with the code that knows what a PCI window is rather than in the tree reader.
+    pub fn find_compatible_prop(&self, compat: &str, prop_name: &str) -> Option<&'a [u8]> {
+        let mut target: Option<&'a str> = None;
+        self.walk(|node, prop, val, _, _| {
+            if prop == "compatible" && val.split(|&c| c == 0).any(|s| s == compat.as_bytes()) {
+                target = Some(node);
+                return true;
+            }
+            false
+        });
+        let target = target?;
+        let mut found: Option<&'a [u8]> = None;
+        self.walk(|node, prop, val, _, _| {
+            if node == target && prop == prop_name && found.is_none() {
+                found = Some(val);
+            }
+            false
+        });
+        found
+    }
+
     /// Where RAM starts, and how much there is in total.
     ///
     /// SUMMED across every `/memory` node rather than taken from the first: a machine may describe

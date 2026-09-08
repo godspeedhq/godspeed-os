@@ -252,21 +252,33 @@ pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     true
 }
 
-/// A monotonic counter, for measuring durations.
+/// A monotonic counter, in CYCLES where the machine will give them.
 ///
-/// `time`, not `cycle`. Both are CSRs S-mode may read only if `mcounteren` permits, and this port
-/// has PROVEN `time` readable on both machines (the boot prints it advancing) while `cycle` has
-/// never been tried - and a CSR the firmware refuses is an illegal-instruction trap, not a zero.
+/// **The magnitude matters, not just the monotonicity.** Userspace budgets are written as cycle
+/// counts against a gigahertz-ish counter - `block-driver`'s AHCI link wait is 400 million, meaning
+/// about a fifth of a second on a PC. Answer with the 10 MHz `time` counter and that same constant
+/// becomes FORTY SECONDS, per port, and a driver that works everywhere else appears to hang. Nothing
+/// in the code is wrong at that point; the unit is.
 ///
-/// **It counts at `timebase-frequency`, not at the core clock**: 10 MHz on QEMU and 4 MHz on the
-/// VisionFive, against a core running some hundreds of times faster. So this is a clock, and the
-/// x86 name it answers to promises cycles. Anything converting its output to a duration must use the
-/// timebase the device tree reported, exactly as the scheduler tick does.
+/// So this reads `cycle` when the machine permits it. Whether it does is not ours to decide: `cycle`
+/// is readable from S-mode only if M-mode set `mcounteren.CY`, and reading it otherwise is an illegal
+/// instruction, not a zero. It is therefore PROBED once at boot - deliberately executed with the trap
+/// handler told to expect the fault, exactly as the user-mode selftest probes an unreadable page - and
+/// the answer is remembered.
+///
+/// Falling back to `time` is honest but coarse: it is monotonic and correct as a clock, and only its
+/// SCALE is wrong for anything counting cycles. The boot says which one is in use, because a duration
+/// that is a hundred times out is worth being able to see rather than deduce.
 pub fn read_cycle_counter() -> u64 {
+    if super::rdcycle_available() {
+        let c: u64;
+        // SAFETY: reading `cycle`, proven readable by the boot probe. No side effects.
+        unsafe { core::arch::asm!("csrr {}, cycle", out(reg) c, options(nomem, nostack)) };
+        return c;
+    }
     let t: u64;
-    // SAFETY: reading the `time` CSR has no side effects. It is readable here because the boot
-    // proved it so before anything relied on it; if a machine refused, the trap vector names it as
-    // an illegal instruction rather than returning a silent zero.
+    // SAFETY: reading `time` has no side effects, and the boot proved it readable before anything
+    // relied on it.
     unsafe { core::arch::asm!("csrr {}, time", out(reg) t, options(nomem, nostack)) };
     t
 }
