@@ -1306,6 +1306,7 @@ pub(super) fn ccache_init(base: u64, zero_dev: u64) {
     let ticks = sbi::time().wrapping_sub(t0);
     let rate = TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
     CCACHE_FLUSH_US.store(if rate == 0 { 0 } else { ticks * 1_000_000 / rate }, Ordering::Relaxed);
+    let hz2 = rate;
 
     print_str("riscv64: last-level cache ");
     print_dec(banks * sets * ways * block / 1024);
@@ -1315,8 +1316,22 @@ pub(super) fn ccache_init(base: u64, zero_dev: u64) {
     print_dec(max_way + 1);
     print_str(" enabled), ");
     print_dec(block);
+    // Twice the cache, so that reading it fills every set completely whatever the replacement policy
+    // does. Reserved rather than merely allocated: it must never become a page table under a service,
+    // and it is read forever.
+    let evict_len = (banks * sets * ways * block * 2) as usize;
+    if let Some(phys) = crate::memory::allocator::alloc_dma_arena(evict_len.div_ceil(4096)) {
+        EVICT_BUF.store(phys, Ordering::Relaxed);
+        EVICT_LEN.store(evict_len, Ordering::Relaxed);
+    }
+
     print_str(" byte lines, a full flush costs ");
     print_dec(CCACHE_FLUSH_US.load(Ordering::Relaxed));
+    print_str(" us, an eviction fill ");
+    let e0 = sbi::time();
+    evict_by_filling();
+    let e_us = if hz2 == 0 { 0 } else { sbi::time().wrapping_sub(e0) * 1_000_000 / hz2 };
+    print_dec(e_us);
     print_str(" us\n");
 }
 
@@ -1412,6 +1427,47 @@ fn ccache_flush_all() {
     }
 }
 
+/// A block of ordinary RAM, twice the size of the last-level cache, owned by nobody and read only to
+/// push other things out of that cache.
+static EVICT_BUF: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static EVICT_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Push the framebuffer out of the cache by filling the cache with something else.
+///
+/// **A second way of doing what `ccache_flush_all` claims to do, using nothing but ordinary memory.**
+/// The vendor's method drives the cache controller's way-masking and writes through a special window
+/// that reads as zeros; whether that window is actually cached is a property of the platform's fixed
+/// memory attributes, which is not written down anywhere I can read and which decides whether that
+/// method does anything at all. This one has no such question in it: reading twice the cache's size
+/// of ordinary RAM fills every set of a 2 MiB 16-way cache with those lines, and what was there
+/// before is written back on the way out because that is what a write-back cache does when it needs
+/// the space.
+///
+/// It is cruder and it costs more - a megabyte of reads rather than a few thousand stores - and it is
+/// used for the kernel's own drawing so that the two methods can be told apart on the screen: if what
+/// the kernel paints comes out clean and what the `console` service paints does not, the vendor's
+/// method is the one that does nothing.
+fn evict_by_filling() {
+    let base = EVICT_BUF.load(Ordering::Relaxed) as usize;
+    let len = EVICT_LEN.load(Ordering::Relaxed);
+    if base == 0 || len == 0 {
+        return;
+    }
+    // SAFETY: a run of RAM this module reserved at boot and nothing else can be given, inside the
+    // identity map, READ only - the values are discarded and nothing observes them. `read_volatile`
+    // is what stops the compiler deleting a loop whose results are unused, which would delete the
+    // whole point of it.
+    unsafe {
+        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+        let mut off = 0usize;
+        while off < len {
+            let _ = ((base + off) as *const u64).read_volatile();
+            off += 64;
+        }
+        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+    }
+}
+
 /// Publish a written rectangle so the display controller's next scan reads it.
 ///
 /// **It did turn out to be wrong, and the television said so.** This used to be a bare `fence`, on
@@ -1435,7 +1491,7 @@ pub fn fb_commit(
     // SAFETY: a memory fence has no operands and no side effect beyond ordering. `rw, rw` is the
     // full barrier - every earlier load and store before every later one.
     unsafe { core::arch::asm!("fence rw, rw", options(nostack, preserves_flags)) };
-    ccache_flush_all();
+    evict_by_filling();
 }
 
 pub mod page_tables {
