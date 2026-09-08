@@ -606,8 +606,15 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     // and exists solely to be written through. Wanted before the display, because the display is
     // what needs it.
     if let Some(reg) = tree.find_compatible_prop("starfive,jh7110-ccache", "reg") {
-        // Two address/size pairs of two cells each, big-endian: registers first, zero device second.
-        if reg.len() >= 32 {
+        // THREE ranges of four cells each, big-endian, and the one that matters is the THIRD.
+        //
+        // The cache controller's node lists its registers, then two 32 MiB windows. The first version
+        // of this took the second range for the zero device, which is the obvious reading and the
+        // wrong one: the vendor driver asks for index TWO. Pointed at the wrong window the flush
+        // wrote thirty-three thousand zeros into somewhere harmless, evicted nothing, and cost 154
+        // microseconds doing it - which from the serial console is indistinguishable from a flush
+        // that works. The screen was the only instrument that could tell the difference.
+        if reg.len() >= 48 {
             let cell = |i: usize| -> u64 {
                 let mut v = 0u64;
                 for b in 0..8 {
@@ -615,7 +622,7 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
                 }
                 v
             };
-            ccache_init(cell(0), cell(2));
+            ccache_init(cell(0), cell(4));
         }
     }
 
@@ -1340,9 +1347,10 @@ pub(super) fn ccache_init(base: u64, zero_dev: u64) {
 static CCACHE_FLUSH_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Ticks since the framebuffer was last published.
 static FB_PUBLISH_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
-/// One publish every this many 10 ms ticks - twenty times a second, which is faster than a terminal
-/// needs in order to feel immediate.
-const FB_PUBLISH_TICKS: usize = 5;
+/// One publish every this many 10 ms ticks. Fifty times a second, which is faster than a terminal
+/// needs and affordable now that the flush is pointed at the right window: 154 microseconds every
+/// 20 milliseconds is under one part in a hundred of the machine.
+const FB_PUBLISH_TICKS: usize = 2;
 
 /// Publish the framebuffer on behalf of whoever is drawing on it.
 ///
