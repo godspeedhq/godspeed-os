@@ -156,6 +156,51 @@ fn device_ctx_off(i: usize) -> usize {
 fn ep0_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x1000
 }
+
+/// Where the CONTROLLER thinks this device's EP0 ring has been consumed to, and with which cycle
+/// state - read from the hardware, not inferred.
+///
+/// **This is the fix for the hot-plug bug that outlived seven others.** Hub port-status probes stop
+/// being answered after enumeration: our write cursor climbs, the event ring does not move, and the
+/// driver asks "is anything on hub port 2 now?" a thousand times without ever getting a reply
+/// (`probes 317/1429`, the success count frozen). We were posting TRBs into ring space the controller
+/// had already consumed and moved past, so it never came back for them.
+///
+/// The cursor was seeded from `hub_off`, a byte offset this driver RECORDED for itself at the end of
+/// enumeration. That is our bookkeeping, and `control()` writes at caller-chosen offsets without
+/// advancing any shared cursor, so nothing kept it in step with the hardware. The controller's own
+/// answer has been sitting in memory we already own the whole time: the endpoint context holds a TR
+/// Dequeue Pointer, updated by the hardware as it consumes the ring (xHCI 6.2.3, offset 0x08 of the
+/// endpoint context; bit 0 is the Dequeue Cycle State, and the pointer is 16-byte aligned).
+///
+/// EP0 is DCI 1, so its endpoint context is one `ctx_size` past the slot context.
+///
+/// Returns `None` rather than a wrong answer when the pointer does not land inside this device's EP0
+/// ring - a zeroed context, a slot that was never addressed, a controller that reset underneath us.
+/// A caller that gets `None` should fall back to its recorded offset, because a plausible cursor beats
+/// a fabricated one: the whole bug was a number nobody checked against the hardware.
+fn ep0_hw_dequeue(
+    dma: &Dma,
+    dev: usize,
+    ctx_size: usize,
+    ring_bytes: usize,
+) -> Option<(usize, u32)> {
+    let deq = dma.read64(device_ctx_off(dev) + ctx_size + 0x08);
+    let cycle = (deq & 1) as u32;
+    let phys = deq & !0xf;
+    if phys == 0 {
+        return None;
+    }
+    let base = dma.phys_at(ep0_tr_off(dev));
+    let off = phys.wrapping_sub(base) as usize;
+    if off >= ring_bytes || off % TRB_SIZE != 0 {
+        return None;
+    }
+    Some((off, cycle))
+}
+/// One page per ring in a device's slice, so an offset at or past this is not in the EP0 ring and
+/// whatever produced it was not a dequeue pointer.
+const EP0_RING_BYTES: usize = 0x1000;
 fn int_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x2000
 }
@@ -3707,8 +3752,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // The HID path was given this seeding and the disk path was not, which is why the disk hub
         // was the one that halted. Same ring, same rule, and now the same code shape.
-        let mut disk_hub_cur = disk.as_ref().map(|d| d.hub_off).unwrap_or(0);
-        let mut disk_hub_pcs = 1u32;
+        // ASK THE HARDWARE WHERE ITS DEQUEUE IS, and fall back to our own note only if it will not
+        // say. `hub_off` is this driver's record of where enumeration finished; the endpoint context's
+        // TR Dequeue Pointer is where the CONTROLLER actually stopped, and when the two disagree it is
+        // ours that is wrong. The cycle state comes with it, which matters just as much: a cursor in
+        // the right place with the wrong cycle bit is a TRB the controller will not execute either.
+        let (mut disk_hub_cur, mut disk_hub_pcs) = match disk.as_ref() {
+            Some(d) => match ep0_hw_dequeue(&dma, d.hub_dev as usize, ctx_size, EP0_RING_BYTES) {
+                Some((off, cyc)) => (off, cyc),
+                None => (d.hub_off, 1u32),
+            },
+            None => (0usize, 1u32),
+        };
         // One-shot latches so the mode is stated once each way, not on every pass.
         let mut poll_noted = false;
         let mut irq_noted = false;
@@ -3741,7 +3796,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut hub_cur = [0usize; MAX_HID];
         let mut hub_pcs = [1u32; MAX_HID];
         for d in 0..ndev {
-            hub_cur[d] = devs[d].hub_off;
+            // Same rule as the disk's cursor above: the controller's TR Dequeue Pointer if it will
+            // give one, our recorded `hub_off` only as a fallback. This is the HID half of the same
+            // bug - the probes that stopped being answered are these.
+            match ep0_hw_dequeue(&dma, devs[d].hub_dev as usize, ctx_size, EP0_RING_BYTES) {
+                Some((off, cyc)) => {
+                    hub_cur[d] = off;
+                    hub_pcs[d] = cyc;
+                }
+                None => hub_cur[d] = devs[d].hub_off,
+            }
         }
         // Two HIDs behind the SAME hub (a keyboard AND a mouse on one back-port hub) share that hub's
         // ONE EP0 control ring, so their downstream GET_STATUS polls MUST advance ONE monotonic cursor -
