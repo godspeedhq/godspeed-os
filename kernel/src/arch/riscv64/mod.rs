@@ -818,6 +818,15 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         unsafe { ap_boot::start_all_aps(bi) };
     }
 
+    // THE ONE CANONICAL SENTENCE, and this port was not saying it. `report_cores_ready` exists in the
+    // neutral kernel precisely so that every architecture cannot help but agree on the wording - x86
+    // used to say `kernel: N cores ready`, the Pi 2 `smp: N cores ready`, and the Pi 4 had grown a
+    // third phrasing, so a reader comparing boot logs across boards had to translate before they
+    // could compare. This port printed each hart's own arrival and then never printed the total at
+    // all, which is the same divergence in its purest form: not a different spelling, an absent line.
+    // GodspeedOS should read the same whatever it is running on.
+    crate::smp::core::report_cores_ready();
+
     crate::task::spawn_supervisor();
 
     // HAND THE CORE OVER. Every tick from here is a preemption point rather than the boot's own,
@@ -2129,7 +2138,40 @@ pub mod pci {
     }
 
     pub fn ehci() -> Option<PciDevice> { find_by_class(0x0c_03_20) }
-    pub fn xhci() -> Option<PciDevice> { find_by_class(0x0c_03_30) }
+    /// The machine's xHCI controller, whether or not it arrived on a bus.
+    ///
+    /// **On this board the controller is soldered to the SoC, and the neutral kernel asks for it
+    /// here.** That is not a mismatch to route around. The question the class resolution asks is "is
+    /// there an xHCI controller, and where does it start", and this port can answer it; the answer
+    /// simply does not come from a configuration space. So the bus scan is tried first, as it must be
+    /// on a machine that has a card, and the SoC controller is offered when the scan finds nothing -
+    /// carrying the no-bus sentinel for its address, because it genuinely has none.
+    ///
+    /// It follows that this driver is a TCB member on this board, for exactly the reason CLAUDE.md
+    /// 6.4 gives for the Pi 4: there is no IOMMU here to confine it, so a compromised driver can aim
+    /// the controller's DMA anywhere. What is bounded is the ACCIDENT surface - a restartable service
+    /// rather than ring-0 code parsing descriptors supplied by whatever was plugged in - and the
+    /// trust posture is not. Recorded here rather than implied.
+    pub fn xhci() -> Option<PciDevice> {
+        if let Some(d) = find_by_class(0x0c_03_30) {
+            return Some(d);
+        }
+        let base = super::usb::window();
+        if base == 0 {
+            return None;
+        }
+        let mut bar = [0u64; 6];
+        bar[0] = base;
+        Some(PciDevice {
+            index: 0,
+            bdf: 0xFFFF,
+            class_code: 0x0c_03_30,
+            bar,
+            irq_line: 0,
+            vendor: 0,
+            device: 0,
+        })
+    }
     pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
 
     /// The first MEMORY BAR, with its flag bits removed and a 64-bit BAR joined to its upper half.

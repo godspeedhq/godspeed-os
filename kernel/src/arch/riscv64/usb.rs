@@ -132,10 +132,10 @@ pub fn init() -> bool {
         XHCI_BASE.store(0, Ordering::Relaxed);
         return false;
     }
+    // The CLOCKS and the connection, which is all the PHY needs before the controller can answer.
+    // Its own registers come later, once its reset is off.
     mmio_write(syscrg, SYSCLK_USB_125M * 4, USB_125M_DIVISOR);
     let app = clk_enable(crg, STGCLK_APP_125M);
-    mmio_write(phy, PHY_CLK_MODE, mmio_read(phy, PHY_CLK_MODE) | PHY_CLK_MODE_RX_NORMAL_PWR);
-    mmio_write(phy, PHY_LS_KEEPALIVE, mmio_read(phy, PHY_LS_KEEPALIVE) | PHY_LS_KEEPALIVE_ENABLE);
     mmio_write(
         sys_syscon,
         SYSCON_USB_SPLIT,
@@ -145,10 +145,6 @@ pub fn init() -> bool {
     super::print_hex(mmio_read(syscrg, SYSCLK_USB_125M * 4) as u64);
     super::print_str(" app_125m=");
     super::print_str(if app { "on" } else { "FAIL" });
-    super::print_str(" mode=");
-    super::print_hex(mmio_read(phy, PHY_CLK_MODE) as u64);
-    super::print_str(" keepalive=");
-    super::print_hex(mmio_read(phy, PHY_LS_KEEPALIVE) as u64);
     super::print_str(" split=");
     super::print_hex(mmio_read(sys_syscon, SYSCON_USB_SPLIT) as u64);
     super::print_str("
@@ -194,6 +190,21 @@ pub fn init() -> bool {
             ok = false;
         }
     }
+    super::print_str("\n");
+
+    // NOW THE PHY'S OWN REGISTERS, and they are here rather than above because the board said so.
+    // Written before the resets came off they read back as ZERO - `mode=0x0 keepalive=0x0` - since a
+    // register in a block still held in reset accepts nothing. The controller answered regardless,
+    // its own registers being on a different domain, so this would have passed for success and failed
+    // later at the one thing it governs: LOW SPEED. The keep-alive is what a host drives to hold a
+    // low-speed device awake, and a keyboard is usually a low-speed device - so the register that was
+    // silently lost is the one this entire stage exists for.
+    mmio_write(phy, PHY_CLK_MODE, mmio_read(phy, PHY_CLK_MODE) | PHY_CLK_MODE_RX_NORMAL_PWR);
+    mmio_write(phy, PHY_LS_KEEPALIVE, mmio_read(phy, PHY_LS_KEEPALIVE) | PHY_LS_KEEPALIVE_ENABLE);
+    super::print_str("riscv64: usb - phy registers: mode=");
+    super::print_hex(mmio_read(phy, PHY_CLK_MODE) as u64);
+    super::print_str(" keepalive=");
+    super::print_hex(mmio_read(phy, PHY_LS_KEEPALIVE) as u64);
     super::print_str("\n");
 
     // DOES IT ANSWER? An xHCI controller's first register holds its capability-structure length and
