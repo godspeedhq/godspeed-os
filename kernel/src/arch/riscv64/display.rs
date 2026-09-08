@@ -497,6 +497,7 @@ const DC_DISPLAY_V_SYNC: usize = 0x1448;
 const DC_DISPLAY_CURRENT_LOCATION: usize = 0x1450;
 const DC_DISPLAY_DPI_CONFIG: usize = 0x14b8;
 const DC_DISPLAY_PANEL_START: usize = 0x1ccc;
+const DC_DISPLAY_DP_CONFIG: usize = 0x1cd0;
 
 /// Pixel format 6 in the controller's table: 8 bits each of alpha, red, green and blue, in that order
 /// within a 32-bit word - so a little-endian `u32` written as `0x00RR_GGBB` puts blue at the low
@@ -504,6 +505,10 @@ const DC_DISPLAY_PANEL_START: usize = 0x1ccc;
 const FORMAT_A8R8G8B8: u32 = 6;
 /// The pixel interface: 5 is 24-bit RGB, which is what an HDMI transmitter wants.
 const DPI_RGB888: u32 = 5;
+/// The SAME choice in the display-port config register, which numbers its formats differently: 2
+/// rather than 5 for 24-bit RGB. Two registers, two encodings, one meaning - and the driver writes
+/// both, so this does too.
+const DP_RGB888: u32 = 2;
 
 /// 1920x1080 at 60 Hz, the CEA-861 timing every television accepts.
 const H_ACTIVE: u32 = 1920;
@@ -709,37 +714,26 @@ pub fn mode_set() -> bool {
     // The controller's own initialisation, from the vendor driver's per-panel loop.
     dc_write(DC_DISPLAY_PANEL_CONFIG, 0x111);
 
-    // The primary plane: where the pixels are, how they are laid out, and where on the screen they
-    // go. The position registers matter more than they look - they default to zero, which is an empty
-    // rectangle, so a plane with a perfectly good address and stride would show nothing at all.
-    dc_write(DC_FRAMEBUFFER_ADDRESS, fb_phys as u32);
-    dc_write(DC_FRAMEBUFFER_STRIDE, FB_STRIDE);
-    dc_write(DC_FRAMEBUFFER_U_ADDRESS, 0);
-    dc_write(DC_FRAMEBUFFER_V_ADDRESS, 0);
-    dc_write(DC_FRAMEBUFFER_U_STRIDE, 0);
-    dc_write(DC_FRAMEBUFFER_V_STRIDE, 0);
-    dc_write(DC_FRAMEBUFFER_SIZE, H_ACTIVE | (V_ACTIVE << 15));
-    dc_write(DC_FRAMEBUFFER_WATER_MARK, 0);
-    dc_write(DC_FRAMEBUFFER_TOP_LEFT, 0);
-    dc_write(DC_FRAMEBUFFER_BOTTOM_RIGHT, H_ACTIVE | (V_ACTIVE << 15));
+    // THE MODE, and it comes before the plane because that is the order the driver runs in: the
+    // display is enabled when the output comes up, the plane is written on the frame that follows.
+    // Starting a display whose plane is not configured yet scans one null frame, which costs nothing
+    // and is what the reference does.
+    //
+    // The two writes at the top are the ones the FIRST attempt missed, and missing them is why it
+    // programmed a correct-looking controller that never scanned. The driver has two display paths -
+    // `setup_display` and `setup_display_ex` - and only one of them is reachable: the function table
+    // names the `_ex` variant, which does this and then calls the other. Reading the plain one and
+    // stopping there produced code that matched a function nothing calls.
+    //
+    // Bit 3 of the display-port config is the output enable; the driver sets it for every encoder
+    // that is not a DSI panel, and clears it for one that is. Bit 16 of the panel config selects a
+    // YUV pipeline, which this is not.
+    dc_write(DC_DISPLAY_DP_CONFIG, DP_RGB888 | (1 << 3));
+    dc_modify(DC_DISPLAY_PANEL_CONFIG, 0, 1 << 16);
 
-    // Format, and everything alongside it switched off explicitly: no swizzle, no tiling, no YUV, no
-    // rotation, no hardware clear, no scaling. The clear masks are the vendor driver's, kept whole
-    // rather than trimmed to the fields being set, because what they buy is that this register ends
-    // in a known state whatever it held before.
-    dc_modify(
-        DC_FRAMEBUFFER_CONFIG,
-        FORMAT_A8R8G8B8 << 26,
-        (0x1f << 26) | (1 << 25) | (0x03 << 23) | (1 << 22) | (0x1f << 17) | (0x07 << 14)
-            | (0x07 << 11) | (1 << 8),
-    );
-    // Bit 13 enables the plane; bits 18:16 are its stacking order and bit 19 says which display it
-    // belongs to - both zero, for the bottom of display 0.
-    dc_modify(DC_FRAMEBUFFER_CONFIG_EX, 1 << 13, (1 << 1) | (1 << 13) | (0x07 << 16) | (1 << 19));
-
-    // The mode. The output is stopped first (the vendor driver clears the same two bits before
-    // touching a timing register) because changing a raster's size underneath a running scan is how a
-    // controller ends up wedged mid-frame.
+    // The output is stopped before a timing register is touched (the driver clears the same two bits
+    // first) because changing a raster's size underneath a running scan is how a controller ends up
+    // wedged mid-frame.
     dc_write(DC_DISPLAY_DPI_CONFIG, DPI_RGB888);
     dc_modify(DC_DISPLAY_PANEL_START, 0, (1 << 0) | (1 << 2));
 
@@ -756,6 +750,79 @@ pub fn mode_set() -> bool {
     // is the two-display sync mode this board does not use.
     dc_modify(DC_DISPLAY_PANEL_CONFIG, 1 << 12, 0);
     dc_modify(DC_DISPLAY_PANEL_START, 1 << 0, 1 << 3);
+
+    // SHADOW REGISTERS OFF WHILE THE PLANE IS WRITTEN, ON AFTERWARDS - the bracket the driver puts
+    // around every commit. With bit 12 set, a write to a plane register lands in a shadow bank that
+    // the hardware latches at the next vertical blank; with it clear, the write is direct. Writing a
+    // whole plane through the shadow bank and never re-arming it would leave the values staged and
+    // never applied, which reads exactly like a write that did not land.
+    dc_modify(DC_FRAMEBUFFER_CONFIG_EX, 0, 1 << 12);
+
+    // The primary plane: where the pixels are, how they are laid out, and where on the screen they
+    // go. The position registers matter more than they look - they default to zero, which is an empty
+    // rectangle, so a plane with a perfectly good address and stride would show nothing at all.
+    dc_write(DC_FRAMEBUFFER_ADDRESS, fb_phys as u32);
+    dc_write(DC_FRAMEBUFFER_STRIDE, FB_STRIDE);
+    dc_write(DC_FRAMEBUFFER_U_ADDRESS, 0);
+    dc_write(DC_FRAMEBUFFER_V_ADDRESS, 0);
+    dc_write(DC_FRAMEBUFFER_U_STRIDE, 0);
+    dc_write(DC_FRAMEBUFFER_V_STRIDE, 0);
+    dc_write(DC_FRAMEBUFFER_SIZE, H_ACTIVE | (V_ACTIVE << 15));
+    dc_write(DC_FRAMEBUFFER_WATER_MARK, 0);
+    dc_write(DC_FRAMEBUFFER_TOP_LEFT, 0);
+    dc_write(DC_FRAMEBUFFER_BOTTOM_RIGHT, H_ACTIVE | (V_ACTIVE << 15));
+
+    // Format, and everything alongside it switched off explicitly: no swizzle, no tiling, no YUV, no
+    // rotation, no hardware clear, no scaling. The clear masks are the driver's, kept whole rather
+    // than trimmed to the fields being set, because what they buy is that this register ends in a
+    // known state whatever it held before.
+    dc_modify(
+        DC_FRAMEBUFFER_CONFIG,
+        FORMAT_A8R8G8B8 << 26,
+        (0x1f << 26) | (1 << 25) | (0x03 << 23) | (1 << 22) | (0x1f << 17) | (0x07 << 14)
+            | (0x07 << 11) | (1 << 8),
+    );
+    // Bit 6 says the source is RGB and bit 8 says it is YUV - the second thing the `_ex` path does
+    // that the plain one does not, and a plane whose colour space is unstated is not obviously going
+    // to scan. Bit 5 is the de-gamma table, off. Bit 13 enables the plane; bits 18:16 are its
+    // stacking order and bit 19 says which display it belongs to - both zero, for the bottom of
+    // display 0. Bit 12 stays clear here and is set once at the end.
+    dc_modify(
+        DC_FRAMEBUFFER_CONFIG_EX,
+        (1 << 6) | (1 << 13),
+        (1 << 1) | (1 << 5) | (1 << 8) | (1 << 13) | (0x07 << 16) | (1 << 19),
+    );
+
+    // Re-arm the shadow bank, so anything written from here on takes effect on a frame boundary
+    // rather than mid-scan. This is the state the driver leaves the hardware in.
+    dc_modify(DC_FRAMEBUFFER_CONFIG_EX, 1 << 12, 0);
+
+    // WHAT THE HARDWARE ACTUALLY HOLDS, read back rather than assumed. A controller that does not
+    // scan has two quite different explanations - the registers do not hold what was written (an
+    // addressing or bus problem) or they do and something else is missing (a clock, an enable) - and
+    // they have nothing in common. One line separates them, and it costs a board boot to guess.
+    super::print_str("riscv64: display - readback:");
+    for (name, off) in [
+        ("panel_cfg", DC_DISPLAY_PANEL_CONFIG),
+        ("panel_start", DC_DISPLAY_PANEL_START),
+        ("dp", DC_DISPLAY_DP_CONFIG),
+        ("dpi", DC_DISPLAY_DPI_CONFIG),
+        ("h", DC_DISPLAY_H),
+        ("hsync", DC_DISPLAY_H_SYNC),
+        ("v", DC_DISPLAY_V),
+        ("vsync", DC_DISPLAY_V_SYNC),
+        ("fb", DC_FRAMEBUFFER_ADDRESS),
+        ("stride", DC_FRAMEBUFFER_STRIDE),
+        ("size", DC_FRAMEBUFFER_SIZE),
+        ("fbcfg", DC_FRAMEBUFFER_CONFIG),
+        ("fbcfg_ex", DC_FRAMEBUFFER_CONFIG_EX),
+    ] {
+        super::print_str(" ");
+        super::print_str(name);
+        super::print_str("=");
+        super::print_hex(dc_read(off) as u64);
+    }
+    super::print_str("\n");
 
     let (first, second, hz) = scanout_rate();
     super::print_str("riscv64: display - scan position ");
