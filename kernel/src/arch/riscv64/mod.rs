@@ -619,7 +619,18 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         }
         if display::power_on_vout() && display::clocks_on() {
             display::probe_dc8200();
-            display::mode_set();
+            // The system controller holding the PLL registers, and the display sub-system
+            // controller. Neither is needed to program the display; both are needed to explain one
+            // that does not run.
+            let mut w5: [Option<u32>; 0] = [];
+            let syscon =
+                tree.find_compatible("starfive,jh7110-sys-syscon", &[], &mut w5).map(|r| r.base);
+            let mut w6: [Option<u32>; 0] = [];
+            let dss = tree.find_compatible("starfive,jh7110-dssctrl", &[], &mut w6).map(|r| r.base);
+            display::set_syscon_bases(syscon.unwrap_or(0), dss.unwrap_or(0));
+            if !display::mode_set() {
+                display::diagnose();
+            }
         }
     }
 

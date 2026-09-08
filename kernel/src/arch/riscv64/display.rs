@@ -29,6 +29,10 @@ static PMU_BASE: AtomicU64 = AtomicU64::new(0);
 /// The system clock/reset generator, and the video-out one. Both from the tree.
 static SYSCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static VOUTCRG_BASE: AtomicU64 = AtomicU64::new(0);
+/// The system controller that holds the PLL registers, and the display sub-system controller. Read
+/// only, and only by the diagnostic at the end of this file.
+static SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
+static DSSCTRL_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Registers, from `jh71xx-pmu.c`.
 const SW_TURN_ON_POWER: usize = 0x0c;
@@ -60,6 +64,11 @@ pub(super) fn set_pmu_base(base: u64) {
 pub(super) fn set_crg_bases(syscrg: u64, voutcrg: u64) {
     SYSCRG_BASE.store(syscrg, Ordering::Relaxed);
     VOUTCRG_BASE.store(voutcrg, Ordering::Relaxed);
+}
+
+pub(super) fn set_syscon_bases(syscon: u64, dssctrl: u64) {
+    SYSCON_BASE.store(syscon, Ordering::Relaxed);
+    DSSCTRL_BASE.store(dssctrl, Ordering::Relaxed);
 }
 
 fn read(off: usize) -> Option<u32> {
@@ -839,4 +848,134 @@ pub fn mode_set() -> bool {
     }
     super::print_str("riscv64: display - scanning 1920x1080; the transmitter is what is left\n");
     true
+}
+
+// ==================== the clock tree, when the raster does not run ====================
+//
+// Every register the controller was given reads back exactly what was written, and it still does not
+// scan. That leaves two explanations, and neither can be settled by reasoning from here: either the
+// pixel clock is not running, or the scan-position register is not the instrument it looks like. So
+// this measures BOTH rather than picking one - a board boot costs more than a long line of output.
+
+/// Registers in the system controller that hold PLL2, from Linux's `clk-starfive-jh7110-pll.c`.
+/// FBDIV and the two power-down bits share one word; the fractional part and the pre- and
+/// post-dividers follow it.
+const PLL2_PD: usize = 0x2c;
+const PLL2_FRAC: usize = 0x30;
+const PLL2_PREDIV: usize = 0x34;
+/// The crystal every PLL on this SoC multiplies up.
+const OSC_HZ: u64 = 24_000_000;
+
+/// The controller's own interrupt latch, in the FIRST register window. Reading it clears it.
+const AQ_INTR_ACKNOWLEDGE: usize = 0x0010;
+const AQ_INTR_ENBL: usize = 0x0014;
+
+/// What PLL2 is actually generating, worked out from its own registers.
+///
+/// The whole pixel clock hangs off this: `vout_src` is a gate on PLL2 and `dc8200_pix` divides it,
+/// and the divisor of eight was chosen on the belief that PLL2 runs at 1188 MHz - which was INFERRED
+/// from the device tree quoting 297 MHz for a clock that is PLL2 over four. Inference is not
+/// measurement, and this is the number that decides whether there is a pixel clock at all.
+fn pll2_hz(syscon: u64) -> (u64, u32, u32, u32) {
+    let pd = mmio_read(syscon, PLL2_PD);
+    let prediv_reg = mmio_read(syscon, PLL2_PREDIV);
+    let fbdiv = (pd >> 17) & 0xfff;
+    let prediv = prediv_reg & 0x3f;
+    let postdiv1 = (prediv_reg >> 28) & 0x03;
+    // Integer mode. The fractional path adds a 24-bit fraction to FBDIV; it is reported separately
+    // rather than folded in, so a board using it is visible rather than silently mis-computed.
+    let hz = if prediv == 0 {
+        0
+    } else {
+        OSC_HZ * fbdiv as u64 / prediv as u64 / (1u64 << postdiv1)
+    };
+    (hz, fbdiv, prediv, postdiv1)
+}
+
+/// Print the whole clock path, the PLL under it, the display sub-system controller, and a second
+/// opinion on whether frames are happening.
+pub fn diagnose() {
+    let sys = SYSCRG_BASE.load(Ordering::Relaxed);
+    let vout = VOUTCRG_BASE.load(Ordering::Relaxed);
+    let syscon = SYSCON_BASE.load(Ordering::Relaxed);
+    let dss = DSSCTRL_BASE.load(Ordering::Relaxed);
+    let top = DC_BASE.load(Ordering::Relaxed);
+
+    if syscon != 0 {
+        let (hz, fbdiv, prediv, postdiv1) = pll2_hz(syscon);
+        super::print_str("riscv64: display - pll2: fbdiv=");
+        super::print_dec(fbdiv as u64);
+        super::print_str(" prediv=");
+        super::print_dec(prediv as u64);
+        super::print_str(" postdiv1=");
+        super::print_dec(postdiv1 as u64);
+        super::print_str(" frac=");
+        super::print_hex(mmio_read(syscon, PLL2_FRAC) as u64);
+        super::print_str(" pd=");
+        super::print_hex(mmio_read(syscon, PLL2_PD) as u64);
+        super::print_str(" -> ");
+        super::print_dec(hz / 1_000_000);
+        super::print_str(" MHz\n");
+    }
+
+    // The system generator's video-out corner. Index 59 is the one to look at: it is the `vout_axi`
+    // DIVIDER, which the first version of this file tried to enable as if it were a gate and then
+    // dropped when that failed. A divider holding zero is a clock that is off, and nothing about the
+    // way it failed said so.
+    if sys != 0 {
+        super::print_str("riscv64: display - syscrg[56..63]:");
+        for i in 56..64usize {
+            super::print_str(" ");
+            super::print_hex(mmio_read(sys, i * 4) as u64);
+        }
+        super::print_str("\n");
+    }
+
+    if vout != 0 {
+        super::print_str("riscv64: display - voutcrg[0..17]:");
+        for i in 0..18usize {
+            super::print_str(" ");
+            super::print_hex(mmio_read(vout, i * 4) as u64);
+        }
+        super::print_str("\n");
+    }
+
+    if dss != 0 {
+        super::print_str("riscv64: display - dssctrl[0..8]:");
+        for i in 0..9usize {
+            super::print_str(" ");
+            super::print_hex(mmio_read(dss, i * 4) as u64);
+        }
+        super::print_str("\n");
+    }
+
+    // A SECOND OPINION ON THE SAME QUESTION, from a different register in a different window. The
+    // controller latches a bit per display when a frame ends, and reading the latch clears it. If
+    // this sees bits while the scan-position register sits at zero, the raster IS running and my
+    // instrument was the broken thing - a mistake this project has made before and one that is
+    // cheaper to rule out than to argue about.
+    if top != 0 {
+        mmio_write(top, AQ_INTR_ENBL, 0xf);
+        let hz = super::timebase_hz() as u64;
+        let window = if hz == 0 { 2_000_000 } else { hz / 5 };
+        let start = super::sbi::time();
+        let mut seen = 0u32;
+        let mut hits = 0u32;
+        while super::sbi::time().wrapping_sub(start) < window {
+            let ack = mmio_read(top, AQ_INTR_ACKNOWLEDGE);
+            if ack != 0 {
+                seen |= ack;
+                hits += 1;
+            }
+        }
+        super::print_str("riscv64: display - frame interrupts in 200 ms: ");
+        super::print_dec(hits as u64);
+        super::print_str(", bits ");
+        super::print_hex(seen as u64);
+        super::print_str("; scan position display0=");
+        super::print_hex(dc_read(DC_DISPLAY_CURRENT_LOCATION) as u64);
+        super::print_str(" display1=");
+        super::print_hex(dc_read(DC_DISPLAY_CURRENT_LOCATION + 4) as u64);
+        super::print_str("\n");
+    }
 }
