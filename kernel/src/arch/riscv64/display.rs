@@ -883,23 +883,38 @@ pub fn mode_set() -> bool {
     // known state whatever it held before.
     dc_modify(
         DC_FRAMEBUFFER_CONFIG,
-        (FORMAT_X8R8G8B8 << 26) | (1 << 8),
+        FORMAT_X8R8G8B8 << 26,
         (0x1f << 26) | (1 << 25) | (0x03 << 23) | (1 << 22) | (0x1f << 17) | (0x07 << 14)
             | (0x07 << 11) | (1 << 8),
     );
-    super::print_str(
-        "riscv64: display - PLANE CLEAR IS ON: the screen should be GREEN if the plane composites, ORANGE if it does not
-",
-    );
+
     // Bit 6 says the source is RGB and bit 8 says it is YUV - the second thing the `_ex` path does
     // that the plain one does not, and a plane whose colour space is unstated is not obviously going
     // to scan. Bit 5 is the de-gamma table, off. Bit 13 enables the plane; bits 18:16 are its
     // stacking order and bit 19 says which display it belongs to - both zero, for the bottom of
     // display 0. Bit 12 stays clear here and is set once at the end.
+    // THE PLANE IS TURNED OFF, and this is the test the last one should have been.
+    //
+    // Asking whether the background colour appeared was meaningless while the plane was enabled,
+    // opaque and covering the whole screen: the background is what shows where NO plane covers, so it
+    // could never have been visible and its absence proved nothing. That was my error in designing
+    // the diagnostic, not a fact about the hardware.
+    //
+    // With bit 13 clear the plane is disabled, nothing covers the display, and the background is all
+    // there is. Both halves of this test use only bits the vendor driver writes by name - the plane
+    // enable, and the background colour register - so unlike the colour bar there is nothing to guess
+    // at. ORANGE means the controller's output path works and every remaining fault is in the plane:
+    // its configuration, or what it fetches. BLACK means the controller emits correct syncs and no
+    // pixels at all, which is a fault in a part of it that nothing I have touched can reach, and the
+    // search moves off the plane entirely.
     dc_modify(
         DC_FRAMEBUFFER_CONFIG_EX,
-        (1 << 6) | (1 << 13),
+        1 << 6,
         (1 << 1) | (1 << 5) | (1 << 8) | (1 << 13) | (0x07 << 16) | (1 << 19),
+    );
+    super::print_str(
+        "riscv64: display - PLANE OFF: the screen should be ORANGE if the controller emits pixels at all
+",
     );
 
     // Re-arm the shadow bank, so anything written from here on takes effect on a frame boundary
@@ -1437,11 +1452,11 @@ pub fn hdmi_on() -> bool {
     // controller for four boots is irrelevant.
     //
     // Either answer retires half the search. That is worth a boot in a way that another guess is not.
-    hdmi_write(HDMI_COLORBAR, 0xff);
-    super::print_str("riscv64: display - transmitter colour bar requested, register reads ");
-    super::print_hex(hdmi_read(HDMI_COLORBAR) as u64);
-    super::print_str("
-");
+    // NOT WRITTEN. `0xff` into the colour-bar register read back as `0xff` - every bit implemented -
+    // and the television lost the signal completely. So that register does reach the TMDS output, and
+    // an all-ones value is not a colour bar but a broken output stage. Left alone rather than probed
+    // a bit at a time: each probe costs a boot, and the test below answers the same question without
+    // needing to know this register's layout at all.
 
     // The driver's last act: strobe register 0xce low then high, which restarts the video path with
     // everything above in place.
