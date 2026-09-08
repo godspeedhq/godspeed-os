@@ -714,6 +714,10 @@ riscv64: S-mode entered, 16550 UART alive
                 .map(|r| r.base)
                 .unwrap_or(0);
             usb::set_bases(crg, stg_syscon, xhci, sys.unwrap_or(0), syscon.unwrap_or(0), phy);
+            let mut w11: [Option<u32>; 0] = [];
+            if let Some(reg) = tree.find_compatible("starfive,jh7110-sys-pinctrl", &[], &mut w11) {
+                usb::set_pinctrl_base(reg.base);
+            }
         }
 
         if display::mode_set() {

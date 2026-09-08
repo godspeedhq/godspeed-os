@@ -76,12 +76,70 @@ const STGCLK_APP_125M: usize = 6;
 const SYSCON_USB_SPLIT: usize = 0x18;
 const USB_PDRSTN_SPLIT: u32 = 1 << 17;
 
+/// The pin configuration the board needs before anything can be plugged into it.
+///
+/// **A hub that enumerates perfectly and reports nothing behind it is a hub with no VBUS.** The
+/// device tree puts two pin groups on the USB node - `power-pins` and `switch-pins` - and nothing in
+/// this port was programming them, so the downstream ports were whatever the boot ROM left them.
+///
+/// The packed value the tree gives is `din:31-24 | dout:23-16 | doen:15-10 | function:9-8 | pin:7-0`,
+/// so `0xff01001a` is pin 26 driven HIGH with its output enabled and no input routed, and
+/// `0xff00003e` is pin 62 driven LOW the same way. Those are the port power switch and the USB 2/3
+/// mux. Decoded here from the tree's own numbers rather than restated as two magic addresses,
+/// because the encoding is the thing worth writing down.
+const SYS_PINCTRL_DOEN: usize = 0x000;
+const SYS_PINCTRL_DOUT: usize = 0x040;
+const SYS_PINCTRL_GPIOEN: usize = 0x0dc;
+const PIN_DOUT_MASK: u32 = 0x7f;
+const PIN_DOEN_MASK: u32 = 0x3f;
+/// `(pin, dout, doen)` - output enabled is doen 0, and dout 1 is high.
+const USB_PINS: [(u32, u32, u32, &str); 2] = [(26, 1, 0, "port power"), (62, 0, 0, "usb2/3 switch")];
+
+static PINCTRL_BASE: AtomicU64 = AtomicU64::new(0);
 static STGCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static STG_SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 static XHCI_BASE: AtomicU64 = AtomicU64::new(0);
 static SYSCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static SYS_SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 static PHY_BASE: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn set_pinctrl_base(base: u64) {
+    PINCTRL_BASE.store(base, Ordering::Relaxed);
+}
+
+/// Drive the two pins the board needs for its USB ports to have power.
+///
+/// One byte per pin in each of two register files, four pins to a word, which is why the offset is
+/// `4 * (pin / 4)` and the shift `8 * (pin % 4)` - read, replace that byte's field, write back, so a
+/// pin sharing a word with three others is not disturbed.
+fn configure_pins() {
+    let base = PINCTRL_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        super::print_str("riscv64: usb - no sys pinctrl; the ports cannot be powered
+");
+        return;
+    }
+    // The GPIO block's own enable, which the reference driver writes once at probe.
+    mmio_write(base, SYS_PINCTRL_GPIOEN, 1);
+    for (pin, dout, doen, _name) in USB_PINS {
+        let off = 4 * (pin as usize / 4);
+        let shift = 8 * (pin % 4);
+        let d = mmio_read(base, SYS_PINCTRL_DOUT + off);
+        mmio_write(
+            base,
+            SYS_PINCTRL_DOUT + off,
+            (d & !(PIN_DOUT_MASK << shift)) | (dout << shift),
+        );
+        let e = mmio_read(base, SYS_PINCTRL_DOEN + off);
+        mmio_write(
+            base,
+            SYS_PINCTRL_DOEN + off,
+            (e & !(PIN_DOEN_MASK << shift)) | (doen << shift),
+        );
+    }
+    super::print_str("riscv64: usb - port power and the usb2/3 switch driven
+");
+}
 
 pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64, syscrg: u64, sys_syscon: u64, phy: u64) {
     STGCRG_BASE.store(stgcrg, Ordering::Relaxed);
@@ -237,6 +295,7 @@ pub fn init() -> bool {
         XHCI_BASE.store(0, Ordering::Relaxed);
         return false;
     }
+    configure_pins();
     super::print_str("riscv64: usb - controller alive; the window is offered to the driver\n");
     true
 }
