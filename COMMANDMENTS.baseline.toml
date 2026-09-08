@@ -381,6 +381,7 @@ PCI_CFG            = 16
 "loongarch64/mod.rs"          = "arch-entry"
 "riscv32/mod.rs"              = "arch-entry"
 "riscv64/context_switch.rs"   = "context-switch"
+"riscv64/display.rs"          = "console"
 "riscv64/fdt.rs"              = "discovery"
 "riscv64/sbi.rs"              = "clock"
 "riscv64/sv39.rs"             = "mmu"

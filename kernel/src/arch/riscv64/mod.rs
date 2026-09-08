@@ -11,6 +11,7 @@ pub mod fdt;
 pub mod sbi;
 pub mod sv39;
 pub mod context_switch;
+pub mod display;
 pub mod syscall;
 pub mod trap;
 pub mod usermode;
@@ -548,6 +549,17 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
     }
 
     probe_rdcycle();
+
+    // THE DISPLAY, first stage: the power domain everything else in VOUT sits behind. Nothing here
+    // touches the display controller - reading an unpowered domain is a transaction with nothing to
+    // answer it, not a zero - so this asks the always-on PMU instead, which is safe at any time.
+    {
+        let mut want: [Option<u32>; 0] = [];
+        if let Some(reg) = tree.find_compatible("starfive,jh7110-pmu", &[], &mut want) {
+            display::set_pmu_base(reg.base);
+        }
+        display::power_on_vout();
+    }
 
     // What the firmware beneath us offers. Probed rather than assumed: the two machines disagree
     // about their own capabilities, and calling into a missing extension is how a boot goes quiet.
@@ -2290,6 +2302,11 @@ fn probe_rdcycle() {
         print_str(" Hz - cycle-denominated waits will be far longer than intended");
     }
     print_str("\n");
+}
+
+/// The machine's monotonic counter rate, for anything that needs to bound a wait in real time.
+pub(super) fn timebase_hz() -> u32 {
+    TIMEBASE_HZ.load(Ordering::Relaxed)
 }
 
 /// Clear this hart's pending software interrupt.
