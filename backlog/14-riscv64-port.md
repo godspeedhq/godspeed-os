@@ -357,6 +357,57 @@ set in between costs a spurious wake rather than a lost one.
 Hart IDS come from the device tree, never from a count: on this board they are 1..4 with hart 0 a
 disabled S7 monitor core, so counting would try to start a different core design and skip hart 4.
 
+### Storage: PCI works, the AHCI signature does not (2026-09-08)
+
+PCI Express is enumerated through ECAM, the BARs are assigned, and the UNMODIFIED x86 AHCI driver
+talks to a controller on RISC-V:
+
+```
+riscv64: pci ecam at 0x30000000, 2 device(s)
+riscv64:   bdf 0x8 class 0x10601 0x8086:0x2922 bar0 0x40000000
+block-driver: AHCI HBA v1.00 CAP=0xc0141f05 (6 ports, 32 cmd slots) GHC=0x80000000 PI=0x0000003f
+block-driver: AHCI port 0: device present (DET=3) sig=0xffffffff
+```
+
+Reproduce with:
+
+```
+qemu-system-riscv64 -M virt ... -drive file=build/rvdisk.img,if=none,id=d0,format=raw \
+  -device ahci,id=ahci0 -device ide-hd,drive=d0,bus=ahci0.0
+```
+
+**Where it stops, exactly.** `PxSIG` holds 0xFFFFFFFF until the device posts its initial D2H Register
+FIS, and QEMU latches it only through its FIS-WRITE path - which requires `PxFB` programmed and `FRE`
+enabled. This driver reads the signature to CHOOSE a port and programs the FIS area in `init_port`
+afterwards, so the signature it needs cannot exist yet. Chicken and egg. On a PC the firmware reset
+the port long before any of this ran, which is why the same code has always worked there.
+
+A COMRESET does not help: it is the FIS AREA that is missing, not the reset. Tried and reverted.
+
+**The correct fix is what Linux does: initialise the port fully - CLB, FB, FRE, ST - and read the
+signature afterwards.** That is a restructure of a driver that is hardware-proven on x86, so it wants
+doing deliberately with a way to test it on x86 too, not squeezed in for an emulator. And it serves
+QEMU alone: this board has no SATA, so AHCI will never be its storage.
+
+**What the board would need instead**, and neither is small:
+
+- **SD/eMMC** is a HAZARD, not an option, for the same reason it is on the Pi: the card is the boot
+  medium, GSFS's superblock lives at LBA 0 where the partition table is, and the ARM ports destroyed
+  two boot cards learning it. If the VisionFive ever gets storage it must not be the boot card.
+- **USB mass storage** needs a USB host driver for the JH7110's controller, which is a project of its
+  own - the same one the Pi ports each spent weeks on.
+
+So storage stays absent on this port, and `fs` comes up storage-unavailable, which is exactly what x86
+reports with no disk attached and what ARM reports with no stick in. The file half of `selfcheck`
+cannot pass here; the single failing assert is that, and it is not a defect.
+
+**What DID come out of the attempt, and is kept:** PCI ECAM enumeration (the only way any PCIe device
+on any RISC-V board will ever be found), BAR assignment, and a `read_cycle_counter` that returns
+CYCLES. That last one was invisible until a driver's cycle budget met it: 400 million cycles is a
+fifth of a second on a PC and forty seconds against a 10 MHz timebase, so the driver appeared to hang
+while being entirely correct. Every cycle-denominated wait in userspace was a hundred times out on
+this port and nothing had noticed, because nothing had waited on one yet.
+
 ### What is still stubbed, now that the shape is clear
 
 - **STORAGE, on any RISC-V machine.** `block-driver` looks for an AHCI controller; QEMU `virt` offers
