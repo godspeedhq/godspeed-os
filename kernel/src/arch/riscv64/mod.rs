@@ -602,7 +602,14 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         if let Some(reg) = tree.find_compatible("starfive,jh7110-pmu", &[], &mut want) {
             display::set_pmu_base(reg.base);
         }
-        display::power_on_vout();
+        let mut w2: [Option<u32>; 0] = [];
+        let sys = tree.find_compatible("starfive,jh7110-syscrg", &[], &mut w2).map(|r| r.base);
+        let mut w3: [Option<u32>; 0] = [];
+        let vout = tree.find_compatible("starfive,jh7110-voutcrg", &[], &mut w3).map(|r| r.base);
+        display::set_crg_bases(sys.unwrap_or(0), vout.unwrap_or(0));
+        if display::power_on_vout() {
+            display::clocks_on();
+        }
     }
 
     // What the firmware beneath us offers. Probed rather than assumed: the two machines disagree
