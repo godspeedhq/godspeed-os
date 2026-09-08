@@ -502,6 +502,8 @@ const DC_FRAMEBUFFER_WATER_MARK: usize = 0x1ce8;
 const DC_FRAMEBUFFER_CONFIG_EX: usize = 0x1cc0;
 const DC_FRAMEBUFFER_TOP_LEFT: usize = 0x24d8;
 const DC_FRAMEBUFFER_BOTTOM_RIGHT: usize = 0x24e0;
+const DC_FRAMEBUFFER_BG_COLOR: usize = 0x1528;
+const DC_FRAMEBUFFER_CLEAR_VALUE: usize = 0x1a18;
 const DC_FRAMEBUFFER_SRC_GLOBAL_COLOR: usize = 0x2500;
 const DC_FRAMEBUFFER_DST_GLOBAL_COLOR: usize = 0x2508;
 const DC_FRAMEBUFFER_BLEND_CONFIG: usize = 0x2510;
@@ -822,6 +824,25 @@ pub fn mode_set() -> bool {
     // the plane away no matter what its pixels contain. `0x3548` is the driver's value for the mode
     // that ignores per-pixel alpha and uses the global one, and the global one is now 0xff - so
     // neither the pixels' fourth byte nor the blend unit can make the picture disappear again.
+    // TWO COLOURS THE CONTROLLER MAKES ITSELF, so that a black screen stops being one answer and
+    // becomes three. The television is now lit and syncing, so the signal is real and every pixel in
+    // it is zero - which is either "the plane is not being composited" or "everything the plane reads
+    // is zero", and those have nothing in common. Neither of these two colours involves the CPU
+    // writing to memory at all:
+    //
+    //   ORANGE is the display background, shown wherever no plane covers it. Seeing it means the
+    //   plane is not reaching the screen, whatever its contents.
+    //
+    //   GREEN is the plane's own hardware clear: with bit 8 set the plane outputs a constant colour
+    //   and does not fetch memory. Seeing it means the plane, the blending, the timings, the
+    //   transmitter and the television are all correct end to end, and the single remaining fault is
+    //   that what the processor writes is not what the controller reads - a memory-visibility problem
+    //   rather than a display one.
+    //
+    // Still black after this would mean neither, which rules out everything above and is worth
+    // knowing too. The colour bars are hidden for this boot; they come back with the answer.
+    dc_write(DC_FRAMEBUFFER_BG_COLOR, 0xffff_8000);
+    dc_write(DC_FRAMEBUFFER_CLEAR_VALUE, 0xff00_ff00);
     dc_write(DC_FRAMEBUFFER_SRC_GLOBAL_COLOR, 0xff << 24);
     dc_write(DC_FRAMEBUFFER_DST_GLOBAL_COLOR, 0xff << 24);
     dc_write(DC_FRAMEBUFFER_BLEND_CONFIG, 0x3548);
@@ -832,9 +853,13 @@ pub fn mode_set() -> bool {
     // known state whatever it held before.
     dc_modify(
         DC_FRAMEBUFFER_CONFIG,
-        FORMAT_X8R8G8B8 << 26,
+        (FORMAT_X8R8G8B8 << 26) | (1 << 8),
         (0x1f << 26) | (1 << 25) | (0x03 << 23) | (1 << 22) | (0x1f << 17) | (0x07 << 14)
             | (0x07 << 11) | (1 << 8),
+    );
+    super::print_str(
+        "riscv64: display - PLANE CLEAR IS ON: the screen should be GREEN if the plane composites, ORANGE if it does not
+",
     );
     // Bit 6 says the source is RGB and bit 8 says it is YUV - the second thing the `_ex` path does
     // that the plain one does not, and a plane whose colour space is unstated is not obviously going
