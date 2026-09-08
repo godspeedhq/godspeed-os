@@ -619,6 +619,7 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
         }
         if display::power_on_vout() && display::clocks_on() {
             display::probe_dc8200();
+            display::mode_set();
         }
     }
 
