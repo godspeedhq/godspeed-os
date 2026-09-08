@@ -286,26 +286,38 @@ silent because the thing that wanted to print was the fault handler. Reach for i
 hang with no output is exactly the case where the emulator can see what the kernel cannot say. The
 fault reporter now prints the live PTE for any page fault, so the next one is a log line instead.
 
-### What to try on the board, in order
+### Verified on the board (2026-09-08)
 
-1. Boot it. Expect the QEMU sequence: `boot hart is 1`, the five selftests, `supervisor: ready`, then
-   the shell prompt. The board has a real 4 MHz timebase against QEMU's 10 MHz, so the quantum and
-   idle re-arm arithmetic is exercised at a different rate for the first time.
-2. Type at the shell. It says `input driver not announced yet - prompting anyway`, and on this board
-   input would come from the same 16550 the kernel prints through - `uart_rx_pop` and friends are
-   still stubs, so KEYS WILL NOT REACH IT YET. That is the next piece of work, not a bug to chase.
-3. `xhci` spawn FAILS on this port and the log says so - there is no PCI on the VisionFive and the
-   service is x86/aarch64-shaped. Expected, and it does not stop the boot.
+Everything above ran on the VisionFive 2 Lite, in two sittings, with ZERO faults both times:
+
+- The full boot: `boot hart is 1`, five selftests, ten spawns, `supervisor: ready`, in about six
+  seconds from the first byte and 236 ms from `entering the scheduler`.
+- **The shell answers.** `about` typed at `gsh>` returned `Version 0.15.0 riscv64`. That closes the
+  loop the port was opened for: the machine boots, runs services, and can be used.
+- The DesignWare UART's RECEIVE path works at `reg-shift 2`. That was the one place the board could
+  plausibly have differed from QEMU - the transmit side had proved the width logic on hardware, the
+  receive side had not - and it did not differ.
+- `xhci` spawn FAILS and says so: no PCI on this board, and the service is x86/aarch64-shaped.
+  Expected, and it does not stop the boot.
 
 ### What is still stubbed, now that the shape is clear
 
-- **Console input.** `uart_rx_pop`, `uart_rx_poll`, `input_ready`, `console_push_byte` are no-ops, so
-  the shell prompts and cannot be typed at. The 16550 the kernel writes is right there; this is a
-  receive path and an interrupt, not a new subsystem.
+- **STORAGE, on any RISC-V machine.** `block-driver` looks for an AHCI controller; QEMU `virt` offers
+  virtio-blk and the VisionFive has SD/eMMC, and neither has a backend. So `fs` comes up, serves its
+  API and reports zero sectors - honest, and it means the FILE half of `selfcheck` cannot pass
+  anywhere on this port yet. The one assert that failed in QEMU (`assert contains done`, section 9)
+  is exactly this and is not a defect: 47 of 48 passed, and the suite's own banner says it needs a
+  flashed drive. `selfcheck` also does not COMPLETE under TCG - too slow with ten services - so the
+  full run belongs on the board.
 - **PLIC.** No device interrupts are routed to userspace, so no driver service can be interrupt-driven
   (12).
 - **SMP.** One hart. `ap_count()` reports what the device tree found, and SBI HSM would start the
   rest; `get_lapic_id` returns the BOOT hart's id and would need to be a `tp` read first.
+- **The idle tick is deliberately NOT slowed** (`boot::rearm_idle_timer` re-arms at the quantum, not
+  at ~1 s). With no PLIC there is no RX interrupt, so the timer tick is the only thing that drains the
+  UART and wakes a shell blocked in `ConsoleRead` - which makes the idle tick the keystroke latency. A
+  second between key and echo is not a slow system, it is a broken one. This is the first thing to
+  revert when the PLIC lands, and it is the reason to want it.
 - **A fault is still fatal.** The reporter names the privilege and now the PTE, but there is no kill
   path, so a faulting task halts the machine instead of dying. This is the single biggest gap between
   this port and the others, and it is what `uaccess`'s pre-walk exists to work around.
