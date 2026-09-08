@@ -66,6 +66,11 @@ fn uart_configure(base: u64, shift: u32, width: u32) {
     UART_BASE.store(base as usize, Ordering::Relaxed);
     UART_SHIFT.store(shift, Ordering::Relaxed);
     UART_WIDTH.store(width, Ordering::Relaxed);
+    // There is now a path by which a keystroke can arrive. On a machine whose console is a USB
+    // keyboard this is announced by that keyboard's SERVICE; here the console is this UART, so the
+    // kernel is the only thing that can say so - and the shell stops reporting that no input driver
+    // announced itself when none ever will.
+    INPUT_READY.store(true, Ordering::Release);
 }
 
 #[inline]
@@ -122,6 +127,95 @@ fn putc(b: u8) {
         }
     }
     uart_thr(b);
+}
+
+/// LSR bit 0: a received byte is waiting in the receive buffer.
+const LSR_DR: u8 = 1 << 0;
+
+/// Receive-buffer register. Index 0, like the transmit register it shares an address with - the
+/// 16550 tells them apart by the direction of the access, which is why this reads where `uart_thr`
+/// writes.
+#[inline]
+fn uart_rbr() -> u8 {
+    let addr = uart_reg(0);
+    // SAFETY: MMIO the firmware left mapped, at the address and width the device tree declares.
+    // Reading it CONSUMES a byte from the FIFO, so it is only ever called with `LSR_DR` set.
+    unsafe {
+        if UART_WIDTH.load(Ordering::Relaxed) >= 4 {
+            (addr as *const u32).read_volatile() as u8
+        } else {
+            (addr as *const u8).read_volatile()
+        }
+    }
+}
+
+/// Keystrokes read out of the UART and not yet consumed by a reader.
+///
+/// `AtomicU8` cells rather than a `static mut` array, so the ring needs no `unsafe` at all: the
+/// producer is the timer tick (or a syscall draining directly) and the consumer is whichever task
+/// holds `CONSOLE_READ`, and they genuinely run at different times on different stacks. A ring of
+/// atomics states that plainly and costs nothing on a machine with the A extension.
+///
+/// 256 bytes: a fixed ceiling readable off the source (§26.6.1). A human types perhaps ten bytes a
+/// second and the tick drains a hundred times a second, so this is roughly two seconds of a paste
+/// burst, and overflowing it drops the OLDEST keystroke loudly rather than growing.
+const RX_RING: usize = 256;
+static RX_BUF: [core::sync::atomic::AtomicU8; RX_RING] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; RX_RING];
+static RX_HEAD: AtomicU32 = AtomicU32::new(0);
+static RX_TAIL: AtomicU32 = AtomicU32::new(0);
+static RX_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// True once there is a path by which a keystroke can arrive.
+///
+/// On a machine whose console is a USB keyboard this is set by the keyboard SERVICE announcing
+/// itself. Here the console is the serial port the kernel is already printing through, so the input
+/// path exists from the moment the UART does - and saying so is what stops the shell reporting that
+/// no input driver has announced itself when one never will.
+static INPUT_READY: AtomicBool = AtomicBool::new(false);
+
+/// Put one byte in the ring. Returns false if it was full.
+fn rx_push(b: u8) -> bool {
+    let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
+    let head = RX_HEAD.load(Ordering::Acquire) as usize;
+    let next = (tail + 1) % RX_RING;
+    if next == head {
+        // FULL, and a KEYSTROKE is being dropped. Counted rather than silent: input that vanishes
+        // with no trace is the kind of fault a user reports as "it missed a character sometimes",
+        // which is unfalsifiable without a number to point at.
+        RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    RX_BUF[tail].store(b, Ordering::Relaxed);
+    RX_TAIL.store(next as u32, Ordering::Release);
+    true
+}
+
+/// Move everything the UART has received into the ring, and wake a blocked reader if anything
+/// arrived.
+///
+/// **The wake is the half that matters.** A task blocked in `ConsoleRead` is parked, and the neutral
+/// code that parked it says it expects to be woken "by the RX IRQ". This port has no PLIC yet, so
+/// there is no RX IRQ - the drain runs from the timer tick instead, and if it did not wake the waiter
+/// the shell would sit blocked forever with its keystroke sitting in the ring.
+///
+/// The loop is BOUNDED by the ring rather than by the FIFO: a UART wedged with `DR` permanently set
+/// would otherwise spin here forever, inside a timer interrupt, and take the machine with it.
+fn uart_rx_drain() {
+    let mut got = false;
+    for _ in 0..RX_RING {
+        if uart_lsr() & LSR_DR == 0 {
+            break;
+        }
+        let b = uart_rbr();
+        got |= rx_push(b);
+    }
+    if got {
+        let w = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+        if w != u32::MAX {
+            crate::task::scheduler::wake_by_slot(w as usize, 0);
+        }
+    }
 }
 
 /// ELF entry - OpenSBI (QEMU default firmware) jumps here in S-mode at 0x8020_0000 (a0=hartid, a1=dtb).
@@ -679,21 +773,57 @@ pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 // ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
 pub fn serial_write_byte(b: u8) { putc(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { putc(b); } }
-pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
-pub fn set_console_echo(on: bool) {}
+/// Console output for a SERVICE - the path the shell's prompt and its echo take.
+///
+/// The kernel's own `kprintln` reaches the UART through `serial_write_byte`, which is why boot output
+/// and service LOGS worked long before this did. A shell prompt is neither: it is console output,
+/// routed through the `console` service and back down to here, and while this was empty the shell
+/// prompted into nothing. The symptom was a system that booted perfectly and showed no prompt.
+///
+/// `to_fb` selects the framebuffer as well, and is ignored: this port has no display, so serial is
+/// not one of two sinks but the only one.
+pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
+    let _ = to_fb;
+    serial_write_bytes_lockfree(s);
+}
+pub fn set_console_echo(on: bool) { let _ = on; }
 pub fn claim_console_foreground(task_slot: u32) {}
 pub fn release_console_foreground() {}
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
 pub fn console_boot_complete() {}
-pub fn console_push_byte(b: u8) {}
-pub fn set_input_ready() {}
-pub fn input_ready() -> bool { false }
+/// Inject a byte as though it had been typed. The kernel uses this to deliver a newline that
+/// re-prompts a shell, and a keyboard SERVICE would use it to deliver real keys.
+pub fn console_push_byte(b: u8) {
+    if rx_push(b) {
+        let w = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+        if w != u32::MAX {
+            crate::task::scheduler::wake_by_slot(w as usize, 0);
+        }
+    }
+}
+pub fn set_input_ready() { INPUT_READY.store(true, Ordering::Release); }
+pub fn input_ready() -> bool { INPUT_READY.load(Ordering::Acquire) }
 pub fn com2_init() {}
 pub fn com2_try_read_byte() -> Option<u8> { None }
-pub fn uart_rx_pop() -> Option<u8> { None }
-pub fn uart_rx_poll() {}
-pub fn uart_rx_drain_now() {}
+/// Take the oldest unread keystroke, if there is one.
+pub fn uart_rx_pop() -> Option<u8> {
+    let head = RX_HEAD.load(Ordering::Relaxed) as usize;
+    let tail = RX_TAIL.load(Ordering::Acquire) as usize;
+    if head == tail {
+        return None;
+    }
+    let b = RX_BUF[head].load(Ordering::Relaxed);
+    RX_HEAD.store(((head + 1) % RX_RING) as u32, Ordering::Release);
+    Some(b)
+}
+/// Called from the core-0 timer tick. On this port that tick IS the input path - see
+/// `boot::rearm_idle_timer` for why the idle tick is not slowed here.
+pub fn uart_rx_poll() { uart_rx_drain(); }
+/// Drain on demand, so capturing input never depends on the tick having run. The blocked
+/// `ConsoleRead` path calls this before it parks, and the non-blocking read calls it before it
+/// answers empty.
+pub fn uart_rx_drain_now() { uart_rx_drain(); }
 
 pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -706,16 +836,22 @@ pub mod boot {
     /// its idle `wait_for_interrupt`: slow the timer while a core sleeps, restore the quantum on wake.
     /// A no-op here is CORRECT for a stub - the tick simply never slows - and a real port implements
     /// them on its own timer (generic timer on ARM, CLINT/mtimecmp on RISC-V).
-    /// Re-arm at the IDLE rate: about a second, instead of the 10 ms quantum.
+    /// Re-arm an idle core - at the QUANTUM on this port, not at the usual ~1 s idle rate.
     ///
-    /// A core with nothing to run still has to wake often enough to be seen as alive by the
-    /// cross-core wedge watchdog and to re-poll its run queue for a lost wake, so the tick is SLOWED
-    /// rather than stopped. Stopping it would make an idle core and a wedged one look identical.
+    /// **Because here the idle tick IS the keystroke latency.** A task blocked in `ConsoleRead` is
+    /// parked waiting to be woken "by the RX IRQ", and this port has no PLIC, so there is no RX IRQ:
+    /// the timer tick is the only thing that drains the UART and wakes that task. Slowing the tick to
+    /// a second while a core idles - which is exactly when a shell is waiting at a prompt - would put
+    /// up to a second between a key being pressed and the shell seeing it, and typing would be
+    /// unusable.
+    ///
+    /// So this deliberately declines the power saving until there is an interrupt that can replace
+    /// it. The cost is 100 wakes a second on an idle core instead of one; the core still halts in
+    /// between (`wait_for_interrupt`), so it is a slower sleep rather than a spin. When the PLIC
+    /// lands and the UART can raise an interrupt, the slow idle tick becomes correct and this becomes
+    /// the one-second re-arm the other ports use.
     pub fn rearm_idle_timer() {
-        let hz = super::TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
-        if hz != 0 {
-            super::sbi::set_timer(super::sbi::time().wrapping_add(hz));
-        }
+        rearm_quantum_timer();
     }
 
     /// Re-arm at the 10 ms scheduler quantum (CLAUDE.md 9.1).
