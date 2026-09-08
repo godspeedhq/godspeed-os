@@ -1127,6 +1127,56 @@ fn config_video_timing() {
     hdmi_write(HDMI_VIDEO_TIMING_CTL, 1 | (1 << 2) | (1 << 3));
 }
 
+/// Status, including whether the transmitter can see a television on the other end of the cable.
+const HDMI_STATUS: usize = 0xc8;
+/// Hot-plug detect: the sink pulls this up through the cable, so it is the transmitter's own answer
+/// to "is something plugged in and powered". It is the one bit here that depends on the world outside
+/// the board, which is what makes it worth more than any of the others.
+const HDMI_HOTPLUG: u32 = 1 << 7;
+
+/// Read the transmitter back, register by register, and say whether it sees a sink.
+///
+/// Every value written to this block so far has been written blind. The controller's registers were
+/// read back and that is how it was established that the mode set was not the problem; the same is
+/// owed here before anything else is guessed at. In particular the PHY's output stage - the LDO, the
+/// serializer, the TMDS driver - could accept a write and hold nothing if the analog supplies are
+/// not up, which is the difference between "the transmitter is configured" and "the transmitter is
+/// working" and is invisible from the digital side.
+fn report_transmitter() {
+    super::print_str("riscv64: display - transmitter readback:");
+    for (name, off) in [
+        ("sys", HDMI_SYS_CTRL),
+        ("vidctl", 0x01usize),
+        ("timing", HDMI_VIDEO_TIMING_CTL),
+        ("htot_l", HDMI_VIDEO_EXT_HTOTAL_L),
+        ("htot_h", HDMI_VIDEO_EXT_HTOTAL_L + 1),
+        ("vtot_l", HDMI_VIDEO_EXT_VTOTAL_L),
+        ("vtot_h", HDMI_VIDEO_EXT_VTOTAL_L + 1),
+        ("vblank", HDMI_VIDEO_EXT_VBLANK),
+        ("ce", 0xce),
+        ("prelock", PHY_PRE_PLL_LOCK),
+        ("postlock", PHY_POST_PLL_LOCK),
+        ("ldo", 0x1b4),
+        ("ser", 0x1be),
+        ("tmds", 0x1b2),
+        ("drive_bf", 0x1bf),
+        ("drive_c0", 0x1c0),
+    ] {
+        super::print_str(" ");
+        super::print_str(name);
+        super::print_str("=");
+        super::print_hex(hdmi_read(off) as u64);
+    }
+    super::print_str("\n");
+
+    let status = hdmi_read(HDMI_STATUS);
+    super::print_str("riscv64: display - HDMI status ");
+    super::print_hex(status as u64);
+    super::print_str(": a television is ");
+    super::print_str(if status & HDMI_HOTPLUG != 0 { "CONNECTED" } else { "NOT detected" });
+    super::print_str("\n");
+}
+
 /// Bring the transmitter up and hand it the raster.
 pub fn hdmi_on() -> bool {
     let hdmi = HDMI_BASE.load(Ordering::Relaxed);
@@ -1142,6 +1192,15 @@ pub fn hdmi_on() -> bool {
     if !reset_deassert(vout, VOUTCRG_RESET_ASSERT, VOUTCRG_RESET_STATUS, VOUTRST_HDMI_TX) {
         super::print_str("riscv64: display - HDMI transmitter reset did not release\n");
         return false;
+    }
+
+    // TEN MILLISECONDS, which the reference driver takes between powering this block and touching
+    // it and which the first version of this stage left out. A bounded wait on the machine's own
+    // counter rather than a spin count, so it is ten milliseconds on both machines.
+    let hz = super::timebase_hz() as u64;
+    let settle = super::sbi::time().wrapping_add(if hz == 0 { 40_000 } else { hz / 100 });
+    while super::sbi::time() < settle {
+        core::hint::spin_loop();
     }
 
     // Two writes the driver makes before anything else, whose meaning is not in any header: bit 2 of
@@ -1175,13 +1234,7 @@ pub fn hdmi_on() -> bool {
     hdmi_write(0xce, 0x00);
     hdmi_write(0xce, 0x01);
 
-    super::print_str("riscv64: display - HDMI transmitter on: sys=");
-    super::print_hex(hdmi_read(HDMI_SYS_CTRL) as u64);
-    super::print_str(" timing=");
-    super::print_hex(hdmi_read(HDMI_VIDEO_TIMING_CTL) as u64);
-    super::print_str(" phy=");
-    super::print_hex(hdmi_read(0x1b2) as u64);
-    super::print_str("\n");
+    report_transmitter();
 
     // AND NOW THE PIXEL CLOCK CHANGES HANDS. Parent 1 of the controller's pixel-clock mux is
     // `hdmitx0_pixelclk`, which is what the PLL just locked is generating; the device tree calls it a
@@ -1200,6 +1253,17 @@ pub fn hdmi_on() -> bool {
     let top = DC_BASE.load(Ordering::Relaxed);
     if top != 0 {
         report_scanout(top, "after the transmitter");
+        // Bit 5 of the plane's config is the controller's underflow flag: set means it asked the
+        // memory system for pixels and did not get them in time. It distinguishes a display that is
+        // scanning nothing from one that is scanning something it could not fetch, which look
+        // identical on a dark screen.
+        super::print_str("riscv64: display - plane fetch: fbcfg=");
+        super::print_hex(dc_read(DC_FRAMEBUFFER_CONFIG) as u64);
+        super::print_str(if dc_read(DC_FRAMEBUFFER_CONFIG) & (1 << 5) != 0 {
+            " UNDERFLOW\n"
+        } else {
+            " no underflow\n"
+        });
     }
     true
 }
@@ -1243,6 +1307,10 @@ pub fn adopt_as_boot_console() {
     // Only NOW does the serial path start mirroring: a byte painted before `bootcon::init` would be
     // drawn through a console that has no framebuffer yet.
     super::screen_ready();
-    crate::bootcon::clear_and_home();
+    // DELIBERATELY NOT CLEARED. The colour bars painted before the mode set stay under the text, so
+    // the screen carries three distinguishable answers instead of one: bars with text on them means
+    // the whole path works; bars alone means the console is not drawing; a black but LIT screen means
+    // the controller is scanning memory it cannot really see, which is what a cache-coherence problem
+    // looks like from the sofa. Once the path is proven this goes back to a clean screen.
     super::print_str("riscv64: display - the boot console now draws to the screen\n");
 }
