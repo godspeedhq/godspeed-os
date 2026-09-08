@@ -1276,12 +1276,37 @@ pub mod interrupts {
 
 // ---------------------------------------------------------------------------
 pub mod rtc {
+    use core::sync::atomic::Ordering;
+
     pub use crate::clock::epoch_secs;
-    pub fn capture_boot_time() {}
+    /// Baseline the monotonic clock. Idempotent, and already done by `start_timer` - which is the
+    /// point where the timebase becomes known and so the earliest moment a baseline means anything.
+    pub fn capture_boot_time() {
+        if super::BOOT_TIME.load(Ordering::Relaxed) == 0 {
+            super::BOOT_TIME.store(super::sbi::time(), Ordering::Relaxed);
+        }
+    }
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
     pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this stub; SNTP wall clock unused (arm is the live RTC-less port)
-    pub fn now_epoch_monotonic() -> i64 { 0 }
+    /// Seconds since boot, from the machine's own counter.
+    ///
+    /// **Returning 0 from the stub this replaces was not harmless.** The shell's `wait` paces on this
+    /// value - it loops until the elapsed count has advanced by N - so a clock frozen at zero meant
+    /// `wait 1` could never satisfy itself and failed instead. `selfcheck` caught it on hardware as
+    /// `assert: FAILED (ok 'wait 1')`, which is the whole reason a suite exists.
+    ///
+    /// Derived, not counted: `time` advances at the device tree's `timebase-frequency` whatever the
+    /// core is doing, so this is correct across idle, preemption and any future frequency scaling -
+    /// unlike a tick count, which measures how often the scheduler ran.
+    pub fn now_epoch_monotonic() -> i64 {
+        let hz = super::TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
+        if hz == 0 {
+            return 0; // no timebase yet: say nothing rather than a number that means nothing
+        }
+        let base = super::BOOT_TIME.load(Ordering::Relaxed);
+        (super::sbi::time().saturating_sub(base) / hz) as i64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1569,13 @@ static TIMEBASE_HZ: AtomicU32 = AtomicU32::new(0);
 /// Set once the neutral scheduler owns this core. Until then the tick is the boot's own; after it,
 /// every tick is a preemption point and belongs to `scheduler::timer_tick_from_irq`.
 static NEUTRAL_SCHED: AtomicBool = AtomicBool::new(false);
+/// The `time` CSR at boot, so elapsed seconds can be derived without an RTC.
+///
+/// This board has no battery-backed clock - and neither does the Pi - so "what time is it" and "how
+/// long have we been up" are different questions with different answers. This is the second one, and
+/// it is the one a `wait` or an `uptime` actually needs: a count of seconds since the kernel started,
+/// which the machine can answer on its own.
+static BOOT_TIME: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// The KERNEL's own Sv39 root, recorded when paging is enabled.
 ///
@@ -1612,6 +1644,7 @@ fn start_timer(hz: u32) -> bool {
     let interval = (hz as usize) / 100;
     TICK_INTERVAL.store(interval, Ordering::Relaxed);
     TIMEBASE_HZ.store(hz, Ordering::Relaxed);
+    BOOT_TIME.store(sbi::time(), Ordering::Relaxed);
     if !sbi::set_timer(sbi::time().wrapping_add(interval as u64)) {
         return false;
     }
