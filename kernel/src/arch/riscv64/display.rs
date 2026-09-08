@@ -229,14 +229,14 @@ const VOUTRST_AXI: u32 = 0;
 const VOUTRST_AHB: u32 = 1;
 const VOUTRST_CORE: u32 = 2;
 
-fn mmio_read(base: u64, off: usize) -> u32 {
+pub(super) fn mmio_read(base: u64, off: usize) -> u32 {
     // SAFETY: a register inside a block the device tree described, in the identity map, whose power
     // domain and parent clocks the caller has already brought up - which is the ordering this whole
     // file exists to get right.
     unsafe { ((base as usize + off) as *const u32).read_volatile() }
 }
 
-fn mmio_write(base: u64, off: usize, val: u32) {
+pub(super) fn mmio_write(base: u64, off: usize, val: u32) {
     // SAFETY: as above.
     unsafe { ((base as usize + off) as *mut u32).write_volatile(val) };
 }
@@ -245,7 +245,7 @@ fn mmio_write(base: u64, off: usize, val: u32) {
 ///
 /// READ BACK, because a write into an unpowered or unclocked block is not an error - it is silence,
 /// and the next stage would then fail somewhere else entirely.
-fn clk_enable(base: u64, index: usize) -> bool {
+pub(super) fn clk_enable(base: u64, index: usize) -> bool {
     let off = index * 4;
     let v = mmio_read(base, off);
     mmio_write(base, off, v | CLK_ENABLE);
@@ -258,7 +258,7 @@ fn clk_enable(base: u64, index: usize) -> bool {
 /// clock is still gated never completes. That is the whole reason clocks are enabled before this is
 /// called, and the bound is what turns a mistake in that ordering into a reported failure instead of
 /// a dead machine with no output.
-fn reset_deassert(base: u64, assert_off: usize, status_off: usize, id: u32) -> bool {
+pub(super) fn reset_deassert(base: u64, assert_off: usize, status_off: usize, id: u32) -> bool {
     let word = (id / 32) as usize * 4;
     let mask = 1u32 << (id % 32);
     let before = mmio_read(base, assert_off + word);
@@ -1609,8 +1609,11 @@ pub fn adopt_as_boot_console() {
     });
     // Only NOW does the serial path start mirroring: a byte painted before `bootcon::init` would be
     // drawn through a console that has no framebuffer yet.
-    super::screen_ready();
+    // CLEAR FIRST, THEN REPLAY. These were the other way round and the second wiped the first: the
+    // held boot log was painted and then the screen was cleared, so what survived was only what
+    // arrived after both. One line, in the wrong order.
     crate::bootcon::clear_and_home();
+    super::screen_ready();
     // Cleared, now that the path is proven. While it was not, the screen deliberately kept whatever
     // had been painted under the text so that it carried three distinguishable answers at once
     // instead of one - which is what turned "still black" from a dead end into a measurement.

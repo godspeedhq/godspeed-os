@@ -12,6 +12,7 @@ pub mod sbi;
 pub mod sv39;
 pub mod context_switch;
 pub mod display;
+mod usb;
 pub mod syscall;
 pub mod trap;
 pub mod usermode;
@@ -664,7 +665,46 @@ GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BO
             if let Some(reg) = tree.find_compatible("starfive,jh7110-hdmi", &[], &mut w7) {
                 display::set_hdmi_base(reg.base);
             }
-            if display::mode_set() {
+            // THE USB HOST CONTROLLER, brought up next to the display for one reason: both are blocks
+        // this SoC leaves switched off, and both are worth nothing until something says whether they
+        // answer. What comes out of this is an address for a driver that already exists.
+        {
+            let mut w8: [Option<u32>; 0] = [];
+            let crg = tree
+                .find_compatible("starfive,jh7110-stgcrg", &[], &mut w8)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            let mut w9: [Option<u32>; 0] = [];
+            let syscon = tree
+                .find_compatible("starfive,jh7110-stg-syscon", &[], &mut w9)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            // The controller sits behind a wrapper that translates addresses, so its window is the
+            // wrapper's parent base plus the controller's own second range - taken from the tree
+            // rather than added up by hand, because a constant here would be this board only.
+            let be32 = |b: &[u8], i: usize| -> u64 {
+                let mut v = 0u64;
+                for k in 0..4 {
+                    v = (v << 8) | b[i * 4 + k] as u64;
+                }
+                v
+            };
+            let mut xhci = 0u64;
+            if let Some(ranges) = tree.find_compatible_prop("starfive,jh7110-usb", "ranges") {
+                if let Some(reg) = tree.find_compatible_prop("cdns,usb3", "reg") {
+                    if ranges.len() >= 16 && reg.len() >= 12 {
+                        // ranges: child address, then the parent address in two cells.
+                        let parent = (be32(ranges, 1) << 32) | be32(ranges, 2);
+                        // The controller's ranges are otg, xhci, dev - the second is the host half.
+                        xhci = parent + be32(reg, 2);
+                    }
+                }
+            }
+            usb::set_bases(crg, syscon, xhci);
+            usb::init();
+        }
+
+        if display::mode_set() {
                 if display::hdmi_on() {
                     // The framebuffer is live and on a wire: hand it to the kernel's boot console so
                     // everything printed from here appears on the screen as well as the serial line.
