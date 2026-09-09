@@ -26,6 +26,35 @@ use super::display::{clk_enable, mmio_read, mmio_write, reset_deassert};
 /// access needs both, which is why these two are the ones that must succeed.
 const AONCLK_GMAC0_AHB: usize = 2;
 const AONCLK_GMAC0_AXI: usize = 3;
+/// **The transmit clock's GATE, and the one that was missing.**
+///
+/// The first frame-path boot reported the MAC's DMA software reset still set after a full second,
+/// and reported it as `0x00000001` BEFORE anything was written - so the block was already held in
+/// reset at boot and stayed there. A DWMAC completes that reset only when all of its clocks are
+/// running, and this is the one that was not.
+///
+/// The mistake was reading a name instead of a clock TREE. Linux's `clk-starfive-jh7110-aon.c`
+/// registers index 6 as `JH71X0__INV(gmac0_tx_inv)` whose PARENT is index 5,
+/// `JH71X0_GMUX(gmac0_tx)` - a gated mux. Enabling the inverter in Linux propagates up and turns the
+/// parent gate on; `clk_enable` here pokes exactly one register and propagates nothing, so index 6
+/// was written (harmlessly, it has no enable bit) and index 5 - the actual gate - was never touched.
+///
+/// The PARENT is the board's choice, not a default: this board's device tree carries
+/// `assigned-clocks = <&aoncrg 5>` with `assigned-clock-parents = <&aoncrg 4>`, which selects
+/// `GMAC0_RMII_RTX` rather than the internal `GMAC0_GTXCLK`. That is the hardware meaning of the
+/// `starfive,tx-use-rgmii-clk` property on the same node: the PHY drives the transmit clock, so the
+/// SoC must take it from the external path. Picking `GTXCLK` because 125 MHz is what gigabit RGMII
+/// "should" use would be substituting an expectation for the board in front of us (26.14).
+const AONCLK_GMAC0_TX: usize = 5;
+/// Parent ORDINAL, not a clock index: the mux field selects among a clock's own parent list, and
+/// `gmac0_tx`'s is `[GMAC0_GTXCLK, GMAC0_RMII_RTX]`. The tree asks for the second.
+const GMAC0_TX_PARENT_RMII_RTX: u32 = 1;
+/// Mux select, bits 27:24 of a JH71x0 clock register - the same field the display's pixel clock uses,
+/// and written down in one place here so the two cannot drift.
+const CLK_MUX_MASK: u32 = 0x0f << 24;
+const CLK_MUX_SHIFT: u32 = 24;
+const CLK_ENABLE: u32 = 1 << 31;
+
 /// The transmit clock, which this SoC provides as an INVERTER rather than a gate.
 ///
 /// **It has no enable bit, and reporting it as a failed gate was wrong.** The device tree names this
@@ -126,12 +155,59 @@ pub fn init() -> bool {
 
     // The rest, best-effort and reported: they carry frames rather than register accesses, so a
     // failure here is a fact the driver stage needs rather than a reason to stop this one.
-    // Poked, not tested: see the constant. The write is harmless on an inverter and keeps the call
-    // in one place if this index ever becomes a real gate; what is dropped is the CLAIM about it.
+    // THE TRANSMIT CLOCK, gate and mux together, and before the resets are released - a block whose
+    // clocks arrive after its reset is deasserted is a block that has already decided it is broken.
+    //
+    // Read-modify-write rather than a bare store: the divisor lives in the low bits of this same
+    // register and is the integrator's business, not ours.
+    let txv = mmio_read(aon, AONCLK_GMAC0_TX * 4);
+    mmio_write(
+        aon,
+        AONCLK_GMAC0_TX * 4,
+        (txv & !CLK_MUX_MASK) | (GMAC0_TX_PARENT_RMII_RTX << CLK_MUX_SHIFT) | CLK_ENABLE,
+    );
+    let txr = mmio_read(aon, AONCLK_GMAC0_TX * 4);
+    // Poked, not tested: an inverter has no enable bit, so the write is harmless and the CLAIM about
+    // it is what was dropped. Kept so the call sits next to the gate it belongs to.
     clk_enable(aon, AONCLK_GMAC0_TX_INV);
     let gtxclk = clk_enable(sys, SYSCLK_GMAC0_GTXCLK);
     let gtxc = clk_enable(sys, SYSCLK_GMAC0_GTXC);
     let ptp = clk_enable(sys, SYSCLK_GMAC0_PTP);
+
+    // SELECT THE INTERFACE, BEFORE THE RESETS COME OFF.
+    //
+    // The order is the reference's: `starfive_dwmac_probe` writes this syscon field and only then
+    // hands over to `stmmac_dvr_probe`, which is what deasserts the block. A MAC that samples its
+    // interface mode as it leaves reset would sample the wrong one if this came after, and the
+    // symptom of that is not an error - it is a controller that comes up in a mode nothing on the
+    // board speaks. This used to run last, after the version read, because reporting a live
+    // controller first read better; that is a reason about the LOG, not about the hardware.
+    let syscon = SYSCON_BASE.load(Ordering::Relaxed);
+    if syscon == 0 {
+        super::print_str("riscv64: net - no sys-syscon in the device tree, so the interface mode
+");
+        super::print_str("riscv64: net - cannot be selected; the MAC is offered but frames may not move
+");
+    } else {
+        let v = mmio_read(syscon, SYSCON_PHY_INTF);
+        let want = (v & !(SYSCON_PHY_INTF_MASK << SYSCON_PHY_INTF_SHIFT))
+            | (PHY_INTF_SEL_RGMII << SYSCON_PHY_INTF_SHIFT);
+        mmio_write(syscon, SYSCON_PHY_INTF, want);
+        // READ IT BACK. A syscon field that is write-protected, or shifted by one, fails silently and
+        // presents later as a MAC that transmits into nothing - a full day of driver debugging for a
+        // register that never took the value.
+        let got = (mmio_read(syscon, SYSCON_PHY_INTF) >> SYSCON_PHY_INTF_SHIFT) & SYSCON_PHY_INTF_MASK;
+        super::print_str("riscv64: net - interface select = ");
+        super::print_dec(got as u64);
+        if got == PHY_INTF_SEL_RGMII {
+            super::print_str(" (RGMII, as asked)
+");
+        } else {
+            super::print_str(" but RGMII is 1 - the field did NOT take; frames will not move
+");
+        }
+    }
+
 
     let mut ok = true;
     for (id, name) in [(AONRST_GMAC0_AXI, "stmmaceth"), (AONRST_GMAC0_AHB, "ahb")] {
@@ -161,7 +237,11 @@ pub fn init() -> bool {
     super::print_dec((snps >> 4) as u64);
     super::print_str(".");
     super::print_dec(((snps & 0xf) * 10) as u64);
-    super::print_str("), gtxclk=");
+    super::print_str("), tx-gate ");
+    super::print_str(if txr & CLK_ENABLE != 0 { "on" } else { "FAIL" });
+    super::print_str(" parent ");
+    super::print_dec(((txr & CLK_MUX_MASK) >> CLK_MUX_SHIFT) as u64);
+    super::print_str(" (want 1), gtxclk=");
     super::print_str(if gtxclk { "on" } else { "FAIL" });
     super::print_str(" gtxc=");
     super::print_str(if gtxc { "on" } else { "FAIL" });
@@ -174,35 +254,6 @@ pub fn init() -> bool {
         MAC_BASE.store(0, Ordering::Relaxed);
         return false;
     }
-    // SELECT THE INTERFACE. Last, because it is the one write this stage makes to anything other
-    // than a clock or a reset, and because doing it before the controller has answered would be
-    // configuring a block that might not be there.
-    let syscon = SYSCON_BASE.load(Ordering::Relaxed);
-    if syscon == 0 {
-        super::print_str("riscv64: net - no sys-syscon in the device tree, so the interface mode
-");
-        super::print_str("riscv64: net - cannot be selected; the MAC is offered but frames may not move
-");
-    } else {
-        let v = mmio_read(syscon, SYSCON_PHY_INTF);
-        let want = (v & !(SYSCON_PHY_INTF_MASK << SYSCON_PHY_INTF_SHIFT))
-            | (PHY_INTF_SEL_RGMII << SYSCON_PHY_INTF_SHIFT);
-        mmio_write(syscon, SYSCON_PHY_INTF, want);
-        // READ IT BACK. A syscon field that is write-protected, or shifted by one, fails silently and
-        // presents later as a MAC that transmits into nothing - a full day of driver debugging for a
-        // register that never took the value.
-        let got = (mmio_read(syscon, SYSCON_PHY_INTF) >> SYSCON_PHY_INTF_SHIFT) & SYSCON_PHY_INTF_MASK;
-        super::print_str("riscv64: net - interface select = ");
-        super::print_dec(got as u64);
-        if got == PHY_INTF_SEL_RGMII {
-            super::print_str(" (RGMII, as asked)
-");
-        } else {
-            super::print_str(" but RGMII is 1 - the field did NOT take; frames will not move
-");
-        }
-    }
-
     super::print_str("riscv64: net - controller alive; the window is offered to the driver
 ");
     true
