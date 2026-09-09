@@ -1164,6 +1164,22 @@ pub fn panic_halt_check() {}
 /// the thing it is diagnosing prints nothing at all, which is how the machine came to go silent in
 /// the first place.
 pub fn halt_all_cores() -> ! {
+    // ONE WRITER. Every hart that panics arrives here, and the liveness watchdog panics on EVERY
+    // core that notices a dark one - so the last wedge printed this dump three times, concurrently,
+    // through a lock-free writer that by design does not serialise. The result was unreadable:
+    //
+    //   5kernel: hart stages at halt (stage/irqs) -/kernel: hart stages at halt...86243 h h14 h=15=/5=/5
+    //
+    // Three correct dumps interleaved character by character are worth less than one, and this is
+    // the output a wedge diagnosis depends on. The losers halt silently; the winner speaks. It has
+    // to be lock-free (a wedged hart may hold the console lock, which is one of the shapes being
+    // hunted) so the claim is a CAS rather than a lock - the one place where "first past the post,
+    // everyone else quiet" is exactly right.
+    if DUMPED.swap(true, Ordering::AcqRel) {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     serial_write_bytes_lockfree(b"kernel: hart stages at halt (stage/irqs) -");
     for hart in 0..MAX_HART_ID {
         let st = CORE_STAGE[hart].load(Ordering::Relaxed);
@@ -1704,6 +1720,10 @@ fn publish_framebuffer_on_tick() {
 /// The RISC-V ISA has nothing to offer here either - this part implements neither `Zicbom` (cache
 /// block operations) nor `Svpbmt` (a non-cacheable page attribute), so there is no portable way to
 /// do this and no way to avoid needing to.
+/// Claimed by the first hart to reach the halt dump, so the other harts stop quietly instead of
+/// interleaving three copies of it into one line.
+static DUMPED: AtomicBool = AtomicBool::new(false);
+
 /// Held while a hart is inside the flush.
 ///
 /// **The flush is not a local operation and never was.** For each cache way it writes that way's
