@@ -472,6 +472,25 @@ const YTPHY_PAGE_SELECT: u32 = 0x1e;
 const YTPHY_PAGE_DATA: u32 = 0x1f;
 /// `YT8521_RGMII_CONFIG1_REG`, in that extended space.
 const YT8521_RGMII_CONFIG1: u16 = 0xa003;
+/// `YT8521_CHIP_CONFIG_REG`, which carries the receive clock's COARSE delay.
+///
+/// **The receive delay is two fields, not one, and missing that broke reception.** The fine field in
+/// `RGMII_CONFIG1` covers 0 to 2250 ps in 150 ps steps; `YT8521_CCR_RXC_DLY_EN` here adds a flat
+/// 1900 ps on top of it. Linux's table is 32 entries for exactly this reason - sixteen fine values,
+/// then the same sixteen again with the coarse bit set - and `ytphy_get_delay_reg_value` clears the
+/// coarse bit whenever the requested delay is found in the first half.
+///
+/// Setting the fine field to the tree's 1500 ps while leaving the coarse bit alone therefore asked
+/// for 3400 ps, and the board answered by receiving nothing at all: `frames scanned` went from 15
+/// to 0 and the DMA status stopped reporting RI. The power-on state that DID work was the mirror
+/// image - fine 0 with the coarse bit on, which is a perfectly ordinary 1900 ps.
+const YT8521_CHIP_CONFIG: u16 = 0xa001;
+/// `YT8521_CCR_RXC_DLY_EN = BIT(8)`, worth 1900 ps when set.
+const CCR_RXC_DLY_EN: u16 = 1 << 8;
+/// `YT8521_CCR_RXC_DLY_1_900_NS`. Named rather than inlined because the comparison below is the
+/// whole of the coarse-bit decision, and a bare 1900 in an `if` says nothing about where it came
+/// from.
+const CCR_RXC_DLY_PS: u32 = 1900;
 /// `YT8521_RC1R_RX_DELAY_MASK = GENMASK(13, 10)`.
 const RC1R_RX_DELAY_SHIFT: u32 = 10;
 /// `YT8521_RC1R_FE_TX_DELAY_MASK = GENMASK(7, 4)` - the 10/100 transmit delay.
@@ -537,6 +556,30 @@ pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
         return false;
     }
 
+    // THE COARSE RECEIVE DELAY FIRST, because the fine field below is only half the number. The
+    // rule is the reference's: a requested delay under 1900 ps is expressible in the fine field
+    // alone, so the coarse bit is cleared; at or above it, the bit carries 1900 and the fine field
+    // carries the remainder.
+    let Some(chip_before) = ytphy_read_ext(ctx, m, phy, YT8521_CHIP_CONFIG) else {
+        ctx.log("nic-driver: dwmac could not read the PHY's chip config - delays NOT applied");
+        return false;
+    };
+    let chip_want = if DELAY_PS >= CCR_RXC_DLY_PS {
+        chip_before | CCR_RXC_DLY_EN
+    } else {
+        chip_before & !CCR_RXC_DLY_EN
+    };
+    if !ytphy_write_ext(ctx, m, phy, YT8521_CHIP_CONFIG, chip_want) {
+        ctx.log("nic-driver: dwmac could not write the PHY's chip config - delays NOT applied");
+        return false;
+    }
+    let chip_after = ytphy_read_ext(ctx, m, phy, YT8521_CHIP_CONFIG).unwrap_or(0);
+    ctx.log_fmt(format_args!(
+        "nic-driver: dwmac PHY coarse rx delay {}: chip config 0x{:04x} -> 0x{:04x} (wanted 0x{:04x})",
+        if chip_want & CCR_RXC_DLY_EN != 0 { "ON (+1900 ps)" } else { "off" },
+        chip_before, chip_after, chip_want
+    ));
+
     let Some(before) = ytphy_read_ext(ctx, m, phy, YT8521_RGMII_CONFIG1) else {
         ctx.log("nic-driver: dwmac could not read the PHY's RGMII config - delays NOT applied");
         return false;
@@ -557,8 +600,10 @@ pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
     // counts packets and delivers none.
     let after = ytphy_read_ext(ctx, m, phy, YT8521_RGMII_CONFIG1).unwrap_or(0);
     ctx.log_fmt(format_args!(
-        "nic-driver: dwmac PHY RGMII delays {} ps: config1 0x{:04x} -> 0x{:04x} (wanted 0x{:04x})",
-        DELAY_PS, before, after, want
+        "nic-driver: dwmac PHY fine delays {} ps (rx total {}): config1 0x{:04x} -> 0x{:04x} (wanted 0x{:04x})",
+        DELAY_PS,
+        DELAY_PS + if chip_want & CCR_RXC_DLY_EN != 0 { CCR_RXC_DLY_PS } else { 0 },
+        before, after, want
     ));
-    after == want
+    after == want && chip_after == chip_want
 }
