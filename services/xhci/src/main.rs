@@ -576,7 +576,12 @@ const HUB_POLL_MS: u64 = 500;
 /// How often the driver says it is still alive. See the heartbeat's comment in the poll loop: this
 /// exists because a STOPPED loop is otherwise indistinguishable from a quiet one, and every failure
 /// detector here counts failures that a stopped loop never produces.
-const HEARTBEAT_MS: u64 = 60_000;
+/// TEMPORARILY 5 s, not 60. Correcting this port's cycle-counter rate made every duration in this
+/// driver real for the first time, and the poll loop went from ~45 passes a second to roughly one
+/// per 45 SECONDS - so the minute-long heartbeat, which is checked once per pass, stopped printing
+/// altogether and took the only breakdown of where the time goes with it. A diagnostic that cannot
+/// report while the fault is happening is not a diagnostic. Back to 60_000 once the wait is found.
+const HEARTBEAT_MS: u64 = 5_000;
 /// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
 /// Only runs while NO HID is bound.
