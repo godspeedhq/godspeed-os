@@ -82,6 +82,15 @@ def main():
                          "long after its confirmation, like a chaos storm")
     ap.add_argument("--settle", type=float, default=8.0,
                     help="seconds to wait after each typed line for its output")
+    ap.add_argument("--net", action="store_true",
+                    help="attach an Intel e1000 on QEMU user-net, so nic-driver and net-stack can be "
+                         "exercised on this arch. The VisionFive's own MAC is a Synopsys DesignWare "
+                         "part that QEMU does not model at all, so this proves the PORT-NEUTRAL half "
+                         "of the stack (PCI discovery, the DMA arena, the frame IPC, ARP/DHCP/ICMP) "
+                         "and says nothing about the board's MAC registers.")
+    ap.add_argument("--pcap", default="",
+                    help="with --net, dump every frame to this file so the wire can be read when the "
+                         "guest disagrees with itself about what it sent")
     ap.add_argument("--chardelay", type=float, default=0.02,
                     help="seconds between characters - slow enough not to outrun a 16-byte FIFO")
     a = ap.parse_args()
@@ -98,6 +107,12 @@ def main():
            "-bios", "default",
            "-kernel", elf,
            "-serial", "mon:stdio"]
+    if a.net:
+        # `virt` has a real PCIe host bridge (ECAM at 0x3000_0000, in the FDT), so this is an ordinary
+        # PCI device the arch's own enumeration finds - not a special case wired in for the test.
+        cmd += ["-device", "e1000,netdev=n0", "-netdev", "user,id=n0"]
+        if a.pcap:
+            cmd += ["-object", "filter-dump,id=nicdump,netdev=n0,file=%s" % a.pcap]
     print("> " + " ".join(cmd))
     os.makedirs(os.path.join(ROOT, os.path.dirname(a.log)), exist_ok=True)
 
