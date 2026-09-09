@@ -1631,14 +1631,18 @@ pub mod page_tables {
     /// # Safety
     /// `root` must be a page-table root this task owns.
     pub unsafe fn finalize_service_address_space(root: u64) {
-        // PUBLISH THE TEXT THIS SPAWN JUST WROTE, and do it here because here is the one point that
-        // is guaranteed to be after every one of the service's regions is in place and before any
-        // hart can be given the task. The loader wrote the service's instructions with ordinary
-        // stores; on RISC-V that leaves them in the data path, invisible to any hart's instruction
-        // fetch until a `fence.i` - and `fence.i` reaches only the hart that runs it, so the loading
-        // hart cannot publish anything to the hart that will execute the code. See
-        // `sbi::remote_fence_i` for the full argument and for the failure it produces.
-        super::publish_written_code();
+        // NOTHING IS PUBLISHED HERE ANY MORE, and the absence is deliberate.
+        //
+        // This used to broadcast `sbi_remote_fence_i` so every hart would discard stale instruction
+        // bytes for the frames this spawn had just written. That is the right GUARANTEE in the wrong
+        // PLACE: a broadcast waits for every other hart to acknowledge, from inside a path that runs
+        // with interrupts off, which is the deadlock `task/scheduler.rs` already documents for TLB
+        // shootdowns. It survived three supervisor respawns and hung the machine on the fourth,
+        // three rounds into a chaos run.
+        //
+        // The guarantee now lives in `context_switch::user_entry_trampoline`: a local `fence.i` on
+        // the hart that is about to run the task, one instruction before it does. Same property, no
+        // cross-hart wait, and cheaper.
 
         // The KERNEL's root, not the live one. This runs inside a spawn, and a spawn is a syscall
         // made by a task, so the live root belongs to whoever asked - see `KERNEL_ROOT`.
@@ -2798,26 +2802,6 @@ const AP_MAX: usize = 4;
 #[repr(align(16))]
 struct ApStacks([u8; AP_STACK_BYTES * AP_MAX]);
 static mut AP_STACKS: ApStacks = ApStacks([0; AP_STACK_BYTES * AP_MAX]);
-
-/// Publish instructions written as data to every hart, and say so once if the firmware cannot.
-///
-/// The reporting is deliberately ONCE rather than per spawn. A machine whose firmware has no RFENCE
-/// extension would otherwise print this on every service start for the life of the boot, which
-/// buries the boot log the operator needs; and the fact does not change between spawns, so saying it
-/// again adds nothing. What it must not do is stay quiet: a spawn path that cannot publish its own
-/// code produces tasks that fault at arbitrary addresses on some harts and not others, and an
-/// operator reading that log deserves to be told the mechanism rather than left to find it.
-fn publish_written_code() {
-    if sbi::remote_fence_i() {
-        return;
-    }
-    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if !SAID.swap(true, Ordering::Relaxed) {
-        print_str("riscv64: the firmware has no RFENCE extension - freshly loaded code\n");
-        print_str("riscv64: cannot be published to the other harts; a service may run stale\n");
-        print_str("riscv64: instructions on any hart but the one that loaded it\n");
-    }
-}
 
 /// The KERNEL's own Sv39 root, recorded when paging is enabled.
 ///

@@ -180,6 +180,29 @@ unsafe extern "C" fn user_entry_trampoline() -> ! {
         "li   t0, {spie}",
         "csrs sstatus, t0",
         "mv   sp, s1",
+        // PUBLISH THIS TASK'S CODE TO THIS HART, one instruction before it runs any of it.
+        //
+        // A service's text arrived as DATA - the loader wrote it with ordinary stores - and on
+        // RISC-V a store is invisible to instruction fetch until `fence.i`, which is HART-LOCAL. So
+        // the fence has to happen on the hart that will execute the code, and this trampoline is the
+        // only place that is true by construction: it runs once per task, on that hart, immediately
+        // before `sret` hands over.
+        //
+        // It replaces an `sbi_remote_fence_i` broadcast issued from inside the spawn, which was
+        // correct and DEADLOCKED. A broadcast waits for every other hart to acknowledge, inside a
+        // path that runs with interrupts off - exactly the hazard `task/scheduler.rs` already
+        // documents for TLB shootdowns ("if a remote core is mid-syscall with IF=0, e.g. loading an
+        // ELF for a concurrent spawn, it cannot ACK the IPI, causing the caller to spin
+        // indefinitely"). It survived three supervisor respawns and hung the machine on the fourth,
+        // three rounds into a chaos run, with the log stopping between "respawning" and "spawned OK".
+        //
+        // Local is also strictly CHEAPER: no ecall, no IPI, no wait, and no dependency on the
+        // firmware carrying the RFENCE extension. And it is enough, because the only code that can
+        // be stale is code freshly written into recycled frames, and no hart can reach that code
+        // except through this line. A task resuming after preemption needs nothing - its bytes were
+        // published when it first entered.
+        "fence",
+        "fence.i",
         "sret",
         spp = const 1u64 << 8,
         spie = const 1u64 << 5,
