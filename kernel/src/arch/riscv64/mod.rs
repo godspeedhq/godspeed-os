@@ -1093,7 +1093,31 @@ pub fn usb_disk_flush() -> bool { false }
 /// Counter ticks a core may make NO forward progress before the liveness watchdog panics. `0` = this
 /// arch cannot say (no calibrated counter rate yet), so the check stays off - see the x86 and arm
 /// implementations for what a real answer looks like.
-pub fn liveness_deadline_cycles() -> u64 { 0 }
+/// How long a core may go dark before the machine says so, in ticks of the counter the scheduler
+/// stamps with.
+///
+/// **This returned 0, which DISABLED the cross-core watchdog on this port, and that is why a chaos
+/// freeze here is a machine that goes quiet instead of one that says what happened.** The neutral
+/// check treats 0 as "this arch cannot say" and skips - a deliberate per-arch answer, but nobody had
+/// given this arch's real one. arm32 shipped its whole port that way and the note in
+/// `task/scheduler.rs` is blunt about the cost: the Pi 2 "ran with NO liveness defence at all", a
+/// chaos run wedged it for 20-30 s and then permanently, "and the machine that is supposed to fail
+/// LOUD (invariant 12) went silent instead, which is what made it undiagnosable". Twice now on this
+/// board a chaos run has ended with a log that simply stops, which is the same symptom and the same
+/// missing instrument.
+///
+/// Ten seconds, matching both ARM ports. Derived from the MEASURED quantum rather than the device
+/// tree's timebase, because that is the counter `read_cycle_counter` returns and therefore the one
+/// the scheduler's timestamps are in - a deadline in a different clock from the stamps it is
+/// compared against is the bug this port already had once, in userspace budgets.
+///
+/// Still 0 before calibration, which is honest: with no rate there is no way to express ten seconds,
+/// and a guessed deadline would panic a healthy machine.
+pub fn liveness_deadline_cycles() -> u64 {
+    const LIVENESS_SECS: u64 = 10;
+    const QUANTA_PER_SEC: u64 = 100; // a quantum is 10 ms
+    boot::tsc_ticks_per_quantum().saturating_mul(QUANTA_PER_SEC * LIVENESS_SECS)
+}
 
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
