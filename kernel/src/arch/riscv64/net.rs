@@ -47,8 +47,31 @@ const AONCLK_GMAC0_AXI: usize = 3;
 /// "should" use would be substituting an expectation for the board in front of us (26.14).
 const AONCLK_GMAC0_TX: usize = 5;
 /// Parent ORDINAL, not a clock index: the mux field selects among a clock's own parent list, and
-/// `gmac0_tx`'s is `[GMAC0_GTXCLK, GMAC0_RMII_RTX]`. The tree asks for the second.
-const GMAC0_TX_PARENT_RMII_RTX: u32 = 1;
+/// `gmac0_tx`'s is `[GMAC0_GTXCLK, GMAC0_RMII_RTX]`.
+///
+/// **GTXCLK, and this is a deliberate divergence from the device tree, which asks for RMII_RTX.**
+///
+/// The tree carries `assigned-clock-parents = <&aoncrg 4>`, index 4 being `GMAC0_RMII_RTX`, and that
+/// is what was set. What the hardware then reported, over several boots:
+/// - the MAC accepts frames and writes back `tdes3 = no-error` - it transmitted them cleanly;
+/// - the PHY reports link up at 1000 Mbit/s full duplex and RECEIVES perfectly (frames scanned
+///   climbing, zero CRC errors);
+/// - and nothing on the network ever answers, including a real gateway ARPed directly.
+///
+/// Frames leaving a clean MAC and dying before the wire is a transmit-clock problem, and RMII_RTX
+/// descends from `gmac0_rmii_refin` - an RMII reference. RGMII at gigabit needs 125 MHz, which is
+/// what `GMAC0_GTXCLK` is for. A clock at an RMII rate explains every observation at once: with
+/// store-and-forward and a 286-byte frame in a 2 KiB FIFO it drains slowly and NEVER underflows
+/// (which is why the zero underflow count did not refute this, as I first claimed), the descriptor
+/// completes without error, and the PHY samples at its own 125 MHz and sees nothing it can use.
+/// Receive is untouched because it is clocked by the PHY's own RXIN.
+///
+/// So this is an EXPERIMENT with a binary outcome, recorded as one rather than presented as a fix:
+/// if ARP replies appear, the tree's parent is not what this board needs and the reason wants
+/// finding. If nothing changes, the clock is exonerated and the RGMII TX delay is next. Either way
+/// the log says which, and 26.14 is the licence: the device tree is a claim about the hardware, and
+/// where the hardware disagrees the hardware wins.
+const GMAC0_TX_PARENT_GTXCLK: u32 = 0;
 /// Mux select, bits 27:24 of a JH71x0 clock register - the same field the display's pixel clock uses,
 /// and written down in one place here so the two cannot drift.
 const CLK_MUX_MASK: u32 = 0x0f << 24;
@@ -164,7 +187,7 @@ pub fn init() -> bool {
     mmio_write(
         aon,
         AONCLK_GMAC0_TX * 4,
-        (txv & !CLK_MUX_MASK) | (GMAC0_TX_PARENT_RMII_RTX << CLK_MUX_SHIFT) | CLK_ENABLE,
+        (txv & !CLK_MUX_MASK) | (GMAC0_TX_PARENT_GTXCLK << CLK_MUX_SHIFT) | CLK_ENABLE,
     );
     let txr = mmio_read(aon, AONCLK_GMAC0_TX * 4);
     // Poked, not tested: an inverter has no enable bit, so the write is harmless and the CLAIM about
@@ -241,7 +264,7 @@ pub fn init() -> bool {
     super::print_str(if txr & CLK_ENABLE != 0 { "on" } else { "FAIL" });
     super::print_str(" parent ");
     super::print_dec(((txr & CLK_MUX_MASK) >> CLK_MUX_SHIFT) as u64);
-    super::print_str(" (want 1), gtxclk=");
+    super::print_str(" (want 0 = gtxclk), gtxclk=");
     super::print_str(if gtxclk { "on" } else { "FAIL" });
     super::print_str(" gtxc=");
     super::print_str(if gtxc { "on" } else { "FAIL" });

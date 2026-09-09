@@ -907,11 +907,17 @@ assert fails ls /sc
 #
 # `net lease` prints ONE word so the retry can test it with the grammar this language has, and prints
 # NOTHING while net-stack is busy - so silence retries rather than counting as a verdict.
+# QUIET WHILE IT WAITS. This loop echoed `wait 1` up to twenty times into the operator's console -
+# twenty lines saying nothing, in the middle of a suite whose value is that its output is readable.
+# The retry is right (Commandment VIII: wait on the truth, with a bound, not on a fixed interval);
+# what was wrong was doing it out loud. One `wait 5` per attempt, four attempts, same twenty-second
+# ceiling, four lines instead of twenty - and the shell prints the command either way, so the fix is
+# fewer iterations rather than a quieter `wait`.
 let mut leaseok = 0
-for i in range 20 {
+for i in range 4 {
     if $leaseok < 1 {
         for line in (net lease) { if $line in ok { leaseok = 1 } }
-        if $leaseok < 1 { wait 1 }
+        if $leaseok < 1 { wait 5 }
     }
 }
 if $leaseok > 0 {
