@@ -27,10 +27,12 @@
 //!
 //! **The address-space switch flushes, because RISC-V does not do it for you (SEC-26/27).** Writing
 //! `satp` does not implicitly invalidate anything - stale translations from the outgoing space would
-//! keep satisfying accesses that no longer exist. The switch issues `sfence.vma` after the write, so
-//! the neutral kill path's x86-shaped assumption ("a page-table reload flushes non-global entries")
-//! holds here too. `arch/CLAUDE.md` names this as an obligation a port must meet by construction; it
-//! is met here rather than deferred.
+//! keep satisfying accesses that no longer exist. The switch issues `sfence.vma` after the write, on
+//! EVERY switch into an address space and with no same-root shortcut, so the neutral kill path's
+//! x86-shaped assumption ("a page-table reload flushes non-global entries") holds here too.
+//! `arch/CLAUDE.md` names this as an obligation a port must meet by construction; it is met here
+//! rather than deferred. The shortcut that used to sit here, and why comparing root ADDRESSES is not
+//! comparing address SPACES once frames are recycled, is written out at the fence itself.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -87,6 +89,14 @@ impl TaskContext {
     /// `stack_top` must point to writable memory owned by this task, with room beneath it for the
     /// task's frames. `cr3` must be a valid Sv39 root physical address, or zero to keep the current
     /// address space (which is what a kernel task with no private space wants).
+    ///
+    /// **Zero INHERITS, and inheriting is only safe while the inherited space cannot be torn down.**
+    /// A task entered with zero runs through whatever root the previous task left in `satp`; if that
+    /// task later dies, its root frame returns to the allocator and this one is executing through a
+    /// page table something else now owns. Nothing detects it. The neutral scheduler never asks for
+    /// this - it seeds each core's scheduler context with that core's real root - and the only caller
+    /// that does is the selftest below, which runs at boot with no user task in existence and no
+    /// address space that can be freed. A future caller owes that same argument or a real root.
     pub unsafe fn new_kernel(
         entry: unsafe extern "C" fn() -> !,
         stack_top: *mut u8,
@@ -210,20 +220,36 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         "sd s10, 0x60(a0)",
         "sd s11, 0x68(a0)",
         // ---- address space ----
-        // Compared against the LIVE `satp` rather than against the outgoing context's field, because
-        // the outgoing context may never have been filled in (the very first switch of a core comes
-        // from a zeroed scheduler context). A root of zero means "no opinion" and leaves it alone,
-        // which is what a kernel task that shares the kernel's map wants.
+        // A root of zero means "no opinion" and leaves translation alone, which is what a kernel task
+        // that shares whatever map is live wants. See `new_kernel` for the constraint that puts on
+        // such a task.
         "ld t0, {off_cr3}(a1)",
         "beqz t0, 2f",
-        "csrr t1, satp",
         // Build the `satp` encoding the field does not carry: PPN in the low 44 bits, MODE 8 (Sv39)
         // in the top four. Done here so no caller has to know the register's shape.
         "srli t2, t0, 12",
         "li   t3, 8",
         "slli t3, t3, 60",   // MODE = 8 (Sv39)
         "or   t2, t2, t3",
-        "beq  t1, t2, 2f",   // already the live space: no write, no fence
+        // WRITTEN AND FENCED UNCONDITIONALLY, and the missing branch here is the point.
+        //
+        // This used to read `satp` first and skip both the write and the fence when the incoming root
+        // already matched: "already the live space, nothing to do". That is an ADDRESS-SPACE identity
+        // test dressed up as a register comparison, and the two are not the same thing. A root is a
+        // physical frame; when a task dies its frames go back to the allocator, and the very next
+        // spawn can be handed that same frame as ITS root. `satp` then holds the right number for the
+        // wrong address space, the comparison says "no change", and the hart keeps translating
+        // through a TLB filled from a page table that has since been overwritten. There is no fault
+        // to catch that: the entries are valid, they simply describe a service that no longer exists.
+        //
+        // The saving it bought was already zero. The neutral scheduler seeds each core's scheduler
+        // context with that core's live root (`task/scheduler.rs`, `run`), so a switch is always
+        // task -> scheduler -> task and the root always changes; there is no path through the loop on
+        // which the branch was taken. So it removed no work while leaving an unsound assumption in
+        // the one place - hand-written assembly under a naked function - where it is least likely to
+        // be re-examined. It is deleted rather than corrected because there is nothing to correct: a
+        // fence on a switch that did not need one is a few hundred cycles, and being wrong here is a
+        // page table read after free.
         "csrw satp, t2",
         // The fence is not optional and not a tidy-up: `satp` takes effect immediately, but stale
         // translations from the outgoing space would keep satisfying accesses that no longer exist.
