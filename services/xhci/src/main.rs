@@ -4154,8 +4154,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the probe spin lives and therefore the first place to look for the 4.7 ms.
                 seg_hub = seg_hub.wrapping_add(now.wrapping_sub(seg_mark));
             }
+            // WHAT IT ASKED FOR AGAINST WHAT IT GOT. Every deadline above computes correctly - one
+            // quantum, 250 ms, 500 ms - and the driver still sits in `BlockRecv` at 0% for tens of
+            // seconds while hot-plug crawls. Those cannot both be true, and four separate readings of
+            // this path have failed to say which is false.
+            //
+            // The heartbeat cannot answer it: it is checked once per pass, so a pass that never ends
+            // never reports. This is measured across the wait itself and printed only when the wait
+            // OVERSHOOTS what was asked by more than a factor of four - so a healthy machine says
+            // nothing, and a machine that oversleeps names the number it overslept from.
+            let wait_t0 = ctx.read_tsc();
             let woke = ctx.recv_timeout(deadline);
             work_t0 = ctx.read_tsc();
+            {
+                let waited = work_t0.wrapping_sub(wait_t0);
+                let per_10ms = ctx.tsc_ticks_per_10ms().max(1);
+                if waited > deadline.saturating_mul(4) {
+                    ctx.log_fmt(format_args!(
+                        "xhci: [wait] asked {} ms, waited {} ms (fast={} polling={} needs_poll={})",
+                        deadline.saturating_mul(10) / per_10ms,
+                        waited.saturating_mul(10) / per_10ms,
+                        wake_fast as u8,
+                        polling as u8,
+                        hid_needs_poll as u8
+                    ));
+                }
+            }
             // Delivered event = something is waking us. Timeout = it is not.
             // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
             //
