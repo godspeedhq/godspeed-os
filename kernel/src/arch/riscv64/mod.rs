@@ -1194,7 +1194,7 @@ pub fn halt_all_cores() -> ! {
         serial_write_bytes_lockfree(b"/");
         emit_dec_lockfree(n as u64);
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2327,6 +2327,16 @@ pub(super) mod stage {
     pub const TRAP_EXIT: u32 = 7;
     pub const SYSCALL: u32 = 8;
     pub const IPI_DRAIN: u32 = 9;
+    /// Inside `timer_tick`, BEFORE the SBI call that re-arms the deadline.
+    ///
+    /// The gap between `TRAP_ENTRY` and `TIMER_REARMED` is where a wedged core has now been found
+    /// twice, and it contains two things with nothing in common: two `ecall`s into M-mode firmware,
+    /// and - for a trap that is not an interrupt - the whole fault-reporting path. A core stuck at 1
+    /// could be in either, and they have no shared fix. These two stamps split them so the next
+    /// wedge names one instead of leaving a choice.
+    pub const TIMER_ENTER: u32 = 11;
+    /// About to report a fault: the printing, the page-table walk, the task-name lookup.
+    pub const FAULT_REPORT: u32 = 12;
     /// Sitting in `wfi`, in the idle path.
     ///
     /// Added after the first stage dump proved the other stages could not discriminate: 5
@@ -3250,6 +3260,7 @@ static KERNEL_ROOT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new
 /// which boots and then does nothing, with no fault to report - which is why it is worth naming here
 /// rather than discovering.
 fn timer_tick(frame: &mut trap::TrapFrame) {
+    note_stage(stage::TIMER_ENTER);
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
     sbi::set_timer(sbi::time().wrapping_add(interval));

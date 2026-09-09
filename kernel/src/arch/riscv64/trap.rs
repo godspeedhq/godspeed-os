@@ -295,6 +295,7 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
         super::serial_write_bytes_lockfree(b"\n");
         super::halt_all_cores();
     }
+    super::note_stage(super::stage::FAULT_REPORT);
     let interrupt = scause >> 63 != 0;
     super::print_str("\nriscv64: TRAP - ");
     super::print_str(cause_name(code, interrupt));

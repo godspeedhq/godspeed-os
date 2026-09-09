@@ -1145,7 +1145,24 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     //
     // The per-arch floor is right and stays; aarch64 was simply never added to it when the port arrived.
     // 500 kHz clears a 54 MHz timer comfortably while still rejecting a clock that is merely creeping.
-    let floor: u64 = if cfg!(any(target_arch = "arm", target_arch = "aarch64")) {
+    //
+    // AND NEITHER WAS RISCV64, which the paragraph above then describes for a third time. Its
+    // `read_cycle_counter` returns `time`, the constant-rate wall clock, which the device tree puts
+    // at 4 MHz on the VisionFive and 10 MHz under QEMU - both far under the 100 MHz floor, so
+    // calibration returned 0 on every boot. The operator reported it as "ping feels slow compared
+    // with the other architectures", which is the second symptom exactly: the window is `tsc_hz/3`,
+    // so at zero a reply is only caught if it happens to land inside the initial drain.
+    //
+    // Three arches have now hit one constant, which says the shape is wrong rather than the values:
+    // a floor exists to reject a clock that is CREEPING, and 100 MHz is not a statement about that -
+    // it is x86's own tick rate leaking into a portability check. 500 kHz is the honest floor for
+    // every arch whose counter is a wall clock rather than a CPU cycle count, and x86 keeps the
+    // higher one only because `deglitch_epoch` lets a CMOS misread yield a few MHz on a GHz TSC.
+    let floor: u64 = if cfg!(any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )) {
         500_000
     } else {
         100_000_000
