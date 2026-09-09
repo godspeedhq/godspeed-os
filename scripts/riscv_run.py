@@ -43,11 +43,21 @@ def type_at_shell(cmd, a):
 
     threading.Thread(target=reader, daemon=True).start()
 
-    # Wait for the prompt rather than for a duration: the shell announces itself, and a fixed sleep
-    # would be a guess that is wrong on a slower host (a count is not a duration).
+    # WAIT FOR THE PROMPT ITSELF, not for the supervisor.
+    #
+    # This waited on "supervisor: ready" and then typed, which is ten seconds into a boot whose
+    # PROMPT does not arrive for about two minutes: with no disk, `fs` waits 30 s for block-driver
+    # and another 20 s for capacity, and the shell then spends 4 x 8 s asking that filesystem for its
+    # sticky-capture file. Every keystroke typed into that gap was discarded, so `--cmd` silently did
+    # nothing and the run looked like a clean boot that simply ignored its command - which is how a
+    # chaos reproduction attempt came back reporting zero rounds.
+    #
+    # `gsh> ` is the shell saying it is READING, which is the actual precondition for typing at it.
     deadline = time.time() + a.timeout
-    while time.time() < deadline and b"supervisor: ready" not in bytes(buf):
+    while time.time() < deadline and b"gsh>" not in bytes(buf):
         time.sleep(0.2)
+    if b"gsh>" not in bytes(buf):
+        print("(no gsh> prompt within the timeout - typed commands would be discarded, so none were sent)")
     time.sleep(1.0)
 
     for line in a.cmd:

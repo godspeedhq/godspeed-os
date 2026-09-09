@@ -19,6 +19,7 @@ pub mod trap;
 pub mod usermode;
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 
 // ============================ Boot bring-up (S-mode via OpenSBI) ============================
 // The 16550 sits at 0x1000_0000 on BOTH QEMU `virt` and the StarFive JH7110, which is luck rather
@@ -1177,7 +1178,45 @@ pub fn halt_all_cores() -> ! {
         serial_write_bytes_lockfree(b"/");
         emit_dec_lockfree(n as u64);
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi\n");
+    // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
+    // it, so comparing it against `deadline` says whether the wake it was waiting for was already
+    // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
+    let now = sbi::time();
+    serial_write_bytes_lockfree(b"  idle sample (hart: armed-in/last-seen-ago/stie/stip) now=");
+    emit_dec_lockfree(now);
+    for hart in 0..MAX_HART_ID {
+        let d = IDLE_DEADLINE[hart].load(Ordering::Relaxed);
+        let t = IDLE_TIME[hart].load(Ordering::Relaxed);
+        if d == 0 && t == 0 {
+            continue;
+        }
+        serial_write_bytes_lockfree(b" h");
+        emit_dec_lockfree(hart as u64);
+        serial_write_bytes_lockfree(b"=");
+        // Signed-ish: a deadline already past when it halted is the interesting case, so say which
+        // side of `now` it fell on rather than printing a huge wrapped number.
+        if d >= now {
+            serial_write_bytes_lockfree(b"+");
+            emit_dec_lockfree(d - now);
+        } else {
+            serial_write_bytes_lockfree(b"-");
+            emit_dec_lockfree(now - d);
+        }
+        serial_write_bytes_lockfree(b"/");
+        emit_dec_lockfree(now.saturating_sub(t));
+        serial_write_bytes_lockfree(if IDLE_SIE[hart].load(Ordering::Relaxed) & (1 << 5) != 0 {
+            b"/STIE"
+        } else {
+            b"/no-stie"
+        });
+        serial_write_bytes_lockfree(if IDLE_SIP[hart].load(Ordering::Relaxed) & (1 << 5) != 0 {
+            b"/STIP"
+        } else {
+            b"/no-stip"
+        });
+    }
+    serial_write_bytes_lockfree(b"\n");
     loop {
         core::hint::spin_loop();
     }
@@ -1396,7 +1435,13 @@ pub mod boot {
     pub fn rearm_quantum_timer() {
         let interval = super::TICK_INTERVAL.load(Ordering::Relaxed) as u64;
         if interval != 0 {
-            super::sbi::set_timer(super::sbi::time().wrapping_add(interval));
+            let when = super::sbi::time().wrapping_add(interval);
+            // RECORDED, and the return value is no longer discarded. `set_timer` reports whether the
+            // firmware accepted the call, and this threw that away - so a refused arm and a
+            // successful one were the same line of code. A core that halts on a deadline the
+            // firmware never took is a core that does not wake, which is the shape being hunted.
+            let ok = super::sbi::set_timer(when);
+            super::note_deadline(if ok { when } else { 0 });
         }
     }
 
@@ -1598,6 +1643,22 @@ const FB_PUBLISH_TICKS: usize = 2;
 /// emptying a two megabyte cache that everything else on the machine was using. The rate is a
 /// deliberate trade and the flush's measured cost is printed at boot so it can be checked.
 fn publish_framebuffer_on_tick() {
+    // ONE HART PUBLISHES, NOT ALL FOUR.
+    //
+    // `timer_tick` runs on every hart, so this ran on every hart: four whole-L2 flushes every two
+    // ticks, to publish one framebuffer that only ever has one writer. Three of the four were waste
+    // even when they did no harm - and `ccache_flush_all` is not a local operation. It reprograms
+    // the way-mask of every bus master on the SoC, so four harts doing it at 50 Hz is a permanent
+    // four-way race over global hardware state.
+    //
+    // Core 0, because the framebuffer's other duties already live there and because "who publishes
+    // the display" wants one answer rather than four identical ones.
+    // SAFETY: reads `tp` for this hart's id; see `note_stage` for why that register is trustworthy
+    // here. Mapped to a CORE id rather than compared as a hart, because on this board the boot hart
+    // is 1 - comparing the hart number against 0 would silently pick a different hart than intended.
+    if hart_core(unsafe { boot::get_lapic_id() }) != Some(0) {
+        return;
+    }
     if CCACHE_BASE.load(Ordering::Relaxed) == 0 || !display::framebuffer_is_live() {
         return;
     }
@@ -1627,7 +1688,49 @@ fn publish_framebuffer_on_tick() {
 /// The RISC-V ISA has nothing to offer here either - this part implements neither `Zicbom` (cache
 /// block operations) nor `Svpbmt` (a non-cacheable page attribute), so there is no portable way to
 /// do this and no way to avoid needing to.
+/// Held while a hart is inside the flush.
+///
+/// **The flush is not a local operation and never was.** For each cache way it writes that way's
+/// mask into the way-mask register of EVERY bus master on the SoC - confining the whole chip to one
+/// sixteenth of its L2 - writes a way's worth of zeros through the zero device to force the
+/// eviction, and finally restores every master to all ways. Two harts interleaving that do not
+/// merely duplicate work: one restores ALL_WAYS while the other still believes the chip is
+/// confined, so the second hart's remaining ways are evicted with no confinement and the flush it
+/// believes it performed did not happen.
+///
+/// A correctness argument, not a performance one, and it stands whatever turns out to cause the
+/// chaos wedge: reprogramming global hardware state from four harts with no mutual exclusion is not
+/// something to leave in place while looking for a reason to remove it.
+static CCACHE_BUSY: AtomicBool = AtomicBool::new(false);
+/// Flushes skipped because another hart held it. Reported rather than silent (26.7).
+static CCACHE_SKIPPED: AtomicU32 = AtomicU32::new(0);
+
 fn ccache_flush_all() {
+    // ONE AT A TIME, and a caller that cannot get in RETURNS rather than waits.
+    //
+    // Waiting is the obvious choice and the wrong one here. Every caller is inside a trap handler
+    // with interrupts masked, so a hart spinning for the holder cannot be preempted, cannot service
+    // an IPI, and cannot be seen to be alive - which is the exact shape of the wedge this port is
+    // chasing. A skipped flush costs a stale framebuffer for one tick; a flush that waits can cost
+    // the machine.
+    //
+    // Skipping is safe for the publisher because the flush is WHOLE-CACHE: the hart already holding
+    // it is flushing everything, including whatever this caller wrote - those writes landed first,
+    // since a publish happens after the write and not before.
+    if CCACHE_BUSY.swap(true, Ordering::Acquire) {
+        CCACHE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    ccache_flush_all_locked();
+    CCACHE_BUSY.store(false, Ordering::Release);
+}
+
+/// How many flushes were skipped because another hart was already flushing.
+pub fn ccache_skipped() -> u32 {
+    CCACHE_SKIPPED.load(Ordering::Relaxed)
+}
+
+fn ccache_flush_all_locked() {
     let base = CCACHE_BASE.load(Ordering::Relaxed) as usize;
     let zero = CCACHE_ZERO_DEV.load(Ordering::Relaxed) as usize;
     let per_way = CCACHE_BYTES_PER_WAY.load(Ordering::Relaxed) as usize;
@@ -1994,6 +2097,19 @@ pub mod interrupts {
     /// `wfi` is also architecturally a HINT that may return at any time, which is sound here for the
     /// same reason it is sound anywhere: the caller is a loop that re-checks its condition.
     pub fn wait_for_interrupt() {
+        // SAMPLE BEFORE SLEEPING. On a hart that never wakes there is no "after", so anything not
+        // captured here is unavailable forever - which is exactly why the first three attempts at
+        // this wedge had nothing to read.
+        let (sie, sip, now): (u64, u64, u64);
+        // SAFETY: three CSR reads, no side effects.
+        unsafe {
+            core::arch::asm!("csrr {}, sie", out(reg) sie, options(nomem, nostack));
+            core::arch::asm!("csrr {}, sip", out(reg) sip, options(nomem, nostack));
+        }
+        now = super::sbi::time();
+        super::note_idle_sample(sie, sip, now);
+        super::note_stage(super::stage::IDLE_HALT);
+
         // SAFETY: `wfi` has no memory effects and is permitted in S-mode while `mstatus.TW` is
         // clear, which it is under OpenSBI; if firmware did trap it, the trap vector names it. The
         // `csrs` then sets `sstatus.SIE`, which is this function's actual job.
@@ -2155,6 +2271,48 @@ pub(super) mod stage {
     pub const TRAP_EXIT: u32 = 7;
     pub const SYSCALL: u32 = 8;
     pub const IPI_DRAIN: u32 = 9;
+    /// Sitting in `wfi`, in the idle path.
+    ///
+    /// Added after the first stage dump proved the other stages could not discriminate: 5
+    /// (`NEUTRAL_SCHED`) is stamped BEFORE `timer_tick_from_irq`, which switches context away and
+    /// does not come back until much later, so every hart rests at 5 whether it is healthy or dead.
+    /// A stage is only evidence if the healthy value differs from the wedged one.
+    pub const IDLE_HALT: u32 = 10;
+}
+
+/// What each hart saw at the instant it decided to halt.
+///
+/// **The four numbers that decide why a `wfi` did not wake, captured where the decision is made.**
+/// A halted core that never returns has exactly three explanations and they are told apart here:
+/// the deadline was never armed (`deadline` stale or zero), the timer was not enabled to wake it
+/// (`sie` missing STIE, bit 5), or it was armed and enabled and the hardware did not deliver
+/// (`deadline` in the past relative to a `time` that has since moved on, with STIP set in `sip`).
+///
+/// Sampled BEFORE the `wfi` rather than after, because after is a moment that never arrives on the
+/// hart in question - which is the whole problem.
+static IDLE_DEADLINE: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
+static IDLE_TIME: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
+static IDLE_SIE: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
+static IDLE_SIP: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
+
+/// Record what this hart saw immediately before halting.
+pub(super) fn note_idle_sample(sie: u64, sip: u64, now: u64) {
+    // SAFETY: reads `tp`; see `note_stage`.
+    let hart = unsafe { boot::get_lapic_id() } as usize;
+    if hart < MAX_HART_ID {
+        IDLE_SIE[hart].store(sie, Ordering::Relaxed);
+        IDLE_SIP[hart].store(sip, Ordering::Relaxed);
+        IDLE_TIME[hart].store(now, Ordering::Relaxed);
+    }
+}
+
+/// Record the deadline this hart just armed, so a halt can be checked against it.
+pub(super) fn note_deadline(when: u64) {
+    // SAFETY: reads `tp`; see `note_stage` for why that is this hart's id.
+    let hart = unsafe { boot::get_lapic_id() } as usize;
+    if hart < MAX_HART_ID {
+        IDLE_DEADLINE[hart].store(when, Ordering::Relaxed);
+    }
 }
 
 /// Stamp this hart's current phase.
