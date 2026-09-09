@@ -232,7 +232,17 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     }
 
     if !interrupt && code == CAUSE_ECALL_U {
+        // STAMPED BOTH SIDES. The number is recorded before the call and cleared after, so a hart
+        // caught between them is unambiguously inside that syscall - and one caught outside them
+        // reports no syscall rather than a stale one, which is the difference between evidence and a
+        // number that used to be true.
+        //
+        // `a7` carries the syscall number in this ABI (see the frame's register map above).
+        super::note_stage(super::stage::SYSCALL);
+        super::note_syscall(frame.x[REG_A7] as u32);
         super::syscall::dispatch(frame);
+        super::note_syscall(u32::MAX);
+        super::note_stage(super::stage::TRAP_EXIT);
         return;
     }
 

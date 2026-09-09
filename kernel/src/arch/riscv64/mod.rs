@@ -1193,8 +1193,16 @@ pub fn halt_all_cores() -> ! {
         emit_dec_lockfree(st as u64);
         serial_write_bytes_lockfree(b"/");
         emit_dec_lockfree(n as u64);
+        // The syscall this hart is INSIDE, if any. Printed next to the stage because that is the
+        // pair that identifies a stuck hart: stage 1 alone said "somewhere in the trap handler",
+        // which was true and useless.
+        let sc = CORE_SYSCALL[hart].load(Ordering::Relaxed);
+        if sc != u32::MAX {
+            serial_write_bytes_lockfree(b"/s");
+            emit_dec_lockfree(sc as u64);
+        }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2402,6 +2410,29 @@ pub(super) fn note_stage(st: u32) {
     let hart = unsafe { boot::get_lapic_id() } as usize;
     if hart < MAX_HART_ID {
         CORE_STAGE[hart].store(st, Ordering::Relaxed);
+    }
+}
+
+/// The syscall number each hart is currently executing, or `u32::MAX` when it is not in one.
+///
+/// **A stage alone was not enough, and the last wedge is why.** The dump showed core 0 pinned at
+/// stage 1 (`trap-entry`) with neither 11 (`timer-enter`) nor 12 (`fault-report`) - which rules out
+/// the SBI calls and the whole fault-reporting path, and leaves exactly one route through the trap
+/// handler that carried no stamp: `syscall::dispatch`. A hart inside a syscall therefore reported
+/// "trap-entry" and looked like a mystery.
+///
+/// Recording the NUMBER rather than just the fact costs the same store and answers a different
+/// question. "Stuck in a syscall" leaves sixty-odd candidates; "stuck in syscall 41" names the code
+/// that has to be read, and the locks it takes are then a matter of reading it rather than of
+/// another boot.
+static CORE_SYSCALL: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(u32::MAX) }; MAX_HART_ID];
+
+/// Record which syscall this hart is entering, and that it has left one.
+pub(super) fn note_syscall(nr: u32) {
+    // SAFETY: reads `tp`; see `note_stage`.
+    let hart = unsafe { boot::get_lapic_id() } as usize;
+    if hart < MAX_HART_ID {
+        CORE_SYSCALL[hart].store(nr, Ordering::Relaxed);
     }
 }
 
