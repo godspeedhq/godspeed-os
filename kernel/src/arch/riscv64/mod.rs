@@ -1650,12 +1650,26 @@ pub(super) fn ccache_init(base: u64, zero_dev: u64) {
 /// How long one whole-cache flush takes, in microseconds. MEASURED at boot, because the publish rate
 /// below is a trade against it and a trade against a guess is not a trade.
 static CCACHE_FLUSH_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-/// Ticks since the framebuffer was last published.
-static FB_PUBLISH_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
-/// One publish every this many 10 ms ticks. Fifty times a second, which is faster than a terminal
-/// needs and affordable now that the flush is pointed at the right window: 154 microseconds every
-/// 20 milliseconds is under one part in a hundred of the machine.
-const FB_PUBLISH_TICKS: usize = 2;
+/// When the framebuffer was last published, on the machine's wall clock.
+static FB_LAST_PUBLISH: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// How often to publish, in microseconds. 200 Hz.
+///
+/// **A DURATION, because a tick countdown made the picture depend on how many harts existed.** This
+/// was "one publish every two ticks" against a counter every hart incremented - so on four harts it
+/// fired about 200 times a second, and the number 2 described nothing anyone had chosen. Restricting
+/// the publish to core 0 to stop four harts racing over the cache controller therefore also cut the
+/// rate to 50 Hz, and the operator saw exactly that: tearing and dirt on a screen that had been
+/// clean, on a port where the other ports have no such problem.
+///
+/// The rate is now stated rather than emergent. 200 Hz is what the screen actually had before, and
+/// the cost is affordable and measured rather than assumed: `CCACHE_FLUSH_US` times five publishes
+/// per 10 ms tick - about 3% of one core at the 154 us this board measures. That buys a framebuffer
+/// which is never more than 5 ms stale on hardware that cannot keep it coherent for us.
+///
+/// Paced on the CLOCK and claimed with a compare-exchange, so it holds whichever hart calls it and
+/// however many do. The try-lock inside the flush is still what makes it SAFE; this only makes it
+/// REGULAR.
+const FB_PUBLISH_US: u64 = 5_000;
 
 /// Publish the framebuffer on behalf of whoever is drawing on it.
 ///
@@ -1675,31 +1689,37 @@ const FB_PUBLISH_TICKS: usize = 2;
 /// emptying a two megabyte cache that everything else on the machine was using. The rate is a
 /// deliberate trade and the flush's measured cost is printed at boot so it can be checked.
 fn publish_framebuffer_on_tick() {
-    // ONE HART PUBLISHES, NOT ALL FOUR.
+    // ANY HART MAY PUBLISH; AT MOST ONE DOES PER INTERVAL.
     //
-    // `timer_tick` runs on every hart, so this ran on every hart: four whole-L2 flushes every two
-    // ticks, to publish one framebuffer that only ever has one writer. Three of the four were waste
-    // even when they did no harm - and `ccache_flush_all` is not a local operation. It reprograms
-    // the way-mask of every bus master on the SoC, so four harts doing it at 50 Hz is a permanent
-    // four-way race over global hardware state.
+    // Restricting this to core 0 was the wrong lever. `ccache_flush_all` is not a local operation -
+    // it reprograms the way-mask of every bus master on the SoC - so four harts entering it at once
+    // is a genuine race, but the fix for a race is mutual exclusion, which the try-lock inside the
+    // flush already provides. Cutting the number of CALLERS instead also cut the publish RATE by
+    // four, and on a framebuffer this SoC cannot keep coherent that is visible as tearing.
     //
-    // Core 0, because the framebuffer's other duties already live there and because "who publishes
-    // the display" wants one answer rather than four identical ones.
-    // SAFETY: reads `tp` for this hart's id; see `note_stage` for why that register is trustworthy
-    // here. Mapped to a CORE id rather than compared as a hart, because on this board the boot hart
-    // is 1 - comparing the hart number against 0 would silently pick a different hart than intended.
-    if hart_core(unsafe { boot::get_lapic_id() }) != Some(0) {
-        return;
-    }
+    // So the pacing is a clock and the safety is a lock, which is what each is actually for.
     if CCACHE_BASE.load(Ordering::Relaxed) == 0 || !display::framebuffer_is_live() {
         return;
     }
-    let n = FB_PUBLISH_COUNTDOWN.load(Ordering::Relaxed);
-    if n + 1 < FB_PUBLISH_TICKS {
-        FB_PUBLISH_COUNTDOWN.store(n + 1, Ordering::Relaxed);
+    let hz = TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
+    if hz == 0 {
+        return; // no clock to pace against yet; the boot console still owns the screen
+    }
+    let interval = (hz / 1_000_000).max(1) * FB_PUBLISH_US;
+    let now = sbi::time();
+    let last = FB_LAST_PUBLISH.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < interval {
         return;
     }
-    FB_PUBLISH_COUNTDOWN.store(0, Ordering::Relaxed);
+    // Compare-exchange, so exactly one hart wins an interval however many arrive together. A loser
+    // returns rather than retrying: the winner is about to publish everything, including whatever
+    // the loser was here for.
+    if FB_LAST_PUBLISH
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
     ccache_flush_all();
 }
 
