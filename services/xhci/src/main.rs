@@ -581,7 +581,7 @@ const HUB_POLL_MS: u64 = 500;
 /// per 45 SECONDS - so the minute-long heartbeat, which is checked once per pass, stopped printing
 /// altogether and took the only breakdown of where the time goes with it. A diagnostic that cannot
 /// report while the fault is happening is not a diagnostic. Back to 60_000 once the wait is found.
-const HEARTBEAT_MS: u64 = 5_000;
+const HEARTBEAT_MS: u64 = 60_000;
 
 /// How often the PASS COUNTER reports, in milliseconds of wall clock.
 ///
@@ -595,8 +595,16 @@ const HEARTBEAT_MS: u64 = 5_000;
 /// So this is checked at the TOP, before anything in a pass can exit it, and paced by time rather
 /// than by iterations. The two numbers it prints answer the question the others could not: whether
 /// the driver is spinning through passes and finding nothing, or sitting inside ONE pass for tens of
-/// seconds. Those have opposite fixes and the log currently cannot tell them apart.
-const PASS_REPORT_MS: u64 = 2_000;
+/// seconds. Those have opposite fixes and no earlier log could tell them apart.
+///
+/// **It answered that, so it is now paced for a machine rather than for an investigation.** At two
+/// seconds it produced 80 lines in a 150-second boot - 22% of the whole log, each one a synchronous
+/// write to a 115200-baud port - which is an instrument heavy enough to change what it measures,
+/// and exactly the wrong thing to carry into a chaos run. It is KEPT rather than deleted because
+/// its PLACEMENT is the part that was hard to get right: it is the only counter in this loop that a
+/// pass cannot exit past, so it is what the next latency question should be asked with, and working
+/// that out again would cost the same several boots it cost this time.
+const PASS_REPORT_MS: u64 = 60_000;
 /// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
 /// Only runs while NO HID is bound.
@@ -3261,7 +3269,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Declared OUTSIDE both loops, deliberately. A counter declared inside the loop it measures is
     // reset by that loop and reads zero forever - a mistake this project has made three times, and
     // one that is invisible because a zero looks like a measurement.
-    let mut passes: u64 = 0;
     let mut reenums: u64 = 0;
     let mut passes_at_report: u64 = 0;
     let mut reenums_at_report: u64 = 0;
@@ -3982,6 +3989,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         'poll: loop {
             // THE PASS COUNTER, first statement of the pass and ahead of every exit from it.
             //
+            // ONE counter, shared with the `alive` line below, and that is the second bug found
+            // here: this was declared fresh, which SHADOWED the existing `passes` and left both its
+            // increment and mine landing on the same variable - so every finished pass counted
+            // twice and the first rates I read off this instrument were inflated by up to 2x. An
+            // instrument that measures itself wrong is worse than none, and the compiler caught it
+            // only because the shadowed original then had no readers left.
+            //
             // Counted here and REPORTED on a wall clock, so the report happens whether or not any
             // given pass reaches the bottom. See `PASS_REPORT_MS` for why that is the whole design:
             // the two instruments this replaces both live below six early exits.
@@ -4209,32 +4223,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the probe spin lives and therefore the first place to look for the 4.7 ms.
                 seg_hub = seg_hub.wrapping_add(now.wrapping_sub(seg_mark));
             }
-            // WHAT IT ASKED FOR AGAINST WHAT IT GOT. Every deadline above computes correctly - one
-            // quantum, 250 ms, 500 ms - and the driver still sits in `BlockRecv` at 0% for tens of
-            // seconds while hot-plug crawls. Those cannot both be true, and four separate readings of
-            // this path have failed to say which is false.
-            //
-            // The heartbeat cannot answer it: it is checked once per pass, so a pass that never ends
-            // never reports. This is measured across the wait itself and printed only when the wait
-            // OVERSHOOTS what was asked by more than a factor of four - so a healthy machine says
-            // nothing, and a machine that oversleeps names the number it overslept from.
-            let wait_t0 = ctx.read_tsc();
             let woke = ctx.recv_timeout(deadline);
             work_t0 = ctx.read_tsc();
-            {
-                let waited = work_t0.wrapping_sub(wait_t0);
-                let per_10ms = ctx.tsc_ticks_per_10ms().max(1);
-                if waited > deadline.saturating_mul(4) {
-                    ctx.log_fmt(format_args!(
-                        "xhci: [wait] asked {} ms, waited {} ms (fast={} polling={} needs_poll={})",
-                        deadline.saturating_mul(10) / per_10ms,
-                        waited.saturating_mul(10) / per_10ms,
-                        wake_fast as u8,
-                        polling as u8,
-                        hid_needs_poll as u8
-                    ));
-                }
-            }
             // Delivered event = something is waking us. Timeout = it is not.
             // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
             //
@@ -4419,7 +4409,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // leaves - its root port is the hub's, and the hub stays put - so it is instead detected by
             // GET_STATUSing the hub's downstream port, throttled (a control transfer, not free). Either
             // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
-            passes = passes.wrapping_add(1);
+            // The pass counter USED to be incremented here, at the bottom, and moving it to the top
+            // of the loop is not tidying - it is a correction. Six early exits sit between the top
+            // and this line, so what was counted here was "passes that finished", reported under a
+            // name that reads as "passes". The `alive` line has therefore been under-reporting for
+            // the whole investigation, on exactly the machine where passes were suspected of not
+            // finishing.
             // TIME the work half of the pass, not just count passes.
             //
             // Every measurement in this investigation has counted EVENTS - wakes, MSI, messages,
