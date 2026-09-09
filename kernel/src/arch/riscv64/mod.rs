@@ -12,6 +12,7 @@ pub mod sbi;
 pub mod sv39;
 pub mod context_switch;
 pub mod display;
+mod net;
 mod usb;
 pub mod syscall;
 pub mod trap;
@@ -721,6 +722,8 @@ riscv64: S-mode entered, 16550 UART alive
             }
         }
 
+        }
+
         if display::mode_set() {
             if display::hdmi_on() {
                 // The framebuffer is live and on a wire: hand it to the kernel's boot console so
@@ -738,6 +741,23 @@ riscv64: S-mode entered, 16550 UART alive
         // ending with the line that says what was about to be read. That is the difference between a
         // failure and a mystery, and it costs nothing but a position in the boot.
         usb::init();
+
+        // THE ETHERNET MAC, last for the same reason USB is late: a register read into an unclocked
+        // block on this interconnect stalls rather than faulting, so anything that might do it goes
+        // after the display, where a stall still leaves the whole boot log on the screen.
+        {
+            let mut w12: [Option<u32>; 0] = [];
+            let aon = tree
+                .find_compatible("starfive,jh7110-aoncrg", &[], &mut w12)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            let mut w13: [Option<u32>; 0] = [];
+            let mac = tree
+                .find_compatible("starfive,jh7110-dwmac", &[], &mut w13)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            net::set_bases(aon, sys.unwrap_or(0), mac);
+            net::init();
         }
     }
 
@@ -2213,7 +2233,33 @@ pub mod pci {
             device: 0,
         })
     }
-    pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
+    /// The machine's ethernet controller, whether or not it arrived on a bus.
+    ///
+    /// Same shape and same reasoning as `xhci()` above: the class resolution asks "is there an
+    /// ethernet controller, and where does it start", and on this board the answer is a Synopsys
+    /// DesignWare MAC soldered to the SoC rather than a card. The bus scan is tried first, because a
+    /// machine with a card should use it, and the SoC controller is offered only when the scan finds
+    /// nothing - with the no-bus sentinel for its address, because it genuinely has none.
+    pub fn nic() -> Option<PciDevice> {
+        if let Some(d) = find_by_class(0x02_00_00) {
+            return Some(d);
+        }
+        let base = super::net::window();
+        if base == 0 {
+            return None;
+        }
+        let mut bar = [0u64; 6];
+        bar[0] = base;
+        Some(PciDevice {
+            index: 0,
+            bdf: 0xFFFF,
+            class_code: 0x02_00_00,
+            bar,
+            irq_line: 0,
+            vendor: 0,
+            device: 0,
+        })
+    }
 
     /// The first MEMORY BAR, with its flag bits removed and a 64-bit BAR joined to its upper half.
     ///

@@ -383,6 +383,7 @@ PCI_CFG            = 16
 "riscv64/context_switch.rs"   = "context-switch"
 "riscv64/display.rs"          = "console"
 "riscv64/usb.rs"              = "discovery"
+"riscv64/net.rs"              = "discovery"
 "riscv64/fdt.rs"              = "discovery"
 "riscv64/sbi.rs"              = "clock"
 "riscv64/sv39.rs"             = "mmu"
