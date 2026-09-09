@@ -140,33 +140,82 @@ const RDES3_BUF1V: u32 = 1 << 24;
 const RDES3_ES: u32 = 1 << 15;
 const RDES3_LEN_MASK: u32 = 0x7fff;
 
-/// Yields to allow a hardware bit to change before calling it stuck.
+/// How long to give the DMA software reset, in microseconds. **One second, and the number is the
+/// reference's, not a guess.**
 ///
-/// Bounded by a yield rather than a spin, so it is "up to N reschedules" instead of N iterations of
-/// unknown length. Nothing here is allowed to wait forever: a MAC that never clears its reset must
-/// leave this service SERVING, with empty replies, rather than take the machine's networking down
-/// with it.
-const HW_YIELDS: u32 = 200;
+/// This was `200` yields, and that is the bug the first hardware boot found: a COUNT is not a
+/// DURATION. On an idle four-hart machine a yield returns almost immediately, so two hundred of them
+/// can be microseconds - while Linux's `dwmac4` gives this exact bit a full second
+/// (`readl_poll_timeout(..., 10000, 1000000)`). The board reported "DMA reset never cleared" against
+/// a controller whose PHY had just negotiated gigabit, which is not the shape of dead silicon; it is
+/// the shape of asking too soon.
+///
+/// The generosity is free, because it is a CEILING and not a delay: the loop exits the moment the
+/// bit clears. What it buys is that a failure here means the block really is not responding, which
+/// is a thing worth being able to conclude.
+const RESET_US: u64 = 1_000_000;
+
+/// How long to give one transmit before calling the descriptor lost. A gigabit frame is on the wire
+/// in about twelve microseconds, so twenty milliseconds is three orders of magnitude of headroom and
+/// still bounded well under the caller's own deadline.
+const TX_US: u64 = 20_000;
+
+/// Polls to allow when the machine reports no counter calibration at all.
+///
+/// The honest fallback, and it is deliberately NOT presented as a duration: with no calibration
+/// there is no way to convert one, so this is a plain iteration ceiling whose only job is to
+/// TERMINATE. Said out loud at bring-up rather than left to silently change what every bound above
+/// means.
+const UNCALIBRATED_POLLS: u32 = 200_000;
 
 pub struct Dwmac {
     pub m: Mmio,
     pub a: Dma,
     pub mac: [u8; 6],
+    /// Counter ticks in ten milliseconds, so a microsecond budget can be converted into something
+    /// the monotonic counter can be compared against. Zero means the machine could not tell us, and
+    /// every bound below falls back to an iteration ceiling that is honest about being one.
+    per_10ms: u64,
     tx_next: usize,
     rx_next: usize,
 }
 
-fn wait_clear(ctx: &ServiceContext, m: &Mmio, reg: usize, bit: u32) -> bool {
-    let mut spins = 0u32;
-    while spins < HW_YIELDS {
-        if m.read32(reg) & bit == 0 {
-            return true;
-        }
-        ctx.yield_cpu();
-        spins += 1;
+impl Dwmac {
+    /// Counter ticks in `us` microseconds, floored at one so a budget is never zero.
+    fn ticks_for_us(&self, us: u64) -> u64 {
+        (self.per_10ms.saturating_mul(us) / 10_000).max(1)
     }
-    false
+
+    /// Spin until `reg & bit` clears, or the budget expires. Returns whether it cleared, and how
+    /// many microseconds it took - the second half matters because "cleared in 900 ms" and "cleared
+    /// instantly" are the same success with very different meanings for the next person.
+    fn wait_clear(&self, ctx: &ServiceContext, reg: usize, bit: u32, us: u64) -> (bool, u64) {
+        if self.per_10ms == 0 {
+            let mut polls = 0u32;
+            while polls < UNCALIBRATED_POLLS {
+                if self.m.read32(reg) & bit == 0 {
+                    return (true, 0);
+                }
+                polls += 1;
+                core::hint::spin_loop();
+            }
+            return (false, 0);
+        }
+        let budget = self.ticks_for_us(us);
+        let start = ctx.read_tsc();
+        loop {
+            let waited = ctx.read_tsc().wrapping_sub(start);
+            if self.m.read32(reg) & bit == 0 {
+                return (true, waited.saturating_mul(10_000) / self.per_10ms);
+            }
+            if waited >= budget {
+                return (false, us);
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
+
 
 impl Dwmac {
     /// Bring the controller up around an already-negotiated link, or report why not.
@@ -190,14 +239,36 @@ impl Dwmac {
             return None;
         }
 
+        let mut d = Dwmac { m, a, mac, per_10ms: ctx.tsc_ticks_per_10ms(), tx_next: 0, rx_next: 0 };
+        if d.per_10ms == 0 {
+            // Said once, here, rather than letting every bound below quietly change meaning. The
+            // machine still works; its timeouts are counted instead of measured.
+            ctx.log("nic-driver: dwmac has no counter calibration - hardware waits fall back to an iteration ceiling, which is NOT a duration");
+        }
+        // The window we were actually granted. Printed because every offset below is an assumption
+        // about it: the DMA block lives at 0x1000 and MTL at 0xd00, so a window shorter than 0x1180
+        // would make this whole file address nothing, and that failure is invisible from the
+        // register values alone.
+        ctx.log_fmt(format_args!(
+            "nic-driver: dwmac window {} bytes, arena {} bytes",
+            d.m.len(),
+            d.a.len()
+        ));
+
         // RESET THE DMA FIRST. Everything below programs registers whose reset values this then
         // guarantees; doing it after would undo the configuration, which is a bug that presents as
         // "works on the second spawn".
-        m.write32(DMA_BUS_MODE, m.read32(DMA_BUS_MODE) | DMA_BUS_MODE_SFT_RESET);
-        if !wait_clear(ctx, &m, DMA_BUS_MODE, DMA_BUS_MODE_SFT_RESET) {
-            ctx.log("nic-driver: dwmac DMA reset never cleared - the block is not responding, serving empty replies");
+        let before = d.m.read32(DMA_BUS_MODE);
+        d.m.write32(DMA_BUS_MODE, before | DMA_BUS_MODE_SFT_RESET);
+        let (cleared, took_us) = d.wait_clear(ctx, DMA_BUS_MODE, DMA_BUS_MODE_SFT_RESET, RESET_US);
+        if !cleared {
+            ctx.log_fmt(format_args!(
+                "nic-driver: dwmac DMA reset did not clear in {} us - bus mode was 0x{:08x}, now 0x{:08x}",
+                RESET_US, before, d.m.read32(DMA_BUS_MODE)));
+            ctx.log("nic-driver: dwmac not brought up - serving empty replies (net degrades, it does not hang)");
             return None;
         }
+        ctx.log_fmt(format_args!("nic-driver: dwmac DMA reset cleared in {} us", took_us));
         // Reported rather than programmed. The AXI burst-length field lives here, and its reset
         // value permits undefined-length bursts - which is what this needs. Writing a burst policy
         // read off another SoC's device tree would be borrowing their INTEGRATION, not the silicon's
@@ -205,11 +276,10 @@ impl Dwmac {
         // reason to change it.
         ctx.log_fmt(format_args!(
             "nic-driver: dwmac sys-bus mode 0x{:08x} (left at reset; bursts undefined-length)",
-            m.read32(DMA_SYS_BUS_MODE)
+            d.m.read32(DMA_SYS_BUS_MODE)
         ));
 
-        a.zero();
-        let mut d = Dwmac { m, a, mac, tx_next: 0, rx_next: 0 };
+        d.a.zero();
         d.arm_rx_ring();
         d.program(speed, full_duplex);
         Some(d)
@@ -372,18 +442,31 @@ impl Dwmac {
         self.m.write32(DMA_CH_TX_END, (tail & 0xffff_ffff) as u32);
         self.tx_next = (i + 1) % TX_DESCS;
 
-        // Wait for the engine to hand the descriptor back, bounded. Waiting is what makes the reply
-        // to net-stack mean "sent" rather than "queued"; the bound is what stops a wedged engine
-        // from wedging this service.
-        let mut spins = 0u32;
-        while spins < HW_YIELDS {
+        // Wait for the engine to hand the descriptor back. Waiting is what makes the reply to
+        // net-stack mean "sent" rather than "queued"; the bound is what stops a wedged engine from
+        // wedging this service. A DURATION, for the reason RESET_US spells out.
+        if self.per_10ms == 0 {
+            let mut polls = 0u32;
+            while polls < UNCALIBRATED_POLLS {
+                if self.desc_read(off, 3) & TDES3_OWN == 0 {
+                    return true;
+                }
+                polls += 1;
+                core::hint::spin_loop();
+            }
+            return false;
+        }
+        let budget = self.ticks_for_us(TX_US);
+        let start = ctx.read_tsc();
+        loop {
             if self.desc_read(off, 3) & TDES3_OWN == 0 {
                 return true;
             }
-            ctx.yield_cpu();
-            spins += 1;
+            if ctx.read_tsc().wrapping_sub(start) >= budget {
+                return false;
+            }
+            core::hint::spin_loop();
         }
-        false
     }
 
     /// Take one frame off the receive ring, or return 0 if none has arrived.

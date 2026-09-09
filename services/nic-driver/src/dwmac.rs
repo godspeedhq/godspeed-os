@@ -84,27 +84,44 @@ const PHY_BMSR: u32 = 1; // basic status: bit 2 link, bit 5 auto-negotiation com
 const PHY_ID1: u32 = 2;
 const PHY_ID2: u32 = 3;
 
-/// How many yields to give the MDIO busy bit before giving up.
+/// How long to give the MDIO busy bit, in microseconds. Linux's total budget for the same wait.
 ///
-/// A COUNT is not a duration, so what bounds this is the yield: each iteration hands the core away,
-/// which makes the wait "up to N reschedules" rather than N spins of an unknown length. Linux allows
-/// 10 ms in total, polling every 100 us; a scheduler quantum here is 10 ms, so a hundred yields is
-/// far past any transfer that was ever going to complete. What matters is that it RETURNS - a driver
-/// that spins forever on a bit an absent MDIO master will never clear takes the machine's networking
-/// down with it, and the Rule Above The Rules says it must report instead.
-const MDIO_YIELDS: u32 = 100;
+/// This was a count of yields. It happened to WORK - the sweep found the PHY on the first boot - and
+/// that is exactly why it is being changed anyway: the identical count-shaped bound on the DMA reset
+/// in `dwmac_ring.rs` did not work, and a bound that is right by luck on one register and wrong on
+/// another is not a bound, it is a coin. A count of yields is not a duration; on an idle machine it
+/// can be microseconds and under load it can be seconds, and neither is what the datasheet meant.
+const MDIO_US: u64 = 10_000;
 
-/// Wait, bounded, for the MDIO master to report itself idle.
+/// Iterations to allow when the machine reports no counter calibration. A plain ceiling whose only
+/// job is to terminate, and not dressed up as a time.
+const MDIO_UNCALIBRATED_POLLS: u32 = 20_000;
+
+/// Wait, bounded in REAL TIME, for the MDIO master to report itself idle.
 fn mdio_idle(ctx: &ServiceContext, m: &Mmio) -> bool {
-    let mut spins = 0u32;
-    while spins < MDIO_YIELDS {
+    let per_10ms = ctx.tsc_ticks_per_10ms();
+    if per_10ms == 0 {
+        let mut polls = 0u32;
+        while polls < MDIO_UNCALIBRATED_POLLS {
+            if m.read32(GMAC_MDIO_ADDR) & MDIO_BUSY == 0 {
+                return true;
+            }
+            polls += 1;
+            core::hint::spin_loop();
+        }
+        return false;
+    }
+    let budget = (per_10ms.saturating_mul(MDIO_US) / 10_000).max(1);
+    let start = ctx.read_tsc();
+    loop {
         if m.read32(GMAC_MDIO_ADDR) & MDIO_BUSY == 0 {
             return true;
         }
-        ctx.yield_cpu();
-        spins += 1;
+        if ctx.read_tsc().wrapping_sub(start) >= budget {
+            return false;
+        }
+        core::hint::spin_loop();
     }
-    false
 }
 
 /// Read one clause-22 register out of one PHY, or `None` if the master never went idle.
