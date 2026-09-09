@@ -42,6 +42,22 @@ const FID_HART_START: u64 = 0;
 pub const EXT_IPI: u64 = 0x0073_5049;
 const FID_SEND_IPI: u64 = 0;
 
+/// Remote fences ("RFNC"), which is how one hart reaches ANOTHER hart's caches and TLBs.
+///
+/// **RISC-V has no broadcast maintenance instruction.** `fence.i` and `sfence.vma` act on the hart
+/// that executes them and on no other; there is no equivalent of ARM's inner-shareable `ICIALLUIS`
+/// or of x86 simply not needing one. Reaching a sibling hart is therefore a call: the firmware
+/// raises an inter-hart interrupt and each target runs the fence on itself. That is a property of
+/// the ISA rather than of this particular firmware, which is why it is absorbed here and nothing
+/// above the seam learns it.
+pub const EXT_RFENCE: u64 = 0x5246_4E43;
+const FID_REMOTE_FENCE_I: u64 = 0;
+
+/// Every hart selected by `mask`/`mask_base`, or all of them when `mask_base` is all-ones. SBI reads
+/// -1 as "ignore the mask, take every available hart", which is what a kernel that has just written
+/// code wants: it does not care which harts exist, only that none of them holds a stale opinion.
+const HART_MASK_ALL: u64 = u64::MAX;
+
 /// Result of an SBI call: a firmware error code and a value.
 pub struct SbiRet {
     pub error: i64,
@@ -140,6 +156,43 @@ pub fn send_ipi(mask: u64, mask_base: u64) -> bool {
     // SAFETY: IPI function 0 (SEND_IPI). It raises a supervisor software interrupt on the selected
     // harts and does nothing else.
     let r = unsafe { call(EXT_IPI, FID_SEND_IPI, mask, mask_base) };
+    r.error == 0
+}
+
+/// Make instructions written as DATA visible to every hart's instruction FETCH.
+///
+/// **A service's text arrives as data.** The loader copies an ELF's segments with ordinary stores,
+/// then a hart is asked to execute them - and on RISC-V a store is not visible to the instruction
+/// fetch of any hart, including the one that made it, until a `fence.i` says so. The ISA is explicit
+/// that this is the program's job: there is no hardware coherence between the data path and the
+/// instruction path, and the fence is HART-LOCAL, so the loading hart fencing itself publishes
+/// nothing to the hart that will actually run the code.
+///
+/// The failure that follows is not a crash at the write; it is a hart executing whatever those
+/// physical lines held BEFORE, which on a recycled frame is a previous service's text. The bytes
+/// decode, the boundaries land in different places, and the task faults somewhere plausible-looking
+/// inside its own address space. Observed on the VisionFive as `roster` and `upper` trapping at a
+/// fixed `sepc` on a fixed hart while the identical spawn succeeded on another - the same signature,
+/// and the same cause, as the ARM32 port's `publish_user_pages_to_other_cores`
+/// (`arch/arm/page_tables.rs`), which exists for exactly this reason.
+///
+/// Ordering matters as much as the fence: the stores must be globally visible before another hart
+/// fences, or that hart fences over data it cannot yet see. `fence rw, rw` first, then the local
+/// `fence.i`, then the call that makes every other hart do the same.
+///
+/// Returns false if the firmware has no RFENCE extension, because a port that cannot publish its
+/// code to the other harts is a port whose spawns are a coin toss and must say so rather than look
+/// like it worked.
+pub fn remote_fence_i() -> bool {
+    // SAFETY: `fence rw, rw` and `fence.i` take no operands and have no effect beyond ordering and
+    // discarding this hart's own fetched instructions.
+    unsafe { core::arch::asm!("fence rw, rw", "fence.i", options(nostack)) };
+    if !probe(EXT_RFENCE) {
+        return false;
+    }
+    // SAFETY: RFENCE function 0 (REMOTE_FENCE_I). It makes the selected harts execute `fence.i` and
+    // does nothing else; it cannot touch memory or change this hart's state.
+    let r = unsafe { call(EXT_RFENCE, FID_REMOTE_FENCE_I, 0, HART_MASK_ALL) };
     r.error == 0
 }
 

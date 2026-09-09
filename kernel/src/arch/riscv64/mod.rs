@@ -1231,17 +1231,13 @@ fn mirror_to_screen(s: &[u8]) {
 /// mirrors to the screen on its own, so a caller that does NOT want the screen has to be given a path
 /// that skips it rather than one that cannot reach it.
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
-    if to_fb {
-        serial_write_bytes_lockfree(s);
-        return;
-    }
-    let got = serial_lock_acquire();
-    for &b in s {
-        putc(b);
-    }
-    if got {
-        SERIAL_LOCK.store(false, Ordering::Release);
-    }
+    // `to_fb` is IGNORED, and putting it back that way is deliberate. Honouring it looked tidier -
+    // a caller that does not want the framebuffer gets a path that cannot reach it - but this port
+    // mirrors the serial write to the screen rather than writing the screen separately, so the flag
+    // selects nothing here. What it did select was whether the early-boot log captured the bytes,
+    // which is not what any caller is asking about.
+    let _ = to_fb;
+    serial_write_bytes_lockfree(s);
 }
 pub fn set_console_echo(on: bool) { let _ = on; }
 pub fn claim_console_foreground(task_slot: u32) {}
@@ -1626,6 +1622,15 @@ pub mod page_tables {
     /// # Safety
     /// `root` must be a page-table root this task owns.
     pub unsafe fn finalize_service_address_space(root: u64) {
+        // PUBLISH THE TEXT THIS SPAWN JUST WROTE, and do it here because here is the one point that
+        // is guaranteed to be after every one of the service's regions is in place and before any
+        // hart can be given the task. The loader wrote the service's instructions with ordinary
+        // stores; on RISC-V that leaves them in the data path, invisible to any hart's instruction
+        // fetch until a `fence.i` - and `fence.i` reaches only the hart that runs it, so the loading
+        // hart cannot publish anything to the hart that will execute the code. See
+        // `sbi::remote_fence_i` for the full argument and for the failure it produces.
+        super::publish_written_code();
+
         // The KERNEL's root, not the live one. This runs inside a spawn, and a spawn is a syscall
         // made by a task, so the live root belongs to whoever asked - see `KERNEL_ROOT`.
         let kernel_root = super::KERNEL_ROOT.load(core::sync::atomic::Ordering::Relaxed);
@@ -2784,6 +2789,26 @@ const AP_MAX: usize = 4;
 #[repr(align(16))]
 struct ApStacks([u8; AP_STACK_BYTES * AP_MAX]);
 static mut AP_STACKS: ApStacks = ApStacks([0; AP_STACK_BYTES * AP_MAX]);
+
+/// Publish instructions written as data to every hart, and say so once if the firmware cannot.
+///
+/// The reporting is deliberately ONCE rather than per spawn. A machine whose firmware has no RFENCE
+/// extension would otherwise print this on every service start for the life of the boot, which
+/// buries the boot log the operator needs; and the fact does not change between spawns, so saying it
+/// again adds nothing. What it must not do is stay quiet: a spawn path that cannot publish its own
+/// code produces tasks that fault at arbitrary addresses on some harts and not others, and an
+/// operator reading that log deserves to be told the mechanism rather than left to find it.
+fn publish_written_code() {
+    if sbi::remote_fence_i() {
+        return;
+    }
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        print_str("riscv64: the firmware has no RFENCE extension - freshly loaded code\n");
+        print_str("riscv64: cannot be published to the other harts; a service may run stale\n");
+        print_str("riscv64: instructions on any hart but the one that loaded it\n");
+    }
+}
 
 /// The KERNEL's own Sv39 root, recorded when paging is enabled.
 ///

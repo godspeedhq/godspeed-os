@@ -270,12 +270,26 @@ pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
 /// SCALE is wrong for anything counting cycles. The boot says which one is in use, because a duration
 /// that is a hundred times out is worth being able to see rather than deduce.
 pub fn read_cycle_counter() -> u64 {
-    if super::rdcycle_available() {
-        let c: u64;
-        // SAFETY: reading `cycle`, proven readable by the boot probe. No side effects.
-        unsafe { core::arch::asm!("csrr {}, cycle", out(reg) c, options(nomem, nostack)) };
-        return c;
-    }
+    // **`time`, ALWAYS - never `cycle`, and the difference is not about precision.**
+    //
+    // This used to prefer `rdcycle` where the firmware permitted it, so that cycle-denominated budgets
+    // written for a gigahertz machine would not be answered in 4 MHz timebase ticks. That reasoning
+    // was about MAGNITUDE and it missed what the two counters ARE. `cycle` counts CPU clock cycles: it
+    // stops, or changes rate, when the hart halts in `wfi` or its frequency moves - the ISA says so,
+    // and QEMU's interpreter makes it track execution rather than time. `time` is the constant-rate
+    // wall clock, and that is the property every caller of this function actually depends on.
+    //
+    // What that cost, measured on hardware: a driver computes a deadline as a delta of this counter,
+    // then sleeps. The core halts. The counter stops advancing. The deadline it is waiting for cannot
+    // arrive, so the wait ends only when something else happens to wake the core - and hot-plug went
+    // from milliseconds to tens of seconds while the driver sat at 0% CPU. In QEMU it was worse: the
+    // shell prompt never appeared at all, at any settle time, because a deadline measured in a
+    // counter that only moves while you are running cannot elapse while you are waiting.
+    //
+    // The magnitude problem the probe was written for is real and is a DIFFERENT bug: a driver that
+    // hardcodes a cycle COUNT rather than deriving one from the machine's rate is wrong on every
+    // machine, which is the "a count is not a duration" rule this project already carries. It is not
+    // fixed by making the clock lie about which counter it is.
     let t: u64;
     // SAFETY: reading `time` has no side effects, and the boot proved it readable before anything
     // relied on it.
