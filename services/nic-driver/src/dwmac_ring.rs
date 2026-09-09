@@ -167,6 +167,29 @@ const TDES2_IOC: u32 = 1 << 31;
 const TDES3_OWN: u32 = 1 << 31;
 const TDES3_FD: u32 = 1 << 29;
 const TDES3_LD: u32 = 1 << 28;
+/// TDES3, WRITE-BACK format: what the hardware puts back in the descriptor once it has finished
+/// with the frame. `dwmac4_descs.h`.
+///
+/// **This is the register that says WHY, and it was being thrown away.** The transmit path checked
+/// only the OWN bit - "has the engine given it back" - and reported success on that alone. But the
+/// MAC's own counters say 8 frames attempted and 0 good, with no underflow and no carrier error, so
+/// the failure has a name and the descriptor has been carrying it back every time.
+///
+/// Reported RAW as well as decoded, because a decode is a claim: if these bit positions are wrong
+/// for this part, the hex word is still the truth and can be read against the datasheet, whereas a
+/// confident wrong decode would send the next boot somewhere useless.
+const TDES3_ES: u32 = 1 << 15; // error summary
+const TDES3_JABBER: u32 = 1 << 14;
+const TDES3_FLUSHED: u32 = 1 << 13;
+const TDES3_PAYLOAD_ERR: u32 = 1 << 12;
+const TDES3_LOSS_CARRIER: u32 = 1 << 11;
+const TDES3_NO_CARRIER: u32 = 1 << 10;
+const TDES3_LATE_COLL: u32 = 1 << 9;
+const TDES3_EXCESS_COLL: u32 = 1 << 8;
+const TDES3_EXCESS_DEFER: u32 = 1 << 3;
+const TDES3_UNDERFLOW: u32 = 1 << 2;
+const TDES3_IP_HDR_ERR: u32 = 1 << 0;
+
 const RDES3_OWN: u32 = 1 << 31;
 const RDES3_IOC: u32 = 1 << 30;
 const RDES3_BUF1V: u32 = 1 << 24;
@@ -209,6 +232,9 @@ pub struct Dwmac {
     /// the monotonic counter can be compared against. Zero means the machine could not tell us, and
     /// every bound below falls back to an iteration ceiling that is honest about being one.
     per_10ms: u64,
+    /// The last TDES3 the hardware wrote back, kept so the serve loop can report WHY a transmit
+    /// failed rather than only that it did.
+    pub last_tx_status: u32,
     tx_next: usize,
     rx_next: usize,
 }
@@ -272,7 +298,7 @@ impl Dwmac {
             return None;
         }
 
-        let mut d = Dwmac { m, a, mac, per_10ms: ctx.tsc_ticks_per_10ms(), tx_next: 0, rx_next: 0 };
+        let mut d = Dwmac { m, a, mac, per_10ms: ctx.tsc_ticks_per_10ms(), last_tx_status: 0, tx_next: 0, rx_next: 0 };
         if d.per_10ms == 0 {
             // Said once, here, rather than letting every bound below quietly change meaning. The
             // machine still works; its timeouts are counted instead of measured.
@@ -453,6 +479,27 @@ impl Dwmac {
         )
     }
 
+    /// Name the bits set in the last transmit write-back, or "none" if it was clean.
+    pub fn tx_error_name(&self) -> &'static str {
+        let d = self.last_tx_status;
+        if d & TDES3_ES == 0 {
+            return "no-error";
+        }
+        // Most specific first: several can be set at once, and the first one that is true is the one
+        // worth chasing.
+        if d & TDES3_NO_CARRIER != 0 { return "NO-CARRIER (the PHY never asserted CRS while we sent)" }
+        if d & TDES3_LOSS_CARRIER != 0 { return "LOSS-OF-CARRIER (carrier vanished mid-frame)" }
+        if d & TDES3_LATE_COLL != 0 { return "LATE-COLLISION (half-duplex mismatch: we think full, the link thinks half)" }
+        if d & TDES3_EXCESS_COLL != 0 { return "EXCESSIVE-COLLISION (16 attempts; duplex mismatch)" }
+        if d & TDES3_UNDERFLOW != 0 { return "UNDERFLOW (the FIFO ran dry - transmit clock too slow)" }
+        if d & TDES3_EXCESS_DEFER != 0 { return "EXCESSIVE-DEFERRAL (the medium never went idle)" }
+        if d & TDES3_FLUSHED != 0 { return "FLUSHED (the frame was discarded before transmission)" }
+        if d & TDES3_JABBER != 0 { return "JABBER-TIMEOUT" }
+        if d & TDES3_PAYLOAD_ERR != 0 { return "PAYLOAD-CHECKSUM-ERROR" }
+        if d & TDES3_IP_HDR_ERR != 0 { return "IP-HEADER-ERROR" }
+        "error-summary set, but no bit this driver names"
+    }
+
     /// The DMA channel's own account of itself, for a log line that can tell a dead ring from a dead
     /// cable. `DMA_CHAN_STATUS`: TI/RI are normal completions, FBE is a bus error, RBU means the
     /// engine ran out of descriptors we gave it.
@@ -511,10 +558,15 @@ impl Dwmac {
         let budget = self.ticks_for_us(TX_US);
         let start = ctx.read_tsc();
         loop {
-            if self.desc_read(off, 3) & TDES3_OWN == 0 {
+            let d3 = self.desc_read(off, 3);
+            if d3 & TDES3_OWN == 0 {
+                // KEEP THE WRITE-BACK. Returning `true` on the OWN bit alone reports "sent" for a
+                // frame the hardware may have just told us it could not send.
+                self.last_tx_status = d3;
                 return true;
             }
             if ctx.read_tsc().wrapping_sub(start) >= budget {
+                self.last_tx_status = d3;
                 return false;
             }
             core::hint::spin_loop();

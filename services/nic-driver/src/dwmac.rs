@@ -446,11 +446,10 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
                 tx_reports += 1;
                 let (tgb, tg, tuf, tce, rgb, rcrc, dbg) = d.mac_counters();
                 ctx.log_fmt(format_args!(
-                    "nic-driver: dwmac sent {} bytes, dma 0x{:08x} | MAC tx {}/{} good, underflow {}, carrier {}, rx {} crc-err {} | debug 0x{:08x} (tpe {} tfc {})",
-                    p.len(), d.dma_status(),
-                    tg, tgb, tuf, tce, rgb, rcrc, dbg,
-                    (dbg >> 16) & 1,
-                    (dbg >> 17) & 3));
+                    "nic-driver: dwmac sent {} bytes | tdes3 0x{:08x} = {} | MAC tx {}/{} good, underflow {}, carrier {}, rx {} crc-err {} | dma 0x{:08x} debug 0x{:08x}",
+                    p.len(), d.last_tx_status, d.tx_error_name(),
+                    tg, tgb, tuf, tce, rgb, rcrc,
+                    d.dma_status(), dbg));
             }
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
         }
