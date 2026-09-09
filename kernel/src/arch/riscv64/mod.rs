@@ -1150,7 +1150,54 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// see the aarch64 implementation for the shape (a published flag, checked here).
 pub fn panic_halt_check() {}
 
-pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
+/// Stop, and SAY WHAT EVERY HART WAS DOING on the way down.
+///
+/// This was a bare spin loop that printed nothing, which is a waste of the one moment when the
+/// answer is still in the registers. The kernel reaches here from a panic - and on this port the
+/// panic that matters is the liveness watchdog, which knows a core stopped but not where. Each
+/// hart's last stage and interrupt count are exactly the two facts that turn "core 0 wedged" into a
+/// phase of the trap handler.
+///
+/// Written through the LOCK-FREE serial path on purpose. A wedged hart may be holding the console
+/// lock - that is one of the shapes being hunted - and a diagnostic that waits for a lock held by
+/// the thing it is diagnosing prints nothing at all, which is how the machine came to go silent in
+/// the first place.
+pub fn halt_all_cores() -> ! {
+    serial_write_bytes_lockfree(b"kernel: hart stages at halt (stage/irqs) -");
+    for hart in 0..MAX_HART_ID {
+        let st = CORE_STAGE[hart].load(Ordering::Relaxed);
+        let n = CORE_IRQ_COUNT[hart].load(Ordering::Relaxed);
+        if st == 0 && n == 0 {
+            continue; // a hart that never ran; saying so for all eight buries the ones that did
+        }
+        serial_write_bytes_lockfree(b" h");
+        emit_dec_lockfree(hart as u64);
+        serial_write_bytes_lockfree(b"=");
+        emit_dec_lockfree(st as u64);
+        serial_write_bytes_lockfree(b"/");
+        emit_dec_lockfree(n as u64);
+    }
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// One unsigned number, straight out of the port, taking no lock. Only for the halt path above.
+fn emit_dec_lockfree(v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut n = v;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 || i == 0 {
+            break;
+        }
+    }
+    serial_write_bytes_lockfree(&buf[i..]);
+}
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
 // ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
@@ -2080,6 +2127,46 @@ pub fn soc_nic_present() -> bool { false }
 static CORE_IRQ_COUNT: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
 static CORE_IRQ_LAST: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
 
+/// Where in the kernel each hart last was, so a wedge can say WHICH PHASE it stopped in.
+///
+/// **The watchdog names a core and a task; it cannot name a line of code.** The first two wedges
+/// this port caught reported core 1 running `block-driver` and core 0 running `supervisor`, which
+/// between them rule out a single guilty service and leave the kernel path they share. The interrupt
+/// counter then showed core 0 taking 3838 interrupts and FREEZING at 3838 - and since a RISC-V trap
+/// clears `sstatus.SIE` and only `sret` restores it, a core that stops taking interrupts is a core
+/// that entered a trap and never came out. That narrows it to the trap handler, and this narrows it
+/// further, to a phase within one.
+///
+/// A single relaxed store per stamp, on a path that already does several. It is deliberately NOT a
+/// ring buffer or a timestamped trail: the question is "where did it stop", one value answers it,
+/// and an instrument heavy enough to change the timing of the thing it is watching is how a
+/// heisenbug gets manufactured.
+static CORE_STAGE: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
+
+/// Stages, in the order a tick passes through them. A wedge reports the LAST one reached, so the
+/// culprit is between that stage and the next.
+pub(super) mod stage {
+    pub const TRAP_ENTRY: u32 = 1;
+    pub const TIMER_REARMED: u32 = 2;
+    pub const USERMODE_HOOK: u32 = 3;
+    pub const FB_PUBLISH: u32 = 4;
+    pub const NEUTRAL_SCHED: u32 = 5;
+    pub const TICK_DONE: u32 = 6;
+    pub const TRAP_EXIT: u32 = 7;
+    pub const SYSCALL: u32 = 8;
+    pub const IPI_DRAIN: u32 = 9;
+}
+
+/// Stamp this hart's current phase.
+#[inline]
+pub(super) fn note_stage(st: u32) {
+    // SAFETY: reads `tp`, which each hart sets to its own id at entry. No side effects.
+    let hart = unsafe { boot::get_lapic_id() } as usize;
+    if hart < MAX_HART_ID {
+        CORE_STAGE[hart].store(st, Ordering::Relaxed);
+    }
+}
+
 /// Record that this hart took an interrupt whose `scause` code is `vector`.
 ///
 /// Indexed by HART, not by core: the hart id is in `tp` and costs one register read, while the core
@@ -2902,10 +2989,12 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
     sbi::set_timer(sbi::time().wrapping_add(interval));
+    note_stage(stage::TIMER_REARMED);
 
     // A tick taken while user mode was running is the preemption path, and the user-mode selftest is
     // the only thing that currently notices. Offered AFTER the next deadline is set, so the machine
     // is never left without one whatever the hook decides to do with the frame.
+    note_stage(stage::USERMODE_HOOK);
     usermode::on_timer_tick(frame);
 
     // ONCE THE SCHEDULER OWNS THE CORE, A TICK IS A PREEMPTION POINT and belongs to neutral code.
@@ -2914,13 +3003,16 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
     // the task. That works because the frame is on the task's own kernel stack, which the context
     // switch saves and restores as `sp` - which is the whole reason the `sscratch` latch had to exist
     // before this line could.
+    note_stage(stage::FB_PUBLISH);
     publish_framebuffer_on_tick();
 
     if NEUTRAL_SCHED.load(Ordering::Relaxed) {
+        note_stage(stage::NEUTRAL_SCHED);
         // SAFETY: the neutral preemption entry, reached only from this handler, with interrupts
         // masked by the trap and running on the interrupted task's kernel stack - the same contract
         // the ARM port's call site documents, met the same way.
         unsafe { crate::task::scheduler::timer_tick_from_irq(0, 0, 0) };
+        note_stage(stage::TICK_DONE);
         return;
     }
 

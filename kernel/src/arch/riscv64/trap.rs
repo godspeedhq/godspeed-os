@@ -157,6 +157,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     if interrupt {
         super::note_irq(code as u32);
     }
+    super::note_stage(super::stage::TRAP_ENTRY);
 
     if interrupt && code == 1 {
         // A SUPERVISOR SOFTWARE INTERRUPT: another hart poked this one. It carries no vector - SBI's
@@ -168,7 +169,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         // hart would not be interrupted again to notice. Clearing first can only cause a spurious
         // wake, which costs a loop and is always safe.
         super::clear_software_interrupt();
+        super::note_stage(super::stage::IPI_DRAIN);
         super::drain_ipis();
+        super::note_stage(super::stage::TRAP_EXIT);
         return;
     }
 
@@ -177,6 +180,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         // it, and leaving the deadline in the past re-raises the interrupt immediately - a live
         // lock that presents as a machine which boots and then does nothing.
         super::timer_tick(frame);
+        super::note_stage(super::stage::TRAP_EXIT);
         return;
     }
 
