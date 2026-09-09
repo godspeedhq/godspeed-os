@@ -2411,8 +2411,19 @@ pub fn publish_bsp_lapic_id() {
 ");
 }
 
-/// PCI config read. See the `pci` module: no bus is enumerated until the FDT is parsed.
-pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+/// PCI config read, for the `hw-enumerator` SERVICE - the seam member, not the internal walk.
+///
+/// **This returned `None` unconditionally, which is why PCI semantics still live in ring 0 on this
+/// port.** The kernel's own `pci::cfg_read32` has worked since the ECAM window was found; what was
+/// missing was the seam the userspace enumerator reaches through, so `hw-enumerator` had nothing to
+/// answer with and was left out of the build entirely. That is a gap in the port, not a property of
+/// the machine, and it is the one thing keeping this arch behind x86 and aarch64 on step D2.
+///
+/// The selector encoding is the SERVICE's knowledge and stays there - that is the whole point of D2
+/// - so this only decodes it.
+pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
+    pci::cfg_read_gated(sel, off)
+}
 
 /// Bytes emitted by the panic-path serial writer that bypasses the lock.
 pub fn serial_unlocked_emit_count() -> u64 { 0 }
@@ -2478,6 +2489,31 @@ pub mod pci {
             return None; // past the window the tree described: not ours to touch
         }
         Some((base + offset) as usize)
+    }
+
+    /// Read one configuration register on behalf of the userspace enumerator.
+    ///
+    /// `None` means REFUSED, and there is exactly one reason to refuse: there is no ECAM window on
+    /// this machine, so nothing could answer. An ABSENT DEVICE IS NOT A REFUSAL - the bus floats
+    /// high and the read returns all-ones, which is data for the caller to interpret. Conflating the
+    /// two would have the enumerator report "the kernel would not let me look" for every empty slot.
+    ///
+    /// Simpler than either existing backend, and worth saying why rather than leaving it looking
+    /// like an omission. x86 and the Pi 4 both reach configuration space through an index/data
+    /// register PAIR, which needs a lock so two callers cannot interleave a select with a read. ECAM
+    /// is flat - the address IS the selector - so there is no window between selecting and reading
+    /// for anyone to race into, and no lock to take. The Pi 4's bus-0 special case is absent for the
+    /// same reason: there is no shared bridge register block that every slot would alias to.
+    pub(super) fn cfg_read_gated(sel: u32, off: u16) -> Option<u32> {
+        if ECAM_BASE.load(Ordering::Relaxed) == 0 {
+            return None; // no host bridge in the device tree: nothing to read, and saying so
+        }
+        // The service's encoding, decoded into the `bdf` the rest of this module passes around.
+        // Both are ECAM; they differ only in whether the fields arrive pre-shifted.
+        let bus = (sel >> 20) & 0xff;
+        let dev = (sel >> 15) & 0x1f;
+        let func = (sel >> 12) & 0x7;
+        cfg_read32((bus << 8) | (dev << 3) | func, off & 0xfff)
     }
 
     /// Read one configuration-space register.

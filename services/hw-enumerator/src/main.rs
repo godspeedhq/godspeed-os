@@ -104,7 +104,13 @@ impl Found {
 fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Option<u32> {
     #[cfg(target_arch = "x86_64")]
     let sel = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8);
-    #[cfg(target_arch = "aarch64")]
+    // aarch64 and riscv64 share this line because they share the LAYOUT: both are ECAM, whose
+    // address IS the selector - `bus[27:20] device[19:15] function[14:12]`. They reach it
+    // differently (the Pi 4 through a root-complex index/data pair, RISC-V by addressing the window
+    // directly), but that is the kernel's side of the seam and not this service's. Two arches, one
+    // encoding, and adding the third needing no new idea here is D2's claim holding rather than
+    // being asserted.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let sel = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
     ctx.pci_cfg_read(sel, offset as u16)
 }

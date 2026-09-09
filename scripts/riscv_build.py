@@ -49,6 +49,11 @@ TARGET = "riscv64imac-unknown-none-elf"
 # anyway, since a bare-metal image ships no adversary (§4.4).
 SERVICES = [
     "events", "recorder", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
+    # `hw-enumerator` joins the build now that this arch answers `pci_cfg_read32`. It was absent
+    # because the seam member returned None unconditionally, so the service had nothing to enumerate
+    # WITH - not because the board has no PCI (QEMU `virt` has a generic host bridge and this port
+    # walks it). Its absence was the last thing keeping PCI semantics in ring 0 on this arch.
+    "hw-enumerator",
     "ping", "pong", "greet", "upper", "roster", "counter", "reply-server", "asker",
     "resource-server", "holder", "block-driver", "fs", "nic-driver", "net-stack",
     # `xhci` was missing, and that is the whole of "supervisor: spawn xhci FAILED" - the supervisor

@@ -55,16 +55,6 @@ ARCH_EXEMPT = {
         "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
                 "whose host half is an xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver",
-        "hw-enumerator": "NOT for the reason the arm entry gives, and saying 'no port I/O' here "
-                         "would explain nothing - the Pi 4 has no port I/O either and still runs "
-                         "this service, through a memory-mapped index/data register pair. The real "
-                         "reason is that both existing backends are an INDEX/DATA PAIR and RISC-V "
-                         "config space is ECAM: flat, address = base + (bdf << 12) + offset, a third "
-                         "access shape nobody has written. A genuine gap in this port rather than an "
-                         "impossibility. Compounding it, this board has no PCI to enumerate today: "
-                         "its PCIe uses StarFive's own device-tree binding rather than the generic "
-                         "ECAM one, so the kernel finds no host bridge at all, and the slot is empty "
-                         "(U-Boot reports the port link down).",
     },
 }
 
