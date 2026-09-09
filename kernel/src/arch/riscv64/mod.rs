@@ -756,7 +756,16 @@ riscv64: S-mode entered, 16550 UART alive
                 .find_compatible("starfive,jh7110-dwmac", &[], &mut w13)
                 .map(|r| r.base)
                 .unwrap_or(0);
-            net::set_bases(aon, sys.unwrap_or(0), mac);
+            // The system controller again, looked up here rather than carried down from the display
+            // block that found it first: this stage runs whether or not that one did, and a base
+            // borrowed across an `if` it does not control is a base that is zero on the day the
+            // display is skipped.
+            let mut w14: [Option<u32>; 0] = [];
+            let net_syscon = tree
+                .find_compatible("starfive,jh7110-sys-syscon", &[], &mut w14)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            net::set_bases(aon, sys.unwrap_or(0), mac, net_syscon);
             net::init();
         }
     }

@@ -36,6 +36,8 @@ mod genet;
 /// for why that is a step rather than a stub.
 #[cfg(target_arch = "riscv64")]
 mod dwmac;
+#[cfg(target_arch = "riscv64")]
+mod dwmac_ring;
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
 const REG_CTRL:   usize = 0x0000; // Device Control
@@ -1075,9 +1077,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(target_arch = "arm")]
     kernel_net_main(ctx);
 
+    // The VisionFive 2's on-SoC DesignWare MAC, with the driver where it belongs: the kernel grants
+    // this service the controller's window and a DMA arena by name, and drives no ethernet itself.
+    // Same posture as GENET on the Pi 4.
+    #[cfg(target_arch = "riscv64")]
+    dwmac::dwmac_main(ctx);
+
     // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
     // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    // riscv64 is excluded here for the same reason arm and aarch64 are: its NIC is on the SoC, not
+    // on PCI, so there is no vendor/device pair to sort by and the backend above has already taken
+    // the call. Left in the `not(...)` list it compiles as unreachable code, which is a warning
+    // today and a misleading read of the dispatch forever.
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
     if ctx.nic_vendor_device() == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }
@@ -1088,29 +1100,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
 
-    // riscv64: THE GRANTED WINDOW IS NOT AN e1000, AND THE PATH BELOW MUST NOT TOUCH IT.
-    //
-    // The dispatch above sorts an RTL8168 from an e1000 by PCI vendor/device, and everything that
-    // is neither falls through to the Intel path. On the VisionFive that is wrong in the most
-    // expensive way available: the kernel grants this service the on-SoC DesignWare MAC at
-    // 0x1603_0000, so the e1000 bring-up wrote Intel register offsets into Synopsys silicon - a
-    // reset bit into `GMAC_CONFIG`, ring base addresses into whatever happens to live at the e1000's
-    // descriptor registers - and then read a MAC address back out of a register that holds
-    // something else entirely. The board reported exactly what that produces:
-    // `e1000 up  link down  MAC 00:00:00:00:00:00`, which reads like an unplugged cable and is in
-    // fact a driver talking to the wrong chip.
-    //
-    // So identify the part properly, then hand the rest of this function `None` for the window. The
-    // service still SERVES the frame interface - with empty replies - so net-stack degrades with a
-    // clear answer instead of hanging on one (26.7). Shadowing rather than branching is deliberate:
-    // it makes it impossible for any later site in this function to reach those registers by
-    // accident, which a boolean guard would not.
-    #[cfg(target_arch = "riscv64")]
-    let (mmio, arena) = {
-        dwmac::identify(&ctx, mmio.as_ref());
-        let _ = arena;
-        (None::<godspeed_sdk::Mmio>, None::<godspeed_sdk::Dma>)
-    };
     // NOTE: there is deliberately no `active` boolean here any more. It was a second copy of a fact
     // the two Options already hold (Commandment III), and every site that consulted it then re-asserted
     // that fact with `unwrap()` - a service declaring that its own failure should halt the machine
