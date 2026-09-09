@@ -98,6 +98,39 @@ const GMAC_CONFIG_PS: u32 = 1 << 15;
 /// the CRC on every frame and subtract it once, in `receive`. One rule, no per-frame guessing, and
 /// it matches what every other backend in this service hands upward.
 const RX_FCS_BYTES: usize = 4;
+/// The MAC's own account of its transmit and receive engines. `dwmac4.h`.
+///
+/// **The one register that separates "the DMA read our buffer" from "the frame left the pins".** A
+/// completed descriptor with TI set means only that the DMA engine fetched the data and handed it to
+/// the MTL; it says nothing about what the RGMII pins did with it. If the transmit clock is wrong or
+/// absent, frames pile up in the FIFO and the transmit protocol engine sits in a state this register
+/// names, while the descriptor ring drains happily and every counter above it looks healthy.
+const GMAC_DEBUG: usize = 0x0114;
+/// `GMAC_DEBUG_TPESTS = BIT(16)` - the transmit protocol engine is ACTIVE (not idle).
+const DEBUG_TPESTS: u32 = 1 << 16;
+/// `GMAC_DEBUG_TFCSTS_MASK = GENMASK(18, 17)`: 0 idle, 1 waiting, 2 generating pause, 3 transferring.
+/// A engine that is permanently 3 (transferring) with nothing arriving anywhere is an engine
+/// shifting into a clock that is not moving.
+const DEBUG_TFCSTS_SHIFT: u32 = 17;
+
+/// Management counters, `MMC_GMAC4_OFFSET 0x700` from the MAC base (`mmc.h`), with the individual
+/// offsets from `mmc_core.c`. These are the MAC's own tallies, kept in hardware, and they are the
+/// difference between believing a frame was sent and knowing it.
+const MMC_BASE: usize = 0x0700;
+/// Frames the MAC counted as transmitted, good OR bad.
+const MMC_TX_FRAMECOUNT_GB: usize = MMC_BASE + 0x18;
+/// Frames the MAC counted as transmitted GOOD. If GB climbs and G does not, the MAC itself knows the
+/// transmissions are failing, and the difference is the whole diagnosis.
+const MMC_TX_FRAMECOUNT_G: usize = MMC_BASE + 0x68;
+/// The FIFO ran dry mid-frame - the classic symptom of a transmit clock that is too slow or stopped.
+const MMC_TX_UNDERFLOW_ERROR: usize = MMC_BASE + 0x48;
+/// Carrier lost or never asserted, which is what a PHY reports when the MAC talks into a dead link.
+const MMC_TX_CARRIER_ERROR: usize = MMC_BASE + 0x60;
+/// Frames received, good or bad, and how many failed CRC. A CRC count climbing beside a good count
+/// means the receive TIMING is marginal rather than the path being broken.
+const MMC_RX_FRAMECOUNT_GB: usize = MMC_BASE + 0x80;
+const MMC_RX_CRC_ERROR: usize = MMC_BASE + 0x94;
+
 const GMAC_PACKET_FILTER: usize = 0x0008;
 const GMAC_RXQ_CTRL0: usize = 0x00a0;
 /// `GMAC_RX_DCB_QUEUE_ENABLE(0) = BIT(1)`.
@@ -399,6 +432,25 @@ impl Dwmac {
             _ => cfg |= GMAC_CONFIG_PS,
         }
         self.m.write32(GMAC_CONFIG, cfg);
+    }
+
+    /// What the MAC itself says about the frames it was given: `(tx_gb, tx_good, underflow, carrier,
+    /// rx_gb, rx_crc, debug)`.
+    ///
+    /// Read together and reported together, because each number is only meaningful beside the
+    /// others. `tx_gb` climbing with `tx_good` flat is the MAC telling us the transmissions are
+    /// failing; both climbing together means the frames left correctly and the fault is beyond this
+    /// chip; `underflow` climbing points at the transmit clock; `carrier` at the link itself.
+    pub fn mac_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32) {
+        (
+            self.m.read32(MMC_TX_FRAMECOUNT_GB),
+            self.m.read32(MMC_TX_FRAMECOUNT_G),
+            self.m.read32(MMC_TX_UNDERFLOW_ERROR),
+            self.m.read32(MMC_TX_CARRIER_ERROR),
+            self.m.read32(MMC_RX_FRAMECOUNT_GB),
+            self.m.read32(MMC_RX_CRC_ERROR),
+            self.m.read32(GMAC_DEBUG),
+        )
     }
 
     /// The DMA channel's own account of itself, for a log line that can tell a dead ring from a dead

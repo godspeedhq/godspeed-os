@@ -437,13 +437,20 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
                 ctx.log_fmt(format_args!(
                     "nic-driver: dwmac did NOT send a {} byte frame (ring full, or the engine never returned the descriptor) - dma 0x{:08x}",
                     p.len(), d.dma_status()));
-            } else if tx_reports < 3 {
-                // The first few transmits only. This is the measurement that separates "we are not
-                // sending" from "nothing is answering": if the descriptor came back and the status
-                // shows TI, the frame left the building.
+            } else if tx_reports < 8 {
+                // The first several transmits, because these counters only mean something as a
+                // SEQUENCE: one sample cannot show whether `tx good` is climbing with `tx gb` or
+                // standing still beside it, and that difference is the entire diagnosis. Eight is
+                // enough to span a DHCP attempt and still bounded, so a busy link cannot turn this
+                // into a console flood.
                 tx_reports += 1;
+                let (tgb, tg, tuf, tce, rgb, rcrc, dbg) = d.mac_counters();
                 ctx.log_fmt(format_args!(
-                    "nic-driver: dwmac sent {} bytes, dma 0x{:08x}", p.len(), d.dma_status()));
+                    "nic-driver: dwmac sent {} bytes, dma 0x{:08x} | MAC tx {}/{} good, underflow {}, carrier {}, rx {} crc-err {} | debug 0x{:08x} (tpe {} tfc {})",
+                    p.len(), d.dma_status(),
+                    tg, tgb, tuf, tce, rgb, rcrc, dbg,
+                    (dbg >> 16) & 1,
+                    (dbg >> 17) & 3));
             }
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
         }
