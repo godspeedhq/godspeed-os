@@ -609,6 +609,7 @@ riscv64: S-mode entered, 16550 UART alive
     }
 
     probe_rdcycle();
+    calibrate_cycle_counter();
 
     // The last-level cache, and the window used to flush it. Both come from the cache controller's
     // own node: its first range is the registers and its second is a memory window that reads zeros
@@ -1305,13 +1306,31 @@ pub mod boot {
 
     pub fn audit_wx() {}
 
-    /// Ticks of the machine's monotonic counter in one 10 ms quantum.
+    /// Ticks of the counter `read_cycle_counter` RETURNS, in one 10 ms quantum.
     ///
-    /// Named for x86's TSC and NOT counting cycles: `read_cycle_counter` on this arch reads `time`,
-    /// which advances at the device tree's `timebase-frequency` - 10 MHz on QEMU, 4 MHz on the
-    /// VisionFive. Both halves of every duration the neutral kernel computes come from that same
-    /// counter, so they agree; what they are not is cycles.
+    /// **Those two must describe the same clock, and for a while they did not.** This used to return
+    /// the device tree's timebase rate, with a comment explaining that `read_cycle_counter` reads
+    /// `time` so both halves of any duration come from one counter. That was true when it was
+    /// written and stopped being true the moment `rdcycle` was probed for: on this board the counter
+    /// became the CPU's, running at roughly 1.5 GHz, while the rate reported here stayed at the
+    /// 4 MHz timebase - a factor of nearly four hundred.
+    ///
+    /// Userspace computes a duration as `rate * ms / 10` and compares it against `read_tsc`, so
+    /// every such duration came out hundreds of times too SHORT. The keyboard's typematic repeat is
+    /// the one a person notices: half a second before a held key repeats became about a
+    /// millisecond, so typing `ping 8` produced a burst of eights. The same arithmetic had already
+    /// gone the other way earlier in this port, when a cycle-denominated AHCI link wait was answered
+    /// in timebase ticks and became forty seconds per port. One mismatch, two opposite symptoms, and
+    /// both invisible until something took long enough or short enough for a person to feel it.
+    ///
+    /// MEASURED rather than declared, which also makes it right whichever counter the probe settled
+    /// on: it times `read_cycle_counter` against the timebase, so if `rdcycle` was refused and the
+    /// counter fell back to `time`, the measurement simply returns the timebase's own rate.
     pub fn tsc_ticks_per_quantum() -> u64 {
+        let measured = super::CYCLES_PER_QUANTUM.load(Ordering::Relaxed);
+        if measured != 0 {
+            return measured;
+        }
         super::TICK_INTERVAL.load(Ordering::Relaxed) as u64
     }
     pub unsafe fn rearm_tsc_deadline() {}
@@ -2679,6 +2698,9 @@ static TICK_INTERVAL: AtomicUsize = AtomicUsize::new(0);
 /// expressed in SECONDS while the quantum is expressed in milliseconds, and deriving one from the
 /// other needs the rate rather than a ratio.
 static TIMEBASE_HZ: AtomicU32 = AtomicU32::new(0);
+/// Ticks of whatever `read_cycle_counter` returns in one 10 ms quantum, MEASURED at boot against the
+/// device tree's timebase. Zero until then, and the fallback is the timebase's own rate.
+static CYCLES_PER_QUANTUM: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Set once the neutral scheduler owns this core. Until then the tick is the boot's own; after it,
 /// every tick is a preemption point and belongs to `scheduler::timer_tick_from_irq`.
 static NEUTRAL_SCHED: AtomicBool = AtomicBool::new(false);
@@ -2823,6 +2845,35 @@ fn probe_rdcycle() {
         print_str(" Hz - cycle-denominated waits will be far longer than intended");
     }
     print_str("\n");
+}
+
+/// Time the counter USERSPACE will read against the one the device tree describes.
+///
+/// Ten milliseconds of boot, once, to learn a number every duration computed above the kernel
+/// depends on. Measured rather than read from anywhere because nothing reports it: the device tree
+/// gives the TIMEBASE frequency, which is a different clock from the CPU's cycle counter, and this
+/// part has no register that states the core's frequency.
+fn calibrate_cycle_counter() {
+    let hz = TIMEBASE_HZ.load(Ordering::Relaxed) as u64;
+    if hz == 0 {
+        return;
+    }
+    let window = hz / 100; // 10 ms, in timebase ticks
+    let t0 = sbi::time();
+    let c0 = uaccess::read_cycle_counter();
+    while sbi::time().wrapping_sub(t0) < window {
+        core::hint::spin_loop();
+    }
+    let cycles = uaccess::read_cycle_counter().wrapping_sub(c0);
+    if cycles == 0 {
+        return;
+    }
+    CYCLES_PER_QUANTUM.store(cycles, Ordering::Relaxed);
+    print_str("riscv64: cycle counter ");
+    print_dec(cycles / 10_000);
+    print_str(" MHz, ");
+    print_dec(cycles);
+    print_str(" ticks per 10 ms quantum\n");
 }
 
 /// The machine's monotonic counter rate, for anything that needs to bound a wait in real time.
