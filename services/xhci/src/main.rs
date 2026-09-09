@@ -582,6 +582,21 @@ const HUB_POLL_MS: u64 = 500;
 /// altogether and took the only breakdown of where the time goes with it. A diagnostic that cannot
 /// report while the fault is happening is not a diagnostic. Back to 60_000 once the wait is found.
 const HEARTBEAT_MS: u64 = 5_000;
+
+/// How often the PASS COUNTER reports, in milliseconds of wall clock.
+///
+/// **A wall clock, and not a pass count, and that distinction is the whole point of this
+/// instrument.** Every measurement in this investigation so far has been checked once per pass at
+/// the BOTTOM of the poll loop - the heartbeat, the `[wait]` overshoot line - and neither has ever
+/// printed on this board, while topology changes log normally. Six hypotheses were eliminated
+/// against instruments that cannot fire when a pass leaves early, and the poll loop has six ways to
+/// leave early: four `break 'poll` and two `continue 'reenum`, all of them ahead of the heartbeat.
+///
+/// So this is checked at the TOP, before anything in a pass can exit it, and paced by time rather
+/// than by iterations. The two numbers it prints answer the question the others could not: whether
+/// the driver is spinning through passes and finding nothing, or sitting inside ONE pass for tens of
+/// seconds. Those have opposite fixes and the log currently cannot tell them apart.
+const PASS_REPORT_MS: u64 = 2_000;
 /// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
 /// Only runs while NO HID is bound.
@@ -3243,7 +3258,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!(
         "xhci: IRQ vector granted by the kernel: {}",
         match msi_vector { Some(v) => v, None => 0 }));
+    // Declared OUTSIDE both loops, deliberately. A counter declared inside the loop it measures is
+    // reset by that loop and reads zero forever - a mistake this project has made three times, and
+    // one that is invisible because a zero looks like a measurement.
+    let mut passes: u64 = 0;
+    let mut reenums: u64 = 0;
+    let mut passes_at_report: u64 = 0;
+    let mut reenums_at_report: u64 = 0;
+    let mut last_pass_report = ctx.read_tsc();
+
     'reenum: loop {
+        reenums += 1;
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
         // every step with a log: the last line printed before a freeze is then the exact MMIO that hung.
@@ -3955,6 +3980,36 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         'poll: loop {
+            // THE PASS COUNTER, first statement of the pass and ahead of every exit from it.
+            //
+            // Counted here and REPORTED on a wall clock, so the report happens whether or not any
+            // given pass reaches the bottom. See `PASS_REPORT_MS` for why that is the whole design:
+            // the two instruments this replaces both live below six early exits.
+            passes += 1;
+            let since = ctx.read_tsc().wrapping_sub(last_pass_report);
+            if since > ctx.duration_cycles(PASS_REPORT_MS) {
+                last_pass_report = ctx.read_tsc();
+                // Rates, not raw totals, and the elapsed time is MEASURED rather than assumed to be
+                // PASS_REPORT_MS: the check fires on the first pass after the interval, which on a
+                // driver that blocks can be far later than the interval itself. Reporting the
+                // nominal period would quietly turn a 40-second gap into a 2-second one and hide the
+                // very thing this exists to find.
+                // Converted ONCE, here at the report, rather than carrying a unit around: the
+                // per-10ms figure is what the kernel measured at boot, so this is the same clock the
+                // deadlines above use and cannot disagree with them.
+                let per_10ms = ctx.tsc_ticks_per_10ms();
+                let ms = if per_10ms == 0 { 0 } else { since * 10 / per_10ms }.max(1);
+                ctx.log_fmt(format_args!(
+                    "xhci: [pass] {} passes and {} re-enums in {} ms ({} passes/s)",
+                    passes - passes_at_report,
+                    reenums - reenums_at_report,
+                    ms,
+                    (passes - passes_at_report) * 1000 / ms,
+                ));
+                passes_at_report = passes;
+                reenums_at_report = reenums;
+            }
+
             // Observe every root port FIRST, before anything in this pass can break out of the loop.
             //
             // The first placement was near the end, after four `break 'poll` sites, so a pass that
