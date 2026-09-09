@@ -2058,9 +2058,59 @@ pub fn soc_nic_present() -> bool { false }
 // someone tried. Wiring riscv64 into a build path is therefore worth more than any single body below.
 // ---------------------------------------------------------------------------
 
-/// Interrupt vector taken by this core, and the last one seen. Stubbed until the PLIC is real.
-pub fn note_irq(_vector: u32) {}
-pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
+/// Interrupts this core has taken, and the last cause it saw.
+///
+/// **This was a stub returning `(0, 0)`, and the stub told a lie at the worst possible moment.** The
+/// liveness watchdog prints these two numbers inside its panic, so the first wedge this port ever
+/// caught reported "it has taken 0 timer interrupts, last vector 0x00000000" about a core whose
+/// timer nobody had ever counted. Zero is the single most incriminating answer that message can
+/// carry - it reads as "the timer stopped" - and it was not a reading at all.
+///
+/// x86 carried the same stub and fixing it is what finally let a repro there distinguish a timer
+/// that STOPPED from a tick that was merely SKIPPED. Those have nothing in common: one is an
+/// interrupt controller or a deadline that was never re-armed, the other is a core that is taking
+/// ticks and still not reaching the scheduler. Guessing between them is how a wedge stays open for
+/// sessions.
+///
+/// Counted at the trap itself rather than in the tick handler, so a timer that fires and is then
+/// dropped somewhere later still increments - the question being asked is "did the interrupt ARRIVE",
+/// and a counter further down the path cannot answer it. Relaxed ordering throughout: this is
+/// evidence for a human, read after a core has already stopped, and a barrier per interrupt to make
+/// a debug counter exact would be paying on the hot path for a precision nobody reads.
+static CORE_IRQ_COUNT: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
+static CORE_IRQ_LAST: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
+
+/// Record that this hart took an interrupt whose `scause` code is `vector`.
+///
+/// Indexed by HART, not by core: the hart id is in `tp` and costs one register read, while the core
+/// id needs a table lookup, and this runs on every interrupt on every hart. The translation happens
+/// in `core_irq_debug`, which runs once, inside a panic.
+pub fn note_irq(vector: u32) {
+    // SAFETY: reads `tp`, which each hart sets to its own id at entry. No side effects.
+    let hart = unsafe { boot::get_lapic_id() } as usize;
+    if hart < MAX_HART_ID {
+        CORE_IRQ_COUNT[hart].fetch_add(1, Ordering::Relaxed);
+        CORE_IRQ_LAST[hart].store(vector, Ordering::Relaxed);
+    }
+}
+
+/// `(interrupts taken, last cause)` for a CORE, for the liveness watchdog's panic line.
+///
+/// Walks the hart-to-core table rather than indexing it, because the mapping is one-way: harts are
+/// told their core, and on this board the boot hart is 1, so hart and core numbers do not coincide
+/// and assuming they do would report another core's counters under this one's name - a wrong number
+/// being far worse here than no number, since this is read while deciding why a machine stopped.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    for hart in 0..MAX_HART_ID {
+        if hart_core(hart as u32) == Some(core) {
+            return (
+                CORE_IRQ_COUNT[hart].load(Ordering::Relaxed),
+                CORE_IRQ_LAST[hart].load(Ordering::Relaxed),
+            );
+        }
+    }
+    (0, 0)
+}
 
 /// Publish the boot hart's identity before any secondary starts.
 ///
