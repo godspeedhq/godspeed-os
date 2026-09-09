@@ -67,11 +67,32 @@ pub const REG_S2: usize = 18;
 pub const REG_S3: usize = 19;
 pub const REG_S4: usize = 20;
 
-/// Set once a fault has been reported, so a fault INSIDE the reporter cannot recurse forever.
+/// Set once a fault is being reported, so a fault INSIDE the reporter cannot recurse forever.
 ///
-/// A trap handler that faults re-enters itself, and on a machine whose console is the thing that
-/// faulted this shows up as either a hang or an endless partial line. One flag turns that into a
-/// single truncated report, which is still readable.
+/// **The flag was right and both its placement and its handling were wrong, and the combination is
+/// what makes this machine go SILENT rather than loud.** It was checked only on the kernel-fault
+/// path, after the user-fault path had already called `report_fault` without setting it - so a
+/// kernel fault raised while reporting a USER fault arrived at the check with the flag still clear,
+/// reported all over again, and only stopped on the round after that. And when it did stop it
+/// called `halt()`, which prints NOTHING: one hart parks in a `wfi` loop with interrupts masked, the
+/// operator sees the log simply stop, and the liveness watchdog panics ten seconds later about a
+/// core that went dark for reasons nothing recorded.
+///
+/// That is the exact signature a chaos run produced - core 0 pinned at stage `TRAP_ENTRY` with its
+/// interrupt count frozen - and the boot before it showed the other half directly, a kernel-mode
+/// load page fault inside `core::fmt::write`, which IS the reporting path faulting.
+///
+/// It is now claimed at the top of `report_fault` itself, so it covers both callers, and the
+/// recursion path SAYS SO before stopping (invariant 12: failures are loud, never silent).
+///
+/// **And it is RELEASED when a report finishes, which the first version of this fix forgot.** The
+/// original was a one-shot latch and could afford to be, because it was only ever read on the
+/// kernel-fault path where halting is the right answer regardless. Covering user faults with a latch
+/// meant the first user fault set it and the SECOND one - an ordinary, unrelated, entirely
+/// survivable fault in another service - was mistaken for recursion and killed the machine. QEMU
+/// caught it in one run: `events` faulted at 0x401fde, something else faulted at 0x401c4e, and the
+/// terse line named a USER address, which is what gave it away. The flag means "a report is in
+/// progress", not "a report has happened".
 static REPORTING: AtomicBool = AtomicBool::new(false);
 
 /// Cause codes worth naming. The rest are printed as numbers, because a wrong name is worse than
@@ -234,11 +255,6 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
 
     // A KERNEL fault, or an interrupt nothing claimed. There is no task to kill: the thing that
     // faulted IS the thing that would do the killing, so the only honest move is to stop loudly.
-    if REPORTING.swap(true, Ordering::Relaxed) {
-        // A fault inside the reporter. Stop rather than recurse: on a machine whose console is what
-        // faulted, recursion shows up as a hang or an endless partial line.
-        super::halt();
-    }
     report_fault(frame, scause, code, stval, false);
     super::print_str("riscv64: halted - the KERNEL faulted, so there is nothing left to kill instead\n");
     super::halt();
@@ -249,6 +265,36 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
 /// Shared by both outcomes so a killed task and a halted kernel are reported in the same words - a
 /// diagnosis should not depend on which of the two happened to occur.
 fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user: bool) {
+    // RE-ENTRANCY GUARD: a fault taken WHILE reporting a fault must not try to report again.
+    //
+    // **This is what makes the machine go silent instead of loud, and silence is the failure this
+    // project ranks worst (invariant 12).** Reporting a fault runs real code - it reads task state,
+    // walks a page table, formats and writes to a UART - and every line of that can itself fault on
+    // the corrupt state that caused the first one. When it does, the trap handler re-enters, reports
+    // again, faults again, forever: no output, no panic, one hart dark, and nothing to read.
+    //
+    // That is not hypothetical here. A chaos run left core 0 pinned at stage `TRAP_ENTRY` with its
+    // interrupt count frozen - the exact signature, since `note_irq` only counts INTERRUPTS, so an
+    // exception loop re-stamps the stage while the count stands still. An earlier boot showed the
+    // other half directly: a kernel-mode load page fault inside `core::fmt::write`, which is the
+    // reporting path faulting.
+    //
+    // So the second report says the least it possibly can, through the lock-free writer, and halts.
+    // Least, because everything it might add is a thing that could fault: no task name, no page
+    // walk, no formatting. The `sepc` and `scause` of the SECOND fault are what a reader needs, and
+    // they are already in hand.
+    if REPORTING.swap(true, Ordering::Acquire) {
+        super::serial_write_bytes_lockfree(
+            b"\nriscv64: FAULT WHILE REPORTING A FAULT - halting\n  scause ",
+        );
+        super::serial_write_hex_lockfree(scause);
+        super::serial_write_bytes_lockfree(b"  sepc ");
+        super::serial_write_hex_lockfree(frame.sepc);
+        super::serial_write_bytes_lockfree(b"  stval ");
+        super::serial_write_hex_lockfree(stval);
+        super::serial_write_bytes_lockfree(b"\n");
+        super::halt_all_cores();
+    }
     let interrupt = scause >> 63 != 0;
     super::print_str("\nriscv64: TRAP - ");
     super::print_str(cause_name(code, interrupt));
@@ -260,7 +306,16 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
         // it happens to be living.
         let slot = crate::task::scheduler::current_task_slot();
         super::print_str(" in USER task '");
-        let name = crate::task::scheduler::task_stat(slot).name;
+        // `task_name`, NOT `task_stat`. The latter is a full introspection snapshot: it walks the
+        // routing table for a queue depth, recomputes a restart count and reads the monotonic clock,
+        // and this path wanted exactly one string out of it. Doing that much work on possibly-corrupt
+        // state, from a fault handler, is asking to fault again - and the guard above exists because
+        // it did. `task_name` is a single bounds-checked read from a static table.
+        //
+        // The same call is in `arch/arm/exceptions.rs` and `arch/aarch64/exceptions.rs`; they are a
+        // latent instance of this and are left alone here rather than changed untested on hardware
+        // this session cannot reach (26.7).
+        let name = crate::task::scheduler::task_name(slot);
         super::print_str(name);
         super::print_str("' (slot ");
         super::print_dec(slot as u64);
@@ -300,6 +355,13 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
     if from_user {
         super::print_str("riscv64: killing it; the kernel continues\n");
     }
+
+    // RELEASED, so the NEXT fault is judged on its own merits. Only a report that RETURNS clears it;
+    // one that faults part-way through leaves it set, which is exactly the recursion the flag exists
+    // to catch. Outside the `from_user` arm deliberately: a kernel fault halts anyway, but leaving a
+    // path that never releases would be relying on the halt, and a flag whose correctness depends on
+    // its caller dying is one refactor away from being wrong.
+    REPORTING.store(false, Ordering::Release);
 }
 
 /// Bytes of stack a trap frame occupies. Deliberately larger than the struct so `sp` stays 16-byte

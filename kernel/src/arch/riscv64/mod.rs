@@ -1222,6 +1222,22 @@ pub fn halt_all_cores() -> ! {
     }
 }
 
+/// One 64-bit value in hex, straight out of the port, taking no lock.
+///
+/// For the paths that must print when the ordinary console cannot be trusted: a fault raised while
+/// reporting a fault, and the halt dump. Fixed width, because a reader comparing two `sepc` values
+/// should not have to count digits, and because a fixed loop cannot get its own bounds wrong.
+pub fn serial_write_hex_lockfree(v: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let nib = ((v >> (60 - i * 4)) & 0xf) as u8;
+        buf[2 + i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+    }
+    serial_write_bytes_lockfree(&buf);
+}
+
 /// One unsigned number, straight out of the port, taking no lock. Only for the halt path above.
 fn emit_dec_lockfree(v: u64) {
     let mut buf = [0u8; 20];
