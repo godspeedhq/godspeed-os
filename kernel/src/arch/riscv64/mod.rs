@@ -2158,6 +2158,20 @@ pub(super) mod stage {
 }
 
 /// Stamp this hart's current phase.
+///
+/// **Reads `tp` from inside a trap, including a trap FROM USER MODE, and that is sound only because
+/// of an invariant worth writing down before someone breaks it.** The trap entry does not restore a
+/// kernel `tp`, so this reads whatever the interrupted context had. It is still the hart id, because
+/// NOTHING ever writes `tp` after each hart sets it at entry: rustc reserves the register in both
+/// the kernel and the service builds, `switch_context` saves only `ra`, `sp` and `s0`-`s11`, and
+/// neither trampoline touches it.
+///
+/// That invariant is load-bearing far beyond this counter - `boot::get_lapic_id` is how the neutral
+/// scheduler learns which core it is on, from exactly the same register, on exactly this path. If a
+/// future service ever gets thread-local storage, or an `asm!` block clobbers `tp`, the symptom will
+/// not be a wrong diagnostic; it will be the scheduler operating on another core's run queue. Checked
+/// deliberately while auditing these counters, because a counter indexed by a user-controlled value
+/// would have made every number this port has reported about harts worthless.
 #[inline]
 pub(super) fn note_stage(st: u32) {
     // SAFETY: reads `tp`, which each hart sets to its own id at entry. No side effects.
