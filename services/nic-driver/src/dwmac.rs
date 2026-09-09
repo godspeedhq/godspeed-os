@@ -61,6 +61,8 @@ const MDIO_RDA_SHIFT: u32 = 16;
 const MDIO_CR_SHIFT: u32 = 8;
 /// `MII_GMAC4_READ = 3 << MII_GMAC4_GOC_SHIFT`, with `MII_GMAC4_GOC_SHIFT = 2`.
 const MDIO_OP_READ: u32 = 3 << 2;
+/// `MII_GMAC4_WRITE = 1 << MII_GMAC4_GOC_SHIFT`.
+const MDIO_OP_WRITE: u32 = 1 << 2;
 /// `MII_ADDR_GBUSY = BIT(0)`. Software sets it to start; the controller clears it when done.
 const MDIO_BUSY: u32 = 1 << 0;
 /// `MII_DATA_GD_MASK = GENMASK(15, 0)`.
@@ -315,6 +317,12 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
     identify(&ctx, Some(&m));
 
     let phy = 0; // `ethernet-phy@0` in the device tree, and the sweep confirms it answers
+
+    // The PHY's RGMII timing, BEFORE the link is read and the MAC is programmed. It changes how the
+    // PHY samples and drives the bus, so it belongs with bring-up rather than being applied to a
+    // link already in use.
+    configure_phy_delays(&ctx, &m, phy);
+
     let (up, speed, fd) = link(&ctx, &m, phy);
     ctx.log_fmt(format_args!(
         "nic-driver: dwmac link {} at {} Mbit/s {} duplex",
@@ -441,4 +449,116 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
         }
         ctx.remove_cap(reply_cap);
     }
+}
+
+// ---- The PHY's RGMII timing. `motorcomm.c`. ----------------------------------------------------
+//
+// **The board asks for this explicitly and nothing was doing it.** The device tree's PHY node
+// carries `rx-internal-delay-ps = <1500>` and `tx-internal-delay-ps = <1500>` alongside
+// `phy-mode = "rgmii-id"`, and those numbers are not decoration: at gigabit the RGMII clock and data
+// are edge-aligned as they leave the transmitter, so SOMETHING has to shift one relative to the
+// other before the receiver samples it. `rgmii-id` says the PHY does it, at both ends, and a PHY
+// that has not been told simply samples at the wrong instant. The frames still leave the MAC and
+// still count as transmitted - the failure is entirely on the wire, which is why it presents as a
+// network that can be heard but never answers.
+//
+// Vendor registers, so they are gated on the vendor ID actually read back. A wrong guess about which
+// PHY this is would otherwise write 0xA003 on a part where that address means something else.
+
+/// The part this board carries, confirmed against `motorcomm.c`: `PHY_ID_YT8531 0x4f51e91b`.
+const PHY_ID_YT8531: u32 = 0x4f51_e91b;
+/// The extended-register window: write the address to 0x1E, then read or write 0x1F.
+const YTPHY_PAGE_SELECT: u32 = 0x1e;
+const YTPHY_PAGE_DATA: u32 = 0x1f;
+/// `YT8521_RGMII_CONFIG1_REG`, in that extended space.
+const YT8521_RGMII_CONFIG1: u16 = 0xa003;
+/// `YT8521_RC1R_RX_DELAY_MASK = GENMASK(13, 10)`.
+const RC1R_RX_DELAY_SHIFT: u32 = 10;
+/// `YT8521_RC1R_FE_TX_DELAY_MASK = GENMASK(7, 4)` - the 10/100 transmit delay.
+const RC1R_FE_TX_DELAY_SHIFT: u32 = 4;
+/// `YT8521_RC1R_GE_TX_DELAY_MASK = GENMASK(3, 0)` - the gigabit transmit delay.
+const RC1R_GE_TX_DELAY_SHIFT: u32 = 0;
+const RC1R_DELAY_FIELD: u16 = 0xf;
+
+/// 1500 ps, as the device tree asks, in this register's units.
+///
+/// The encoding is a 16-step table in 150 ps increments starting at zero, so the value is simply the
+/// picoseconds divided by the step. Written as the arithmetic rather than as a magic `10` so the
+/// device tree's number stays visible in the code that consumes it - if the board is ever respun
+/// with a different delay, the line to change is obvious and the units are stated.
+const DELAY_STEP_PS: u32 = 150;
+const DELAY_PS: u32 = 1500;
+const DELAY_CODE: u16 = ((DELAY_PS / DELAY_STEP_PS) & 0xf) as u16;
+
+/// Write one clause-22 register. Same sequence as a read with the write opcode, and the data
+/// register loaded before the address register starts the transfer.
+fn mdio_write(ctx: &ServiceContext, m: &Mmio, phy: u32, reg: u32, val: u16) -> bool {
+    if !mdio_idle(ctx, m) {
+        return false;
+    }
+    m.write32(GMAC_MDIO_DATA, val as u32);
+    let addr = ((phy & 0x1f) << MDIO_PA_SHIFT)
+        | ((reg & 0x1f) << MDIO_RDA_SHIFT)
+        | (MDIO_CR_DIV204 << MDIO_CR_SHIFT)
+        | MDIO_OP_WRITE
+        | MDIO_BUSY;
+    m.write32(GMAC_MDIO_ADDR, addr);
+    mdio_idle(ctx, m)
+}
+
+fn ytphy_read_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16) -> Option<u16> {
+    if !mdio_write(ctx, m, phy, YTPHY_PAGE_SELECT, ext) {
+        return None;
+    }
+    mdio_read(ctx, m, phy, YTPHY_PAGE_DATA)
+}
+
+fn ytphy_write_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16, val: u16) -> bool {
+    mdio_write(ctx, m, phy, YTPHY_PAGE_SELECT, ext) && mdio_write(ctx, m, phy, YTPHY_PAGE_DATA, val)
+}
+
+/// Apply the RGMII internal delays the board's device tree specifies, and say what took.
+///
+/// Returns false only when the PHY is not the part this knows how to configure, or MDIO failed -
+/// both of which leave the link exactly as it was rather than half-programmed.
+pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
+    let (Some(id1), Some(id2)) = (mdio_read(ctx, m, phy, PHY_ID1), mdio_read(ctx, m, phy, PHY_ID2))
+    else {
+        ctx.log("nic-driver: dwmac could not read the PHY id - RGMII delays NOT applied");
+        return false;
+    };
+    let id = ((id1 as u32) << 16) | id2 as u32;
+    if id != PHY_ID_YT8531 {
+        // Loud, not silent. An unconfigured RGMII link is the failure that looks like a dead network
+        // rather than a misconfigured one, so a reader needs to know it was skipped and why.
+        ctx.log_fmt(format_args!(
+            "nic-driver: PHY id 0x{:08x} is not the YT8531 this knows - RGMII delays NOT applied, and a link that carries nothing is the expected result",
+            id));
+        return false;
+    }
+
+    let Some(before) = ytphy_read_ext(ctx, m, phy, YT8521_RGMII_CONFIG1) else {
+        ctx.log("nic-driver: dwmac could not read the PHY's RGMII config - delays NOT applied");
+        return false;
+    };
+    let want = (before
+        & !((RC1R_DELAY_FIELD << RC1R_RX_DELAY_SHIFT)
+            | (RC1R_DELAY_FIELD << RC1R_FE_TX_DELAY_SHIFT)
+            | (RC1R_DELAY_FIELD << RC1R_GE_TX_DELAY_SHIFT)))
+        | (DELAY_CODE << RC1R_RX_DELAY_SHIFT)
+        | (DELAY_CODE << RC1R_FE_TX_DELAY_SHIFT)
+        | (DELAY_CODE << RC1R_GE_TX_DELAY_SHIFT);
+    if !ytphy_write_ext(ctx, m, phy, YT8521_RGMII_CONFIG1, want) {
+        ctx.log("nic-driver: dwmac could not write the PHY's RGMII config - delays NOT applied");
+        return false;
+    }
+    // READ IT BACK. A vendor register behind a page-select is exactly the kind of write that can go
+    // to the wrong place and report nothing; and this one's failure mode is a link that comes up,
+    // counts packets and delivers none.
+    let after = ytphy_read_ext(ctx, m, phy, YT8521_RGMII_CONFIG1).unwrap_or(0);
+    ctx.log_fmt(format_args!(
+        "nic-driver: dwmac PHY RGMII delays {} ps: config1 0x{:04x} -> 0x{:04x} (wanted 0x{:04x})",
+        DELAY_PS, before, after, want
+    ));
+    after == want
 }
