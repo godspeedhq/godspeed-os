@@ -32,6 +32,10 @@ use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 /// is the ONLY path - the kernel drives no ethernet at all (Commandment I).
 #[cfg(target_arch = "aarch64")]
 mod genet;
+/// The VisionFive 2's Synopsys DesignWare MAC. Identification only so far - see the module header
+/// for why that is a step rather than a stub.
+#[cfg(target_arch = "riscv64")]
+mod dwmac;
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
 const REG_CTRL:   usize = 0x0000; // Device Control
@@ -1083,6 +1087,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
+
+    // riscv64: THE GRANTED WINDOW IS NOT AN e1000, AND THE PATH BELOW MUST NOT TOUCH IT.
+    //
+    // The dispatch above sorts an RTL8168 from an e1000 by PCI vendor/device, and everything that
+    // is neither falls through to the Intel path. On the VisionFive that is wrong in the most
+    // expensive way available: the kernel grants this service the on-SoC DesignWare MAC at
+    // 0x1603_0000, so the e1000 bring-up wrote Intel register offsets into Synopsys silicon - a
+    // reset bit into `GMAC_CONFIG`, ring base addresses into whatever happens to live at the e1000's
+    // descriptor registers - and then read a MAC address back out of a register that holds
+    // something else entirely. The board reported exactly what that produces:
+    // `e1000 up  link down  MAC 00:00:00:00:00:00`, which reads like an unplugged cable and is in
+    // fact a driver talking to the wrong chip.
+    //
+    // So identify the part properly, then hand the rest of this function `None` for the window. The
+    // service still SERVES the frame interface - with empty replies - so net-stack degrades with a
+    // clear answer instead of hanging on one (26.7). Shadowing rather than branching is deliberate:
+    // it makes it impossible for any later site in this function to reach those registers by
+    // accident, which a boolean guard would not.
+    #[cfg(target_arch = "riscv64")]
+    let (mmio, arena) = {
+        dwmac::identify(&ctx, mmio.as_ref());
+        let _ = arena;
+        (None::<godspeed_sdk::Mmio>, None::<godspeed_sdk::Dma>)
+    };
     // NOTE: there is deliberately no `active` boolean here any more. It was a second copy of a fact
     // the two Options already hold (Commandment III), and every site that consulted it then re-asserted
     // that fact with `unwrap()` - a service declaring that its own failure should halt the machine
@@ -1168,6 +1196,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         m.write32(REG_RCTL, RCTL_VALUE);
         ctx.log("nic-driver: serving the frame interface");
     } else {
+        #[cfg(target_arch = "riscv64")]
+        ctx.log("nic-driver: dwmac has no frame path yet - serving empty replies (identification above is the state of the port)");
+        #[cfg(not(target_arch = "riscv64"))]
         ctx.log("nic-driver: no Intel e1000 mapped (absent, or a different NIC) - serving empty replies");
     }
 
