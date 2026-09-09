@@ -2941,7 +2941,14 @@ fn calibrate_cycle_counter() {
     }
     CYCLES_PER_QUANTUM.store(cycles, Ordering::Relaxed);
     print_str("riscv64: cycle counter ");
-    print_dec(cycles / 10_000);
+    // ROUNDED, not truncated. 10 ms is 10,000 microseconds, so ticks-per-quantum over 10,000
+    // is megahertz - and 39,999 ticks is 4 MHz, which integer division reports as 3. The
+    // measurement below it was right all along; only the label was understating it by most of
+    // a megahertz, which is exactly the kind of instrument that gets believed over the number
+    // beside it. (That 4 MHz is also a fact worth reading: it is the device tree's TIMEBASE
+    // rate, so `rdcycle` on this part is aliased to the timebase rather than to the core
+    // clock, whatever its name suggests.)
+    print_dec((cycles + 5_000) / 10_000);
     print_str(" MHz, ");
     print_dec(cycles);
     print_str(" ticks per 10 ms quantum\n");
