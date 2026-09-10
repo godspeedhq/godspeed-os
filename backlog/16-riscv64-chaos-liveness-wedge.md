@@ -69,3 +69,46 @@ needs a guess. Fix the panic serialisation at the same time, since it is in the 
 
 Reproduce in QEMU first (`scripts/riscv_run.py --cmd`) - `project_riscv64_chaos_wedge` records that
 the board was being used as a debugger and should not be again.
+
+---
+
+## ROOT CAUSE FOUND, by reading rather than by booting (2026-09-10)
+
+**Nothing above ring 0 wedges the machine. The kernel's own tick handler blocks on a lock it takes
+with interrupts masked, and chaos is only the load that makes the wait long.**
+
+The chain:
+
+1. Core 1 sat at **stage 5, `NEUTRAL_SCHED`** - stamped by `arch/riscv64/mod.rs::timer_tick`
+   IMMEDIATELY before `scheduler::timer_tick_from_irq`, with stage 6 (`TICK_DONE`) stamped
+   immediately after. So it entered neutral tick code and never returned.
+2. `CORE_LAST_TICK_TSC`, the progress stamp the watchdog reads, is written 69 lines INTO
+   `timer_tick_from_irq` (scheduler.rs:1434). The first thing that function does is
+   `drain_pending_kstack(cid)`.
+3. That calls `free_kstack` and `free_page_table_root` -> `memory::allocator::free_frame`, which takes
+   **`alloc_lock()`** - inside a trap handler, interrupts masked. The lock's own comment says
+   "IRQ-safe: ALLOC_LOCKED is also taken in interrupt context", which prevents same-core re-entry and
+   says nothing about a CROSS-CORE holder.
+4. Under chaos the deferred-free queue is non-empty on nearly every tick (constant kill + respawn) and
+   the allocator is contended by the spawns, so a core can spin there indefinitely.
+
+**THE DISCRIMINATOR WAS IN THE LOG ALL ALONG.** The panic printed twice, 31 ms apart, from two
+different cores - and both report **exactly `94726`** timer interrupts for core 1. The count is
+FROZEN, not climbing. The core is not taking interrupts at all; it is inside one trap with them
+masked. (The first reading of this note said "94726, more than any other hart" and drew the opposite
+conclusion. h4 had 95404. The number was never the point - its STABILITY across two reports was.)
+
+## The fix, and it is a pattern this repo already established
+
+`arch/riscv64/mod.rs::ccache_flush_all` carries the argument verbatim:
+
+> Every caller is inside a trap handler with interrupts masked, so a hart spinning for the holder
+> cannot be preempted, cannot service an IPI, and cannot be seen to be alive - which is the exact
+> shape of the wedge this port is chasing.
+
+That reasoning was applied to the cache controller and given a try-lock. It was not applied to the
+allocator lock on the same path. `drain_pending_kstack` should **try** the lock and leave the work
+queued for the next tick when it cannot get it: a deferred free that waits one more tick costs
+nothing, and a wait that cannot be preempted costs the machine.
+
+Neutral kernel code, so it lands on every port. Reproduce chaos in QEMU first.
