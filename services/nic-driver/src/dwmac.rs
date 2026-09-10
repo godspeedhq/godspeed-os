@@ -354,6 +354,21 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
 fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
     let mut rxbuf = [0u8; crate::FRAME_MAX];
     let mut fails = 0u32;
+    // COUNTERS ON BOTH ENDS OF THIS HOP, before theorising about where frames go.
+    //
+    // net-stack reports `88 drains, 0 frames seen` across a full 900 ms ping window, and then a
+    // reply arrives moments after it closes. Two explanations fit that equally well and they have
+    // nothing in common: either no frame reached this driver during the window, or frames reached it
+    // and it did not hand them over. The MAC's own `rx` counter covers wire-to-MAC; nothing covered
+    // MAC-to-net-stack, which is exactly the hop in question.
+    //
+    // This is the measurement the Pi 2's own notes say cracked the identical symptom there:
+    // "13 PARSED, 13 HANDED OUT" proved the loss was ABOVE the driver and killed half the search
+    // space in one boot.
+    let mut asked: u64 = 0; // drain requests received (ops 4 and 9)
+    let mut handed: u64 = 0; // frames actually returned
+    let mut empty: u64 = 0; // drains that found the ring empty
+    let mut last_report = ctx.read_tsc();
     // Once-only latches, OUTSIDE the loop they guard: one declared inside resets every iteration and
     // reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
@@ -398,7 +413,9 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             out[7] = up as u8;
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 4 {
+            asked += 1;
             let n = d.receive(&mut rxbuf);
+            if n == 0 { empty += 1 } else { handed += 1 }
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count][len:u16 LE][bytes]... Bounded three ways - the count, the
@@ -406,14 +423,17 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             let mut out = [0u8; crate::BATCH_MSG_MAX];
             let mut opos = 1usize;
             let mut count = 0usize;
+            asked += 1;
             while count < crate::BATCH_MAX {
                 if opos + 2 + crate::FRAME_MAX > out.len() {
                     break;
                 }
                 let n = d.receive(&mut rxbuf);
                 if n == 0 {
+                    if count == 0 { empty += 1 }
                     break;
                 }
+                handed += 1;
                 out[opos..opos + 2].copy_from_slice(&(n as u16).to_le_bytes());
                 opos += 2;
                 out[opos..opos + n].copy_from_slice(&rxbuf[..n]);
@@ -454,6 +474,21 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
         }
         ctx.remove_cap(reply_cap);
+
+        // Paced on a WALL CLOCK, not per request: a drain-rate report printed per drain would be
+        // ninety lines a second, and an instrument that floods the console changes the timing of the
+        // thing it is measuring.
+        let per_10ms = ctx.tsc_ticks_per_10ms();
+        if per_10ms != 0 && ctx.read_tsc().wrapping_sub(last_report) > per_10ms * 500 {
+            last_report = ctx.read_tsc();
+            let (tgb, tg, _tuf, _tce, rgb, rcrc, _dbg) = d.mac_counters();
+            // MAC rx against frames handed out is the whole question. If `rx` climbs while `handed`
+            // does not, the frames are arriving and this driver is losing them. If neither climbs,
+            // they never reached the MAC and the fault is below us.
+            ctx.log_fmt(format_args!(
+                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {}/{} | drains asked {} handed {} empty {}",
+                rgb, rcrc, tg, tgb, asked, handed, empty));
+        }
     }
 }
 
