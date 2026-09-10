@@ -70,6 +70,27 @@ static TASK_NAMES: NameTable<MAX_TASKS, TASK_NAME_MAX> = NameTable::new();
 /// This slot's name, or `""` for a slot that has none.
 pub fn task_name(slot: usize) -> &'static str { TASK_NAMES.get(slot) }
 
+/// Is core `cid` still using `slot` - either running it, or not yet finished leaving it?
+///
+/// The kill path's spin-wait asks this before reclaiming a task's stack and page tables. It used to
+/// ask only about `CORE_CURRENT`, which a core releases one step before it stops USING the task. See
+/// `CORE_LEAVING` for the window that opened and what fell into it.
+fn core_still_using(cid: usize, slot: usize) -> bool {
+    CORE_CURRENT.get(cid).load(Ordering::SeqCst) == slot
+        || CORE_LEAVING.get(cid).0.load(Ordering::SeqCst) == slot as u64
+}
+
+/// This core has re-entered the scheduler, so whatever it was leaving, it has left.
+///
+/// The first provable moment: re-entry means the previous `switch_context` completed, so the core is
+/// on a different stack and in a different address space. Called at every scheduler entry rather than
+/// after each `switch_context` call, because the switch into a FRESH task never returns - it `sret`s
+/// to user through the trampoline - so "after the call" is a point some paths never reach.
+#[inline]
+fn core_finished_leaving(cid: usize) {
+    CORE_LEAVING.get(cid).0.store(IDLE as u64, Ordering::SeqCst);
+}
+
 /// Per-task DECLARED SEND-PEERS, recorded at spawn.
 ///
 /// The kernel authorises `AcquireSendCap` for a name a service DECLARED as a peer, so a service can
@@ -435,6 +456,40 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// Has a core already panicked for a liveness wedge? See the guard in the watchdog below.
 static WEDGE_PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The task a core is still LEAVING - published while it has stopped claiming `prev` but has not yet
+/// stopped using it.
+///
+/// **Closing a window the reclaim's own safety comment says is closed and is not.** That comment
+/// reads: "the spin-wait above guarantees every other core has loaded a *different* CR3 since last
+/// running this task". The guarantee it needs is about CR3. The guarantee it actually has is about
+/// `CORE_CURRENT`. Those two diverge, and the gap is this:
+///
+/// ```text
+///   1. CAS TASK_STATE[next]: Ready -> Running      claims `next`
+///   2. CORE_CURRENT[cid] = next                    STOPS claiming `prev`
+///   3. fence + re-check                            completes the handshake for `next`
+///   4. prepare_ring3_switch(cid, next)
+///   5. switch_context(TASK_CTX[prev], ...)         STILL on prev's kernel STACK,
+///                                                  STILL translating through prev's satp
+/// ```
+///
+/// A kill of `prev` arriving between 2 and 5 sees `CORE_CURRENT[cid] != prev`, concludes no core is
+/// running it, and reclaims it: `reclaim_user_frames` frees the page tables the hart is translating
+/// through, and `free_kstack` frees the stack it is executing on - which the next spawn reallocates.
+/// The handshake at 1-3 is correct and protects `next` perfectly; nothing protected `prev`.
+///
+/// The symptom is a core that goes silent rather than faulting, because the casualty is the reporting
+/// machinery itself: a trap taken from S-mode runs on whatever stack it finds, so once that stack is
+/// another task's, the handler corrupts it further instead of reporting anything. It was found on
+/// riscv64, where a bad physical access hangs rather than faults, but the race is arch-neutral and
+/// every port has it - the others merely fail more loudly, or have not been chaos-tested at the same
+/// point in the window.
+///
+/// So a core now claims BOTH: the task it is going to, and the task it has not finished leaving. The
+/// killer waits for either. Cleared on re-entry to the scheduler, which is the first moment the core
+/// is provably off the old stack and out of the old address space.
+static CORE_LEAVING: PerCore<CachePaddedU64> = PerCore::new();
+
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 /// A wake that arrived for a task which was RUNNABLE at the time, and so left no other trace.
 ///
@@ -567,6 +622,7 @@ pub fn init_arenas(n: usize) {
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_LEAVING.init_with(n, |_| CachePaddedU64(AtomicU64::new(IDLE as u64)));
     CORE_IDLE_HALTS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
@@ -1198,6 +1254,9 @@ pub fn run(core_id: u32) -> ! {
     }
 
     loop {
+        // Coming round the loop proves the previous switch completed: this core is off
+        // whatever it was leaving. See `CORE_LEAVING`.
+        core_finished_leaving(cid);
         // Free any deferred kstack from a prior self-kill on this core.
         // RSP is on CORE_SCHED_CTX's stack (per-core BSS), not any kstack.
         drain_pending_kstack(cid);
@@ -1373,6 +1432,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
     // own dispatcher; on x86 there is no such funnel, so the timer path stamps it here (vector 32).
     crate::arch::imp::note_irq(32);
     let cid = current_core_id();
+    // Re-entry proves the previous switch completed: this core is off whatever it was
+    // leaving, so release that claim. See `CORE_LEAVING`.
+    core_finished_leaving(cid);
     // A11-1: EVERY core checks the panic flag, on the tick every core takes.
     //
     // The A10-1 fix put this check in `uart_rx_poll`, whose only caller is the `cid == 0` branch
@@ -1667,6 +1729,12 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             )
             .is_err();
         if !abort_to_sched {
+            // CLAIM `prev` BEFORE RELEASING IT. See `CORE_LEAVING`: the store below stops this
+            // core claiming `prev`, but it keeps using prev's kernel stack and address space
+            // until `switch_context` further down. A killer of `prev` arriving in between would
+            // otherwise free both out from under us. SeqCst, and BEFORE, so the killer's wait
+            // cannot observe the release without also observing this.
+            CORE_LEAVING.get(cid).0.store(prev as u64, Ordering::SeqCst);
             CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
@@ -1729,6 +1797,9 @@ pub fn yield_current() {
     crate::arch::imp::disable_interrupts();
 
     let cid = current_core_id();
+    // Re-entry proves the previous switch completed: this core is off whatever it was
+    // leaving, so release that claim. See `CORE_LEAVING`.
+    core_finished_leaving(cid);
 
     // SAFETY: IF=0.
     unsafe {
@@ -1851,6 +1922,12 @@ pub fn yield_current() {
             )
             .is_err();
         if !abort_to_sched {
+            // CLAIM `prev` BEFORE RELEASING IT. See `CORE_LEAVING`: the store below stops this
+            // core claiming `prev`, but it keeps using prev's kernel stack and address space
+            // until `switch_context` further down. A killer of `prev` arriving in between would
+            // otherwise free both out from under us. SeqCst, and BEFORE, so the killer's wait
+            // cannot observe the release without also observing this.
+            CORE_LEAVING.get(cid).0.store(prev as u64, Ordering::SeqCst);
             CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
@@ -2524,7 +2601,7 @@ pub fn kill_task_by_slot(slot: usize) {
         {
             let my_core = current_core_id();
             for cid in 0..num_cores() {
-                if cid != my_core && CORE_CURRENT.get(cid).load(Ordering::SeqCst) == slot {
+                if cid != my_core && core_still_using(cid, slot) {
                     // cid is a valid core index (loop bound); APIC mapped (outer unsafe).
                     crate::smp::ipi::send_ipi(
                         cid as u32,
@@ -2545,7 +2622,7 @@ pub fn kill_task_by_slot(slot: usize) {
                     // conflicting accesses are SeqCst so the two sides cannot both
                     // miss each other. (The fence is now redundant but harmless.)
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if CORE_CURRENT.get(cid).load(Ordering::SeqCst) != slot { break; }
+                    if !core_still_using(cid, slot) { break; }
                     core::hint::spin_loop();
                 }
             }
@@ -2696,6 +2773,9 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         crate::arch::imp::disable_interrupts();
 
         let cid  = current_core_id();
+        // Re-entry proves the previous switch completed: this core is off whatever it was
+        // leaving, so release that claim. See `CORE_LEAVING`.
+        core_finished_leaving(cid);
         let slot = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire),
                 "block_and_reschedule: no running task");
