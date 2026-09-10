@@ -262,6 +262,7 @@ unsafe extern "C" fn user_entry_trampoline() -> ! {
 /// As the naked half, plus: `next.cr3` must be a live page-table root, since it is installed before
 /// the register switch and the very next instruction fetch translates through it.
 pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {
+    super::note_stage(super::stage::SWITCH_ENTER);
     // SAFETY: `next` is a valid context per the caller's contract.
     let root = unsafe { (*next).cr3 };
     if root != 0 {
@@ -311,6 +312,7 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
             crate::memory::allocator::phys_in_ram(sp)
         );
     }
+    super::note_stage(super::stage::SWITCH_ARMED);
     // SAFETY: the caller's contract; the address space this returns into is now installed.
     unsafe { riscv64_switch_registers(current, next) }
 }

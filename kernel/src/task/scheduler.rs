@@ -86,6 +86,25 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
 /// on a different stack and in a different address space. Called at every scheduler entry rather than
 /// after each `switch_context` call, because the switch into a FRESH task never returns - it `sret`s
 /// to user through the trampoline - so "after the call" is a point some paths never reach.
+/// Stop claiming the task this core is running, and start claiming that it is still LEAVING it.
+///
+/// **Every release goes through here so that no site can forget the second half.** The first attempt
+/// at this fix hand-placed the claim at the two `CORE_CURRENT = next` sites I had found by reading -
+/// and there are FOUR, plus a dozen more that release to `IDLE`, several of them `Relaxed` against a
+/// killer that reads `SeqCst`. Finding call sites by eye is exactly the method that produced the bug.
+///
+/// So this reads what it is about to release rather than being told, which makes it correct at a site
+/// nobody remembered to think about. `IDLE` released as `IDLE` is harmless: it matches no slot, so the
+/// killer's wait ignores it.
+#[inline]
+fn core_release_current(cid: usize, to: usize) {
+    let leaving = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
+    // ORDER MATTERS AND SO DOES SeqCst: the killer must not be able to observe the release without
+    // also observing the claim, or it concludes nobody is using a task this core is still standing on.
+    CORE_LEAVING.get(cid).0.store(leaving as u64, Ordering::SeqCst);
+    CORE_CURRENT.get(cid).store(to, Ordering::SeqCst);
+}
+
 #[inline]
 fn core_finished_leaving(cid: usize) {
     CORE_LEAVING.get(cid).0.store(IDLE as u64, Ordering::SeqCst);
@@ -1309,7 +1328,7 @@ pub fn run(core_id: u32) -> ! {
                         )
                         .is_err();
                     if !abort {
-                        CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+                        core_release_current(cid, next);
                         core::sync::atomic::fence(Ordering::SeqCst);
                         abort = TASK_STATE[next].load(Ordering::SeqCst)
                             != TaskState::Running as u8;
@@ -1328,7 +1347,7 @@ pub fn run(core_id: u32) -> ! {
                     }
                     // Shared tail (switched, or aborted): leave CORE_CURRENT off
                     // `next` so a racing kill's spin-wait proceeds, then re-loop.
-                    CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+                    core_release_current(cid, IDLE);
                     crate::arch::imp::enable_interrupts();
                 }
             }
@@ -1620,7 +1639,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
             };
-            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+            core_release_current(cid, IDLE);
             let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
             switch_context(current_ctx, sched_ctx);
             // Resumes here when prev is next scheduled (after the spawn yields its quantum back).
@@ -1641,7 +1660,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
-                    CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+                    core_release_current(cid, IDLE);
                     // Save into CORE_DEAD_CTX - not TASK_CTX[prev] - to avoid a
                     // write-after-claim race if a concurrent spawn has already
                     // reserved TASK_CTX[prev] (possible now that TASK_VALID=false
@@ -1692,7 +1711,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
             };
-            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+            core_release_current(cid, IDLE);
             let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
             switch_context(current_ctx, sched_ctx);
             // Resumes here when prev is next scheduled (after run()'s loop top did the respawn).
@@ -1729,20 +1748,14 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             )
             .is_err();
         if !abort_to_sched {
-            // CLAIM `prev` BEFORE RELEASING IT. See `CORE_LEAVING`: the store below stops this
-            // core claiming `prev`, but it keeps using prev's kernel stack and address space
-            // until `switch_context` further down. A killer of `prev` arriving in between would
-            // otherwise free both out from under us. SeqCst, and BEFORE, so the killer's wait
-            // cannot observe the release without also observing this.
-            CORE_LEAVING.get(cid).0.store(prev as u64, Ordering::SeqCst);
-            CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+            core_release_current(cid, next);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
                 TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
         }
         if abort_to_sched {
             // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
-            CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+            core_release_current(cid, IDLE);
             if prev >= MAX_TASKS {
                 // Core was idle (in run()'s loop) - nothing to switch out; return to it.
                 return;
@@ -1841,7 +1854,7 @@ pub fn yield_current() {
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
-                    CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+                    core_release_current(cid, IDLE);
                     // Save into CORE_DEAD_CTX, not TASK_CTX[prev], to avoid a
                     // write-after-claim race with a concurrent spawn that may
                     // have already reserved the now-available slot.
@@ -1888,7 +1901,7 @@ pub fn yield_current() {
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
             };
-            CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+            core_release_current(cid, IDLE);
             let sched_ctx: *const TaskContext = CORE_SCHED_CTX.as_ptr(cid);
             switch_context(current_ctx, sched_ctx);
             // Resumes here when prev is next scheduled (after run()'s loop top did the respawn).
@@ -1922,20 +1935,14 @@ pub fn yield_current() {
             )
             .is_err();
         if !abort_to_sched {
-            // CLAIM `prev` BEFORE RELEASING IT. See `CORE_LEAVING`: the store below stops this
-            // core claiming `prev`, but it keeps using prev's kernel stack and address space
-            // until `switch_context` further down. A killer of `prev` arriving in between would
-            // otherwise free both out from under us. SeqCst, and BEFORE, so the killer's wait
-            // cannot observe the release without also observing this.
-            CORE_LEAVING.get(cid).0.store(prev as u64, Ordering::SeqCst);
-            CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+            core_release_current(cid, next);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
                 TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
         }
         if abort_to_sched {
             // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
-            CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+            core_release_current(cid, IDLE);
             if prev >= MAX_TASKS {
                 // Core was idle - nothing to switch out; return to it.
                 crate::arch::imp::enable_interrupts();
@@ -2843,7 +2850,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                     )
                     .is_err();
                 if !abort_to_sched {
-                    CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+                    core_release_current(cid, next);
                     core::sync::atomic::fence(Ordering::SeqCst);
                     abort_to_sched =
                         TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
@@ -2852,7 +2859,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                     // Kill won the race: release its spin-wait (CORE_CURRENT off `next`)
                     // and switch the now-Blocked `slot` to the scheduler context, exactly
                     // as the None branch does - `slot` resumes here when later woken.
-                    CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+                    core_release_current(cid, IDLE);
                     let sched = CORE_SCHED_CTX.as_mut_ptr(cid);
                     switch_context(current_ctx, sched);
                 } else {
@@ -2864,7 +2871,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                 }
             }
             None => {
-                CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
+                core_release_current(cid, IDLE);
                 let sched = CORE_SCHED_CTX.as_mut_ptr(cid);
                 switch_context(current_ctx, sched);
             }

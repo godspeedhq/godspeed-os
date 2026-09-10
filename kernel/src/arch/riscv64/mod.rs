@@ -1225,7 +1225,7 @@ pub fn halt_all_cores() -> ! {
             serial_write_hex_lockfree(ra);
         }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch (syscall NR shown as sN)\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch 18 switch-enter 19 switch-armed (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2423,6 +2423,17 @@ pub(super) mod stage {
     /// wedge here is in `switch_context`, which on this port writes `satp` and `sfence.vma`
     /// unconditionally, and would fault forever with no output if handed a reclaimed root.
     pub const PRE_SWITCH: u32 = 17;
+    /// Inside `switch_context`'s Rust half, before the address space is installed.
+    ///
+    /// Only possible because the switch was SPLIT: the naked function it replaced could not call
+    /// anything, so this window has been unstamped for the whole hunt and every capture has read 17 -
+    /// which means "somewhere after `prepare_ring3_switch`" and could be the guards, the `satp` write,
+    /// the register restore, or the `ret` into the next task.
+    pub const SWITCH_ENTER: u32 = 18;
+    /// Inside `switch_context`, PAST both guards and past the `satp` write, about to hand off to the
+    /// naked register restore. 18 against 19 separates "the checks or the address-space install" from
+    /// "the registers and the `ret` into the resumed task".
+    pub const SWITCH_ARMED: u32 = 19;
     /// Inside `timer_tick`, BEFORE the SBI call that re-arms the deadline.
     ///
     /// The gap between `TRAP_ENTRY` and `TIMER_REARMED` is where a wedged core has now been found
