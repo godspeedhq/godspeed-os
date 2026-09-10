@@ -72,6 +72,29 @@ const AONCLK_GMAC0_TX: usize = 5;
 /// the log says which, and 26.14 is the licence: the device tree is a claim about the hardware, and
 /// where the hardware disagrees the hardware wins.
 const GMAC0_TX_PARENT_GTXCLK: u32 = 0;
+/// ...and the parent the DEVICE TREE actually assigns: `JH71X0_GMUX(gmac0_tx)` lists its parents as
+/// `[GMAC0_GTXCLK, GMAC0_RMII_RTX]`, so `assigned-clock-parents = <&aoncrg 4>` - `GMAC0_RMII_RTX` -
+/// is mux index 1.
+///
+/// **The experiment above was scored wrong.** It said: "if ARP replies appear, the tree's parent is
+/// not what this board needs". ARP replies appear about FOUR TIMES IN TEN, and a clock that is nearly
+/// right is exactly what produces a partial result - so a half-answer was read as the pass branch and
+/// `GTXCLK` was kept on the strength of it.
+///
+/// The argument for `GTXCLK` is still the honest one and is recorded rather than deleted:
+/// `GMAC0_RMII_RTX` is `JH71X0__DIV(..., 30, GMAC0_RMII_REFIN)`, and this board's device tree declares
+/// `gmac0_rmii_refin` as a fixed 50 MHz while gigabit RGMII needs 125 MHz, which no divisor of 50 can
+/// reach. Against that stands the board's own explicit assignment plus `starfive,tx-use-rgmii-clk`,
+/// whose meaning Linux states outright: the transmit clock comes from the external source and "there
+/// is no need to configure the clock internally, because rgmii_rxin will be adaptively adjusted" -
+/// which is why `fix_mac_speed` is deliberately not installed on this board. A `fixed-clock` node is
+/// a nominal declaration, not a measurement of what a pin carries in a mode it was not named for.
+///
+/// So the tie goes to the board (26.14), and this time the outcome is scored honestly in advance:
+/// LOSS COLLAPSES means the tree was right; TRANSMIT DIES OUTRIGHT, with the link still negotiating
+/// 1000 Mbit over MDIO, means 50 MHz is real and `GTXCLK` goes back with the question settled instead
+/// of assumed. Partial improvement is NOT a pass - that is the mistake being corrected here.
+const GMAC0_TX_PARENT_RMII_RTX: u32 = 1;
 /// Mux select, bits 27:24 of a JH71x0 clock register - the same field the display's pixel clock uses,
 /// and written down in one place here so the two cannot drift.
 const CLK_MUX_MASK: u32 = 0x0f << 24;
@@ -187,7 +210,7 @@ pub fn init() -> bool {
     mmio_write(
         aon,
         AONCLK_GMAC0_TX * 4,
-        (txv & !CLK_MUX_MASK) | (GMAC0_TX_PARENT_GTXCLK << CLK_MUX_SHIFT) | CLK_ENABLE,
+        (txv & !CLK_MUX_MASK) | (GMAC0_TX_PARENT_RMII_RTX << CLK_MUX_SHIFT) | CLK_ENABLE,
     );
     let txr = mmio_read(aon, AONCLK_GMAC0_TX * 4);
     // Poked, not tested: an inverter has no enable bit, so the write is harmless and the CLAIM about
@@ -264,7 +287,12 @@ pub fn init() -> bool {
     super::print_str(if txr & CLK_ENABLE != 0 { "on" } else { "FAIL" });
     super::print_str(" parent ");
     super::print_dec(((txr & CLK_MUX_MASK) >> CLK_MUX_SHIFT) as u64);
-    super::print_str(" (want 0 = gtxclk), gtxclk=");
+    // AS FOUND, before this code touched it. The line used to print only the value we had just
+    // written, which can only ever agree with itself - so it has never once reported what the board
+    // came up with, and that is the number that says whether firmware had an opinion here at all.
+    super::print_str(" (was ");
+    super::print_dec(((txv & CLK_MUX_MASK) >> CLK_MUX_SHIFT) as u64);
+    super::print_str(", want 1 = rmii_rtx per the device tree), gtxclk=");
     super::print_str(if gtxclk { "on" } else { "FAIL" });
     super::print_str(" gtxc=");
     super::print_str(if gtxc { "on" } else { "FAIL" });
