@@ -1149,7 +1149,22 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
 /// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
 /// see the aarch64 implementation for the shape (a published flag, checked here).
-pub fn panic_halt_check() {}
+pub fn panic_halt_check() {
+    note_stage(stage::NEUTRAL_TICK);
+    // AND STOP, IF THE MACHINE IS ALREADY DYING. x86 leaves this a stub because it halts its
+    // siblings with an NMI broadcast; RISC-V has no NMI, which is exactly why this seam member
+    // exists and why leaving it empty here left `halt_all_cores` halting only the hart that called
+    // it - a recorded gap, and the reason a panicking machine kept running services on three harts
+    // while one printed its post-mortem. Every other hart takes a timer tick within a quantum, so
+    // polling here reaches all of them promptly without an IPI that a wedged hart could not answer.
+    if DUMPED.load(Ordering::Relaxed) {
+        loop {
+            // SAFETY: `wfi` is a hint with no operands and no memory effect. Halting rather than
+            // spinning keeps the core quiet while the winner writes its dump over the same UART.
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        }
+    }
+}
 
 /// Stop, and SAY WHAT EVERY HART WAS DOING on the way down.
 ///
@@ -1202,7 +1217,7 @@ pub fn halt_all_cores() -> ! {
             emit_dec_lockfree(sc as u64);
         }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill (syscall NR shown as sN)\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 neutral-tick(past-entry) (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2335,6 +2350,21 @@ pub(super) mod stage {
     pub const TRAP_EXIT: u32 = 7;
     pub const SYSCALL: u32 = 8;
     pub const IPI_DRAIN: u32 = 9;
+    /// Inside `scheduler::timer_tick_from_irq`, PAST its entry and BEFORE `drain_pending_kstack`.
+    ///
+    /// **The window a wedged hart has now been found in three times, and the one stamp that can split
+    /// it.** `NEUTRAL_SCHED` (5) is written by this port immediately before calling the neutral tick,
+    /// and `TICK_DONE` (6) immediately after, so a hart resting at 5 is somewhere inside a function
+    /// whose progress stamp - the one the liveness watchdog reads - sits 69 lines in. Every arch call
+    /// in that window is an empty stub on this port (`apic_send_eoi`, `rearm_tsc_deadline`), leaving
+    /// `drain_pending_kstack` as the only thing there that can block: it takes `KSTACK_USED` and the
+    /// frame allocator's lock, from inside a trap with interrupts masked.
+    ///
+    /// `panic_halt_check` is called between the two, so stamping there answers the question with a
+    /// reading rather than an argument. A wedge showing 5 is stuck BEFORE it - in `note_irq` or
+    /// `current_core_id`, which are a store and a register read. A wedge showing this is stuck at or
+    /// after the drain.
+    pub const NEUTRAL_TICK: u32 = 14;
     /// Inside `timer_tick`, BEFORE the SBI call that re-arms the deadline.
     ///
     /// The gap between `TRAP_ENTRY` and `TIMER_REARMED` is where a wedged core has now been found

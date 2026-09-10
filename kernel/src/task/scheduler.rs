@@ -432,6 +432,9 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// power-gates), PANICS loudly instead of letting the machine freeze silently (invariant 12 / §26.7).
 /// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
 /// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
+/// Has a core already panicked for a liveness wedge? See the guard in the watchdog below.
+static WEDGE_PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 /// A wake that arrived for a task which was RUNNABLE at the time, and so left no other trace.
 ///
@@ -1474,11 +1477,32 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // core's own wakeup path.
                     let what = if stuck_task == IDLE { "IDLE (no task)" } else { "task slot" };
                     let slot_num = if stuck_task == IDLE { 0 } else { stuck_task };
+                    // NAME THE TASK. "task slot 2" sends a reader to cross-reference a number
+                    // against a boot log they may not still have; the name is the fact they need.
+                    let stuck_name = if stuck_task == IDLE { "" } else { task_name(stuck_task) };
+                    // ONE REPORTER. A dark core is visible to EVERY neighbour at once and each
+                    // independently decides to announce it, so the last two captures printed the
+                    // panic twice and the second began mid-line of the first:
+                    //
+                    //   kernel: hart stages at halt (stage/irqs) -KERNEL PANIC: panicked at ...
+                    //
+                    // A report that can be interleaved is unreadable exactly when it matters, and on
+                    // a wedged machine it is the only report there will be. Losing this exchange
+                    // means a neighbour is already saying it; stop rather than talk over it.
+                    if WEDGE_PANICKED.swap(true, Ordering::AcqRel) {
+                        // Stop here. Not `halt_all_cores` - that is the winner's job and calling it
+                        // twice is the interleaving being prevented. A plain spin needs nothing from
+                        // the arch seam and costs nothing: this core is inside a trap with interrupts
+                        // masked on a machine that is already being taken down.
+                        loop {
+                            core::hint::spin_loop();
+                        }
+                    }
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); it was running {} {}; it has taken {} timer interrupts, last vector \
+                         allowed); it was running {} {} '{}'; it has taken {} timer interrupts, last vector \
                          {:#010x}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / deadline, deadline, what, slot_num, irqs, last_src, cid
+                        other, dark, dark / deadline, deadline, what, slot_num, stuck_name, irqs, last_src, cid
                     );
                 }
             }
