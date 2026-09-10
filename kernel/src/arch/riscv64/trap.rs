@@ -256,6 +256,12 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         // "a service dies, the system continues" has to be true of a FAULT and not only of a
         // deliberate kill, because a fault is the case nobody planned for.
         report_fault(frame, scause, code, stval, true);
+        // The kill is a DIFFERENT stage from the report, and the last wedge is why: core 0 sat at
+        // stage 12 for ten seconds, and stage 12 covered both of these. Reporting is printing plus
+        // one page-table read, all bounded. Killing takes locks, frees every frame of an address
+        // space and reschedules. Only one of those can plausibly stall that long, and the dump had
+        // no way to say which.
+        super::note_stage(super::stage::KILL);
         crate::task::kill_current();
         // `kill_current` marks the task Dead and reschedules, so it does not come back for a corpse.
         // If it somehow does, halting beats returning into a task that no longer exists.

@@ -1202,7 +1202,7 @@ pub fn halt_all_cores() -> ! {
             emit_dec_lockfree(sc as u64);
         }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report (syscall NR shown as sN)\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2343,6 +2343,14 @@ pub(super) mod stage {
     /// could be in either, and they have no shared fix. These two stamps split them so the next
     /// wedge names one instead of leaving a choice.
     pub const TIMER_ENTER: u32 = 11;
+    /// Inside the KILL path, having already reported the fault.
+    ///
+    /// Split from `FAULT_REPORT` because stage 12 covered both and they are not remotely the same
+    /// thing. Reporting is printing and a page-table read - bounded, and measured at well under a
+    /// second even with a wedged UART, since `putc` gives up after 200k spins. Killing takes locks,
+    /// walks a page table freeing every frame, and reschedules. A ten-second stall belongs to the
+    /// second of those, and the dump could not say which.
+    pub const KILL: u32 = 13;
     /// About to report a fault: the printing, the page-table walk, the task-name lookup.
     pub const FAULT_REPORT: u32 = 12;
     /// Sitting in `wfi`, in the idle path.
