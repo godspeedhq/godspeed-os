@@ -182,3 +182,52 @@ a trap. Candidates:
    Rejected for that reason.
 
 (1) is the right one. QEMU can exercise it: `scripts/riscv_run.py --cmd`.
+
+---
+
+## STATE AFTER FIVE FIXES (2026-09-10 late) - the remaining question is the KILL/PICK RACE
+
+Five real defects were found and fixed in `arch/riscv64`, each by reading that folder rather than
+theorising, none touching neutral kernel code (`shared_surface_check` confirms it per commit):
+
+| # | defect | commit | effect |
+|---|--------|--------|--------|
+| 1 | `tp` (hart id) restored from a USER-writable register on every trap return | 764575f1 | wedge unchanged; made the DUMP trustworthy, which found 2-5 |
+| 2 | `sv39` walks followed an unchecked PPN; a bad phys address HANGS this ISA instead of faulting | ef3d3398 | stage 12 gone for good |
+| 3 | `satp` installed unchecked | 664ce3ca | guarded (never fires) |
+| 4 | the switch was ONE naked function, so it could neither check nor report - split Pi-style | 4b0c7c67 | failures became panics |
+| 5 | kernel `sp` restored unchecked - worse than the root, because a trap runs ON it | 43b55ab1 | guarded (never fires) |
+
+Plus the instrument that made the last two possible: `note_stage` records its caller's RETURN ADDRESS
+and the dump prints it (`h2=17/2235/s37@0x40215d3c`). Resolve with `llvm-nm` + `llvm-objdump`. Three
+stage numbers had been ambiguous before this - a stage names a FUNCTION and a function has callers.
+
+**WHERE IT STANDS.** Two captures in a row land at the SAME resolved site:
+
+```
+h2 (wedged)  -> timer_tick_from_irq + 0x65c   immediately after `prepare_ring3_switch` returns
+h3/h4 (ok)   -> timer_tick_from_irq + 0x0aa
+```
+
+with `switch_context` next, and BOTH new guards silent - so the root was valid and the stack pointer
+was valid. The hart still disappears.
+
+**THE STRUCTURAL READING, and why the next step is NOT a sixth guard.** Every one of findings 2, 3 and
+5 is the same shape: a value read from a context that is being RECLAIMED underneath the reader.
+`pick_next` checks `TASK_VALID` and `TASK_STATE == Ready`, and between that check and
+`switch_context` consuming the context, another core can kill the task, free its kernel stack and
+reclaim its page tables. Guarding each field in turn treats the symptom; the window is the disease.
+
+**NEXT (do this rather than more guards):**
+1. Establish whether the wedged task was killed concurrently - the capture already hints at it: slot 5
+   `block-driver` and slot 3/4 `time` are chaos targets, and the last one carried a syscall stamp
+   (`s37`) where the previous had none.
+2. Decide the fix in the kill/pick ordering: either a task cannot be reclaimed while any core may
+   still switch to it, or the switch re-validates the slot's liveness after `pick_next` under the
+   same CAS discipline the Running->Ready transition already uses ([[feedback_cas_not_store]]).
+3. That is NEUTRAL kernel code, so it lands on every port. If it is a genuine neutral race, other
+   ports have it latent and riscv64 merely EXPOSES it - the same story as the xhci hot-plug fix.
+
+**Do not re-litigate:** the allocator lock (contract honoured, masked correctly), `report_fault`
+(stage 12 gone), the drain (`KSTACK_USED`), `uart_rx_drain` (bounded, wakes only on a real byte),
+`panic_halt_check`/`apic_send_eoi`/`rearm_tsc_deadline` (stubs on this port).
