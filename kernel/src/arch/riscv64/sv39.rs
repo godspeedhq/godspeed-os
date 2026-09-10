@@ -77,6 +77,37 @@ pub fn pte_is_valid(pte: u64) -> bool {
 
 /// Physical address out of a PTE: the PPN sits in bits [53:10] and addresses a 4 KiB frame.
 #[inline]
+/// **Is this physical address safe to DEREFERENCE as a page table?**
+///
+/// A walk takes the next table's address out of the PTE it just read, and every reader in this file
+/// used to dereference that without asking. On a healthy table it is fine. On a table being RECLAIMED
+/// underneath the walk - which is what a chaos storm does continuously, killing a service while its
+/// page tables are freed - a PTE can hold a recycled or garbage PPN, and the walk follows it to an
+/// arbitrary physical address.
+///
+/// **On x86 that FAULTS**, loudly, and this project has already met it there: "kill-path reclaim
+/// followed corrupt PTE to ~68GB, HHDM fault", guarded in the kill path. RISC-V gives no such
+/// courtesy. A load from an address with no RAM and no device behind it need not raise anything at
+/// all - on this SoC the bus transaction simply never completes, and the hart stops mid-instruction
+/// with interrupts masked inside a trap. It makes no progress, its interrupt count freezes, and the
+/// only thing that ever notices is another core's liveness watchdog, ten seconds later, reporting a
+/// core that looks dark for no reason it can name.
+///
+/// That is the shape the riscv64 chaos wedge was captured in: core 0 running `supervisor`, stuck at
+/// stage 12 - inside `report_fault`, which walks the faulting task's page table to print its PTE,
+/// which is exactly this walk on exactly the table being reclaimed.
+///
+/// So every walk checks before it follows. Two conditions, both cheap: the address is inside RAM the
+/// allocator knows about, and it is page-aligned as a table must be. A walk that fails either
+/// answers "not mapped", which is both true and the safe direction - the alternative is a hart that
+/// never comes back.
+#[inline]
+fn table_is_followable(phys: u64) -> bool {
+    phys != 0
+        && phys & 0xfff == 0
+        && crate::memory::allocator::phys_in_ram(phys)
+}
+
 pub fn pte_phys(pte: u64) -> u64 {
     ((pte >> 10) & 0x0fff_ffff_ffff) << 12
 }
@@ -183,7 +214,14 @@ pub fn map_page(root: u64, va: u64, pa: u64, bits: u64) -> Result<(), MapFail> {
             // invariants and nothing here creates one yet, so refuse rather than pretend.
             return Err(MapFail::AlreadyMapped);
         } else {
-            table = pte_phys(pte);
+            // FOLLOW ONLY WHAT IS FOLLOWABLE. See `table_is_followable`: this address came out
+            // of a PTE that may be mid-reclaim, and dereferencing a bad one does not fault on
+            // this ISA - it hangs the hart inside the trap, forever.
+            let next = pte_phys(pte);
+            if !table_is_followable(next) {
+                return Err(MapFail::NotMapped);
+            }
+            table = next;
         }
     }
     // SAFETY: as above.
@@ -213,7 +251,14 @@ pub fn unmap_page(root: u64, va: u64) -> Result<u64, MapFail> {
         if !pte_is_valid(pte) || pte_is_leaf(pte) {
             return Err(MapFail::NotMapped);
         }
-        table = pte_phys(pte);
+        // FOLLOW ONLY WHAT IS FOLLOWABLE. See `table_is_followable`: this address came out
+        // of a PTE that may be mid-reclaim, and dereferencing a bad one does not fault on
+        // this ISA - it hangs the hart inside the trap, forever.
+        let next = pte_phys(pte);
+        if !table_is_followable(next) {
+            return Err(MapFail::NotMapped);
+        }
+        table = next;
     }
     // SAFETY: as above.
     let slot = unsafe { (table as *mut u64).add(vpn(va, 0)) };
@@ -242,7 +287,14 @@ pub fn translate(root: u64, va: u64) -> Option<u64> {
         if pte_is_leaf(pte) {
             return Some(pte);
         }
-        table = pte_phys(pte);
+        // FOLLOW ONLY WHAT IS FOLLOWABLE. See `table_is_followable`: this address came out
+        // of a PTE that may be mid-reclaim, and dereferencing a bad one does not fault on
+        // this ISA - it hangs the hart inside the trap, forever.
+        let next = pte_phys(pte);
+        if !table_is_followable(next) {
+            return None;
+        }
+        table = next;
     }
     // SAFETY: as above.
     let pte = unsafe { (table as *const u64).add(vpn(va, 0)).read_volatile() };
