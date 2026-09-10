@@ -33,6 +33,28 @@ use godspeed_sdk::{Dma, Mmio, ServiceContext};
 const DMA_BUS_MODE: usize = 0x1000;
 const DMA_BUS_MODE_SFT_RESET: u32 = 1 << 0;
 const DMA_SYS_BUS_MODE: usize = 0x1004;
+// The AXI master's bus protocol, from `dwmac4_dma_axi` and `dwmac4_dma_init`. **Declared here and
+// never written until now**, which left the master issuing whatever burst shape it powers up with
+// against an interconnect whose own device tree specifies a different one.
+//
+// Values are this board's, not a default: `snps,fixed-burst` on `ethernet@16030000`, and the
+// `stmmac-axi-config` node it points at with `snps,blen = <256 128 64 32 0 0 0>`,
+// `snps,wr_osr_lmt = <15>` and `snps,rd_osr_lmt = <15>`.
+/// `DMA_SYS_BUS_FB` - fixed burst length. `snps,fixed-burst`.
+const DMA_SYS_BUS_FB: u32 = 1 << 0;
+/// `DMA_AXI_BLEN32|64|128|256`, bits 4 to 7 - the burst lengths the master may use.
+const DMA_AXI_BLEN_DT: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+/// `DMA_AXI_WR_OSR_LMT = GENMASK(27, 24)` and `RD_OSR_LMT = GENMASK(19, 16)`, `DMA_AXI_OSR_MAX 0xf`.
+const DMA_AXI_WR_OSR_SHIFT: u32 = 24;
+const DMA_AXI_RD_OSR_SHIFT: u32 = 16;
+const DMA_AXI_OSR_DT: u32 = 15;
+/// `DMA_AXI_EN_LPI = BIT(31)`. **Deliberately NOT set**, though the axi-config node carries
+/// `snps,lpi_en`. Low-power idle is a power feature rather than a property of the bus, and §26.14 is
+/// explicit that what gets borrowed from a reference is the silicon's requirement and not the other
+/// system's choices. Gating a link that is idle between one ping and the next, while chasing
+/// intermittent loss, is a variable this driver does not need to introduce today. Recorded rather
+/// than silently omitted.
+const _DMA_AXI_EN_LPI: u32 = 1 << 31;
 /// Channel 0. `DMA_CHAN_BASE_ADDR 0x1100`, `DMA_CHAN_BASE_OFFSET 0x80` - and there is only one
 /// channel on this part, so the stride never gets used.
 const CH: usize = 0x1100;
@@ -78,7 +100,11 @@ const DMA_CONTROL_OSP: u32 = 1 << 4;
 /// enough that a 2 KiB FIFO cannot be overrun by one burst, which is the only property that matters
 /// here and the reason not to reach for the largest number available.
 const PBL_SHIFT: u32 = 16;
-const PBL_8: u32 = 8;
+/// `snps,txpbl = <16>` and `snps,rxpbl = <16>` on this board's MAC node. Eight was a guess dressed as
+/// caution ("small enough that a 2 KiB FIFO cannot be overrun by one burst"); sixteen is what the
+/// board asks for, and the FIFO argument was never the constraint - `snps,no-pbl-x8` is also set, so
+/// the x8 multiplier stays clear and sixteen beats is sixteen beats.
+const PBL_16: u32 = 16;
 /// `DMA_RBSZ_MASK = GENMASK(14, 1)` - the receive buffer size, stored shifted left by one.
 const RBSZ_SHIFT: u32 = 1;
 
@@ -93,6 +119,26 @@ const MTL_OP_MODE_TSF: u32 = 1 << 1;
 const MTL_OP_MODE_TXQEN: u32 = 1 << 3;
 /// `MTL_OP_MODE_RSF` - store and forward on receive, for the same reason.
 const MTL_OP_MODE_RSF: u32 = 1 << 5;
+// THRESHOLD MODE, WHICH IS WHAT THIS BOARD ASKS FOR AND WHAT WE WERE NOT DOING.
+//
+// `ethernet@16030000` carries `snps,force_thresh_dma_mode`, and in `stmmac_dma_operation_mode` that
+// property does exactly one thing: `txmode = tc; rxmode = tc;` - threshold both ways, at the driver's
+// `tc` default of 64 bytes. We set `TSF | RSF` instead, store-and-forward both ways, which is the
+// branch that property exists to prevent.
+//
+// It is not a preference. `rx-fifo-depth` and `tx-fifo-depth` are both `<0x800>` on this node - 2 KiB -
+// and store-and-forward means the MAC holds an ENTIRE frame in that FIFO before the DMA may move any
+// of it. At 1518 bytes plus overhead, one frame very nearly fills it, so anything arriving while the
+// previous frame is still draining has nowhere to go and is dropped inside the MAC, before any
+// counter this part implements would record it. StarFive set this property for their silicon;
+// §26.14 says take the silicon's requirement, and this is one.
+/// `MTL_OP_MODE_TTC_MASK 0x70`, `TTC_SHIFT 4`, `TTC_64 = 1 << 4`.
+const MTL_OP_MODE_TTC_MASK: u32 = 0x70;
+const MTL_OP_MODE_TTC_64: u32 = 1 << 4;
+/// `MTL_OP_MODE_RTC_MASK 0x18`, `RTC_SHIFT 3`. `RTC_64` is ZERO - the threshold this board wants is
+/// the encoding's own default, so the field is cleared rather than set.
+const MTL_OP_MODE_RTC_MASK: u32 = 0x18;
+const MTL_OP_MODE_RTC_64: u32 = 0;
 /// `MTL_OP_MODE_TQS_MASK = GENMASK(24, 16)` and `RQS_MASK = GENMASK(29, 20)`, both counted in
 /// 256-byte blocks minus one. `HW_FEATURE1` said 2048 bytes, so 2048/256 - 1 = 7.
 const MTL_TQS_SHIFT: u32 = 16;
@@ -517,12 +563,33 @@ impl Dwmac {
             ((rx_ring + ((RX_DESCS - 1) * DESC_BYTES) as u64) & 0xffff_ffff) as u32,
         );
 
-        // MTL: store and forward both ways, the queue enabled, the FIFO sizes the part reported.
+        // The AXI master's bus protocol, before anything is asked to move. See the constants: this
+        // register was declared and never written, so the master has been bursting against this
+        // SoC's interconnect in whatever shape it powers up in, while the board's own device tree
+        // specifies a different one.
+        let bus = m.read32(DMA_SYS_BUS_MODE);
+        m.write32(
+            DMA_SYS_BUS_MODE,
+            bus | DMA_SYS_BUS_FB
+                | DMA_AXI_BLEN_DT
+                | (DMA_AXI_OSR_DT << DMA_AXI_WR_OSR_SHIFT)
+                | (DMA_AXI_OSR_DT << DMA_AXI_RD_OSR_SHIFT),
+        );
+
+        // MTL: THRESHOLD mode both ways, the queue enabled, the FIFO sizes this board declares.
         m.write32(
             MTL_TX_OP_MODE,
-            MTL_OP_MODE_TSF | MTL_OP_MODE_TXQEN | (FIFO_BLOCKS << MTL_TQS_SHIFT),
+            ((MTL_OP_MODE_TXQEN | (FIFO_BLOCKS << MTL_TQS_SHIFT)) & !MTL_OP_MODE_TTC_MASK)
+                | MTL_OP_MODE_TTC_64,
         );
-        m.write32(MTL_RX_OP_MODE, MTL_OP_MODE_RSF | (FIFO_BLOCKS << MTL_RQS_SHIFT));
+        m.write32(
+            MTL_RX_OP_MODE,
+            ((FIFO_BLOCKS << MTL_RQS_SHIFT) & !MTL_OP_MODE_RTC_MASK) | MTL_OP_MODE_RTC_64,
+        );
+        // Flow control (RFD/RFA/EHFC) is deliberately absent: `dwmac4_dma_rx_chan_op_mode` programs it
+        // only when a channel gets 4 KiB or more of FIFO, and this one declares 2 KiB.
+        let _ = MTL_OP_MODE_TSF;
+        let _ = MTL_OP_MODE_RSF;
         // Route queue 0 to the DCB path. Without this the MAC receives nothing at all, however
         // correct the ring is: frames arrive and are dropped before they reach the DMA.
         m.write32(GMAC_RXQ_CTRL0, GMAC_RX_QUEUE0_DCB);
@@ -577,11 +644,11 @@ impl Dwmac {
         // its ring is running has nowhere to put the first frame.
         m.write32(
             DMA_CH_RX_CONTROL,
-            DMA_CONTROL_START | ((BUF_BYTES as u32) << RBSZ_SHIFT) | (PBL_8 << PBL_SHIFT),
+            DMA_CONTROL_START | ((BUF_BYTES as u32) << RBSZ_SHIFT) | (PBL_16 << PBL_SHIFT),
         );
         m.write32(
             DMA_CH_TX_CONTROL,
-            DMA_CONTROL_START | DMA_CONTROL_OSP | (PBL_8 << PBL_SHIFT),
+            DMA_CONTROL_START | DMA_CONTROL_OSP | (PBL_16 << PBL_SHIFT),
         );
 
         let mut cfg = GMAC_CONFIG_TE | GMAC_CONFIG_RE;
