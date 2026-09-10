@@ -1218,7 +1218,7 @@ pub fn halt_all_cores() -> ! {
             emit_dec_lockfree(sc as u64);
         }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain 16 halted-by-another-hart (syscall NR shown as sN)\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2387,6 +2387,21 @@ pub(super) mod stage {
     /// showed four harts at 14 and the reader had to know which one the panic named. An instrument
     /// whose two meanings need a second instrument to distinguish is one instrument short.
     pub const PANIC_HALTED: u32 = 16;
+    /// Past `pick_next`, one line before `switch_context`.
+    ///
+    /// **Because stage 15 was being read as a LOCATION when it is only the last stamp.** Nothing
+    /// stamps between the progress stamp and the end of the tick, so a hart that recorded its
+    /// progress and then hung in `pick_next` or the context switch shows 15 exactly like one stuck
+    /// before it - with a `CORE_LAST_TICK_TSC` frozen at the moment it went in, which is precisely
+    /// what the watchdog then reports ten seconds later. That reading fits the capture better than
+    /// the window before the stamp does, because for a core that is NOT core 0 that window contains
+    /// two atomic accesses and a CSR read and nothing that can block at all.
+    ///
+    /// The neutral tick calls `syscall_slot` - an arch function - on the line before the switch, so
+    /// stamping there splits it with no neutral code touched. A wedge at 15 is in `pick_next`; a
+    /// wedge here is in `switch_context`, which on this port writes `satp` and `sfence.vma`
+    /// unconditionally, and would fault forever with no output if handed a reclaimed root.
+    pub const PRE_SWITCH: u32 = 17;
     /// Inside `timer_tick`, BEFORE the SBI call that re-arms the deadline.
     ///
     /// The gap between `TRAP_ENTRY` and `TIMER_REARMED` is where a wedged core has now been found

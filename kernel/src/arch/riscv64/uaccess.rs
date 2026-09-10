@@ -80,6 +80,11 @@ static USER_READ_SCRATCH: PerCoreMut<[u8; crate::ipc::message::MAX_MESSAGE_SIZE]
 static mut BSP_SYSCALL: PerCoreSyscallData = PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 };
 
 pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData {
+    // A BOUNDARY MARKER, for free. The neutral tick reads this slot on the line immediately before
+    // `switch_context`, so stamping here is the only way to tell a hart stuck in `pick_next` from one
+    // stuck in the switch - and nothing else stamps between the progress stamp and the end of the
+    // tick. See `stage::PRE_SWITCH`. Costs one store on a path that is already storing.
+    super::note_stage(super::stage::PRE_SWITCH);
     if PER_CORE_SYSCALL.initialised() {
         PER_CORE_SYSCALL.as_mut_ptr(core_id)
     } else {
