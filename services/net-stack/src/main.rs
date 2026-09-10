@@ -1018,88 +1018,6 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8;
 /// reply within the budget. Used by `net arp` (any host) and `net scan` (across the subnet). Same frame
 /// path and bound as `ping`/`dns_resolve`, which is why it is reliable now that the receiver no longer
 /// stalls (RTL8168 RDU recovery) and the deadline no longer glitches (deglitched RTC).
-/// **Does UNICAST RECEPTION work?** Asked with ARP, because its two halves travel differently.
-///
-/// Everything that fails on this board is a unicast frame coming IN - the echo reply, the DNS reply,
-/// the DHCP ACK - and everything that never fails is broadcast. But a ping exercises BOTH directions
-/// at once, so it cannot say which one is at fault, and that ambiguity has cost several boots.
-///
-/// ARP separates them. The request goes out BROADCAST, over the path already proven reliable by DHCP
-/// DISCOVER drawing an OFFER first try on every boot. The reply comes back UNICAST. So the fraction of
-/// probes answered is a measurement of unicast RECEPTION alone, using an exchange the gateway is
-/// obliged to answer and has no reason to rate-limit - unlike ICMP, where a silent gateway is always
-/// an available excuse.
-///
-/// Reads against the ping loss in the same boot:
-///   - answered ~100% while ping stays lossy -> unicast reception is FINE, and what is failing is our
-///     own unicast TRANSMIT: the echo request is not reaching the gateway, so no reply is ever built.
-///   - answered at about the ping rate -> unicast RECEPTION is the fault, and it is below the address
-///     filter (which this boot proved innocent) - the frame is lost between the wire and the ring.
-///
-/// Bounded hard: a fixed probe count, a fixed short window each, no retries, and it runs once. A
-/// diagnostic that can outlast a boot is a diagnostic that gets blamed for the boot.
-fn arp_probe(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], gw_ip: &[u8; 4], gw_mac: &[u8; 6]) {
-    const PROBES: u32 = 20;
-    /// One probe's listening window. An ARP reply on a LAN is well under a millisecond; 120 ms is
-    /// three orders of magnitude of headroom and still bounds the whole probe under three seconds.
-    const WINDOW_MS: u64 = 120;
-
-    let mut arp = [0u8; 42];
-    for b in arp.iter_mut().take(6) { *b = 0xff; }        // eth dst = broadcast
-    arp[6..12].copy_from_slice(our_mac);
-    arp[12] = 0x08; arp[13] = 0x06;                       // ethertype ARP
-    arp[14] = 0x00; arp[15] = 0x01;                       // htype Ethernet
-    arp[16] = 0x08; arp[17] = 0x00;                       // ptype IPv4
-    arp[18] = 0x06; arp[19] = 0x04;                       // hlen 6, plen 4
-    arp[20] = 0x00; arp[21] = 0x01;                       // oper = request
-    arp[22..28].copy_from_slice(our_mac);
-    arp[28..32].copy_from_slice(our_ip);
-    arp[38..42].copy_from_slice(gw_ip);
-    let req = Message::from_bytes(&arp);
-
-    let mut sent = 0u32;
-    let mut answered = 0u32;
-    let mut frames = 0u32;
-    let mut unicast = 0u32;
-    for _ in 0..PROBES {
-        if nic_req(ctx, &req, LINK_SECS).is_none() { continue; }
-        sent += 1;
-        let mut got = false;
-        let t0 = ctx.read_tsc();
-        let per = ctx.tsc_ticks_per_10ms().saturating_mul(WINDOW_MS / 10);
-        loop {
-            if let Some(b) = nic_drain_ms(ctx, 20) {
-                let p = b.payload_bytes();
-                let n = if p.is_empty() { 0 } else { p[0] as usize };
-                let mut pos = 1usize;
-                for _ in 0..n {
-                    if pos + 2 > p.len() { break; }
-                    let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
-                    pos += 2;
-                    if pos + fl > p.len() { break; }
-                    let f = &p[pos..pos + fl];
-                    pos += fl;
-                    frames += 1;
-                    if f.len() >= 6 && f[..6] == our_mac[..] { unicast += 1; }
-                    // An ARP REPLY from the gateway: oper 2, sender hw = the MAC we already resolved.
-                    if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06
-                        && f[20] == 0 && f[21] == 2 && f[22..28] == gw_mac[..] {
-                        got = true;
-                    }
-                }
-            }
-            if got { break; }
-            // Bounded by the CLOCK, never by a poll count: a count means a different duration on every
-            // machine, which this project has already been bitten by twice.
-            if per == 0 || ctx.read_tsc().wrapping_sub(t0) >= per { break; }
-        }
-        if got { answered += 1; }
-    }
-    ctx.log_fmt(format_args!(
-        "net-stack: arp probe - {} of {} broadcast requests answered by a UNICAST reply ({} frames scanned, {} of them addressed to us).          This measures RECEPTION only; compare it against the ping loss in this same boot.",
-        answered, sent, frames, unicast));
-}
-
 fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4],
                serve_status: Option<&[u8; 19]>) -> Option<[u8; 6]> {
     let mut arp = [0u8; 42];
@@ -1552,9 +1470,6 @@ fn run_dance(ctx: &ServiceContext, serve_status: Option<&[u8; 19]>) -> NetState 
                 "net-stack: ARP - {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 gateway[0], gateway[1], gateway[2], gateway[3],
                 m[0], m[1], m[2], m[3], m[4], m[5]));
-            // Measure unicast RECEPTION now, while the gateway is known and before anything else runs.
-            // Once, at configure time, bounded under three seconds.
-            arp_probe(ctx, &our_ip, &our_mac, &gateway, &m);
             (m, true)
         }
         None => ([0u8; 6], false),
@@ -2055,11 +1970,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     "net-stack: gateway {}.{}.{}.{} resolved on retry - {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     gateway[0], gateway[1], gateway[2], gateway[3],
                     m[0], m[1], m[2], m[3], m[4], m[5]));
-                // ALSO HERE. The probe sat behind a successful first-attempt ARP and so never ran on
-                // the one boot where it mattered - the boot whose gateway ARP failed 0 of 6 is exactly
-                // the boot whose unicast reception most needed measuring. A diagnostic gated on the
-                // thing not going wrong is a diagnostic that runs only when it has nothing to say.
-                arp_probe(&ctx, &our_ip, &our_mac, &gateway, &m);
             }
         }
         if let Some((rid, right)) = badge {

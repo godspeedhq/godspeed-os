@@ -69,21 +69,6 @@ const DMA_CH_RX_END: usize = CH + 0x28;
 const DMA_CH_TX_RING_LEN: usize = CH + 0x2c;
 const DMA_CH_RX_RING_LEN: usize = CH + 0x30;
 const DMA_CH_STATUS: usize = CH + 0x60;
-/// `DMA_CHAN_CUR_RX_DESC` - the address of the descriptor the ENGINE is working on right now.
-///
-/// The one register that can contradict this driver's own bookkeeping. `receive` inspects exactly one
-/// descriptor per call, `rx_next`, and advances only when it harvests - so `rx_next` is a BELIEF about
-/// where the engine is, and nothing has ever checked it. The engine stops and restarts at every `RBU`,
-/// of which this board records sixteen to twenty-two during bring-up on every boot, and it resumes
-/// from ITS pointer, not ours.
-///
-/// If the two drift apart, frames land in descriptors ahead of us while we poll one the engine passed
-/// long ago, and nothing surfaces until it wraps the whole ring. That would leave `handed == MAC rx`
-/// intact - we do deliver everything eventually - while making every SOLICITED reply late: an ARP
-/// reply due in under a millisecond, or an echo reply due in one, arriving far outside the window that
-/// was waiting for it. Unsolicited broadcast traffic, which nobody times, would look perfectly
-/// healthy throughout. That is this board's fault description, line for line.
-const DMA_CH_CUR_RX_DESC: usize = CH + 0x4c;
 /// `DMA_CHAN_STATUS_RBU = BIT(7)` - RECEIVE BUFFER UNAVAILABLE: the engine wanted a descriptor and
 /// this driver had not given it one, so the frame was dropped. Write-one-to-clear.
 ///
@@ -709,21 +694,6 @@ impl Dwmac {
     /// others. `tx_gb` climbing with `tx_good` flat is the MAC telling us the transmissions are
     /// failing; both climbing together means the frames left correctly and the fault is beyond this
     /// chip; `underflow` climbing points at the transmit clock; `carrier` at the link itself.
-    /// Where the engine says it is, against where this driver believes it is - as ring INDICES, so
-    /// the two are directly comparable. `None` if the engine's pointer is not inside our ring at all,
-    /// which would be a different and worse problem than being out of step.
-    pub fn rx_position(&self) -> (Option<usize>, usize) {
-        let cur = self.m.read32(DMA_CH_CUR_RX_DESC) as u64;
-        let base = self.a.phys_at(RX_RING_OFF);
-        let end = base + (RX_DESCS * DESC_BYTES) as u64;
-        let idx = if cur >= base && cur < end {
-            Some(((cur - base) / DESC_BYTES as u64) as usize)
-        } else {
-            None
-        };
-        (idx, self.rx_next)
-    }
-
     pub fn mac_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
         (
             self.m.read32(MMC_TX_FRAMECOUNT_GB),
@@ -870,6 +840,12 @@ impl Dwmac {
             self.rbu = self.rbu.saturating_add(1);
             self.m.write32(DMA_CH_STATUS, DMA_STATUS_RBU); // write-one-to-clear
         }
+        // ONE DESCRIPTOR PER CALL, THE ONE WE BELIEVE IS NEXT - and that belief was CHECKED rather
+        // than assumed. `DMA_CHAN_CUR_RX_DESC` (CH + 0x4c) publishes where the engine actually is;
+        // read against `rx_next` across a full run it stayed equal or a handful ahead, which is just
+        // descriptors filled and not yet harvested, and never drifted or left the ring. So the
+        // bookkeeping survives the engine stopping and restarting at every `RBU`, and this is not a
+        // place frames go missing. Recorded here so the next reader does not have to re-derive it.
         let i = self.rx_next;
         let off = RX_RING_OFF + i * DESC_BYTES;
         let d3 = self.desc_read(off, 3);

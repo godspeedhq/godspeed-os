@@ -501,7 +501,7 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
         let per_10ms = ctx.tsc_ticks_per_10ms();
         if per_10ms != 0 && ctx.read_tsc().wrapping_sub(last_report) > per_10ms * 500 {
             last_report = ctx.read_tsc();
-            let (tgb, tg, _tuf, _tce, rgb, rcrc, rocts, _dbg) = d.mac_counters();
+            let (tgb, tg, _tuf, _tce, rgb, _rcrc, _rocts, _dbg) = d.mac_counters();
             // ASK THE MAC WHY, whenever it says it transmitted frames it does not call good. Silent
             // when the two agree, so a healthy machine prints nothing and this cannot become noise
             // that hides the line beneath it.
@@ -521,16 +521,16 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             // number beside it refutes is worse than no instrument: it is a false lead with a
             // timestamp on it.
             let rbu = if d.rbu == 0 { "" } else { " - THE RING RAN DRY, frames were dropped" };
-            // WHERE THE ENGINE IS, AGAINST WHERE WE THINK IT IS. Printed every hop because a drift
-            // between them is invisible in every other number on this line: `handed` still equals
-            // `MAC rx` while frames are delivered a whole ring late.
-            let (engine, ours) = d.rx_position();
             ctx.log_fmt(format_args!(
-                "nic-driver: dwmac rx position - engine at {:?}, we poll {} (of {})",
-                engine, ours, crate::dwmac_ring::RX_DESCS));
-            ctx.log_fmt(format_args!(
-                "nic-driver: dwmac hop | MAC rx {} crc-err {} (rx octets {}) tx {} | drains asked {} handed {} empty {} | RBU {}{}",
-                rgb, rcrc, rocts, tgb, asked, handed, empty, d.rbu, rbu));
+                // NO `crc-err`, AND NO OCTET COUNTS. Both were printed here and both are meaningless on
+            // this part: `MMC_TX_FRAMECOUNT_G` and BOTH octet counters read a confident zero forever
+            // while the frame counters beside them work, so the receive CRC counter has no more
+            // claim to be believed than they had. It was read as "the RGMII receive path is clean"
+            // for most of an investigation, which is worse than printing nothing. What is left here
+            // are the three numbers this part does populate and that can disagree with each other:
+            // frames the MAC took, frames this driver handed on, and frames the engine had to drop.
+            "nic-driver: dwmac hop | MAC rx {} tx {} | drains asked {} handed {} empty {} | RBU {}{}",
+                rgb, tgb, asked, handed, empty, d.rbu, rbu));
             let _ = tg;
         }
     }
