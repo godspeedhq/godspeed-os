@@ -318,18 +318,17 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
 
     let phy = 0; // `ethernet-phy@0` in the device tree, and the sweep confirms it answers
 
-    // The PHY's RGMII timing, BEFORE the link is read and the MAC is programmed. It changes how the
-    // PHY samples and drives the bus, so it belongs with bring-up rather than being applied to a
-    // link already in use.
+    // RESET, THEN CONFIGURE, THEN WAIT - in that order, and the order is the fix.
+    //
+    // A reboot does not reset this PHY, so it carries the previous image's register state into this
+    // boot. And a reset CLEARS the vendor delay registers, so the delays have to be applied after
+    // it. Doing this the other way round is how a boot ended up negotiating for twelve seconds and
+    // programming the MAC as "link down, 0 Mbit/s, half duplex".
+    if !phy_reset(&ctx, &m, phy) {
+        ctx.log("nic-driver: dwmac PHY reset did not complete - continuing from whatever state it is in");
+    }
     configure_phy_delays(&ctx, &m, phy);
-
-    let (up, speed, fd) = link(&ctx, &m, phy);
-    ctx.log_fmt(format_args!(
-        "nic-driver: dwmac link {} at {} Mbit/s {} duplex",
-        if up { "UP" } else { "down" },
-        speed,
-        if fd { "full" } else { "half" }
-    ));
+    let (up, speed, fd) = wait_for_link(&ctx, &m, phy);
 
     // Come up around whatever the link is NOW, including no link at all. A MAC configured at a
     // default speed still answers and still serves, and the link edge in the serve loop re-applies
@@ -771,4 +770,73 @@ pub fn rgmii_loopback_sweep(ctx: &ServiceContext, d: &mut Dwmac, phy: u32) {
     let _ = mdio_write(ctx, &d.m, phy, PHY_BMCR, bmcr0);
     ctx.sleep_ms(20);
     ctx.log("nic-driver: dwmac loopback sweep done - PHY restored");
+}
+
+/// BMCR reset. IEEE 802.3 clause 22, register 0 bit 15: self-clearing when the PHY is ready.
+const BMCR_RESET: u16 = 1 << 15;
+
+/// Reset the PHY to a known state, then wait - bounded - for it to finish.
+///
+/// **A reboot does not reset this PHY.** It is a separate chip with its own reset line, so whatever
+/// the last image left in its registers survives into the next boot. This session proved it the
+/// hard way: a diagnostic that toggled BMCR loopback and rewrote the delay registers was followed by
+/// a boot where autonegotiation took TWELVE SECONDS instead of two, and the driver programmed the
+/// MAC from a link that was still down.
+///
+/// So bring-up starts from a defined state rather than from whatever happened last. The order
+/// matters and is the whole point: a reset CLEARS the vendor delay registers, so the delays must be
+/// applied after it, not before - which is why `configure_phy_delays` moved below this call.
+fn phy_reset(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
+    let Some(bmcr) = mdio_read(ctx, m, phy, PHY_BMCR) else {
+        return false;
+    };
+    if !mdio_write(ctx, m, phy, PHY_BMCR, bmcr | BMCR_RESET) {
+        return false;
+    }
+    // Self-clearing, and bounded because a PHY that never clears it is a PHY that is not there.
+    // 100 ms is ten times the datasheet figure for a clause-22 reset.
+    for _ in 0..20 {
+        ctx.sleep_ms(5);
+        if let Some(v) = mdio_read(ctx, m, phy, PHY_BMCR) {
+            if v & BMCR_RESET == 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Wait for autonegotiation to finish and the link to come up, bounded, and report what it settled on.
+///
+/// **The MAC's speed and duplex are programmed from this, so reading it too early programs the wrong
+/// thing.** Bring-up used to take whatever `link()` said at the instant it ran - about two seconds
+/// into boot, while the PHY was still negotiating - and on a slow negotiation that meant configuring
+/// a gigabit MAC as "link down, 0 Mbit/s, half duplex" and hoping the serve loop's edge-detect fixed
+/// it later. It does fix it, twelve seconds later, which is not the same as being right.
+///
+/// WAITS ON THE ANSWER, WITH A BOUND, rather than on a fixed delay - Commandment VIII. A cable that
+/// is genuinely unplugged returns "down" after the ceiling and the driver comes up anyway, serving
+/// with no link, because refusing to start without a cable is how a machine ends up needing a reboot
+/// after someone plugs one in.
+fn wait_for_link(ctx: &ServiceContext, m: &Mmio, phy: u32) -> (bool, u32, bool) {
+    const CEILING_MS: u64 = 5_000;
+    const STEP_MS: u64 = 100;
+    let mut waited = 0;
+    loop {
+        let (up, speed, fd) = link(ctx, m, phy);
+        if up && speed != 0 {
+            ctx.log_fmt(format_args!(
+                "nic-driver: dwmac link settled after {} ms: {} Mbit/s {} duplex",
+                waited, speed, if fd { "full" } else { "half" }));
+            return (up, speed, fd);
+        }
+        if waited >= CEILING_MS {
+            ctx.log_fmt(format_args!(
+                "nic-driver: dwmac no link after {} ms - coming up anyway and serving; the serve loop re-applies when a cable arrives",
+                waited));
+            return (false, 0, false);
+        }
+        ctx.sleep_ms(STEP_MS);
+        waited += STEP_MS;
+    }
 }
