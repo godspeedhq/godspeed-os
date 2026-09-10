@@ -451,12 +451,25 @@ impl Dwmac {
         // Ring length is the LAST INDEX, not the count.
         m.write32(DMA_CH_TX_RING_LEN, (TX_DESCS - 1) as u32);
         m.write32(DMA_CH_RX_RING_LEN, (RX_DESCS - 1) as u32);
-        // Tail pointers. TX starts equal to its base, which means "nothing to send"; RX starts one
-        // past the last descriptor, which means "all of them are yours".
+        // Tail pointers, AND THE TWO SIDES DO NOT MEAN THE SAME THING.
+        //
+        // TX is exclusive: the tail is one past the last descriptor filled, so a base-valued tail
+        // says "nothing to send". RX is NOT. `dwc_eth_qos.c` - the driver that brings this exact IP
+        // up on this exact board - initialises the receive tail to the address of the LAST
+        // DESCRIPTOR, `eqos_get_desc(eqos, EQOS_DESCRIPTORS_RX - 1)`, and hands back a refilled
+        // descriptor by writing THAT descriptor's own address, never the next one.
+        //
+        // This wrote one past the end of the ring, on the reasoning that it should mirror the
+        // transmit side and mean "all of them are yours". The engine disagreed and said so: `RBU`
+        // climbed on a ring whose every descriptor was armed and OWNed by it, which is a reading
+        // that cannot happen unless something is refusing them, and the tail is the only thing that
+        // can. This is a property of the silicon, not of anyone's design, so it is taken from the
+        // reference unchanged (26.14) - and recorded here because the asymmetry is exactly the kind
+        // a reader would otherwise "tidy" back into a bug.
         m.write32(DMA_CH_TX_END, (tx_ring & 0xffff_ffff) as u32);
         m.write32(
             DMA_CH_RX_END,
-            ((rx_ring + (RX_DESCS * DESC_BYTES) as u64) & 0xffff_ffff) as u32,
+            ((rx_ring + ((RX_DESCS - 1) * DESC_BYTES) as u64) & 0xffff_ffff) as u32,
         );
 
         // MTL: store and forward both ways, the queue enabled, the FIFO sizes the part reported.
@@ -704,7 +717,13 @@ impl Dwmac {
         self.desc_write(off, 1, (buf >> 32) as u32);
         self.desc_write(off, 2, 0);
         self.desc_write(off, 3, RDES3_OWN | RDES3_BUF1V | RDES3_IOC);
-        let tail = self.a.phys_at(RX_RING_OFF + i * DESC_BYTES) + DESC_BYTES as u64;
+        // THIS DESCRIPTOR'S OWN ADDRESS, NOT THE NEXT ONE. See the note in `program`: the receive
+        // tail is inclusive where the transmit tail is exclusive, and `eqos_free_pkt` writes the
+        // address of the descriptor it just refilled with `rx_desc_idx` advanced only afterwards.
+        // Writing `+ DESC_BYTES` here handed the engine a tail equal to its own next position, so a
+        // sixteen-deep ring behaved as a one-deep one: every frame that arrived before the driver
+        // came back round was met with no descriptor and counted at `rbu`.
+        let tail = self.a.phys_at(RX_RING_OFF + i * DESC_BYTES);
         self.m.write32(DMA_CH_RX_END, (tail & 0xffff_ffff) as u32);
         self.rx_next = (i + 1) % RX_DESCS;
         n
