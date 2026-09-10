@@ -347,6 +347,10 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
         LOCAL_MAC[0], LOCAL_MAC[1], LOCAL_MAC[2], LOCAL_MAC[3], LOCAL_MAC[4], LOCAL_MAC[5],
         d.dma_status()
     ));
+    // The RGMII transmit sweep, once, before serving. See `rgmii_loopback_sweep` for why this is
+    // the measurement the board's 58% ping loss actually needs.
+    rgmii_loopback_sweep(&ctx, &mut d, phy);
+
     ctx.log("nic-driver: serving the frame interface");
     serve(&ctx, &mut d)
 }
@@ -648,4 +652,109 @@ pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
         before, after, want
     ));
     after == want && chip_after == chip_want
+}
+
+/// PHY BMCR, and its internal loopback bit. IEEE 802.3 clause 22, register 0 bit 14.
+const PHY_BMCR: u32 = 0;
+const BMCR_LOOPBACK: u16 = 1 << 14;
+
+/// Frames per delay setting in the loopback sweep. Small and fixed: this runs once at bring-up and
+/// its job is to separate "most get through" from "most do not", which a dozen frames answers as
+/// well as a thousand and without a second of boot spent on it.
+const LOOPBACK_FRAMES: usize = 12;
+
+/// **Does the RGMII TRANSMIT path work, and at which delay?** Answered locally, with no network.
+///
+/// The board loses 58% of pings to its own gateway one hop away, identically to a public address, so
+/// the loss is ours. Everything else has been eliminated by measurement rather than argument: the
+/// driver hands out every frame the MAC receives, transmits complete with `tdes3 = no-error`, the
+/// address filter reads back correct AND disabling it entirely changed nothing, and 547 frames come
+/// in with ZERO CRC errors - which proves the RGMII RECEIVE path is clean. The one direction never
+/// independently tested is transmit, and the one setting applied without confirmation is its delay.
+///
+/// The PHY's internal loopback closes that. With BMCR bit 14 set, a frame goes MAC -> RGMII -> PHY,
+/// turns around inside the PHY, and comes back RGMII -> MAC. It therefore exercises the transmit
+/// path in exactly the way the wire does, while depending on nothing outside this board - no
+/// gateway, no cable, no far end that might be rate-limiting. If frames come back, the MAC-to-PHY
+/// direction is sound at that delay; if they do not, it is not.
+///
+/// SWEPT rather than tested at one value, because a single reading cannot distinguish "this setting
+/// is wrong" from "loopback does not work here". A curve across the range says which: several
+/// settings passing and one failing is a delay problem, and everything failing means the test itself
+/// proved nothing and should be believed accordingly.
+///
+/// Bounded and restorative: fixed frame count, bounded receive poll, and both the delay and BMCR are
+/// put back before it returns. A diagnostic that leaves a PHY in loopback would take the network down
+/// far more convincingly than the bug it is chasing.
+pub fn rgmii_loopback_sweep(ctx: &ServiceContext, d: &mut Dwmac, phy: u32) {
+    let Some(bmcr0) = mdio_read(ctx, &d.m, phy, PHY_BMCR) else {
+        ctx.log("nic-driver: dwmac loopback sweep SKIPPED - the PHY did not answer");
+        return;
+    };
+    let Some(cfg0) = ytphy_read_ext(ctx, &d.m, phy, YT8521_RGMII_CONFIG1) else {
+        ctx.log("nic-driver: dwmac loopback sweep SKIPPED - could not read the RGMII config");
+        return;
+    };
+    if !mdio_write(ctx, &d.m, phy, PHY_BMCR, bmcr0 | BMCR_LOOPBACK) {
+        ctx.log("nic-driver: dwmac loopback sweep SKIPPED - could not enter loopback");
+        return;
+    }
+
+    // A minimal well-formed frame: broadcast destination, our source, an unused EtherType, padded to
+    // the 60-byte Ethernet minimum so nothing downstream can reject it as a runt. Content does not
+    // matter - only whether the bytes come back.
+    let mut probe = [0u8; 60];
+    probe[..6].copy_from_slice(&[0xff; 6]);
+    probe[6..12].copy_from_slice(&d.mac);
+    probe[12] = 0x88;
+    probe[13] = 0xb5; // IEEE 802.1 local experimental EtherType
+    let mut rx = [0u8; crate::FRAME_MAX];
+
+    for code in [0u16, 5, 10, 15] {
+        let want = (cfg0 & !(RC1R_DELAY_FIELD << RC1R_GE_TX_DELAY_SHIFT))
+            | (code << RC1R_GE_TX_DELAY_SHIFT);
+        if !ytphy_write_ext(ctx, &d.m, phy, YT8521_RGMII_CONFIG1, want) {
+            continue;
+        }
+        // Let the PHY settle after a timing change before trusting anything it does.
+        ctx.sleep_ms(20);
+        while d.receive(&mut rx) != 0 {} // discard anything already in the ring
+
+        let mut sent = 0usize;
+        let mut back = 0usize;
+        for _ in 0..LOOPBACK_FRAMES {
+            if !d.transmit(ctx, &probe) {
+                continue;
+            }
+            sent += 1;
+            // Bounded wait for the turnaround. A loopback is microseconds; a millisecond is three
+            // orders of magnitude of headroom and still terminates on a path that is simply dead.
+            let mut spins = 0u32;
+            loop {
+                let n = d.receive(&mut rx);
+                if n != 0 {
+                    back += 1;
+                    break;
+                }
+                spins += 1;
+                if spins > 20_000 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        ctx.log_fmt(format_args!(
+            "nic-driver: dwmac loopback tx-delay {} ps: sent {}, returned {}",
+            code as u32 * DELAY_STEP_PS,
+            sent,
+            back
+        ));
+    }
+
+    // PUT IT BACK. Both of them, and in this order, so the PHY leaves loopback already carrying the
+    // delay the device tree asked for rather than whichever one the sweep ended on.
+    let _ = ytphy_write_ext(ctx, &d.m, phy, YT8521_RGMII_CONFIG1, cfg0);
+    let _ = mdio_write(ctx, &d.m, phy, PHY_BMCR, bmcr0);
+    ctx.sleep_ms(20);
+    ctx.log("nic-driver: dwmac loopback sweep done - PHY restored");
 }

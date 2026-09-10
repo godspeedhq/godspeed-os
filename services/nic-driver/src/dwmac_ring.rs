@@ -163,8 +163,11 @@ const GMAC_PACKET_FILTER: usize = 0x0008;
 /// unchanged, the frames genuinely are not arriving and the remaining suspect is RGMII transmit
 /// timing.
 ///
-/// It MUST come back out either way - a NIC that hears everything cannot tell you its filter is
-/// broken, which is the whole reason the driver did not start this way (26.7).
+/// ANSWERED, 2026-09-10, and the answer was NO: loss with the filter disabled was 63% against 58%
+/// with it on, and the address register reads back exactly what was written. The filter is innocent
+/// and the frames are genuinely not arriving. Left defined, with the result recorded here, so the
+/// next person to suspect the filter can re-run the experiment in one line rather than argue about
+/// it - and so nobody re-runs it expecting a different answer.
 const GMAC_PACKET_FILTER_PR: u32 = 1 << 0;
 const GMAC_RXQ_CTRL0: usize = 0x00a0;
 /// `GMAC_RX_DCB_QUEUE_ENABLE(0) = BIT(1)`.
@@ -436,9 +439,16 @@ impl Dwmac {
         // Route queue 0 to the DCB path. Without this the MAC receives nothing at all, however
         // correct the ring is: frames arrive and are dropped before they reach the DMA.
         m.write32(GMAC_RXQ_CTRL0, GMAC_RX_QUEUE0_DCB);
-        // PROMISCUOUS, temporarily - see `GMAC_PACKET_FILTER_PR`. Normally 0 (perfect match on our
-        // own address plus broadcast), and it goes back to 0 the moment this experiment has answered.
-        m.write32(GMAC_PACKET_FILTER, GMAC_PACKET_FILTER_PR);
+        // PERFECT MATCH on our own address, plus broadcast. Back to 0: the promiscuous experiment
+        // has answered, and the answer was no. Disabling the filter entirely left the loss at 63%
+        // against 58% with it on, and the address reads back exactly what was written - so the
+        // filter was never rejecting our replies, and a driver that keeps listening to everything
+        // can no longer tell us when it IS wrong.
+        //
+        // `GMAC_PACKET_FILTER_PR` stays defined, with that result written against it, so the next
+        // person to suspect the filter can re-run the same experiment in one line instead of
+        // reasoning about it (26.7).
+        m.write32(GMAC_PACKET_FILTER, 0);
 
         // Our address, in the shape `stmmac_dwmac4_set_mac_addr` writes it: bytes 4 and 5 in the low
         // half of HIGH with the enable bit, bytes 0 to 3 in LOW.
