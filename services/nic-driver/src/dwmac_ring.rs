@@ -266,7 +266,23 @@ const GMAC_ADDR_ENABLE: u32 = 1 << 31;
 /// deep ring buys nothing that the caller's own pacing does not already provide, and every extra
 /// descriptor is arena that something else could be using.
 const TX_DESCS: usize = 4;
-/// Receive descriptors. **Sixteen, and four was the bug.**
+/// Receive descriptors. **Twenty-four, and this number is a MITIGATION, not a fix.**
+///
+/// Four was a bug and sixteen was a guess; the actual bug was the tail pointer (see `receive`), which
+/// made every one of those values behave as ONE. With that fixed the ring is genuinely as deep as it
+/// says, and what it now bounds is how long this driver can go UNASKED before the engine runs out of
+/// descriptors and the MAC starts dropping.
+///
+/// That window is real and was measured: during a `selfcheck` run, with nothing draining the NIC, a
+/// burst of about 32 frames a second arrived and 162 frames came in while 19 were handed on. Nothing
+/// wanted those frames, so nothing broke - but the same gap would drop a frame we DID want.
+///
+/// Twenty-four is simply the most the granted 64 KiB arena affords beside the transmit buffers, so it
+/// buys half again as much slack for free. It does not change the shape of the problem, and the
+/// comment on `DMA_STATUS_RBU` already named the real answer before this was written: if it still
+/// fires, the number is not what is short - the COVERAGE is, and the fix is a driver that harvests
+/// without being asked. That needs somewhere to put frames nobody has requested yet, which is real
+/// work and is recorded in `backlog/` rather than half-done here (26.7).
 ///
 /// The driver is polled: net-stack drains once per scheduler tick, so every frame arriving in a
 /// 10 ms window has to fit in the ring or the MAC drops it - and four 2 KiB buffers is four frames.
@@ -284,7 +300,7 @@ const TX_DESCS: usize = 4;
 /// frames per tick" into "sixteen" - the same 10 ms exposure with four times the headroom. It is a
 /// mitigation rather than a cure: the real fix for a polled receive path is to be woken by the
 /// controller's interrupt, which this port cannot do until the PLIC is wired.
-pub const RX_DESCS: usize = 16;
+pub const RX_DESCS: usize = 24;
 /// A descriptor is four 32-bit words.
 const DESC_BYTES: usize = 16;
 /// One buffer per descriptor. 2048 rather than 1536 because `RBSZ` wants a multiple of the bus width
