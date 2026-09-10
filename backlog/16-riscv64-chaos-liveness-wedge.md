@@ -112,3 +112,73 @@ queued for the next tick when it cannot get it: a deferred free that waits one m
 nothing, and a wait that cannot be preempted costs the machine.
 
 Neutral kernel code, so it lands on every port. Reproduce chaos in QEMU first.
+
+---
+
+## CORRECTION, and the real defect - it is in `arch/riscv64/`, where it should have been looked for first
+
+**The "allocator lock" root cause above is WITHDRAWN.** Checked: `free_frame` wraps `alloc_lock()` in
+`crate::smp::without_interrupts`, exactly as its contract requires, and riscv64 implements masking
+correctly (`local_irq_save` is an atomic `csrrc sstatus, SIE`, not a stub). x86 and ARM reach the same
+`free_frame` on the same path. So nothing there is riscv64-specific and the inference does not survive
+being checked. It was built on a real observation and stated with more confidence than it had earned -
+the same error as citing `crc-err 0`.
+
+The operator's point is what found the real one: **a new ISA is introduced without touching the rest,
+so if the kernel wedges, the fault is in that ISA's own folder.** The neutral scheduler and allocator
+have survived 1000 chaos rounds on x86, 100 on the Pi 2 and max-carnage on the Pi 4. The riscv64 arch
+layer is weeks old. Elimination points one way.
+
+### The defect: `tp` is the kernel's per-hart identity, and userspace owns it
+
+```
+arch/riscv64/trap.rs:436     sd x4, 32(sp)      save the interrupted tp into the frame
+     ... nothing reloads the kernel's hart id ...
+arch/riscv64/trap.rs:488     ld x4, 32(sp)      restore tp FROM THE FRAME on the way out
+```
+
+`x4` is `tp`, and `core_id()` (mod.rs:1531) is `mv {}, tp`. `tp` is written exactly three times in the
+whole port: once at boot (mod.rs:344), once at AP boot (mod.rs:3039), and by that epilogue - which
+writes it on **every return to user mode**, from task state.
+
+So for the entire duration of any trap taken from user mode, the kernel's idea of which hart it is
+running on is whatever the interrupted task last had in `tp`. On RISC-V that register is the
+userspace THREAD POINTER: user code is architecturally entitled to write it.
+
+Everything the wedge involves is indexed by it: `CORE_LAST_TICK_TSC` (the watchdog's own progress
+stamp), `note_stage`, `note_irq`, and every other `PerCore` lookup reached from a trap.
+
+This port's own note calls the invariant out - "tp holds hart id (nothing ever writes it)" - while the
+trap epilogue writes it on every sret. It has been correct by accident, not by construction.
+
+### Why this matters beyond one wedge
+
+A core whose `tp` is wrong stamps ANOTHER core's progress slot, and then looks dark to the liveness
+watchdog while it is demonstrably running. That is the exact captured signature: stage stamps that
+advanced and then froze, an interrupt count IDENTICAL in two panic reports 31 ms apart, and a progress
+slot that never updated.
+
+It is also a Commandment problem, not only a bug: a userspace task can make the kernel misidentify its
+own core by writing one register. Nothing above ring 0 may be able to do that.
+
+**NOT claimed: that this is proven to be the cause of the captured wedge.** It is a defect that must be
+fixed on its own merits, and the wedge's signature is consistent with it. Proving causation means
+fixing it and re-running.
+
+### The fix needs design, not a patch
+
+`sscratch` is already the sp latch (it holds the interrupted `sp` from user, and zero while kernel code
+runs), so there is no free CSR holding per-hart state and no kernel-owned source for the hart id inside
+a trap. Candidates:
+
+1. **`sscratch` points at a small per-hart struct** `{ kernel_sp, hartid }` instead of holding `sp`
+   directly - the standard RISC-V approach (Linux, xv6). Correct, and a real refactor of a delicate
+   entry path.
+2. **Derive the hart id from `sp`** by giving each hart a power-of-two-aligned trap stack and masking.
+   No CSR needed; changes stack allocation.
+3. **Reserve `tp` for the kernel in both privilege modes**, with the epilogue writing the hart id
+   rather than the saved value. Cheapest, and NOT sufficient on its own: a task can still write `tp`
+   between `sret` and its next trap, so the kernel would still be trusting a user-writable register.
+   Rejected for that reason.
+
+(1) is the right one. QEMU can exercise it: `scripts/riscv_run.py --cmd`.
