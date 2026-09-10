@@ -287,6 +287,30 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
             );
         }
     }
+    // AND THE STACK, which is worse to get wrong than the address space.
+    //
+    // The naked half restores `sp` from this same context, and a trap taken from S-mode runs on
+    // whatever `sp` it finds - the handler's very first store goes there. So a garbage kernel stack
+    // pointer does not fault once, it faults forever: the fault handler's own prologue faults, on the
+    // same bad `sp`, before it can reach a single instruction that would report anything. Another
+    // hart that lands on a reclaimed root at least dies in a way `satp` can be checked for; this one
+    // dies with the reporting machinery itself as the casualty.
+    //
+    // Two conditions, and neither can reject a legitimate stack: RISC-V requires `sp` to be
+    // 16-byte aligned by ABI, and a kernel stack is memory the allocator knows about. Garbage fails
+    // one or both nearly always. Checked HERE for the reason the whole function was split - in Rust
+    // this is two calls and a sentence; in the naked half it was neither.
+    //
+    // SAFETY: `next` is a valid context per the caller's contract.
+    let sp = unsafe { (*next).sp };
+    if sp & 0xf != 0 || !crate::memory::allocator::phys_in_ram(sp) {
+        panic!(
+            "switch_context: kernel stack pointer {:#x} is not usable (16-byte aligned={}, in RAM={}).              Restoring it would make the next trap fault on its own prologue, forever, with nothing              able to report it.",
+            sp,
+            sp & 0xf == 0,
+            crate::memory::allocator::phys_in_ram(sp)
+        );
+    }
     // SAFETY: the caller's contract; the address space this returns into is now installed.
     unsafe { riscv64_switch_registers(current, next) }
 }
