@@ -521,6 +521,13 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             // number beside it refutes is worse than no instrument: it is a false lead with a
             // timestamp on it.
             let rbu = if d.rbu == 0 { "" } else { " - THE RING RAN DRY, frames were dropped" };
+            // WHERE THE ENGINE IS, AGAINST WHERE WE THINK IT IS. Printed every hop because a drift
+            // between them is invisible in every other number on this line: `handed` still equals
+            // `MAC rx` while frames are delivered a whole ring late.
+            let (engine, ours) = d.rx_position();
+            ctx.log_fmt(format_args!(
+                "nic-driver: dwmac rx position - engine at {:?}, we poll {} (of {})",
+                engine, ours, crate::dwmac_ring::RX_DESCS));
             ctx.log_fmt(format_args!(
                 "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} | RBU {}{}",
                 rgb, rcrc, tgb, asked, handed, empty, d.rbu, rbu));
