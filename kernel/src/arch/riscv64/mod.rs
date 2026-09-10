@@ -1158,6 +1158,7 @@ pub fn panic_halt_check() {
     // while one printed its post-mortem. Every other hart takes a timer tick within a quantum, so
     // polling here reaches all of them promptly without an IPI that a wedged hart could not answer.
     if DUMPED.load(Ordering::Relaxed) {
+        note_stage(stage::PANIC_HALTED);
         loop {
             // SAFETY: `wfi` is a hint with no operands and no memory effect. Halting rather than
             // spinning keeps the core quiet while the winner writes its dump over the same UART.
@@ -1217,7 +1218,7 @@ pub fn halt_all_cores() -> ! {
             emit_dec_lockfree(sc as u64);
         }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 neutral-tick(past-entry) (syscall NR shown as sN)\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain 16 halted-by-another-hart (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -1530,7 +1531,13 @@ pub mod boot {
         super::TICK_INTERVAL.load(Ordering::Relaxed) as u64
     }
     pub unsafe fn rearm_tsc_deadline() {}
-    pub unsafe fn apic_send_eoi() {}
+    pub unsafe fn apic_send_eoi() {
+        // NOT AN EOI - RISC-V clears the timer interrupt by re-arming the deadline, which
+        // `timer_tick` already did. The neutral tick calls this immediately after
+        // `drain_pending_kstack`, so the empty stub is a free boundary marker in the window a wedge
+        // has now been found in twice. See `stage::TICK_PAST_DRAIN`.
+        super::note_stage(super::stage::TICK_PAST_DRAIN);
+    }
     /// The id of the hart this call is running on.
     ///
     /// # Safety
@@ -2365,6 +2372,21 @@ pub(super) mod stage {
     /// `current_core_id`, which are a store and a register read. A wedge showing this is stuck at or
     /// after the drain.
     pub const NEUTRAL_TICK: u32 = 14;
+    /// Inside `timer_tick_from_irq`, PAST `drain_pending_kstack` and before the progress stamp.
+    ///
+    /// Stamped from `apic_send_eoi`, which is an empty stub on this port and is called on the very
+    /// next line after the drain - so it is the boundary, for free, with no neutral code touched.
+    /// Stage 14 against 15 now separates the two lock-takers left in that window: the drain, which
+    /// takes `KSTACK_USED` and the frame allocator, from `scan_timed_wakes` and the core-0 work after
+    /// it, which take the scheduler's.
+    pub const TICK_PAST_DRAIN: u32 = 15;
+    /// This hart stopped because ANOTHER hart is panicking - it is not the casualty.
+    ///
+    /// Separated because stage 14 was doing both jobs and could not tell them apart: the wedged hart
+    /// rests there, and every healthy hart halted by `panic_halt_check` rested there too, so a dump
+    /// showed four harts at 14 and the reader had to know which one the panic named. An instrument
+    /// whose two meanings need a second instrument to distinguish is one instrument short.
+    pub const PANIC_HALTED: u32 = 16;
     /// Inside `timer_tick`, BEFORE the SBI call that re-arms the deadline.
     ///
     /// The gap between `TRAP_ENTRY` and `TIMER_REARMED` is where a wedged core has now been found
