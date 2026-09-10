@@ -47,6 +47,14 @@ const DMA_CH_RX_END: usize = CH + 0x28;
 const DMA_CH_TX_RING_LEN: usize = CH + 0x2c;
 const DMA_CH_RX_RING_LEN: usize = CH + 0x30;
 const DMA_CH_STATUS: usize = CH + 0x60;
+/// `DMA_CHAN_STATUS_RBU = BIT(7)` - RECEIVE BUFFER UNAVAILABLE: the engine wanted a descriptor and
+/// this driver had not given it one, so the frame was dropped. Write-one-to-clear.
+///
+/// This is the MAC saying "you were too slow" in as many words, and nothing has ever read it. It is
+/// the difference between a ring-size THEORY and a ring-size measurement, so it is latched and
+/// counted even after the ring is enlarged - if it still fires with sixteen descriptors, sixteen is
+/// not enough either and the answer is interrupts rather than a bigger number.
+const DMA_STATUS_RBU: u32 = 1 << 7;
 /// `DMA_CONTROL_ST` and `DMA_CONTROL_SR` are both `BIT(0)`, in their own registers.
 const DMA_CONTROL_START: u32 = 1 << 0;
 /// `DMA_CONTROL_OSP` - operate on second packet, so the engine does not stall between frames.
@@ -182,7 +190,25 @@ const GMAC_ADDR_ENABLE: u32 = 1 << 31;
 /// deep ring buys nothing that the caller's own pacing does not already provide, and every extra
 /// descriptor is arena that something else could be using.
 const TX_DESCS: usize = 4;
-const RX_DESCS: usize = 4;
+/// Receive descriptors. **Sixteen, and four was the bug.**
+///
+/// The driver is polled: net-stack drains once per scheduler tick, so every frame arriving in a
+/// 10 ms window has to fit in the ring or the MAC drops it - and four 2 KiB buffers is four frames.
+/// A quiet LAN still bursts well past four frames in 10 ms (ARP, mDNS, broadcast), and each burst
+/// takes whatever else was in the ring with it.
+///
+/// Three independent readings say this, and none of them needed a theory:
+/// - every successful ping is EXACTLY 10 ms, which is the drain interval, not a round trip;
+/// - promiscuous mode made loss WORSE, 63% against 58% - more traffic, more overflow, which is
+///   backwards for every other candidate and forwards for this one;
+/// - the loss is binary. A frame either arrives promptly or never, which is what a dropped frame
+///   looks like and not what marginal timing looks like.
+///
+/// Sixteen because that is what the arena affords beside the transmit buffers, and it turns "four
+/// frames per tick" into "sixteen" - the same 10 ms exposure with four times the headroom. It is a
+/// mitigation rather than a cure: the real fix for a polled receive path is to be woken by the
+/// controller's interrupt, which this port cannot do until the PLIC is wired.
+const RX_DESCS: usize = 16;
 /// A descriptor is four 32-bit words.
 const DESC_BYTES: usize = 16;
 /// One buffer per descriptor. 2048 rather than 1536 because `RBSZ` wants a multiple of the bus width
@@ -272,6 +298,9 @@ pub struct Dwmac {
     /// The last TDES3 the hardware wrote back, kept so the serve loop can report WHY a transmit
     /// failed rather than only that it did.
     pub last_tx_status: u32,
+    /// Times the engine reported RECEIVE BUFFER UNAVAILABLE - frames dropped because this driver had
+    /// not re-armed a descriptor in time. Cumulative; cleared in the hardware as it is counted.
+    pub rbu: u32,
     tx_next: usize,
     rx_next: usize,
 }
@@ -335,7 +364,7 @@ impl Dwmac {
             return None;
         }
 
-        let mut d = Dwmac { m, a, mac, per_10ms: ctx.tsc_ticks_per_10ms(), last_tx_status: 0, tx_next: 0, rx_next: 0 };
+        let mut d = Dwmac { m, a, mac, per_10ms: ctx.tsc_ticks_per_10ms(), last_tx_status: 0, rbu: 0, tx_next: 0, rx_next: 0 };
         if d.per_10ms == 0 {
             // Said once, here, rather than letting every bound below quietly change meaning. The
             // machine still works; its timeouts are counted instead of measured.
@@ -638,6 +667,14 @@ impl Dwmac {
     ///
     /// Never blocks. An empty ring is an ordinary answer, not a failure: the caller polls.
     pub fn receive(&mut self, out: &mut [u8]) -> usize {
+        // ASK THE ENGINE WHETHER IT HAD TO DROP ANYTHING, before looking at what it kept. Checked
+        // here rather than on a timer because this is the moment the answer is about: RBU means a
+        // frame arrived while every descriptor was still ours.
+        let st = self.m.read32(DMA_CH_STATUS);
+        if st & DMA_STATUS_RBU != 0 {
+            self.rbu = self.rbu.saturating_add(1);
+            self.m.write32(DMA_CH_STATUS, DMA_STATUS_RBU); // write-one-to-clear
+        }
         let i = self.rx_next;
         let off = RX_RING_OFF + i * DESC_BYTES;
         let d3 = self.desc_read(off, 3);

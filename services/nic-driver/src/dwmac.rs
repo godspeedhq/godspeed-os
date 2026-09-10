@@ -347,9 +347,16 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
         LOCAL_MAC[0], LOCAL_MAC[1], LOCAL_MAC[2], LOCAL_MAC[3], LOCAL_MAC[4], LOCAL_MAC[5],
         d.dma_status()
     ));
-    // The RGMII transmit sweep, once, before serving. See `rgmii_loopback_sweep` for why this is
-    // the measurement the board's 58% ping loss actually needs.
-    rgmii_loopback_sweep(&ctx, &mut d, phy);
+    // NOT RUN. The sweep returned `sent 12, returned 0` at all four delays, which is the outcome
+    // its own doc comment names as proving nothing: everything failing means the loopback never
+    // engaged, not that transmit is broken at every setting. A YT8531 wants autoneg disabled and the
+    // speed forced before BMCR bit 14 does anything, and this did neither.
+    //
+    // Kept rather than deleted because the reasoning behind it is sound and the fix is small - if
+    // the receive ring turns out not to be the whole story, this is the next instrument and it
+    // wants one addition, not a rewrite. Running it now would cost a second of every boot to print
+    // four zeros nobody should read.
+    let _ = rgmii_loopback_sweep;
 
     ctx.log("nic-driver: serving the frame interface");
     serve(&ctx, &mut d)
@@ -490,8 +497,8 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             // does not, the frames are arriving and this driver is losing them. If neither climbs,
             // they never reached the MAC and the fault is below us.
             ctx.log_fmt(format_args!(
-                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} (rx-handed = frames the MAC flagged bad)",
-                rgb, rcrc, tgb, asked, handed, empty));
+                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} | RBU {} (ring ran dry - frames DROPPED)",
+                rgb, rcrc, tgb, asked, handed, empty, d.rbu));
             let _ = tg;
         }
     }
@@ -683,9 +690,16 @@ const LOOPBACK_FRAMES: usize = 12;
 /// settings passing and one failing is a delay problem, and everything failing means the test itself
 /// proved nothing and should be believed accordingly.
 ///
+/// **RUN 2026-09-10: `sent 12, returned 0` at ALL FOUR delays - so it proved nothing, exactly as the
+/// paragraph above says to read that.** The loopback never engaged: a YT8531 wants autoneg disabled
+/// and the speed forced before BMCR bit 14 does anything, and this does neither. Not deleted,
+/// because the reasoning holds and the fix is one addition rather than a rewrite - but not run
+/// either, since a second of every boot spent printing four zeros is worse than nothing.
+///
 /// Bounded and restorative: fixed frame count, bounded receive poll, and both the delay and BMCR are
 /// put back before it returns. A diagnostic that leaves a PHY in loopback would take the network down
 /// far more convincingly than the bug it is chasing.
+#[allow(dead_code)]
 pub fn rgmii_loopback_sweep(ctx: &ServiceContext, d: &mut Dwmac, phy: u32) {
     let Some(bmcr0) = mdio_read(ctx, &d.m, phy, PHY_BMCR) else {
         ctx.log("nic-driver: dwmac loopback sweep SKIPPED - the PHY did not answer");
