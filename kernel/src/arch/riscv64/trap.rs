@@ -141,6 +141,27 @@ pub struct TrapFrame {
     pub x: [u64; 32],
     pub sepc: u64,
     pub sstatus: u64,
+    /// **This hart's id, parked by the kernel so it never has to ask userspace who it is.**
+    ///
+    /// `core_id()` on this port is `mv {}, tp`, and every per-core structure the kernel reaches from
+    /// a trap is indexed by it - the run queue, `note_stage`, `note_irq`, and `CORE_LAST_TICK_TSC`,
+    /// which is the liveness watchdog's own progress stamp. `tp` was written exactly three times in
+    /// the whole port: once at boot, once at AP boot, and by the trap EPILOGUE, which restored it
+    /// from this frame on every single return to user mode.
+    ///
+    /// On RISC-V `tp` is the userspace THREAD POINTER. A task is architecturally entitled to write
+    /// it, and the epilogue handed whatever it wrote straight back to the kernel on the next trap.
+    /// So the kernel's identity was correct by accident rather than by construction, and a task that
+    /// changed one register could make a hart stamp ANOTHER hart's progress slot - at which point the
+    /// watchdog sees a core that is demonstrably running as dark, and panics the machine. That is
+    /// something above ring 0 halting the kernel, which is the one thing nothing may do.
+    ///
+    /// The fix keeps the register but stops trusting it. The epilogue parks the KERNEL's `tp` here on
+    /// the way out to user, and the prologue loads it back on the way in - kernel-owned memory on the
+    /// task's own kernel stack, which user code cannot reach. The user's `tp` is still saved and
+    /// restored exactly as before, so the ABI is untouched; the kernel simply stops asking it a
+    /// question only the kernel can answer.
+    pub hartid: u64,
 }
 
 impl TrapFrame {
@@ -383,13 +404,16 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
 
 /// Bytes of stack a trap frame occupies. Deliberately larger than the struct so `sp` stays 16-byte
 /// aligned, as the RISC-V ABI requires at a call - and `trap_dispatch` is a call.
-const FRAME_BYTES: usize = 288;
+pub(super) const FRAME_BYTES: usize = 288;
 const _: () = assert!(core::mem::size_of::<TrapFrame>() <= FRAME_BYTES);
 const _: () = assert!(FRAME_BYTES % 16 == 0);
 
 /// Byte offsets of the two CSR fields, so the assembly below and `TrapFrame` cannot drift.
 const OFF_SEPC: usize = 32 * 8;
 const OFF_SSTATUS: usize = 33 * 8;
+/// Where the kernel parks its own hart id. Inside `FRAME_BYTES` (288) but past the 34 words above,
+/// so adding it costs no stack: the frame was already rounded up for 16-byte alignment.
+pub(super) const OFF_HARTID: usize = 34 * 8;
 
 /// Trap entry: land on a kernel stack, save everything, dispatch, restore, return.
 ///
@@ -434,6 +458,21 @@ unsafe extern "C" fn trap_entry() -> ! {
         "sd x1, 8(sp)",
         "sd x3, 24(sp)",
         "sd x4, 32(sp)",
+        // WE ARE THE KERNEL; TAKE BACK OUR OWN IDENTITY. `x4` is `tp`, and it currently holds
+        // whatever the INTERRUPTED code had - which, from user mode, is the task's thread pointer and
+        // entirely the task's to choose. `core_id()` reads this register, so every per-core lookup
+        // below depends on it being ours. It is reloaded from the frame slot the epilogue parked it
+        // in, which lives on this task's kernel stack where user code cannot reach.
+        //
+        // Only on the path FROM USER. A trap taken from S-mode is already running with our `tp`, and
+        // its frame's slot holds nothing meaningful - reloading there would replace a correct value
+        // with a stale one. `x5` is free here: it was saved first and its contents are already in
+        // the frame.
+        "csrr x5, sstatus",
+        "andi x5, x5, {spp}",
+        "bnez x5, 3f",
+        "ld x4, {hartid}(sp)",
+        "3:",
         "sd x6, 48(sp)",
         "sd x7, 56(sp)",
         "sd x8, 64(sp)",
@@ -482,6 +521,11 @@ unsafe extern "C" fn trap_entry() -> ! {
         "bnez x5, 2f",
         "addi x5, sp, {frame}",
         "csrw sscratch, x5",
+        // PARK OUR HART ID FOR THE NEXT TRAP, in the same breath as arming the stack latch and for
+        // the same reason: both are state the kernel will need back and cannot ask user mode for.
+        // `x4` still holds the KERNEL's `tp` here - the restores below are what overwrite it with the
+        // user's. This runs only on the return-to-user branch, which is the only path that loses it.
+        "sd x4, {hartid}(sp)",
         "2:",
         "ld x1, 8(sp)",
         "ld x3, 24(sp)",
@@ -520,6 +564,7 @@ unsafe extern "C" fn trap_entry() -> ! {
         frame = const FRAME_BYTES,
         sepc = const OFF_SEPC,
         sstatus = const OFF_SSTATUS,
+        hartid = const OFF_HARTID,
         spp = const SSTATUS_SPP,
         dispatch = sym trap_dispatch,
     )

@@ -174,6 +174,16 @@ unsafe extern "C" fn first_entry_trampoline() -> ! {
 unsafe extern "C" fn user_entry_trampoline() -> ! {
     core::arch::naked_asm!(
         "csrw sscratch, sp",
+        // SEED THIS TASK'S HART-ID SLOT, because this is the one `sret` that does not go through the
+        // trap epilogue and so is the one place that would otherwise leave it unwritten.
+        //
+        // The latch just armed makes `sp` the address the next trap's frame will END at, so that
+        // frame occupies `[sp - FRAME_BYTES, sp)` and its hart-id word sits at
+        // `sp - FRAME_BYTES + OFF_HARTID`. `tp` is the kernel's here - this runs in S-mode on the
+        // hart that is about to own the task - which is exactly the value the prologue needs to find.
+        // Without this the first trap from a freshly spawned task would load an uninitialised word
+        // into `tp` and the kernel would misidentify its own core for as long as that task ran.
+        "sd tp, {hartid_from_latch}(sp)",
         "csrw sepc, s0",
         "li   t0, {spp}",
         "csrc sstatus, t0",
@@ -204,6 +214,7 @@ unsafe extern "C" fn user_entry_trampoline() -> ! {
         "fence",
         "fence.i",
         "sret",
+        hartid_from_latch = const (crate::arch::riscv64::trap::OFF_HARTID as isize - crate::arch::riscv64::trap::FRAME_BYTES as isize),
         spp = const 1u64 << 8,
         spie = const 1u64 << 5,
     )
