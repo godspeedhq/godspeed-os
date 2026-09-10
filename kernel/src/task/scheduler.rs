@@ -2621,6 +2621,17 @@ pub fn kill_task_by_slot(slot: usize) {
             let my_core = current_core_id();
             for cid in 0..num_cores() {
                 if cid == my_core { continue; }
+                // BOUNDED, AND IT NAMES THE BLOCKER. This was an unbounded spin, which is a 26.6 violation in
+                // the one place that can least afford it: the wait runs inside a syscall with interrupts
+                // masked, so a core that never releases the slot does not merely delay this kill - it takes
+                // this core out too. A capture showed exactly that, and the cost was diagnostic as much as
+                // operational: the liveness watchdog then fired against the WAITER, reporting "core 0 made no
+                // progress" about a core whose only fault was waiting correctly for one that had already died.
+                //
+                // A quarter of the liveness deadline, so this fires FIRST and gets to say the useful thing -
+                // which core is holding what - rather than leaving the watchdog to blame the wrong one.
+                let budget = crate::arch::imp::liveness_deadline_cycles() / 4;
+                let t0 = crate::arch::imp::read_cycle_counter();
                 loop {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
@@ -2630,6 +2641,14 @@ pub fn kill_task_by_slot(slot: usize) {
                     // miss each other. (The fence is now redundant but harmless.)
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                     if !core_still_using(cid, slot) { break; }
+                    if budget > 0 && crate::arch::imp::read_cycle_counter().wrapping_sub(t0) > budget {
+                        panic!(
+                            "kill: core {} has not released task slot {} after {} counter ticks (CORE_CURRENT={}, CORE_LEAVING={}). It is running or leaving a task this kill must reclaim and is not making progress, so this core cannot safely free the stack and page tables - and will not wait forever pretending it can.",
+                            cid, slot, budget,
+                            CORE_CURRENT.get(cid).load(Ordering::SeqCst),
+                            CORE_LEAVING.get(cid).0.load(Ordering::SeqCst),
+                        );
+                    }
                     core::hint::spin_loop();
                 }
             }
