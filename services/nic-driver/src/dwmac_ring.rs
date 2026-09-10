@@ -119,8 +119,22 @@ const DEBUG_TFCSTS_SHIFT: u32 = 17;
 const MMC_BASE: usize = 0x0700;
 /// Frames the MAC counted as transmitted, good OR bad.
 const MMC_TX_FRAMECOUNT_GB: usize = MMC_BASE + 0x18;
-/// Frames the MAC counted as transmitted GOOD. If GB climbs and G does not, the MAC itself knows the
-/// transmissions are failing, and the difference is the whole diagnosis.
+/// **Frames transmitted GOOD - and this register does NOT hold that on this part.**
+///
+/// The offset is what `mmc_core.c` lists, and it reads ZERO on every sample while the same run
+/// completes a DHCP lease, resolves DNS, answers ARP and gets 27 ping replies back from the public
+/// internet. Transmission plainly works, and the per-frame descriptor write-back agrees - `tdes3 =
+/// no-error`, every time. So the register is not the good-frame count here, whatever the table says.
+///
+/// Kept and read, but no longer REPORTED as "good", because a counter that says zero next to a
+/// working network is worse than no counter: it is a fact-shaped thing pointing the wrong way, and
+/// it already cost one round of chasing a transmit path that was never broken. The good/bad SPLIT is
+/// the claim being withdrawn; `MMC_TX_FRAMECOUNT_GB` counts correctly and is what gets printed.
+///
+/// Recorded rather than silently deleted (26.7): if someone needs a good-frame count on this part,
+/// the offset wants finding in the JH7110 documentation rather than inherited from a driver table
+/// that covers several DesignWare generations.
+#[allow(dead_code)]
 const MMC_TX_FRAMECOUNT_G: usize = MMC_BASE + 0x68;
 /// The FIFO ran dry mid-frame - the classic symptom of a transmit clock that is too slow or stopped.
 const MMC_TX_UNDERFLOW_ERROR: usize = MMC_BASE + 0x48;

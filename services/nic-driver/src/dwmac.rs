@@ -486,8 +486,9 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             // does not, the frames are arriving and this driver is losing them. If neither climbs,
             // they never reached the MAC and the fault is below us.
             ctx.log_fmt(format_args!(
-                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {}/{} | drains asked {} handed {} empty {}",
-                rgb, rcrc, tg, tgb, asked, handed, empty));
+                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} (rx-handed = frames the MAC flagged bad)",
+                rgb, rcrc, tgb, asked, handed, empty));
+            let _ = tg;
         }
     }
 }
