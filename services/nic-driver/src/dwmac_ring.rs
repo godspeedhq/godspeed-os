@@ -497,16 +497,29 @@ impl Dwmac {
         // Route queue 0 to the DCB path. Without this the MAC receives nothing at all, however
         // correct the ring is: frames arrive and are dropped before they reach the DMA.
         m.write32(GMAC_RXQ_CTRL0, GMAC_RX_QUEUE0_DCB);
-        // PERFECT MATCH on our own address, plus broadcast. Back to 0: the promiscuous experiment
-        // has answered, and the answer was no. Disabling the filter entirely left the loss at 63%
-        // against 58% with it on, and the address reads back exactly what was written - so the
-        // filter was never rejecting our replies, and a driver that keeps listening to everything
-        // can no longer tell us when it IS wrong.
+        // PROMISCUOUS, AND THIS IS A RE-RUN, NOT A REPEAT. The result recorded here previously - "63%
+        // loss with the filter off against 58% with it on, so the filter is innocent" - was measured
+        // through a receive ring that was running ONE DESCRIPTOR DEEP because the tail pointer was off
+        // by one (see `receive`). Every reading taken before that was fixed is void, this one loudest,
+        // because a ring that drops frames and a filter that rejects them produce the same number.
         //
-        // `GMAC_PACKET_FILTER_PR` stays defined, with that result written against it, so the next
-        // person to suspect the filter can re-run the same experiment in one line instead of
-        // reasoning about it (26.7).
-        m.write32(GMAC_PACKET_FILTER, 0);
+        // What makes it worth spending a boot on now is that the shape of the fault has narrowed to
+        // exactly what this register controls. Broadcast reception is reliable - DHCP DISCOVER draws an
+        // OFFER first try on every boot, and background broadcast frames arrive throughout. Unicast
+        // reception is not: about 43%, and during a failing 900 ms ping window the count of frames
+        // addressed to our own MAC is ZERO while broadcast frames keep arriving. The address filter is
+        // the only thing in this MAC that tells those two apart.
+        //
+        // So: listen to everything for one boot and see which way it falls. If the loss collapses, the
+        // filter is rejecting frames that are arriving and the next question is why a perfect-match
+        // comparison against an address that reads back correctly is failing at all. If the loss is
+        // unchanged AND frames addressed to us are still absent while everyone else's unicast now
+        // floods in, the frames genuinely never reach this MAC, the filter is cleared for good, and
+        // what remains is the transmit direction.
+        //
+        // NOT A SETTING. A driver that listens to everything cannot tell us when its filter is wrong,
+        // and this goes back to 0 the moment the question is answered either way.
+        m.write32(GMAC_PACKET_FILTER, GMAC_PACKET_FILTER_PR);
 
         // Our address, in the shape `stmmac_dwmac4_set_mac_addr` writes it: bytes 4 and 5 in the low
         // half of HIGH with the enable bit, bytes 0 to 3 in LOW.
@@ -560,6 +573,12 @@ impl Dwmac {
             lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff, (lo >> 24) & 0xff,
             hi & 0xff, (hi >> 8) & 0xff, (hi >> 31) & 1,
             self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]));
+        // SAY SO, EVERY BOOT, WHILE IT IS ON. A diagnostic that is silent about itself is how a
+        // temporary experiment becomes a permanent setting nobody remembers choosing - and this one
+        // disables the very mechanism whose innocence it is testing.
+        if self.m.read32(GMAC_PACKET_FILTER) & GMAC_PACKET_FILTER_PR != 0 {
+            ctx.log("nic-driver: dwmac PROMISCUOUS - the address filter is OFF for this image only, to                      settle whether it is what drops our unicast. This is NOT a setting.");
+        }
     }
 
     /// Re-apply just the speed and duplex, for a cable that arrived after bring-up.
