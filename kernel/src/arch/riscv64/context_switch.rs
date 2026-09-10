@@ -259,6 +259,24 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         // such a task.
         "ld t0, {off_cr3}(a1)",
         "beqz t0, 2f",
+        // CHECK THE ROOT BEFORE INSTALLING IT, because installing a bad one cannot be reported.
+        //
+        // `csrw satp` takes effect immediately. If `t0` is a RECLAIMED root - a frame freed by a kill
+        // and handed to something else - the very next instruction fetch happens in an address space
+        // where this kernel's text is no longer mapped, and the resulting fault cannot be handled
+        // either: `stvec` points into the same dead space. The hart enters a hardware fault loop with
+        // no output, no interrupts and no panic. From outside it is simply dark, and the only thing
+        // that ever notices is another hart's liveness watchdog, ten seconds later.
+        //
+        // Same class as the unguarded page-table walk in `sv39`, one layer up, and the same answer: a
+        // physical address that came from reclaimable memory is checked before it is dereferenced -
+        // or here, before it becomes the thing every fetch dereferences THROUGH. Two conditions, four
+        // instructions: page-aligned as a root must be, and below the top of RAM the allocator knows.
+        "slli t3, t0, 52",
+        "bnez t3, 3f",
+        "la   t3, {ram_limit}",
+        "ld   t3, 0(t3)",
+        "bgeu t0, t3, 3f",
         // Build the `satp` encoding the field does not carry: PPN in the low 44 bits, MODE 8 (Sv39)
         // in the top four. Done here so no caller has to know the register's shape.
         "srli t2, t0, 12",
@@ -288,6 +306,15 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         // The fence is not optional and not a tidy-up: `satp` takes effect immediately, but stale
         // translations from the outgoing space would keep satisfying accesses that no longer exist.
         "sfence.vma",
+                "j    2f",
+        // REFUSED. Record the offending root and DO NOT install it: continuing in the outgoing
+        // space means the task faults in a way the kernel can see, report and kill - which is
+        // recoverable - where installing it means a hart that is gone with nothing to read.
+        // `panic_halt_check` runs every tick and prints this once, so it is loud rather than
+        // silently survived (invariant 12).
+        "3:",
+        "la   t3, {bad_root}",
+        "sd   t0, 0(t3)",
         "2:",
         // ---- restore the incoming context from *a1 ----
         "ld ra, 0x00(a1)",
@@ -306,6 +333,8 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         "ld s11, 0x68(a1)",
         "ret",
         off_cr3 = const OFF_CR3,
+        ram_limit = sym super::RAM_LIMIT_PHYS,
+        bad_root = sym super::BAD_SATP_ROOT,
     )
 }
 

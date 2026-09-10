@@ -589,6 +589,17 @@ pub fn total_frame_count() -> usize {
 /// `max_valid_frame` (usable only) - Limine places the kernel's initial page tables in bootloader-
 /// reclaimable RAM above usable RAM, and walking those legit tables must not false-positive (else the
 /// guard floods). Set once at init, immutable after, so this is lock-free.
+/// One past the highest RAM-backed physical address the allocator knows about.
+///
+/// The same fact `phys_in_ram` answers, as a NUMBER rather than a call, because one caller cannot
+/// make a call: `arch/riscv64`'s context switch is a naked function, and the `satp` it installs there
+/// has to be checked before it is written or the hart executes into an address space that may no
+/// longer exist. Exposed here rather than recomputed, so the two can never disagree.
+pub fn ram_limit_phys() -> u64 {
+    // SAFETY: read-only; max_ram_frame is set once at init, never mutated after.
+    unsafe { (ALLOCATOR.max_ram_frame as u64) * FRAME_SIZE }
+}
+
 pub fn phys_in_ram(phys: u64) -> bool {
     // SAFETY: read-only; max_ram_frame is set once at init, never mutated after.
     let idx = (phys / FRAME_SIZE) as usize;

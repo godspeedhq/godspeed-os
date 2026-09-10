@@ -521,6 +521,10 @@ riscv64: S-mode entered, 16550 UART alive
             // facts, not by teaching it anything. Everything it needs came from the device tree or
             // the link, so nothing inside it knows which machine it is on.
             crate::memory::init(&bi);
+            // The context switch's `satp` guard cannot call `phys_in_ram` - it is naked assembly - so
+            // it reads this instead. Seeded HERE, the instant the allocator knows the answer and
+            // before any address space exists to switch into. See `RAM_LIMIT_PHYS`.
+            RAM_LIMIT_PHYS.store(crate::memory::allocator::ram_limit_phys(), Ordering::Release);
 
             // Keep walking `kernel_main`'s own sequence. Each of these is shared code that needs
             // nothing from the MMU, so they run now rather than waiting behind Sv39 - and each one
@@ -1149,8 +1153,37 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
 /// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
 /// see the aarch64 implementation for the shape (a published flag, checked here).
+/// One past the top of RAM, in physical addresses, for the context switch's `satp` guard.
+///
+/// A NUMBER rather than a call because the only caller cannot make one: `switch_context` is a naked
+/// function. Seeded once from `memory::allocator::ram_limit_phys` after the allocator is up; zero
+/// until then, which the guard reads as "refuse everything" and is the safe direction - no user
+/// address space exists before the allocator does.
+pub static RAM_LIMIT_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The last page-table root the context switch REFUSED to install, or zero if it never has.
+///
+/// Written from the naked switch, which has nowhere to report from, and read by `panic_halt_check` on
+/// the next tick. A refusal means the kernel was about to hand a hart an address space that is not
+/// backed by RAM - the switch surviving it is recovery, and recovery that is not reported is exactly
+/// the silent fallback invariant 12 forbids.
+pub static BAD_SATP_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+static BAD_SATP_REPORTED: AtomicBool = AtomicBool::new(false);
+
 pub fn panic_halt_check() {
     note_stage(stage::NEUTRAL_TICK);
+    // SAY IT ONCE, on the first tick after a refusal. See `BAD_SATP_ROOT`.
+    let bad = BAD_SATP_ROOT.load(Ordering::Relaxed);
+    if bad != 0 && !BAD_SATP_REPORTED.swap(true, Ordering::Relaxed) {
+        print_str("riscv64: context switch REFUSED a page-table root outside RAM - ");
+        print_hex(bad);
+        print_str("
+  The task was left in the outgoing address space and will fault where the kernel
+");
+        print_str("  can see it. Installing it would have made this hart dark with nothing to read.
+");
+    }
     // AND STOP, IF THE MACHINE IS ALREADY DYING. x86 leaves this a stub because it halts its
     // siblings with an NMI broadcast; RISC-V has no NMI, which is exactly why this seam member
     // exists and why leaving it empty here left `halt_all_cores` halting only the hart that called
