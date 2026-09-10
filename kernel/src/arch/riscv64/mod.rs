@@ -2522,10 +2522,35 @@ pub fn serial_unlocked_emit_count() -> u64 { 0 }
 /// Returns false until S-mode user pages exist. Refusing is the safe direction: a caller that cannot
 /// read user memory fails its syscall, where a caller that wrongly SUCCEEDS reads someone else's.
 
-/// Is a driver's DMA arena mapped uncached? True until Sv39 attributes are wired, because assuming
-/// COHERENT when it is not gives a driver silently stale descriptors - the failure that cannot be
-/// debugged from a log.
-pub const DMA_ARENA_UNCACHED: bool = true;
+/// Is a driver's DMA arena mapped uncached? **No - and on this port that is the truthful answer, not
+/// a deferral.**
+///
+/// This read `true`, on the reasoning that assuming COHERENT when you are not gives a driver silently
+/// stale descriptors, and that the flag could be honoured "until Sv39 attributes are wired". Both
+/// halves were wrong in a way worth stating, because the constant was making a claim the machine
+/// never carried out.
+///
+/// **It was never honoured.** `sv39::flags_to_pte_bits` builds `V|R|W|X|U|A|D` and nothing else;
+/// `PageFlags::PCD` is discarded on the way into a PTE. So every arena this port has ever handed a
+/// driver was ordinary cacheable write-back while the kernel believed it had mapped it uncached - a
+/// silent fallback at exactly the boundary invariant 12 exists to keep honest.
+///
+/// **And there is nothing to wire.** Sv39 has no memory-type field, this part implements neither
+/// `Svpbmt` nor `Zicbom` (see `fb_commit`, where the television proved it), so there is no page
+/// attribute that could say "uncached" and no cache-block instruction a driver could use instead.
+/// Leaving `true` in place would have kept a promise open that this silicon cannot ever keep.
+///
+/// **The arena does not need it.** DMA to a driver's arena is COHERENT with the CPU caches here, and
+/// that is hardware evidence rather than an inference from the device tree's silence - which
+/// `fb_commit` records being burned by. `xhci` takes its arena through this same path and enumerates
+/// devices over it: the controller reads TRBs the service wrote and writes back event TRBs the
+/// service reads, thousands of round trips, and the keyboard, hot-plug on every port, and mass
+/// storage all work. Non-coherent memory does not do that intermittently; it does not do it at all.
+///
+/// The DISPLAY is the exception on this SoC, not the rule - coherence here is per master - and the
+/// kernel already owns that case explicitly in `publish_framebuffer_on_tick`, at a stated rate with a
+/// measured cost. A driver arena needs no such treatment, and now says so for the true reason.
+pub const DMA_ARENA_UNCACHED: bool = false;
 /// Virtual base at which a driver's DMA arena is mapped.
 pub const DRIVER_DMA_VA: u64 = 0x7000_0000;
 
