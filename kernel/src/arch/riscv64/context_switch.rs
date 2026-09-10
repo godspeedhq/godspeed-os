@@ -235,8 +235,64 @@ unsafe extern "C" fn user_entry_trampoline() -> ! {
 /// Both pointers must be valid `TaskContext`s, and `next` must describe a resumable task: a real
 /// return address, a stack that belongs to it, and either a valid Sv39 root or zero. Returning here
 /// means some other context switched back.
-#[unsafe(naked)]
+/// Switch address space, then registers - **in that order, and split for the reason the Pi 4 is split.**
+///
+/// This used to be ONE naked function that did both, with the `satp` write buried in the middle of the
+/// register save. That shape has a cost that only shows up when something goes wrong: naked assembly
+/// cannot call anything, so it cannot check what it is about to install and it cannot say a word if
+/// the value is impossible. `arch/aarch64` already does it the other way - `switch_context` there is
+/// ordinary Rust that installs `ttbr0_el1` and then calls a naked `aarch64_switch_context` for the
+/// registers alone - and that is the shape adopted here.
+///
+/// **What the split buys is the difference between a crash and a disappearance.** `csrw satp` takes
+/// effect immediately: hand it a RECLAIMED root - a frame freed by a kill and handed to something
+/// else - and the very next instruction fetch happens in an address space where this kernel's text is
+/// no longer mapped. The fault cannot be handled either, because `stvec` points into that same dead
+/// space. The hart enters a hardware fault loop with no output, no interrupts and no panic; from
+/// outside it is simply dark, and the only thing that ever notices is another hart's liveness
+/// watchdog ten seconds later, reporting a core stuck for a reason it cannot name. That is this
+/// port's chaos wedge, and it cost several boots to corner precisely because nothing could speak.
+///
+/// So the root is checked HERE, where checking is a function call and failing is a sentence. A root
+/// that is not page-aligned or not inside RAM the allocator knows about is a kernel bug, and the
+/// answer to a kernel bug is to say so and stop - loudly, bounded, with the value in hand - rather
+/// than install it and vanish, or skip it and let a task run in somebody else's address space.
+///
+/// # Safety
+/// As the naked half, plus: `next.cr3` must be a live page-table root, since it is installed before
+/// the register switch and the very next instruction fetch translates through it.
 pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {
+    // SAFETY: `next` is a valid context per the caller's contract.
+    let root = unsafe { (*next).cr3 };
+    if root != 0 {
+        // Zero means "keep whatever root is live" - the kernel's own contexts are entered that way,
+        // and there is nothing to validate or install.
+        if root & 0xfff != 0 || !crate::memory::allocator::phys_in_ram(root) {
+            panic!(
+                "switch_context: page-table root {:#x} is not installable (aligned={}, in RAM={}).                  Installing it would leave this hart executing in an address space that does not                  exist, unable to fetch the fault handler that would have reported it.",
+                root,
+                root & 0xfff == 0,
+                crate::memory::allocator::phys_in_ram(root)
+            );
+        }
+        // SAFETY: `root` has just been checked to be a page-aligned physical address inside RAM. The
+        // encoding is PPN in the low 44 bits with MODE 8 (Sv39). The fence is not optional: `satp`
+        // takes effect immediately, but stale translations from the outgoing space survive it.
+        unsafe {
+            core::arch::asm!(
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) (root >> 12) | (8u64 << 60),
+                options(nostack),
+            );
+        }
+    }
+    // SAFETY: the caller's contract; the address space this returns into is now installed.
+    unsafe { riscv64_switch_registers(current, next) }
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn riscv64_switch_registers(current: *mut TaskContext, next: *const TaskContext) {
     core::arch::naked_asm!(
         // ---- save the outgoing context into *a0 ----
         "sd ra, 0x00(a0)",
@@ -257,65 +313,6 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         // A root of zero means "no opinion" and leaves translation alone, which is what a kernel task
         // that shares whatever map is live wants. See `new_kernel` for the constraint that puts on
         // such a task.
-        "ld t0, {off_cr3}(a1)",
-        "beqz t0, 2f",
-        // CHECK THE ROOT BEFORE INSTALLING IT, because installing a bad one cannot be reported.
-        //
-        // `csrw satp` takes effect immediately. If `t0` is a RECLAIMED root - a frame freed by a kill
-        // and handed to something else - the very next instruction fetch happens in an address space
-        // where this kernel's text is no longer mapped, and the resulting fault cannot be handled
-        // either: `stvec` points into the same dead space. The hart enters a hardware fault loop with
-        // no output, no interrupts and no panic. From outside it is simply dark, and the only thing
-        // that ever notices is another hart's liveness watchdog, ten seconds later.
-        //
-        // Same class as the unguarded page-table walk in `sv39`, one layer up, and the same answer: a
-        // physical address that came from reclaimable memory is checked before it is dereferenced -
-        // or here, before it becomes the thing every fetch dereferences THROUGH. Two conditions, four
-        // instructions: page-aligned as a root must be, and below the top of RAM the allocator knows.
-        "slli t3, t0, 52",
-        "bnez t3, 3f",
-        "la   t3, {ram_limit}",
-        "ld   t3, 0(t3)",
-        "bgeu t0, t3, 3f",
-        // Build the `satp` encoding the field does not carry: PPN in the low 44 bits, MODE 8 (Sv39)
-        // in the top four. Done here so no caller has to know the register's shape.
-        "srli t2, t0, 12",
-        "li   t3, 8",
-        "slli t3, t3, 60",   // MODE = 8 (Sv39)
-        "or   t2, t2, t3",
-        // WRITTEN AND FENCED UNCONDITIONALLY, and the missing branch here is the point.
-        //
-        // This used to read `satp` first and skip both the write and the fence when the incoming root
-        // already matched: "already the live space, nothing to do". That is an ADDRESS-SPACE identity
-        // test dressed up as a register comparison, and the two are not the same thing. A root is a
-        // physical frame; when a task dies its frames go back to the allocator, and the very next
-        // spawn can be handed that same frame as ITS root. `satp` then holds the right number for the
-        // wrong address space, the comparison says "no change", and the hart keeps translating
-        // through a TLB filled from a page table that has since been overwritten. There is no fault
-        // to catch that: the entries are valid, they simply describe a service that no longer exists.
-        //
-        // The saving it bought was already zero. The neutral scheduler seeds each core's scheduler
-        // context with that core's live root (`task/scheduler.rs`, `run`), so a switch is always
-        // task -> scheduler -> task and the root always changes; there is no path through the loop on
-        // which the branch was taken. So it removed no work while leaving an unsound assumption in
-        // the one place - hand-written assembly under a naked function - where it is least likely to
-        // be re-examined. It is deleted rather than corrected because there is nothing to correct: a
-        // fence on a switch that did not need one is a few hundred cycles, and being wrong here is a
-        // page table read after free.
-        "csrw satp, t2",
-        // The fence is not optional and not a tidy-up: `satp` takes effect immediately, but stale
-        // translations from the outgoing space would keep satisfying accesses that no longer exist.
-        "sfence.vma",
-                "j    2f",
-        // REFUSED. Record the offending root and DO NOT install it: continuing in the outgoing
-        // space means the task faults in a way the kernel can see, report and kill - which is
-        // recoverable - where installing it means a hart that is gone with nothing to read.
-        // `panic_halt_check` runs every tick and prints this once, so it is loud rather than
-        // silently survived (invariant 12).
-        "3:",
-        "la   t3, {bad_root}",
-        "sd   t0, 0(t3)",
-        "2:",
         // ---- restore the incoming context from *a1 ----
         "ld ra, 0x00(a1)",
         "ld sp, 0x08(a1)",
@@ -332,9 +329,6 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         "ld s10, 0x60(a1)",
         "ld s11, 0x68(a1)",
         "ret",
-        off_cr3 = const OFF_CR3,
-        ram_limit = sym super::RAM_LIMIT_PHYS,
-        bad_root = sym super::BAD_SATP_ROOT,
     )
 }
 

@@ -521,10 +521,6 @@ riscv64: S-mode entered, 16550 UART alive
             // facts, not by teaching it anything. Everything it needs came from the device tree or
             // the link, so nothing inside it knows which machine it is on.
             crate::memory::init(&bi);
-            // The context switch's `satp` guard cannot call `phys_in_ram` - it is naked assembly - so
-            // it reads this instead. Seeded HERE, the instant the allocator knows the answer and
-            // before any address space exists to switch into. See `RAM_LIMIT_PHYS`.
-            RAM_LIMIT_PHYS.store(crate::memory::allocator::ram_limit_phys(), Ordering::Release);
 
             // Keep walking `kernel_main`'s own sequence. Each of these is shared code that needs
             // nothing from the MMU, so they run now rather than waiting behind Sv39 - and each one
@@ -1153,37 +1149,8 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
 /// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
 /// see the aarch64 implementation for the shape (a published flag, checked here).
-/// One past the top of RAM, in physical addresses, for the context switch's `satp` guard.
-///
-/// A NUMBER rather than a call because the only caller cannot make one: `switch_context` is a naked
-/// function. Seeded once from `memory::allocator::ram_limit_phys` after the allocator is up; zero
-/// until then, which the guard reads as "refuse everything" and is the safe direction - no user
-/// address space exists before the allocator does.
-pub static RAM_LIMIT_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// The last page-table root the context switch REFUSED to install, or zero if it never has.
-///
-/// Written from the naked switch, which has nowhere to report from, and read by `panic_halt_check` on
-/// the next tick. A refusal means the kernel was about to hand a hart an address space that is not
-/// backed by RAM - the switch surviving it is recovery, and recovery that is not reported is exactly
-/// the silent fallback invariant 12 forbids.
-pub static BAD_SATP_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-static BAD_SATP_REPORTED: AtomicBool = AtomicBool::new(false);
-
 pub fn panic_halt_check() {
     note_stage(stage::NEUTRAL_TICK);
-    // SAY IT ONCE, on the first tick after a refusal. See `BAD_SATP_ROOT`.
-    let bad = BAD_SATP_ROOT.load(Ordering::Relaxed);
-    if bad != 0 && !BAD_SATP_REPORTED.swap(true, Ordering::Relaxed) {
-        print_str("riscv64: context switch REFUSED a page-table root outside RAM - ");
-        print_hex(bad);
-        print_str("
-  The task was left in the outgoing address space and will fault where the kernel
-");
-        print_str("  can see it. Installing it would have made this hart dark with nothing to read.
-");
-    }
     // AND STOP, IF THE MACHINE IS ALREADY DYING. x86 leaves this a stub because it halts its
     // siblings with an NMI broadcast; RISC-V has no NMI, which is exactly why this seam member
     // exists and why leaving it empty here left `halt_all_cores` halting only the hart that called
@@ -1249,6 +1216,13 @@ pub fn halt_all_cores() -> ! {
         if sc != u32::MAX {
             serial_write_bytes_lockfree(b"/s");
             emit_dec_lockfree(sc as u64);
+        }
+        // AND WHERE THAT STAGE WAS STAMPED FROM. See `CORE_STAGE_RA`: a stage names a function, and a
+        // function has callers - this names the CALL SITE, which cannot be ambiguous.
+        let ra = CORE_STAGE_RA[hart].load(Ordering::Relaxed);
+        if ra != 0 {
+            serial_write_bytes_lockfree(b"@");
+            serial_write_hex_lockfree(ra);
         }
     }
     serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch (syscall NR shown as sN)\n");
@@ -2377,6 +2351,20 @@ static CORE_IRQ_LAST: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; M
 /// and an instrument heavy enough to change the timing of the thing it is watching is how a
 /// heisenbug gets manufactured.
 static CORE_STAGE: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
+/// WHERE the last stage stamp was made from - the caller's return address.
+///
+/// **Because a stage names a FUNCTION, and a function has callers.** Three times in this wedge hunt a
+/// stamp was read as a location and turned out to be ambiguous: stage 14 meant both "wedged in the
+/// drain" and "halted because a neighbour panicked"; stage 15 meant both "before the progress stamp"
+/// and "past it, hung in the switch"; stage 17 was placed on `syscall_slot` because the timer tick
+/// reads it one line before `switch_context`, and `syscall_slot` turns out to have EIGHT call sites -
+/// the timer switch, yield, block-and-reschedule and more. Each time the ambiguity was found only
+/// after a conclusion had been drawn from it, and each cost a boot.
+///
+/// A return address cannot be ambiguous. `note_stage` is `#[inline(never)]` so its `ra` is the site
+/// that called it, and the dump prints it beside the stage - one `llvm-objdump` away from the exact
+/// line, however many callers the function grows later.
+static CORE_STAGE_RA: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
 
 /// Stages, in the order a tick passes through them. A wedge reports the LAST one reached, so the
 /// culprit is between that stage and the next.
@@ -2513,11 +2501,18 @@ pub(super) fn note_deadline(when: u64) {
 /// deliberately while auditing these counters, because a counter indexed by a user-controlled value
 /// would have made every number this port has reported about harts worthless.
 #[inline]
+#[inline(never)]
 pub(super) fn note_stage(st: u32) {
     // SAFETY: reads `tp`, which each hart sets to its own id at entry. No side effects.
     let hart = unsafe { boot::get_lapic_id() } as usize;
+    // SAFETY: reads `ra`, this function's own return address. No operands, no memory effect. It is
+    // meaningful only because of `#[inline(never)]` above - inlined, `ra` would belong to whoever the
+    // compiler folded this into. See `CORE_STAGE_RA` for why a stage number alone was not enough.
+    let ra: u64;
+    unsafe { core::arch::asm!("mv {}, ra", out(reg) ra, options(nomem, nostack)) };
     if hart < MAX_HART_ID {
         CORE_STAGE[hart].store(st, Ordering::Relaxed);
+        CORE_STAGE_RA[hart].store(ra, Ordering::Relaxed);
     }
 }
 
