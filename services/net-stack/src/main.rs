@@ -1270,6 +1270,22 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     // than a fine one and far better than none.
     let coarse_t0 = ctx.epoch_secs_monotonic();
     let mut drains: u32 = 0;
+    // WHO IS ASKING FOR US, AND WHAT ACTUALLY ARRIVES ADDRESSED TO US.
+    //
+    // Every failing exchange on this board is UNICAST - the echo reply, the DNS reply, the DHCP ACK -
+    // and the one that never fails is the broadcast one, DISCOVER to OFFER. `arp_resolve` already
+    // separates those two cases for its own failures and says why; this is the same question asked
+    // where it can be seen, because a gateway can only address a unicast frame to a host whose ARP it
+    // holds, and this stack answers an ARP for itself ONLY while it happens to be draining for some
+    // other reason. Between operations - about 990 ms of every second after a ping SUCCEEDS - nobody
+    // here answers at all.
+    //
+    // So: `arp-for-us` is how often we were asked while listening, and `to-our-mac` is how much of
+    // what arrives is addressed to us rather than broadcast. Roughly one ARP per failing window would
+    // say the gateway keeps losing us and the missing background responder is the cause; none at all
+    // says it is a bystander and the unicast frames are being lost somewhere else entirely.
+    let mut arp_for_us = 0u16;
+    let mut to_our_mac = 0u16;
     // MEASURE THE DRAIN ITSELF, because a 60 ms bound on it did not change a 1.0 s window and I have
     // already been wrong once about why. Reports the FIRST drain only (one line per window, silent on
     // a healthy one) and prints what the SDK thought its budget was in cycles beside what the call
@@ -1290,6 +1306,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
                 let f = &p[pos..pos + fl];
                 pos += fl;
                 *frames += 1;
+                if f.len() >= 6 && f[..6] == our_mac[..] { to_our_mac += 1; }
                 if is_echo(f) { return Some((rtt_us(), f[22])); }
                 if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
                     // DECIDED, not overlooked: this is a courtesy reply to somebody else's ARP, sent
@@ -1309,6 +1326,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
                 // way, and the comment on step 1 already records that a SEND's reply "carries nothing
                 // now". So this was a full second spent waiting for an acknowledgement with no content,
                 // in the one place that could least afford it.
+                arp_for_us += 1;
                 let _ = ctx.request_with_reply_ms("nic-driver", &Message::from_bytes(&arp_out), ARP_ACK_MS);
                 }
             }
@@ -1343,8 +1361,8 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
             let spent = ctx.read_tsc().wrapping_sub(t1);
             let us = if tsc_hz > 0 { spent.saturating_mul(1_000_000) / tsc_hz } else { 0 };
             ctx.log_fmt(format_args!(
-                "net-stack: ping window closed after {} us ({} drains, {} frames seen, {} nic timeouts)                  [budget {} us, deadline {} cycles, tsc_hz {}]",
-                us, drains, *frames, *timeouts,
+                "net-stack: ping window closed after {} us ({} drains, {} frames seen, {} to-our-mac, {} arp-for-us, {} nic timeouts)                  [budget {} us, deadline {} cycles, tsc_hz {}]",
+                us, drains, *frames, to_our_mac, arp_for_us, *timeouts,
                 if tsc_hz > 0 { deadline_cycles.saturating_mul(1_000_000) / tsc_hz } else { 0 },
                 deadline_cycles, tsc_hz));
             return None;
