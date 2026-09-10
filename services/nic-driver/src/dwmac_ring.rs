@@ -146,6 +146,26 @@ const MMC_RX_FRAMECOUNT_GB: usize = MMC_BASE + 0x80;
 const MMC_RX_CRC_ERROR: usize = MMC_BASE + 0x94;
 
 const GMAC_PACKET_FILTER: usize = 0x0008;
+/// `GMAC_PACKET_FILTER_PR = BIT(0)` - promiscuous: receive every frame, filter nothing.
+///
+/// **A DELIBERATE, TEMPORARY EXPERIMENT, not a setting.** Ping loses 58% to the operator's own
+/// gateway one hop away, and identically to a public address - so it is ours, not the uplink. Every
+/// reply that arrives takes 10 ms; every failure burns the full 900 ms window and gets nothing. That
+/// is binary frame loss, not jitter.
+///
+/// Two candidates are left and they share no fix: either the replies never reach the MAC (a
+/// transmit-side or wire problem), or they reach it and the ADDRESS FILTER rejects them. The MMC
+/// `rx` counter cannot tell them apart, because a frame the filter drops is never counted as
+/// received in the first place - the instrument and the suspect are the same register.
+///
+/// Promiscuous mode splits them in one boot. Filter nothing: if the loss collapses, the filter was
+/// rejecting our own unicast replies and the MAC address programming is wrong. If the loss is
+/// unchanged, the frames genuinely are not arriving and the remaining suspect is RGMII transmit
+/// timing.
+///
+/// It MUST come back out either way - a NIC that hears everything cannot tell you its filter is
+/// broken, which is the whole reason the driver did not start this way (26.7).
+const GMAC_PACKET_FILTER_PR: u32 = 1 << 0;
 const GMAC_RXQ_CTRL0: usize = 0x00a0;
 /// `GMAC_RX_DCB_QUEUE_ENABLE(0) = BIT(1)`.
 const GMAC_RX_QUEUE0_DCB: u32 = 1 << 1;
@@ -355,6 +375,7 @@ impl Dwmac {
         d.a.zero();
         d.arm_rx_ring();
         d.program(speed, full_duplex);
+        d.log_filter_addr(ctx);
         Some(d)
     }
 
@@ -415,10 +436,9 @@ impl Dwmac {
         // Route queue 0 to the DCB path. Without this the MAC receives nothing at all, however
         // correct the ring is: frames arrive and are dropped before they reach the DMA.
         m.write32(GMAC_RXQ_CTRL0, GMAC_RX_QUEUE0_DCB);
-        // Perfect filtering on our own address, plus broadcast (which the MAC accepts unless told
-        // otherwise). Deliberately NOT promiscuous: a driver that hears everything cannot tell you
-        // its address filter is wrong.
-        m.write32(GMAC_PACKET_FILTER, 0);
+        // PROMISCUOUS, temporarily - see `GMAC_PACKET_FILTER_PR`. Normally 0 (perfect match on our
+        // own address plus broadcast), and it goes back to 0 the moment this experiment has answered.
+        m.write32(GMAC_PACKET_FILTER, GMAC_PACKET_FILTER_PR);
 
         // Our address, in the shape `stmmac_dwmac4_set_mac_addr` writes it: bytes 4 and 5 in the low
         // half of HIGH with the enable bit, bytes 0 to 3 in LOW.
@@ -433,6 +453,7 @@ impl Dwmac {
                 | (self.mac[1] as u32) << 8
                 | self.mac[0] as u32,
         );
+
 
         // Start the DMA engines, then enable the MAC. This order matters: a receiver enabled before
         // its ring is running has nowhere to put the first frame.
@@ -455,6 +476,22 @@ impl Dwmac {
             _ => cfg |= GMAC_CONFIG_PS,
         }
         m.write32(GMAC_CONFIG, cfg);
+    }
+
+    /// Read the programmed filter address back, and say what it holds.
+    ///
+    /// `identify` reads this register BEFORE bring-up, so it has only ever reported the reset value
+    /// (all-ones) and nothing has ever checked that what we wrote landed. A silently wrong address
+    /// filter drops exactly the unicast replies a ping depends on while broadcast traffic - DHCP,
+    /// ARP - keeps working, which is uncomfortably close to what this board is doing.
+    pub fn log_filter_addr(&self, ctx: &ServiceContext) {
+        let hi = self.m.read32(GMAC_ADDR_HIGH0);
+        let lo = self.m.read32(GMAC_ADDR_LOW0);
+        ctx.log_fmt(format_args!(
+            "nic-driver: dwmac filter addr reads back {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (ae {}) - wanted {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff, (lo >> 24) & 0xff,
+            hi & 0xff, (hi >> 8) & 0xff, (hi >> 31) & 1,
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]));
     }
 
     /// Re-apply just the speed and duplex, for a cable that arrived after bring-up.
