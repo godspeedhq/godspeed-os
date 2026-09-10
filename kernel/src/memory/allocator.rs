@@ -99,6 +99,13 @@ struct BitmapAllocator {
     /// ABOVE usable RAM, so walking a legit page table there must not false-positive as corrupt. A
     /// truly corrupt entry (phys far beyond total RAM, e.g. ~68 GB) is still caught.
     max_ram_frame: usize,
+    /// LOWEST frame across all RAM-backed regions. The partner `max_ram_frame` has always had, and
+    /// its absence was a real hole: `phys_in_ram` tested only the upper bound, so on any machine
+    /// whose RAM does not start at zero, every address BELOW it passed a check whose name says it is
+    /// RAM. On this project that is the two Pis and the VisionFive, where RAM starts at 0x40000000 -
+    /// so a gigabyte of MMIO and nothing answered "yes, that is RAM". x86 never noticed because its
+    /// RAM starts at zero and the hole has no width there.
+    min_ram_frame: usize,
     /// Count of double-free attempts (a frame freed while already free). The bitmap absorbs these
     /// idempotently, but they must not inflate `free_frames` (else it exceeds `total_frames` and
     /// observe's RAM read underflows). Counted so the loud log can be rate-limited.
@@ -118,7 +125,8 @@ const MAX_DMA_RESERVES: usize = 6;
 impl BitmapAllocator {
     const fn new() -> Self {
         Self {
-            free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, max_ram_frame: 0, double_frees: 0,
+            free_frames: 0, total_frames: 0, next_byte: 0, max_valid_frame: 0, max_ram_frame: 0,
+            min_ram_frame: usize::MAX, double_frees: 0,
             dma_reserves: [(0, 0); MAX_DMA_RESERVES],
         }
     }
@@ -149,6 +157,8 @@ impl BitmapAllocator {
                                    | MemoryKind::KernelImage | MemoryKind::BootloaderReclaimable) {
                 let ram_last = ((region.base + region.len + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
                 if ram_last > self.max_ram_frame { self.max_ram_frame = ram_last; }
+                let ram_first = (region.base / FRAME_SIZE) as usize;
+                if ram_first < self.min_ram_frame { self.min_ram_frame = ram_first; }
             }
             if !matches!(region.kind, MemoryKind::Usable) { continue; }
             let start = frame_align_up(region.base);
@@ -601,9 +611,21 @@ pub fn ram_limit_phys() -> u64 {
 }
 
 pub fn phys_in_ram(phys: u64) -> bool {
-    // SAFETY: read-only; max_ram_frame is set once at init, never mutated after.
+    // BOTH ENDS. This tested only the upper bound, and the lower one is not a formality on a machine
+    // whose RAM does not start at zero: on the VisionFive and both Pis, RAM begins at 0x40000000, so
+    // every address in the gigabyte below it - MMIO, firmware, nothing at all - answered "yes, that
+    // is RAM". x86's RAM starts at zero, so the hole has no width there and nothing ever found it.
+    //
+    // It was found by the fault it caused. A page-table walk followed a garbage PPN of about 0x1000,
+    // asked this whether it was safe to dereference, was told yes, and took a LOAD ACCESS FAULT -
+    // scause 5, `stval 0x1ff8`, in `sv39::map_page` - which halted the hart, which the liveness
+    // watchdog then reported ten seconds later as a core that "made no progress". A guard that
+    // accepts a bad address is worse than no guard: it converts a caught error into a crash wearing
+    // somebody else's name.
+    //
+    // SAFETY: read-only; both bounds are set once at init and never mutated after.
     let idx = (phys / FRAME_SIZE) as usize;
-    unsafe { idx < ALLOCATOR.max_ram_frame }
+    unsafe { idx >= ALLOCATOR.min_ram_frame && idx < ALLOCATOR.max_ram_frame }
 }
 
 /// Reserve a physical range the allocator must NEVER hand back to the free pool.
