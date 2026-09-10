@@ -183,6 +183,20 @@ const MMC_TX_CARRIER_ERROR: usize = MMC_BASE + 0x60;
 /// means the receive TIMING is marginal rather than the path being broken.
 const MMC_RX_FRAMECOUNT_GB: usize = MMC_BASE + 0x80;
 const MMC_RX_CRC_ERROR: usize = MMC_BASE + 0x94;
+/// Octets received, good and bad. **The witness for `MMC_RX_CRC_ERROR` itself.**
+///
+/// `crc-err 0` has been read as "the RGMII receive path is clean" since this investigation started,
+/// and that reading has no basis: `MMC_TX_FRAMECOUNT_G` and both TRANSMIT octet counters are
+/// unpopulated in this synthesis, reading a confident zero forever. Nothing says the receive error
+/// counters are any different, and an instrument that cannot report a fault is indistinguishable from
+/// a machine that has none - which is how `0/N good` wasted a boot.
+///
+/// So read a receive counter that MUST move if the block is populated at all. If octets climb while
+/// `crc-err` stays zero, the zero is a real measurement and receive timing is genuinely clean. If
+/// octets read zero too, then `crc-err 0` never meant anything, and a marginal receive delay - frames
+/// arriving corrupt and being dropped before they are ever counted - is back on the table as the one
+/// remaining explanation that fits every observation.
+const MMC_RX_OCTETCOUNT_GB: usize = MMC_BASE + 0x84;
 
 const GMAC_PACKET_FILTER: usize = 0x0008;
 /// `GMAC_PACKET_FILTER_PR = BIT(0)` - promiscuous: receive every frame, filter nothing.
@@ -643,7 +657,7 @@ impl Dwmac {
         (idx, self.rx_next)
     }
 
-    pub fn mac_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32) {
+    pub fn mac_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
         (
             self.m.read32(MMC_TX_FRAMECOUNT_GB),
             self.m.read32(MMC_TX_FRAMECOUNT_G),
@@ -651,6 +665,7 @@ impl Dwmac {
             self.m.read32(MMC_TX_CARRIER_ERROR),
             self.m.read32(MMC_RX_FRAMECOUNT_GB),
             self.m.read32(MMC_RX_CRC_ERROR),
+            self.m.read32(MMC_RX_OCTETCOUNT_GB),
             self.m.read32(GMAC_DEBUG),
         )
     }

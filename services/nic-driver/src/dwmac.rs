@@ -484,7 +484,7 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
                 // enough to span a DHCP attempt and still bounded, so a busy link cannot turn this
                 // into a console flood.
                 tx_reports += 1;
-                let (tgb, tg, tuf, tce, rgb, rcrc, dbg) = d.mac_counters();
+                let (tgb, tg, tuf, tce, rgb, rcrc, _rocts, dbg) = d.mac_counters();
                 ctx.log_fmt(format_args!(
                     "nic-driver: dwmac sent {} bytes | tdes3 0x{:08x} = {} | MAC tx {}/{} good, underflow {}, carrier {}, rx {} crc-err {} | dma 0x{:08x} debug 0x{:08x}",
                     p.len(), d.last_tx_status, d.tx_error_name(),
@@ -501,7 +501,7 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
         let per_10ms = ctx.tsc_ticks_per_10ms();
         if per_10ms != 0 && ctx.read_tsc().wrapping_sub(last_report) > per_10ms * 500 {
             last_report = ctx.read_tsc();
-            let (tgb, tg, _tuf, _tce, rgb, rcrc, _dbg) = d.mac_counters();
+            let (tgb, tg, _tuf, _tce, rgb, rcrc, rocts, _dbg) = d.mac_counters();
             // ASK THE MAC WHY, whenever it says it transmitted frames it does not call good. Silent
             // when the two agree, so a healthy machine prints nothing and this cannot become noise
             // that hides the line beneath it.
@@ -529,8 +529,8 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
                 "nic-driver: dwmac rx position - engine at {:?}, we poll {} (of {})",
                 engine, ours, crate::dwmac_ring::RX_DESCS));
             ctx.log_fmt(format_args!(
-                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} | RBU {}{}",
-                rgb, rcrc, tgb, asked, handed, empty, d.rbu, rbu));
+                "nic-driver: dwmac hop | MAC rx {} crc-err {} (rx octets {}) tx {} | drains asked {} handed {} empty {} | RBU {}{}",
+                rgb, rcrc, rocts, tgb, asked, handed, empty, d.rbu, rbu));
             let _ = tg;
         }
     }

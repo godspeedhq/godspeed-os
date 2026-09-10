@@ -2055,6 +2055,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     "net-stack: gateway {}.{}.{}.{} resolved on retry - {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     gateway[0], gateway[1], gateway[2], gateway[3],
                     m[0], m[1], m[2], m[3], m[4], m[5]));
+                // ALSO HERE. The probe sat behind a successful first-attempt ARP and so never ran on
+                // the one boot where it mattered - the boot whose gateway ARP failed 0 of 6 is exactly
+                // the boot whose unicast reception most needed measuring. A diagnostic gated on the
+                // thing not going wrong is a diagnostic that runs only when it has nothing to say.
+                arp_probe(&ctx, &our_ip, &our_mac, &gateway, &m);
             }
         }
         if let Some((rid, right)) = badge {
