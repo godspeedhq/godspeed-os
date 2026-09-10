@@ -146,6 +146,22 @@ const MMC_TX_FRAMECOUNT_GB: usize = MMC_BASE + 0x18;
 const MMC_TX_FRAMECOUNT_G: usize = MMC_BASE + 0x68;
 /// The FIFO ran dry mid-frame - the classic symptom of a transmit clock that is too slow or stopped.
 const MMC_TX_UNDERFLOW_ERROR: usize = MMC_BASE + 0x48;
+// The rest of the transmit fault accounting, `dwmac_mmc.h`. Read together because the question they
+// answer only makes sense together: `FRAMECOUNT_GB` counts every frame the MAC transmitted and
+// `FRAMECOUNT_G` counts the ones it considers GOOD, so a gap between them is the MAC saying it
+// flagged something - and exactly one of these says what.
+const MMC_TX_SINGLECOL_G: usize = MMC_BASE + 0x4c;
+const MMC_TX_MULTICOL_G: usize = MMC_BASE + 0x50;
+const MMC_TX_DEFERRED: usize = MMC_BASE + 0x54;
+const MMC_TX_LATECOL: usize = MMC_BASE + 0x58;
+const MMC_TX_EXESSCOL: usize = MMC_BASE + 0x5c;
+const MMC_TX_EXCESSDEF: usize = MMC_BASE + 0x6c;
+/// Octets transmitted, good+bad and good. The cross-check on the frame counts: if `FRAMECOUNT_G`
+/// reads zero because the counter is simply not populated in this synthesis, `OCTETCOUNT_G` will read
+/// zero too while `OCTETCOUNT_GB` counts - which is a different claim from "every frame was flagged",
+/// and the two are worth being able to tell apart before anyone acts on either.
+const MMC_TX_OCTETCOUNT_GB: usize = MMC_BASE + 0x14;
+const MMC_TX_OCTETCOUNT_G: usize = MMC_BASE + 0x64;
 /// Carrier lost or never asserted, which is what a PHY reports when the MAC talks into a dead link.
 const MMC_TX_CARRIER_ERROR: usize = MMC_BASE + 0x60;
 /// Frames received, good or bad, and how many failed CRC. A CRC count climbing beside a good count
@@ -579,6 +595,33 @@ impl Dwmac {
             self.m.read32(MMC_RX_FRAMECOUNT_GB),
             self.m.read32(MMC_RX_CRC_ERROR),
             self.m.read32(GMAC_DEBUG),
+        )
+    }
+
+    /// **Why does the MAC not consider our transmitted frames GOOD?** Its own answer.
+    ///
+    /// `MMC_TX_FRAMECOUNT_G` has read 0 on every boot of this port while `_GB` counts correctly, and
+    /// that was written off once as a register this synthesis does not populate - on the reasoning
+    /// that transmit demonstrably works, so the counter must be wrong. That reasoning is backwards:
+    /// it decided what the instrument must mean from what the code was assumed to be doing, which is
+    /// how a reading gets dismissed for saying something inconvenient.
+    ///
+    /// Exactly one of these distinguishes the two possibilities, and neither is a guess afterwards:
+    /// if a fault counter tracks `_GB` then the MAC is flagging every frame and NAMES the reason; if
+    /// every fault counter is zero AND `OCTETCOUNT_G` is zero while `OCTETCOUNT_GB` counts, the
+    /// good-side counters are unpopulated in this part and the whole thread closes for good.
+    ///
+    /// Read-only, and reported only when there is a gap to explain.
+    pub fn tx_fault_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
+        (
+            self.m.read32(MMC_TX_SINGLECOL_G),
+            self.m.read32(MMC_TX_MULTICOL_G),
+            self.m.read32(MMC_TX_DEFERRED),
+            self.m.read32(MMC_TX_LATECOL),
+            self.m.read32(MMC_TX_EXESSCOL),
+            self.m.read32(MMC_TX_EXCESSDEF),
+            self.m.read32(MMC_TX_OCTETCOUNT_GB),
+            self.m.read32(MMC_TX_OCTETCOUNT_G),
         )
     }
 

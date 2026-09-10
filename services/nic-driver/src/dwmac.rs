@@ -502,6 +502,15 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
         if per_10ms != 0 && ctx.read_tsc().wrapping_sub(last_report) > per_10ms * 500 {
             last_report = ctx.read_tsc();
             let (tgb, tg, _tuf, _tce, rgb, rcrc, _dbg) = d.mac_counters();
+            // ASK THE MAC WHY, whenever it says it transmitted frames it does not call good. Silent
+            // when the two agree, so a healthy machine prints nothing and this cannot become noise
+            // that hides the line beneath it.
+            if tg != tgb {
+                let (sc, mc, df, lc, ec, ed, ogb, og) = d.tx_fault_counters();
+                ctx.log_fmt(format_args!(
+                    "nic-driver: dwmac tx {} sent but only {} good | single-col {} multi-col {} deferred {} late-col {} excess-col {} excess-defer {} | octets {}/{} good",
+                    tgb, tg, sc, mc, df, lc, ec, ed, og, ogb));
+            }
             // MAC rx against frames handed out is the whole question. If `rx` climbs while `handed`
             // does not, the frames are arriving and this driver is losing them. If neither climbs,
             // they never reached the MAC and the fault is below us.
