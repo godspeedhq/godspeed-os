@@ -495,9 +495,16 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             // MAC rx against frames handed out is the whole question. If `rx` climbs while `handed`
             // does not, the frames are arriving and this driver is losing them. If neither climbs,
             // they never reached the MAC and the fault is below us.
+            // SAY "DROPPED" ONLY WHEN SOMETHING WAS. The verdict used to be unconditional text in
+            // the format string, so every line read `RBU 0 (ring ran dry - frames DROPPED)` - a
+            // reading and its own contradiction on the same line, printed hundreds of times across a
+            // run in which the ring never once ran dry. An instrument that states a conclusion the
+            // number beside it refutes is worse than no instrument: it is a false lead with a
+            // timestamp on it.
+            let rbu = if d.rbu == 0 { "" } else { " - THE RING RAN DRY, frames were dropped" };
             ctx.log_fmt(format_args!(
-                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} | RBU {} (ring ran dry - frames DROPPED)",
-                rgb, rcrc, tgb, asked, handed, empty, d.rbu));
+                "nic-driver: dwmac hop | MAC rx {} crc-err {} tx {} | drains asked {} handed {} empty {} | RBU {}{}",
+                rgb, rcrc, tgb, asked, handed, empty, d.rbu, rbu));
             let _ = tg;
         }
     }
