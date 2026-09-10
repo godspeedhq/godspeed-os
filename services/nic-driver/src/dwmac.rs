@@ -329,6 +329,12 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
     }
     configure_phy_delays(&ctx, &m, phy);
     let (up, speed, fd) = wait_for_link(&ctx, &m, phy);
+    // The transmit clock edge, now that there is a speed to be right about. Only when the link
+    // actually settled: with no cable there is no negotiated speed, and the cable-arrival edge in the
+    // serve loop applies it then.
+    if up {
+        configure_tx_clk_edge(&ctx, &m, phy, speed);
+    }
 
     // Come up around whatever the link is NOW, including no link at all. A MAC configured at a
     // default speed still answers and still serves, and the link edge in the serve loop re-applies
@@ -411,6 +417,10 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
                 ctx.log_fmt(format_args!(
                     "nic-driver: dwmac link came up at {} Mbit/s - re-applying MAC speed", speed));
                 if speed != 0 {
+                    // The clock edge is speed-dependent, so it is re-applied here for the same
+                    // reason the MAC speed is: this may be the first speed this boot has seen, or a
+                    // different one from the last cable.
+                    configure_tx_clk_edge(ctx, &d.m, 0, speed);
                     d.set_link(speed, fd);
                     link_was_up = true;
                 }
@@ -558,6 +568,33 @@ const RC1R_FE_TX_DELAY_SHIFT: u32 = 4;
 const RC1R_GE_TX_DELAY_SHIFT: u32 = 0;
 const RC1R_DELAY_FIELD: u16 = 0xf;
 
+/// `YT8521_RC1R_TX_CLK_SEL_INVERTED = BIT(14)`, in the same `RGMII_CONFIG1` register as the delays.
+///
+/// **This is the transmit CLOCK EDGE, and it is a board fact, not a PHY default.** The delay fields
+/// beside it shift data against the clock in picoseconds; this picks which edge of that clock the PHY
+/// samples the MAC's transmit data on. Get it wrong and the data is sampled off the eye: the frame
+/// leaves the MAC intact, the MAC scores it transmitted the instant it hands it over, and what
+/// reaches the wire is noise that the far end drops on FCS without ever telling us.
+const RC1R_TX_CLK_SEL_INVERTED: u16 = 1 << 14;
+
+// Whether to invert, per speed. Straight off THIS board's device tree - `ethernet@16030000`'s PHY node
+// in `jh7110s-starfive-visionfive-2-lite.dtb`, which is the MAC this driver owns:
+//
+//     motorcomm,tx-clk-adj-enabled      (true)
+//     motorcomm,tx-clk-100-inverted     (true)
+//     motorcomm,tx-clk-1000-inverted    (true)
+//     rx-internal-delay-ps              <1500>
+//     tx-internal-delay-ps              <1500>
+//
+// The OTHER port on the same SoC, `ethernet@16040000`, declares `tx-clk-100-inverted` and NOT
+// `tx-clk-1000-inverted` - which is the proof that this is per-port wiring rather than something the
+// PHY or the vendor driver would arrive at on its own. Ours needs it at exactly the speed we run.
+// `motorcomm,tx-clk-10-inverted` is absent from both, so ten megabit is left alone.
+const TX_CLK_ADJ_ENABLED: bool = true;
+const TX_CLK_1000_INVERTED: bool = true;
+const TX_CLK_100_INVERTED: bool = true;
+const TX_CLK_10_INVERTED: bool = false;
+
 /// 1500 ps, as the device tree asks, in this register's units.
 ///
 /// The encoding is a 16-step table in 150 ps increments starting at zero, so the value is simply the
@@ -599,6 +636,54 @@ fn ytphy_write_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16, val: u16)
 ///
 /// Returns false only when the PHY is not the part this knows how to configure, or MDIO failed -
 /// both of which leave the link exactly as it was rather than half-programmed.
+/// Set the transmit clock edge for the speed we actually negotiated. `yt8531_link_change_notify`.
+///
+/// **Speed-dependent, so it cannot be done at bring-up with the delays.** Linux hangs this off the
+/// link-change notifier for that reason, and so do we: the register bit means "invert at THIS speed",
+/// and until autonegotiation finishes there is no speed to be right about. Called once the link is
+/// settled, and again on the cable-arrival edge.
+///
+/// A speed we do not recognise leaves the bit ALONE rather than clearing it. Clearing would be a
+/// guess dressed as a decision, and the failure it produces is the invisible one described on
+/// `RC1R_TX_CLK_SEL_INVERTED`.
+pub fn configure_tx_clk_edge(ctx: &ServiceContext, m: &Mmio, phy: u32, speed: u32) {
+    if !TX_CLK_ADJ_ENABLED {
+        return;
+    }
+    let invert = match speed {
+        1000 => TX_CLK_1000_INVERTED,
+        100 => TX_CLK_100_INVERTED,
+        10 => TX_CLK_10_INVERTED,
+        _ => {
+            ctx.log_fmt(format_args!(
+                "nic-driver: dwmac tx clock edge left as it is - speed {} is not one this board describes",
+                speed));
+            return;
+        }
+    };
+    let Some(before) = ytphy_read_ext(ctx, m, phy, YT8521_RGMII_CONFIG1) else {
+        ctx.log("nic-driver: dwmac could not read RGMII_CONFIG1 - transmit clock edge NOT set");
+        return;
+    };
+    let want = if invert {
+        before | RC1R_TX_CLK_SEL_INVERTED
+    } else {
+        before & !RC1R_TX_CLK_SEL_INVERTED
+    };
+    if !ytphy_write_ext(ctx, m, phy, YT8521_RGMII_CONFIG1, want) {
+        ctx.log("nic-driver: dwmac could not write RGMII_CONFIG1 - transmit clock edge NOT set");
+        return;
+    }
+    // READ IT BACK. A register that accepts a write has proved the address is writable and nothing
+    // more, which is a lesson this project has already paid for once on the Pi 4.
+    let after = ytphy_read_ext(ctx, m, phy, YT8521_RGMII_CONFIG1).unwrap_or(0);
+    ctx.log_fmt(format_args!(
+        "nic-driver: dwmac tx clock at {} Mbit/s: {} (RGMII_CONFIG1 0x{:04x} -> 0x{:04x}, wanted 0x{:04x})",
+        speed,
+        if invert { "INVERTED" } else { "not inverted" },
+        before, after, want));
+}
+
 pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
     let (Some(id1), Some(id2)) = (mdio_read(ctx, m, phy, PHY_ID1), mdio_read(ctx, m, phy, PHY_ID2))
     else {
