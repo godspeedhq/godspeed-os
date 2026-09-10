@@ -517,9 +517,17 @@ impl Dwmac {
         // floods in, the frames genuinely never reach this MAC, the filter is cleared for good, and
         // what remains is the transmit direction.
         //
-        // NOT A SETTING. A driver that listens to everything cannot tell us when its filter is wrong,
-        // and this goes back to 0 the moment the question is answered either way.
-        m.write32(GMAC_PACKET_FILTER, GMAC_PACKET_FILTER_PR);
+        // ANSWERED, and the filter is INNOCENT - this time on a measurement that could have said
+        // otherwise. With `PR` set, so with no filtering at all, the count of frames addressed to our
+        // own MAC during a failing 900 ms ping window was still ZERO, while the total frame count
+        // climbed (23 and 11 per window against 0 to 6 before, which is the other hosts' unicast we
+        // could suddenly see). The replies are not being rejected. They are not arriving.
+        //
+        // So it goes back to a real filter, as promised: a driver that listens to everything can no
+        // longer tell us when its filter IS wrong. `GMAC_PACKET_FILTER_PR` stays defined, and the
+        // record above stays with it, so this can be re-run in one line - which is the only reason the
+        // void first attempt cost a boot rather than a week.
+        m.write32(GMAC_PACKET_FILTER, 0);
 
         // Our address, in the shape `stmmac_dwmac4_set_mac_addr` writes it: bytes 4 and 5 in the low
         // half of HIGH with the enable bit, bytes 0 to 3 in LOW.
