@@ -55,10 +55,22 @@
 > Wyse (Intel)        100 rounds. backlog/19 fixed and verified: ping recovers with NO reboot.
 > T630 (AMD)          100 rounds / 646 kills. RTL8168 confirmed - it runs the changed path too.
 > Pi 2 (arm32)        100 rounds / 558 kills. selfcheck 452/0 x3. ping 0% loss around the storm.
-> Pi 4 (aarch64)      NOT RE-TESTED.
+> Pi 4 (aarch64)      100 rounds / 583 kills. 61 controller resets, 0 HCRST timeouts. 461/460/463, 0 fails.
 > ```
 >
-> Zero kernel panics and zero liveness wedges on all four tested boards.
+> **Zero kernel panics and zero liveness wedges on all FIVE machines, across four architectures and
+> three memory-model families.** Networking recovered from the storm on every board that has one, with
+> no reboot.
+>
+> The Pi 4 is the one that mattered most for the `xhci` reset change: it drives a VL805 over PCIe, a
+> third distinct controller from the VisionFive's platform xHCI and the PC's, and it reset 61 times
+> without once reaching the new path.
+>
+> Its selfcheck counts vary (461, 460, 463) and that is NOT truncation - all three runs reported all
+> six section banners. The variation is conditional tests, one of which says so out loud:
+> `SKIP date - the clock is not set on this machine (no RTC, no network); not a failure`. Checked
+> rather than assumed, because a count lower than another machine's is a truncation until shown
+> otherwise.
 >
 > **A method lesson that cost a wrong call today.** I argued a board was unaffected because the changed
 > code was `cfg`'d out for its architecture. The operator asked to check anyway, and the RISC-V binary
@@ -68,9 +80,9 @@
 > embedded at all (`xhci` on arm32, per `services/supervisor/build.rs`: `"arm" => &["dwc2"]`). Where
 > the exemption is `cfg`-shaped, hash the artefact or test the board.
 >
-> **Two caveats on the coverage above.** The Pi 2 ran a `kernel7.img` built BEFORE the nic-driver
-> change, so it confirms the ARM port rather than HEAD. And the Pi 4 has not been re-tested since the
-> `xhci` reset change at all.
+> **One caveat remains on the coverage above.** The Pi 2 ran a `kernel7.img` built BEFORE the
+> nic-driver change, so it confirms the ARM port rather than HEAD. Every other board ran a binary
+> built from the commit it was testing.
 
 > **SOAK: 22,872 ROUNDS / 136,906 KILLS, 2026-09-11.** Five and a half hours of
 > `chaos max-carnage all-services` on the VisionFive 2 Lite at 4 harts, then stopped with `q`:
