@@ -1,7 +1,26 @@
 # 19. Networking does not recover from a chaos storm (Wyse / RTL8168)
 
 **Severity:** real, user-visible, and it survives the storm looking healthy - which is the worse half.
-**Status:** open, observed 2026-09-11 on the Dell Wyse (Intel, RTL8168). Not fixed.
+**Status:** FIXED 2026-09-11 (`dd74d4c1`), verified on the machine that showed it. Kept open as a
+record because the fix implements a documented sequence rather than pinpointing the faulty register -
+see *What is NOT established* below, which still stands.
+
+**Verification, same board, same sequence:** ping, `chaos max-carnage all-services 100 yes`, ping
+again WITHOUT a reboot. Every defining symptom is gone:
+
+```
+                              before        after
+TX timeout                       5            0
+RX SILENT                        1            0
+DHCP - no offer                 15            0
+boots needed to get ping back     2            1
+```
+
+The post-storm ping showed 9 of 13 replies. One loss is the stack re-ARPing seconds after the storm;
+three consecutive losses mid-run carry `link not confirmed` and coincide with a deliberate Ethernet
+hot-plug test. Neither resembles the failure recorded here, which was total and permanent until
+reboot. During the storm itself `nic-driver` restarted repeatedly and each time reached
+`reset OK / C+ rings up / DHCP ACK / echo reply`, which is the recovery that previously never came.
 
 ## What happens
 
