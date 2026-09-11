@@ -48,6 +48,35 @@
 > installed config back to confirm the Debian fallback survived. It needs elevation, because Windows
 > hides an EFI System Partition and ACLs it to administrators.
 
+> **SOAK: 22,872 ROUNDS / 136,906 KILLS, 2026-09-11.** Five and a half hours of
+> `chaos max-carnage all-services` on the VisionFive 2 Lite at 4 harts, then stopped with `q`:
+>
+> ```
+> total: 22872 rounds, 136906 kills, 113879 flooded, 22871 mem-pressure, 22871 spawns. kernel: alive
+>
+> 0 KERNEL PANIC   0 LIVENESS WEDGE   0 FAULT WHILE REPORTING   0 HCRST timeouts
+> selfcheck 461/0, twice
+> xhci: probes 908/908 then 1384/1384 ok, 18232 msg, serve 23643 ms vs hub 3869 ms
+> hot-plug: keyboard re-bound, 15 GB USB disk re-bound with sector 0 read back
+> network: DHCP re-acquired, ping 2/2 at 0% loss either side of an Ethernet hot-plug
+> ```
+>
+> The xhci line is the one that matters, because it is the instrument that lied during the failure:
+> `probes 12/412 ok, 0 msg, serve 3 ms vs hub 4999 ms` then, against `probes 1384/1384, 18232 msg`
+> now. Work is dominated by SERVE rather than by the hub path, which is the healthy shape.
+>
+> **What this does NOT establish**, kept here because a big number invites the opposite reading:
+> - The **stale peer cap** defect is still present - 77 gen-mismatch lines after the soak. It is not
+>   the permanent freeze that broke a machine, though: the values MOVE (`cap=275081 rec=275091`, then
+>   `cap=275091 rec=275097`), so holders are reacquiring and making progress, unlike the frozen
+>   `cap=1169 rec=1220` of the failing run. Still open; work parked at `riscv64-stale-cap-wip`.
+> - The xhci **retry** and **USB IS DEGRADED** paths added with the fix have STILL never fired, across
+>   22,872 rounds. They remain untested code; forcing them needs a test feature that sets the reset
+>   budget to zero.
+> - Roughly 22,700 of those rounds ran with the serial disconnected, so the round and kill counts are
+>   from the end-of-run report rather than from a continuous capture. A failure during that window
+>   would have been visible only as changed state at the end, not diagnosable.
+
 > **USB DEAD AFTER A STORM - ROOT-CAUSED AND FIXED 2026-09-11 (d7d4e6db), hardware-verified.**
 > Symptom: after `chaos max-carnage`, the USB keyboard and mass storage stop working while `xhci`
 > reports `1 HID, disk yes`. That health line reports what the driver ASKED for, not what functions.
