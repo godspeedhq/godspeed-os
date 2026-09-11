@@ -64,9 +64,14 @@ one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
 | port | `phys_in_ram` lower bound | kill-path changes |
 |------|---------------------------|-------------------|
 | riscv64 | HARDWARE: chaos 100/100, selfcheck 461/0 after it | HARDWARE, same run |
-| x86_64 | **identity suite 24/24** - and 6A/6B/15/4A/4B/10A/10B all exercise the kill path | **identity suite 24/24** |
+| x86_64 | **HARDWARE (HP T630, AMD): selfcheck 461/0, chaos 100/100, 461/0 again, hot-plug, 461/0 again** - plus identity 24/24 in QEMU | **same run**; identity 6A/6B/15/4A/4B/10A/10B all drive the kill path |
 | aarch64 (Pi 4) | QEMU: boots, 12 services up, no panic - so the bound is not wrong here | **NOT COVERED** |
 | arm32 (Pi 2) | builds clean (`--release`) | **NOT COVERED** |
+
+**CLOSED ON x86 IN HARDWARE 2026-09-11.** 639 kills, 538 floods, 50 supervisor respawns absorbed, and the
+selfcheck passed BEFORE, AFTER the chaos, and again after hot-plug - 461/0 every time. A different vendor
+(AMD) and a different memory model from the riscv64 board, which is what makes the `SeqCst` handshake
+changes genuinely tested rather than merely executed.
 
 **The x86 result is the one that was most wanted, and it is a NULL result by design.** x86 RAM starts at
 zero, so the lower bound closes a hole with no width there - anything OTHER than "no change" would have
