@@ -13,10 +13,10 @@ Two consequences worth stating plainly:
 
 - **Wiping or reflashing the card cannot brick the board.** It boots to U-Boot regardless; it simply
   finds nothing to load.
-- **But the card still needs the full StarFive partition layout**, because U-Boot's compiled-in
-  environment loads from `mmc 0:3` and only from there. This was previously written up as "one plain
-  FAT32 partition is enough", which is the error the rest of this file documents: the bootloader not
-  being on the card does not make the card's LAYOUT free.
+- **The card carries a kernel and nothing else.** One FAT32 partition is enough.
+- **But its 16-byte partition entry must sit in MBR SLOT 3**, because U-Boot's compiled-in environment
+  loads from `mmc 0:3` and only from there. The bootloader not being on the card does not make the
+  card's layout free, and "one partition is enough" is true only once that slot is right.
 
 ## Layout - and the correction that cost a boot
 
@@ -35,8 +35,10 @@ Error reading config file
 
 ## The measured layout
 
-Restore it by writing an official StarFive VisionFive image to the card (Rufus, Raspberry Pi Imager,
-`dd` - it is a plain image write). Measured on a freshly flashed card, 2026-09-11:
+Writing an official StarFive VisionFive image gives a card that boots, and is the option that needs no
+raw-sector work. It is NOT what this card used for the port - see the next section; a single FAT32
+partition in MBR slot 3 is enough and preserves the files already on it. Measured on a freshly flashed
+official image, 2026-09-11:
 
 ```
 disk: GPT, 7.61 GB
@@ -61,26 +63,39 @@ partition table the other way is denied too (`Access to the path '\\.\PhysicalDr
 
 ## The correction that cost a boot
 
-**This file used to record "MBR (not GPT) ... Partition 1 of 1 - FAT32, offset 1048576".** Every field
-of that is wrong against the measurement above: wrong table format, wrong count, wrong index, wrong
-offset. Booting it produced the failure quoted at the top of this file.
+**The saved note read "MBR (not GPT) ... Partition 1 of 1 - FAT32, offset 1048576".** Every field of
+that is accurate. The field it does not mention is the one U-Boot reads: **which MBR slot the entry
+occupies.** The card booted for the whole port with a single FAT32 partition whose 16-byte entry sat in
+**slot 3**, and `backlog/14-riscv64-port.md` says so in the paragraph written the day it first booted:
 
-Two explanations were offered for it before anything was measured - that Windows hides partitions it
-has no filesystem driver for, and that Windows renumbers partitions sequentially rather than reporting
-table slots. **Both are disproven by the measurement.** Windows lists all four partitions here,
-including two raw ones and an ext4 rootfs it cannot mount, and it reports the ESP as `PartitionNumber
-3`, its true slot. So the tool was not hiding or renumbering anything, and the recorded note simply did
-not describe a card this board can boot.
+> One FAT32 partition is enough - and it must sit in MBR slot 3 [...] Moving the 16-byte partition
+> entry from slot 1 to slot 3 is enough; no filesystem data moves.
 
-What the note should have been checked against was already in the repository:
-`scripts/riscv_build.py` prints "copy it to the card's FAT partition (partition 3, the ESP)" every time
-it builds. A measurement that contradicts a claim the build system is making out loud is the moment to
-stop and reconcile, not to write the measurement down and move on.
+`build/mbr_backup.bin` is the pre-move backup, and decodes to exactly that: slot 1 type 0x0C, startLBA
+2048, 15952344 sectors; slots 2, 3 and 4 empty.
 
-Partitions 1 and 2 hold SPL and U-Boot, but the board does not boot from them - SPL, OpenSBI and U-Boot
-all run from the 16 MB SPI flash, and U-Boot reports `bad CRC, using default environment`, so `mmc 0:3`
-is compiled in rather than configured. That is why wiping this card cannot brick the board, and why
-p1/p2 only need to exist.
+**Windows numbers MBR partitions sequentially and does not report slots.** That is why the note says
+partition 1 for an entry living in slot 3, and it is the single fact that would have prevented all of
+this. Do not read a `PartitionNumber` as a slot index on an MBR card.
+
+Two wrong explanations were published before that was established, and the way the second one went
+wrong is worth keeping. It was "checked" against a freshly written official image - a GPT card with all
+four slots occupied, where index and slot match trivially. A test whose cases cannot come apart cannot
+disprove anything, and it was reported as a disproof.
+
+What the note should have been reconciled against was in the repository the whole time:
+`scripts/riscv_build.py` prints "copy it to the card's FAT partition (partition 3, the ESP)" on every
+build, and `backlog/14` describes the slot move. A measurement that contradicts a claim the project is
+making out loud is the moment to stop and reconcile, not to write the measurement down and move on.
+
+**Also unrecorded until now: HOW the slot move was performed.** The backup survives, the tooling does
+not, and that gap is a large part of why restoring this card was hard. It needs an ELEVATED shell:
+an ordinary one is refused at both doors, `Access to the path '\\.\PhysicalDrive<N>' is denied` for the raw
+table and `Access to a CIM resource was not available to the client` for mounting an ESP.
+
+Partitions beyond the FAT32 one are not needed at all. SPL, OpenSBI and U-Boot all run from the 16 MB
+SPI flash, and U-Boot reports `bad CRC, using default environment`, so `mmc 0:3` is compiled in rather
+than configured. That is why wiping this card cannot brick the board.
 
 ## Contents
 
