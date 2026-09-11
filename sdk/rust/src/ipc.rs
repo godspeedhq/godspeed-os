@@ -166,6 +166,28 @@ pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<M
     }
 }
 
+/// A send failed. If the peer was REPLACED rather than merely busy, refresh the cached send cap so
+/// the NEXT send resolves to the live instance, and return the error unchanged.
+///
+/// This is the single choke point for that repair. Every one of the SDK's request/send helpers
+/// funnels through the four raw send syscalls below, so hooking it here covers all of them at once;
+/// hooking each helper instead is how eleven of fifteen get covered and the other four keep the bug.
+///
+/// Only `EndpointDead` heals. The kernel's `CapRevoked` decodes to it too (`i64_to_ipc_error` maps
+/// every unlisted code to `EndpointDead`), so both staleness cases are caught. `QueueFull` is a live
+/// peer that is busy, and `CapNotHeld` is a cap that was never held - reacquiring for either would be
+/// answering a question nobody asked.
+///
+/// A TIMEOUT never heals, and that is deliberate: `Ok(None)` means the deadline passed with the
+/// request possibly still in flight and still answerable. Only the `Err` arms below call this.
+#[inline]
+fn note_send_failure(endpoint: CapHandle, err: IpcError) -> IpcError {
+    if matches!(err, IpcError::EndpointDead) {
+        crate::service_context::heal_stale_send_slot(endpoint.0);
+    }
+    err
+}
+
 /// Send a message to `endpoint`; block if the queue is full. (§8.2 - `send`)
 pub fn send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
     let payload = msg.payload_bytes();
@@ -178,7 +200,7 @@ pub fn send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
             payload.len() as u64,
         )
     };
-    if ret == 0 { Ok(()) } else { Err(i64_to_ipc_error(ret)) }
+    if ret == 0 { Ok(()) } else { Err(note_send_failure(endpoint, i64_to_ipc_error(ret))) }
 }
 
 /// Send without blocking; return `QueueFull` immediately. (§8.2 - `try_send`)
@@ -193,7 +215,7 @@ pub fn try_send(endpoint: CapHandle, msg: &Message) -> Result<(), IpcError> {
             payload.len() as u64,
         )
     };
-    if ret == 0 { Ok(()) } else { Err(i64_to_ipc_error(ret)) }
+    if ret == 0 { Ok(()) } else { Err(note_send_failure(endpoint, i64_to_ipc_error(ret))) }
 }
 
 /// Synchronous CALL (syscall 41): send `request` to `target` carrying `reply_grant` as a one-shot
@@ -227,7 +249,7 @@ pub fn call(
     // buffer pointer before use.
     let ret = unsafe { raw_syscall(41, packed, buf.as_mut_ptr() as u64, recv_len) };
     if ret < 0 {
-        Err(i64_to_ipc_error(ret))
+        Err(note_send_failure(target, i64_to_ipc_error(ret)))
     } else {
         Ok(Message::from_bytes(&buf[..ret as usize]))
     }
@@ -301,7 +323,7 @@ pub fn call_deadline_into(
     if ret == RECV_TIMED_OUT {
         Ok(None)
     } else if ret < 0 {
-        Err(i64_to_ipc_error(ret))
+        Err(note_send_failure(target, i64_to_ipc_error(ret)))
     } else {
         Ok(Some(ret as usize))
     }

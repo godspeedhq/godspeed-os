@@ -641,6 +641,96 @@ impl CacheEntry {
 static mut SEND_CAP_CACHE: [CacheEntry; CACHE_SIZE] =
     [const { CacheEntry::empty() }; CACHE_SIZE];
 
+/// The peer name whose cached send cap lives in `slot`, if any.
+///
+/// The reverse of `find_send_slot`. A send fails with a SLOT, and reacquiring needs a NAME, so
+/// something has to map one to the other; this is it. Both tables are searched, cache first, in the
+/// same order `find_send_slot` consults them, so the name recovered here is the name that resolved
+/// to this slot in the first place.
+/// The name is COPIED OUT, not borrowed. The caller's next move is `reacquire_cap`, which writes
+/// `SEND_CAP_CACHE` - so a reference into that static would still be live while the static is being
+/// mutated, which is undefined behaviour however single-threaded the service is. 32 bytes on the
+/// stack removes the question.
+fn peer_name_for_slot(slot: u32) -> Option<([u8; PEER_NAME_BYTES], usize)> {
+    if slot == u32::MAX { return None; }
+    // SAFETY: single-threaded service process; no concurrent access. `addr_of!` avoids constructing
+    // a reference to the `static mut` itself (static_mut_refs), and nothing is held across the copy.
+    unsafe {
+        let cache = &*core::ptr::addr_of!(SEND_CAP_CACHE);
+        for entry in cache.iter() {
+            if entry.slot == slot && entry.name_len > 0 {
+                return Some((entry.name, entry.name_len as usize));
+            }
+        }
+    }
+    let data  = ServiceContext::ctx();
+    let count = (data.send_peer_count as usize).min(MAX_SEND_PEERS);
+    for i in 0..count {
+        let entry = &data.send_peers[i];
+        if entry.slot == slot && entry.name_len > 0 {
+            return Some((entry.name, (entry.name_len as usize).min(PEER_NAME_BYTES)));
+        }
+    }
+    None
+}
+
+/// A send to `slot` failed because the peer it names was replaced. Refresh the cached cap so the
+/// NEXT send resolves to the live instance.
+///
+/// **This does not retry, and that is the design.** The operation that just failed stays failed and
+/// is reported to the caller (§26.7: a failure is not hidden because recovery is available). Only the
+/// cache is repaired. Re-issuing the request is the caller's decision, because it is the only party
+/// that knows whether that is safe: §14.3 is explicit that reacquiring an endpoint is necessary but
+/// NOT sufficient - a fresh instance never issued the ids, offsets or transaction state the old one
+/// did, so replaying a stateful request into it desyncs the protocol rather than recovering it.
+///
+/// Nor is this the "silent rebinding" §26.5 rejects. That means authority quietly re-pointed
+/// underneath a holder; this is the client explicitly asking the name directory for a new cap, which
+/// is precisely what §14.3 prescribes - factored into one place instead of copied into each service,
+/// where it was reliably forgotten (`xhci`, `console`, `dwc2`, `ehci`, `events`, `hw-enumerator` and
+/// `observe` never did it at all).
+///
+/// Without this, `find_send_slot` hands back the same dead slot forever: the cache is only written by
+/// `reacquire_cap`, so a peer that respawns leaves every client that did not explicitly reacquire
+/// permanently unable to reach it, while the kernel logs the same stale-cap line until reboot.
+pub(crate) fn heal_stale_send_slot(slot: u32) -> bool {
+    let (name_buf, len) = match peer_name_for_slot(slot) {
+        Some(v) => v,
+        // No name for this slot: it is not a cached peer cap (a reply cap, or one derived for a
+        // single use). Nothing to reacquire, and nothing is wrong - stay quiet.
+        None => return false,
+    };
+    let name = match core::str::from_utf8(&name_buf[..len]) {
+        Ok(s)  => s,
+        Err(_) => return false,
+    };
+    // ServiceContext is zero-sized (`_private: ()`), so this borrows nothing and allocates nothing.
+    let ctx = ServiceContext { _private: () };
+    match ctx.reacquire_cap(name) {
+        Ok(_)  => {
+            // SAY SO. A repair that leaves no trace cannot be shown to have happened, and this one
+            // is invisible by construction otherwise - it changes nothing the caller can observe,
+            // because the failed send still fails. Without this line, "the cache self-heals" is a
+            // claim about code rather than an observed fact, and a storm looks identical whether the
+            // heal fires every time or never. It also keeps the repair VISIBLE per §26.4: a peer
+            // being silently swapped underneath a service is exactly what should not happen quietly.
+            ctx.log_fmt(format_args!(
+                "peer '{}' was replaced - reacquired it; the send that failed is NOT retried (14.3)",
+                name));
+            true
+        }
+        Err(_) => {
+            // §26.7: a recovery that itself fails is still a failure, and must stay as visible as the
+            // original. Reported once per failed heal rather than per send, because the send path
+            // reports its own error to the caller anyway.
+            ctx.log_fmt(format_args!(
+                "peer '{}' was replaced and could not be reacquired - sends to it will keep failing until it registers",
+                name));
+            false
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TaskStat - returned by ServiceContext::task_stat.
 // ---------------------------------------------------------------------------
