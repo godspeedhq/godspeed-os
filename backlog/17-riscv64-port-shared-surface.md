@@ -57,6 +57,20 @@ and mass storage, unplug and replug, including into a different port.
 
 ## Cross-port coverage of the NEUTRAL changes (2026-09-11)
 
+**COMPLETE 2026-09-11. All four architectures, five machines, on real hardware.** Every board ran the
+identical sequence - `selfcheck`, `chaos max-carnage all-services 100 yes`, `selfcheck`, hot-plug,
+`selfcheck` - with zero kernel panics, zero liveness wedges and zero kill-path panics everywhere.
+Roughly 2,600 service kills and 2,200 floods absorbed in total.
+
+The memory models are the point, not the machine count: RISC-V RVWMO (weak), x86-TSO on two different
+vendors, ARMv7 (weak) and ARMv8 (weak). `CORE_LEAVING` is a SeqCst Dekker handshake, and ordering bugs
+are precisely the class that pass under one model and fail under another.
+
+`phys_in_ram`'s lower bound is the fix that closed the riscv64 wedge, and it had WIDTH on three of
+these boards - the VisionFive and both Pis start RAM at 0x40000000. On the two x86 machines it is a
+null result by construction, which is exactly what it should be.
+
+
 Three neutral kernel changes landed while closing the riscv64 chaos wedge, and they run on every port:
 `phys_in_ram` gaining a LOWER bound, `CORE_LEAVING` + routing all 15 `CORE_CURRENT` releases through
 one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
@@ -65,7 +79,7 @@ one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
 |------|---------------------------|-------------------|
 | riscv64 (VisionFive 2 Lite) | **HARDWARE: 461/0, chaos 100/100, 461/0, hot-plug, 461/0** | **same run** |
 | x86_64 | **HARDWARE (HP T630, AMD): selfcheck 461/0, chaos 100/100, 461/0 again, hot-plug, 461/0 again** - plus identity 24/24 in QEMU | **same run**; identity 6A/6B/15/4A/4B/10A/10B all drive the kill path |
-| aarch64 (Pi 4) | QEMU: boots, 12 services, no panic. **Hardware run PENDING - image is on the card** | **PENDING** |
+| aarch64 (Pi 4) | **HARDWARE: 461/0, chaos 100/100, 463/0, hot-plug, 462/0** | **same run** |
 | arm32 (Pi 2) | **HARDWARE: 452/0, chaos 100/100, 452/0, hot-plug, 452/0** | **same run** |
 | x86_64 (Dell Wyse, **Intel**) | **HARDWARE: 461/0, chaos 100/100, 461/0, hot-plug, 461/0** | **same run** |
 
