@@ -63,7 +63,7 @@ one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
 
 | port | `phys_in_ram` lower bound | kill-path changes |
 |------|---------------------------|-------------------|
-| riscv64 | HARDWARE: chaos 100/100, selfcheck 461/0 after it | HARDWARE, same run |
+| riscv64 (VisionFive 2 Lite) | **HARDWARE: 461/0, chaos 100/100, 461/0, hot-plug, 461/0** | **same run** |
 | x86_64 | **HARDWARE (HP T630, AMD): selfcheck 461/0, chaos 100/100, 461/0 again, hot-plug, 461/0 again** - plus identity 24/24 in QEMU | **same run**; identity 6A/6B/15/4A/4B/10A/10B all drive the kill path |
 | aarch64 (Pi 4) | QEMU: boots, 12 services up, no panic - so the bound is not wrong here | **NOT COVERED** |
 | arm32 (Pi 2) | builds clean (`--release`) | **NOT COVERED** |
