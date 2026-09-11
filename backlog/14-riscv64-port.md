@@ -48,6 +48,33 @@
 > installed config back to confirm the Debian fallback survived. It needs elevation, because Windows
 > hides an EFI System Partition and ACLs it to administrators.
 
+> **STALE PEER CAPS - fixed 2026-09-11, verified in QEMU, NOT yet verified at soak scale.**
+> A send cap to a peer that respawned stayed stale for the rest of the boot: `find_send_slot` answers
+> from a cache only `reacquire_cap` writes, so a service that never explicitly reacquired kept
+> resolving the same dead slot. Seven services never reacquired at all (`xhci`, `console`, `dwc2`,
+> `ehci`, `events`, `hw-enumerator`, `observe`). On this board it presented as a dead USB keyboard and
+> no shell prompt after a storm, with `xhci` reporting `1 HID, disk yes` while delivering `0 msg`.
+>
+> **Not a RISC-V bug and not new.** The signature is in every chaos log in `build/` going back to
+> July, on every port. Counts of the serious `liveness=Alive` variant (peer respawned and running,
+> client holding a cap to the previous incarnation): x86_64 Wyse 608, riscv64 660, aarch64 Pi 4 224,
+> arm32 Pi 2 95. Nobody had read the line.
+>
+> Fixed in the SDK at the choke point - the four raw send syscalls all fifteen request/send helpers
+> funnel through - so no helper can forget. It repairs the CACHE and deliberately does not retry: the
+> failed send stays failed and is reported, because §14.3 is explicit that reacquiring is necessary but
+> not sufficient, and replaying a stateful request into an instance that never issued the ids it
+> references desyncs a protocol rather than recovering it.
+>
+> QEMU, 8-round max-carnage run to completion: 49 kills, 327 reacquisitions, 0 panics, 0 wedges, and
+> **0 stale-cap lines after the storm ended**. Stale lines still appear DURING a storm, which is
+> correct.
+>
+> **What is NOT established:** there is no same-environment before/after (the pre-fix QEMU attempt was
+> truncated mid-storm, so the comparison crosses from a before-fix HARDWARE log to an after-fix QEMU
+> one), and QEMU cannot reach soak scale - roughly 85 s per chaos round under TCG with 4 harts, so 100
+> rounds is over two hours. The board's soak is what settles both.
+
 **Severity:** feature, in progress. The target board is a StarFive **VisionFive 2** class machine
 (JH7110); QEMU `virt` is the primary development target and will remain so for the early work.
 **Status:** 2026-09-07 - the kernel BUILDS for `riscv64imac-unknown-none-elf` and BOOTS under QEMU
