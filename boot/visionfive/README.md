@@ -74,9 +74,21 @@ occupies.** The card booted for the whole port with a single FAT32 partition who
 `build/mbr_backup.bin` is the pre-move backup, and decodes to exactly that: slot 1 type 0x0C, startLBA
 2048, 15952344 sectors; slots 2, 3 and 4 empty.
 
-**Windows numbers MBR partitions sequentially and does not report slots.** That is why the note says
-partition 1 for an entry living in slot 3, and it is the single fact that would have prevented all of
-this. Do not read a `PartitionNumber` as a slot index on an MBR card.
+**Whether a Windows `PartitionNumber` is a table slot is UNRESOLVED for MBR, and it was asserted twice
+in this file before it was measured. Do not trust either claim.**
+
+What IS measured, on GPT, is that Windows reports the true entry index. A card carrying a 100 MB ESP in
+entry 3 and a 7681 MB partition in entry 1 is listed as `3` then `1` - out of offset order, the large
+partition at the high offset reported first. Sequential renumbering cannot produce that.
+
+The MBR case was never measured. The reasoning that "proved" renumbering there ran: the backup shows the
+entry in slot 1, the backlog says to move it to slot 3, the later note says partition 1, therefore
+Windows renumbers. Every step is a record rather than an observation, and the middle one - that the move
+was actually performed - is an assumption. `build/mbr_backup.bin` is a PRE-move backup; no post-move
+capture was ever taken, and the card has since been overwritten. It is not knowable from what survives.
+
+The useful rule needs none of that: **read the slot, never the ordinal.** On GPT, `Get-Partition` gives
+it. On MBR it takes the raw table, which needs an elevated shell.
 
 Two wrong explanations were published before that was established, and the way the second one went
 wrong is worth keeping. It was "checked" against a freshly written official image - a GPT card with all
