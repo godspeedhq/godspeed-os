@@ -24,6 +24,30 @@
 > is what ends the hard-coded UART address and unblocks Sv39, the trap vector and the timer.
 
 
+> **SINGLE HART VERIFIED ON HARDWARE 2026-09-11.** `--features riscv-single-hart` clamps the hart
+> count at DISCOVERY, so the percpu arenas, `ap_count` and the liveness watchdog are all sized for one
+> core rather than sized for four and overridden later. On the board:
+>
+> ```
+> riscv64: usable harts 1
+> smp: no secondary harts started - running single-core
+> smp: 1 core ready
+> ```
+>
+> `smp: 1 core ready` is singular, and no line names core 1, 2 or 3 anywhere in 1.36 MB of serial.
+> Sequence: selfcheck 461/0, chaos max-carnage 100 rounds absorbing 609 service kills, selfcheck
+> 461/0, USB hot-plug, selfcheck 461/0. **0 kernel panics, 0 liveness wedges, 0 kernel faults.**
+> Networking held throughout - DHCP was re-acquired DURING the chaos run, ping 8.8.8.8 returned 2/2
+> at 0% loss and DNS resolved afterwards. 461 is the same count the multi-hart runs produce, so it is
+> a full run rather than a truncated one.
+>
+> Deployment is now `scripts/deploy_visionfive.ps1` rather than steps retyped from memory. The card
+> runs an official StarFive image; our kernel goes on its ESP (partition 3) and our label is APPENDED
+> to the `extlinux.conf` already there, so Debian stays selectable. The script refuses to write unless
+> the target really is that partition, verifies the kernel by SHA256 after copying, and parses the
+> installed config back to confirm the Debian fallback survived. It needs elevation, because Windows
+> hides an EFI System Partition and ACLs it to administrators.
+
 **Severity:** feature, in progress. The target board is a StarFive **VisionFive 2** class machine
 (JH7110); QEMU `virt` is the primary development target and will remain so for the early work.
 **Status:** 2026-09-07 - the kernel BUILDS for `riscv64imac-unknown-none-elf` and BOOTS under QEMU
