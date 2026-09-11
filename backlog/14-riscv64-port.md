@@ -48,6 +48,30 @@
 > installed config back to confirm the Debian fallback survived. It needs elevation, because Windows
 > hides an EFI System Partition and ACLs it to administrators.
 
+> **CROSS-BOARD COVERAGE, 2026-09-11.** Every machine re-run after the day's driver fixes:
+>
+> ```
+> VisionFive riscv64  22,872 rounds / 136,906 kills, then 100 rounds on the FINAL binary. 461/0.
+> Wyse (Intel)        100 rounds. backlog/19 fixed and verified: ping recovers with NO reboot.
+> T630 (AMD)          100 rounds / 646 kills. RTL8168 confirmed - it runs the changed path too.
+> Pi 2 (arm32)        100 rounds / 558 kills. selfcheck 452/0 x3. ping 0% loss around the storm.
+> Pi 4 (aarch64)      NOT RE-TESTED.
+> ```
+>
+> Zero kernel panics and zero liveness wedges on all four tested boards.
+>
+> **A method lesson that cost a wrong call today.** I argued a board was unaffected because the changed
+> code was `cfg`'d out for its architecture. The operator asked to check anyway, and the RISC-V binary
+> turned out to DIFFER from the soaked one - same size, different SHA256, with a reproducible build to
+> prove the difference was real rather than build noise. **`cfg`'d-out is not the same as absent**: the
+> function still compiles and the layout moves. The only absolute exemption is a binary that is not
+> embedded at all (`xhci` on arm32, per `services/supervisor/build.rs`: `"arm" => &["dwc2"]`). Where
+> the exemption is `cfg`-shaped, hash the artefact or test the board.
+>
+> **Two caveats on the coverage above.** The Pi 2 ran a `kernel7.img` built BEFORE the nic-driver
+> change, so it confirms the ARM port rather than HEAD. And the Pi 4 has not been re-tested since the
+> `xhci` reset change at all.
+
 > **SOAK: 22,872 ROUNDS / 136,906 KILLS, 2026-09-11.** Five and a half hours of
 > `chaos max-carnage all-services` on the VisionFive 2 Lite at 4 harts, then stopped with `q`:
 >
