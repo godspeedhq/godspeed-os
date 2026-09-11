@@ -67,6 +67,15 @@ one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
 | x86_64 | **HARDWARE (HP T630, AMD): selfcheck 461/0, chaos 100/100, 461/0 again, hot-plug, 461/0 again** - plus identity 24/24 in QEMU | **same run**; identity 6A/6B/15/4A/4B/10A/10B all drive the kill path |
 | aarch64 (Pi 4) | QEMU: boots, 12 services up, no panic - so the bound is not wrong here | **NOT COVERED** |
 | arm32 (Pi 2) | builds clean (`--release`) | **NOT COVERED** |
+| x86_64 (Dell Wyse, **Intel**) | **HARDWARE: 461/0, chaos 100/100, 461/0, hot-plug, 461/0** | **same run** |
+
+**CLOSED ON x86 IN HARDWARE 2026-09-11, ON TWO DIFFERENT VENDORS.** The T630 is AMD and the Wyse is
+Intel; both ran 461/0, chaos 100/100, 461/0, hot-plug, 461/0 with zero panics, zero wedges, zero
+kill-path panics and zero kernel faults. Between them and the VisionFive that is THREE hardware
+memory models - RISC-V weak ordering, AMD x86-TSO and Intel x86-TSO - which is what makes the SeqCst
+handshake in `CORE_LEAVING` genuinely tested rather than executed three times on the same silicon.
+
+Original T630 note follows.
 
 **CLOSED ON x86 IN HARDWARE 2026-09-11.** 639 kills, 538 floods, 50 supervisor respawns absorbed, and the
 selfcheck passed BEFORE, AFTER the chaos, and again after hot-plug - 461/0 every time. A different vendor
