@@ -719,15 +719,17 @@ pub(crate) fn heal_stale_send_slot(slot: u32) -> bool {
                 name));
             true
         }
-        Err(_) => {
-            // §26.7: a recovery that itself fails is still a failure, and must stay as visible as the
-            // original. Reported once per failed heal rather than per send, because the send path
-            // reports its own error to the caller anyway.
-            ctx.log_fmt(format_args!(
-                "peer '{}' was replaced and could not be reacquired - sends to it will keep failing until it registers",
-                name));
-            false
-        }
+        // NOT LOGGED, deliberately. A failed heal means the peer is not in the name directory at this
+        // instant - the normal, transient state during a storm, reached once per send. Logging it here
+        // produced 164 lines in seven chaos rounds, all saying what two other lines already said: the
+        // caller reports the send error it was handed ("fs: block-driver did not reply within 30 s"),
+        // and the kernel names the holder ("'fs' holds a STALE cap to ResourceId(118)"). A third copy
+        // is not more visibility, it is the flood that buries the first two.
+        //
+        // §26.7 is satisfied by those, not by this: the original failure is reported and never
+        // swallowed. What that section forbids is a failed recovery being treated AS a success, which
+        // is why `false` is returned rather than swallowed - the send still fails, and says so.
+        Err(_) => false,
     }
 }
 
