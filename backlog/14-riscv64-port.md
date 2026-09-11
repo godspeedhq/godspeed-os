@@ -48,6 +48,41 @@
 > installed config back to confirm the Debian fallback survived. It needs elevation, because Windows
 > hides an EFI System Partition and ACLs it to administrators.
 
+> **USB DEAD AFTER A STORM - ROOT-CAUSED AND FIXED 2026-09-11 (d7d4e6db), hardware-verified.**
+> Symptom: after `chaos max-carnage`, the USB keyboard and mass storage stop working while `xhci`
+> reports `1 HID, disk yes`. That health line reports what the driver ASKED for, not what functions.
+> The numbers in the same line are what tell you:
+>
+> ```
+> broken:   work  5003 ms (serve     3  hub 4999),  probes  12/412 ok,     0 msg
+> healthy:  work 18267 ms (serve 18057  hub  187),  probes 468/468 ok, 12404 msg
+> ```
+>
+> **Cause, in two parts.** `xhci: TIMEOUT after ~250 ms waiting for USBCMD.HCRST to clear`, 24 times
+> in one run - the reset was SLOW, not stuck. And `spin()` returns a bool saying whether the wait
+> succeeded which **no caller in the reset path bound**, so the driver programmed a controller that
+> had never reset and then described itself as healthy. A failed recovery treated as a success
+> (§26.7); the loudest line in the log was also the most ignored.
+>
+> **Why slow only on this port.** The kernel's driver-death quiesce clears PCI Bus-Master-Enable, and
+> this board's xHCI is a PLATFORM device at MMIO 0x10110000 with no BDF, so `task_hw_bdf` returns
+> 0xFFFF and nothing stops the controller when chaos kills its driver. The next instance resets a
+> controller that was mid-flight rather than idle. Hence chaos-only and riscv-only.
+>
+> **Verified:** 100 rounds, 563 kills, selfcheck 461/0 twice, hot-plug re-bound keyboard and the
+> 15 GB disk with sector 0 read back, 0 panics, 0 wedges, **0 HCRST timeouts** (was 24).
+>
+> **UNPROVEN and recorded as such:** the bounded-retry and `USB IS DEGRADED` paths added alongside
+> never fired, because the larger budget alone was enough. They are untested code. Forcing them needs
+> a test feature that sets the budget to zero - the same "prove the guard fires" discipline used for
+> `iommu-fault-test`.
+>
+> **The cost, and the lesson.** Hours went into a capability-staleness theory because
+> `cap::get ... gen mismatch` lines are loud and numerous during a storm. They are NORMAL - a peer
+> really is being replaced - and the failing run contained exactly ONE frozen stale pair. A loud,
+> numerous signal is not the same as the failing one; find the instrument whose numbers CHANGED
+> between a healthy run and a broken one. One line of xhci telemetry had it the whole time.
+
 > **STALE PEER CAPS - a real defect, NOT fixed. The attempt was REVERTED on 2026-09-11.**
 > The work is preserved at tag `riscv64-stale-cap-wip` (8d9fde24); nothing is lost, and the diagnosis
 > below is worth more than the code was.
