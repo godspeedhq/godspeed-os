@@ -32,9 +32,21 @@ Retrieving file: /extlinux/extlinux.conf
 Error reading config file
 ```
 
-**This file originally recorded "MBR, 1 of 1 partition", and that was wrong.** It came from Windows
-`Get-Partition`, which does not list partitions it has no filesystem driver for - so it showed the ESP
-and silently hid the two before it. A measurement that omits the part that matters is worse than no
+**This file originally recorded "MBR, 1 of 1 partition", and that reading could not boot.** It came
+from Windows `Get-Partition`. Exactly WHY that disagreed with U-Boot is still open, and the two
+candidates are worth keeping apart rather than picking the tidier one:
+
+1. Windows hid partitions it has no filesystem driver for, showing only the ESP; or
+2. Windows' `PartitionNumber` is a sequential index over the partitions that EXIST, not the MBR/GPT
+   table slot - so a card whose only entry sits in slot 3 is reported as "partition 1 of 1".
+
+**The test that settles it:** after restoring a known-good layout, compare what `Get-Partition` reports
+for the ESP against the raw table. If Windows says `PartitionNumber 1` while the table has the entry in
+slot 3, (2) is proven and the warning to record is "Windows renumbers - it does not report slots".
+Reading the raw table needs an ELEVATED shell; an ordinary one gets `Access to the path
+'\\.\PhysicalDrive1' is denied` and cannot see slots at all.
+
+Either way the lesson already holds: a measurement that omits the part that matters is worse than no
 measurement, because it gets trusted. `scripts/riscv_build.py` had been saying "partition 3, the ESP"
 in its own deploy message the whole time.
 
