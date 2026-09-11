@@ -11,11 +11,12 @@ log says so: `Trying to boot from SPI`, `Loading Environment from SPIFlash: SF: 
 
 Two consequences worth stating plainly:
 
-- **The card carries a kernel and nothing else.** One plain FAT32 partition is enough. There is no
-  SPL partition, no U-Boot partition, and none of the GPT type GUIDs a from-scratch VisionFive 2
-  install needs.
 - **Wiping or reflashing the card cannot brick the board.** It boots to U-Boot regardless; it simply
-  finds nothing to load. Restoring is copying three files back.
+  finds nothing to load.
+- **But the card still needs the full StarFive partition layout**, because U-Boot's compiled-in
+  environment loads from `mmc 0:3` and only from there. This was previously written up as "one plain
+  FAT32 partition is enough", which is the error the rest of this file documents: the bootloader not
+  being on the card does not make the card's LAYOUT free.
 
 ## Layout - and the correction that cost a boot
 
@@ -32,46 +33,54 @@ Retrieving file: /extlinux/extlinux.conf
 Error reading config file
 ```
 
-**This file originally recorded "MBR, 1 of 1 partition", and that reading could not boot.** It came
-from Windows `Get-Partition`. Exactly WHY that disagreed with U-Boot is still open, and the two
-candidates are worth keeping apart rather than picking the tidier one:
+## The measured layout
 
-1. Windows hid partitions it has no filesystem driver for, showing only the ESP; or
-2. Windows' `PartitionNumber` is a sequential index over the partitions that EXIST, not the MBR/GPT
-   table slot - so a card whose only entry sits in slot 3 is reported as "partition 1 of 1".
-
-**The test that settles it:** after restoring a known-good layout, compare what `Get-Partition` reports
-for the ESP against the raw table. If Windows says `PartitionNumber 1` while the table has the entry in
-slot 3, (2) is proven and the warning to record is "Windows renumbers - it does not report slots".
-Reading the raw table needs an ELEVATED shell; an ordinary one gets `Access to the path
-'\\.\PhysicalDrive1' is denied` and cannot see slots at all.
-
-Either way the lesson already holds: a measurement that omits the part that matters is worse than no
-measurement, because it gets trusted. `scripts/riscv_build.py` had been saying "partition 3, the ESP"
-in its own deploy message the whole time.
-
-Partitions 1 and 2 do not need CONTENTS - SPL, OpenSBI and U-Boot all live in SPI flash (see below).
-They only need to exist, so that the FAT32 lands at index 3.
-
-### Rebuilding the layout (Windows `diskpart`, as Administrator)
-
-> Identify the card the safe way first: `list disk`, physically REMOVE the card, `list disk` again -
-> the disk that disappeared is yours. Reinsert before selecting. Selecting the wrong disk here erases
-> it.
+Restore it by writing an official StarFive VisionFive image to the card (Rufus, Raspberry Pi Imager,
+`dd` - it is a plain image write). Measured on a freshly flashed card, 2026-09-11:
 
 ```
-diskpart
-  list disk
-  select disk N          <- the card, confirmed by the remove-and-compare above
-  clean
-  create partition primary size=2
-  create partition primary size=4
-  create partition primary
-  select partition 3
-  format fs=fat32 quick label=GODSPEED
-  assign
-  exit
+disk: GPT, 7.61 GB
+  p1     2 MB   offset   2097152   2e54b353-1271-4842-806f-e436d6af6985   SPL
+  p2     4 MB   offset   4194304   5b193300-fc78-40cd-8002-e86c45580b47   U-Boot
+  p3   100 MB   offset   8388608   c12a7328-f81f-11d2-ba4b-00a0c93ec93b   EFI System  <- mmc 0:3
+  p4  3891 MB   offset 113246208   0fc63daf-8483-4772-8e79-3d69d8477de4   Linux rootfs
 ```
+
+Only p3 matters to us. GodspeedOS is deployed by copying the kernel and DTB onto that ESP and ADDING a
+label to the `/extlinux/extlinux.conf` already there - not replacing it, so the image's own kernel stays
+in the menu as a known-good fallback (the same role a stock `kernel8.img` plays on the Pi 4).
+
+The ESP is not mounted by Windows and has no drive letter. Assigning one needs an ELEVATED shell:
+
+```powershell
+Add-PartitionAccessPath -DiskNumber <N> -PartitionNumber 3 -AssignDriveLetter
+```
+
+An ordinary shell gets `Access to a CIM resource was not available to the client`, and reading the raw
+partition table the other way is denied too (`Access to the path '\\.\PhysicalDrive<N>' is denied`).
+
+## The correction that cost a boot
+
+**This file used to record "MBR (not GPT) ... Partition 1 of 1 - FAT32, offset 1048576".** Every field
+of that is wrong against the measurement above: wrong table format, wrong count, wrong index, wrong
+offset. Booting it produced the failure quoted at the top of this file.
+
+Two explanations were offered for it before anything was measured - that Windows hides partitions it
+has no filesystem driver for, and that Windows renumbers partitions sequentially rather than reporting
+table slots. **Both are disproven by the measurement.** Windows lists all four partitions here,
+including two raw ones and an ext4 rootfs it cannot mount, and it reports the ESP as `PartitionNumber
+3`, its true slot. So the tool was not hiding or renumbering anything, and the recorded note simply did
+not describe a card this board can boot.
+
+What the note should have been checked against was already in the repository:
+`scripts/riscv_build.py` prints "copy it to the card's FAT partition (partition 3, the ESP)" every time
+it builds. A measurement that contradicts a claim the build system is making out loud is the moment to
+stop and reconcile, not to write the measurement down and move on.
+
+Partitions 1 and 2 hold SPL and U-Boot, but the board does not boot from them - SPL, OpenSBI and U-Boot
+all run from the 16 MB SPI flash, and U-Boot reports `bad CRC, using default environment`, so `mmc 0:3`
+is compiled in rather than configured. That is why wiping this card cannot brick the board, and why
+p1/p2 only need to exist.
 
 ## Contents
 
@@ -87,11 +96,16 @@ than none, because somebody will eventually flash it.
 
 ## To rebuild the card
 
-1. Partition as **MBR** with a single **FAT32** partition starting at 1 MiB. No boot flag needed.
-2. Copy `extlinux.conf` to `/extlinux/extlinux.conf` on the card.
-3. Copy `dtbs/jh7110s-starfive-visionfive-2-lite.dtb` to `/dtbs/` on the card.
+1. Write an official StarFive VisionFive image to the card with any imaging tool. Do NOT partition it
+   by hand: the layout above, with the ESP at partition 3, is what U-Boot's compiled-in environment
+   expects, and a hand-rolled single-partition card silently fails to boot.
+2. Mount partition 3 from an ELEVATED shell (see above); Windows will not give it a letter otherwise.
+3. Copy `dtbs/jh7110s-starfive-visionfive-2-lite.dtb` to `/dtbs/` on that partition.
 4. `python scripts/riscv_build.py --release --visionfive`, then copy
-   `build/godspeed-riscv64-visionfive.img` to the card root.
+   `build/godspeed-riscv64-visionfive.img` to the partition root.
+5. ADD the label from `extlinux.conf` in this directory to the `/extlinux/extlinux.conf` already on the
+   card, and point `default` at it. Appending rather than overwriting keeps the image's own kernel in
+   the menu as a fallback.
 
 ## Why the device tree is kept here rather than fetched
 
