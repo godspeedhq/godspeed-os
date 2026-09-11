@@ -48,32 +48,44 @@
 > installed config back to confirm the Debian fallback survived. It needs elevation, because Windows
 > hides an EFI System Partition and ACLs it to administrators.
 
-> **STALE PEER CAPS - fixed 2026-09-11, verified in QEMU, NOT yet verified at soak scale.**
-> A send cap to a peer that respawned stayed stale for the rest of the boot: `find_send_slot` answers
-> from a cache only `reacquire_cap` writes, so a service that never explicitly reacquired kept
-> resolving the same dead slot. Seven services never reacquired at all (`xhci`, `console`, `dwc2`,
-> `ehci`, `events`, `hw-enumerator`, `observe`). On this board it presented as a dead USB keyboard and
-> no shell prompt after a storm, with `xhci` reporting `1 HID, disk yes` while delivering `0 msg`.
+> **STALE PEER CAPS - a real defect, NOT fixed. The attempt was REVERTED on 2026-09-11.**
+> The work is preserved at tag `riscv64-stale-cap-wip` (8d9fde24); nothing is lost, and the diagnosis
+> below is worth more than the code was.
 >
-> **Not a RISC-V bug and not new.** The signature is in every chaos log in `build/` going back to
-> July, on every port. Counts of the serious `liveness=Alive` variant (peer respawned and running,
-> client holding a cap to the previous incarnation): x86_64 Wyse 608, riscv64 660, aarch64 Pi 4 224,
-> arm32 Pi 2 95. Nobody had read the line.
+> **What is wrong.** A send cap to a peer that respawned can stay stale for the rest of the boot:
+> `find_send_slot` answers from a cache only `reacquire_cap` writes, so a service that never
+> explicitly reacquires keeps resolving the same dead slot. Seven services never reacquire at all
+> (`xhci`, `console`, `dwc2`, `ehci`, `events`, `hw-enumerator`, `observe`).
 >
-> Fixed in the SDK at the choke point - the four raw send syscalls all fifteen request/send helpers
-> funnel through - so no helper can forget. It repairs the CACHE and deliberately does not retry: the
-> failed send stays failed and is reported, because §14.3 is explicit that reacquiring is necessary but
-> not sufficient, and replaying a stateful request into an instance that never issued the ids it
-> references desyncs a protocol rather than recovering it.
+> **The signature is on every port**, in every chaos log in `build/` going back to July. Counts of the
+> serious `liveness=Alive` variant (peer respawned and running, client holding a cap to the previous
+> incarnation): x86_64 Wyse 608, riscv64 660, aarch64 Pi 4 224, arm32 Pi 2 95. Nobody had read the line.
 >
-> QEMU, 8-round max-carnage run to completion: 49 kills, 327 reacquisitions, 0 panics, 0 wedges, and
-> **0 stale-cap lines after the storm ended**. Stale lines still appear DURING a storm, which is
-> correct.
+> **But the signature is not the failure, and conflating them was the error that drove this work.**
+> The user-visible failure - USB keyboard dead and no shell prompt after a storm, with `xhci` reporting
+> `1 HID, disk yes` while delivering `0 msg` - was seen ONCE, on one 4-hart run. The same build (the
+> only intervening commit is `riscv-single-hart`, which is `cfg!`-gated and inert when off) had already
+> passed 100 rounds cleanly at 4 harts the previous night, and a 1-hart build passed 100 rounds and
+> recovered fully the same morning. **So the failure is an intermittent race that a single hart does
+> not reproduce**, which is exactly the control `a76614a5` predicted: "a bug that survives on one hart
+> is not a race."
 >
-> **What is NOT established:** there is no same-environment before/after (the pre-fix QEMU attempt was
-> truncated mid-storm, so the comparison crosses from a before-fix HARDWARE log to an after-fix QEMU
-> one), and QEMU cannot reach soak scale - roughly 85 s per chaos round under TCG with 4 harts, so 100
-> rounds is over two hours. The board's soak is what settles both.
+> **Why the fix came out.** It repaired permanent staleness, which is a different bug from an
+> intermittent race, so it was unverified against the actual failure. It changes the SDK that every
+> port links. And it produced `riscv64: FAULT WHILE REPORTING A FAULT - halting` on the board at chaos
+> round 17 - a guard present since `2adb2f8b` that had never fired in nine prior captures. The likely
+> cause was its own logging: 622 of 2812 lines, on the same serial path the trap reporter uses, with
+> the report's output visibly split mid-word. Circumstantial, not proven.
+>
+> **What the attempt established, and what it did not.** In QEMU, an 8-round storm run to completion
+> left 0 stale-cap lines after it ended, with 327 reacquisitions during it - so the cache repair works
+> for peers it can NAME. It is incomplete: `nic-driver`, `net-stack` and `xhci` held stale caps the SDK
+> could not resolve to a name (not in `SEND_CAP_CACHE` or `send_peers`), and those need per-service
+> `reacquire_by_name`, which is what §14.3 asks for anyway.
+>
+> **Next time, the method matters more than the patch.** The single-hart build is the control: run the
+> same storm at 1 hart and at 4, repeatedly, and count recoveries. A race needs repetition to measure;
+> one clean run proves nothing and one failure proves little.
 
 **Severity:** feature, in progress. The target board is a StarFive **VisionFive 2** class machine
 (JH7110); QEMU `virt` is the primary development target and will remain so for the early work.

@@ -319,14 +319,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // 1 = reply-style (we kill it instead - flooding corrupts its reply stream), 2 = no acquirable send
     // endpoint (acquire_send_cap returned None). Discovered at runtime, not hardcoded.
     let mut sv_flood_na: [u8; MAX_SVC] = [0u8; MAX_SVC];
-    // ROUND IN WHICH THIS SERVICE WAS LAST A CANDIDATE. Without it the panel shows a frozen row for a
-    // service that died and was never restarted - `recorder 1 1` sitting there for 99 further rounds,
-    // reading exactly like a service swept every round when nothing was tested after the first.
-    // `recorder` is the real case: the shell spawns it on demand and the supervisor deliberately does
-    // NOT restart it (one resurrected without its target path would be alive and writing nothing while
-    // `status` said running), so chaos kills it once and it leaves the live set for good. Same reasoning
-    // as the flood column's loud N/A: a number with no state beside it invites the flattering reading.
-    let mut sv_last_seen: [u64; MAX_SVC] = [0u64; MAX_SVC];
     let mut nsv = 0usize;
 
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -478,7 +470,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 idx = Some(nsv); nsv += 1;
             }
             let s = match idx { Some(s) => s, None => continue }; // tally full (won't happen at ~8 services)
-            sv_last_seen[s] = round;   // live and in the victim set THIS round
 
             if name == "shell" || name == "fs" {
                 // Reply-style: KILL every sweep. The kill bumps the endpoint generation, so reclaim any
@@ -563,25 +554,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         let _ = write!(f, "\x1b[K\r\n");
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
-        let _ = write!(f, "  {:<16} {:>10} {:>11}  {:<6}\x1b[K\r\n", "service", "kill-storm", "flood-storm", "state");
+        let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", "service", "kill-storm", "flood-storm");
         for s in 0..nsv {
             let nm = str_of(&sv_name[s][..sv_nlen[s]]);
-            // STATE: is this row still being tested? A service absent from the victim set for two full
-            // rounds has left the live set and is not coming back on its own, so its counts are frozen
-            // history rather than a running total. Two rounds of grace, not zero, because a service
-            // caught mid-restart is legitimately absent for an instant and is NOT gone.
-            let state = if round > sv_last_seen[s] + 2 { "gone" } else { "live" };
             // flood cell: a LOUD N/A (with the reason) where flooding does not apply, else the count. A
             // bare 0 reads as "tried, got nothing"; this says "not applicable, and why".
             match sv_flood_na[s] {
-                1 => { let _ = write!(f, "  {:<16} {:>10} {:>11}  {:<6}\x1b[K\r\n", nm, sv_killed[s], "N/A (reply)", state); }
-                2 => { let _ = write!(f, "  {:<16} {:>10} {:>11}  {:<6}\x1b[K\r\n", nm, sv_killed[s], "N/A (no-ep)", state); }
-                _ => { let _ = write!(f, "  {:<16} {:>10} {:>11}  {:<6}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s], state); }
+                1 => { let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], "N/A (reply)"); }
+                2 => { let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], "N/A (no-ep)"); }
+                _ => { let _ = write!(f, "  {:<16} {:>10} {:>11}\x1b[K\r\n", nm, sv_killed[s], sv_flooded[s]); }
             }
         }
         let _ = write!(f, "  ----------------------------------------------------\x1b[K\r\n");
         let _ = write!(f, "  flood N/A: reply = killed instead (reply-style); no-ep = no send endpoint\x1b[K\r\n");
-        let _ = write!(f, "  state: gone = left the live set and was not restarted; its counts stopped moving\x1b[K\r\n");
         let _ = write!(f, "  system:  mem-pressure {}   spawn-storm {}\x1b[K\r\n", mempr, spawns);
         if target_all || target_random {
             let _ = write!(f, "  kernel: ALIVE   abort: 'q' in the SERIAL console (keyboard dead)\x1b[K\r\n");

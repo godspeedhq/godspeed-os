@@ -55,20 +55,8 @@ impl CapTable {
         if !cap.generation.matches(record.generation) {
             // Only log for endpoint resources (id>=100) to avoid startup test noise.
             if cap.resource_id.0 >= 100 {
-                // NAME THE HOLDER. Without it this line says a cap went stale but not whose, and on a
-                // multi-core machine the surrounding log lines are NOT a clue - they interleave across
-                // cores, so reading the neighbouring line as "the caller" is a guess that looks like
-                // evidence. Deciding which service failed to reacquire (14.3) is the whole question this
-                // line exists to answer, and a chaos storm produces over a thousand of them.
-                //
-                // Both calls are lock-free (an atomic load, and a read of `smp::names::NameTable`), which
-                // is why the holder is named and the resource's OWNER is not: a reverse lookup would take
-                // the `ipc::names` SpinLock on a path every syscall reaches, and a lock taken in an error
-                // path to improve a log message is a deadlock waiting for the right interleaving.
-                let holder = crate::task::scheduler::task_name(
-                    crate::task::scheduler::current_task_slot());
-                crate::kprintln!("cap::get: '{}' holds a STALE cap to ResourceId({}) - cap={} rec={} liveness={:?} (it must reacquire; see 14.3)",
-                    holder, cap.resource_id.0, cap.generation.0, record.generation.0, record.liveness);
+                crate::kprintln!("cap::get: ResourceId({}) gen mismatch cap={} rec={} liveness={:?}",
+                    cap.resource_id.0, cap.generation.0, record.generation.0, record.liveness);
             }
             return Err(match record.liveness {
                 Liveness::Dead    => CapError::EndpointDead,
