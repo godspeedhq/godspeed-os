@@ -65,8 +65,8 @@ one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
 |------|---------------------------|-------------------|
 | riscv64 (VisionFive 2 Lite) | **HARDWARE: 461/0, chaos 100/100, 461/0, hot-plug, 461/0** | **same run** |
 | x86_64 | **HARDWARE (HP T630, AMD): selfcheck 461/0, chaos 100/100, 461/0 again, hot-plug, 461/0 again** - plus identity 24/24 in QEMU | **same run**; identity 6A/6B/15/4A/4B/10A/10B all drive the kill path |
-| aarch64 (Pi 4) | QEMU: boots, 12 services up, no panic - so the bound is not wrong here | **NOT COVERED** |
-| arm32 (Pi 2) | builds clean (`--release`) | **NOT COVERED** |
+| aarch64 (Pi 4) | QEMU: boots, 12 services, no panic. **Hardware run PENDING - image is on the card** | **PENDING** |
+| arm32 (Pi 2) | **HARDWARE: 452/0, chaos 100/100, 452/0, hot-plug, 452/0** | **same run** |
 | x86_64 (Dell Wyse, **Intel**) | **HARDWARE: 461/0, chaos 100/100, 461/0, hot-plug, 461/0** | **same run** |
 
 **CLOSED ON x86 IN HARDWARE 2026-09-11, ON TWO DIFFERENT VENDORS.** The T630 is AMD and the Wyse is
@@ -90,6 +90,16 @@ meant the fix was wrong in a way no other port could expose. Nothing moved.
 use by the VisionFive, and reflashing it would destroy the active branch's only boot chain. The Pi 4
 needs Raspberry Pi OS firmware on a FAT partition before GodspeedOS's two files (`godspeed8.img` +
 `config.txt`) mean anything - GodspeedOS does not ship `start4.elf` and friends.
+
+**Pi 2 CLOSED 2026-09-11 in hardware:** 452/0 three times around chaos 100/100 (541 kills, 446 floods),
+plus hot-plug. 452 rather than 461 is a genuine DIFFERENCE, not a truncation - the suite ran to its end
+and the log says why: `SKIP hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure`.
+Two data aborts during chaos were USER tasks (`events`, `console`, null derefs), killed and stepped
+over - the pre-existing chaos service aborts, not kernel faults.
+
+**ONE CARD NOW BOOTS BOTH PIS.** The Raspberry Pi OS flash carries the firmware for both models, so
+`config.txt` uses `[pi2]`/`[pi4]` conditional sections and the card needs no reflash between boards.
+`kernel7.img` and `godspeed8.img` are both on it.
 
 **To close them:** a spare card for either Pi, then `chaos max-carnage all-services 100 yes` followed by
 `selfcheck` - in that order, because "alive" and "still correct" are different claims and the riscv64
