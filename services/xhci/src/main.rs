@@ -572,6 +572,24 @@ const PORT_POWER_SETTLE_MS: u64 = 200;
 /// enumeration, and the alternative is a device that never enumerates at all.
 const PORT_RECOVERY_MS: u64 = 20;
 
+/// How long to wait for USBCMD.HCRST to clear after a reset is requested.
+///
+/// WAS 250 ms, and that is the number this port timed out on 24 times in one `chaos max-carnage`
+/// run. The reason is specific to being killed and respawned: the kernel's kill-path quiesce clears
+/// PCI Bus-Master-Enable, and this board's xHCI is a PLATFORM device at MMIO 0x10110000 with no BDF,
+/// so nothing stops it when the driver dies. The next instance therefore resets a controller that
+/// was mid-flight rather than idle, and a reset from that state legitimately takes longer.
+///
+/// 250 ms is the SHORT end of what a real driver allows; Linux carries a second, far longer reset
+/// timeout for controllers that need it, because the spec sets no upper bound the host must meet.
+/// This is the silicon's requirement, not a guess dressed as one (§26.14) - and the cost of being
+/// generous is paid only on a path that is already failing.
+const HCRST_CLEAR_MS: u64 = 1000;
+/// How many times to re-attempt the whole controller re-init when the reset does not complete,
+/// before giving up on resetting it and saying so. Bounded, because an unbounded retry against a
+/// genuinely dead controller is a spin, not a recovery (§26.6).
+const HCRST_RETRIES: u32 = 3;
+
 const HUB_POLL_MS: u64 = 500;
 /// How often the driver says it is still alive. See the heartbeat's comment in the poll loop: this
 /// exists because a STOPPED loop is otherwise indistinguishable from a quiet one, and every failure
@@ -3270,6 +3288,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reset by that loop and reads zero forever - a mistake this project has made three times, and
     // one that is invisible because a zero looks like a measurement.
     let mut reenums: u64 = 0;
+    // OUTSIDE `'reenum`, for the reason the comment above gives: a counter declared inside the loop
+    // it measures is reset by that loop and reads zero forever.
+    let mut reset_failures: u32 = 0;
     let mut passes_at_report: u64 = 0;
     let mut reenums_at_report: u64 = 0;
     let mut last_pass_report = ctx.read_tsc();
@@ -3320,7 +3341,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         spin(&ctx, "USBSTS.CNR to clear after HCRST", 500, || {
             mmio.read32(op + OP_USBSTS) & STS_CNR == 0
         });
-        spin(&ctx, "USBCMD.HCRST to clear", 250, || {
+        let reset_cleared = spin(&ctx, "USBCMD.HCRST to clear", HCRST_CLEAR_MS, || {
             mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0
         });
         ctx.log_fmt(format_args!(
@@ -3328,6 +3349,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             mmio.read32(op + OP_USBCMD),
             mmio.read32(op + OP_USBSTS)
         ));
+        // A RESET THAT DID NOT COMPLETE IS NOT A RESET, and carrying on is how this became hard to
+        // find. `spin` reports its own expiry, but every caller here discarded the bool, so the
+        // driver programmed a controller that had never reset and then described itself as healthy:
+        // `1 HID, disk yes` while 400 of 412 hub probes failed and 4999 ms of 5003 ms of work went
+        // into the hub path. That is §26.7's failed recovery treated as a success - the loudest
+        // single line in the log became the least consequential.
+        //
+        // Retry the whole re-init a bounded number of times, then proceed ONCE while saying plainly
+        // that USB is degraded. Proceeding is deliberate: parking instead would have the supervisor
+        // respawn us into the same controller state forever, turning one broken device into a
+        // restart storm. What must not happen is proceeding QUIETLY.
+        if !reset_cleared {
+            if reset_failures < HCRST_RETRIES {
+                reset_failures += 1;
+                ctx.log_fmt(format_args!(
+                    "xhci: reset did NOT complete (attempt {} of {}) - re-initialising rather than programming an unreset controller",
+                    reset_failures, HCRST_RETRIES));
+                continue 'reenum;
+            }
+            ctx.log_fmt(format_args!(
+                "xhci: CONTROLLER WILL NOT RESET after {} attempts - USB IS DEGRADED. Keyboard and storage on this controller are unreliable; any 'HID bound'/'disk yes' below is what we asked for, not what works.",
+                HCRST_RETRIES));
+        } else {
+            reset_failures = 0;
+        }
         // Rebuild DMA structures + run.
         dma.zero();
         // Scratchpad: build the SBA (N pointers to page-aligned buffers) and point
