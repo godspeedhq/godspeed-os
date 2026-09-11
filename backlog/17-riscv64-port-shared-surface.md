@@ -52,3 +52,33 @@ the one that rots. The answer is to test it, not to fence it off.
 
 **To close this item:** on x86 and on the Pi 4, exercise USB hot-plug in both directions - keyboard
 and mass storage, unplug and replug, including into a different port.
+
+---
+
+## Cross-port coverage of the NEUTRAL changes (2026-09-11)
+
+Three neutral kernel changes landed while closing the riscv64 chaos wedge, and they run on every port:
+`phys_in_ram` gaining a LOWER bound, `CORE_LEAVING` + routing all 15 `CORE_CURRENT` releases through
+one helper, and BOUNDING the kill spin-wait (it had no deadline at all).
+
+| port | `phys_in_ram` lower bound | kill-path changes |
+|------|---------------------------|-------------------|
+| riscv64 | HARDWARE: chaos 100/100, selfcheck 461/0 after it | HARDWARE, same run |
+| x86_64 | **identity suite 24/24** - and 6A/6B/15/4A/4B/10A/10B all exercise the kill path | **identity suite 24/24** |
+| aarch64 (Pi 4) | QEMU: boots, 12 services up, no panic - so the bound is not wrong here | **NOT COVERED** |
+| arm32 (Pi 2) | builds clean (`--release`) | **NOT COVERED** |
+
+**The x86 result is the one that was most wanted, and it is a NULL result by design.** x86 RAM starts at
+zero, so the lower bound closes a hole with no width there - anything OTHER than "no change" would have
+meant the fix was wrong in a way no other port could expose. Nothing moved.
+
+**The two gaps are real and are blocked on hardware, not on effort.** The operator has ONE microSD, in
+use by the VisionFive, and reflashing it would destroy the active branch's only boot chain. The Pi 4
+needs Raspberry Pi OS firmware on a FAT partition before GodspeedOS's two files (`godspeed8.img` +
+`config.txt`) mean anything - GodspeedOS does not ship `start4.elf` and friends.
+
+**To close them:** a spare card for either Pi, then `chaos max-carnage all-services 100 yes` followed by
+`selfcheck` - in that order, because "alive" and "still correct" are different claims and the riscv64
+result only became convincing when the suite passed AFTER the carnage.
+
+The T630 needs no card: `build/os-usb.img` is built and flashes to a USB stick.
