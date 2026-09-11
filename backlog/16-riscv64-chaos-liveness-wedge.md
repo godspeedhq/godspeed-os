@@ -1,6 +1,12 @@
 # 16. riscv64 chaos: core 1 takes interrupts and never switches away
 
-**Status:** open. Captured 2026-09-10 at `34e229d0`, `chaos max-carnage`, round 2 of 100.
+**Status: CLOSED 2026-09-11.** Hardware: `chaos max-carnage all-services 100` completed 100/100 with
+0 panics, 0 wedges, 0 kernel faults and 0 guard firings, and `selfcheck` ran AFTER it at 461/0 - so the
+machine was still CORRECT, not merely alive. 783 kills, 650 floods, 77 supervisor respawns and 570
+service recoveries absorbed. The fix that closed it is `phys_in_ram`'s missing LOWER bound (ca543af4);
+the rest of this file is the hunt that made the dump readable enough to find it.
+
+Originally captured 2026-09-10 at `34e229d0`, `chaos max-carnage`, round 2 of 100.
 
 This is the best data yet on the chaos wedge, and it says something different from what earlier runs
 suggested. Recording it before the next attempt so the reading is not re-derived.
