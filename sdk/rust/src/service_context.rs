@@ -707,18 +707,21 @@ pub(crate) fn heal_stale_send_slot(slot: u32) -> bool {
     // ServiceContext is zero-sized (`_private: ()`), so this borrows nothing and allocates nothing.
     let ctx = ServiceContext { _private: () };
     match ctx.reacquire_cap(name) {
-        Ok(_)  => {
-            // SAY SO. A repair that leaves no trace cannot be shown to have happened, and this one
-            // is invisible by construction otherwise - it changes nothing the caller can observe,
-            // because the failed send still fails. Without this line, "the cache self-heals" is a
-            // claim about code rather than an observed fact, and a storm looks identical whether the
-            // heal fires every time or never. It also keeps the repair VISIBLE per §26.4: a peer
-            // being silently swapped underneath a service is exactly what should not happen quietly.
-            ctx.log_fmt(format_args!(
-                "peer '{}' was replaced - reacquired it; the send that failed is NOT retried (14.3)",
-                name));
-            true
-        }
+        // NOT LOGGED. This line existed to prove the heal fires at all, and it did that job: 327
+        // reacquisitions across an 8-round QEMU storm. Kept in, it HALTED THE BOARD.
+        //
+        // On hardware under `chaos max-carnage` it produced 282 lines - 264 of them for `events`
+        // alone, which is killed every round and which every service sends traces to - and together
+        // with the kernel's stale-cap line that was 22% of a 2812-line capture. All of it lands on
+        // the same serial path the trap reporter uses to print a fault, and the capture shows the
+        // report's own lines being split apart mid-word by these. The run ended in `riscv64: FAULT
+        // WHILE REPORTING A FAULT - halting`, which had never fired in any previous run on any port,
+        // including a clean 100-round storm on this same board hours earlier.
+        //
+        // The lesson is not "logging is bad", it is that a line whose rate is set by how often a peer
+        // is REPLACED has no bound during a storm whose whole purpose is replacing peers constantly.
+        // Verification output and production output are not the same thing, and this was the former.
+        Ok(_) => true,
         // NOT LOGGED, deliberately. A failed heal means the peer is not in the name directory at this
         // instant - the normal, transient state during a storm, reached once per send. Logging it here
         // produced 164 lines in seven chaos rounds, all saying what two other lines already said: the
