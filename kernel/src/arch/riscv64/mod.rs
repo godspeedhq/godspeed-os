@@ -498,12 +498,21 @@ riscv64: S-mode entered, 16550 UART alive
 ");
             }
 
+            // ONE HART, IF THE BUILD ASKED FOR ONE. Clamped at DISCOVERY rather than anywhere later, so
+            // every decision downstream is made FOR a single-core machine instead of made for four and then
+            // overridden: the percpu arenas are sized for one, `ap_count` returns zero so no secondary hart
+            // is ever started, and the liveness watchdog scans one core. The port already HAS this state -
+            // it prints `running single-core` whenever firmware refuses the other harts - so this reaches an
+            // existing configuration rather than inventing one.
+            let harts = if cfg!(feature = "riscv-single-hart") { 1 } else { harts };
             USABLE_HARTS.store(harts.max(1), Ordering::Relaxed);
             // The IDs, not just how many. `hart_start` needs a number, and on this board they are
             // 1..4 with hart 0 disabled, so counting would name the wrong harts.
             {
                 let mut ids = [0u32; 8];
                 let n = tree.usable_hart_ids(&mut ids);
+                // The first usable id is the BOOT hart, which is the one already running.
+                let n = if cfg!(feature = "riscv-single-hart") { n.min(1) } else { n };
                 HART_COUNT.store(n as u32, Ordering::Relaxed);
                 for (i, id) in ids.iter().enumerate().take(n) {
                     HART_IDS[i].store(*id, Ordering::Relaxed);

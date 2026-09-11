@@ -48,6 +48,14 @@ features = [
 # now off by default and turned on only by `osdev test identity`, which is the build that asserts on
 # their output.
 "kernel-selftest",
+# Bring up ONE hart on riscv64 and leave the rest parked. Pinned deliberately: it is a switch on what
+# the kernel IS, and the reason it adds no responsibility is worth stating rather than assuming - the
+# port ALREADY reaches this state at runtime whenever firmware refuses the secondary harts, printing
+# `smp: no secondary harts started - running single-core`. The feature only makes hart DISCOVERY
+# report one, so every downstream decision follows from that number exactly as it already does. It
+# REMOVES concurrency rather than adding a code path, which is also what makes it useful: a bug that
+# survives on one hart is not a race.
+    "riscv-single-hart",
     "arm-autochaos",
     "arm-fault-test",
     "arm-sched-demo",

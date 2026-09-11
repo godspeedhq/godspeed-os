@@ -56,6 +56,18 @@ name-trace = []
 # Selects the 0x80000 flat-load linker script and the BCM2711 peripheral base (PL011 at 0xFE201000);
 # without it the aarch64 build stays the QEMU `virt` boundary-demarcation target it has been.
 pi4 = []
+# Bring up ONE hart and leave the rest parked, on riscv64. OFF by default.
+#
+# Not a device-tree edit and not a debug hack: the port ALREADY supports running single-core - it
+# prints `smp: no secondary harts started - running single-core` whenever firmware refuses the others
+# - so this only makes hart DISCOVERY report one, and every downstream decision (percpu arena sizing,
+# `ap_count`, the liveness watchdog's core scan) follows from that single number as it already does.
+#
+# Worth having as a build flag rather than a boot argument because the whole point is to test the
+# machine as it would be if it had one core, including the arena sizes chosen at boot. It is also the
+# cleanest way to ask whether a concurrency fix is load-bearing: a bug that survives on one hart is
+# not a race.
+riscv-single-hart = []
 # Diagnostic only, OFF by default. Widens the EL0 fault dump: a bigger raw stack window, a
 # fill-byte run length (the production one measures a ZERO run, which reports "0 bytes" when the
 # overrun is written with anything else - a space-filled smash on the Pi 4 measured exactly that,
