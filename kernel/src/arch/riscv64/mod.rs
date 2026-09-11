@@ -1225,7 +1225,7 @@ pub fn halt_all_cores() -> ! {
             serial_write_hex_lockfree(ra);
         }
     }
-    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch 18 switch-enter 19 switch-armed (syscall NR shown as sN)\n");
+    serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch 18 switch-enter 19 switch-armed 20 HALTED-AFTER-KERNEL-FAULT(read the TRAP line above, not this) (syscall NR shown as sN)\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
@@ -2434,6 +2434,17 @@ pub(super) mod stage {
     /// naked register restore. 18 against 19 separates "the checks or the address-space install" from
     /// "the registers and the `ret` into the resumed task".
     pub const SWITCH_ARMED: u32 = 19;
+    /// This hart HALTED ITSELF after a kernel fault. It is not wedged; it is finished.
+    ///
+    /// **The distinction that cost six captures.** A kernel fault is reported and then the hart halts
+    /// by design - there is nothing left to kill instead. Ten seconds later the liveness watchdog
+    /// notices a hart that has stopped ticking and reports "core N made NO progress", which is true
+    /// and is the least useful true thing available: it names the symptom, ten seconds late, and
+    /// buries the actual fault two lines earlier in the log where nobody scrolls.
+    ///
+    /// A stage of 20 in the dump says "look UP, not here" - the cause is the TRAP line above, with its
+    /// scause, sepc and stval, and those name the faulting instruction exactly.
+    pub const KERNEL_FAULT_HALTED: u32 = 20;
     /// Inside `timer_tick`, BEFORE the SBI call that re-arms the deadline.
     ///
     /// The gap between `TRAP_ENTRY` and `TIMER_REARMED` is where a wedged core has now been found

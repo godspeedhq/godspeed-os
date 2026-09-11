@@ -293,7 +293,16 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     // A KERNEL fault, or an interrupt nothing claimed. There is no task to kill: the thing that
     // faulted IS the thing that would do the killing, so the only honest move is to stop loudly.
     report_fault(frame, scause, code, stval, false);
+    // SAY SO IN THE DUMP TOO, not only here. This hart is about to stop for good, and ten seconds
+    // later the liveness watchdog will notice it has stopped ticking and report "made NO progress" -
+    // true, useless, and ten seconds adrift of the TRAP line just printed above. Stage 20 tells the
+    // reader of that dump to look UP rather than at it. Six captures went the other way.
+    super::note_stage(super::stage::KERNEL_FAULT_HALTED);
     super::print_str("riscv64: halted - the KERNEL faulted, so there is nothing left to kill instead\n");
+    super::print_str("riscv64: the TRAP line above is the cause; a LIVENESS WEDGE naming this core in
+");
+    super::print_str("         ~10s is this halt being NOTICED, not a second fault.
+");
     super::halt();
 }
 
