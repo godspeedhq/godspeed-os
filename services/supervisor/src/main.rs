@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `supervisor` - restart authority. TCB member (§6.1). Non-restartable.
+//! `supervisor` - restart authority + name authority. TCB member (§6.1), but **RESTARTABLE**: the
+//! kernel respawns it on death, unconditionally and forever (Path C / Phase 6, §6.2), and the
+//! respawned instance RECONCILES - adopting the still-running services by name rather than
+//! duplicating them. The only unkillable component is the kernel.
 //!
-//! Phase 5:
-//!   1. Spawns `pong` on core 1 and `ping` on core 0 (§23.2 acceptance criteria).
-//!   2. Logs "supervisor: ready".
-//!   3. Yields indefinitely (death-notification restart loop deferred to Phase 6).
+//! What it does, in order:
+//!   1. Spawns `events`, then `console` (the display changes hands once, early).
+//!   2. In non-bare-metal builds, `pong` on core 1 then `ping` on core 0 (§23.2), then the probes.
+//!   3. Spawns the service set: time, control, hw-enumerator, the USB host, block-driver, fs,
+//!      shell, nic-driver, net-stack - in dependency order (`services/CLAUDE.md`).
+//!   4. Logs "supervisor: ready" once every spawn has completed.
+//!   5. Runs the death-notification restart loop, forever.
+//!
+//! This header said "Non-restartable" and "Yields indefinitely (death-notification restart loop
+//! deferred to Phase 6)". Phase 6 shipped: the loop is ~1,400 lines below, and the supervisor is the
+//! worked example of §6.2. Someone reading this file to learn the restart model was told the opposite
+//! of the system.
 //!
 //! The kernel wires send-peer SEND caps at spawn time, so supervisor does not
 //! need to coordinate cap distribution manually.

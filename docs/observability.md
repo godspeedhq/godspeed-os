@@ -274,7 +274,7 @@ code (the supervisor's image table and MANAGED list, contracts, the name directo
 ### The constraint that must survive the rename
 
 `docs/logging.md` makes a load-bearing argument that this service is a **stateless broker, not a
-store**: a persisting events cycles through `fs`, and worse, **makes observing a storage failure
+store**: a persisting `events` cycles through `fs`, and worse, **makes observing a storage failure
 depend on storage.**
 
 Renaming it to `events` invites exactly the violation - "events implies history, history implies

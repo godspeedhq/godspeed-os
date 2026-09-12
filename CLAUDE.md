@@ -267,8 +267,8 @@ os/
                            #   (init removed, Phase 5; registry service retired, Phase 4 - Path C §3.7)
     events/
     console/               # the terminal: ANSI/CSI, grid, cursor, scroll (docs/console-service.md 9)
-    block-driver/          # v1: trusted
-    fs/                    # v1: trusted, depends on block-driver
+    block-driver/          # restartable (Phase D)
+    fs/                    # restartable (Phase D); depends on block-driver
 
   sdk/rust/                # service_context.rs, capability.rs, ipc.rs
 
@@ -1226,7 +1226,7 @@ Where the machine's only output device is a display, the floor also includes a *
 
 ### 12.1 Model
 
-Kernel routes interrupts. Drivers are user-space services. Essential drivers (block-driver) are trusted in v1.
+Kernel routes interrupts. Drivers are user-space services. `block-driver` is **restartable like any other service** (§6.1, Phase D amendment 2026-06-17) - it was "trusted in v1" until `fs` gained crash-consistent recovery.
 
 ### 12.2 Routing
 
@@ -1321,7 +1321,7 @@ Every syscall checks the calling task's capability table, populated *from* the c
 4. Asks kernel to create a new task on that core with declared resources.
 5. Kernel mints capabilities per contract (each tagged with current resource generation).
 6. Kernel maps service binary into new address space.
-7. Service registers any owned endpoints with registry.
+7. Service registers any owned endpoints in the kernel name directory (`ipc::names`).
 8. Service enters main loop on its assigned core.
 
 ```text
@@ -1339,7 +1339,7 @@ Every syscall checks the calling task's capability table, populated *from* the c
   Supervisor ◀── Ok(task_id) ────────────────┘
                                                │
   New Service:                      enters execution
-    ── registers endpoint with registry
+    ── registers endpoint in the kernel name directory
     ── service_main() ── enters work loop
 ```
 
@@ -1359,14 +1359,14 @@ Every syscall checks the calling task's capability table, populated *from* the c
 
   Step 3 - Supervisor spawns B on Core 2:
     Kernel starts B with fresh cap table (gen=5)
-    B registers endpoint with registry
+    B re-registers its endpoint in the kernel name directory
 
   Step 4 - A reacquires:
-    A ── registry.lookup("B") ──▶ fresh cap (gen=5, Core 2)
+    A ── AcquireSendCap("B") ──▶ fresh cap (gen=5, Core 2)   [kernel name directory]
     A ── send(gen=5 cap) ──▶ Ok  (routes to Core 2)
 ```
 
-**Key principle:** the new instance may run on a different core than the old one. Clients never know - they see only `EndpointDead`, look up via registry, and resume.
+**Key principle:** the new instance may run on a different core than the old one. Clients never know - they see only `EndpointDead`, reacquire by name through the kernel directory, and resume.
 
 ### 14.3 Cascading Failure
 
@@ -2008,7 +2008,7 @@ test stale_cap_revoked_after_restart:
 
     assert ping.send_via_stale_cap("hello") in [Err(CapRevoked), Err(EndpointDead)]
 
-    fresh = ping.lookup_via_registry("pong")
+    fresh = ping.reacquire_by_name("pong")
     assert ping.send_via(fresh, "hello") == Ok
 ```
 
@@ -2145,7 +2145,7 @@ test client_reacquires_after_core_change:
 
     assert ping.send_via_stale_cap("hello") == Err(EndpointDead)
 
-    fresh = ping.lookup_via_registry("pong")
+    fresh = ping.reacquire_by_name("pong")
     assert fresh.target_core == 2
     assert ping.send_via(fresh, "hello") == Ok
     assert pong.received("hello")
@@ -2239,7 +2239,7 @@ goal reached), §15 (transactional recovery), §14 (supervisor restart authority
 `fs` and `block-driver` are restartable userspace services (Phase D amendment 2026-06-17), made
 safe by `fs`'s crash-consistent recovery (Phase C). Killing `fs` must NOT panic the kernel; the
 supervisor must observe its death and respawn it; `fs` must re-mount to a consistent state
-(persisted data intact) and re-register; and a client must reacquire it via the registry and
+(persisted data intact) and re-register; and a client must reacquire it by name and
 keep working.
 
 ```
@@ -2255,7 +2255,7 @@ test fs_survives_own_restart:                     # osdev test fs-restart
     assert serial_contains("supervisor: fs restarted")
     assert serial_contains("fs: serving file API")   # re-mounted + re-registered
 
-    # The shell reacquires a fresh fs cap via the registry (§14.3); the file persisted.
+    # The shell reacquires a fresh fs cap by name via the kernel directory (§14.3); the file persisted.
     assert shell("read /t.txt") contains "survives-restart"
     assert kernel_did_not_panic()
 ```
@@ -2370,15 +2370,15 @@ The system continues running.
 
 ### 23.2 Acceptance Criteria ✅
 
-1. `osdev run --smp 4` boots the OS with 4 cores; init, supervisor, registry, logger, ping, and pong reach steady state. ✅
+1. `osdev run --smp 4` boots the OS with 4 cores; supervisor, events, ping, and pong reach steady state. ✅ *(As recorded in 2026-05 this read "init, supervisor, registry, logger"; `init` was removed in Phase 5, the `registry` service retired in Phase 4, and `logger` renamed `events` in 2026-09.)*
 2. ping placed on core 0; pong placed on core 1. ✅
 3. `osdev logs ping` shows ping sending a message every second. ✅
 4. `osdev logs pong` shows pong receiving each message (cross-core IPC). ✅
 5. `osdev restart pong --core 2` kills pong on core 1 and respawns it on core 2. ✅
-6. ping observes `EndpointDead` and reacquires via the registry; the new cap routes to core 2. ✅
+6. ping observes `EndpointDead` and reacquires by name; the new cap routes to core 2. ✅
 7. After reacquisition, ping and pong continue communicating across the new core boundary. ✅
 8. The kernel does not panic on any core. ✅
-9. **All ten identity tests in §22 pass.** ✅
+9. **All identity tests in §22 pass.** ✅ *(ten at the time; fifteen tests / 24 cases today.)*
 
 ### 23.3 Bare-Metal Achievement ✅
 
@@ -2467,7 +2467,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Routing table** - Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
 - **TCB** - Trusted Computing Base. Kernel + arch + smp + supervisor. (**Not `init`** - it was removed in Path C / Phase 5; the kernel spawns the supervisor directly. And the supervisor is trusted but RESTARTABLE, Phase 6, so the only unkillable component is the kernel.) `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`, and ARM's `dwc2`) are in the TCB only on a machine without an IOMMU to confine them (§6.4); all three are userspace services now.
 - **Trusted root** - `supervisor` (sole; `init` was removed in Path C / Phase 5 - the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally, forever - so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
-- **Name directory** - the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` - historical.)*
+- **Name directory** - the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` service's design note was deleted with the service; `docs/naming-design.md` §3.7 is the record.)*
 - **Service** - Userspace component with a contract, capability table, and isolated address space.
 - **Contract** - a service's `contracts/<name>.toml` (e.g. `examples/ping/contracts/ping.toml`) declaring resource, capability, and placement requirements.
 - **Supervisor** - User-space service holding restart authority over other services.

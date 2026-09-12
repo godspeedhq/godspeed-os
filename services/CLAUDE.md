@@ -29,9 +29,10 @@ is the kernel itself** (`{kernel}`). Pinned by §22 Test 15.
 | `events/`    | Stateless; respawn drains the kernel ring buffer afresh |
 | `time/`      | The wall clock as a service. Restartable; a respawn re-reads the persisted floor (`/clock.last`) and re-asks the network, so the clock is re-established rather than resumed |
 | `control/`   | The operator control channel (COM2 / second UART) the test harness drives. Restartable; a respawn re-opens the port |
-| `hw-enumerator/` | PCI enumeration in USERSPACE (x86). Restartable: a respawn re-walks the bus, so a death costs a rescan and nothing else |
+| `hw-enumerator/` | PCI enumeration in USERSPACE (x86_64, aarch64, riscv64 - every port where configuration space is reachable; not arm32, which has no PCI). Restartable: a respawn re-walks the bus, so a death costs a rescan and nothing else |
 | `nic-driver/` | The ethernet driver (e1000 / RTL8168 / GENET / smsc95xx by port). Restartable; a respawn re-initialises the controller and re-establishes the link |
 | `net-stack/` | ARP/ICMP/UDP-DHCP/DNS/TCP. Restartable; a respawn re-configures from the link (or stays unconfigured and RESPONSIVE if there is none) and clients reacquire by name |
+| `counter/` | An `examples/` service, but it IS in the kernel's `matches!` and has its own supervisor death-loop arm, so it accrues restarts and is respawned like the rest. Listed here because this table's rule is that the kernel's set and this set agree |
 | `console/`   | The terminal - owns the display (`docs/console-service.md` §9). A respawn re-maps the framebuffer grant, clears it, and renders from the next byte on; scrollback is lost because it lived in the dead instance's grid (a re-init, not a resume). While it is dead the kernel's `bootcon` floor takes the screen back, so the machine is never mute |
 
 `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn). The kernel notifies
@@ -65,15 +66,21 @@ The supervisor spawns services in this order, observed on hardware (Pi 4, and th
 
 0. **events**, then **console** - console before anything that produces console output, so the
    display changes hands once, early, rather than mid-boot
-1. **time**, **control**, **hw-enumerator** - the clock, the operator channel, and bus enumeration
-2. the **storage chain, in dependency order**: the USB/AHCI host driver (**xhci** / **ehci** /
-   **dwc2** by port), then **block-driver**, then **fs**. `block-driver` must precede `fs` because
-   fs's send-peer cap to it wires at spawn
-3. **shell** - after storage, so the first prompt can already reach the disk
-4. **nic-driver**, then **net-stack**
-5. In the identity/QEMU build only: **pong** (core 1) before **ping** (core 0), so ping's SEND cap is
-   wired at ping's spawn time, then 178 probe services (§22 test infrastructure). A `bare-metal`
-   build skips both
+1. In non-bare-metal builds only: **pong** (core 1) before **ping** (core 0), so ping's SEND cap is
+   wired at ping's spawn time; then the probe services (183 in the full build, 16 in `identity-only`)
+   and **observe**. **These come SECOND, not last.** Spawning the pair early gets cross-core IPC
+   running within ~10 s of boot, and the probe loop alone takes 18-120 s on Windows TCG
+   (`supervisor/CLAUDE.md`). A `bare-metal` build skips all of them
+2. **time**, **control**, **hw-enumerator** - the clock, the operator channel, and bus enumeration
+3. the **storage chain, in dependency order**: the USB host driver where the disk lives behind one
+   (**dwc2** on arm32, **xhci** on aarch64), then **block-driver**, then **fs**. `block-driver` must
+   precede `fs` because fs's send-peer cap to it wires at spawn.
+   *Per-port caveat:* on x86 the disk is AHCI, so no USB host is in the chain. On **riscv64** the disk
+   IS behind `xhci`, but `xhci` is spawned after `block-driver` - the ordering this step exists to
+   prevent. It is survivable (§14.3: the peer is reacquired by name) and costs one round of failure
+   and recovery at boot; recorded here rather than left implied
+4. **shell** - after storage, so the first prompt can already reach the disk
+5. **nic-driver**, then **net-stack**; on x86 the USB hosts (**xhci**, **ehci**) come in here too
 6. Logs `"supervisor: ready"`
 
 The order is a DEPENDENCY order, not a preference, and the ordering constraint is the same one §14.3

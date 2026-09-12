@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    // services/init → services/ → workspace root
+    // services/block-driver -> services/ -> workspace root
     let workspace = std::path::Path::new(&manifest)
         .parent().unwrap()
         .parent().unwrap();

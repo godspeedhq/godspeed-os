@@ -18,15 +18,15 @@ The supervisor has mutually exclusive spawn-set features:
 
 | Feature            | Spawns                                  | Used by                          |
 |--------------------|-----------------------------------------|----------------------------------|
-| *(none)*           | pong + ping + all 178 probe services    | `osdev run` (full QEMU build)    |
-| `identity-only`    | pong + ping + 15 identity probe services | `osdev test identity`            |
+| *(none)*           | pong + ping + all 183 probe services    | `osdev run` (full QEMU build)    |
+| `identity-only`    | pong + ping + 16 identity probe services | `osdev test identity`            |
 | `perf-only`        | pong + ping + B1-B10 perf probes        | `osdev test perf`                |
 | `perf-brutal-only` | pong + ping + BP1-BP10 brutal probes    | `osdev test perf-brutal`         |
 | `stress-only`      | pong + ping + S1-S10 stress probes      | `osdev image --mode stress`      |
-| `adv-only`         | pong + ping + A1-A10 adversarial probes | `osdev image --mode adv`         |
+| `adv-only`         | pong + ping + A1-A15 adversarial probes | `osdev image --mode adv`         |
 | `chaos-only`       | pong + ping + C2-C7 chaos probes        | `osdev image --mode chaos`       |
 | `fuzz-only`        | pong + ping + F1/F2/F5/F6/F7/F8 + BF1/BF2/BF5/BF6/BF7/BF8 fuzz probes | `osdev image --mode fuzz` |
-| `bare-metal`       | shell only - rests at a quiet `gsh>`     | `osdev image` (USB boot)         |
+| `bare-metal`       | the full service set, NO probes and NO ping/pong/observe - rests at a quiet `gsh>` | `osdev image` (USB boot) |
 
 The `bare-metal` feature exists because probe services require the QEMU control port (COM2/TCP:5555) to complete. Without it, probe-4b-send blocks permanently, and probe-hog runs `loop {}` starving core 0. On real hardware these probes would stall the system indefinitely.
 
@@ -46,11 +46,12 @@ within ~10 s of boot.
 ```
 service_main():
   1. spawn("events")              ← moved here from init (Phase 5); not TCB, retry once
-  2. spawn("pong") on core 1      ← pong must precede ping (SEND cap wired at spawn)
-  3. spawn("ping") on core 0
-  4. spawn probe / bare-metal services from the name→cap map (no kernel name resolution)
-  5. log("supervisor: ready")
-  6. loop { recv() }  ← death-notification restart loop
+  2. spawn("console")             ← before anything that produces console output
+  3. spawn("pong") on core 1      ← pong must precede ping (SEND cap wired at spawn)
+  4. spawn("ping") on core 0      ← both skipped in a bare-metal build
+  5. spawn the probe set, then the service set from the name→cap map (no kernel name resolution)
+  6. log("supervisor: ready")
+  7. loop { recv() }  ← death-notification restart loop
 ```
 
 `"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its yield loop - no restart-mid-spawn conflict.
