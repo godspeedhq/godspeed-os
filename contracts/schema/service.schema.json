@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://godspeed.os/schemas/service/v1",
   "title": "ServiceContract",
-  "description": "Structural schema for a GodspeedOS service contract (service.toml). See §13.",
+  "description": "Structural schema for a GodspeedOS service contract (service.toml). See 13. NOTE (2026-09-12): this schema had drifted behind the contracts it validates - six shipped services could not pass `osdev validate` because `additionalProperties: false` met four keys the schema never declared (hw_pci_class, hw_pci_bar, hw_pci_irq, pci_cfg) and an `hw_device` enum that predated the move to class-based PCI resolution. Those are added/widened here, which is permissive and so stays within v1. Two DEAD keys are deliberately NOT removed - `hw_pio` (capability retired with ATA PIO) and `spawn` (init removed, Phase 5) - because removing a key NARROWS the schema, which 13.5 makes a major version bump with a documented migration. They are marked dead in place; the narrowing is a deliberate v2, tracked in backlog/20.",
   "type": "object",
   "required": ["name", "version", "resources", "capabilities"],
   "additionalProperties": false,
@@ -49,7 +49,7 @@
         },
         "log_write": {
           "type": "boolean",
-          "description": "Permission to send log messages to the `events` service."
+          "description": "Permission to write the kernel log: syscall 5, straight to the 16 KiB ring buffer and the serial console. NOT routed through any service - CLAUDE.md 11.4 (amendment 2026-09-04) exists to deny exactly that, so that observing a failure never depends on a service that can fail."
         },
         "service_control": {
           "type": "boolean",
@@ -58,7 +58,7 @@
         "spawn": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "init-only: list of services init may spawn."
+          "description": "DEAD KEY. `init` was removed in Path C / Phase 5 and no contract declares this; the SPAWN privilege is carried in the supervisor's spawn REQUEST, not declared by a contract. Kept only because removing a key narrows the schema, which 13.5 makes a major version bump - see the note at the foot of this file."
         },
         "hw_interrupt": {
           "type": "array",
@@ -73,12 +73,32 @@
         "hw_pio": {
           "type": "array",
           "items": { "type": "string", "pattern": "^0x[0-9a-fA-F]+\\+0x[0-9a-fA-F]+$" },
-          "description": "I/O port ranges: base+length in hex (e.g. 0x170+0x8). Port I/O is kernel-mediated and validated per access (docs/persistence.md §5)."
+          "description": "DEAD KEY. The ATA-PIO block backend and the `hw_pio` capability were retired with the move to AHCI; `hw_pio` exists nowhere in kernel/ or sdk/. A contract declaring it would validate here and be unhonourable at spawn. Kept pending the v2 narrowing - see the note at the foot of this file."
         },
         "hw_device": {
           "type": "string",
-          "enum": ["ahci", "nic", "xhci", "ehci"],
-          "description": "The discovered PCI device CLASS this driver is granted (its MMIO BAR + a DMA arena + bus-master). The kernel resolves the runtime BAR address by the PCI scan (kernel service_hw / HwClass); this class is reconciled against the kernel by scripts/contract_check.py (audit T1 Phase B)."
+          "enum": ["ahci", "nic", "xhci", "ehci", "dwc2", "framebuffer", "test-irq"],
+          "description": "A NON-PCI device kind, named because nothing enumerates it: an SoC or boot fact (`dwc2` is soldered to the BCM283x, `framebuffer` is a Limine/mailbox handoff, `test-irq` is software). These are the names the kernel decodes to a `HwClass` variant. Reconciled against the supervisor's spawn row by scripts/contract_check.py. PCI devices do NOT belong here - they are named by what the bus says they are, via `hw_pci_class` below (step D1). `ahci` is retained only because removing an enum member narrows the schema (13.5); nothing uses it - block-driver is `hw_pci_class = \"010601\"` now."
+        },
+        "hw_pci_class": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{6}$",
+          "description": "ANY PCI device, named by the industry-standard 24-bit (class, subclass, prog-if) triple as six hex digits - e.g. \"010601\" AHCI, \"020000\" ethernet, \"0c0330\" xHCI. A driver for a device this kernel has never heard of needs NO kernel change: the supervisor puts the code in the spawn request and the PCI scan answers it. The runtime BAR ADDRESS is the one fact never written down (step D1)."
+        },
+        "hw_pci_bar": {
+          "description": "Which BAR holds this device's registers - an INDEX (xHCI 0, AHCI 5), never an address - or \"auto\" for the first mapped MEMORY BAR. Belongs to the DRIVER, not the bus, which is why the contract states it.",
+          "oneOf": [
+            { "type": "integer", "minimum": 0, "maximum": 5 },
+            { "type": "string", "enum": ["auto"] }
+          ]
+        },
+        "hw_pci_irq": {
+          "type": "boolean",
+          "description": "This driver takes an interrupt, so the kernel allocates a vector and programs MSI/MSI-X at spawn. Without it the driver polls. Reconciled against the supervisor's spawn row: a contract that stops declaring it while the row still asks for a vector is a FAIL, not a silent downgrade."
+        },
+        "pci_cfg": {
+          "type": "boolean",
+          "description": "Authority to READ PCI configuration space (syscall 53). Held by `hw-enumerator` alone: the kernel keeps the privileged access (x86 port I/O, the Pi 4's memory-mapped INDEX/DATA window, riscv64's flat ECAM window) and this service owns what the read MEANS - which is how bus enumeration left the kernel (step D2)."
         },
         "resource_mint": {
           "type": "boolean",
