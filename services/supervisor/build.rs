@@ -67,11 +67,25 @@ fn main() {
         &[]
     };
 
-    // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so the binaries this build
-    // needs sit four levels up. Derived rather than assumed, so it holds for every triple.
+    // Find the PROFILE directory, which is where the service binaries sit.
+    //
+    // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so this used to take
+    // `ancestors().nth(3)` and call it "derived rather than assumed, so it holds for every triple".
+    // It held for every triple and NOT for every platform: on a Linux CI runner that index landed on
+    // `<profile>/build` instead of `<profile>`, so every service ELF resolved to a cargo build-script
+    // DIRECTORY and the supervisor failed to compile with 26 "Is a directory (os error 21)".
+    //
+    // Counting levels is the fragile part, so the count is gone. Walk up to the nearest ancestor
+    // actually NAMED `build` and take its parent: that is the profile directory by construction,
+    // whatever cargo nests in between.
     let out = std::env::var("OUT_DIR").unwrap();
     let target_dir = std::path::Path::new(&out)
-        .ancestors().nth(3).expect("OUT_DIR shallower than expected").to_path_buf();
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "build"))
+        .and_then(|b| b.parent())
+        .unwrap_or_else(|| panic!("supervisor/build.rs: no `build` component in OUT_DIR ({out}) - \
+                                   cannot locate the profile directory"))
+        .to_path_buf();
 
     for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(probe.iter()) {
         let elf = target_dir.join(name);
