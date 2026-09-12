@@ -217,6 +217,27 @@ static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 /// with no function 0). Having to ASK which machine produced a serial log is how a fact about one
 /// board becomes a claim about the port - the exact mistake this project has made before.
 fn banner() {
+    // The art is decoration and the lines under it are evidence, so the art goes FIRST and nothing
+    // below it changes. A bug report needs the version, the arch, the build sha and the CPU; those
+    // stay exactly where they were and in the same order, because logs get grepped.
+    //
+    // Plain ASCII on purpose. The kernel's framebuffer floor (`bootcon`) draws printable ASCII and
+    // DISCARDS escape sequences - no colour, no cursor positioning - so anything cleverer would
+    // render as garbage on a machine with no serial port, which is exactly where a boot banner
+    // matters most. 71 columns, chosen to fit an 80-column line with margin: the floor wraps rather
+    // than scrolling sideways.
+    crate::kprintln!(r"
+  _____             _                                _   ____    _____
+ / ____|           | |                              | | / __ \  / ____|
+| |  __   ___    __| |  ___   _ __    ___   ___   __| || |  | || (___
+| | |_ | / _ \  / _` | / __| | '_ \  / _ \ / _ \ / _` || |  | | \___ \
+| |__| || (_) || (_| | \__ \ | |_) ||  __/|  __/| (_| || |__| | ____) |
+ \_____| \___/  \__,_| |___/ | .__/  \___| \___| \__,_| \____/ |_____/
+                             | |
+                             |_|
+
+            Small enough to understand. Rigorous enough to trust.
+");
     crate::kprintln!("GodspeedOS {} {} ({}) - kernel", env!("CARGO_PKG_VERSION"),
                      env!("GODSPEED_TARGET_ARCH"), env!("GODSPEED_GIT_SHA"));
     // Bounded, on the stack, no heap (§26.6.1). 64 covers the x86 brand string (48 bytes) with room
