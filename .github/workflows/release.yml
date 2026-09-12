@@ -31,7 +31,17 @@ env:
 jobs:
   artefacts:
     name: Build release artefacts
-    runs-on: ubuntu-latest
+    # WINDOWS, to match the machine these builds are developed and hardware-tested on.
+    # Compiler AND platform both have to match or the artefacts differ from what the
+    # developer sees: a Linux runner produced a RISC-V image 88 KiB adrift of a local
+    # build of the identical commit. `runs-on` fixes half of that; the pinned toolchain
+    # in rust-toolchain.toml fixes the other half.
+    runs-on: windows-latest
+    defaults:
+      run:
+        # The steps below are POSIX shell. Windows runners ship Git Bash, so they run
+        # unchanged rather than being rewritten in PowerShell.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,28 +78,27 @@ jobs:
       - name: Fetch Limine (pinned)
         # tools/ is gitignored, so the bootloader is fetched rather than committed.
         #
-        # FROM THE RELEASE ASSET, NOT A BRANCH. The first version of this step cloned
-        # a `v12.3.1-binary` branch; no such branch exists. Limine's `-binary`
-        # branches stop at v11.x, and from 12.x the binaries ship as a release asset
-        # - which is exactly what the README already tells a human to download. The
-        # tarball unpacks to `limine-binary/`.
+        # FROM THE RELEASE ASSET, NOT A BRANCH. An earlier version cloned a
+        # `v12.3.1-binary` branch; no such branch exists. Limine's `-binary` branches
+        # stop at v11.x, and from 12.x the binaries ship as a release asset - which is
+        # what README.md already tells a human to download. The tarball unpacks to
+        # `limine-binary/`.
         #
-        # `make` is required: the asset ships a prebuilt host tool for WINDOWS only,
-        # and the Makefile builds `limine` from `limine.c` with plain `cc`. `osdev
-        # image` invokes that host tool to write the boot sectors, so BOOTX64.EFI
-        # alone is not enough.
+        # NO `make` HERE, unlike a Linux runner: the asset carries a PREBUILT host tool
+        # for Windows (`limine-tool-windows-x86/limine.exe`), and `osdev` looks for
+        # exactly that name on this platform (`if cfg!(windows) { limine.exe }`).
+        # BOOTX64.EFI alone is not enough - the host tool writes the boot sectors.
         run: |
           set -e
           URL="https://github.com/limine-bootloader/limine/releases/download/${LIMINE_VERSION}/limine-binary.tar.xz"
-          curl -sSLf -o /tmp/limine-binary.tar.xz "$URL"
+          curl -sSLf -o limine-binary.tar.xz "$URL"
           mkdir -p tools
-          tar -xJf /tmp/limine-binary.tar.xz -C tools
+          tar -xJf limine-binary.tar.xz -C tools
           mv tools/limine-binary tools/limine
-          make -C tools/limine
-          test -x tools/limine/limine
+          cp tools/limine/limine-tool-windows-x86/limine.exe tools/limine/limine.exe
+          test -f tools/limine/limine.exe
           test -f tools/limine/BOOTX64.EFI
           test -f tools/limine/limine-bios.sys
-          echo "limine $(tools/limine/limine version 2>/dev/null || echo '(version query unsupported)')" 
 
       # ---- the same enforcement layer a local build runs -------------------------
       # A release is the worst possible time to discover a checker was failing.
@@ -161,24 +170,28 @@ jobs:
           [ "$bad" -eq 0 ] || { echo "release artefacts do not match the tagged commit"; exit 1; }
 
       - name: Package
+        # 7-Zip, not xz/zip: Git Bash on a Windows runner ships neither, and 7z is
+        # preinstalled. This only affects how the artefacts are WRAPPED - the images
+        # inside are the bytes the gate above just verified.
         run: |
           set -e
           V="${{ steps.v.outputs.tag }}"
           cd dist
-          xz -k -9 -f "godspeed-os-$V-x86_64.img"
-          zip -q -9 "godspeed-os-$V-x86_64.img.zip" "godspeed-os-$V-x86_64.img"
+          7z a -txz -bso0 -bsp0 "godspeed-os-$V-x86_64.img.xz"  "godspeed-os-$V-x86_64.img"
+          7z a -tzip -bso0 -bsp0 "godspeed-os-$V-x86_64.img.zip" "godspeed-os-$V-x86_64.img"
           rm -f "godspeed-os-$V-x86_64.img"
           # The Pi zips carry the config.txt the firmware needs; a kernel alone does
           # not boot either board.
           cp config-pi2.txt config.txt
-          zip -q -9 "godspeed-os-$V-arm32-pi2.zip"   "godspeed-os-$V-arm32-pi2-kernel7.img"   config.txt
+          7z a -tzip -bso0 -bsp0 "godspeed-os-$V-arm32-pi2.zip"   "godspeed-os-$V-arm32-pi2-kernel7.img"   config.txt
+          rm -f config.txt
           cp config-pi4.txt config.txt
-          zip -q -9 "godspeed-os-$V-aarch64-pi4.zip" "godspeed-os-$V-aarch64-pi4-kernel8.img" config.txt
+          7z a -tzip -bso0 -bsp0 "godspeed-os-$V-aarch64-pi4.zip" "godspeed-os-$V-aarch64-pi4-kernel8.img" config.txt
           rm -f config.txt config-pi2.txt config-pi4.txt
           # The VisionFive equivalent is the extlinux stanza: the kernel goes on the
           # stock ESP and a label is APPENDED, never replacing what is there.
           cp ../boot/visionfive/extlinux-on-stock-esp.conf extlinux.conf
-          zip -q -9 "godspeed-os-$V-riscv64-visionfive.zip" "godspeed-os-$V-riscv64-visionfive.img" extlinux.conf
+          7z a -tzip -bso0 -bsp0 "godspeed-os-$V-riscv64-visionfive.zip" "godspeed-os-$V-riscv64-visionfive.img" extlinux.conf
           rm -f extlinux.conf
           sha256sum * > "SHA256SUMS-$V"
           ls -l

@@ -220,7 +220,7 @@ current tree; the boot-verified pass they were first taken from is
 
 **Want to write a service?** See [**GETTING_STARTED.md**](GETTING_STARTED.md) - a 5-minute, copy-`examples/00-hello` walkthrough. The rest of this section is about building and booting the OS itself.
 
-**Requirements:** Rust nightly (pinned in `rust-toolchain.toml`), QEMU on your PATH, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (`nightly-2026-05-16`; rustup installs it for you), QEMU on your PATH, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
 
 **Set up Limine (once).** GodspeedOS boots via the Limine bootloader, whose binaries are not committed (`tools/` is gitignored). Download a Limine binary release (https://github.com/limine-bootloader/limine/releases - the project tracks the 12.x line) and copy these into `tools/limine/`:
 
