@@ -7,9 +7,18 @@ containing the `unsafe` keyword per file and compares to the baseline table belo
 unless this file is updated in the same commit with a written SAFETY argument.**
 
 `unsafe_check.py` scans `kernel/src/` (tracked against the inventory below) **and `services/`** (where
-it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`). The SDK's permitted-layer `unsafe`
-(`syscall`, `mmio`, `dma`, `adversarial` - §18.1) is not inventoried here; each block carries a SAFETY
-comment.
+it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`).
+
+**`sdk/` is scanned by NOTHING, and it is not only the permitted-layer files.** The script defines two
+roots, `kernel/src` and `services`; no SDK file is read by it or inventoried here. The SDK holds ~125
+`unsafe` lines, and only 35 of them are in the four modules §18.1 permits (`syscall`, `mmio`, `dma`,
+`adversarial`). The other ~90 are in **`service_context.rs` (~82)** and **`ipc.rs` (~8)** - files
+§18.2 forbids outright, named here because listing only the permitted four implied that was where the
+SDK's `unsafe` lives. Each block carries a SAFETY comment, but nothing ratchets them. Tracked as
+`backlog/18`.
+
+So the bolded rule above is narrower than it sounds: it holds for any file under `kernel/src/` or
+`services/`, and not at all for `sdk/`.
 
 ---
 
@@ -2540,9 +2549,16 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 394 lines across 22 files  
-**Grandfathered total:** 53 lines across 6 files  
-**Grand total:** 447 lines across 28 files
+**Permitted total:** 1158 lines across 72 files  
+**Grandfathered total:** 50 lines across 6 files  
+**Grand total:** 1208 lines across 78 files
+
+> These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
+> existed for months, and a grand total 2.7x low. They are derived by summing the inventory block
+> immediately above, and `scripts/unsafe_check.py` independently prints the same grand total
+> ("78 audited files, 1208 total unsafe lines"). **The check validates the inventory rows, never this
+> prose**, which is how a number inside the file the check guards drifted that far. Re-derive them
+> whenever a row moves.
 
 > **2026-06-28** (branch `hardening/dma-reserve-pool`). **Audit reconciliation** - three permitted-layer
 > files drifted (each line already carrying a `// SAFETY:` comment; the counts just weren't bumped as the

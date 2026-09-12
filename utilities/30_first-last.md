@@ -18,8 +18,8 @@ terminal. They pair as cleanly as head/tail, and read naturally with the count.
 ## 2. Usage
 
 ```
-first 0.1.0 - keep the first N lines (default 10)
-last  0.1.0 - keep the last N lines (default 10)
+first 0.4.0 - keep the first N lines (default 10)
+last  0.4.0 - keep the last N lines (default 10)
 
 usage:
   <producer> | first [N]   first N lines of piped input

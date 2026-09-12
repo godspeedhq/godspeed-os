@@ -22,7 +22,7 @@ It is whole-filesystem **enumeration**: the one operation that reads across the 
 rather than a single path or directory.
 
 ```
-find 0.1.0 - search the tree by name (substring, or glob with */?)
+find 0.4.0 - search the tree by name (substring, or glob with */?)
 
 usage:
   find <name>            search from / for entries whose name contains <name>

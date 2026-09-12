@@ -1,10 +1,11 @@
 # Utility Spec: `observe`
 
 **Utility:** `observe` - system metrics viewer
-**Version:** 0.1.0
+**Version:** 0.4.0 (`UTIL_VERSION`, `services/shell/src/main.rs`)
 **Status:** **BUILT and hardware-verified.** `services/observe/` ships, in three modes from one
 binary (`observe`, `observe-now`, `observe-live`). Written spec-first, per the utility-spec-first
-rule, and the spec was not updated when the implementation landed.
+rule; the build-order and "live view coming soon" scaffolding below is history, not a plan - the
+live view ships (`cmd_observe_live`) and that string exists nowhere in `services/`.
 **Last updated:** 2026-06-03
 
 ---
@@ -30,7 +31,7 @@ apart is deliberate: `observe` = *what is happening*; `status` = *is it healthy*
 | `observe now` | **Static** one-shot frame. Prints once, returns to `gsh>`. |
 | `observe help` | Usage for the utility (modes, subcommands, version header). |
 | `observe now help` | Usage for the static subcommand (what the columns mean). |
-| `observe version` | Prints `observe 0.1.0`. |
+| `observe version` | Prints `observe 0.4.0`. |
 
 `observe` (bare verb) means *ongoing observation* - that is why the live view is
 the default and the static one is the modified form. The word after the verb picks
@@ -80,7 +81,7 @@ them; what remains below is `observe`'s own normative help output.
 ### Help output shape (normative)
 
 ```
-observe 0.1.0 - system metrics viewer
+observe 0.4.0 - system metrics viewer
 
 usage:
   observe          watch live metrics (refreshes until you press q)
@@ -99,7 +100,7 @@ subcommand help:
 ### 4.1 Layout
 
 ```
-observe 0.1.0  ·  snapshot
+observe 0.4.0  ·  snapshot
 
 SLOT  NAME              CORE  STATE         MEM KiB (used/lim)   Q  RST
 ----  ----------------  ----  ------------  ------------------  --  ---

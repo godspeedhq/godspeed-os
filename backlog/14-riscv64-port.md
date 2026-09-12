@@ -187,10 +187,22 @@
 > same storm at 1 hart and at 4, repeatedly, and count recoveries. A race needs repetition to measure;
 > one clean run proves nothing and one failure proves little.
 
-**Severity:** feature, in progress. The target board is a StarFive **VisionFive 2** class machine
-(JH7110); QEMU `virt` is the primary development target and will remain so for the early work.
-**Status:** 2026-09-07 - the kernel BUILDS for `riscv64imac-unknown-none-elf` and BOOTS under QEMU
-`virt`, reaching S-mode and driving the 16550 UART. Everything above that is stubbed.
+**Severity:** feature - **SHIPPED**. The board is a StarFive **VisionFive 2 Lite** (JH7110).
+**Status: COMPLETE and released.** Merged at `1fd6cc52`, constitution amended for four ISAs, shipped as
+**v0.16.0** (2026-09-12). On hardware: 4 harts, the full service set, shell, 1080p60 HDMI, USB keyboard
+and mass storage, networking at zero loss, selfcheck 0 fails, and a 22,872-round chaos soak with no
+kernel panic and no liveness wedge.
+
+> The line above read *"2026-09-07 - the kernel BUILDS ... Everything above that is stubbed"* until
+> 2026-09-12, describing a shipped and released port as early scaffolding. `backlog/README.md` states
+> that **"Status lives here and nowhere else"**, so this field being wrong made the index wrong too.
+
+**What is genuinely still open**, and all this file should now be read for:
+1. **Stale peer caps** - preserved at tag `riscv64-stale-cap-wip`; the fix HALTED the board
+   (`FAULT WHILE REPORTING A FAULT`) and was reverted whole.
+2. **The xhci retry / `USB IS DEGRADED` paths have never executed** - not in ~23,500 chaos rounds. They
+   are correct by reading and untested by running, which is worth saying out loud (`feedback: prove the
+   guard fires`).
 
 ## What was actually wrong when this started
 

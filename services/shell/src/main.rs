@@ -1528,7 +1528,7 @@ impl ShellError {
 ///
 /// `#[inline(never)]`: `cmd_run` calls `execute` per script line, so `execute` must NOT be
 /// inlined into `cmd_run` - that would fold `execute`'s whole frame (including the `pipe_run`
-/// path's 64 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
+/// path's 16 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
 fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
@@ -1740,8 +1740,8 @@ fn cmd_result(ctx: &ServiceContext, prev: Result<(), ShellError>) {
 /// load (comments / blank lines / indentation stripped, `compact_step`), so this bounds the *code*,
 /// not the raw file - a heavily-commented source can be much larger on disk and still fit. 2 IO_CHUNKs
 /// (~7 KiB) is the most the bounded user stack allows while this buffer coexists with the heaviest run
-/// path (a `run … save` whose script has a `| assert` pipe: buffer + 16 KiB report + a 64 KiB pipe
-/// stream + a 64 KiB assert cap; `4 x` was MEASURED to overflow it). Code past this truncates LOUDLY -
+/// path (a `run … save` whose script has a `| assert` pipe: buffer + 16 KiB report + a 16 KiB pipe
+/// stream + a 16 KiB assert cap; `4 x` was MEASURED to overflow it). Code past this truncates LOUDLY -
 /// a huge script is a program (the `.gsh` -> `.gs` line, §26.6.1 / docs/scripting.md §9).
 const SCRIPT_MAX: usize = 2 * IO_CHUNK; // 7112
 
@@ -3462,7 +3462,7 @@ fn dispatch_call(ctx: &ServiceContext, b: &[u8], stmt: &str, ft: &FnTable, fi: u
 /// normal run, or `Out::File(&mut ReportBuf)` for `selfcheck/run … save <path>`, where the utility
 /// writes its OWN file. Each sub-command's own output still goes to the console (it is produced
 /// inside `execute`). The `save` path is a DIRECT file write, NOT a pipe: `run`/`selfcheck` stay
-/// non-producers (capturing one through a pipe nests a 64 KiB `Stream` and overflows the stack,
+/// non-producers (capturing one through a pipe nests a 16 KiB `Stream` and overflows the stack,
 /// HW-proven - [[project-shell-stack-pipe]]). The `ReportBuf` is a modest bounded buffer, so it +
 /// a sub-pipeline's transient buffers fit the user stack - the whole point of saving directly.
 #[inline(never)]
@@ -6257,7 +6257,7 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
 /// (total seconds since boot). Bare `uptime` renders the grid; `uptime | to json|yaml` renders the
 /// row; `uptime | select seconds` etc. work like any record stream. The clock is a wall-clock RTC
 /// delta (now − boot, InspectKernel queries 11/12), so it's correct on any APIC timer mode.
-#[inline(never)] // keep this builder's frame out of pipe_run's 64 KiB Stream frame, like every sibling
+#[inline(never)] // keep this builder's frame out of pipe_run's 16 KiB Stream frame, like every sibling
                  // record-builder (build_ls/caps/drives/find/observe/status); a byte pipe overflows the
                  // user stack otherwise (the PUSER-PF lesson). Audit L7 - it was the lone omission.
 fn build_uptime_table(ctx: &ServiceContext) -> Table {
@@ -6625,13 +6625,14 @@ enum Stream {
 /// sinks (`write`) or, if it isn't a sink, the final stream is rendered to the console. Replaces
 /// the separate byte and record pipelines. (docs/pipes.md, docs/records.md)
 ///
-/// `#[inline(never)]`: holds a 64 KiB `Stream` on its frame, so it must never be inlined into
-/// `execute` (which would carry that 64 KiB into every command's frame, and via a nested
+/// `#[inline(never)]`: holds a 16 KiB `Stream` on its frame, so it must never be inlined into
+/// `execute` (which would carry that 16 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
 fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
     // HIGH-WATER MARK, reported only when it moves. This file's own header says the user stack is
-    // 64 KiB and that this frame already sits near it, and the Pi 4 twice killed the shell inside a
+    // 256 KiB and that this frame already sits near it (measured at 177,297 bytes on entry, 68%), and
+    // the Pi 4 twice killed the shell inside a
     // pipe with `ELR_EL1 = 0x0` - a branch to address zero, which is what a smashed frame's saved LR
     // looks like. That is a HYPOTHESIS, and the shell was the one service with no way to confirm or
     // kill it: `fs` prints its deepest block call, this printed nothing.
@@ -6783,8 +6784,8 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
 /// Checks: `contains <text>`, `lacks <text>` (negation), `empty`. (Content correctness; the
 /// `assert ok/fails <cmd>` *result* form is handled in `cmd_assert`, no pipe.)
 ///
-/// `#[inline(never)]`: holds a 64 KiB `Cap` (to materialise a `Table`), so it must not fold into
-/// `pipe_run`'s frame (which already carries a 64 KiB `Stream`) - the inline-frame stack rule.
+/// `#[inline(never)]`: holds a 16 KiB `Cap` (to materialise a `Table`), so it must not fold into
+/// `pipe_run`'s frame (which already carries a 16 KiB `Stream`) - the inline-frame stack rule.
 #[inline(never)]
 fn assert_stream(ctx: &ServiceContext, s: &Stream, arg: &str) -> Result<(), ShellError> {
     let mut tmp = Cap::new();
@@ -6996,7 +6997,7 @@ fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
 /// `roster` (bare) - render the example record service's table directly: the same data a pipe
 /// sees (`roster | where role=core`). Spawns roster, drains its binary wire encoding (`Table::
 /// encode`), decodes it back into a `Table`, and renders the grid. `#[inline(never)]` - it holds a
-/// 64 KiB `Cap` on the user stack (USER_STACK_PAGES is tight; see [[project-shell-stack-pipe]]).
+/// 16 KiB `Cap` on the user stack (USER_STACK_PAGES is tight; see [[project-shell-stack-pipe]]).
 #[inline(never)]
 fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
     let mut cap = Cap::new();
@@ -9367,7 +9368,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // whose name describes a different operation; this OS does not carry POSIX vocabulary).
     //
     // NOT `selfcheck`/`run`: an orchestrator runs the suite's OWN sub-pipelines, so capturing it
-    // nests a pipe_run (64 KiB Stream) inside a pipe_run - two coexisting 64 KiB buffers overflow
+    // nests a pipe_run (16 KiB Stream) inside a pipe_run - two coexisting 16 KiB buffers overflow
     // the tight user stack (HW-proven shell crash, [[project-shell-stack-pipe]]). They refuse
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
@@ -9418,7 +9419,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
 /// stream renders to `out`); a bare producer builtin captures directly. A bare producer SERVICE
 /// drains through a local `Cap` (no coexisting pipe buffer, so it fits). A non-producer bare command
 /// is refused loudly. `out` is a small (16 KiB `ReportBuf`-backed) sink so it does NOT stack up
-/// against `pipe_run`'s own 64 KiB buffers on the pipeline path - the nested-capture overflow trap
+/// against `pipe_run`'s own 16 KiB buffers on the pipeline path - the nested-capture overflow trap
 /// ([[project-shell-stack-pipe]]). Returns true on success.
 fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
     let inner = inner.trim();
@@ -9437,7 +9438,7 @@ fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
         return true;
     }
     if is_pipe_producer_service(c0) {
-        // A bare producer service has no coexisting pipe_run Stream, so a 64 KiB drain Cap fits.
+        // A bare producer service has no coexisting pipe_run Stream, so a 16 KiB drain Cap fits.
         let mut cap = Cap::new();
         if !drain_service(ctx, c0, None, &mut cap) { return false; }
         out.put_bytes(ctx, cap.bytes());
@@ -9465,8 +9466,8 @@ fn capture_form(v: &str) -> Option<&str> {
 
 /// `let [mut] name = $( cmd )` - define a binding from captured command output (trailing whitespace
 /// trimmed). `#[inline(never)]`: the 16 KiB capture buffer lives ONLY here, off the common let path.
-/// A ReportBuf (16 KiB), not a Cap (64 KiB), so on the `$(pipe)` path it does not overflow the stack
-/// against pipe_run's own 64 KiB buffers. A value larger than the var arena is refused by `define`.
+/// A ReportBuf (16 KiB), not a Cap (16 KiB), so on the `$(pipe)` path it does not overflow the stack
+/// against pipe_run's own 16 KiB buffers. A value larger than the var arena is refused by `define`.
 #[inline(never)]
 fn capture_define(ctx: &ShellCtx, cwd: &Cwd, name: &str, inner: &str, mutable: bool, vars: &mut Vars) -> Result<(), ShellError> {
     let mut rb = ReportBuf::new();
@@ -13030,7 +13031,7 @@ fn cmd_match(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<()
 
 /// Run a filter built-in (`match`, `count`) over `input`, writing its output to `out`. Used
 /// when the filter sits **mid-pipe** or as the last stage - it runs in-process, so it is not
-/// subject to the 4 KiB service-boundary cap and can filter a full 64 KiB stage buffer.
+/// subject to the 4 KiB service-boundary cap and can filter a full 16 KiB stage buffer.
 fn run_filter_builtin(ctx: &ServiceContext, stage: &str, input: &[u8], out: &mut Out) -> bool {
     let (cmd, _) = split_first(stage);
     match cmd {

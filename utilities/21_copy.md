@@ -15,7 +15,7 @@
 ## 2. Usage
 
 ```
-copy 0.1.0 - copy a file
+copy 0.4.0 - copy a file
 
 usage:
   copy <src> <dst>              copy the file <src> to <dst>

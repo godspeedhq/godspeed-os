@@ -16,7 +16,7 @@ cryptic; `delete` says it plainly. It is destructive, so it is **loud** about wh
 ## 2. Usage
 
 ```
-delete 0.1.0 - remove a file or directory
+delete 0.4.0 - remove a file or directory
 
 usage:
   delete <path>             remove the file or empty directory at <path>

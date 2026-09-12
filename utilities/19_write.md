@@ -26,7 +26,7 @@ no `>`"). `write` is both the inline primitive and that pipe sink.
 ## 2. Usage
 
 ```
-write 0.1.0 - create, overwrite, append, or prepend a file
+write 0.4.0 - create, overwrite, append, or prepend a file
 
 usage:
   write <path>                     create an empty file at <path>

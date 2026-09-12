@@ -19,7 +19,7 @@ Reading **one** file is the whole job. Joining multiple streams is a pipe concer
 ## 2. Usage
 
 ```
-read 0.1.0 - print a file's contents
+read 0.4.0 - print a file's contents
 
 usage:
   read <path>         print the file at <path>

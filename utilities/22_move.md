@@ -17,7 +17,7 @@ secretly does both; GodspeedOS keeps them distinct because they are different ac
 ## 2. Usage
 
 ```
-move 0.1.0 - relocate a file
+move 0.4.0 - relocate a file
 
 usage:
   move <src> <dst>    move the file <src> to <dst>

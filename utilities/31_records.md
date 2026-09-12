@@ -35,10 +35,10 @@ reverse ticks` is the native "top"). Only the one-shot `observe now` is pipeable
 ## 2. Usage
 
 ```
-where  0.1.0 - keep records whose field matches
-select 0.1.0 - keep only some columns, in order
-to     0.1.0 - render records to a format
-from   0.1.0 - parse text into records
+where  0.4.0 - keep records whose field matches
+select 0.4.0 - keep only some columns, in order
+to     0.4.0 - render records to a format
+from   0.4.0 - parse text into records
 
 usage:
   <records> | where <col><op><val>   ops: = != > < >= <= ~ (contains)

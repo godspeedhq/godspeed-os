@@ -1,6 +1,14 @@
 # Bug 1 - Cross-core IPC reply to the BSP (core 0) never reaches a blocked receiver
 
-**Status:** Open · confirmed real (reproduces on a clean, diagnostic-free kernel)
+**Status: RESOLVED 2026-05-31 (`a306fd3`).** Root cause: an unbounded COM2 drain in core 0's timer
+ISR with IF=0. The T630 has no usable COM2, so its LSR floats and the drain never terminated - core 0
+live-locked in the ISR and the AP->BSP reply never ran. Fixed by bounding the drain to 256
+iterations per call. `milestones/hardware/ring3-bringup.md` ("BP2 unblocked") is the landing record,
+and `CLAUDE.md` §23.3 cites this file for the investigation; BP2 was measured on the T630 immediately
+afterwards. Kept for the investigation, which is the reason the file exists.
+
+*(This header read "Open - confirmed real" for three months after the fix landed, while two other
+documents recorded it as closed.)*
 **Severity:** High - blocks the cross-core IPC round-trip (BP2 benchmark / any request→reply where the requester is on the BSP)
 **Hardware:** HP T630 thin client - AMD GX-420GI (Jaguar/Puma+, Family 22h), 4 cores ~2 GHz, 8 GB RAM. LAPIC IDs 16/17/18/19 (BSP = LAPIC 16 = logical core 0).
 **First seen:** 2026-05-29 · last reproduced clean: 2026-05-30

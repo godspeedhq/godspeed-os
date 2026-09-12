@@ -1,7 +1,14 @@
 # Bug 2 - Intermittent KERNEL PF (rip=0) on core 0 after a benchmark/test completes
 
 **Date:** 2026-05-31 · **Hardware:** HP T630 (AMD GX-420GI) · **Branch:** `stress/cross-core-t630`
-**Status:** OPEN - surfaced while clearing S9; deferred until S3 is cleared, then to be chased.
+**Status: RESOLVED 2026-06-01.** Root cause: the `ud2`/#UD syscall path entered on
+`TSS.rsp0 = K0T` - the same top-of-kstack region the timer ISR's context-switch path descends into
+(~K0T-504) - so `ud2_syscall_entry` ran the whole syscall chain there and the two overlapped.
+`milestones/hardware/ring3-bringup.md` carries the landing record under "Bug 2 fixed - #UD syscall /
+timer stack overlap", verified across 14 power-cycles with `S9 pass (100/100)` every boot. Updates 1-9
+below are the investigation and are kept.
+
+*(This header read OPEN for three months after the fix landed and after the milestone recorded it.)*
 
 ## Symptom
 

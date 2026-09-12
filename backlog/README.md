@@ -55,6 +55,13 @@ direction.
 | [12](12-xhci-probe-blocks-input.md) | xHCI hub probes block the input loop - typing lags on one core | Latency | - |
 | [11](11-ehci-bios-handoff.md) | `ehci` resets a BIOS-owned controller with no USBLEGSUP handoff - fatal on one core | **Latent everywhere** | single-core on the T630 |
 | [10](10-ipc-efficiency.md) | IPC cost: fewer ROUND TRIPS, not a tighter protocol - batching, co-location, and the fixed 4 KiB message | Performance | the hot paths |
+| [13](13-ehci-holds-core-when-unplugged.md) | EHCI holds a core while a device is unplugged; xHCI `Enable Slot` timeouts | Cosmetic-to-minor | - |
+| [14](14-riscv64-port.md) | The RISC-V 64 port (StarFive VisionFive 2 Lite) - **shipped in v0.16.0**; open tails only | Feature / shipped | - |
+| [15](15-nic-rx-coverage.md) | The NIC receive ring is only drained when somebody asks | Recorded (§26.7) | - |
+| [16](16-riscv64-chaos-liveness-wedge.md) | riscv64 chaos: core 1 takes interrupts and never switches away - **CLOSED 2026-09-11** | Closed | - |
+| [17](17-riscv64-port-shared-surface.md) | What the riscv64 port changed OUTSIDE riscv64, and what still needs testing elsewhere | Cross-port | - |
+| [18](18-unsafe-audit-misses-the-sdk.md) | The unsafe audit does not cover the SDK, and §18.4 says it covers everything | **Enforcement gap** | trust in §18.4 |
+| [19](19-networking-does-not-recover-from-a-chaos-storm.md) | Networking does not recover from a chaos storm (Wyse / RTL8168) - fixed, kept open on evidence | Fixed / open on evidence | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.

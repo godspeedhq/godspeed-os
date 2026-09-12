@@ -182,7 +182,7 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 | Fuzz (F1-F8) | Kernel never panics on user-controllable input | Active |
 | Stress (S1-S10) | No drift, leaks, or corruption over time | Active |
 | Performance (B1-B10) | Latency / throughput baselines | Active |
-| Adversarial (A1-A10) | Capability isolation under direct attack | Active |
+| Adversarial (A1-A15) | Capability isolation under direct attack | Active |
 | Chaos (C1-C7) | Graceful degradation under partial failures | Active |
 
 The layers above are categories - each generalises over many inputs. Below them sit **scenario tests**,
@@ -202,17 +202,20 @@ emulation at all. `peer-storm` found a real protocol desync on its first outing 
 
 Every `unsafe` block is inventoried in `audits/unsafe-audit.md` and enforced by
 `scripts/unsafe_check.py` - counts may not grow without a written SAFETY argument.
-The inventory grows as the system does - three CPU ports and userspace drivers all need it - so the
-check is that every line is ACCOUNTED for, not that the count stays still. Figures below are from the
-current tree; the boot-verified pass they were first taken from is
-`milestones/testing/static-analysis-audit.md` (2026-05-31, AMD T630):
+The inventory grows as the system does - four CPU ports and userspace drivers all need it - so the
+check is that every line is ACCOUNTED for, not that the count stays still.
+
+The first row below is from the **current tree** (re-run `python scripts/unsafe_check.py` to reproduce
+it). The other three are **dated evidence** from the boot-verified pass of 2026-05-31 on the AMD T630
+(`milestones/testing/static-analysis-audit.md`) and are not re-measured on every change - they sat
+under a "figures below are from the current tree" line that made three-month-old numbers read as live:
 
 | Check | Result |
 |-------|--------|
-| Unsafe confined to permitted layers (§18.1) | audit passes: 1049 lines across 69 files, no unaccounted additions |
-| Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) | ✅ 0 |
-| Kernel build warnings | 104 → 57 (remaining are intentional unwired architecture) |
-| Hardware boot regression | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
+| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1208 lines across 78 files, no unaccounted additions |
+| Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) *(2026-05-31)* | ✅ 0 |
+| Kernel build warnings *(2026-05-31)* | 104 → 57 (remaining are intentional unwired architecture) |
+| Hardware boot regression *(2026-05-31, T630)* | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
 
 ---
 

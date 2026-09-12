@@ -236,7 +236,7 @@ persistence (the bytes survive a power-cycle); it is never part of the workflow.
 ## 9. `help` / `version` (convention shape, `0_conventions.md`)
 
 ```
-drives 0.1.0 - manage attached disks (format, name, select)
+drives 0.4.0 - manage attached disks (format, name, select)
 
 usage:
   drives                        list attached drive(s)

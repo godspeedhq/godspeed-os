@@ -15,7 +15,7 @@ verb - a universal contraction, one of the three short ones we keep (`ls` / `cd`
 ## 2. Usage
 
 ```
-mkdir 0.1.0 - create a directory
+mkdir 0.4.0 - create a directory
 
 usage:
   mkdir <path>        create the directory at <path>

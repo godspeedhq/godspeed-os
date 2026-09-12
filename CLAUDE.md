@@ -772,13 +772,15 @@ Same generation-mismatch mechanism underlies `CapRevoked` and `EndpointDead`; th
 
 Multiple cores may execute syscalls touching the same capability table simultaneously. v1 uses a locking discipline that guarantees:
 
-- Reads (cap lookup, generation check) are wait-free under common cases.
+- Reads (cap lookup, generation check) and writes take the SAME exclusive lock; nothing here is wait-free or reader-parallel.
 - Writes (cap insertion on spawn, removal on death) are serialized.
 - A revocation in flight on one core is visible to a syscall in flight on another core within bounded time (next memory barrier).
 
 The exact primitive is an implementation choice, not a spec choice.
 
-> **v1 implementation note:** A single global `RwLock` is acceptable for the v1 milestone. Syscall-path serialization is a known performance cost; sharded or RCU-based designs are explicit v2 work and require benchmarks before adoption.
+> **v1 implementation note:** A single global lock is acceptable for the v1 milestone. Syscall-path serialization is a known performance cost; sharded or RCU-based designs are explicit v2 work and require benchmarks before adoption.
+>
+> **Amendment 2026-09-12: it is a `SpinLock`, not an `RwLock`, and this section claimed a property the code never had.** `GLOBAL_RESOURCES` is a `SpinLock<GlobalResourceTable>` (`kernel/src/capability/table.rs`); there is no `RwLock` type anywhere in the kernel. So "reads are wait-free under common cases" was never true: a cap lookup takes the same exclusive lock a spawn does and can spin behind it. The bullet above is corrected. This does not weaken any guarantee - §7.8's actual requirements (reads correct, writes serialized, revocation visible within bounded time) all hold under plain mutual exclusion, and it is strictly more conservative than the `RwLock` this described. What changes is the performance claim, which B7 measures.
 
 ### 7.9 Example
 
@@ -1718,7 +1720,7 @@ Performance benchmarks lock in numbers so regressions are detected commit-to-com
 | B9  | Message copy cost: 4 KiB upper-bound copy             |
 | B10 | Scheduler decision cost: time to pick next task       |
 
-Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` will surface most visibly in B7 - record the number now so the v2 sharded/RCU migration has a target.
+Results are committed to `tests/qemu/perf/baseline.json`. **Comparison is MANUAL.** `collect_perf_baseline` only WRITES the baseline; the `regression_threshold_pct: 10` it emits is an inert field nothing reads, and no workflow runs the perf suite at all (every test workflow is `workflow_dispatch`-only; the release workflow builds images, it does not benchmark). This said "CI compares each run against baseline and flags regressions >= 10%", which described a gate that has never existed. The §7.8 single global lock will surface most visibly in B7 - record the number now so the v2 sharded/RCU migration has a target.
 
 ---
 
@@ -1738,6 +1740,11 @@ Adversarial tests verify capability isolation holds under direct attack. The sys
 | A8  | Service tries to monopolize a core via a tight loop without yielding                |
 | A9  | Service tries to spawn another service directly, bypassing the supervisor           |
 | A10 | Service passes kernel addresses as syscall arguments                                |
+| A11 | Service invokes `InspectKernel` system queries without an `INTROSPECT` cap          |
+| A12 | Service invokes `Reboot` without the capability                                     |
+| A13 | Service invokes `AcquireSendCap` without the capability                             |
+| A14 | Ring-3 CPU exception (null read, non-canonical read, divide-by-zero) kills the task, not the kernel |
+| A15 | A bad user pointer kills the caller, not the kernel                                 |
 
 Bar: every attack returns a defined error. Any attack that succeeds is a security hole; any attack that panics the kernel is a kernel bug. Both are mandatory fixes.
 

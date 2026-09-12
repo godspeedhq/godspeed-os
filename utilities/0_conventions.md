@@ -177,6 +177,6 @@ top-level `help` list - is closed.
 
 The last-open item is now closed too: the top-level **`help`** command conforms.
 Bare `help` is still the categorised command list, but its first line now carries the
-version header (rule 6: `help 0.1.0 - GodspeedOS shell commands`), and `help help` /
+version header (rule 6: `help 0.4.0 - GodspeedOS shell commands`), and `help help` /
 `help version` resolve like any other utility's. So **every** command the shell
 dispatches - including `help` itself - self-documents and reports a version.

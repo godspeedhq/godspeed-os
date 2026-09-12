@@ -15,7 +15,7 @@ its own sake. Its natural use is a pipe (`find *.txt | sort`, `read /names | sor
 ## 2. Usage
 
 ```
-sort 0.1.0 - order the lines (ascending, or reverse)
+sort 0.4.0 - order the lines (ascending, or reverse)
 
 usage:
   <producer> | sort         sort piped input

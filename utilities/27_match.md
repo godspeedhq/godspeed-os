@@ -22,7 +22,7 @@ If a line matches, it is kept; if it doesn't, it is dropped. One honest verb cov
 ## 2. Usage
 
 ```
-match 0.1.0 - keep the lines that match a pattern
+match 0.4.0 - keep the lines that match a pattern
 
 usage:
   <producer> | match <pattern>   keep piped lines that match <pattern>

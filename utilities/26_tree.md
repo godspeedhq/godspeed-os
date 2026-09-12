@@ -14,7 +14,7 @@ the same name as the POSIX/util `tree` because the name is already plain and not
 ## 2. Usage
 
 ```
-tree 0.1.0 - print the directory hierarchy
+tree 0.4.0 - print the directory hierarchy
 
 usage:
   tree            tree of the current directory

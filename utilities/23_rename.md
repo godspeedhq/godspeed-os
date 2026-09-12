@@ -17,7 +17,7 @@ up.
 ## 2. Usage
 
 ```
-rename 0.1.0 - rename a file or directory in place
+rename 0.4.0 - rename a file or directory in place
 
 usage:
   rename <path> <newname>   rename the entry at <path> to <newname>

@@ -18,7 +18,7 @@ layperson reads correctly. Its natural partner is a pipe - *"how many?"* after a
 ## 2. Usage
 
 ```
-count 0.1.0 - count lines, words, and bytes
+count 0.4.0 - count lines, words, and bytes
 
 usage:
   <producer> | count   count piped input
