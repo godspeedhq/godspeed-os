@@ -1241,11 +1241,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // state that a post-chaos Pi 2 got stuck in for 23 s. A dependency spawned after its dependent
     // guarantees a failed first probe; ordering it correctly costs nothing.
     //
-    // The later `xhci` site stays, and ADOPTS this instance rather than starting a second - which is
-    // what `ensure_mapped` is for, and why this is safe to say twice. x86 keeps its existing
-    // position: there `xhci` is a keyboard driver and the disk is AHCI, so it is not in this path.
-    #[cfg(target_arch = "aarch64")]
-    ensure_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
+    // The later host site stays, and ADOPTS this instance rather than starting a second - which is
+    // what `ensure_mapped` is for, and why this is safe to say twice.
+    //
+    // ASKED ON THE RIGHT AXIS, and that is the whole of this block. It used to read
+    // `#[cfg(target_arch = "aarch64")]`, which is a question about an INSTRUCTION SET standing in for
+    // a question about a BOARD - so when the VisionFive arrived with the same disk topology and a
+    // different ISA, it sat outside the cfg and every boot began with the failed first probe this
+    // comment exists to prevent. Widening the cfg to name riscv64 too would have fixed that board and
+    // left the identical trap for the next one; `shared_surface_check.py` refused it, correctly.
+    //
+    // The real question is "does this board's `block-driver` reach its disk through a USB host", and
+    // the IMAGES row above ALREADY ANSWERS IT: block-driver's PEER list names that host - `dwc2` on
+    // the Pi 2, `xhci` on the Pi 4 and the VisionFive, neither on x86 where the disk is AHCI and the
+    // USB drivers are keyboards. Reading the peers means a new board is covered by its own row, with
+    // no condition here to extend and no ISA named above the kernel at all.
+    //
+    // Why it was worth ordering: a dependency spawned after its dependent guarantees a failed first
+    // probe. Not fatal - `fs` re-probes and 14.3 has the client reacquire by name, which is why a
+    // 22,872-round soak never flagged it on riscv64 - but "starts storage-less and recovers" is not
+    // the same as "works", and on the Pi 4 it showed as `block-driver: 'xhci' did not answer ... COULD
+    // NOT REACQUIRE` two lines before `task: 'xhci' spawned OK`.
+    const USB_HOSTS: [&str; 2] = ["dwc2", "xhci"];
+    if let Some(row) = IMAGES.iter().find(|r| r.0 == "block-driver") {
+        for host in row.5.iter().filter(|p| USB_HOSTS.contains(p)) {
+            ensure_mapped(&ctx, &mut name_map, host, 0xFFFF);
+        }
+    }
 
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.

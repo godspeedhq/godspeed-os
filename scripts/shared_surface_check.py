@@ -53,8 +53,28 @@ def rel(path):
     return os.path.relpath(path, ROOT).replace(os.sep, "/")
 
 
+def _strip_comments(text):
+    """Drop `//` line comments before counting.
+
+    This counted RAW FILE TEXT, so a comment that MENTIONED `target_arch` counted as an
+    arch-conditional site. Two ways that bites, and the second is the bad one:
+
+      * prose alone could trip the ratchet and refuse a change that added no conditional code
+        (this file's own fix did exactly that - a comment quoting the cfg it had just DELETED kept
+        the count level and hid a genuine reduction);
+      * and the reverse - deleting a conditional while describing it in a comment leaves the number
+        unmoved, so the ratchet reports no progress for real progress, which is the slower poison.
+
+    `arch_boundary_check.py`, the sibling that enforces the same boundary inside the kernel, has
+    stripped comments since it was written. This is that, applied to the other side of the seam.
+    Block comments and string literals are rare enough here that a line-comment strip suffices; a
+    miss is a count that is too HIGH, which fails loudly rather than passing quietly.
+    """
+    return chr(10).join(line.split("//", 1)[0] for line in text.splitlines())
+
+
 def scan_counts():
-    """Occurrences of an arch cfg per shared file, as {path: count}."""
+    """Occurrences of an arch cfg per shared file, as {path: count}. Comments do not count."""
     counts = {}
     for root_name in SHARED_ROOTS:
         root = os.path.join(ROOT, root_name)
@@ -65,7 +85,7 @@ def scan_counts():
                     continue
                 full = os.path.join(dirpath, fn)
                 with open(full, encoding="utf-8", errors="replace") as fh:
-                    n = len(ARCH_CFG.findall(fh.read()))
+                    n = len(ARCH_CFG.findall(_strip_comments(fh.read())))
                 if n:
                     counts[rel(full)] = n
     return counts
