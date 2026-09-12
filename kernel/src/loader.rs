@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! ELF64 service loader - §14.1.
+//! ELF service loader - §14.1.
 //!
-//! Parses ELF64 PT_LOAD segments from a flat byte slice (embedded in the
-//! kernel via `include_bytes!(env!("SVC_*_ELF"))`) and maps each segment into
-//! a fresh `PageTable`.  BSS (p_memsz > p_filesz) is zero-filled automatically.
+//! Parses PT_LOAD segments from a flat byte slice (embedded in the supervisor, or in the kernel via
+//! `include_bytes!(env!("SVC_*_ELF"))`) and maps each segment into a fresh `PageTable`. BSS
+//! (p_memsz > p_filesz) is zero-filled automatically.
 //!
-//! Only the ELF64 subset used by static services is handled:
-//!   - ET_EXEC, EM_X86_64, ELFCLASS64, little-endian
+//! ARCH-NEUTRAL, and BOTH ELF CLASSES. The machine and class come from the arch seam
+//! (`arch::imp::ELF_MACHINE` / `ELF_CLASS`), so one loader parses 32-bit ARMv7 service ELFs and
+//! 64-bit ones alike - `ehdr_size`, `phdr_size` and `rd_addr` all branch on the class. This said
+//! "ELF64 ... EM_X86_64, ELFCLASS64", which named one ISA's answer as the rule.
+//!
+//! Only the subset used by static services is handled:
+//!   - ET_EXEC, `arch::imp::ELF_MACHINE`, ELFCLASS32 or ELFCLASS64, little-endian
 //!   - PT_LOAD program headers (all others are skipped)
 //!   - PF_X / PF_W / PF_R flags → PageFlags
 

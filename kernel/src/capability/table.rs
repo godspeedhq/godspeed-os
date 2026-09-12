@@ -10,9 +10,11 @@
 //! 2. `GlobalResourceTable` - one per kernel; maps `ResourceId` to its
 //!    current generation and liveness. Consulted on every cap validation.
 //!
-//! Concurrency (§7.8): v1 uses a global RwLock. Reads (lookup + gen check)
-//! are concurrent; writes (insertion on spawn, removal on death) are serialized.
-//! A v2 sharded or RCU design requires benchmarks before adoption.
+//! Concurrency (§7.8): v1 uses a single global `SpinLock` - the "global RwLock" §7.8 approves,
+//! implemented as plain mutual exclusion. EVERYTHING serialises: a read (lookup + generation check)
+//! takes the same exclusive lock a write (insertion on spawn, removal on death) does, and can spin
+//! behind it. This said "reads are concurrent", which was a claim about an `RwLock` the kernel does
+//! not have. A v2 sharded or RCU design requires benchmarks before adoption.
 
 use super::cap::{CapError, Capability, ResourceId};
 use super::generation::Generation;

@@ -1,6 +1,6 @@
 # kernel/src/capability/
 
-The capability system (§7). Unsafe boundary: the global resource table uses a raw static; access is serialised by a spinlock (v1: global RwLock per §7.8).
+The capability system (§7). Unsafe boundary: the global resource table uses a raw static; access is serialised by a single global `SpinLock` (§7.8).
 
 ## Files
 
@@ -25,7 +25,7 @@ The capability system (§7). Unsafe boundary: the global resource table uses a r
 
 ## Concurrency (§7.8)
 
-v1: a single global `RwLock` around `GlobalResourceTable`. Reads (cap lookup + gen check) take a read lock; writes (spawn, death, revoke) take a write lock. This is a known bottleneck; sharding is v2 work requiring benchmarks (see B7 in `tests/qemu/perf/CLAUDE.md`).
+v1: a single global `SpinLock` around `GlobalResourceTable` - this is the "single global RwLock" §7.8 approves, implemented as plain mutual exclusion. There is no `RwLock` type in the kernel, so READS SERIALISE TOO: a cap lookup + generation check takes the same exclusive lock a spawn does, and can spin behind it. (This said "reads take a read lock" and "reads are concurrent", which was a performance claim the code never made.) A known bottleneck; sharding is v2 work requiring benchmarks (see B7 in `tests/qemu/perf/CLAUDE.md`).
 
 Per-task `CapTable` is NOT shared: only one core accesses a given task's table (the task is pinned to that core). No lock needed for `CapTable`.
 

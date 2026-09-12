@@ -38,7 +38,6 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 | `invariants/`    | §22         | No  |
 | `bootcon/`       | §11.4       | No - see below |
 | `log.rs`         | §11.4       | No  |
-| `control.rs`     | §17         | No  |
 
 ## Unsafe policy (§18)
 
@@ -72,9 +71,16 @@ GRANTED to the `console` service at spawn (`release`), and stops from that momen
 byte the service renders, which can be seconds later and let the floor paint over a live terminal. It
 takes the screen back if that service dies (`reclaim_on_death`) or on a panic (`reclaim_for_panic`).
 
-## Control channel (`control.rs`)
+## Control channel (the `control` SERVICE, not kernel code)
 
-`control.rs` implements the COM2 serial control channel used by the test harness to inject `RESTART`/`KILL` commands at runtime (§17). `process_pending()` is called from Core 0's timer ISR on every tick - not only in the scheduler idle branch - so commands are processed even under full task load.
+`kernel/src/control.rs` **does not exist**. This section described it, and `task/mod.rs:2432` says so
+in as many words: "not `control::process_pending` - which does not exist any more". The COM2 serial
+control channel the test harness drives (`RESTART`/`KILL`, §17) is `services/control`, a restartable
+userspace service that re-opens the port on respawn. It was moved out in C1-6, and
+`capability/mod.rs:111` records the move.
+
+The kernel's only remaining stake in it is the gated `FireIrq` syscall (51), which `control` carries in
+its spawn request rather than receiving by name.
 
 ## Panic behaviour
 

@@ -43,8 +43,6 @@ pub fn register(irq: u8, endpoint: EndpointId) {
     table[irq as usize] = Some(endpoint);
 }
 
-/// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
-/// only the driver that owns the route may re-open its IOAPIC gate (§12).
 /// Release every IRQ routed to `endpoint`, and mask those lines. Returns how many were released.
 ///
 /// BY ENDPOINT, NOT BY NAME. The kill path used to work out which line a dying task owned from a
@@ -79,6 +77,8 @@ pub fn unregister_endpoint(endpoint: EndpointId) -> usize {
     released
 }
 
+/// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
+/// only the driver that owns the route may re-open its IOAPIC gate (§12).
 pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
     IRQ_TABLE.lock_irq()[irq as usize]
 }
@@ -101,9 +101,9 @@ pub fn unregister(irq: u8) {
     // registers correctly, waits for an interrupt that is switched off at the controller, and looks
     // like a driver that cannot see its hardware.
     //
-    // On arm32 it is worse than a stuck driver: the USB route falls back to the IN-KERNEL stack when
-    // nobody is registered, so `kill dwc2` would hand USB back to a driver whose interrupt line had
-    // been silently disabled - keyboard and storage dead, with the undo apparently applied.
+    // On arm32 nothing falls back: slice 5 deleted the in-kernel stack, and `arch/arm/irq.rs:553` says
+    // so at the dispatch site. A masked line simply stays masked until the respawned `dwc2` service
+    // registers again and unmasks it - which is why releasing the route must also unmask.
     //
     // Releasing the route and releasing the mask are the same act: whoever holds the route owes the
     // unmask, and if they are gone the debt falls here. Harmless for edge/MSI vectors, where masking
@@ -111,15 +111,16 @@ pub fn unregister(irq: u8) {
     crate::arch::imp::ioapic::unmask_vector(irq);
 }
 
+/// One bit per IDT vector: has `deliver` ever run for it? Read and set by the one-shot inside
+/// `deliver`, below.
+static VECTOR_SEEN: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
 ///
 /// # Safety
 /// Called from interrupt context with IF=0. The APIC EOI is sent unconditionally
 /// at the end; missing the EOI would leave the IRQ line permanently masked.
-/// One bit per IDT vector: has `deliver` ever run for it? Read and set by the one-shot above.
-static VECTOR_SEEN: [core::sync::atomic::AtomicU64; 4] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
-
 pub unsafe fn deliver(irq: u8) {
     // FIRST delivery of each vector, logged once - generalised from the EHCI-only one-shot this
     // replaces, because the question it answered for the EHCI is the one now being asked of the xHCI

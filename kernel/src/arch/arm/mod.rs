@@ -1237,10 +1237,6 @@ pub fn board_mac_packed() -> Option<u64> {
     })
 }
 
-/// USB mass-storage block device, served by the in-kernel DWC2 Bulk-Only stack (`dwc2`). Exposed to the
-/// userspace `block-driver` through the USB_DISK-gated syscalls 46-48, the same shape as the USB-net
-/// bridge: the kernel owns the controller and the transport, the driver owns the block protocol above it.
-
 // --- The in-kernel USB stack is GONE (arm32 slice 5) ------------------------------------------------
 //
 // `arch/arm/dwc2.rs` (3,981 lines) and `arch/hid.rs` (241) are deleted. They were ring-0 code parsing
@@ -1256,7 +1252,8 @@ pub fn board_mac_packed() -> Option<u64> {
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
-/// Make prior writes durable (SCSI SYNCHRONIZE CACHE) - see `dwc2::msc_sync_cache`.
+/// No in-kernel USB disk on this port (slice 5): always false. Durability is the `dwc2` SERVICE's
+/// job, reached over IPC. (`dwc2::msc_sync_cache` went with `arch/arm/dwc2.rs`.)
 pub fn usb_disk_flush() -> bool { false }
 /// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
 /// failure at all - the caller should re-ask, with interrupts enabled in between.

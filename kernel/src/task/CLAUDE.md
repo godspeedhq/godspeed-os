@@ -54,6 +54,8 @@ In the self-kill path (the dying task's CR3 is still active on the core), the PM
 
 Fix: the PML4 frame is stored in `CORE_PENDING_PML4[my_core]` during the kill path. It is freed at the next `drain_pending_kstack` call (timer tick or scheduler idle) when a different CR3 is already loaded on that core.
 
-## Control channel polling (§17)
+## Control channel polling (§17) - NO LONGER IN THE KERNEL
 
-`timer_tick()` on Core 0 calls `control::process_pending()` on every tick. This drains COM2 bytes and executes any `RESTART`/`KILL` commands. The call is made **on every tick** (not only in the idle branch) so control commands are processed even when Core 0 always has runnable tasks.
+`timer_tick()` does **not** call `control::process_pending()`; that module does not exist, and
+`task/mod.rs:2432` says so directly. The COM2 control channel is `services/control`, a restartable
+userspace service (moved out in C1-6). Nothing on the timer tick drains COM2 any more.

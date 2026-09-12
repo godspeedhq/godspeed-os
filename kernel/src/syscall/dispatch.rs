@@ -2739,8 +2739,10 @@ fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let mut buf = [0u8; USB_DISK_BLOCK];
-    // -2 = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 = failed, because the
-    // two need opposite responses and collapsing them is what turned a busy stick into a "broken" one.
+    // USB_DISK_BUSY (-20) = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 =
+    // failed, because the two need opposite responses and collapsing them is what turned a busy stick
+    // into a "broken" one. NOT -2: that is `CapNotHeld`, and giving BUSY a cap-error code was the
+    // original bug - see the `USB_DISK_BUSY` constant, which records it.
     if !crate::arch::imp::usb_disk_read(lba, &mut buf) {
         // ABSENT first: it is the stronger fact. `usb_disk_busy` reads the last TRANSFER's outcome, which
         // a refusal never updates, so asking it about a device that is not there answers from stale state.

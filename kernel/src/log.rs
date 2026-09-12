@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Kernel ring buffer - §11.4.
 //!
-//! 16 KiB shared sink. Written to before the `events` service exists;
-//! drained by the `events` service on startup. Also mirrors to the serial
-//! console at all times so panics are always visible.
+//! 16 KiB shared sink, mirrored to the serial console at all times so panics are always visible.
+//!
+//! NOTHING DRAINS IT. This said it was "drained by the `events` service on startup"; `drain_to_events`
+//! below has zero callers anywhere in the tree. That is not an oversight to correct - §11.4's 2026-09-04
+//! amendment makes it the design: `ctx.log()` is syscall 5 writing this ring and serial DIRECTLY, so
+//! logging never depends on a service that can die. Do not wire this up.
 //!
 //! Unsafe boundary: none. The ring buffer is protected by a SpinLock.
 
@@ -106,12 +109,15 @@ pub fn write_fmt(args: fmt::Arguments) {
     });
 }
 
-/// Drain the ring buffer into the `events` service endpoint once it is ready.
+/// Drain the ring buffer into a sink.
+///
+/// UNUSED - zero callers. Kept because the masking discipline below is the correct shape for any future
+/// drainer, but see the module header: logging deliberately does not flow through a service (§11.4).
 pub fn drain_to_events(send: impl FnMut(u8)) {
     // Masked, for the reason `write_fmt` above states: `RING` is taken from interrupt context too, and
     // a spinlock is not reentrant - so an unmasked hold lets the timer ISR spin on a lock its own core
-    // already owns. This one runs once, when `events` starts, which makes the window small rather
-    // than absent; the identical hazard in `arch/arm/irq.rs::HIRES` took 1754 chaos rounds to hit.
+    // already owns. The identical hazard in `arch/arm/irq.rs::HIRES` took 1754 chaos rounds to hit, which
+    // is why the masking stays even though this function is currently never called.
     crate::smp::without_interrupts(|| RING.lock().drain(send));
 }
 

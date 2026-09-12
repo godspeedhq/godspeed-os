@@ -207,11 +207,11 @@ static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 /// `bootcon::init` only runs on a machine that HAS a framebuffer, so a headless boot printed no
 /// identity at all. An identity line missing from exactly the logs read over a serial cable is the
 /// wrong way round. So it lives here instead, and each boot path calls it once serial is up and the
-/// framebuffer floor (if the machine has one) is already mirroring: `kernel_main` on x86, and the two
-/// ARM `*_boot_main`s, which bring the machine up themselves and never reach `kernel_main`. Three call
-/// sites because there are three boot paths - not because the line is conditional on anything.
+/// framebuffer floor (if the machine has one) is already mirroring: `kernel_main` on x86, the two ARM
+/// `*_boot_main`s, and the RISC-V S-mode entry - none of the last three reach `kernel_main`. FOUR call
+/// sites because there are four boot paths - not because the line is conditional on anything.
 ///
-/// The CPU line exists because an ARCH is not a MACHINE. Four boards run this system and two of them
+/// The CPU line exists because an ARCH is not a MACHINE. Five boards run this system and two of them
 /// report `x86_64`: an AMD GX-420GI and an Intel Gemini Lake, which have already diverged in ways that
 /// mattered (the AMD box needs IOMMU passthrough for a firmware DMA quirk; the Intel one has a device
 /// with no function 0). Having to ASK which machine produced a serial log is how a fact about one

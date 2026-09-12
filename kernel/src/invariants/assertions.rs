@@ -25,12 +25,15 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
     );
 }
 
-/// Assert the kernel's TCB services are still alive. Called at key checkpoints.
+/// Assert the kernel's non-restartable services are still alive. Called at key checkpoints.
 /// Invariant §6.2.
 ///
-/// Checks that each TCB service's endpoint is still registered in the IPC name
-/// directory and alive in the routing table. Death of any TCB service requires
-/// an immediate system reboot - §6.2.
+/// A DELIBERATE NO-OP TODAY. `TCB` below is empty, so the loop never runs. This doc used to say
+/// "death of any TCB service requires an immediate system reboot", which was true when the set held
+/// `init` + `supervisor` + `registry` and has been false since Path C / Phase 6 made the supervisor
+/// restartable: the non-restartable set is `{kernel}` alone, and nothing above the kernel reboots the
+/// machine. The call sites are kept as the §6.2 checkpoint - if a component ever becomes
+/// unkillable again, this is where it is named.
 pub fn assert_tcb_alive() {
     // The non-restartable set is now EMPTY (Path C / Phase 6: the supervisor is restartable too -
     // the kernel respawns it on death, §6.2). `fs`/`block-driver` are restartable (Phase D). The
@@ -53,9 +56,9 @@ pub fn assert_tcb_alive() {
         for slot in 0..crate::task::scheduler::MAX_TASKS {
             let stat = crate::task::scheduler::task_stat(slot);
             if stat.valid && stat.name == name {
-                // Found the task. Liveness by task state works uniformly, including
-                // for `init`, which persists (`loop { yield }`) but registers no
-                // named IPC endpoint and so cannot be checked by endpoint.
+                // Found the task. Liveness by task state works uniformly, including for a service
+                // that persists but registers no named IPC endpoint and so cannot be checked by
+                // endpoint. (`init` was the example here; it was removed in Path C / Phase 5.)
                 if stat.state == DEAD {
                     panic!("invariant violation: TCB service '{}' is Dead (§6.2)", name);
                 }

@@ -106,8 +106,10 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
 pub fn board_mac_packed() -> Option<u64> { None }
 
-/// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
-/// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
+/// USB mass-storage block device. NO port has an in-kernel USB stack any more - `arch/arm/dwc2.rs`
+/// and `arch/aarch64/xhci.rs` were both deleted (§6.4, 2026-08-09 and 2026-08-17) - so disks are
+/// userspace drivers everywhere and this always answers "no device". The USB_DISK syscalls (46-49)
+/// are a dead ABI; nothing holds the capability (`task/mod.rs`: `usb_disk: false`).
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
