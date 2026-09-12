@@ -50,10 +50,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Build the TAG, not the branch tip. The kernel stamps
-          # `git rev-parse --short HEAD` into itself and the shell prints it as
-          # `version`, so an artefact built from a later commit would contradict
-          # its own release notes.
+          # Build the TAG, not the branch tip. The kernel and the shell each stamp
+          # `git rev-parse --short=8 HEAD` (kernel/build.rs, services/shell/build.rs -
+          # two independent stamps of the same fact), so an artefact built from a later
+          # commit would contradict its own release notes.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Resolve the version and commit under build
@@ -61,8 +61,14 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           echo "tag=$TAG"                          >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "Building $TAG at $(git rev-parse --short HEAD)"
+          # --short=8, MATCHING THE STAMPERS. A bare `--short` auto-sizes to the shortest
+          # unambiguous prefix, so the width follows the CLONE rather than the commit: this
+          # runner checks out at fetch-depth 1 and gets 7; a full local clone gets 8. The verify
+          # step below greps this value INSIDE each image, so a 7-character value checked 7 of
+          # the 8 characters the binaries actually carry - it passed only because a prefix
+          # matches a prefix. Same width on both sides, or the gate is weaker than it reads.
+          echo "sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG at $(git rev-parse --short=8 HEAD)"
 
       - name: Install Rust toolchain
         # `rustup show` honours rust-toolchain.toml, which pins the compiler DATE and
