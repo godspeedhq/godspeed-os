@@ -161,10 +161,28 @@ def parse_kernel(name: str, source: str) -> dict | None:
 # not quietly escape the check. The table deliberately carries the same fields the kernel row did.
 SUPERVISOR_MAIN = SERVICES / "supervisor" / "src" / "main.rs"
 
-def _core_of(expr: str):
-    """A `preferred_core` expression as an int, or None for `u32::MAX` (no preference)."""
+def _core_of(expr: str, src: str = ""):
+    """A `preferred_core` expression as an int, or None for `u32::MAX` (no preference).
+
+    `src` is the file the expression came from, so ONE level of named-constant indirection resolves -
+    `board::SHELL_CORE` becomes the `const SHELL_CORE: u32 = ...` it names. Same treatment, for the
+    same reason, as the peer column below: the spawn table is data for this checker as well as for
+    the program, so a row that stops spelling its core inline takes the parser with it. Without this
+    the three placements that moved into `mod board` read as `None` and reported a mismatch against
+    contracts that were correct.
+
+    Deliberately one level and no more. A constant naming another constant does not resolve and
+    fails visibly as a mismatch, rather than quietly reading 0.
+    """
     if "u32::MAX" in expr:
         return None
+    named = re.match(r'(?:[A-Za-z_][A-Za-z_0-9]*::)*([A-Z][A-Z_0-9]*)\s*$', expr.strip())
+    if named and src:
+        cm = re.search(r'const\s+' + re.escape(named.group(1)) + r'\s*:\s*u32\s*=\s*(.*?);', src,
+                       re.DOTALL)
+        if not cm:
+            return None
+        expr = cm.group(1).strip()
     m = re.search(r'if cfg!\([^)]*\)\s*\{\s*\d+\s*\}\s*else\s*\{\s*(\d+)\s*\}', expr)
     if m:
         return int(m.group(1))
@@ -298,7 +316,7 @@ def parse_supervisor_images(name: str):
         # { 0 }` takes the ELSE (x86) branch, because this check runs on the host and the .toml states
         # the x86-intended core. Without it the shell's row raised a ValueError rather than reporting a
         # mismatch - a checker that CRASHES is worse than one that fails, since it reports nothing at all.
-        "core":  _core_of(core_expr),
+        "core":  _core_of(core_expr, src),
         # DEDUPED, because the comment above says UNION and a union is a set. Concatenating the
         # branches was indistinguishable from a union until a peer appeared in MORE THAN ONE branch -
         # `events` is the first, since every port traces - and then `block-driver` read as

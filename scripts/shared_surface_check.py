@@ -57,6 +57,16 @@ SHARED_ROOTS = ("services", "sdk")
 # censused zero frames on riscv64 and called it a pass. A ruler you can step off is not a ruler.
 ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"|CARGO_CFG_TARGET_ARCH')
 
+# In a BUILD SCRIPT the arch is read once into a variable and then compared - `match arch.as_str()`,
+# `arch == "x86_64"` - so `CARGO_CFG_TARGET_ARCH` alone counts a fifty-arm table as ONE. That is the
+# ruler going blind in the slower way: not missing the file, but reporting a number that cannot grow
+# no matter how much arch-conditional code the file accumulates.
+#
+# So a build script ALSO counts each arch it names. A new ISA's real cost there is one arm per
+# question the file asks, and that is what this measures. Only in `build.rs`, where an arch name in a
+# string is a decision; in ordinary source it would match prose and paths.
+ARCH_NAME = re.compile(r'"(x86_64|x86|aarch64|arm|riscv64|riscv32|loongarch64|s390x)"')
+
 
 def rel(path):
     return os.path.relpath(path, ROOT).replace(os.sep, "/")
@@ -94,7 +104,10 @@ def scan_counts():
                     continue
                 full = os.path.join(dirpath, fn)
                 with open(full, encoding="utf-8", errors="replace") as fh:
-                    n = len(ARCH_CFG.findall(_strip_comments(fh.read())))
+                    text = _strip_comments(fh.read())
+                n = len(ARCH_CFG.findall(text))
+                if fn == "build.rs":
+                    n += len(ARCH_NAME.findall(text))
                 if n:
                     counts[rel(full)] = n
     return counts

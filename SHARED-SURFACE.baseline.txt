@@ -13,10 +13,10 @@
     6  sdk/rust/src/adversarial.rs
     2  sdk/rust/src/ipc.rs
     4  sdk/rust/src/syscall.rs
-    1  services/block-driver/build.rs
+    4  services/block-driver/build.rs
     3  services/hw-enumerator/src/main.rs
     3  services/net-stack/src/main.rs
    10  services/nic-driver/src/main.rs
     7  services/shell/src/main.rs
-    1  services/supervisor/build.rs
-   47  services/supervisor/src/main.rs
+    9  services/supervisor/build.rs
+    4  services/supervisor/src/main.rs

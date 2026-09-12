@@ -196,10 +196,17 @@ static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
 static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
-/// Hardware discovery in userspace (step D2). Where configuration space is reachable: x86 via the
-/// CF8/CFC ports, aarch64 via the Pi 4's memory-mapped INDEX/DATA window. Not arm32 - the Pi 2 has
-/// no PCI bus at all, so the service would have nothing to read.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+/// Hardware discovery in userspace (step D2), on a board where configuration space is REACHABLE:
+/// x86 through the CF8/CFC ports, aarch64 through the Pi 4's memory-mapped INDEX/DATA window,
+/// riscv64 through a flat ECAM window. Not the Pi 2, which has no PCI bus at all, so the service
+/// would have nothing to read.
+///
+/// `has_hw_enumerator` comes from `build.rs`, which decides whether to embed this image - so the
+/// gate and the embedding cannot disagree. It used to be `any(x86_64, aarch64, riscv64)`, written
+/// out at SEVEN sites in this file: here, the IMAGES row, the `req.bdf` block, both helper
+/// functions, and both call sites. Seven copies of one board fact, none of which knew about
+/// `build.rs`'s copy.
+#[cfg(has_hw_enumerator)]
 static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
@@ -211,13 +218,15 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 
 static CONSOLE_ELF: &[u8] = include_bytes!(env!("SVC_CONSOLE_ELF"));
 static NIC_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_NIC_DRIVER_ELF"));
-// The USB host drivers exist only where their controller does (see `build.rs`, which embeds exactly
-// these): xhci+ehci on a PC, dwc2 on the Pi 2, xhci on the Pi 4, xhci on the VisionFive 2.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+// The USB host drivers exist only where their controller does: xhci+ehci on a PC, dwc2 on the Pi 2,
+// xhci on the Pi 4 and on the VisionFive 2. `build.rs` decides that and sets one cfg per image it
+// embedded, so these gates are the same fact rather than a second copy of it - which is what the
+// per-arch spelling was, in this file and in the five `USB_IMAGES` tables below.
+#[cfg(has_xhci)]
 static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
-#[cfg(target_arch = "x86_64")]
+#[cfg(has_ehci)]
 static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
-#[cfg(target_arch = "arm")]
+#[cfg(has_dwc2)]
 static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
@@ -272,6 +281,23 @@ mod board {
         &["events"]                    // x86: AHCI over PCI, no USB in the path
     };
 
+    /// WHERE THE THREE DISPLACED SERVICES SIT, and the one reason all three move together.
+    ///
+    /// A board whose USB host is a single-channel DWC2 gives that driver core 0 to itself, and
+    /// everything else shifts up. The reason is hardware and is recorded at the console row below:
+    /// a full-screen repaint is millions of non-cacheable pixel stores in one un-preemptible
+    /// stretch, and sharing a core with dwc2's 125 us split-transaction windows produced NYET
+    /// storms and a six-second keyboard stall. `shell` and `block-driver` move for the same
+    /// contention, one core each.
+    ///
+    /// Asked as `has_dwc2` rather than as `target_arch = "arm"` - which is what all three rows said,
+    /// separately, each with its own fragment of this explanation. The ISA was never the reason; the
+    /// controller was. An arm32 board with no DWC2 would have paid this shift for nothing, and an
+    /// aarch64 board with one would not have paid it at all.
+    pub const SHELL_CORE:   u32 = if cfg!(has_dwc2) { 1 } else { 0 };
+    pub const BLOCK_CORE:   u32 = if cfg!(has_dwc2) { 2 } else { 1 };
+    pub const CONSOLE_CORE: u32 = if cfg!(has_dwc2) { 3 } else { 0 };
+
     /// The USB host this board's NIC sits behind. Only the Pi 2 puts ethernet on USB (the LAN9514);
     /// every other board's NIC is on a bus its driver reaches directly.
     pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
@@ -294,7 +320,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // separate operations. That was the first design, and it was replaced: the pair is stateful, so
     // split across two syscalls two callers read each other's device - and the KERNEL drives the same
     // registers on its spawn and kill paths, so a split interface raced the kernel too.)
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(has_hw_enumerator)]
     ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, u32::MAX, &["events"],
      godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
@@ -343,7 +369,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter.
     ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
                        | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
-     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "events", "supervisor"],
+     8 * 1024 * 1024, board::SHELL_CORE, &["fs", "block-driver", "time", "console", "events", "supervisor"],
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
@@ -376,7 +402,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // and the missing piece the edge between them"), which is the argument for carrying a warning
     // WITH the thing it warns about.
     ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
-     if cfg!(target_arch = "arm") { 2 } else { 1 },
+     board::BLOCK_CORE,
      board::STORAGE_PEERS,
      0, 0,
      // NAMED BY THE BUS, not by the kernel (step D1). 0x010601 is the industry-standard PCI class
@@ -395,11 +421,12 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // terminal, which is this service. Same class mechanism as a driver's BAR, and for the same
     // reason: the supervisor may not name a physical address.
     //
-    // Core 3 on ARM (not 0) is deliberate and hardware-earned: a full-screen repaint is millions of
-    // non-cacheable pixel stores in one un-preemptible stretch, and sharing a core with dwc2's
-    // 125 us split-transaction windows produced NYET storms and a six-second keyboard stall.
+    // Off core 0 where the board has a DWC2, and it is hardware-earned: a full-screen repaint is
+    // millions of non-cacheable pixel stores in one un-preemptible stretch, and sharing a core with
+    // dwc2's 125 us split-transaction windows produced NYET storms and a six-second keyboard stall.
+    // That reasoning, and the two services that move with this one, are at `board::CONSOLE_CORE`.
     ("console", CONSOLE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 3 } else { 0 }, &["events"], 0, 0,
+     8 * 1024 * 1024, board::CONSOLE_CORE, &["events"], 0, 0,
      godspeed_sdk::service_context::hwclass::FRAMEBUFFER),
     // The four INTERRUPT-DRIVEN drivers. None of them names a vector: the kernel derives it from the
     // device class (`hw_irqs_for`), because routing a vector IS authority - on ARM, granting the USB
@@ -412,13 +439,24 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     //
     // Cores 2 and 3: both USB drivers busy-poll their controllers at ~100% CPU, and co-locating them
     // on core 1 saturated it - starving networking and garbling the keyboard itself on the T630.
-    // NET_DEVICE is aarch64-only in effect: the Pi 4's GENET sits behind the NetFrame syscalls, while
-    // arm32 reaches frames through the `dwc2` service over IPC. The bit is arch-neutral - the kernel
-    // refuses any privilege the supervisor cannot delegate - so it is set where it is used and the
-    // grant is simply never exercised elsewhere.
+    // NO NET_DEVICE, AND THAT IS THE CHANGE. This row granted it on aarch64, described as "set where
+    // it is used" - and it had not been used for a month. The Pi 4's GENET moved into `nic-driver`
+    // itself in 2026-08 (CLAUDE.md 6.4), so the service drives the MAC through its own register
+    // window and calls no NetFrame syscall; arm32 reaches frames by IPC to `dwc2`; x86 and riscv64
+    // never had it. The kernel's own aarch64 file says so in as many words: "`nic-driver` still holds
+    // the NET_DEVICE capability and simply does not use it on this port."
+    //
+    // A capability granted to nobody's benefit is not free. It is standing authority to move ethernet
+    // frames through the kernel, held by a service that a compromise would then inherit - the exact
+    // thing 3.1 and 26.9 ask to be granted deliberately or not at all. The comment above was the
+    // giveaway: "the grant is simply never exercised" is a sentence about a grant that should not
+    // exist, not a justification for one.
+    //
+    // This is step 1 of the three `backlog/21` records, in the order it prescribes: the grant first
+    // (one line, provable by a boot), the SDK wrappers second, syscalls 42-44 last. Steps 2 and 3 are
+    // kernel and SDK surface and are NOT taken here.
     ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 1, board::NIC_PEERS,
-     if cfg!(target_arch = "aarch64") { godspeed_sdk::service_context::privbits::NET_DEVICE } else { 0 }, 0,
+     16 * 1024 * 1024, 1, board::NIC_PEERS, 0, 0,
      // x86: named by the bus. 0x020000 is class 0x02 network, subclass 0x00 ethernet - the class
      // EVERY PCI ethernet controller reports, whoever made it.
      //
@@ -431,9 +469,11 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      // puts its registers in BAR0 while the RTL8168 puts I/O ports there and its registers in BAR2.
      // "The first mapped memory BAR" is what the old scan did and what both need.
      //
-     // ARM keeps the kind: the NIC is not on a PCI bus on either Pi (LAN9514 over USB on the Pi 2,
-     // GENET on the Pi 4), so there is no class code to name and no table to find it in.
-     if cfg!(target_arch = "x86_64") {
+     // Everywhere else keeps the kind: the MAC is not on a PCI bus (LAN9514 over USB on the Pi 2,
+     // GENET on the Pi 4, dwmac on the VisionFive), so there is no class code to name and no table to
+     // find it in. Asked as `nic_on_pci`, a board fact set in `build.rs`, rather than as x86_64 -
+     // an aarch64 board with a PCIe NIC would want the class form and should get it by saying so.
+     if cfg!(nic_on_pci) {
          godspeed_sdk::service_context::hwclass::pci(
              0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
      } else { godspeed_sdk::service_context::hwclass::NIC }),
@@ -445,67 +485,67 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
 ];
 
-/// The USB host drivers, which exist only where their controller does - so the TABLE is per arch,
-/// rather than one table with rows that would name an image this build never embedded. Same split as
-/// `build.rs` and `scripts/service_embed_check.py`, and it must stay in step with both.
-#[cfg(target_arch = "x86_64")]
+/// The USB host drivers, one row per controller, each present exactly where its image is.
+///
+/// THIS WAS FIVE TABLES - one per arch, plus an empty catch-all - and the comment on that last one
+/// is the reason this is now one: "an EMPTY list is why `spawn xhci FAILED` survived three separate
+/// fixes: the kernel found the controller, the build list named the service, the embed list named
+/// the arch, and this table still said there was nothing to spawn. Four places had to agree, and
+/// each one was silent about the others."
+///
+/// A row's `#[cfg(has_*)]` is set by `build.rs` from the list that embeds the image, so the table
+/// and the embedding are now the SAME decision rather than two that must agree. A board with no USB
+/// host at all gets an empty table for the honest reason - no row's image was embedded - instead of
+/// by falling off the end of an arch list.
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    #[cfg(has_xhci)]
     ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      64 * 1024 * 1024, 2, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
-     // Named by the bus, WITH an interrupt (step D1b). 0x0C0330 is the industry-standard class code
-     // for an xHCI USB controller - class 0x0C serial bus, subclass 0x03 USB, prog-if 0x30 xHCI -
-     // and its registers are in BAR0. `pci_irq` asks the kernel for a vector from its MSI pool; the
-     // caller never names one, because routing a vector is authority.
+     // Named by the bus, and WITH an interrupt where the kernel can route one (step D1b). 0x0C0330
+     // is the industry-standard class code for an xHCI controller - class 0x0C serial bus, subclass
+     // 0x03 USB, prog-if 0x30 xHCI - and its registers are in BAR0. `pci_irq` asks the kernel for a
+     // vector from its MSI pool; the caller never names one, because routing a vector is authority.
      //
-     // This is the strictest driver to move: it is the only one that is IOMMU-CONFINED, it needs the
-     // largest DMA arena (292 pages for the 256-buffer scratchpad), and §22 Test 12 checks the whole
-     // chain end to end - confined to its arena, out-of-arena unmapped, and a keyboard actually
-     // enumerated THROUGH the confined domain.
-     godspeed_sdk::service_context::hwclass::pci_irq(0x0C_03_30, 0, true)),
+     // `xhci_msi` is NOT "is it on PCI". The Pi 4's VL805 is a PCIe device and still takes the plain
+     // class, because what it lacks is a routable vector, not a bus; the VisionFive's Cadence core
+     // has no interrupt controller wired up at all and the driver polls, which it is built to do.
+     // Asking for an interrupt that can never arrive is the failure invariant 12 exists to prevent.
+     //
+     // On x86 this is the strictest driver to move: the only IOMMU-CONFINED one, needing the largest
+     // DMA arena (292 pages for the 256-buffer scratchpad), with §22 Test 12 checking the whole chain
+     // end to end - confined to its arena, out-of-arena unmapped, and a keyboard actually enumerated
+     // THROUGH the confined domain.
+     if cfg!(xhci_msi) {
+         godspeed_sdk::service_context::hwclass::pci_irq(0x0C_03_30, 0, true)
+     } else {
+         godspeed_sdk::service_context::hwclass::XHCI
+     }),
+    #[cfg(has_ehci)]
     ("ehci", EHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      64 * 1024 * 1024, 3, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::EHCI),
-];
-#[cfg(target_arch = "aarch64")]
-const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
-    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 2, &["events"],
-     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
-     godspeed_sdk::service_context::hwclass::XHCI),
-];
-/// arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why `nic-driver`
-/// and `block-driver` both name it as a peer on that port.
-#[cfg(target_arch = "arm")]
-const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    // arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why
+    // `nic-driver` and `block-driver` both name it as a peer on that port.
+    #[cfg(has_dwc2)]
     ("dwc2", DWC2_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      64 * 1024 * 1024, 0, &["events"],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::DWC2),
 ];
-/// The VisionFive 2's USB host is a Cadence USB3 controller on the SoC bus, and its host half IS an
-/// xHCI - the same driver as the PC card and the Pi 4's VL805, which is exactly what the hardware
-/// CLASS is for: the kernel resolves "an xHCI controller and where it starts" and the driver never
-/// learns whether it arrived on a bus.
+
+/// A build that EMBEDDED a USB host image must have a row to spawn it with.
 ///
-/// Plain `XHCI` rather than the x86 `pci_irq` form, because there is nothing to route a vector to:
-/// this port has no interrupt controller yet, so the driver polls - which it is built to do. Asking
-/// for an interrupt that can never arrive is the failure invariant 12 exists to prevent.
-#[cfg(target_arch = "riscv64")]
-const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
-    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 2, &["events"],
-     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
-     godspeed_sdk::service_context::hwclass::XHCI),
-];
-/// Any other architecture holds no USB image, and an EMPTY list is why `spawn xhci FAILED` survived
-/// three separate fixes: the kernel found the controller, the build list named the service, the embed
-/// list named the arch - and this table still said there was nothing to spawn. Four places had to
-/// agree, and each one was silent about the others.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm",
-              target_arch = "riscv64")))]
-const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[];
+/// This is the failure the five-table version kept producing, stated as a compile error: the kernel
+/// found the controller, the build list named the service, the embed list named the arch - and the
+/// table still said there was nothing to spawn, silently, because an absent arch arm fell through to
+/// an empty list. Now the row and the embedding come from the same `build.rs` list, and this refuses
+/// the build if they ever come apart again. A board with no USB host at all sets no `has_*` cfg, so
+/// it is not asked the question.
+#[cfg(any(has_xhci, has_dwc2))]
+const _: () = assert!(!USB_IMAGES.is_empty(),
+    "a USB host image was embedded but USB_IMAGES has no row for it");
 
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
 /// kernel catalogue", which is how the two coexist while services move across one at a time.
@@ -534,7 +574,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // address: the kernel reads that device's registers to learn its BAR and IRQ, so this grants
     // nothing naming the class would not - it only removes the kernel's need to GUESS which device a
     // class refers to. Zero when unknown, which is the pre-D3 behaviour exactly.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(has_hw_enumerator)]
     {
         req.bdf = if hw & godspeed_sdk::service_context::hwclass::PCI != 0 {
             ask_bdf_for_class(ctx, hw & 0x00FF_FFFF)
@@ -807,7 +847,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// one IPC round trip per driver spawn. The checker refused it, correctly.
 ///
 /// Best effort: any failure returns 0 and the machine boots exactly as it did before.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(has_hw_enumerator)]
 fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
     const OP_BY_CLASS: u8 = 3;
     const ANSWER_SECS: i64 = 2;
@@ -833,7 +873,7 @@ fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
 /// `request_with_reply` resolves peers through that cache - so a request made on the strength of the
 /// map's handle finds no slot and fails INSTANTLY rather than talking to anyone. That exact trap cost
 /// a silent `0 sectors` from `dwc2` once already; the comment above `RECOVERY` records it.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(has_hw_enumerator)]
 fn probe_hw_enumerator(ctx: &ServiceContext) {
     const OP_COUNT: u8 = 1;
     const OP_DEVICE: u8 = 2;
@@ -1236,7 +1276,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reconcile set - it says what to RESTART, not what to START. A service in MANAGED and nowhere
     // else is embedded, configured, watched, and never runs; that is the shape the comment above
     // MANAGED warns about, and this service hit it on its first boot.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(has_hw_enumerator)]
     ensure_mapped(&ctx, &mut name_map, "hw-enumerator", 0xFFFF);
     // ASK IT WHAT IT FOUND. This is the first CLIENT `hw-enumerator` has ever had: its request/reply
     // loop was written before anything called it, which is the speculative-feature mistake (§26.2),
@@ -1247,7 +1287,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // switch-over depends on: the kernel's scan and the userspace walk already print their lists, and
     // this proves the supervisor can actually OBTAIN that list over IPC, which is the step that has to
     // work before any of it can be load-bearing. Record, cross-check, and only then switch over.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(has_hw_enumerator)]
     probe_hw_enumerator(&ctx);
     // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
     // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a
@@ -1265,7 +1305,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // path to storage, keyboard and network, so every arm32 build that boots at all wants it. Fewer
     // conditions also means fewer ways for this spawn to silently not happen - which is the exact
     // failure being fixed.
-    #[cfg(target_arch = "arm")]
+    #[cfg(has_dwc2)]
     ensure_mapped(&ctx, &mut name_map, "dwc2", 0xFFFF);
 
     // THE USB HOST COMES UP BEFORE THE DISK THAT LIVES ON IT - on aarch64 too, not just arm32.
@@ -1401,7 +1441,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // not an xHCI - a different driver, spawned above. Its in-kernel stack is deleted too (slice 5);
     // this comment used to say otherwise, and that stale sentence is exactly why nothing filled the
     // gap when the kernel driver went away.
-    #[cfg(not(target_arch = "arm"))]
+    #[cfg(has_xhci)]
     // Adopt if already running - the same omission `nic-driver` and `net-stack` had. Both USB
     // drivers are in MANAGED, so the supervisor watches them for death; on its own respawn a bare
     // `spawn_*` is refused with "already running" and the driver is left out of the name-cap map.
@@ -1415,7 +1455,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    // `has_ehci`, not `not(any(arm, aarch64))` - which was TRUE ON RISCV64, a board that has never
+    // had an EHCI image embedded. The runtime `ehci_present()` check below is what saved it; the cfg
+    // was simply wrong, and wrong in the direction that spawns a driver for a controller that is not
+    // there. Asking whether the image exists cannot be wrong that way.
+    #[cfg(has_ehci)]
     if ctx.ehci_present() {
         // Adopt if already running, as above. `ehci_present()` still gates whether it should exist
         // at all; this only decides spawn-versus-adopt once it should.
