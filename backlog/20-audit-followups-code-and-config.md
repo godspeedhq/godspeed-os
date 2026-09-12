@@ -1,9 +1,47 @@
 # 20. What the 2026-09-12 documentation audit found in CODE and CONFIG
 
-**Severity:** mixed - one item breaks a gate the constitution requires (`osdev validate`), three are
-enforcement blind spots, two are cosmetic-to-minor.
-**Status:** open. Scoped on `portability-hardening`, split out of the documentation
-audit because that pass was deliberately restricted to documentation and comments.
+**Severity:** mixed - one item broke a gate the constitution requires (`osdev validate`), three were
+enforcement blind spots, two were cosmetic-to-minor.
+**Status: ALL SIX FIXED on `portability-hardening` (2026-09-12).** Item 6 wants a VisionFive boot to
+confirm; the other five are verified locally, each by forcing the guard to fire rather than by
+observing it pass.
+
+| # | Item | Commit |
+|---|------|--------|
+| 1 | `osdev validate` failed on six contracts | `b790cd7a` - schema now expresses `hw_pci_class` / `hw_pci_bar` / `hw_pci_irq` / `pci_cfg`; 32/32 pass |
+| 2 | `release.yml` verified 7 of 8 stamp characters | `161930ca` |
+| 3 | `arch_boundary_check.py` blind to two arches | `8aa2e5ed` - list derived from `kernel/src/arch/`, not restated |
+| 4 | `riscv_build.py` ran none of three guards | `442285a6` - two of the three were WRONG for this port; see below |
+| 5 | Dead `if` + its `unsafe` MPIDR read on every ARM tick | `3d43b27a` - `arm/mod.rs` 53 -> 52 unsafe lines |
+| 6 | riscv64 spawned `xhci` after `block-driver` | `db3b800b` - **awaiting hardware confirmation** |
+
+**What the work actually found, beyond the six.** Three of the fixes turned out to be shallower than
+the defect under them, and the pattern is the same each time: the instrument did not merely miss a
+port, it was built on an assumption that had already been superseded.
+
+- **`service_embed_check` would have raised a FALSE FAILURE** if wired in as-is. It compares the
+  supervisor's managed set against `<arch>_built` in `kernel/build.rs`, but `riscv64_built` is
+  `["supervisor"]` - this is the first port to finish step C, where the supervisor owns every image.
+  The only port that has completed the migration was the one the checker would have failed. It now
+  reads the supervisor's own roster on such a port, and its failure message names that file rather
+  than sending the reader to a kernel list that is already correct.
+- **`stack_fit_check` censused ZERO frames out of 412** on riscv64: its prologue pattern is ARM's
+  `sub sp, sp, #N` and RISC-V uses `addi sp, sp, -N`. It now knows both, and - the general fix -
+  RAISES when it recognises nothing at all, rather than reporting a pass it did not earn.
+- **`shared_surface_check` counted PROSE.** It applied its regex to raw file text, so a comment
+  mentioning `target_arch` counted as an arch-conditional site. That hid the reduction item 6 makes,
+  and worse, would let a real reduction go unrecorded whenever it is described in a comment.
+
+**And item 6 was fixed twice.** The first attempt widened `#[cfg(target_arch = "aarch64")]` to
+`any(aarch64, riscv64)`; `shared_surface_check` refused it, correctly. Above the kernel `target_arch`
+stands in for "which BOARD am I on", so naming riscv64 would have fixed one board and left the same
+trap for the next. The spawn site now derives the host from `block-driver`'s peer list, which already
+encodes the real question - and the surface goes 49 -> 48 rather than up.
+
+**Deliberately NOT done**, and why: the schema's two dead keys (`hw_pio`, `spawn`) and the dead `ahci`
+enum member stay. Removing them NARROWS the schema, which 13.5 makes a major version bump with a
+documented migration - a deliberate v2, not something to slip into a gate fix. They are marked dead
+in place.
 
 The audit that produced commits `2a95f841`..`94abdde8` swept 293 markdown files and ~44,700 comment
 lines. Those five commits fixed what was safe to fix - prose. Six findings were **not** prose, so they
