@@ -18,6 +18,11 @@ on:
       tag:
         description: 'Existing tag to build and attach to (e.g. v0.16.0)'
         required: true
+      overwrite_published:
+        description: 'Replace assets on an ALREADY-PUBLISHED release (destructive - normally leave false)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # needed to upload assets onto the release
@@ -201,17 +206,42 @@ jobs:
         # hand, so the usual order is tag, then write, then publish. Rather than
         # failing on that ordering, create a DRAFT if there is no release yet: the
         # artefacts are preserved and attached, and nothing is published under a
-        # placeholder body. If the release already exists this only uploads, and
-        # --clobber makes a re-run replace assets instead of erroring on duplicates.
+        # placeholder body.
+        #
+        # A PUBLISHED release is treated differently, and that difference is the point
+        # of this step. `--clobber` replaces assets in place, which is right for a draft
+        # nobody has downloaded and WRONG for a release people already hold: the bytes
+        # behind a published URL would change silently, and SHA256SUMS would be rewritten
+        # in the same breath to match the new bytes - so nothing would disagree afterwards
+        # and nothing would report it. That is the exact failure the verify step above
+        # exists to prevent, reintroduced one step later.
+        #
+        # So: a draft is clobbered freely; a published release is REFUSED unless a human
+        # dispatches the run with overwrite_published=true. The refusal is loud and says
+        # what to do instead (invariant 12). Nothing is lost either way - the next step
+        # keeps the artefacts on the run itself.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           V="${{ steps.v.outputs.tag }}"
+          OVERRIDE="${{ github.event.inputs.overwrite_published }}"
+
           if ! gh release view "$V" >/dev/null 2>&1; then
             echo "no release for $V yet - creating a DRAFT to hold the artefacts"
-            gh release create "$V" --draft --title "$V" \
-              --notes "Draft created by the release workflow to hold build artefacts. Write the notes and publish."
+            gh release create "$V" --draft --title "$V"               --notes "Draft created by the release workflow to hold build artefacts. Write the notes and publish."
+          else
+            DRAFT=$(gh release view "$V" --json isDraft -q .isDraft)
+            echo "release $V already exists (draft: $DRAFT)"
+            if [ "$DRAFT" != "true" ] && [ "$OVERRIDE" != "true" ]; then
+              echo "::error::$V is PUBLISHED. Refusing to replace its assets: people may already have"
+              echo "::error::downloaded them, and SHA256SUMS would be rewritten to match the new bytes,"
+              echo "::error::so nothing afterwards would disagree. Cut a new tag instead - or re-run"
+              echo "::error::from the Actions tab with overwrite_published=true if you really mean to"
+              echo "::error::replace the artefacts of a published release."
+              echo "The built artefacts are still attached to this run - see the next step."
+              exit 1
+            fi
           fi
           gh release upload "$V" dist/* --clobber
 
