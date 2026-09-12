@@ -2819,7 +2819,7 @@ pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
 
-    /// The Pi 4 HAS PCIe and a real table - what it has no PCI ethernet controller. GENET is on the
+    /// The Pi 4 HAS PCIe and a real table - what it has NOT is a PCI ethernet controller. GENET is on the
     /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
     /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
     /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it

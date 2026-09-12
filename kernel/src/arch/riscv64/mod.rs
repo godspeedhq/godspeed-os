@@ -583,7 +583,10 @@ riscv64: S-mode entered, 16550 UART alive
                         }
                     }
                 } else {
-                    print_str("riscv64: no pci-host-ecam-generic in the device tree - no PCI\n");
+                    // NOT "no PCI". This says what was looked for and not found; whether the machine
+                    // has a PCI controller under some OTHER binding is a different question,
+                    // and this code did not ask it. The VisionFive is exactly that case.
+                    print_str("riscv64: no pci-host-ecam-generic node - no PCI devices enumerated (a vendor host bridge, if present, is not read by this port)\n");
                 }
             }
             pci::init();
@@ -2698,8 +2701,18 @@ pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
     use portable_atomic::AtomicU64;
 
-    /// Base of the ECAM window, and how large it is. Zero means "no PCI on this machine", which is a
-    /// true and common answer - the VisionFive's device tree may not describe one at all.
+    /// Base of the ECAM window, and how large it is.
+    ///
+    /// Zero means **we found no GENERIC host bridge**, which is not the same as "this machine has no
+    /// PCI" - and saying the latter sent a reader, and the author of this comment, to the wrong
+    /// conclusion about the VisionFive. That board HAS PCIe: U-Boot probes `starfive_pcie
+    /// pcie@2C000000` and Linux binds `/soc/pcie@9c0000000`. What it does not have is a node
+    /// `compatible = "pci-host-ecam-generic"`, which is the only binding this port looks for, so
+    /// `hw-enumerator` correctly reports zero devices and the reason is OURS, not the board's.
+    ///
+    /// The aarch64 port made this identical mistake and the note left by its fix is worth repeating,
+    /// because this comment went on to reproduce the very error it warns about: a false statement in
+    /// a comment is a trap for whoever reads it next.
     static ECAM_BASE: AtomicU64 = AtomicU64::new(0);
     static ECAM_SIZE: AtomicU64 = AtomicU64::new(0);
 
