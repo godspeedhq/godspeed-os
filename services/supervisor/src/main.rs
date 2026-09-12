@@ -238,6 +238,49 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 /// move would quietly weaken the check that keeps the two honest.
 ///
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
+/// The board facts the spawn table asks about, named once instead of asked inline as an ISA.
+///
+/// The rows below used to carry chains like
+///
+///     if cfg!(target_arch = "arm") { &["dwc2", "events"] }
+///     else if cfg!(target_arch = "aarch64") { &["xhci", "events"] } ...
+///
+/// which is a question about an INSTRUCTION SET standing in for a question about a BOARD - the same
+/// wrong axis that left the VisionFive outside the early-host spawn until 2026-09-12. A row is DATA,
+/// and the fact it needs is "what does the disk sit behind on this machine", not "what does this
+/// machine execute".
+///
+/// THIS IS A CONCENTRATION, NOT AN ELIMINATION, and saying so matters. The ISA is still named - once
+/// per fact, here, where it is reviewable - instead of inline in rows that are otherwise pure data.
+/// Removing it outright means making the board a RUNTIME fact: the supervisor asking what host
+/// controller exists rather than having it compiled in, which would also let ONE binary serve two
+/// boards of the same ISA. That is a design change, recorded rather than half-started (26.7).
+mod board {
+    /// The USB host this board's STORAGE sits behind, as a peer list - or just `events` where the
+    /// disk is not on USB at all.
+    /// One `cfg!` per branch, deliberately: `scripts/contract_check.py` reads this table as TEXT and
+    /// its chain matcher takes `[^)]*` inside `cfg!(..)`, so `cfg!(a) || cfg!(b)` truncates the chain
+    /// and the union it reconciles against silently loses a peer. Written in the shape the checker
+    /// already parses.
+    pub const STORAGE_PEERS: &[&str] = if cfg!(target_arch = "arm") {
+        &["dwc2", "events"]            // Pi 2: the stick hangs off DWC2
+    } else if cfg!(target_arch = "aarch64") {
+        &["xhci", "events"]            // Pi 4: VL805 over PCIe
+    } else if cfg!(target_arch = "riscv64") {
+        &["xhci", "events"]            // VisionFive 2: the SoC Cadence USB3's host half
+    } else {
+        &["events"]                    // x86: AHCI over PCI, no USB in the path
+    };
+
+    /// The USB host this board's NIC sits behind. Only the Pi 2 puts ethernet on USB (the LAN9514);
+    /// every other board's NIC is on a bus its driver reaches directly.
+    pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
+        &["dwc2", "events"]
+    } else {
+        &["events"]
+    };
+}
+
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
     ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack", "events"], 0, 0, 0),
@@ -310,7 +353,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
     ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
-    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 1 }, &["nic-driver", "time", "events"],
+    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, 1, &["nic-driver", "time", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT
      | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
     // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
@@ -334,7 +377,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // WITH the thing it warns about.
     ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      if cfg!(target_arch = "arm") { 2 } else { 1 },
-     if cfg!(target_arch = "arm") { &["dwc2", "events"] } else if cfg!(target_arch = "aarch64") { &["xhci", "events"] } else if cfg!(target_arch = "riscv64") { &["xhci", "events"] } else { &["events"] },
+     board::STORAGE_PEERS,
      0, 0,
      // NAMED BY THE BUS, not by the kernel (step D1). 0x010601 is the industry-standard PCI class
      // code for an AHCI SATA controller - class 0x01 mass storage, subclass 0x06 SATA, prog-if 0x01
@@ -374,7 +417,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // refuses any privilege the supervisor cannot delegate - so it is set where it is used and the
     // grant is simply never exercised elsewhere.
     ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 1, if cfg!(target_arch = "arm") { &["dwc2", "events"] } else { &["events"] },
+     16 * 1024 * 1024, 1, board::NIC_PEERS,
      if cfg!(target_arch = "aarch64") { godspeed_sdk::service_context::privbits::NET_DEVICE } else { 0 }, 0,
      // x86: named by the bus. 0x020000 is class 0x02 network, subclass 0x00 ethernet - the class
      // EVERY PCI ethernet controller reports, whoever made it.
