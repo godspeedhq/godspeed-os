@@ -33,14 +33,23 @@ Broadcom's, and large); the Raspberry Pi Imager writes them for you.
      default trying to load a `kernel8`.
    - `enable_uart=1` - keep the PL011 clock stable so the 115200 8N1 serial console is not garbled.
 4. **Copy `build/kernel7.img` onto it.**
-5. **Create `kernel7.img.bak` on the card** - copy `kernel7.img` to `kernel7.img.bak` right there. The
-   flash flow (`scripts/`, the `bootfs` copy) uses this file as its "is this the right card?" guard and
-   refuses to write a card that lacks it. (On the original stock card this `.bak` was the Raspbian
-   kernel - a way back to Linux; ours is just a copy of our own image.)
+5. **Optionally keep a `kernel7.img.bak` on the card.** On the original stock card this `.bak` was the
+   Raspbian kernel - a way back to Linux. Ours is just a copy of our own image, so it buys a manual
+   rollback and nothing else.
+
+   > **This used to claim a guard that does not exist.** The text here said the flash flow "uses this
+   > file as its 'is this the right card?' guard and refuses to write a card that lacks it". There is no
+   > flash flow: nothing under `scripts/` or in `osdev` mentions `bootfs` or `kernel7.img.bak`, and the
+   > copy is done by hand every time. A reader was being told they were protected against writing the
+   > wrong card when nothing was checking. **Check the drive letter yourself before you copy.**
 6. **Eject safely, boot the Pi, watch serial (115200 8N1).** You should see `GodspeedOS arm32: _start
-   reached...`, then the boot, then `dwc2: USB IRQ DELIVERY CONFIRMED` (present since the interrupt-route
-   work). If serial is blank, the firmware cannot read the card (bad FAT / wrong files); if it prints
-   `_start` then stops, the kernel faulted.
+   reached...`, then the boot, then `dwc2-svc: USB vector armed`, and on the first device interrupt
+   `dwc2-svc: *** USB INTERRUPT DELIVERED TO USERSPACE ***`. If serial is blank, the firmware cannot read
+   the card (bad FAT / wrong files); if it prints `_start` then stops, the kernel faulted.
+
+   (This step named `dwc2: USB IRQ DELIVERY CONFIRMED`, a string that appears nowhere in the tree - the
+   driver became a userspace service and its log lines are prefixed `dwc2-svc:`. Anyone following the
+   old text concluded a healthy board was broken.)
 
 **If the label is `boot` not `bootfs`,** rename the volume to `bootfs` in Windows so the flash flow
 finds it, or the copy step just becomes a manual drag of the two files.

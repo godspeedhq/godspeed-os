@@ -15,7 +15,7 @@ cargo run -p osdev -- build          # build the kernel + all services
 cargo run -p osdev -- run --smp 4    # boot in QEMU with 4 cores
 ```
 
-You should see `kernel: 4 cores ready`, then `supervisor: ready`, then ping and pong exchanging
+You should see `smp: 4 cores ready`, then `supervisor: ready`, then ping and pong exchanging
 messages across cores. For an interactive prompt instead, run `cargo run -p osdev -- shell` and type
 `help` at the `gsh>` prompt.
 
@@ -56,7 +56,7 @@ To make it *your* service, edit just two files:
    ...).
 
 Add your new crate to the workspace `Cargo.toml` members list, then `cargo run -p osdev -- build` and
-boot. (`cargo run -p osdev -- new <name>` scaffolds these four files for you.)
+boot. (Copy `examples/00-hello` as your starting point - `osdev new` is not implemented yet.)
 
 ## 3. The one gotcha that will bite you: `#[no_mangle]` on `service_main`
 

@@ -52,6 +52,6 @@ osdev test property          # run property tests (P1-P10)
 osdev test fuzz              # run fuzz corpus (F1-F8)
 osdev test stress            # run stress scenarios (S1-S10)
 osdev test perf              # run benchmarks (B1-B10)
-osdev test adversarial       # run red-team tests (A1-A10)
+osdev test adv               # run red-team tests (A1-A15)
 osdev test chaos             # run chaos scenarios (C1-C7)
 ```

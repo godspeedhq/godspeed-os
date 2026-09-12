@@ -261,7 +261,7 @@ The build is pure Cargo plus the `osdev` CLI - identical on every platform. The 
 
    **Booting in QEMU is not proof the on-hardware image is good - a clean build is.** If a copy is taken *after* an `osdev run`/`osdev test` (both rebuild `os.img`), you may hand hardware an incremental image that only works under QEMU.
 
-2. **Flash the copy** with Rufus (DD Image mode) or `dd if=build/my-hw.img of=/dev/sdX bs=4M`, let the write fully finish, and boot the stick in **UEFI** mode. Serial console is 115200 8N1; a healthy boot prints `kernel: N cores ready` then `supervisor: ready`.
+2. **Flash the copy** with Rufus (DD Image mode) or `dd if=build/my-hw.img of=/dev/sdX bs=4M`, let the write fully finish, and boot the stick in **UEFI** mode. Serial console is 115200 8N1; a healthy boot prints `smp: N cores ready` then `supervisor: ready`.
 
 ---
 

@@ -1399,21 +1399,27 @@ Push vs pull is irrelevant - verification is the security property. Live code up
 ## 17. Developer Workflow
 
 ```bash
-osdev new <service-name>            # scaffold
 osdev build                         # build kernel + services
 osdev run --smp <N>                 # boot in QEMU with N cores
-osdev image                         # build bare-metal image → build/os.img (UEFI GPT)
-osdev publish                       # package + serve a service
+osdev image                         # build bare-metal image → build/os-usb.img (UEFI GPT)
 osdev restart <service> [--core N]  # restart in running OS; --core is dev-mode only
 osdev logs <service>                # tail logs
-osdev status <service>              # show service state + assigned core
-osdev caps <service>                # show held capabilities
 osdev test identity                 # run §22 test suite
+osdev validate                      # validate every service contract
+osdev mkfs / script-disk            # build a filesystem image / a script disk
+
+# NOT IMPLEMENTED - these are `todo!()` stubs that panic if invoked:
+#   osdev new <service-name>        # scaffold        (copy examples/00-hello instead)
+#   osdev publish                   # package + serve
+#   osdev status <service>          # state + core     (use the shell's `status`)
+#   osdev caps <service>            # held caps        (use the shell's `caps`)
 ```
 
 **`osdev restart --core N`** is the CLI surface for the supervisor's `placement_override` (§14.4). It is rejected outside dev mode and subject to the same strict placement rules as a contract-specified core.
 
-Iteration loop: edit → `build` → `publish` → `restart` → `logs`. Only the changed service restarts.
+Iteration loop: edit → `build` → `restart` → `logs`. Only the changed service restarts. (`publish`
+is in the not-implemented list above, so the loop does not pass through it; §26.2's "not implemented;
+will be implemented when a test requires it" is the honest state of all four.)
 
 ---
 

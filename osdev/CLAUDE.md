@@ -6,14 +6,14 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 
 | Command                     | What it does |
 |-----------------------------|-------------|
-| `osdev new <name>`          | Scaffold a new service (dir, Cargo.toml, src/main.rs, contract) |
+| `osdev new <name>`          | **NOT IMPLEMENTED** (`todo!()`, panics). Copy `examples/00-hello` instead |
 | `osdev build`               | Build kernel + all services for the bare-metal target |
 | `osdev run [--smp N]`       | Boot in QEMU with N cores (default 4) |
-| `osdev publish [service]`   | Package a service update |
+| `osdev publish [service]`   | **NOT IMPLEMENTED** (`todo!()`, panics) |
 | `osdev restart <service>`   | Restart a service in the running OS |
 | `osdev logs <service>`      | Tail service log output |
-| `osdev status <service>`    | Show service state + assigned core |
-| `osdev caps <service>`      | Show held capabilities |
+| `osdev status <service>`    | **NOT IMPLEMENTED** (`todo!()`, panics). The shell's `status` does this |
+| `osdev caps <service>`      | **NOT IMPLEMENTED** (`todo!()`, panics). The shell's `caps` does this |
 | `osdev test identity`       | Run §22 identity test suite (24 cases: Tests 1-11 + 15, A/B, + IR1A/B) |
 | `osdev test property`       | Run property tests (P1-P10) |
 | `osdev test fuzz`           | Run fuzz tests (F1-F8) |
@@ -44,7 +44,7 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev script-disk <out> <script.gsh>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` - `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
 | `osdev validate`            | Validate all contracts against the JSON schema |
 | `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build - no probe services; type `help` at `gsh>` prompt; Ctrl-A X to quit) |
-| `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os.img` (GPT + ESP + BOOTX64.EFI) |
+| `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os-usb.img` (GPT + ESP + BOOTX64.EFI) |
 | `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1-B10 probes) |
 | `osdev image --mode perf-brutal` | Same image, `perf-brutal-only` supervisor (BP1-BP10 probes) |
 | `osdev image --mode identity` | Same image, `identity-only` supervisor (WatchSerial identity tests) |
@@ -86,30 +86,34 @@ osdev expects `qemu-system-x86_64` to be on PATH (or at the configured path). On
 ## Iteration loop (§17)
 
 ```
-edit → osdev build → osdev publish → osdev restart <service> → osdev logs <service>
+edit → osdev build → osdev restart <service> → osdev logs <service>
 ```
+
+`publish` is a `todo!()` stub, so the loop does not pass through it.
 
 Only the changed service restarts; the kernel and other services keep running.
 
 ## Bare-metal USB image (`osdev image`)
 
-Creates a UEFI-bootable disk image at `build/os.img` for writing to a USB drive.
+Creates a UEFI-bootable disk image at `build/os-usb.img` for writing to a USB drive.
 
-> **⚠️ Deliver a CLEAN image, copied BEFORE any boot.** `osdev run` and `osdev test` rebuild
-> `build/os.img` incrementally as a side effect (`cmd_run` -> `cmd_build()` + `disk_image::create()`),
-> and an incrementally-built kernel can boot under QEMU yet be **rejected by real UEFI firmware** - the
-> machine will not pick up the USB. To hand hardware a reliable image: `cargo clean --target
-> x86_64-unknown-none`, then `osdev image`, then `cp build/os.img build/<name>.img` **immediately,
-> before any `osdev run` / `osdev test`** (either would rebuild `os.img` underneath you, so a copy taken
-> afterwards is the incremental build). **Booting in QEMU is not proof the on-hardware image is good; a
-> clean build is.** See README "Flashing to real hardware".
+> **⚠️ Deliver a CLEAN image.** An incrementally-built kernel can boot under QEMU yet be **rejected
+> by real UEFI firmware** - the machine simply will not pick up the USB. To hand hardware a reliable
+> image: `cargo clean --target x86_64-unknown-none`, then `osdev image`. **Booting in QEMU is not
+> proof the on-hardware image is good; a clean build is.** See README "Flashing to real hardware".
+>
+> The *clobbering* half of this warning no longer applies, and the reason is worth knowing: `osdev
+> run` / `osdev test` write `build/os.img` (BIOS, for QEMU) while `osdev image` writes
+> `build/os-usb.img` (UEFI, for hardware). They are two files, "named apart from the QEMU image on
+> purpose" (`disk_image.rs:304`), so a QEMU run can no longer overwrite the image you are about to
+> flash. Copying it aside first is no longer necessary - only the clean build is.
 
 **Build mode:** Uses `supervisor/bare-metal` feature - spawns only TCB services + ping + pong. Probe services are excluded because they require the QEMU control port (COM2/TCP:5555) to complete and would stall indefinitely on real hardware.
 
 **Image layout:**
 
 ```
-build/os.img (64 MiB, GPT)
+build/os-usb.img (64 MiB, GPT)
   Protective MBR (LBA 0)
   Primary GPT header (LBA 1)
   GPT partition entries (LBA 2-33)
@@ -125,7 +129,7 @@ build/os.img (64 MiB, GPT)
 
 **Writing to USB (Windows):** Use Cygwin `dd` in an elevated shell:
 ```
-dd if=build/os.img of=/dev/sdb bs=1M
+dd if=build/os-usb.img of=/dev/sdb bs=1M
 ```
 where `/dev/sdb` corresponds to the target `PhysicalDriveN`. Use `diskpart` → `list disk` to identify the drive number first.
 
