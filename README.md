@@ -45,7 +45,8 @@ requirement (§26.11), and a diagram you can redraw from memory is the only proo
                          ▲
                          │  arch::imp - the only seam, and the only unsafe
                ┌────────────────────────────────────────────────────────┐
- hardware      │ x86_64      ARM (Pi 2)      AArch64 (Pi 4)             │
+ hardware      │ x86_64   ARM (Pi 2)   AArch64 (Pi 4)   RISC-V (VF2)    │
+               │ four ISAs, three memory models, one kernel             │
                └────────────────────────────────────────────────────────┘
 ```
 
