@@ -14,8 +14,17 @@ fn main() {
     //
     // Best-effort: no git, or a tarball build, reports "unknown". `.git/logs/HEAD` is appended on every
     // commit and checkout, so watching it refreshes the stamp when HEAD moves.
+    //
+    // `--short=8`, with the length SPELLED OUT. A bare `--short` auto-sizes to the shortest prefix
+    // that is unambiguous in the repository it is run against, so the width depends on how the clone
+    // was made rather than on the commit: a CI runner checking out at `fetch-depth: 1` holds almost
+    // no objects and prints 7, while a full local clone prints 8. The same commit therefore stamped
+    // itself two different ways, which is a poor property for the one line a serial log is attributed
+    // by - and it made two builds of one commit differ in a way that looked like a real difference.
+    // Eight is what this repository already needed; fixing the width costs nothing and removes the
+    // dependency on clone depth entirely.
     let sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "--short=8", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())

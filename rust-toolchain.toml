@@ -1,4 +1,42 @@
 [toolchain]
+# PINNED TO A DATE, not to `nightly`. `channel = "nightly"` is a MOVING channel: it
+# resolves to whatever was published the day the build runs, so two builds of the same
+# commit used two different compilers and produced two different binaries. A RISC-V
+# image built in CI came out 88 KiB adrift of a local build of the identical commit for
+# exactly this reason. A release artefact has to be attributable to its source, so the
+# compiler is part of the source.
+#
+# (Nightly at all, rather than stable, because the `limine` crate needs it. That is an
+# x86-only dependency; whether the other three ports build on stable is untested.)
 channel = "nightly-2026-05-16"
-targets = ["x86_64-unknown-none"]
-components = ["rust-src", "rustfmt", "clippy", "miri"]
+
+# EVERY target a shipping port builds for. This list used to name only
+# `x86_64-unknown-none` - "what a normal build needs" - which meant a fresh clone could
+# build ONE of the four ports and the release workflow had to add the rest by hand in a
+# separate step. Worse, the failure was not loud: the missing component surfaced as
+# `could not read the .text VMA/LMA from the ELF - refusing to emit an image`, which
+# reads like a linker fault rather than an uninstalled target.
+#
+# The pin file now describes the WHOLE build, so `rustup show` (or any cargo invocation)
+# installs everything the four ports need, on a developer machine and on a runner alike.
+#   x86_64-unknown-none           - PC, UEFI via Limine
+#   armv7a-none-eabi              - Raspberry Pi 2
+#   aarch64-unknown-none          - Raspberry Pi 4
+#   riscv64imac-unknown-none-elf  - QEMU virt + StarFive VisionFive 2 Lite
+#
+# The STUB arches (riscv32, loongarch64, s390x) are deliberately absent: nothing builds
+# them as part of a release. They exist as the arch-boundary demarcation test, run by
+# hand with an explicit `cargo build --target ...` (see `.cargo/config.toml`), so paying
+# to install them on every machine would buy nothing.
+targets = [
+    "x86_64-unknown-none",
+    "armv7a-none-eabi",
+    "aarch64-unknown-none",
+    "riscv64imac-unknown-none-elf",
+]
+
+# `llvm-tools` supplies `rust-objcopy`, which the ARM, AArch64 and RISC-V scripts use to
+# turn the kernel ELF into a flat image (the Pi and U-Boot loaders take an image, not an
+# ELF). It was missing here for the same reason the targets were, with the same result:
+# three of the four ports could not be built from a clean checkout.
+components = ["rust-src", "rustfmt", "clippy", "miri", "llvm-tools"]

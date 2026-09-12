@@ -65,20 +65,26 @@ jobs:
           echo "Building $TAG at $(git rev-parse --short HEAD)"
 
       - name: Install Rust toolchain
-        run: rustup show      # honours rust-toolchain.toml (nightly + rust-src + x86_64-unknown-none)
-
-      - name: Add the other bare-metal targets
-        # rust-toolchain.toml pins only x86_64-unknown-none, because that is what a
-        # normal build needs. A release builds all four ports.
-        run: rustup target add armv7a-none-eabi aarch64-unknown-none riscv64imac-unknown-none-elf
+        # `rustup show` honours rust-toolchain.toml, which pins the compiler DATE and
+        # names every target and component the four ports need. This step used to be
+        # followed by a `rustup target add` for the three non-x86 targets and a
+        # `rustup component add llvm-tools`, because the pin file described only the
+        # x86 build. Both are gone: the pin file describes the whole build now.
+        #
+        # Deleting them is the point, not tidying. A step here that installs what the
+        # pin file should have installed makes CI pass over a pin file that no longer
+        # works, while a developer with a clean checkout cannot build three of the four
+        # ports. The gap is then invisible to exactly the thing meant to catch it. With
+        # the duplicates removed, CI builds from the same pin a contributor gets.
+        run: rustup show
 
       - name: Install rust-objcopy
         # The ARM, AArch64 and RISC-V scripts turn the kernel ELF into a flat image
         # with `rust-objcopy -O binary`; the Pi and U-Boot loaders take an image, not
-        # an ELF.
-        run: |
-          rustup component add llvm-tools
-          cargo install cargo-binutils --locked
+        # an ELF. The binary ships in `cargo-binutils`, a cargo install rather than a
+        # rustup component, so it cannot live in rust-toolchain.toml; the `llvm-tools`
+        # component it wraps does, and is declared there.
+        run: cargo install cargo-binutils --locked
 
       - name: Fetch Limine (pinned)
         # tools/ is gitignored, so the bootloader is fetched rather than committed.

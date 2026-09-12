@@ -13,8 +13,14 @@ fn main() {
     // build (e.g. "GodspeedOS 0.3.0 (a1b2c3d)"). Best-effort: a checkout with no git, or a build
     // from a tarball, reports "unknown". `.git/logs/HEAD` is appended on every commit/checkout, so
     // watching it re-runs this and refreshes the SHA when HEAD moves.
+    //
+    // `--short=8` with the length spelled out, and the kernel's stamp (`kernel/build.rs`) matches.
+    // A bare `--short` auto-sizes to the shortest prefix unambiguous in the repository it runs
+    // against, so the width follows the CLONE rather than the commit: a shallow CI checkout prints
+    // 7, a full clone prints 8. `version` and the kernel's boot line are meant to be the same fact
+    // stated twice, so neither may vary by how the tree was fetched.
     let sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "--short=8", "HEAD"])
         .current_dir(workspace)
         .output()
         .ok()
