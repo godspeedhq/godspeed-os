@@ -62,6 +62,7 @@ direction.
 | [17](17-riscv64-port-shared-surface.md) | What the riscv64 port changed OUTSIDE riscv64, and what still needs testing elsewhere | Cross-port | - |
 | [18](18-unsafe-audit-misses-the-sdk.md) | The unsafe audit does not cover the SDK, and §18.4 says it covers everything | **Enforcement gap** | trust in §18.4 |
 | [19](19-networking-does-not-recover-from-a-chaos-storm.md) | Networking does not recover from a chaos storm (Wyse / RTL8168) - fixed, kept open on evidence | Fixed / open on evidence | - |
+| [20](20-audit-followups-code-and-config.md) | What the 2026-09-12 doc audit found in CODE and CONFIG - `osdev validate` fails 6 contracts; three instruments do not cover riscv64 | **Enforcement + a broken gate** | 13.4's pre-PR gate |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
