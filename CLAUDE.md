@@ -312,6 +312,11 @@ os/
     site_check.py        #   the 4 hand-written site pages still match the repository
     arch_boundary_check.py #  neutral layers reach hardware ONLY through the `arch::imp` seam
     arch_seam_check.py   #   ...and every arch ANSWERS every member of it (the other direction)
+    scaffold_check.py    #   ...and the BOUNDED-PORT TEST: how far a fresh ISA gets with only
+                         #   `arch/<isa>/` written. The two above prove no RULE is broken; this one
+                         #   exercises the claim, because a count is a proxy and a build is not
+    shared_surface_check.py #  ratchets arch-conditional code ABOVE the kernel (the other axis:
+                         #   `target_arch` there is usually "which BOARD am I on")
     dash_check.py        #   no em/en dashes anywhere (§21)
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds

@@ -327,6 +327,15 @@ pub mod interrupts {
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}
+
+    /// The pool of MSI vectors the kernel may hand to a driver, as (base, length).
+    ///
+    /// EMPTY here, which is the honest answer rather than a placeholder: a pool of zero says "ask me
+    /// for a vector and you get nothing", and the allocator treats that as "this machine cannot do
+    /// message-signalled interrupts" - true of a scaffold with no PCI. riscv64 answers the same way
+    /// for the same reason. A real LoongArch port replaces both when it has an interrupt controller.
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +380,53 @@ pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
 
+    /// One device as the kernel's PCI scan records it. Shape borrowed from the ports that have a bus,
+    /// so the neutral callers compile unchanged; on this scaffold nothing ever constructs one.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+
+    /// A ceiling readable off the source (26.6.1).
+    ///
+    /// ONE, on a machine with no PCI bus at all - and that is a FINDING, not a choice. The truthful
+    /// answer here is zero, and zero does not build: `task/mod.rs` has
+    ///
+    ///     _ => &PCI_DMA_PHYS[0],
+    ///
+    /// whose own comment calls the arm "Unreachable ... returns a real slot rather than panicking".
+    /// It is unreachable at runtime, but a ZERO-LENGTH array makes the compiler evaluate the index
+    /// anyway and `unconditional_panic` refuses the build. So the neutral kernel carries an unstated
+    /// contract: an arch must offer at least one PCI slot, whether or not it has a bus.
+    ///
+    /// arm - a complete, hardware-verified port on a board with no PCI whatsoever - already pays it,
+    /// also with `MAX_DEVICES = 1`. This scaffold is simply the first to have tried saying zero. The
+    /// constraint is recorded here rather than worked around silently, and fixing it means editing
+    /// neutral code, which is exactly the kind of split the bounded-port test exists to find
+    /// (scripts/scaffold_check.py).
+    pub const MAX_DEVICES: usize = 1;
+
+    /// Find a device by its 24-bit PCI class code - the lookup that replaced per-driver names in
+    /// step D1. `None` on a machine with no bus, which is what the caller already handles.
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
+    /// Where an MSI should be delivered, as an interrupt-controller destination id.
+    ///
+    /// The name is x86's (a Local APIC id). It is the seam's, not this port's, and answering it
+    /// truthfully here means returning a destination no device will ever use.
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
+
+    /// Program a device's MSI / MSI-X to raise `vector` at `dest`. False = not programmed, so the
+    /// caller falls back to polling rather than waiting for an interrupt that cannot arrive.
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
     pub fn ehci() -> Option<PciDevice> { None }
@@ -408,3 +464,68 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+// ---------------------------------------------------------------------------
+// Seam members the neutral kernel asks every arch for. Answered here so this scaffold COMPILES -
+// milestone M1 of the bounded-port test (scripts/scaffold_check.py). Each returns the value that is
+// TRUE of a machine with no bus and no userspace yet, never a value invented to make a caller happy:
+// a wrong answer that compiles is worse than a missing one, because the compiler stops asking.
+
+/// Copy from a user address into kernel memory, refusing anything not mapped to the caller.
+///
+/// FALSE until this port has user pages, and refusing is the safe direction: a caller that cannot
+/// read user memory fails its syscall, where one that wrongly SUCCEEDS reads someone else's memory.
+pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
+
+/// Per-core interrupt counters, as (count, last vector). `(0, 0)` here.
+///
+/// A STUB THAT RETURNS ZERO IS A KNOWN TRAP on this seam member: x86's was `(0, 0)` for the life of
+/// the port, and a liveness investigation could not tell "the timer stopped" from "the tick was
+/// skipped" because the instrument reported the same thing either way. It is acceptable only while
+/// this arch takes no interrupts at all. The moment it does, this must become real or the first
+/// wedge here is undiagnosable.
+pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
+
+/// What the CPU calls itself, for the boot line. An ARCH is not a MACHINE, so this is the ISA name
+/// until there is a way to read the model.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let name = b"LoongArch64";
+    let n = name.len().min(buf.len());
+    buf[..n].copy_from_slice(&name[..n]);
+    n
+}
+
+/// Record that `vector` was taken on this core. No-op: nothing raises an interrupt here yet, and a
+/// counter that only ever counts zero is better left obviously empty than quietly wrong.
+pub fn note_irq(_vector: u32) {}
+
+/// Read one 32-bit PCI configuration register, or `None` where config space is unreachable.
+///
+/// `None` is load-bearing rather than lazy: this is the seam `hw-enumerator` reaches through, and the
+/// riscv64 port shipped with it returning `None` unconditionally - so the service was spawned, found
+/// nothing, and the failure looked like a missing driver rather than a missing seam answer. On this
+/// scaffold there is genuinely no config space, so `None` is the truth.
+pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+
+/// Publish the boot core's interrupt-controller id so the scheduler can address it.
+///
+/// The NAME is x86's - a Local APIC id - and LoongArch has no LAPIC. It is recorded here rather than
+/// renamed because the seam is shared: every arch answers this, so the vocabulary is the seam's debt,
+/// not this port's. No-op until secondary cores exist.
+pub fn publish_bsp_lapic_id() {}
+
+/// How many bytes the panic path emitted without taking the serial lock. Zero until this port has a
+/// lock to bypass.
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
+/// Is a driver's DMA arena mapped uncached?
+///
+/// FALSE, and on a scaffold that is the truthful answer rather than a deferral: nothing here grants a
+/// DMA arena, so there is no mapping whose cacheability could differ. Note this is a PER-MASTER fact
+/// on real silicon, not a per-arch one - the VisionFive's display is non-coherent while its USB is
+/// coherent - so a real port must not assume one answer covers the board.
+pub const DMA_ARENA_UNCACHED: bool = false;
+
+/// The virtual address a driver's DMA arena is mapped at. Matches the other ports' choice so the
+/// neutral layout code is unchanged; unused until something here grants an arena.
+pub const DRIVER_DMA_VA: u64 = 0x7000_0000;
