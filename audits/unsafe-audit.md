@@ -9,16 +9,35 @@ unless this file is updated in the same commit with a written SAFETY argument.**
 `unsafe_check.py` scans `kernel/src/` (tracked against the inventory below) **and `services/`** (where
 it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`).
 
-**`sdk/` is scanned by NOTHING, and it is not only the permitted-layer files.** The script defines two
-roots, `kernel/src` and `services`; no SDK file is read by it or inventoried here. The SDK holds ~125
-`unsafe` lines, and only 35 of them are in the four modules §18.1 permits (`syscall`, `mmio`, `dma`,
-`adversarial`). The other ~90 are in **`service_context.rs` (~82)** and **`ipc.rs` (~8)** - files
-§18.2 forbids outright, named here because listing only the permitted four implied that was where the
-SDK's `unsafe` lives. Each block carries a SAFETY comment, but nothing ratchets them. Tracked as
-`backlog/18`.
+**`sdk/` IS NOW SCANNED** (2026-09-12). It was scanned by nothing: the script defined two roots,
+`kernel/src` and `services`, so ~125 `unsafe` lines went through no tool at all while §18.4 said "CI
+checks the file matches source". `backlog/18` recorded the gap; this closes it.
 
-So the bolded rule above is narrower than it sounds: it holds for any file under `kernel/src/` or
-`services/`, and not at all for `sdk/`.
+| File | Lines | Status |
+|------|-------|--------|
+| `sdk/rust/src/syscall.rs` | 8 | permitted (§18.1 - the syscall ABI) |
+| `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
+| `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
+| `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
+| `sdk/rust/src/service_context.rs` | **82** | **grandfathered floor** (§18.5) |
+| `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
+
+**The 90 are not 90 defects.** 86 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
+is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
+these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
+worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
+
+The remaining 4 are genuinely different and are the ones to look at first: three bare `unsafe {`
+blocks and one raw-pointer deref (`&*(SERVICE_CTX_ADDR as *const ServiceContextData)`).
+
+**The real fix, recorded rather than done:** give `raw_syscall` a SAFE wrapper. The kernel validates
+every user pointer, so passing integers to a validating callee is sound, and ~86 of these would
+collapse to nothing - taking the SDK to roughly the 35 lines §18.1 actually sanctions. It is an SDK
+redesign on every service's call path and wants hardware validation, so it is written down here
+instead of attempted in the same change that made it visible (§26.7).
+
+Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and either floor growing
+FAILS. They may decrease freely.
 
 ---
 

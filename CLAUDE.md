@@ -1508,10 +1508,31 @@ A PR with an unsafe block lacking a SAFETY comment is rejected without review.
 ### 18.5 Grandfathered Floors
 
 `unsafe` outside the four permitted layers (§18.1) is tolerated only as
-**grandfathered** lines in `task/`, `syscall/`, and `interrupt/`, frozen at the
-counts in `audits/unsafe-audit.md`. Those counts may **decrease** freely but may
+**grandfathered** lines in `task/`, `syscall/`, `interrupt/`, `loader.rs` and
+`main.rs`, and in the two SDK files named below, frozen at the counts in
+`audits/unsafe-audit.md`. Those counts may **decrease** freely but may
 **increase** only by an amendment recorded here and in the audit, with a written
 safety + necessity rationale.
+
+> **Amendment 2026-09-12: the SDK's `service_context.rs` (82) and `ipc.rs` (8) are recorded as
+> grandfathered floors, and this list gains `loader.rs` and `main.rs`, which it had always omitted.**
+> Neither is new `unsafe` - both are the state of the tree being written down for the first time.
+> `scripts/unsafe_check.py` scanned only `kernel/src/` and `services/`, so the SDK's ~125 `unsafe`
+> lines were audited by nothing at all while §18.4 claimed CI checks the audit against source
+> (`backlog/18`). The scan now covers `sdk/`, which is what makes these floors enforceable rather
+> than merely stated.
+>
+> **They are one design consequence, not 90 violations.** 86 of the 90 are `unsafe { raw_syscall(..) }`
+> call sites: `raw_syscall` is an `unsafe fn` because it issues the trap instruction, so every caller
+> opens a block - and these two files ARE the wrapper layer §18.1 describes, the one that exists so
+> that driver and application services need no `unsafe` of their own. **That worked: `services/` is at
+> ZERO**, mechanically enforced. The isolation stopped one layer short of itself.
+>
+> The fix that would actually close this is a SAFE `raw_syscall` wrapper - the kernel validates every
+> user pointer, so passing integers to a validating callee is sound - which collapses ~86 of them and
+> leaves the SDK at roughly the 35 lines §18.1 sanctions. That is an SDK redesign on every service's
+> call path, so per §26.7 it is recorded here as the known route rather than half-done. Until then the
+> floors may only fall.
 
 New `unsafe` that a feature or hardening needs must first try to live in a permitted
 layer (`arch/`, `memory/`, `capability/`, `smp/`) rather than grow a grandfathered

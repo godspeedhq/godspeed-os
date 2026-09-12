@@ -20,6 +20,27 @@ from pathlib import Path
 REPO_ROOT   = Path(__file__).parent.parent
 KERNEL_SRC  = REPO_ROOT / "kernel" / "src"
 SERVICES    = REPO_ROOT / "services"
+SDK         = REPO_ROOT / "sdk"
+
+# 18.1 names the SDK files where `unsafe` is PERMITTED: the syscall ABI, the MMIO/DMA accessors a
+# userspace driver cannot do without, and the adversarial test module. Everything else under `sdk/`
+# is forbidden by 18.2 exactly as a service is.
+SDK_PERMITTED = {"syscall.rs", "mmio.rs", "dma.rs", "adversarial.rs"}
+
+# ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
+# to the SDK). These are NOT 90 separate defects: 86 of the 90 are `unsafe { raw_syscall(..) }` call
+# sites. `raw_syscall` is an `unsafe fn` because it issues the trap instruction, so every caller must
+# open a block - and these two files ARE the wrapper layer that exists to keep services unsafe-free.
+# The isolation 18.1 describes worked (services/ is at ZERO) and stopped one layer short of itself.
+#
+# Freezing them makes the debt visible and bounded. The real fix is a SAFE `raw_syscall` wrapper -
+# the kernel validates every user pointer, so passing integers to a validating callee is sound - which
+# would collapse ~86 of these to nothing. That is an SDK redesign on every service's call path, so it
+# is recorded rather than done here.
+SDK_GRANDFATHERED = {
+    "sdk/rust/src/service_context.rs": 82,
+    "sdk/rust/src/ipc.rs": 8,
+}
 AUDIT_FILE  = REPO_ROOT / "audits" / "unsafe-audit.md"
 
 INVENTORY_START = "<!-- unsafe-inventory-start -->"
@@ -133,6 +154,33 @@ def main() -> int:
                 f"  FAIL  {rel}: {n} unsafe line(s) - §18.2 forbids `unsafe` in a userspace service; "
                 f"move it behind a safe SDK wrapper (§18.1, e.g. sdk `adversarial`/`mmio`/`dma`)"
             )
+
+    # 18.1/18.2 for the SDK. THIS WAS SCANNED BY NOTHING: the script defined two roots, kernel/src
+    # and services, so `sdk/`'s ~125 unsafe lines were audited by no tool at all - while 18.4 says
+    # "CI checks the file matches source" and the audit's own header implied the SDK's unsafe lived
+    # only in the four permitted files. It does not (backlog/18).
+    for rs_file in sorted(SDK.rglob("*.rs")):
+        rel = rs_file.relative_to(REPO_ROOT).as_posix()
+        if "target" in rel.split("/"):
+            continue
+        n = count_unsafe(rs_file)
+        if n == 0 or rs_file.name in SDK_PERMITTED:
+            continue
+        frozen = SDK_GRANDFATHERED.get(rel)
+        if frozen is None:
+            failures.append(
+                f"  FAIL  {rel}: {n} unsafe line(s) - 18.2 forbids `unsafe` outside the SDK's "
+                f"audited layer ({', '.join(sorted(SDK_PERMITTED))}); put it there behind a safe "
+                f"wrapper, or record a floor in SDK_GRANDFATHERED with a rationale"
+            )
+        elif n > frozen:
+            failures.append(
+                f"  FAIL  {rel}: {n} unsafe line(s), frozen at {frozen} - a grandfathered SDK floor "
+                f"may DECREASE freely and may increase only by an amendment (18.5)"
+            )
+        elif n < frozen:
+            infos.append(f"  INFO  {rel}: unsafe count shrank {frozen} -> {n} "
+                         f"(lower SDK_GRANDFATHERED to lock in the reduction)")
 
     if infos:
         print("Unsafe audit - reductions detected (update audit to capture them):")

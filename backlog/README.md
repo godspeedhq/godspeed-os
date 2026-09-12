@@ -60,7 +60,7 @@ direction.
 | [15](15-nic-rx-coverage.md) | The NIC receive ring is only drained when somebody asks | Recorded (§26.7) | - |
 | [16](16-riscv64-chaos-liveness-wedge.md) | riscv64 chaos: core 1 takes interrupts and never switches away - **CLOSED 2026-09-11** | Closed | - |
 | [17](17-riscv64-port-shared-surface.md) | What the riscv64 port changed OUTSIDE riscv64, and what still needs testing elsewhere | Cross-port | - |
-| [18](18-unsafe-audit-misses-the-sdk.md) | The unsafe audit does not cover the SDK, and §18.4 says it covers everything | **Enforcement gap** | trust in §18.4 |
+| [18](18-unsafe-audit-misses-the-sdk.md) | The unsafe audit does not cover the SDK - **CLOSED**; `sdk/` is scanned and its two floors frozen. Open tail: a safe `raw_syscall` wrapper would collapse ~86 of the 90 | Closed / open tail | - |
 | [19](19-networking-does-not-recover-from-a-chaos-storm.md) | Networking does not recover from a chaos storm (Wyse / RTL8168) - fixed, kept open on evidence | Fixed / open on evidence | - |
 | [20](20-audit-followups-code-and-config.md) | What the 2026-09-12 doc audit found in CODE and CONFIG - **all six FIXED**; item 6 awaits a VisionFive boot | Fixed / one on hardware | - |
 

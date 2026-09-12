@@ -2,6 +2,24 @@
 
 **Severity:** correctness of an enforcement check, not of running code. Nothing is known to be unsound;
 what is wrong is that the mechanism which would tell us does not look here.
+
+**Status: CLOSED 2026-09-12.** `scripts/unsafe_check.py` now scans `sdk/`. The four files 18.1 permits
+are allowed; the two it does not - `service_context.rs` (82) and `ipc.rs` (8) - are recorded as
+grandfathered floors in `audits/unsafe-audit.md` and amended into 18.5, so they may fall and may not
+grow. Both guards were forced to fire before this was closed: a new `unsafe` in another `sdk/` file
+FAILS, and either floor growing FAILS.
+
+What the count turned out to MEAN is worth carrying forward, because the number alone reads worse than
+the truth: **86 of the 90 are `unsafe { raw_syscall(..) }` call sites.** `raw_syscall` is an `unsafe fn`
+because it issues the trap instruction, so every caller opens a block - and these two files ARE the
+wrapper layer 18.1 describes, the one whose purpose is that services need no `unsafe`. That part
+worked: `services/` is at ZERO. The isolation stopped one layer short of itself.
+
+The remaining OPEN work, which this item hands on: a SAFE `raw_syscall` wrapper. The kernel validates
+every user pointer, so passing integers to a validating callee is sound, and it would collapse ~86 of
+the 90, leaving the SDK at roughly the 35 lines 18.1 sanctions. It is an SDK redesign on every
+service's call path and wants hardware validation, so it is recorded rather than attempted in the
+change that made it visible.
 **Status:** open, found 2026-09-11 while adding one `unsafe` block to `sdk/rust/src/service_context.rs`
 and noticing that `unsafe_check.py` passed without being told about it.
 
