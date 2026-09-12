@@ -25,8 +25,8 @@ permissions:
 env:
   # The Limine version this project tracks. Pinned deliberately: a bootloader that
   # silently moves is a boot failure nobody can bisect. Matches what the README
-  # tells a human to download.
-  LIMINE_TAG: v12.3.1-binary
+  # tells a human to download, and what tools/limine reports locally (12.3.1).
+  LIMINE_VERSION: v12.3.1
 
 jobs:
   artefacts:
@@ -67,14 +67,29 @@ jobs:
 
       - name: Fetch Limine (pinned)
         # tools/ is gitignored, so the bootloader is fetched rather than committed.
-        # `make` builds the host install tool (`tools/limine/limine`), which
-        # `osdev image` invokes to write the boot sectors - BOOTX64.EFI alone is not
-        # enough.
+        #
+        # FROM THE RELEASE ASSET, NOT A BRANCH. The first version of this step cloned
+        # a `v12.3.1-binary` branch; no such branch exists. Limine's `-binary`
+        # branches stop at v11.x, and from 12.x the binaries ship as a release asset
+        # - which is exactly what the README already tells a human to download. The
+        # tarball unpacks to `limine-binary/`.
+        #
+        # `make` is required: the asset ships a prebuilt host tool for WINDOWS only,
+        # and the Makefile builds `limine` from `limine.c` with plain `cc`. `osdev
+        # image` invokes that host tool to write the boot sectors, so BOOTX64.EFI
+        # alone is not enough.
         run: |
-          git clone --depth 1 --branch "$LIMINE_TAG" https://github.com/limine-bootloader/limine.git tools/limine
+          set -e
+          URL="https://github.com/limine-bootloader/limine/releases/download/${LIMINE_VERSION}/limine-binary.tar.xz"
+          curl -sSLf -o /tmp/limine-binary.tar.xz "$URL"
+          mkdir -p tools
+          tar -xJf /tmp/limine-binary.tar.xz -C tools
+          mv tools/limine-binary tools/limine
           make -C tools/limine
           test -x tools/limine/limine
           test -f tools/limine/BOOTX64.EFI
+          test -f tools/limine/limine-bios.sys
+          echo "limine $(tools/limine/limine version 2>/dev/null || echo '(version query unsupported)')" 
 
       # ---- the same enforcement layer a local build runs -------------------------
       # A release is the worst possible time to discover a checker was failing.
