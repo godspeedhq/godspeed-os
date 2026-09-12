@@ -212,7 +212,7 @@ under a "figures below are from the current tree" line that made three-month-old
 
 | Check | Result |
 |-------|--------|
-| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1208 lines across 78 files, no unaccounted additions |
+| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1207 lines across 78 files, no unaccounted additions |
 | Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) *(2026-05-31)* | ✅ 0 |
 | Kernel build warnings *(2026-05-31)* | 104 → 57 (remaining are intentional unwired architecture) |
 | Hardware boot regression *(2026-05-31, T630)* | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |

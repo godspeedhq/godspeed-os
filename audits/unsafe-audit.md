@@ -2504,7 +2504,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 53 | permitted |
+| arch/arm/mod.rs | 52 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
@@ -2549,9 +2549,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 1158 lines across 72 files  
+**Permitted total:** 1157 lines across 72 files  
 **Grandfathered total:** 50 lines across 6 files  
-**Grand total:** 1208 lines across 78 files
+**Grand total:** 1207 lines across 78 files
 
 > These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
 > existed for months, and a grand total 2.7x low. They are derived by summing the inventory block

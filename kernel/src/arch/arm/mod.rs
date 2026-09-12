@@ -2103,22 +2103,13 @@ pub fn autochaos_tick() {
 /// `timer_tick_from_irq` (core 0).
 pub fn uart_rx_poll() {
     pl011_rx_drain();
-    // Advance USB enumeration one transaction per tick, on core 0 only (it is the single writer of the
-    // DWC2 channel + DMA buffer). Reached both from the Core-0 tick and from the idle loop; the MPIDR
-    // gate keeps an AP that idles here from racing core 0 on the controller.
-    {
-        let mpidr: u32;
-        // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
-        unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
-        // STAND DOWN when a userspace service owns the controller (Phase 3, Slice 0).
-        //
-        // These are the in-kernel driver's periodic hooks. The controller has exactly ONE owner: two
-        // drivers programming the same channels would corrupt each other's transfers, and the failure
-        // would look like flaky hardware rather than two owners. Gating them on the same predicate the
-        // IRQ dispatch uses means ownership is decided in one place from one fact.
-        if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() {
-        }
-    }
+    // The in-kernel USB enumeration hooks that used to run here are GONE (arm32 slice 5 deleted
+    // `arch/arm/dwc2.rs`; `services/dwc2` drives the controller off USB_VECTOR). What survived the
+    // deletion was their SCAFFOLDING: an `if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() { }`
+    // with an empty body, and an `unsafe` MPIDR read that existed only to feed that dead condition -
+    // so every timer tick on this port paid for a coprocessor read whose result was discarded. The
+    // ownership predicate it consulted is still the right one and is still used where it matters
+    // (`irq::usb_owned_by_userspace`, the IRQ dispatch); there is simply nothing left here to gate.
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
         let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
         if waiter != u32::MAX {
