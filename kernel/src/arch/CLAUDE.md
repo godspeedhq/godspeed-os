@@ -8,7 +8,9 @@ If you are porting GodspeedOS to a new architecture, this file is your map. The 
 one proven in `docs/multi-arch.md`: **a new architecture is bounded to `arch/<isa>/` - you write that
 directory and nothing else in the kernel changes.** Six ISA families (x86-64, AArch64, ARMv7,
 RISC-V, LoongArch, s390x) and both word sizes (64-bit and 32-bit) have been proven this way - and
-**arm32 boots on real hardware** (Raspberry Pi 2 Model B, 2026-07-20), not only under emulation.
+**four of them boot real hardware**, not only emulation: x86-64 (HP T630, Dell Wyse), ARMv7
+(Raspberry Pi 2, 2026-07-20), AArch64 (Raspberry Pi 4) and RISC-V 64 (StarFive VisionFive 2 Lite,
+2026-09-07).
 
 ## The seam: `arch::imp`
 
@@ -61,10 +63,22 @@ RAM pool - see that function for the measurement that found it.
 
 For the **first milestone** of a new arch - boot the neutral kernel and print to a UART - the surface
 is far smaller: a `_start`, minimal CPU/stack setup, and a byte-out to the platform's serial device.
-The existing non-x86 stubs (`arch/aarch64/mod.rs`, `arch/riscv64/mod.rs`, `arch/loongarch64/mod.rs`,
-`arch/riscv32/mod.rs`, `arch/arm/mod.rs`) are exactly that milestone and are the templates to copy.
-The full port (MMU, exception vectors, syscalls, interrupt controller, timer, SMP, the userspace
-SDK/services) is deliberate later work, tracked in `docs/aarch64.md`.
+**Which of these are stubs, and which are finished ports, because the distinction was wrong here for
+months.** This paragraph used to call `aarch64`, `riscv64` and `arm` "stubs at the first milestone".
+They are not, and a porter told to copy a working 3000-line port as a "minimal template" is being
+sent somewhere useless:
+
+| directory | state |
+|---|---|
+| `arch/x86_64/` | complete; the reference |
+| `arch/arm/` | complete, boots a Raspberry Pi 2 on real hardware |
+| `arch/aarch64/` | complete, boots a Raspberry Pi 4 on real hardware |
+| `arch/riscv64/` | complete, boots a StarFive VisionFive 2 Lite on real hardware |
+| `arch/riscv32/`, `arch/loongarch64/`, `arch/s390x/` | **stubs** - the first milestone, and the templates to copy |
+
+For the FIRST milestone of a new arch the surface is small, and the three stubs above are what it
+looks like. The full port (MMU, exception vectors, syscalls, interrupt controller, timer, SMP, the
+userspace SDK/services) is the rest of the work; `docs/aarch64.md` tracks how one of them got there.
 
 ## Adding an architecture: the checklist
 

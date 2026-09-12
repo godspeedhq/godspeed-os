@@ -42,14 +42,30 @@ fn main() {
         "x86_64"  => &["xhci", "ehci"],
         "arm"     => &["dwc2"],
         "aarch64" => &["xhci"],
+        // The VisionFive 2's USB is a Cadence USB3 controller on the SoC bus, and its host half IS an
+        // xHCI - so the same driver that runs on a PC card and on the Pi 4's VL805 runs here, which is
+        // the whole point of the class the kernel resolves. This arm was absent, and an absent arm
+        // falls to the empty list: the supervisor shipped with no image, and `spawn xhci FAILED` was
+        // never about the controller at all.
+        "riscv64" => &["xhci"],
         _         => &[],
     };
 
     // Embedded where configuration space is REACHABLE: x86 through the CF8/CFC ports, aarch64
-    // through the Pi 4's memory-mapped INDEX/DATA window. Not arm32 - the Pi 2 has no PCI at all,
-    // so there is nothing there for it to read.
-    let enumerator: &[&str] =
-        if arch == "x86_64" || arch == "aarch64" { &["hw-enumerator"] } else { &[] };
+    // through the Pi 4's memory-mapped INDEX/DATA window, riscv64 through a flat ECAM window. Not
+    // arm32 - the Pi 2 has no PCI at all, so there is nothing there for it to read.
+    //
+    // riscv64 was absent for a reason that had nothing to do with the machine: its
+    // `pci_cfg_read32` seam member returned `None` unconditionally, so the service would have been
+    // embedded, spawned, and had nothing to answer with. The kernel's own ECAM walk had worked since
+    // the window was found; only the seam the SERVICE reaches through was missing. That gap was the
+    // last thing keeping PCI semantics - what a class code means, where BARs live, how to walk a bus
+    // - inside ring 0 on this port, which is exactly what step D2 exists to move out (4.4, 26.10).
+    let enumerator: &[&str] = if arch == "x86_64" || arch == "aarch64" || arch == "riscv64" {
+        &["hw-enumerator"]
+    } else {
+        &[]
+    };
 
     // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so the binaries this build
     // needs sit four levels up. Derived rather than assumed, so it holds for every triple.

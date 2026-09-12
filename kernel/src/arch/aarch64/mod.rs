@@ -359,8 +359,16 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// Rust side of boot. Milestone 1: write a line to the PL011 and halt. Later this grows into the real
-/// init (MMU, EL1 exceptions, GIC, generic timer, PSCI) and finally calls the neutral `kernel_main`.
+/// Rust side of boot, and the ENTRY POINT FOR THIS PORT - it does not call `kernel_main`.
+///
+/// This comment described a milestone-1 stub that printed one line and halted, and said the function
+/// would one day "finally call the neutral `kernel_main`". Neither half is true: the function is the
+/// full boot (MMU, EL1 exceptions, GIC, generic timer, PSCI, SMP) and `kernel_main` has exactly one
+/// call site in the tree, in `arch/x86_64`. The statement four hundred lines below - "this port does
+/// not reach `kernel_main`, so the call is here rather than there" - is the accurate one.
+///
+/// Why it matters beyond tidiness: anything added to the neutral boot path runs on x86-64 ALONE and
+/// silently, because no other port passes through it.
 extern "C" fn aarch64_boot_main(dtb: u64, entry_el: u64) -> ! {
     // SAFETY: single-threaded boot; written once here before anything reads it.
     unsafe { ENTRY_EL = entry_el };
@@ -2819,7 +2827,7 @@ pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
 
-    /// The Pi 4 HAS PCIe and a real table - what it has no PCI ethernet controller. GENET is on the
+    /// The Pi 4 HAS PCIe and a real table - what it has NOT is a PCI ethernet controller. GENET is on the
     /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
     /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
     /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it

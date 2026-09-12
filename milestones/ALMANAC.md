@@ -1133,6 +1133,102 @@ corollary is kinder than it sounds: the BSP had been able to halt onto a dead ti
 the port, and only became visible when a change stopped userspace spinning long enough for the core
 to idle. The bug was never created. Something merely stopped hiding it.
 
+## 2026-09-07 - The day the emulator's luck ran out
+
+GodspeedOS booted on a fourth architecture. `Starting kernel ...` and then our own banner, out of a
+16550 on a StarFive JH7110, from a kernel U-Boot loaded off an SD card. What made the day worth
+writing down is not that it worked. It is that everything which went wrong first was something QEMU
+was structurally incapable of telling me, and that three of them were the same mistake.
+
+The kernel would not load at all: `Bad Linux RISCV Image magic!` after U-Boot had read all 4279 bytes
+perfectly. `booti` requires a 64-byte header that Linux defines and a flat binary must carry. QEMU had
+never asked for it, because `-kernel` is handed an ELF and takes the entry point from the ELF header,
+while `booti` is handed a raw image and has nowhere else to look. The difference was in the BOOT
+PROTOCOL, not the silicon, so no amount of emulator testing could have surfaced it. And when I wrote
+the header, the jump at its front had to be wrapped in `.option norvc`: with compressed instructions
+on, `j` assembles to two bytes, every field behind it shifts, and the magic lands somewhere U-Boot
+does not read.
+
+Before that, the board disagreed with the emulator about nearly everything the port had assumed. RAM
+at 0x4000_0000 rather than 0x8000_0000, so the kernel was linked to an address the loader would never
+jump to. A 4 MHz timer where QEMU runs 10. OpenSBI v1.2 against QEMU's v1.8. And the boot hart is
+**hart 1**, because hart 0 is the JH7110's monitor core. Only the UART agreed, at 0x1000_0000, which
+was luck rather than design and the single reason the banner printed unchanged.
+
+That week I had already spent a day on an x86 bug of exactly this shape. Core 0's local APIC id was
+published only inside AP startup, so a single-core boot never published it and every interrupt was
+addressed to APIC id 0. It was invisible to the whole suite because QEMU's boot processor really IS
+id 0: the wrong value was accidentally right on the only machine CI runs. Now the same trap was
+waiting one architecture over, in "hart 0 is the boot hart" - natural, universally true in the
+emulator, and false on the first real board I tried.
+
+I also spent hours solving the wrong problem. The card could not be mounted on Windows, so I fought
+`diskpart`, `Set-Partition` and `wsl --mount` in turn, and every one refused. The user asked why we
+were making it hard, and whether wiping the card would do. It would, and the reason was in the board's
+own boot log all along: `Trying to boot from SPI`. The bootloader lives in the board's flash, not on
+the card, so the card only ever needed to carry a kernel, and a single partition Windows would happily
+letter was enough. I had been reading that log for other facts for two days.
+
+**What I came to understand:** an emulator does not merely omit hardware, it supplies DEFAULTS, and a
+default that happens to match your assumption hides the assumption instead of testing it. Zero is the
+dangerous one, because zero is what an untested field already contains: APIC id 0, hart 0, an entry
+point read from a header that a real loader will not read. So the question to ask of a green emulator
+run is not "did it pass" but "which of my assumptions did this environment happen to satisfy", and the
+answer is worth writing down before the hardware arrives rather than after it disagrees. The corollary
+is why the first hardware boot should be the smallest thing that can possibly fail: five assumptions
+died in one afternoon, and each one announced itself by name only because there was nothing else in
+the kernel for them to hide behind.
+
+## 2026-09-08 - The day a borrowed mechanism brought someone else's memory map
+
+GodspeedOS became a system on RISC-V today rather than a kernel that boots: four harts, ten services,
+a shell that answers, a fault that kills a task instead of the machine, and its own chaos suite run to
+completion on real silicon - 53 kills across ten rounds, the supervisor itself killed three times and
+respawned by the kernel, which then adopted the services still running rather than duplicating them.
+
+None of that is the thing worth writing down. This is: **four separate bugs today were the same fact
+about this machine, and I reached for x86's shape first every time.**
+
+On x86 the kernel lives higher-half. Userspace is low, the kernel is high, and nothing in the code
+says so - it is a property of the LAYOUT, invisible at every call site that depends on it. On RISC-V
+this kernel is identity-mapped from zero and a service links at 0x400000, so the two share an address
+range. Every place x86 had quietly been using "which half" as the boundary, I inherited a check that
+compiled, ran, and answered wrongly:
+
+- The syscall-pointer check rejects a kernel address on x86 because of where the kernel is. Here it
+  answers *true* for the kernel's own code - correctly, since a task may legitimately map its own page
+  at that virtual address.
+- Building a task's address space by copying top-level entries works on x86 because the halves cannot
+  collide. Here it replaced the supervisor's own text with a kernel mapping, and the first thing the
+  first service ever did was fault on an address that WAS mapped, by an entry it never asked for.
+- Reclaiming a dead task by walking "the low half" is the same assumption a third time. Here it would
+  hand the kernel's UART mapping back to the frame allocator.
+
+In all three the answer is the same and it is not an index: the `U` bit. One fact about the port,
+three places it decides everything, and it took three separate failures to see it was one fact.
+Section 26.14 already says to borrow the silicon's requirement and never the other system's model.
+What I had not understood is that a memory map is part of that model even when no line of code
+mentions it. Portable code can carry an unportable assumption in complete silence, because the
+assumption lives in the addresses rather than in the instructions.
+
+And the fourth was yesterday's lesson wearing a different hat. A hart asked which core it was; the
+lookup requires the core to be marked ready, a hart cannot be ready before it knows its core, and the
+function **falls through to 0**. So all four harts reported themselves core 0, four of them wrote on
+one core's scheduler state, and the first service died of a capability error that had nothing to do
+with capabilities. Zero again: not absent, not an error - a plausible answer, from a function with no
+way to say "I do not know".
+
+A quieter version of the same thing cost several hundred restarts. `reclaim_user_frames` was a stub
+returning 0, and the kill path PRINTS what it returns. `freed 0 frames` reads as *this task had
+nothing*; it meant *nothing was reclaimed*. A service faulting in a restart loop leaked its whole
+address space every cycle, and the machine died of an allocation failure a long way from the cause.
+
+**What I came to understand:** a stub that returns a NUMBER is not neutral, and neither is a lookup
+that falls through to one. Absence has to be expressible - `None`, an error, a refusal - or every
+caller downstream treats a placeholder as data and the failure surfaces somewhere it cannot be traced
+back from. And when porting, the code that compiles unchanged is exactly the code to distrust: it
+brought its author's address space with it, and that is the part no compiler checks.
+
 ## The Named Bugs - the teachers
 
 Some bugs are worth naming, because a name turns a failure into shorthand. Years from now someone

@@ -77,9 +77,9 @@ impl Reply {
     }
 }
 
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
 mod ahci;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64"))]
 mod usbdisk;
 // Now on BOTH ARM targets: arm32 reaches the `dwc2` service and aarch64 the `xhci` service, through
 // this one client. The wire format is identical, so only the service name differs.
@@ -109,13 +109,15 @@ const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 
 /// Run the arch-appropriate backend against the kernel-granted MMIO window.
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
 fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ctx, m) }
-/// ARM storage is the USB stick, and ONLY the USB stick. Never the SD/EMMC card.
+/// On a board whose only card slot is its boot medium, storage is the USB stick and ONLY the USB
+/// stick. Never the SD/EMMC card.
 ///
-/// **Both ARM ports, for the same reason.** The Pi 4 has the same single-slot topology as the Pi 2:
-/// one SD card, which is the boot medium. The rule below was established on the Pi 2 and applies
-/// unchanged there.
+/// **All three such ports, for the same reason.** The Pi 4 has the Pi 2's single-slot topology, and
+/// so does the VisionFive 2: one SD card, which is what the machine boots from. The rule below was
+/// established on the Pi 2 and applies unchanged to both of the others - the JH7110 has an eMMC
+/// controller and an SD slot, and the slot is where U-Boot, the device tree and this kernel live.
 ///
 /// The Pi 2 has one SD slot and boots from it: that card carries the firmware, the kernel image, and a
 /// FAT boot partition. It is the boot medium, full stop - there is no safe way to also hand it to GSFS,
@@ -127,7 +129,7 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 /// removed. With no USB stick, there is simply NO storage - exactly what x86 reports with no disk
 /// attached - and `fs` comes up storage-unavailable. `usbdisk::run` with a 0 sector count serves that
 /// no-disk state (capacity 0, every read/write refused) WITHOUT touching the card.
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64"))]
 fn backend_run(ctx: &ServiceContext) -> ! {
     // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
     // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
@@ -185,9 +187,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reached through syscalls. Going through the `ctx.mmio()` gate would refuse a perfectly good USB
     // stick on any board that does not also hand the service a peripheral window it never reads - which
     // is the Pi 4 exactly. So those ports do not ask.
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64"))]
     backend_run(&ctx);
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
     match ctx.mmio() {
         Some(m) => backend_run(&ctx, &m),
         None => {

@@ -369,7 +369,34 @@ fn clean_supervisor() {
 /// `--selftest` runs alongside the checks and is not optional. A check can be silently weakened -
 /// narrow a regex, shrink a scan - and the ordinary run will still print PASS over code it stopped
 /// looking at. Only the probe corpus notices, so the corpus runs every time the checks do.
+/// The OTHER checkers the ARM build paths have always run, and this one never did.
+///
+/// `scripts/arm_build.py` gates on commandments + dash + unsafe + arch-boundary + arch-seam +
+/// contracts. This path gated on commandments alone, so four of those were enforced on one build
+/// path and therefore on none: an `arch::x86_64::` reference from the neutral `smp/` layer was
+/// committed and shipped from here, and only the ARM build refused it - days later, by accident.
+///
+/// Listed explicitly rather than discovered from the directory, so that ADDING a checker is a
+/// decision each build path makes, not something that silently changes what a build enforces.
+const EXTRA_CHECKS: &[&str] = &[
+    "scripts/dash_check.py",
+    "scripts/unsafe_check.py",
+    "scripts/arch_boundary_check.py",
+    "scripts/arch_seam_check.py",
+    "scripts/contract_check.py",
+];
+
 fn commandment_check() {
+    for extra in EXTRA_CHECKS {
+        match std::process::Command::new("python").arg(extra).status() {
+            Ok(st) if st.success() => {}
+            Ok(_) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("osdev: cannot run {extra} ({e}). Refusing to build - a checker that cannot run is not a checker that passed.");
+                std::process::exit(1);
+            }
+        }
+    }
     for args in [["scripts/commandments.py", "--selftest"], ["scripts/commandments.py", ""]] {
         let mut cmd = std::process::Command::new("python");
         cmd.arg(args[0]);

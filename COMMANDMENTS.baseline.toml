@@ -48,6 +48,14 @@ features = [
 # now off by default and turned on only by `osdev test identity`, which is the build that asserts on
 # their output.
 "kernel-selftest",
+# Bring up ONE hart on riscv64 and leave the rest parked. Pinned deliberately: it is a switch on what
+# the kernel IS, and the reason it adds no responsibility is worth stating rather than assuming - the
+# port ALREADY reaches this state at runtime whenever firmware refuses the secondary harts, printing
+# `smp: no secondary harts started - running single-core`. The feature only makes hart DISCOVERY
+# report one, so every downstream decision follows from that number exactly as it already does. It
+# REMOVES concurrency rather than adding a code path, which is also what makes it useful: a bug that
+# survives on one hart is not a race.
+    "riscv-single-hart",
     "arm-autochaos",
     "arm-fault-test",
     "arm-sched-demo",
@@ -81,7 +89,29 @@ features = [
     "pi4-supervisor",
     "test-bad-elf",
     "test-bad-elf-brutal",
-    "test-bad-supervisor"
+    "test-bad-supervisor",
+# Link the riscv64 kernel for the StarFive VisionFive 2 Lite instead of QEMU `virt`. Admitted because
+# it adds NO kernel responsibility and changes exactly one number: the load address.
+#
+# NARROWED 2026-09-07. It briefly also picked the UART's register layout, which was a board fact in
+# the kernel and is now read from the device tree instead - the same binary logic reports
+# `shift 0 width 1` on QEMU and `shift 2 width 4` on the JH7110 without being told which it is on.
+# What remains is only the link address, and that one genuinely cannot be discovered at runtime: a
+# non-relocatable kernel must be placed before it can run. The change that retires the pin entirely
+# is a position-independent kernel (backlog/14). QEMU enters the
+# kernel at 0x8020_0000, the JH7110 at 0x4020_0000 - both read off the board's own OpenSBI banner and
+# confirmed by the vendor image's `kernel_addr_r`. Not even the UART differs (0x1000_0000 on both).
+#
+# Pinned rather than done outside the kernel because a load address is fixed at LINK time: a kernel
+# cannot relocate itself before it has run, so there is no runtime check that could replace it.
+# `pi4` above is the same split on aarch64 for the same reason.
+#
+# NOT the `single-core` case. That flag forced a state the same binary could already reach, which is
+# why it was deleted once it had found its bug. Two SoCs with different RAM bases cannot share one
+# non-relocatable image, so this is a real difference rather than a forced one. The change that would
+# retire it is a position-independent kernel - real work, recorded in backlog/14 rather than pretended
+# at. If that lands, this pin goes.
+    "visionfive"
 ]
 
 # DEBT, NOT AN ALLOWANCE. This list may only ever SHRINK. Kernel responsibility does not expand, so
@@ -358,6 +388,17 @@ PCI_CFG            = 16
 "arm/video.rs"                = "console"
 "loongarch64/mod.rs"          = "arch-entry"
 "riscv32/mod.rs"              = "arch-entry"
+"riscv64/context_switch.rs"   = "context-switch"
+"riscv64/display.rs"          = "console"
+"riscv64/usb.rs"              = "discovery"
+"riscv64/net.rs"              = "discovery"
+"riscv64/fdt.rs"              = "discovery"
+"riscv64/sbi.rs"              = "clock"
+"riscv64/sv39.rs"             = "mmu"
+"riscv64/syscall.rs"          = "syscall-entry"
+"riscv64/trap.rs"             = "interrupts"
+"riscv64/usermode.rs"         = "usermode"
+"riscv64/uaccess.rs"          = "uaccess"
 "riscv64/mod.rs"              = "arch-entry"
 "s390x/mod.rs"                = "arch-entry"
 "x86_64/ap_boot.rs"           = "boot"

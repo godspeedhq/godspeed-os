@@ -51,6 +51,11 @@ ARCH_EXEMPT = {
         "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
     },
+    "riscv64": {
+        "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
+                "whose host half is an xHCI",
+        "dwc2": "arm32-only (Pi 2) USB host driver",
+    },
 }
 
 NAME = chr(34) + "([a-z0-9" + chr(45) + "]+)" + chr(34)

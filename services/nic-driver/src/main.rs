@@ -32,6 +32,12 @@ use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 /// is the ONLY path - the kernel drives no ethernet at all (Commandment I).
 #[cfg(target_arch = "aarch64")]
 mod genet;
+/// The VisionFive 2's Synopsys DesignWare MAC. Identification only so far - see the module header
+/// for why that is a step rather than a stub.
+#[cfg(target_arch = "riscv64")]
+mod dwmac;
+#[cfg(target_arch = "riscv64")]
+mod dwmac_ring;
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
 const REG_CTRL:   usize = 0x0000; // Device Control
@@ -154,6 +160,14 @@ const RTL_ISR:       usize = 0x3E; // Interrupt Status Register (16-bit)
 const RTL_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
 const RTL_RMS:       usize = 0xDA; // RX Max packet Size (16-bit)
 const RTL_RDSAR:     usize = 0xE4; // RX Descriptor Start Address (64-bit phys, 256B aligned)
+/// C+ Command Register (16-bit). Programmed EXPLICITLY rather than inherited.
+///
+/// This driver never wrote it, relying on the soft reset to leave a usable default. That is a
+/// dependency on what a reset does to a chip whose previous owner was killed mid-DMA, which is
+/// exactly the assumption that failed here. r8169 sets it on every start.
+const RTL_CPCR:      usize = 0xE0;
+/// Max Transmit Packet Size, in 128-byte units. Also never written; r8169 programs it on every start.
+const RTL_MTPS:      usize = 0xEC;
 const RTL_DTCCR:     usize = 0x10; // Dump Tally Counter Command Register (64-bit): buf phys | bit3 (Dump)
 // The DTCCR counter dump is a DIAGNOSTIC (the chip's cumulative RxOk/TxOk tallies for `net stats`), and
 // it is DMA-driven: on a healthy NIC it completes in ~us (the first few poll iterations). But it must
@@ -202,6 +216,14 @@ const RTL_DESC_LS:  u32 = 1 << 28; // last segment (TX)
 const RTL_RCR_VALUE: u32 = 0x0F | (7 << 8) | (7 << 13);
 const RTL_TCR_VALUE: u32 = 7 << 8;      // MXDMA unlimited
 const RTL_RMS_VALUE: u16 = RX_BUF_SIZE as u16; // accept up to one buffer (2 KiB >> a 1518-byte frame)
+/// C+ mode with no offloads: no RX VLAN stripping, no RX checksum, no PCI dual-address cycle. A
+/// known value beats whatever the last instance left behind.
+const RTL_CPCR_VALUE: u16 = 0x0000;
+/// 0x3B * 128 = 7552 bytes, comfortably above our 1518-byte frames. The r8169 value for this family.
+const RTL_MTPS_VALUE: u8 = 0x3B;
+/// How long to let the chip settle after Rx/Tx are switched off, before asking it to reset. Gives an
+/// in-flight DMA burst time to retire instead of being reset underneath itself.
+const RTL_QUIESCE_MS: u64 = 10;
 
 /// Realtek RTL8168 (the T630's NIC). Networking Phase 4, STAGE A: reset the controller, read the MAC
 /// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
@@ -218,6 +240,25 @@ fn realtek_main(ctx: ServiceContext) -> ! {
         Some(m) => m,
         None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); serve_status(&ctx, &[0u8; 8]); }
     };
+    // STOP THE CHIP BEFORE RESETTING IT, and say why, because this driver did not and it cost a
+    // network that never came back from a chaos storm (backlog/19).
+    //
+    // A respawned driver does NOT meet an idle controller. The kernel's kill path clears PCI
+    // Bus-Master-Enable, which stops NEW DMA but leaves the chip with Rx/Tx still enabled in CR and
+    // whatever descriptor state it had mid-flight. Writing CR.RST into that is asking the chip to
+    // reset itself underneath its own in-flight work. It reported `reset OK link UP` afterwards and
+    // then timed out every transmit with the descriptor still OWNed, while receive missed 1029
+    // frames - the reset completed and the chip still did not run.
+    //
+    // So: mask interrupts, clear RE|TE, let an in-flight burst retire, THEN reset. This is the same
+    // sequence `xhci` already performs for the same reason (clear R/S, wait for HCH, then HCRST) -
+    // that path was correct and this one was not, on the same machine, for the same cause.
+    mmio.write16(RTL_IMR, 0x0000);              // no interrupts while we take the chip down
+    mmio.write8(R_CR, 0x00);                    // Rx and Tx OFF - stop the engine before resetting it
+    let t_quiesce = ctx.read_tsc().wrapping_add(ctx.duration_cycles(RTL_QUIESCE_MS));
+    while ctx.read_tsc() < t_quiesce { ctx.yield_cpu(); }
+    mmio.write16(RTL_ISR, 0xFFFF);              // drop anything latched by the work we just stopped
+
     // Reset: set CR.RST, wait on the bit self-clearing (bounded SMALL + loud). If MMIO is not reaching
     // the chip (D3 / no memory-space) every read is 0xff, so RST never clears - we TIME OUT, not spin.
     mmio.write8(R_CR, CR_RST);
@@ -307,11 +348,28 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
     mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
 
-    mmio.write32(RTL_TCR, RTL_TCR_VALUE);
-    mmio.write32(RTL_RCR, RTL_RCR_VALUE);
+    // C+ mode and max transmit size, EXPLICITLY. Neither was ever written here; the driver inherited
+    // whatever the reset left, which is a bet on what a reset does to a chip whose previous owner was
+    // killed mid-DMA. r8169 programs both on every start.
+    mmio.write16(RTL_CPCR, RTL_CPCR_VALUE);
+    mmio.write8(RTL_MTPS, RTL_MTPS_VALUE);
+
+    mmio.write8(RTL_9346CR, 0x00);              // lock the config registers before starting the engine
+
+    // ORDER, AND IT IS NOT ARBITRARY. r8169's `rtl_hw_start` enables the engine FIRST and programs the
+    // Rx/Tx configuration AFTER:
+    //
+    //     RTL_W8(tp, ChipCmd, CmdTxEnb | CmdRxEnb);
+    //     rtl_init_rxcfg(tp);
+    //     rtl_set_tx_config_registers(tp);
+    //
+    // This driver did the opposite - TCR, RCR, then CR - which works from a cold power-on and is a
+    // different thing from working on a chip being restarted underneath itself. Borrowed as the
+    // silicon's requirement, not as their design (§26.14).
     mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE); // enable receiver + transmitter
+    mmio.write32(RTL_RCR, RTL_RCR_VALUE);
+    mmio.write32(RTL_TCR, RTL_TCR_VALUE);
     mmio.write16(RTL_ISR, 0xFFFF);              // clear any latched interrupt status (RDU/FOVW would halt RX)
-    mmio.write8(RTL_9346CR, 0x00);              // lock the config registers again
 
     let link_up = mmio.read8(RTL_PHYSTATUS) & 0x02 != 0;
     ctx.log_fmt(format_args!(
@@ -1071,9 +1129,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(target_arch = "arm")]
     kernel_net_main(ctx);
 
+    // The VisionFive 2's on-SoC DesignWare MAC, with the driver where it belongs: the kernel grants
+    // this service the controller's window and a DMA arena by name, and drives no ethernet itself.
+    // Same posture as GENET on the Pi 4.
+    #[cfg(target_arch = "riscv64")]
+    dwmac::dwmac_main(ctx);
+
     // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
     // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    // riscv64 is excluded here for the same reason arm and aarch64 are: its NIC is on the SoC, not
+    // on PCI, so there is no vendor/device pair to sort by and the backend above has already taken
+    // the call. Left in the `not(...)` list it compiles as unreachable code, which is a warning
+    // today and a misleading read of the dispatch forever.
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
     if ctx.nic_vendor_device() == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }
@@ -1083,6 +1151,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
+
     // NOTE: there is deliberately no `active` boolean here any more. It was a second copy of a fact
     // the two Options already hold (Commandment III), and every site that consulted it then re-asserted
     // that fact with `unwrap()` - a service declaring that its own failure should halt the machine
@@ -1168,6 +1237,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         m.write32(REG_RCTL, RCTL_VALUE);
         ctx.log("nic-driver: serving the frame interface");
     } else {
+        #[cfg(target_arch = "riscv64")]
+        ctx.log("nic-driver: dwmac has no frame path yet - serving empty replies (identification above is the state of the port)");
+        #[cfg(not(target_arch = "riscv64"))]
         ctx.log("nic-driver: no Intel e1000 mapped (absent, or a different NIC) - serving empty replies");
     }
 

@@ -1,0 +1,23 @@
+# Arch-conditional code ABOVE the kernel, frozen. See scripts/shared_surface_check.py.
+#
+# THIS FILE MAY ONLY EVER SHRINK, on the same terms as the grandfathered unsafe floors of
+# CLAUDE.md 18.5: a count may DECREASE freely, and may increase only deliberately - by
+# regenerating this file in a commit that says why the port needed it.
+#
+# An `sdk/` entry is not a smell. The SDK is the seam services are supposed to reach hardware
+# through, so an arch cfg there is the right answer. Every `services/` entry is a claim that a
+# SERVICE cares about the instruction set - which above the kernel is usually standing in for
+# 'which board am I on', a different question on a wrong axis.
+#
+# count  path
+    6  sdk/rust/src/adversarial.rs
+    2  sdk/rust/src/ipc.rs
+    4  sdk/rust/src/syscall.rs
+   18  services/block-driver/src/main.rs
+    1  services/block-driver/src/usbdisk.rs
+    2  services/block-driver/src/xhciblk.rs
+    3  services/hw-enumerator/src/main.rs
+    3  services/net-stack/src/main.rs
+   26  services/nic-driver/src/main.rs
+    7  services/shell/src/main.rs
+   49  services/supervisor/src/main.rs

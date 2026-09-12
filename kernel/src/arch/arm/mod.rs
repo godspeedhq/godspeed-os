@@ -891,10 +891,16 @@ pub(super) fn pl011_write_no_fb(s: &[u8]) {
     serial_emit(s, false);
 }
 
-/// Rust side of boot. Milestone 1: prove the toolchain, the load address, the HYP drop, and the UART
-/// on real 32-bit silicon, then halt. The neutral kernel is already linked in; what is still missing
-/// before `kernel_main` can run is the ARMv7 MMU (short/long descriptors via CP15), the vector table
-/// (VBAR), and the BCM2836 interrupt controller - none of which is shared with AArch64.
+/// Rust side of boot, and the ENTRY POINT FOR THIS PORT - it does not call `kernel_main`.
+///
+/// This comment described milestone 1: prove the toolchain, the load address, the HYP drop and the
+/// UART, "then halt", with the ARMv7 MMU, the vector table and the BCM2836 interrupt controller
+/// listed as what was "still missing". All three shipped, this port boots a Raspberry Pi 2 into
+/// userspace, and the comment was never updated - so it read as an unfinished stub on top of a
+/// complete port. Its AArch64 twin carried the same stale text.
+///
+/// `kernel_main` has exactly one call site in the tree, in `arch/x86_64`. The consequence is worth
+/// carrying: anything added to the neutral boot path runs on x86-64 ALONE, and silently.
 extern "C" fn arm_boot_main() -> ! {
     pl011_init();
     pl011_write(b"\r\nGodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS.\r\n");

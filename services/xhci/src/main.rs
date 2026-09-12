@@ -156,6 +156,51 @@ fn device_ctx_off(i: usize) -> usize {
 fn ep0_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x1000
 }
+
+/// Where the CONTROLLER thinks this device's EP0 ring has been consumed to, and with which cycle
+/// state - read from the hardware, not inferred.
+///
+/// **This is the fix for the hot-plug bug that outlived seven others.** Hub port-status probes stop
+/// being answered after enumeration: our write cursor climbs, the event ring does not move, and the
+/// driver asks "is anything on hub port 2 now?" a thousand times without ever getting a reply
+/// (`probes 317/1429`, the success count frozen). We were posting TRBs into ring space the controller
+/// had already consumed and moved past, so it never came back for them.
+///
+/// The cursor was seeded from `hub_off`, a byte offset this driver RECORDED for itself at the end of
+/// enumeration. That is our bookkeeping, and `control()` writes at caller-chosen offsets without
+/// advancing any shared cursor, so nothing kept it in step with the hardware. The controller's own
+/// answer has been sitting in memory we already own the whole time: the endpoint context holds a TR
+/// Dequeue Pointer, updated by the hardware as it consumes the ring (xHCI 6.2.3, offset 0x08 of the
+/// endpoint context; bit 0 is the Dequeue Cycle State, and the pointer is 16-byte aligned).
+///
+/// EP0 is DCI 1, so its endpoint context is one `ctx_size` past the slot context.
+///
+/// Returns `None` rather than a wrong answer when the pointer does not land inside this device's EP0
+/// ring - a zeroed context, a slot that was never addressed, a controller that reset underneath us.
+/// A caller that gets `None` should fall back to its recorded offset, because a plausible cursor beats
+/// a fabricated one: the whole bug was a number nobody checked against the hardware.
+fn ep0_hw_dequeue(
+    dma: &Dma,
+    dev: usize,
+    ctx_size: usize,
+    ring_bytes: usize,
+) -> Option<(usize, u32)> {
+    let deq = dma.read64(device_ctx_off(dev) + ctx_size + 0x08);
+    let cycle = (deq & 1) as u32;
+    let phys = deq & !0xf;
+    if phys == 0 {
+        return None;
+    }
+    let base = dma.phys_at(ep0_tr_off(dev));
+    let off = phys.wrapping_sub(base) as usize;
+    if off >= ring_bytes || off % TRB_SIZE != 0 {
+        return None;
+    }
+    Some((off, cycle))
+}
+/// One page per ring in a device's slice, so an offset at or past this is not in the EP0 ring and
+/// whatever produced it was not a dequeue pointer.
+const EP0_RING_BYTES: usize = 0x1000;
 fn int_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x2000
 }
@@ -527,11 +572,57 @@ const PORT_POWER_SETTLE_MS: u64 = 200;
 /// enumeration, and the alternative is a device that never enumerates at all.
 const PORT_RECOVERY_MS: u64 = 20;
 
+/// How long to wait for USBCMD.HCRST to clear after a reset is requested.
+///
+/// WAS 250 ms, and that is the number this port timed out on 24 times in one `chaos max-carnage`
+/// run. The reason is specific to being killed and respawned: the kernel's kill-path quiesce clears
+/// PCI Bus-Master-Enable, and this board's xHCI is a PLATFORM device at MMIO 0x10110000 with no BDF,
+/// so nothing stops it when the driver dies. The next instance therefore resets a controller that
+/// was mid-flight rather than idle, and a reset from that state legitimately takes longer.
+///
+/// 250 ms is the SHORT end of what a real driver allows; Linux carries a second, far longer reset
+/// timeout for controllers that need it, because the spec sets no upper bound the host must meet.
+/// This is the silicon's requirement, not a guess dressed as one (§26.14) - and the cost of being
+/// generous is paid only on a path that is already failing.
+const HCRST_CLEAR_MS: u64 = 1000;
+/// How many times to re-attempt the whole controller re-init when the reset does not complete,
+/// before giving up on resetting it and saying so. Bounded, because an unbounded retry against a
+/// genuinely dead controller is a spin, not a recovery (§26.6).
+const HCRST_RETRIES: u32 = 3;
+
 const HUB_POLL_MS: u64 = 500;
 /// How often the driver says it is still alive. See the heartbeat's comment in the poll loop: this
 /// exists because a STOPPED loop is otherwise indistinguishable from a quiet one, and every failure
 /// detector here counts failures that a stopped loop never produces.
+/// TEMPORARILY 5 s, not 60. Correcting this port's cycle-counter rate made every duration in this
+/// driver real for the first time, and the poll loop went from ~45 passes a second to roughly one
+/// per 45 SECONDS - so the minute-long heartbeat, which is checked once per pass, stopped printing
+/// altogether and took the only breakdown of where the time goes with it. A diagnostic that cannot
+/// report while the fault is happening is not a diagnostic. Back to 60_000 once the wait is found.
 const HEARTBEAT_MS: u64 = 60_000;
+
+/// How often the PASS COUNTER reports, in milliseconds of wall clock.
+///
+/// **A wall clock, and not a pass count, and that distinction is the whole point of this
+/// instrument.** Every measurement in this investigation so far has been checked once per pass at
+/// the BOTTOM of the poll loop - the heartbeat, the `[wait]` overshoot line - and neither has ever
+/// printed on this board, while topology changes log normally. Six hypotheses were eliminated
+/// against instruments that cannot fire when a pass leaves early, and the poll loop has six ways to
+/// leave early: four `break 'poll` and two `continue 'reenum`, all of them ahead of the heartbeat.
+///
+/// So this is checked at the TOP, before anything in a pass can exit it, and paced by time rather
+/// than by iterations. The two numbers it prints answer the question the others could not: whether
+/// the driver is spinning through passes and finding nothing, or sitting inside ONE pass for tens of
+/// seconds. Those have opposite fixes and no earlier log could tell them apart.
+///
+/// **It answered that, so it is now paced for a machine rather than for an investigation.** At two
+/// seconds it produced 80 lines in a 150-second boot - 22% of the whole log, each one a synchronous
+/// write to a 115200-baud port - which is an instrument heavy enough to change what it measures,
+/// and exactly the wrong thing to carry into a chaos run. It is KEPT rather than deleted because
+/// its PLACEMENT is the part that was hard to get right: it is the only counter in this loop that a
+/// pass cannot exit past, so it is what the next latency question should be asked with, and working
+/// that out again would cost the same several boots it cost this time.
+const PASS_REPORT_MS: u64 = 60_000;
 /// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
 /// Only runs while NO HID is bound.
@@ -551,6 +642,15 @@ const PROBE_ANSWER_MS: u64 = 10;
 /// unbounded drain running forever, and while it runs the USB poll loop is NOT polling: the keyboard
 /// stops. The event drain in this file already carries this exact bound and this exact reasoning;
 /// the message drain is the same shape with a different producer, and was missing it.
+/// How long to let the root ports settle after starting the controller before believing a census
+/// that says nothing is attached.
+///
+/// Two hundred milliseconds: the USB 2.0 spec allows a hundred for a port to report a connection
+/// after power is valid, and this is after a controller reset rather than a cold power-up, so double
+/// it and stop. It is a bound on a WAIT, not a guess at a duration - the loop returns the instant any
+/// port reports a connection, so the only machine that pays it in full is one with nothing plugged in.
+const ROOT_PORT_SETTLE_MS: u64 = 200;
+
 const MSG_DRAIN_MAX: u32 = 256;
 
 // 10, cut from 50, because the budget is spent WAITING FOR AN ANSWER THAT DOES NOT COME.
@@ -3184,7 +3284,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!(
         "xhci: IRQ vector granted by the kernel: {}",
         match msi_vector { Some(v) => v, None => 0 }));
+    // Declared OUTSIDE both loops, deliberately. A counter declared inside the loop it measures is
+    // reset by that loop and reads zero forever - a mistake this project has made three times, and
+    // one that is invisible because a zero looks like a measurement.
+    let mut reenums: u64 = 0;
+    // OUTSIDE `'reenum`, for the reason the comment above gives: a counter declared inside the loop
+    // it measures is reset by that loop and reads zero forever.
+    let mut reset_failures: u32 = 0;
+    let mut passes_at_report: u64 = 0;
+    let mut reenums_at_report: u64 = 0;
+    let mut last_pass_report = ctx.read_tsc();
+
     'reenum: loop {
+        reenums += 1;
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
         // every step with a log: the last line printed before a freeze is then the exact MMIO that hung.
@@ -3229,7 +3341,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         spin(&ctx, "USBSTS.CNR to clear after HCRST", 500, || {
             mmio.read32(op + OP_USBSTS) & STS_CNR == 0
         });
-        spin(&ctx, "USBCMD.HCRST to clear", 250, || {
+        let reset_cleared = spin(&ctx, "USBCMD.HCRST to clear", HCRST_CLEAR_MS, || {
             mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0
         });
         ctx.log_fmt(format_args!(
@@ -3237,6 +3349,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             mmio.read32(op + OP_USBCMD),
             mmio.read32(op + OP_USBSTS)
         ));
+        // A RESET THAT DID NOT COMPLETE IS NOT A RESET, and carrying on is how this became hard to
+        // find. `spin` reports its own expiry, but every caller here discarded the bool, so the
+        // driver programmed a controller that had never reset and then described itself as healthy:
+        // `1 HID, disk yes` while 400 of 412 hub probes failed and 4999 ms of 5003 ms of work went
+        // into the hub path. That is §26.7's failed recovery treated as a success - the loudest
+        // single line in the log became the least consequential.
+        //
+        // Retry the whole re-init a bounded number of times, then proceed ONCE while saying plainly
+        // that USB is degraded. Proceeding is deliberate: parking instead would have the supervisor
+        // respawn us into the same controller state forever, turning one broken device into a
+        // restart storm. What must not happen is proceeding QUIETLY.
+        if !reset_cleared {
+            if reset_failures < HCRST_RETRIES {
+                reset_failures += 1;
+                ctx.log_fmt(format_args!(
+                    "xhci: reset did NOT complete (attempt {} of {}) - re-initialising rather than programming an unreset controller",
+                    reset_failures, HCRST_RETRIES));
+                continue 'reenum;
+            }
+            ctx.log_fmt(format_args!(
+                "xhci: CONTROLLER WILL NOT RESET after {} attempts - USB IS DEGRADED. Keyboard and storage on this controller are unreliable; any 'HID bound'/'disk yes' below is what we asked for, not what works.",
+                HCRST_RETRIES));
+        } else {
+            reset_failures = 0;
+        }
         // Rebuild DMA structures + run.
         dma.zero();
         // Scratchpad: build the SBA (N pointers to page-aligned buffers) and point
@@ -3286,12 +3423,51 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ev_cycle = 1u32;
         let mut cmd_idx = 0usize;
 
+        // --- LET THE ROOT PORTS SETTLE BEFORE BELIEVING THEM ---
+        //
+        // A root port does not report a connection the instant the controller starts. It leaves reset
+        // in RxDetect and takes tens of milliseconds to see what is attached, so a census sampled
+        // immediately after `CMD_RS` reads zero on a port that has a device soldered to it.
+        //
+        // **That is a real fault, not a cosmetic one, and it is asymmetric in a way that hid it.** On
+        // the VisionFive 2, whose four USB-A sockets hang off a hub soldered to the board, the boot
+        // census read `connected=0` on both root ports and the driver recovered six hundred
+        // milliseconds later - but the census after a HOT-UNPLUG read zero in the same millisecond as
+        // the reset that preceded it, concluded the machine had no USB at all, and went to "waiting
+        // for a connection" with a hub physically attached that it had just decided was not there.
+        // The keyboard never came back, and neither did the USB disk.
+        //
+        // Bounded, and it only costs anything when there is nothing to find: it returns the moment any
+        // port reports a connection, so a machine with a device attached pays a few milliseconds and a
+        // machine with none pays the full wait once per pass rather than mis-reporting instantly. A
+        // port that is genuinely empty still reads zero at the end, and the census below still says so.
+        {
+            let any_connected = || {
+                (1..=max_ports).any(|p| {
+                    mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0
+                })
+            };
+            let t0 = ctx.read_tsc();
+            while !any_connected()
+                && ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(ROOT_PORT_SETTLE_MS)
+            {
+                ctx.sleep(ctx.duration_cycles(1));
+            }
+        }
+
         // --- Port census (diagnostic) ---
         // Log EVERY root-hub port's PORTSC, connected or not, before binding. This
         // tells us which xHCI ports are live; a device on a port absent here hangs
         // off the EHCI controller, which this driver does not drive.
         for p in 1..=max_ports {
             let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
+            // An EMPTY port has nothing left to condemn. The poll loop already clears the poison when
+            // it watches a device leave; doing it here as well means a port observed empty at the top
+            // of any pass gets its clean slate too, without depending on which loop happened to be
+            // running when the device was pulled.
+            if psc & PORT_CCS == 0 && p < 64 {
+                poisoned &= !(1u64 << p);
+            }
             topo.note(&ctx, 0, p, Some(psc & PORT_CCS != 0));
             ctx.log_fmt(format_args!(
                 "xhci: port census {}/{}: PORTSC={:#010x} connected={} enabled={} speed={}",
@@ -3560,6 +3736,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 announce = true; // whatever we bind on the re-walk is a real plug event
                 continue 'reenum;
             }
+            // A PASS THAT BOUND NOTHING CLEARS EVERY POISON, and this is a deadlock fix rather than
+            // a tidy-up.
+            //
+            // `poisoned` lives OUTSIDE `'reenum` so a port that wedges the controller stays skipped
+            // across re-inits - which is right. But the only place that ever CLEARED it was the poll
+            // loop, and the poll loop is only reached once at least one device is bound. So a port
+            // poisoned while nothing else is attached can never be un-poisoned: no device binds
+            // because the port is skipped, and the port is skipped because no device binds.
+            //
+            // On the VisionFive 2 that is permanent, because its four sockets hang off a hub soldered
+            // to the board: the hub IS root port 1, it never disconnects, and unplugging a keyboard
+            // behind it changes no root port at all. Once that port was poisoned the controller was
+            // dead until the next power cycle - which is exactly what the board did.
+            //
+            // The bound exists to stop retrying a device that will not come up while good ones work.
+            // When NOTHING works, skipping every port guarantees the thing it was written to prevent,
+            // so the honest response is to let them all try again. It costs a re-init per pass, once
+            // per second, on a controller that is otherwise doing nothing at all.
+            if poisoned != 0 {
+                ctx.log("xhci: nothing bound on any port - clearing every port poison and retrying");
+                poisoned = 0;
+            }
             ctx.log("xhci: no HID keyboard/mouse on any port - waiting for a connection");
             wait_for_port(&ctx, &mmio, op, max_ports);
             announce = true; // whatever connects now is a real plug event
@@ -3637,8 +3835,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // The HID path was given this seeding and the disk path was not, which is why the disk hub
         // was the one that halted. Same ring, same rule, and now the same code shape.
-        let mut disk_hub_cur = disk.as_ref().map(|d| d.hub_off).unwrap_or(0);
-        let mut disk_hub_pcs = 1u32;
+        // ASK THE HARDWARE WHERE ITS DEQUEUE IS, and fall back to our own note only if it will not
+        // say. `hub_off` is this driver's record of where enumeration finished; the endpoint context's
+        // TR Dequeue Pointer is where the CONTROLLER actually stopped, and when the two disagree it is
+        // ours that is wrong. The cycle state comes with it, which matters just as much: a cursor in
+        // the right place with the wrong cycle bit is a TRB the controller will not execute either.
+        let (mut disk_hub_cur, mut disk_hub_pcs) = match disk.as_ref() {
+            Some(d) => match ep0_hw_dequeue(&dma, d.hub_dev as usize, ctx_size, EP0_RING_BYTES) {
+                Some((off, cyc)) => (off, cyc),
+                None => (d.hub_off, 1u32),
+            },
+            None => (0usize, 1u32),
+        };
         // One-shot latches so the mode is stated once each way, not on every pass.
         let mut poll_noted = false;
         let mut irq_noted = false;
@@ -3671,7 +3879,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut hub_cur = [0usize; MAX_HID];
         let mut hub_pcs = [1u32; MAX_HID];
         for d in 0..ndev {
-            hub_cur[d] = devs[d].hub_off;
+            // Same rule as the disk's cursor above: the controller's TR Dequeue Pointer if it will
+            // give one, our recorded `hub_off` only as a fallback. This is the HID half of the same
+            // bug - the probes that stopped being answered are these.
+            //
+            // WHAT THE BOARD SAID WHEN THIS WAS INSTRUMENTED: `recorded 0x3a0, hardware 0`. The two
+            // disagree by most of a ring, every pass, and the reason is `Address Device` - it RESETS
+            // the endpoint's dequeue pointer to the ring base. So after each re-enumeration the
+            // controller genuinely restarts at zero while the offset carried over from the previous
+            // pass points a kilobyte ahead of it, and every probe written there waits behind a pass of
+            // stale TRBs whose cycle bit no longer matches. That is what "posted behind the dequeue"
+            // meant, and the number was in the endpoint context the whole time.
+            match ep0_hw_dequeue(&dma, devs[d].hub_dev as usize, ctx_size, EP0_RING_BYTES) {
+                Some((off, cyc)) => {
+                    hub_cur[d] = off;
+                    hub_pcs[d] = cyc;
+                }
+                None => hub_cur[d] = devs[d].hub_off,
+            }
         }
         // Two HIDs behind the SAME hub (a keyboard AND a mouse on one back-port hub) share that hub's
         // ONE EP0 control ring, so their downstream GET_STATUS polls MUST advance ONE monotonic cursor -
@@ -3808,6 +4033,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         'poll: loop {
+            // THE PASS COUNTER, first statement of the pass and ahead of every exit from it.
+            //
+            // ONE counter, shared with the `alive` line below, and that is the second bug found
+            // here: this was declared fresh, which SHADOWED the existing `passes` and left both its
+            // increment and mine landing on the same variable - so every finished pass counted
+            // twice and the first rates I read off this instrument were inflated by up to 2x. An
+            // instrument that measures itself wrong is worse than none, and the compiler caught it
+            // only because the shadowed original then had no readers left.
+            //
+            // Counted here and REPORTED on a wall clock, so the report happens whether or not any
+            // given pass reaches the bottom. See `PASS_REPORT_MS` for why that is the whole design:
+            // the two instruments this replaces both live below six early exits.
+            passes += 1;
+            let since = ctx.read_tsc().wrapping_sub(last_pass_report);
+            if since > ctx.duration_cycles(PASS_REPORT_MS) {
+                last_pass_report = ctx.read_tsc();
+                // Rates, not raw totals, and the elapsed time is MEASURED rather than assumed to be
+                // PASS_REPORT_MS: the check fires on the first pass after the interval, which on a
+                // driver that blocks can be far later than the interval itself. Reporting the
+                // nominal period would quietly turn a 40-second gap into a 2-second one and hide the
+                // very thing this exists to find.
+                // Converted ONCE, here at the report, rather than carrying a unit around: the
+                // per-10ms figure is what the kernel measured at boot, so this is the same clock the
+                // deadlines above use and cannot disagree with them.
+                let per_10ms = ctx.tsc_ticks_per_10ms();
+                let ms = if per_10ms == 0 { 0 } else { since * 10 / per_10ms }.max(1);
+                ctx.log_fmt(format_args!(
+                    "xhci: [pass] {} passes and {} re-enums in {} ms ({} passes/s)",
+                    passes - passes_at_report,
+                    reenums - reenums_at_report,
+                    ms,
+                    (passes - passes_at_report) * 1000 / ms,
+                ));
+                passes_at_report = passes;
+                reenums_at_report = reenums;
+            }
+
             // Observe every root port FIRST, before anything in this pass can break out of the loop.
             //
             // The first placement was near the end, after four `break 'poll` sites, so a pass that
@@ -4193,7 +4455,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // leaves - its root port is the hub's, and the hub stays put - so it is instead detected by
             // GET_STATUSing the hub's downstream port, throttled (a control transfer, not free). Either
             // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
-            passes = passes.wrapping_add(1);
+            // The pass counter USED to be incremented here, at the bottom, and moving it to the top
+            // of the loop is not tidying - it is a correction. Six early exits sit between the top
+            // and this line, so what was counted here was "passes that finished", reported under a
+            // name that reads as "passes". The `alive` line has therefore been under-reporting for
+            // the whole investigation, on exactly the machine where passes were suspected of not
+            // finishing.
             // TIME the work half of the pass, not just count passes.
             //
             // Every measurement in this investigation has counted EVENTS - wakes, MSI, messages,
