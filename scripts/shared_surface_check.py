@@ -46,7 +46,16 @@ BASELINE = os.path.join(ROOT, "SHARED-SURFACE.baseline.txt")
 # Where shared code lives. `sdk/` is the seam and is EXPECTED to carry arch cfgs - counted so a reader
 # can see the shape, but it is the one place they are the right answer rather than a smell.
 SHARED_ROOTS = ("services", "sdk")
-ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"')
+# Two spellings of the SAME question, because a build script asks it differently and the answer is
+# just as arch-conditional. `CARGO_CFG_TARGET_ARCH` is the environment variable cargo sets for a
+# `build.rs`, and matching on it there is how a crate maps the ISA to a board fact once instead of
+# repeating a `#[cfg(any(...))]` list at every site (`services/block-driver/build.rs`).
+#
+# It is counted, and that is the point: concentrating seven lists into one table should read as
+# 21 -> 1, not as 21 -> 0. A reduction that is really the instrument going blind is the exact failure
+# this branch keeps finding elsewhere - `arch_boundary_check` could not see two arches, `stack_fit`
+# censused zero frames on riscv64 and called it a pass. A ruler you can step off is not a ruler.
+ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"|CARGO_CFG_TARGET_ARCH')
 
 
 def rel(path):

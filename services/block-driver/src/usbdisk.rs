@@ -23,7 +23,7 @@
 //! hold the core waiting and then answers `-2` (busy) rather than `-1` (failed), and the waiting happens
 //! HERE, between yields, where interrupts are on and every other task still runs.
 
-use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
+use godspeed_sdk::{ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
 
 /// Re-ask while the device says BUSY, yielding in between.
 ///
@@ -185,10 +185,8 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                     // SERVICE, not the kernel, and naming the wrong one sends an operator to read
                     // the wrong log. It said "refused by kernel" on the Pi 4's first userspace-USB
                     // boot, where the kernel was not in the path at all.
-                    "block-driver: {} lba {} refused by {}, status {}",
-                    what, lba,
-                    if cfg!(target_arch = "arm") { "the dwc2 service" } else { "the xhci service" },
-                    code));
+                    "block-driver: {} lba {} refused by the {} service, status {}",
+                    what, lba, crate::xhciblk::XHCI, code));
                 return false;
             }
         }
