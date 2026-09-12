@@ -51,9 +51,12 @@ USB keyboard → xhci driver → ctx.console_push (syscall 20)
 shell → ConsoleRead (syscall 17) → reads the ring
 ```
 
-**`events`** is a stub: it logs "ready" and parks. All logging actually
-short-circuits through the kernel ring buffer to serial+fbcon; nothing goes *to*
-the `events` service.
+**`events`** holds the bounded IPC trace ring (461 lines, `utilities/47_events.md`)
+- it was a stub that logged "ready" and parked when this was written. What has NOT
+changed is the half that matters here: all logging still short-circuits through the
+kernel ring buffer to serial and the framebuffer, and no log line goes *to* the
+`events` service. That is deliberate, not an omission - logging must not depend on a
+service that can be killed (CLAUDE.md 11.4).
 
 ---
 

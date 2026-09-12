@@ -14,9 +14,9 @@
 | Arch | Rust target | QEMU machine | Boot handoff | Console | Status | Evidence |
 |------|-------------|--------------|--------------|---------|--------|----------|
 | **x86-64** | `x86_64-unknown-none` | q35 / bare metal (UEFI) | Limine | 16550 COM1 | **Full OS** - 4 cores, supervisor, `gsh>` shell, storage, networking | Hardware (HP T630) + QEMU; identity 24/0; 80k-round chaos soak |
-| **AArch64** | `aarch64-unknown-none` | `-M virt -cpu cortex-a53` | direct `-kernel` (EL1) | PL011 @ `0x0900_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-aarch64` |
+| **AArch64** | `aarch64-unknown-none` | `-M virt -cpu cortex-a53` + bare metal | direct `-kernel` (EL1) / Pi firmware | PL011 @ `0x0900_0000` (`0xFE20_1000` on a Pi 4) | **Full OS** - 4-core SMP, `gsh>` shell, GENET gigabit ethernet, USB keyboard and mass storage via the VL805 xHCI over PCIe, journalled filesystem | **Raspberry Pi 4 Model B** + QEMU; 100 chaos rounds / 583 kills, 0 panics |
 | **ARM (32-bit)** | `armv7a-none-eabi` | `-M raspi2b` + bare metal | firmware loads `kernel7.img` @ `0x8000` (HYP) | PL011 @ `0x3F20_1000` | **RUNS AN INTERACTIVE SHELL** - the kernel boots to a `gsh>` prompt reading serial input on the Pi 2 (`help`/`version` execute, 0 faults), atop the full stack it built up: the supervisor spawning services from its manifest, `ping`->`pong` capability IPC under preemptive scheduling, per-task address spaces, the neutral spawn path, and PL011 console I/O. Full machine layer + syscalls + user mode + scheduler + IPC + neutral spawn + supervisor + shell | **Raspberry Pi 2 Model B v1.1** (2026-07-21) + QEMU |
-| **RISC-V** | `riscv64imac-unknown-none-elf` | `-M virt` | OpenSBI → S-mode @ `0x8020_0000` | NS16550 @ `0x1000_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-riscv64` |
+| **RISC-V 64** | `riscv64imac-unknown-none-elf` | `-M virt` + bare metal | OpenSBI -> S-mode @ `0x8020_0000` (`0x4020_0000` on a VisionFive) | NS16550 @ `0x1000_0000` (`0x1000_0000` JH7110) | **Full OS** - 4 harts, `gsh>` shell, 1080p60 HDMI, USB keyboard and mass storage, DWMAC gigabit ethernet, Sv39, journalled filesystem. First port with **no arch-neutral code naming the ISA** | **StarFive VisionFive 2 Lite** + QEMU; 22,872-round soak / 136,906 kills, 0 panics |
 | **LoongArch64** | `loongarch64-unknown-none-softfloat` | `-M virt` | direct `-kernel` (DA mode) @ `0x20_0000` | NS16550 @ `0x1fe0_01e0` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-loongarch64` |
 | **s390x** (IBM Z) | `s390x-unknown-none-softfloat` (tier-3, `-Zbuild-std`) | `s390-ccw-virtio` | IPL | SCLP console | **Compiles - BIG-ENDIAN**; boot pending the SCLP console (a protocol, not a register) | `qemu-system-s390x` |
 
@@ -38,9 +38,12 @@ arm32  :  GodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS. 
   `arch/<isa>/` would be a boundary leak; there were none (only stub-completeness gaps in the arch layer
   itself, which the compiler pointed out).
 - **Boot-bounded (all five):** each arch's `_start` + minimal boot brings the neutral kernel to life and
-  drives its console. x86-64 goes all the way to the interactive shell; AArch64, ARMv7, RISC-V, and LoongArch reach the
-  UART-print milestone (the full port - MMU, exception vectors, syscalls, GIC/PLIC, timer, SMP, and the
-  userspace SDK/services - is deliberate future work, tracked in docs/aarch64.md).
+  drives its console. **FOUR of them go all the way to the interactive shell on real hardware** -
+  x86-64, ARMv7 (Pi 2), AArch64 (Pi 4) and RISC-V 64 (VisionFive 2 Lite) - each with the full port
+  behind it: MMU, exception vectors, syscalls, interrupt controller, timer, SMP, and the userspace
+  SDK and services. LoongArch reaches the UART-print milestone; s390x compiles.
+  *(This paragraph said only x86-64 reached a shell and called the rest "deliberate future work". That
+  was true when written and was not revisited as three more ports finished.)*
 - **Enforced, not just achieved:** the boundary is held by four CI guards (`unsafe_check`,
   `contract_check`, `arch_boundary_check`, `dash_check`) plus the multi-arch compile itself. A future ISA
   is a drop-in: add `arch/<new>/` to the `imp` surface, add the `#[cfg(target_arch)]` arm, and CI proves
@@ -56,7 +59,7 @@ arm32  :  GodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS. 
   `riscv64imac` (soft-float), sidestepping the FP-enable step entirely, and booted first try - as did LoongArch (`-softfloat`).
 - **Linker scripts:** `kernel/kernel.ld` (x86, higher-half), `kernel-aarch64.ld` (virt `0x4008_0000`),
   `kernel-riscv64.ld` (virt `0x8020_0000`), `kernel-loongarch64.ld` (virt `0x20_0000`). `kernel/build.rs` selects by target and embeds an empty
-  service-ELF placeholder for the non-x86 targets (real cross-arch services are future work).
+  service-ELF placeholder only for targets with no real services yet (riscv32, LoongArch, s390x); x86-64, ARMv7, AArch64 and RISC-V 64 all embed the real ones.
 
 ## Word size: 32-bit as well as 64-bit (proof, recorded for the future)
 
