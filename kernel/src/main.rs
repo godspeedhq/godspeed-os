@@ -221,6 +221,13 @@ fn banner() {
     // below it changes. A bug report needs the version, the arch, the build sha and the CPU; those
     // stay exactly where they were and in the same order, because logs get grepped.
     //
+    // NO SLOGAN HERE, deliberately. "Small enough to understand. Rigorous enough to trust." lives in
+    // `about`, where a human typed a command asking what this system is. A boot log is read by
+    // someone whose machine just did something unexpected, and a value claim printed unprompted into
+    // that is the one line that would make it read as marketing. The art is a firmware convention
+    // (OpenSBI and U-Boot both do it, and on the VisionFive ours prints directly beneath theirs);
+    // a mission statement is not.
+    //
     // Plain ASCII on purpose. The kernel's framebuffer floor (`bootcon`) draws printable ASCII and
     // DISCARDS escape sequences - no colour, no cursor positioning - so anything cleverer would
     // render as garbage on a machine with no serial port, which is exactly where a boot banner
@@ -235,8 +242,6 @@ fn banner() {
  \_____| \___/  \__,_| |___/ | .__/  \___| \___| \__,_| \____/ |_____/
                              | |
                              |_|
-
-            Small enough to understand. Rigorous enough to trust.
 ");
     crate::kprintln!("GodspeedOS {} {} ({}) - kernel", env!("CARGO_PKG_VERSION"),
                      env!("GODSPEED_TARGET_ARCH"), env!("GODSPEED_GIT_SHA"));
