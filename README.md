@@ -105,15 +105,17 @@ single arch-neutral file.
 | **x86-64** | **Full OS.** The `os.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
 | **AArch64** (Raspberry Pi 4) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4-core SMP, GENET gigabit ethernet, USB keyboard and mass storage through the VL805 xHCI over PCIe, journalled filesystem. |
 | **32-bit ARM** (Raspberry Pi 2) | **Full OS.** Same neutral kernel: 4-core SMP, USB keyboard, USB mass storage and USB ethernet - all three through the one DWC2 controller - plus the filesystem and the shell. |
-| RISC-V 64/32, LoongArch | Compile and boot to their UART. |
+| **RISC-V 64** (StarFive VisionFive 2 Lite) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4 harts on a JH7110, 1080p60 HDMI from a cold start, USB keyboard and mass storage through the onboard hub, DWMAC gigabit ethernet at zero packet loss, Sv39 paging, journalled filesystem. The first port finished with **no arch-neutral kernel code naming the ISA**. |
+| RISC-V 32, LoongArch | Compile and boot to their UART. |
 | s390x | Compiles clean (big-endian). |
 
-All three full ports are validated the same way and to the same bar: `selfcheck` (400-odd assertions),
+All four full ports are validated the same way and to the same bar: `selfcheck` (400-odd assertions),
 then `chaos max-carnage` killing every service repeatedly, then `selfcheck` again, then a USB hotplug,
 then `selfcheck` once more - **zero failures, zero kernel panics, zero liveness wedges**.
 
 See **[docs/multi-arch.md](docs/multi-arch.md)** for the proof, **[docs/arm32-status.md](docs/arm32-status.md)**
-and **[docs/aarch64.md](docs/aarch64.md)** for the two Pi ports, and
+and **[docs/aarch64.md](docs/aarch64.md)** for the two Pi ports,
+**[kernel/src/arch/riscv64/CLAUDE.md](kernel/src/arch/riscv64/CLAUDE.md)** for the RISC-V port, and
 **[kernel/src/arch/CLAUDE.md](kernel/src/arch/CLAUDE.md)** for how to add an ISA.
 
 ## Writing a device driver
