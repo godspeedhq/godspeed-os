@@ -520,6 +520,31 @@ Operationally these drivers were already restartable (their death reclaims their
 resources and the supervisor respawns them); this amendment makes the *trust* claim
 official, not the runtime behaviour.
 
+> **Amendment 2026-09-12 (multi-architecture / DMA census): this section names its members as a LIST,
+> and the list was short. The rule is restated by PROPERTY.** §6.1's table and this section's opening
+> sentence enumerate `xhci`, `ehci` and `dwc2` as the DMA-capable drivers whose trust is
+> machine-dependent. That enumeration is not the rule - the rule is the argument two paragraphs above,
+> which turns only on a device being able to DMA: **any service granted a DMA arena is trust-critical on
+> a machine that cannot confine it.** Two services meet that test and were never listed:
+> `block-driver` (the AHCI command list / FIS / PRDT / data buffers) and `nic-driver` (the TX/RX
+> descriptor rings and packet buffers on e1000, RTL8168, GENET and dwmac alike). Their absence
+> understated the TCB rather than changing it - both were always in it by this section's own reasoning.
+>
+> **What confinement actually covers today, stated as fact rather than intent:**
+> - **`xhci` is the only confined driver in the system.** `ehci` and `block-driver` keep a stale
+>   firmware DMA pointer that confinement would fault, so both run in deliberate passthrough
+>   (`kernel/src/task/mod.rs:593`); `nic-driver` is spawned `confine=false`.
+> - **AMD-Vi is x86-only.** Every `iommu::` entry point on `arm`, `aarch64` and `riscv64` is a stub and
+>   `confine_device` returns `false`. Three of the four shipping ports are therefore entirely in the
+>   "without an IOMMU" case, with no confined driver at all.
+>
+> So the honest reading of this section is: the machine-dependent posture is real and the mechanism
+> works, but it currently bounds exactly one device on one architecture. Everything else that can DMA is
+> trust-critical. This is recorded rather than closed (§26.7) because the remaining cases are blocked on
+> hardware (no SMMU is wired up on any non-x86 board) and on a firmware quirk (the stale pointer), not
+> on effort. `docs/networking.md` and `docs/ahci.md` each carried the opposite claim for their own
+> driver and are corrected in the same change.
+
 > **Amendment 2026-07-16 (SEC-2): a confined USB driver's least-privilege claim is bounded by the
 > console it drives.** A USB *keyboard* driver is, by function, the machine's input path: it delivers
 > keystrokes to the shell via `CONSOLE_PUSH`, and keystrokes *are* commands. The kernel cannot

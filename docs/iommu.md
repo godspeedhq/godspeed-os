@@ -1,9 +1,23 @@
 # IOMMU-backed DMA confinement (H1)
 
-> **Status:** Phase 0 + Phase 1 (a-f) implemented and QEMU-verified on branch
-> `feat/iommu-dma-confinement`. Phase 2 (dropping the drivers from the TCB) is a
-> **proposal pending sign-off** - see the end of this document. Real-hardware
-> (T630 / AMD GX-420GI) IVRS presence is still unconfirmed (needs a flash).
+> **Status: SHIPPED and hardware-confirmed.** Phase 0 + Phase 1 (a-f) are merged;
+> Phase 2 was **signed off and is now `CLAUDE.md` §6.4** (this document's own §5
+> header records the 2026-06-12 adoption). Real-hardware IVRS presence on the T630
+> (AMD GX-420GI) is **confirmed**, not pending - see §4. The branch named here no
+> longer exists; the work is on `main`.
+>
+> **Two scope limits this document did not state, both load-bearing:**
+>
+> 1. **AMD-Vi is x86-only.** Every `iommu::` entry point on `arm`, `aarch64` and
+>    `riscv64` is a stub and `confine_device` returns `false` there. The Pi 2, the
+>    Pi 4 and the VisionFive 2 have no usable SMMU, so **every** DMA-capable driver
+>    on those three ports is unconfined and kernel-equivalent by §6.4's own rule.
+>    Three of the four shipping ports are in the "without an IOMMU" case.
+> 2. **`xhci` is the only confined driver, even on x86.** `ehci` and `block-driver`
+>    keep a stale firmware DMA pointer that confinement would fault, so both run in
+>    passthrough by design (`kernel/src/task/mod.rs:593`), and `nic-driver` is
+>    spawned `confine=false`. "Confinement is applied per driver" (§6.4) is doing
+>    more work in that sentence than it looks: today it selects exactly one.
 
 This is the narrative behind H1, the flagship trusted-base reduction. The spec
 (`CLAUDE.md`) is the authority; this document explains the *why* and the *how*.

@@ -48,7 +48,7 @@ subsystem in the book is, in GodspeedOS, a couple of ordinary restartable servic
   a socket capability the stack minted - authority is explicit, not ambient.
 - **§3.10 (30-minute whiteboard rule):** a kernel TCP/IP stack is tens of thousands of lines no single
   engineer fully holds. Out of the kernel, the stack is just another service we can keep small.
-- **§6 (TCB):** in the kernel, a stack bug is a kernel bug. As an IOMMU-confined restartable service
+- **§6 (TCB):** in the kernel, a stack bug is a kernel bug. As a restartable service
   (like `block-driver` / `xhci`), a stack bug kills and restarts one service - it does not own the box.
 
 The kernel's only involvement is what it already provides to every driver: MMIO/IRQ/DMA capabilities
@@ -85,7 +85,7 @@ not "feature-complete."
   │   - owns the host IP + ports (a resource)    │   mints + revokes SOCKET caps (§7.10)
   │   - routes datagrams <-> sockets             │
   ├─────────────────────────────────────────────┤
-  │  nic-driver  (service, IOMMU-confined)       │   model-specific: e1000 (QEMU/Intel), T630 chipset
+  │  nic-driver  (service, NOT IOMMU-confined)   │   per-board: e1000, RTL8168, GENET, dwmac
   │   - raw Ethernet frames in/out via DMA rings │   MMIO + DMA + IRQ caps (§12.3, §6.4)
   ├─────────────────────────────────────────────┤
   │  Kernel  (routes opaque socket caps only)    │   NO networking - delegated-resource-cap routing
@@ -111,10 +111,15 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
 
 - **Capabilities (§12.3):** `hw_mmio` (the NIC's BARs), `hw_interrupt` (the receive IRQ line), and a
   **DMA arena** for the TX/RX descriptor rings + packet buffers.
-- **IOMMU-confined (§6.4, H1):** the DMA arena is the driver's only reach into RAM; a compromise is
-  bounded to it. So the NIC driver is **least-privilege and restartable**, and on an IOMMU machine it
-  is **not in the TCB** (same posture as the confined USB drivers). All `unsafe` lives behind the SDK's
-  audited `Mmio`/`Dma` wrappers (§18.1) - the driver itself is `unsafe`-free.
+- **NOT IOMMU-confined (§6.4).** This said the opposite, and the correction matters because it is a
+  trust claim. `nic-driver` is spawned `hwclass::pci(0x02_00_00, BAR_AUTO, false)` - the third argument
+  is `confine`, and it is `false` (`services/supervisor/src/main.rs:383`). **`xhci` is the only confined
+  driver in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
+  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs:593`). So the
+  NIC driver's DMA is unconfined: a *buggy* one is bounded by the arena it was granted, but a
+  *compromised* one can point the controller anywhere in RAM, which is kernel-equivalent reach by
+  §6.4's own rule. It is restartable, and it is **in the TCB on every machine today**. All `unsafe`
+  lives behind the SDK's audited `Mmio`/`Dma` wrappers (§18.1) - the driver itself is `unsafe`-free.
 - **Model-specific, like AHCI.** The dev driver is **e1000** (Intel 82540EM) - exhaustively documented
   and emulated by QEMU (`-device e1000`). (`virtio-net` is simpler but paravirtual-only - it cannot run
   on bare metal, so it is not the dev target.) **Phase 0 identified the T630 as a Realtek RTL8111/8168
@@ -220,10 +225,11 @@ Each layer is small and testable; the milestone for each is a concrete wire even
 
 ## 9. TCB posture and restartability
 
-- **`nic-driver`** - IOMMU-confined -> least-privilege -> **restartable**, and **out of the TCB on an
-  IOMMU machine** (§6.4, H1, same as the USB drivers). Its death reclaims its IOMMU/DMA resources; the
-  supervisor respawns it; it re-inits the NIC and re-exposes the frame interface; `net-stack` reacquires
-  it by name and retries (§14.3).
+- **`nic-driver`** - **restartable, but NOT confined and therefore in the TCB** (§6.4). Restartability
+  is real and hardware-proven: its death reclaims its DMA resources, the supervisor respawns it, it
+  re-inits the NIC and re-exposes the frame interface, and `net-stack` reacquires it by name and retries
+  (§14.3). What does *not* follow is the TCB drop - that needs confinement, and it is spawned
+  `confine=false`. Restartable bounds the ACCIDENT; only the IOMMU bounds the COMPROMISE.
 - **`net-stack`** - a restartable service.
   - **UDP is stateless:** a restart loses nothing structural. Sockets are caps; holders see
     `EndpointDead`/`CapRevoked`, reacquire `net-stack` by name, and re-`bind` - the §14.3 client-recovery
@@ -259,7 +265,7 @@ reliability on top of this best-effort substrate - not the kernel, not magic.
 | Phase | Deliverable | Milestone / test | Status |
 |-------|-------------|------------------|--------|
 | **0** | PCI-enumerate + print the NIC (`vendor:device`, BARs, IRQ) | We learn the T630's chipset from one boot line | ✅ done |
-| **1** | `nic-driver` (e1000): raw Ethernet TX/RX via DMA rings + RX IRQ, IOMMU-confined | Send a raw frame; receive a raw frame (host-side listener / loopback) in QEMU | ✅ done |
+| **1** | `nic-driver` (e1000): raw Ethernet TX/RX via DMA rings + RX IRQ | Send a raw frame; receive a raw frame (host-side listener / loopback) in QEMU | ✅ done |
 | **2** | ARP + IPv4 + ICMP in `net-stack` | **`ping` the host** end to end - the networking ping/pong | ✅ done + HW-proven |
 | **3** | UDP + **socket-as-capability** (`resource_mint`/badge/revoke); a `net` shell utility | A service opens a UDP socket cap, send/recv a datagram; non-escalation + revoke pinned (a §22 "socket is a capability" test, mirroring Test 14) | ✅ done (DHCP + DNS ride UDP) |
 | **4** | The **Realtek RTL8168 driver** (`10ec:8168`, the T630's NIC), same frame interface - HW-only, no QEMU model | `ping` from bare metal on the T630 | ✅ done + HW-proven |
@@ -277,7 +283,7 @@ the AHCI/GSFS/file-cap ladder.
 | Not in the kernel | §4.4 |
 | No ambient network - socket caps only | §3.1 |
 | Socket is a delegated resource cap (= file mechanism) | §7.10, P2 |
-| NIC driver IOMMU-confined, restartable, TCB-droppable | §6.4 (H1) |
+| NIC driver restartable (confinement NOT applied, so no TCB drop) | §6.4 (H1) |
 | Receive IRQ routed to the driver | §12.2 |
 | Our own minimal stack, not a port | §3.3, §3.10 |
 | Loud failure, bounded retries | §26.6, §26.7 |

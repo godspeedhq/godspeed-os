@@ -33,11 +33,19 @@ Unlike ATA PIO (port I/O), AHCI is **MMIO + DMA**, exactly like the USB drivers:
 
 ## 3. IOMMU (H1)
 
-AHCI is DMA-capable, so on a machine with an IOMMU it should be **confined** to
-its arena like xhci (§6.4). The T630 has a working IOMMU. The driver is brought up
-in **passthrough** first (get it correct), then confined once all its controller
-DMA is provably inside the granted arena - the same "earned confinement" rule the
-USB drivers follow (docs/iommu.md).
+AHCI is DMA-capable, so on a machine with an IOMMU it *should* be confined to its
+arena like xhci (§6.4). The T630 has a working IOMMU. The driver was brought up in
+**passthrough** first (get it correct), on the "earned confinement" rule the USB
+drivers follow (docs/iommu.md).
+
+**It is still in passthrough, and that is now a decision rather than a stage.** The
+T630's BIOS hands the SATA controller over carrying a stale firmware DMA pointer, and
+confining the device makes the controller's first access fault - the same quirk that
+keeps `ehci` in passthrough. The kernel states it at the policy site:
+`kernel/src/task/mod.rs:593`, *"ehci + block-driver keep a stale firmware DMA pointer
+that confinement would fault, so they stay in passthrough"*. **`xhci` is the only
+confined driver in the system.** So `block-driver` is trust-critical on every machine,
+IOMMU or not, exactly as §6.4 says an unconfined DMA driver must be.
 
 ## 4. Build steps (incremental, against QEMU `ich9-ahci`)
 
@@ -62,12 +70,13 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
   file round-trip works over AHCI (`fs: file round-trip OK`). The whole filesystem
   stack now runs on AHCI. Harness: boot on legacy IDE, the persist disk ALONE on
   `ich9-ahci` (→ port 0), mirroring the T630 (SSD is the only SATA disk).
-- **Step E - confine + promote. ✅ done.** AHCI is now the **only** backend (the
-  `ahci` cargo feature is gone; ATA PIO + the `hw_pio` capability + the IDE probe are
-  retired - the T630's SSD is AHCI-only). block-driver is **IOMMU-confined** to its
-  arena at spawn when an IOMMU is present (H1/§6.4) - exact, because all its DMA
-  (command list / FIS / command table / PRDT / data buffer) is arena-resident; a no-op
-  on a machine without an IOMMU (block-driver then stays trust-critical, §6.4).
+- **Step E - promote. ✅ done. Confinement NOT taken.** AHCI is now the **only** backend
+  (the `ahci` cargo feature is gone; ATA PIO + the `hw_pio` capability + the IDE probe are
+  retired - the T630's SSD is AHCI-only). The confinement half of this step was **not**
+  completed and is not pending: block-driver is spawned `hwclass::pci(0x01_06_01, 5, false)`
+  (`services/supervisor/src/main.rs:338`) and stays in IOMMU passthrough for the firmware
+  stale-pointer reason in §3. Its DMA is arena-resident in practice, but nothing enforces
+  that, so block-driver stays trust-critical on every machine (§6.4).
   Verified: `osdev test blockdev` 3/3 + identity 23/23; unsafe audit back to 413/27
   (the `hw_pio` arch wrappers + `capability/hw_pio.rs` + SDK `pio.rs` removed).
 - **Step F - port recovery (COMRESET). ✅ done** (`f069c85`, hardware-found by the million-round soak).
