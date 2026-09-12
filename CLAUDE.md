@@ -159,11 +159,41 @@ These are the laws that bound every design choice. Any change that violates an i
   │  syscall · interrupts · smp/routing              │
   ├──────────────────────────────────────────────────┤
   │  Architecture Layer  (unsafe boundary)           │
-  │  arch/x86_64                                     │
+  │  arch/<isa>  - one directory per ISA, and the    │
+  │  ONLY place that knows which machine this is     │
   ├──────────────────────────────────────────────────┤
   │  Hardware  (multi-core)                          │
   └──────────────────────────────────────────────────┘
 ```
+
+> **Amendment 2026-09-12 (multi-architecture): this document described a single-ISA system, and had
+> stopped being true some months ago.** It named `arch/x86_64` in the layered view above, in the
+> repository map (§5) and in the TCB table (§6.1), and mentioned RISC-V nowhere at all. There are now
+> **four complete ports, all verified on real hardware** - x86-64 (HP T630, Dell Wyse), ARMv7
+> (Raspberry Pi 2), AArch64 (Raspberry Pi 4) and RISC-V 64 (StarFive VisionFive 2 Lite) - plus three
+> stubs that boot and print (`riscv32`, `loongarch64`, `s390x`). The gap predates the RISC-V work; the
+> constitution was not amended for the ARM ports either.
+>
+> **What this amendment does NOT change is the point of it.** No invariant moves, no kernel
+> responsibility is added, and the TCB does not grow: `arch/<isa>` was always the unsafe boundary
+> (invariant 5, §18.1), and only the directory built for the machine in front of you is compiled into
+> it. What changed is that the noun is now plural.
+>
+> **The property that makes this affordable is worth stating as law, because it is what is actually
+> being defended.** A port is bounded to `arch/<isa>/`: you write that directory and nothing else in
+> the kernel changes. Architecture-neutral code reaches hardware only through the `arch::imp` seam and
+> must never name an ISA - enforced mechanically by `scripts/arch_boundary_check.py` (neutral layers
+> reach hardware only through the seam) and `scripts/arch_seam_check.py` (every arch answers every
+> member of it, discovered from usage rather than a hand-kept list). The RISC-V port was the first
+> completed with **no neutral kernel CODE naming the ISA** - two comments in `memory/allocator.rs` and
+> `task/scheduler.rs` cite it as explanation, which is the honest extent of the claim and the standard
+> the others are being brought to. For comparison, neutral code still names `arm` in 8 places,
+> `aarch64` in 4 and `x86_64` in 3.
+>
+> The rule the operator set for that work, recorded here because it is the bar: **an ISA port is not
+> complete when it boots. It is complete when architecture-neutral code no longer knows that the ISA
+> was added.** Where neutral code still enumerates ISAs by name - the supervisor's `#[cfg(any(...))]`
+> spawn arms, the SDK's `hwclass` list - that is acknowledged debt, not the model.
 
 ### 4.2 SMP View (Per-Core)
 
@@ -215,7 +245,12 @@ os/
   kernel/
     src/
       main.rs
-      arch/x86_64/         # boot.rs, interrupts.rs, context_switch.rs, page_tables.rs, ap_boot.rs
+      arch/                # ONE DIRECTORY PER ISA; `arch::imp` aliases the one being built
+        x86_64/            #   complete - boot.rs, interrupts.rs, context_switch.rs, page_tables.rs, ap_boot.rs
+        arm/               #   complete - ARMv7-A, Raspberry Pi 2 (hardware-verified)
+        aarch64/           #   complete - Raspberry Pi 4 (hardware-verified)
+        riscv64/           #   complete - QEMU virt + StarFive VisionFive 2 Lite (hardware-verified)
+        riscv32/  loongarch64/  s390x/    #   stubs: boot + UART only
       memory/              # frame.rs, page.rs, allocator.rs, ownership.rs
       task/                # task.rs, state.rs, scheduler.rs (per-core)
       ipc/                 # message.rs, endpoint.rs, queue.rs, routing.rs
@@ -317,7 +352,7 @@ os/
 | Component         | Trusted because                                     |
 |-------------------|-----------------------------------------------------|
 | Kernel            | Enforces all isolation                              |
-| `arch/x86_64`     | Direct hardware access                              |
+| `arch/<isa>`      | Direct hardware access. The trust is per-ISA: the directory built for this machine is in the TCB, the others are not compiled |
 | `kernel/smp`      | Concurrent-correctness primitives                   |
 | `supervisor`      | Holds restart + name authority; **spawned directly by the kernel** (init removed, Phase 5); trusted but **restartable** - the kernel respawns it on death (Phase 6, §6.2), so the only non-restartable thing is the kernel itself |
 | `xhci`, `ehci`, `dwc2` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it - least-privilege and restartable - wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
@@ -1081,6 +1116,16 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
 > init - spawns the logger. The supervisor's boot-time spawn failure is still **fatal** (the kernel
 > panics, `"supervisor spawn failed"`, §11.3, §6.2) - now from the kernel's direct spawn rather than
 > an init abort. The non-restartable set is now just **`supervisor` + kernel**.
+
+> **Amendment 2026-09-12 (multi-architecture): the sequence above is the x86-64 one, and THERE IS MORE
+> THAN ONE ENTRY PATH.** `kernel_main` is called only by x86-64's `_start`. The ARM, AArch64 and
+> RISC-V ports bring the machine up themselves (`arm_boot_main`, `aarch64_boot_main`, and the RISC-V
+> S-mode entry) and then join the same neutral kernel. The consequence is a real trap rather than a
+> pedantic one: **anything added to the neutral boot path runs on x86 alone, silently**, and a port
+> that never reaches it shows no error at all. Limine, the HHDM and APIC-supplied SMP topology are
+> x86-64 facts; the others discover memory and harts from a device tree and start secondary cores
+> through their own mechanism (PSCI on ARM, SBI HSM on RISC-V). Everything §11 says about WHAT must be
+> true at the end of boot holds on every port; only the route differs.
 
 The bootloader is **Limine**, accessed via the Limine Boot Protocol. Limine is responsible for loading the kernel image, supplying the physical memory map, the framebuffer descriptor, kernel relocation info, and the SMP topology (APIC IDs of all available cores). See Appendix A for the bootloader rationale and installation story.
 
