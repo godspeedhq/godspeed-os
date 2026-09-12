@@ -1,0 +1,197 @@
+name: release
+
+# Builds every release artefact and attaches it to the GitHub release, so images
+# stop being produced on one developer's laptop and pushed by hand.
+#
+# WHY THIS EXISTS AS A GATE AND NOT JUST A CONVENIENCE: building locally produced
+# artefacts that were MIXED. A branch was switched while a build ran, cargo
+# re-stamped some crates and not others, and two images ended up containing
+# components built from different commits. They looked perfectly normal - right
+# sizes, right names. The `verify` step below is the answer to that, and it is the
+# reason this workflow is worth its minutes.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach to (e.g. v0.16.0)'
+        required: true
+
+permissions:
+  contents: write          # needed to upload assets onto the release
+
+env:
+  # The Limine version this project tracks. Pinned deliberately: a bootloader that
+  # silently moves is a boot failure nobody can bisect. Matches what the README
+  # tells a human to download.
+  LIMINE_TAG: v12.3.1-binary
+
+jobs:
+  artefacts:
+    name: Build release artefacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build the TAG, not the branch tip. The kernel stamps
+          # `git rev-parse --short HEAD` into itself and the shell prints it as
+          # `version`, so an artefact built from a later commit would contradict
+          # its own release notes.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve the version and commit under build
+        id: v
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG"                          >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG at $(git rev-parse --short HEAD)"
+
+      - name: Install Rust toolchain
+        run: rustup show      # honours rust-toolchain.toml (nightly + rust-src + x86_64-unknown-none)
+
+      - name: Add the other bare-metal targets
+        # rust-toolchain.toml pins only x86_64-unknown-none, because that is what a
+        # normal build needs. A release builds all four ports.
+        run: rustup target add armv7a-none-eabi aarch64-unknown-none riscv64imac-unknown-none-elf
+
+      - name: Install rust-objcopy
+        # The ARM, AArch64 and RISC-V scripts turn the kernel ELF into a flat image
+        # with `rust-objcopy -O binary`; the Pi and U-Boot loaders take an image, not
+        # an ELF.
+        run: |
+          rustup component add llvm-tools
+          cargo install cargo-binutils --locked
+
+      - name: Fetch Limine (pinned)
+        # tools/ is gitignored, so the bootloader is fetched rather than committed.
+        # `make` builds the host install tool (`tools/limine/limine`), which
+        # `osdev image` invokes to write the boot sectors - BOOTX64.EFI alone is not
+        # enough.
+        run: |
+          git clone --depth 1 --branch "$LIMINE_TAG" https://github.com/limine-bootloader/limine.git tools/limine
+          make -C tools/limine
+          test -x tools/limine/limine
+          test -f tools/limine/BOOTX64.EFI
+
+      # ---- the same enforcement layer a local build runs -------------------------
+      # A release is the worst possible time to discover a checker was failing.
+      - name: Enforcement layer (source-only checks)
+        run: |
+          set -e
+          for c in commandments unsafe_check dash_check arch_boundary_check arch_seam_check \
+                   shared_surface_check contract_check doc_refs facts_check site_check; do
+            echo "--- $c"
+            python3 "scripts/$c.py"
+          done
+
+      # ---- build the four ports ---------------------------------------------------
+      - name: Build x86_64 image
+        run: cargo run -q -p osdev -- image
+
+      - name: Build arm32 (Raspberry Pi 2)
+        # --release is not optional here: a debug ARM build crash-loops `fs`, whose
+        # service_main frame does not fit the 256 KiB user stack.
+        run: python3 scripts/arm_build.py --release
+
+      - name: Build aarch64 (Raspberry Pi 4)
+        run: python3 scripts/pi4_build.py --release
+
+      - name: Build riscv64 (StarFive VisionFive 2 Lite)
+        run: python3 scripts/riscv_build.py --release --visionfive
+
+      - name: Enforcement layer (checks that need built binaries)
+        # These read target/<triple>/release: whether every managed service is really
+        # embedded, whether the supervisor is NEWER than what it embeds (the trap
+        # that shipped stale services on both Pi ports), and whether each service's
+        # frames fit the stack it is given. They cannot run before a build, and are
+        # meaningless if they do.
+        run: |
+          set -e
+          for c in service_embed_check embed_order_check stack_fit_check; do
+            echo "--- $c"
+            python3 "scripts/$c.py"
+          done
+
+      - name: Collect
+        run: |
+          set -e
+          V="${{ steps.v.outputs.tag }}"
+          mkdir -p dist
+          cp build/os-usb.img                      "dist/godspeed-os-$V-x86_64.img"
+          cp build/kernel7.img                     "dist/godspeed-os-$V-arm32-pi2-kernel7.img"
+          cp build/kernel8.img                     "dist/godspeed-os-$V-aarch64-pi4-kernel8.img"
+          cp build/godspeed-riscv64-visionfive.img "dist/godspeed-os-$V-riscv64-visionfive.img"
+          cp build/config-pi2.txt build/config-pi4.txt dist/
+
+      # ---- THE GATE ---------------------------------------------------------------
+      - name: Verify every image was stamped with the tag's commit
+        # This is the step the whole workflow is built around. Each image must carry
+        # the short sha of the commit being released, and nothing else can be
+        # asserted about it from the outside: same name, same size, wrong contents is
+        # exactly what a mixed build looks like.
+        run: |
+          set -e
+          SHA="${{ steps.v.outputs.sha }}"
+          bad=0
+          for f in dist/*.img; do
+            if grep -qa "$SHA" "$f"; then
+              echo "  OK    $(basename "$f")  carries $SHA"
+            else
+              echo "  FAIL  $(basename "$f")  does NOT carry $SHA"; bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] || { echo "release artefacts do not match the tagged commit"; exit 1; }
+
+      - name: Package
+        run: |
+          set -e
+          V="${{ steps.v.outputs.tag }}"
+          cd dist
+          xz -k -9 -f "godspeed-os-$V-x86_64.img"
+          zip -q -9 "godspeed-os-$V-x86_64.img.zip" "godspeed-os-$V-x86_64.img"
+          rm -f "godspeed-os-$V-x86_64.img"
+          # The Pi zips carry the config.txt the firmware needs; a kernel alone does
+          # not boot either board.
+          cp config-pi2.txt config.txt
+          zip -q -9 "godspeed-os-$V-arm32-pi2.zip"   "godspeed-os-$V-arm32-pi2-kernel7.img"   config.txt
+          cp config-pi4.txt config.txt
+          zip -q -9 "godspeed-os-$V-aarch64-pi4.zip" "godspeed-os-$V-aarch64-pi4-kernel8.img" config.txt
+          rm -f config.txt config-pi2.txt config-pi4.txt
+          # The VisionFive equivalent is the extlinux stanza: the kernel goes on the
+          # stock ESP and a label is APPENDED, never replacing what is there.
+          cp ../boot/visionfive/extlinux-on-stock-esp.conf extlinux.conf
+          zip -q -9 "godspeed-os-$V-riscv64-visionfive.zip" "godspeed-os-$V-riscv64-visionfive.img" extlinux.conf
+          rm -f extlinux.conf
+          sha256sum * > "SHA256SUMS-$V"
+          ls -l
+
+      - name: Upload to the release
+        # Pushing a tag can happen BEFORE the release exists - notes are written by
+        # hand, so the usual order is tag, then write, then publish. Rather than
+        # failing on that ordering, create a DRAFT if there is no release yet: the
+        # artefacts are preserved and attached, and nothing is published under a
+        # placeholder body. If the release already exists this only uploads, and
+        # --clobber makes a re-run replace assets instead of erroring on duplicates.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          V="${{ steps.v.outputs.tag }}"
+          if ! gh release view "$V" >/dev/null 2>&1; then
+            echo "no release for $V yet - creating a DRAFT to hold the artefacts"
+            gh release create "$V" --draft --title "$V" \
+              --notes "Draft created by the release workflow to hold build artefacts. Write the notes and publish."
+          fi
+          gh release upload "$V" dist/* --clobber
+
+      - name: Keep the artefacts on the run too
+        # So a failed or manual run still leaves something to inspect without
+        # touching the release.
+        uses: actions/upload-artifact@v4
+        with:
+          name: godspeed-os-${{ steps.v.outputs.tag }}
+          path: dist/
+          if-no-files-found: error
