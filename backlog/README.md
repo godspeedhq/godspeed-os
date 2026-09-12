@@ -64,6 +64,8 @@ direction.
 | [19](19-networking-does-not-recover-from-a-chaos-storm.md) | Networking does not recover from a chaos storm (Wyse / RTL8168) - fixed, kept open on evidence | Fixed / open on evidence | - |
 | [20](20-audit-followups-code-and-config.md) | What the 2026-09-12 doc audit found in CODE and CONFIG - **all six FIXED**; item 6 awaits a VisionFive boot | Fixed / one on hardware | - |
 | [21](21-nic-backend-chosen-by-isa.md) | `nic-driver` picks its MAC by instruction set on 3 of 4 boards (x86 asks the device); and NET_DEVICE syscalls 42-44 now have no userspace caller | Recorded (26.7) | - |
+| [22](22-pi4-display-blanked-while-the-system-stayed-up.md) | Pi 4 display went blank during `selfcheck` while the shell kept answering typed commands - cause NOT established, discriminator recorded | Open / 1 occurrence | - |
+| [23](23-recorder-crashed-and-selfcheck-did-not-notice.md) | `recorder` branched to address 0 mid-suite, and four assertions passed while it was dead | Open / 1 occurrence | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
