@@ -18,6 +18,6 @@
     2  services/block-driver/src/xhciblk.rs
     3  services/hw-enumerator/src/main.rs
     3  services/net-stack/src/main.rs
-   26  services/nic-driver/src/main.rs
+   10  services/nic-driver/src/main.rs
     7  services/shell/src/main.rs
-   48  services/supervisor/src/main.rs
+   47  services/supervisor/src/main.rs

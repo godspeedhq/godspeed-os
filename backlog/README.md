@@ -63,6 +63,7 @@ direction.
 | [18](18-unsafe-audit-misses-the-sdk.md) | The unsafe audit does not cover the SDK - **CLOSED**; `sdk/` is scanned and its two floors frozen. Open tail: a safe `raw_syscall` wrapper would collapse ~86 of the 90 | Closed / open tail | - |
 | [19](19-networking-does-not-recover-from-a-chaos-storm.md) | Networking does not recover from a chaos storm (Wyse / RTL8168) - fixed, kept open on evidence | Fixed / open on evidence | - |
 | [20](20-audit-followups-code-and-config.md) | What the 2026-09-12 doc audit found in CODE and CONFIG - **all six FIXED**; item 6 awaits a VisionFive boot | Fixed / one on hardware | - |
+| [21](21-nic-backend-chosen-by-isa.md) | `nic-driver` picks its MAC by instruction set on 3 of 4 boards (x86 asks the device); and NET_DEVICE syscalls 42-44 now have no userspace caller | Recorded (26.7) | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
