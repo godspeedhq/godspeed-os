@@ -5,6 +5,27 @@
 record because the fix implements a documented sequence rather than pinpointing the faulty register -
 see *What is NOT established* below, which still stands.
 
+**One further observation, T630, 2026-09-13 (`b3054b53`), recorded as evidence and NOT as a
+recurrence.** After `chaos max-carnage all-services 100 yes` (658 kills, 567 flooded) the first
+post-chaos ping was clean 2/2. Twenty-eight seconds later, inside `selfcheck`, one ping lost its
+FIRST packet and the second replied in 36 ms:
+
+```
+net-stack: ping window closed after 915892 us (44 drains, 0 frames seen, 0 to-our-mac,
+           0 arp-for-us, 0 nic timeouts)  [budget 899999 us, tsc_hz 1996160201]
+Request timed out.
+Reply from 8.8.8.8: bytes=32 time=36ms TTL=117
+```
+
+What is notable is `0 frames seen` across 44 drains - the NIC handed up nothing at all for 915 ms,
+rather than handing up frames that did not match. Selfcheck still passed 461/0, three times, and
+networking was working either side of it.
+
+This is NOT the symptom set above returning: no TX timeout, no RX SILENT, no DHCP failure, one boot.
+It is one packet on the same chip family that this entry concerns, which is why it is written here
+rather than being explained away. A single occurrence discriminates nothing; if the Wyse shows the
+same shape, that is two and worth chasing.
+
 **Verification, same board, same sequence:** ping, `chaos max-carnage all-services 100 yes`, ping
 again WITHOUT a reboot. Every defining symptom is gone:
 
