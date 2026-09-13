@@ -25,14 +25,15 @@ still leaves the finding: nothing was watching. The complement to that experimen
 documented rule with no checker, now `arch_boundary_check` rule 3) is this one: a documented SCOPE
 with no checker.
 
-WHAT IT DOES. It finds the merge base with main, works out whether this branch adds an ISA, and if it
-does, classifies every changed path against the guide's tree. In scope: the new `arch/<isa>/`
+WHAT IT DOES. It finds the merge base with main, works out whether this branch is ISA work - it adds
+an arch directory, or it touches exactly one - and if it is, classifies every changed path against
+the guide's tree. In scope: the new `arch/<isa>/`
 directory, its linker script, and the eleven files `docs/porting.md` marks `+`. Out of scope:
 everything else, reported with the guide's own reason where it has one.
 
-IT IS SILENT ON EVERY OTHER BRANCH, deliberately. A branch that adds no arch directory is not a port,
-and "do not edit the neutral kernel" is not a rule about ordinary work - it is a rule about ports. A
-check that fired on every commit would be turned off within a week.
+IT IS SILENT ON EVERY OTHER BRANCH, deliberately. A branch that touches no arch directory, or that
+touches several (a seam change, by definition), is not a port, and "do not edit the neutral kernel"
+is not a rule about ordinary work. A check that fired on every commit would be off within a week.
 
 THE ESCAPE HATCH IS A SENTENCE, NOT A FLAG. `docs/porting.md` says an unavoidable edit should be made
 and its reason written down. So a commit on the branch may carry a trailer:
@@ -187,14 +188,46 @@ def _changed(base):
     return {p.replace("\\", "/") for p in paths if p}
 
 
-def _new_arches(base):
-    """ISA directories that exist now and did not exist at the base. This IS the port."""
+def _port_arches(base, changed):
+    """Which ISA this branch is working on, and why we say so. `(arches, reason)` or `([], reason)`.
+
+    THE FIRST VERSION OF THIS ASKED THE WRONG QUESTION. It triggered only on a `kernel/src/arch/<isa>/`
+    directory that did not exist at the base, reasoning that a new directory IS the port. That misses
+    the single most likely real port, and it missed it on the very first branch it was pointed at:
+    `docs/porting.md` tells a porter to "start from the nearest existing stub", and `riscv32`,
+    `loongarch64` and `s390x` exist for exactly that. Advancing a scaffold adds no directory, so the
+    check reported "not a port branch" over a tree that was nothing but a port. A gate whose trigger
+    excludes the documented happy path is not a loose gate, it is an absent one.
+
+    The honest question is what the work IS, not whether a directory is new: a branch that touches
+    exactly ONE `arch/<isa>/` is doing ISA-specific work, and the scope rule is about ISA-specific
+    work. The discriminator is sharp in practice because the thing most easily confused with a port is
+    a SEAM change - adding an `arch::imp` member - and that touches every arch directory at once.
+
+    A branch that is not a port and still needs a neutral edit alongside one arch directory pays one
+    sentence in a commit message (`Port-Scope:`), which is what CLAUDE.md 26.7 asks for regardless.
+    That is the right side to err on: a false positive costs a sentence, a false negative costs the
+    thing this file exists to catch.
+    """
     at_base = set()
     r = git("ls-tree", "--name-only", "-d", base, "kernel/src/arch/")
     if r.returncode == 0:
-        at_base = {line.rstrip("/").split("/")[-1] for line in r.stdout.split("\n") if line.strip()}
-    now = {p.name for p in ARCH_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")}
-    return sorted(now - at_base)
+        at_base = {line.rstrip("/").split("/")[-1] for line in r.stdout.splitlines() if line.strip()}
+    now = {q.name for q in ARCH_DIR.iterdir() if q.is_dir() and not q.name.startswith(".")}
+
+    added = sorted(now - at_base)
+    if added:
+        return added, "it adds " + ", ".join(f"kernel/src/arch/{a}/" for a in added)
+
+    touched = sorted({c.split("/")[3] for c in changed
+                      if c.startswith("kernel/src/arch/") and len(c.split("/")) > 4} & now)
+    if len(touched) == 1:
+        return touched, (f"kernel/src/arch/{touched[0]}/ is the ONLY arch directory it touches, so it "
+                         f"is ISA-specific work (a seam change would touch all {len(now)})")
+    if len(touched) > 1:
+        return [], (f"it touches {len(touched)} arch directories ({', '.join(touched)}), which is a "
+                    f"seam or cross-arch change, not a port")
+    return [], "it touches no arch directory at all"
 
 
 def _waivers(base):
@@ -229,14 +262,13 @@ def main():
               "this script exists to catch.")
         return 1
 
-    new = _new_arches(base)
+    changed = _changed(base)
+    new, reason = _port_arches(base, changed)
     if not new and not force:
-        print(f"Port-scope check: not a port branch (no new kernel/src/arch/<isa>/ since "
-              f"{base[:12]}), so the scope rule does not apply. It governs ADDING an ISA, not "
-              f"ordinary work in the kernel.")
+        print(f"Port-scope check: not a port branch since {base[:12]} - {reason}. The scope rule "
+              f"governs work on ONE ISA, not ordinary work in the kernel.")
         return 0
 
-    changed = _changed(base)
     waived = _waivers(base)
     in_scope_dirs = tuple(f"kernel/src/arch/{a}/" for a in new)
 
@@ -260,7 +292,7 @@ def main():
 
     isa = ", ".join(new) if new else "(forced)"
     if violations:
-        print(f"Port-scope check - FAILURES (porting {isa}, base {base[:12]}):")
+        print(f"Port-scope check - FAILURES (porting {isa}, base {base[:12]}; {reason}):")
         print()
         for path, why, source in violations:
             print(f"  {path}")
