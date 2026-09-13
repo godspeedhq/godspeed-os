@@ -160,10 +160,14 @@ def facts():
     if ss_total:
         out.append(("shared surface outside arch/", ss_total,
                     "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
-                    [r"([0-9]+) arch-conditional sites outside"]))
+                    [r"([0-9]+) arch-conditional sites outside",
+                     # `| arch-conditional sites outside `arch/` | **143** | **46** |` - the AFTER
+                     # column. A release note states its numbers as a table, not as a sentence.
+                     r"arch-conditional sites outside[^|]*\|[^|]*\|\s*\*\*([0-9]+)\*\*"]))
         out.append(("shared surface, neutral kernel", ss_kern,
                     "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
-                    [r"([0-9]+) in the neutral kernel"]))
+                    [r"([0-9]+) in the neutral kernel",
+                     r"in the NEUTRAL KERNEL[^|]*\|[^|]*\|\s*\*\*([0-9]+)\*\*"]))
 
     qd = const("kernel/src/ipc/queue.rs", "QUEUE_DEPTH")
     if qd:
@@ -213,7 +217,12 @@ DOC_GLOBS = ["docs/*.md", "utilities/*.md", "services/*/CLAUDE.md", "kernel/src/
              # The PUBLISHED site. Most of its pages are `{{#include}}` views of the files above and
              # cannot drift by construction - but four are written for the site and have no source to
              # be a view OF, so they are exactly where a restated number goes stale unwatched.
-             "website/src/*.md"]
+             "website/src/*.md",
+             # RELEASE NOTES. The most public place a number is restated, written once and then
+             # read by everyone who installs the thing - and historically the last place anyone
+             # re-measures. ALMANAC.md is dated prose and is skipped by the HISTORICAL filter
+             # below; a prepared release note is a present-tense claim.
+             "milestones/RELEASE-*.md"]
 
 # A SECTION REFERENCE IS NOT A VALUE. On this script's first run `queue depth (§8.5)` captured "8"
 # and a `0-16` range captured "0" - two false alarms out of two findings. A checker that cries wolf
