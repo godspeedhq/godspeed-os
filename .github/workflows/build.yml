@@ -9,6 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # port_scope_check.py diffs the branch against its merge base with main, which a shallow
+          # clone does not have. It reports that it could not run rather than passing quietly, so a
+          # depth-1 checkout would turn this job red for the wrong reason.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup show
@@ -53,6 +58,12 @@ jobs:
 
       - name: Arch-boundary check (no arch-specific code in neutral layers)
         run: python3 scripts/arch_boundary_check.py
+
+      # Silent on any branch that does not add an ISA. On one that does, it is the only check that
+      # can see an edit to a file `docs/porting.md` marks do-not-touch - the others all ask whether
+      # a RULE was broken, and an ordinary neutral-kernel edit breaks none of them.
+      - name: Port-scope check (a port writes arch/<isa>/ and eleven named files, nothing else)
+        run: python3 scripts/port_scope_check.py
 
       - name: "Dash check (ASCII hyphen only, CLAUDE.md section 21)"
         run: python3 scripts/dash_check.py

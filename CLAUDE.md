@@ -352,6 +352,10 @@ os/
                          #   exercises the claim, because a count is a proxy and a build is not
     shared_surface_check.py #  ratchets arch-conditional code ABOVE the kernel (the other axis:
                          #   `target_arch` there is usually "which BOARD am I on")
+    port_scope_check.py  #   ...and the one the other four cannot answer: did the port EDIT anything
+                         #   outside `arch/<isa>/` and the eleven files `docs/porting.md` marks `+`.
+                         #   They all ask whether a RULE was broken; an ordinary edit to a neutral
+                         #   kernel file breaks none of them, so five ran green over exactly that
     dash_check.py        #   no em/en dashes anywhere (§21)
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds

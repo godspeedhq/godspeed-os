@@ -12,8 +12,11 @@ that, and how to tell the difference between the two without asking anyone.
 That last sentence is the whole point. It is not a warning about carelessness - it is a diagnostic.
 Every file outside the seam that a port has to edit is a place where some earlier port left an
 assumption behind, and the right response is to fix the assumption rather than to add your ISA to a
-list. Four separate checkers exist to tell you when that is happening; they are in
-[How you know where you are](#how-you-know-where-you-are).
+list. Six checkers exist to tell you when that is happening; they are in
+[How you know where you are](#how-you-know-where-you-are). One of them,
+`scripts/port_scope_check.py`, enforces this paragraph literally: it reads the tree below, works out
+from your own diff that you are adding an ISA, and names every file you touched that the tree marks
+do-not-touch.
 
 ---
 
@@ -103,9 +106,9 @@ answered by every arch including the scaffolds.
 
 | what | why it is here |
 |------|----------------|
-| `syscall.rs` (4) | `raw_syscall`, one body per ISA. A trap instruction and its register convention are properties of the instruction set and of nothing else. §18.1 names this file by hand. **You will write one of these. It is expected.** |
-| `adversarial.rs` (6) | Deliberate ring-3 faults for §22 A14/C2 - a non-canonical read and a trapping divide, which have no portable spelling. **You do not need these to boot**; see `backlog/24` for why none of them currently runs off x86 anyway. |
-| `ipc.rs` (1) | A timeout clamp on `target_pointer_width`, not on your ISA. If you are 64-bit it does not apply; if you are 32-bit it already covers you. |
+| `sdk/rust/src/syscall.rs` (4) | `raw_syscall`, one body per ISA. A trap instruction and its register convention are properties of the instruction set and of nothing else. §18.1 names this file by hand. **You will write one of these. It is expected.** |
+| `sdk/rust/src/adversarial.rs` (6) | Deliberate ring-3 faults for §22 A14/C2 - a non-canonical read and a trapping divide, which have no portable spelling. **You do not need these to boot**; see `backlog/24` for why none of them currently runs off x86 anyway. |
+| `sdk/rust/src/ipc.rs` (1) | A timeout clamp on `target_pointer_width`, not on your ISA. If you are 64-bit it does not apply; if you are 32-bit it already covers you. |
 
 ### 33 above the kernel - where the real work is left
 
@@ -196,14 +199,15 @@ whose only alternative is a second copy of a fact `block-driver/build.rs` alread
 
 ## How you know where you are
 
-Four checkers, and each answers a different question. None of them is optional and all of them run
+Six checkers, and each answers a different question. None of them is optional and all of them run
 against your tree without hardware.
 
 | run this | it tells you |
 |----------|--------------|
 | `python scripts/arch_seam_check.py` | which `arch::imp` members your arch has not answered yet |
 | `python scripts/arch_boundary_check.py` | whether neutral kernel code names an ISA or contains asm |
-| `python scripts/shared_surface_check.py` | whether you GREW the arch-conditional surface. **This is the one that catches "I edited something I should not have".** It refuses the build and names the file. |
+| `python scripts/shared_surface_check.py` | whether you GREW the arch-conditional surface. It refuses the build and names the file. It counts arch-conditional SITES, so it sees an added `#[cfg(target_arch)]` and nothing else - an ordinary edit to a neutral file adds no site and passes |
+| `python scripts/port_scope_check.py` | **whether you edited anything outside the scope above.** This is the one that catches "I edited something I should not have", and until 2026-09-13 nothing did: the four checkers around it all ask whether a RULE was broken, and an ordinary edit to `kernel/src/ipc/routing.rs` breaks none of them. It reads the tree on this page, notices from your diff that you are adding an ISA, and names every out-of-scope file with the reason this page gives. An unavoidable edit is cleared by a `Port-Scope: <path> - <reason>` trailer on any commit, which is this page's "write down why" made mechanical |
 | `python scripts/scaffold_check.py` | how far a fresh ISA actually gets with only `arch/<isa>/` written - the bounded-port test itself |
 | `python scripts/line_ending_check.py` | whether a file a BOOTLOADER reads has picked up CRLF. A Windows checkout produces it silently, and U-Boot then reads the trailing CR as part of every FILENAME - a perfect menu that boots nothing (`backlog/26`) |
 
