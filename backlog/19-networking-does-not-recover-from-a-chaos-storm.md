@@ -37,6 +37,23 @@ Reply from 8.8.8.8: bytes=32 time=36ms TTL=117
 - **The pre-chaos selfcheck is clean on both.** Verified on the Wyse: zero `ping window closed` lines
   before the first `ran 461, failed 0`. So it needs the storm to have happened.
 
+**ARM32 DOES NOT REPRODUCE IT, and that is the useful half.** The Pi 2 ran the same sequence on
+2026-09-13 and its ping windows are a different shape entirely:
+
+```
+arm32:  89 drains, 25 frames seen,  3 to-our-mac, 3 arp-for-us   [tsc_hz 999996]
+arm32:  90 drains, 105 frames seen, 0 to-our-mac, 1 arp-for-us
+x86:    44 drains, 0 frames seen,   0 to-our-mac, 0 arp-for-us
+```
+
+On x86 the NIC hands up NOTHING. On arm32 it hands up plenty - 105 frames in one window - and the
+echo reply is simply not among them. Those are different faults, so the x86 one is **not** a shared
+`net-stack` bug: it is on the RTL8168 side, which is what this entry has always been about. A
+cross-architecture negative is worth more here than another x86 repeat would have been.
+
+(arm32 loses the odd packet too, but with frames flowing and ARP answered it looks like ordinary LAN
+behaviour rather than this fingerprint. Not chased, and not claimed as the same thing.)
+
 **What it is NOT.** None of the defining symptoms below returned: no TX timeout, no RX SILENT, no
 DHCP failure, one boot to get networking back. `selfcheck` passed 461/0 three times on each machine,
 and pings either side of the failure were clean. So the `dd74d4c1` fix stands; this is a narrower
