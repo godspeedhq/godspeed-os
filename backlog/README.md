@@ -67,6 +67,7 @@ direction.
 | [22](22-pi4-display-blanked-while-the-system-stayed-up.md) | Pi 4 display went blank during `selfcheck` while the shell kept answering typed commands - cause NOT established, discriminator recorded | Open / 1 occurrence | - |
 | [23](23-recorder-crashed-and-selfcheck-did-not-notice.md) | `recorder` branched to address 0 mid-suite, and four assertions passed while it was dead | Open / 1 occurrence | - |
 | [24](24-adversarial-faults-run-on-one-port.md) | The 22 A14/C2 ring-3 fault tests run only on x86-64 under QEMU; the arm and aarch64 fault primitives exist but no build reaches them, and riscv64 has none | Recorded (26.7) | - |
+| [25](25-pci-selector-layout-is-packed-above-the-kernel.md) | `hw-enumerator` packs a host-bridge config selector that each arch then unpacks - addressing is mechanism and belongs in `arch/` | Recorded (26.7) | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.

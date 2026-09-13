@@ -94,9 +94,27 @@ impl Found {
 /// Pi 4   bus<<20 | dev<<15 | func<<12     (through the root complex config window)
 /// ```
 ///
-/// The kernel performs the access and enforces which registers may be reached. It never learns
-/// either encoding - so a third platform with a third layout needs no kernel change at all, which is
-/// the whole claim D2 makes.
+/// The kernel performs the access and enforces which registers may be reached.
+///
+/// **It DOES learn the encoding, and the sentence that used to sit here said otherwise.** It read
+/// "it never learns either encoding - so a third platform with a third layout needs no kernel change
+/// at all, which is the whole claim D2 makes", and both halves are false. `cfg_read_gated` on x86
+/// masks `sel & 0x00FF_FF00` and ORs the mechanism-#1 enable bit, which only means anything in the
+/// layout above it; the aarch64 one opens with `let bus = (sel >> 20) & 0xFF` to range-check the bus,
+/// which only means anything in the ECAM layout. The selector layout is a CONTRACT between this
+/// function and each arch's `cfg_read_gated`, written out in both places, and a third layout needs a
+/// change at both ends.
+///
+/// What D2 actually claims is intact and is worth stating correctly, because it is the valuable part:
+/// PCI **semantics** left the kernel. What a class code means, which device is "the NIC", how to walk
+/// a bus - all of that is here now, and none of it is in ring 0 (§4.4, §26.10). The kernel kept
+/// exactly the thing a service may not have: the access itself, and the authority derived from it.
+///
+/// The residue is that this service does arch-specific BIT-PACKING, which is the one job it should
+/// not have - naming a device is policy, addressing it is mechanism. The clean form is a neutral
+/// `(bus, device, function)` in the syscall with each arch translating to its own hardware layout,
+/// which would take these two lines to zero. That is a kernel-and-SDK change across three ports, so
+/// per §26.7 it is recorded in `backlog/25` rather than half-started here.
 ///
 /// `None` means the KERNEL REFUSED: either this service does not hold `PCI_CFG`, or the access is
 /// one the machine will not admit. An ABSENT DEVICE IS NOT A REFUSAL - the bus floats high and the
