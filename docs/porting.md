@@ -48,6 +48,24 @@ The compiler is the other half of the same answer. `cargo check -p kernel --targ
 error OUTSIDE `arch/<isa>/` is a different thing entirely: it is a boundary leak, and the fix is a
 new `arch::imp` member, not a special case at the call site.**
 
+### Before you write the trap handler
+
+`arch/<isa>/` **is** kernel, so a mistake there does not kill a service - it kills the machine, and
+three of the four ways it does so are SILENT. Read
+[**"How an arch implementation HALTS THE MACHINE"**](../kernel/src/arch/CLAUDE.md) before the trap
+handler, not after the first mystery halt. It covers, with the incident that taught each:
+
+- a fault report that can itself fault (re-enters forever: no output, no panic, one core dark);
+- a hardware wait with no bound, or a bound whose result nobody reads;
+- code published as DATA with no instruction-cache sync (executes a dead service's text, and only on
+  RESPAWNS, so boot looks fine);
+- a watchdog quantum stubbed to `0`, which does not mean "no limit" - it meant no wedge detection at
+  all for a whole port's bring-up;
+- a `halt_all_cores` that halts only the caller.
+
+The three scaffold stubs carry the warning at the exact function that causes each, so a port
+inherits it rather than rediscovering it.
+
 ### Two rules the boundary rests on
 
 - **No inline asm and no named-arch reference outside `arch/`.** `scripts/arch_boundary_check.py`

@@ -4,6 +4,13 @@
 //! Same `arch::imp` surface as x86_64/aarch64/riscv64; the neutral kernel compiles for loongarch64 with
 //! only this file written. Bodies are stubs; real bodies (LoongArch page tables/DMW, CSR trap vector,
 //! extended IRQ controller, stable timer) come later.
+//!
+//! **BEFORE YOU WRITE THE TRAP HANDLER, read "How an arch implementation HALTS THE MACHINE" in
+//! `kernel/src/arch/CLAUDE.md`.** The single most expensive bug on the RISC-V port was a fault
+//! report that could itself fault: the handler re-entered, reported, faulted, forever - no output,
+//! no panic, one hart dark. The re-entrancy guard belongs in the handler from the first line of it,
+//! not after the first mystery halt, and the second report must say the least it possibly can
+//! through the lock-free writer below and then stop.
 
 #![allow(unused_variables, dead_code)]
 
@@ -146,8 +153,21 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
 /// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
 /// see the aarch64 implementation for the shape (a published flag, checked here).
+/// Called from the timer tick on every core so a panic can stop the machine rather than one core.
+///
+/// **STUB: a no-op here means the panic on another core never reaches this one.** Pairs with
+/// `halt_all_cores` above and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
 pub fn panic_halt_check() {}
 
+/// Stop EVERY core, not just this one. Called from the panic path (§6.2, §19).
+///
+/// **STUB, and the consequence is the point: a panic on one core currently leaves the others
+/// RUNNING**, executing against whatever state the panic was about - a machine in an undefined
+/// state, reporting nothing. This spins the CALLER and signals nobody.
+///
+/// A real body must reach the other cores (IPI, SBI HSM, SGI - whatever this ISA has), and it must
+/// do so BEFORE SMP is enabled, not after. See "How an arch implementation HALTS THE MACHINE" in
+/// `kernel/src/arch/CLAUDE.md`, item 5.
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
@@ -215,6 +235,21 @@ pub mod page_tables {
     ///
     /// # Safety
     /// `_root` must be a page-table root this task owns.
+    /// Make a service's freshly written TEXT visible to the INSTRUCTION fetcher, on every hart that
+    /// could run it.
+    ///
+    /// **STUB, and this is the one that executes GARBAGE rather than failing.** A loader writes text
+    /// through the DATA path; on a split-cache arch the instruction fetcher does not see it, and a
+    /// sync instruction is often HART-LOCAL - so a core that did not run the loader executes whatever
+    /// its I-cache still holds, which is a DEAD service's text out of a recycled frame.
+    ///
+    /// Boot spawns look fine; only RESPAWNS fail, because a boot spawn gets fresh frames. The
+    /// signature is unmistakable once known: the same faulting PC every time, only on SOME cores, and
+    /// the PC disassembles mid-instruction.
+    ///
+    /// x86-64 is a legitimate no-op here (coherent with respect to instruction fetch). **Copying that
+    /// no-op onto a weak arch is the mistake.** See `arch/CLAUDE.md`, item 3, and
+    /// `arch/aarch64/mod.rs` / `arch/arm/usermode.rs` for real bodies.
     pub unsafe fn finalize_service_address_space(_root: u64) {}
 
     /// Free a task's page-table root and the structure below it, at task death.

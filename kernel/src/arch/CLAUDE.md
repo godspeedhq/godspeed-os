@@ -217,6 +217,109 @@ MUST add cache maintenance (clean before a device read of a CPU-written buffer; 
 read of a device-written buffer), either by mapping the arena non-cacheable or via a `dma_sync`-style
 hook the accessors call. This is separate from the SMMU/H1 posture `docs/aarch64.md` already flags.
 
+## How an arch implementation HALTS THE MACHINE, and the rules that prevent it
+
+The section above is about being WRONG - a stale read, an under-flushed TLB, an incoherent buffer.
+This one is about being SILENT, which this project ranks worse (invariant 12, and the Rule Above The
+Rules: only the kernel is unkillable, so a kernel bug is the one that takes everything with it).
+
+**`arch/<isa>/` is kernel. A mistake here does not kill a service - it kills the machine.** Every
+failure below was found on the RISC-V port by running `chaos max-carnage`, and in each case nothing
+above ring 0 was at fault: the arch layer was. They are gathered here because a port rediscovers them
+as heisenbugs otherwise, and because three of the four are INVISIBLE - the machine does not say
+anything, it just stops.
+
+### 1. A trap handler that can fault while reporting a fault - SILENT HALT
+
+Reporting a fault runs real code: it reads task state, walks a page table, formats, writes to a UART.
+Every line of that can itself fault on the corrupt state that caused the first fault. When it does,
+the trap handler re-enters, reports, faults, forever. **No output, no panic, one hart dark, nothing to
+read.**
+
+Observed exactly: a chaos run left core 0 pinned at stage `TRAP_ENTRY` with its interrupt count
+frozen - the signature of an EXCEPTION loop, since an interrupt counter only counts interrupts while
+the stage keeps being re-stamped. An earlier boot showed the other half directly: a kernel-mode load
+page fault inside `core::fmt::write`, which is the reporting path faulting.
+
+> **THE RULE. A fault report needs a re-entrancy guard, and the second report must say the LEAST it
+> possibly can, through a LOCK-FREE writer, and then halt.** Least, because everything it might add
+> is a thing that could fault: no task name, no page walk, no formatting. The fault address and cause
+> of the SECOND fault are what a reader needs and they are already in hand.
+
+Two ways to get this wrong that both LOOK right: putting the guard where it is never reached on the
+faulting path, and taking the guard but never releasing it - the second turns the first real fault
+into a permanent mute. `arch/riscv64/trap.rs::report_fault` is the worked example.
+
+### 2. A wait with no bound - WEDGE
+
+A spin on a hardware condition that never becomes true is a core that never comes back. The neutral
+kernel's liveness watchdog will eventually panic on it (item 4), which is the loud outcome and the
+one to want - but only if the watchdog is armed on this port.
+
+The subtler version is a bounded wait whose RESULT NOBODY READS. The xHCI reset on RISC-V returned a
+bool from `spin()` that no caller checked, so a controller that never left reset was programmed
+anyway; the health line said `1 HID, disk yes` while 400 of 412 probes failed.
+
+> **THE RULE. Every hardware wait is bounded, and every bound RETURNS A RESULT THE CALLER READS. A
+> `#[must_use]` on the helper is cheap and catches it at compile time.** A count is not a duration:
+> "spin 10000 times" is a different wall-clock bound on every machine, so bound on the arch's own
+> time source where one exists.
+
+### 3. Code published as DATA without an instruction-cache sync - EXECUTES GARBAGE
+
+A loader writes a service's text through the data path. On an arch with split caches that text is not
+visible to the instruction fetcher until it is made so, and on RISC-V `fence.i` is **hart-local** - so
+a hart that did not run the loader can execute whatever its I-cache still holds. What it runs is a
+DEAD service's text out of a recycled frame.
+
+> **THE SIGNATURE, because it is unmistakable once seen: the same faulting PC and fault address every
+> time, but only on SOME harts, and the PC disassembles mid-instruction.** The bytes being fetched are
+> not the bytes in the file. Boot spawns are fine and only RESPAWNS fail, because a boot spawn gets
+> fresh frames.
+
+> **THE RULE. `finalize_service_address_space` is where a port pays this**, and it must reach every
+> hart that could run the task, not just the one that built the page table. arm32 has the same
+> obligation (`publish_user_pages_to_other_cores`); x86-64 does not, because its caches are coherent
+> with respect to instruction fetch. Matching the x86 no-op is the mistake.
+
+### 4. A liveness watchdog that is armed with a stubbed number - NO WEDGE DETECTION AT ALL
+
+`ticks_before_wedge` (or whatever the port calls its quantum) gates the neutral watchdog. A stub
+returning `0` does not mean "no limit"; on this codebase it meant the watchdog never armed, and the
+ARM port ran for its whole bring-up with **no cross-core wedge detection**, so every hang was silent
+instead of a loud panic naming the core and its last task.
+
+> **THE RULE. A stub that returns zero must say, in a comment, whether zero means "disabled" or
+> "unlimited" to the neutral caller - and the honest stub for a number a watchdog reads is one that
+> disables the feature LOUDLY rather than quietly.** Same class as `panic_halt_check`: a no-op there
+> means a panic on one core leaves the others running, which is a machine in an undefined state
+> reporting nothing.
+
+### 5. A panic that stops only the panicking core - UNDEFINED STATE, STILL RUNNING
+
+`halt_all_cores` and `panic_halt_check` exist so that a panic on any core stops every core (§6.2,
+§19). A port whose `halt_all_cores` only halts the caller leaves the other cores executing against
+whatever state the panic was about.
+
+> **THE RULE. If the port cannot signal the other cores yet, SAY SO IN THE STUB.** The loongarch64
+> stub does: *"a no-op on this port until its `halt_all_cores` actually signals the other cores"*.
+> That is the right shape - an unimplemented thing that names its own consequence.
+
+### What to do with this when you write `arch/<isa>/`
+
+Bring the port up in this order, because each step makes the next one's failures visible rather than
+silent:
+
+1. **UART first, and a lock-free writer with it.** Everything below is diagnosed through it, and the
+   panic path cannot take a lock.
+2. **The trap handler, with the re-entrancy guard from day one.** Not after the first mystery halt.
+3. **The watchdog quantum, real.** A wedge you can see is a bug; a wedge you cannot is a week.
+4. **`halt_all_cores` that actually reaches the other cores**, before SMP is enabled.
+5. **I-cache publication**, before the first service RESPAWN - boot spawns will not show the bug.
+
+Then run `chaos max-carnage` and read the counters, not the summary. Three of the five above were
+found by a ratio inside a health line that ended "disk yes".
+
 ## Porting a driver: the method (the doctrine)
 
 Supporting new hardware does not mean inventing a driver from the datasheet. Read the **working**
