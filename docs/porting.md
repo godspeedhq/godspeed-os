@@ -114,6 +114,7 @@ against your tree without hardware.
 | `python scripts/arch_boundary_check.py` | whether neutral kernel code names an ISA or contains asm |
 | `python scripts/shared_surface_check.py` | whether you GREW the arch-conditional surface. **This is the one that catches "I edited something I should not have".** It refuses the build and names the file. |
 | `python scripts/scaffold_check.py` | how far a fresh ISA actually gets with only `arch/<isa>/` written - the bounded-port test itself |
+| `python scripts/line_ending_check.py` | whether a file a BOOTLOADER reads has picked up CRLF. A Windows checkout produces it silently, and U-Boot then reads the trailing CR as part of every FILENAME - a perfect menu that boots nothing (`backlog/26`) |
 
 The first two prove no rule is broken. `scaffold_check` is different in kind: it BUILDS the scaffold
 arches and reports how far each got, because a count is a proxy and a build is not. Its ladder:

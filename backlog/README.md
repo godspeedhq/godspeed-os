@@ -68,7 +68,7 @@ direction.
 | [23](23-recorder-crashed-and-selfcheck-did-not-notice.md) | `recorder` branched to address 0 mid-suite, and four assertions passed while it was dead | Open / 1 occurrence | - |
 | [24](24-adversarial-faults-run-on-one-port.md) | The 22 A14/C2 ring-3 fault tests run only on x86-64 under QEMU; the arm and aarch64 fault primitives exist but no build reaches them, and riscv64 has none | Recorded (26.7) | - |
 | [25](25-pci-selector-layout-is-packed-above-the-kernel.md) | `hw-enumerator` packs a host-bridge config selector that each arch then unpacks - addressing is mechanism and belongs in `arch/` | Recorded (26.7) | - |
-| [26](26-visionfive-uboot-cannot-load-large-files.md) | The VisionFive's U-Boot fails every multi-MB read from the SD card, including StarFive's own initrd; card and image both proven good. Blocks riscv64 hardware verification | Open / board-side | - |
+| [26](26-visionfive-uboot-cannot-load-large-files.md) | VisionFive would not boot: `extlinux.conf` was CRLF, so U-Boot read the trailing CR as part of every FILENAME - **CLOSED**, and now enforced by `line_ending_check.py` | Closed | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.

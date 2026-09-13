@@ -2,7 +2,10 @@
 
 **Severity:** blocks hardware verification of the riscv64 port. Not a GodspeedOS kernel defect - the
 failure is in U-Boot, before our first instruction runs.
-**Status: CAUSE FOUND (CRLF in `extlinux.conf`), FIXED, awaiting one confirming boot.**
+**Status: CLOSED 2026-09-13.** Cause was CRLF in `extlinux.conf`. Fixed, and the board booted
+GodspeedOS at `7fa2e2e2`: 4 harts, `xhci` before `block-driver`, no `ehci`, dwmac up, ping
+8.8.8.8 3/3 at 21-59 ms. Now enforced by `scripts/line_ending_check.py` in the build gates
+and in CI.
 
 > **This entry previously concluded "board-side: the board cannot load large files, try another card
 > or PSU". THAT WAS WRONG and is corrected below.** It was written from a reading of the evidence that
@@ -107,14 +110,30 @@ Proven before committing: 2 CRs in, 0 out, and the script parses.
    2.7 MB file through Windows into the populated ESP does not damage it for U-Boot. That also means
    the file is sitting on a card that boots, which is what makes the next step a single command.
 
-## The one confirming boot
+## The confirming boot, and what it also confirmed
 
-Re-run `scripts\deploy_visionfive.ps1` (it now writes the config LF-only and refuses if a CR reaches
-the card), then boot. Expect the menu to select `GodspeedOS riscv64` and the kernel to load instead of
-"Failed to load".
+`7fa2e2e2` booted on the board. That was riscv64's FIRST hardware run of anything on
+`portability-hardening`, so it confirmed seven changes at once:
 
-That boot is also the FIRST time this port runs any of `portability-hardening` on hardware, so it
-confirms far more than this entry: see "What stays blocked" below.
+| what | evidence |
+|---|---|
+| `db3b800b` USB host before the disk | `task: 'xhci' spawned OK` precedes `task: 'block-driver' spawned OK`, and no `COULD NOT REACQUIRE` |
+| `has_ehci` false on this port | **zero** occurrences of `ehci` in the whole log (it used to fall inside `not(any(arm, aarch64))`) |
+| `has_hw_enumerator` | `task: 'hw-enumerator' spawned OK` |
+| one `USB_IMAGES` table | `xhci` row present and spawned |
+| TSC floor default-safe (`7f8f6924`) | ping 8.8.8.8 3/3, **21-59 ms** - a real RTT. The old 100 MHz floor rejected this port's 4 MHz counter and reported 0 |
+| `storage_is_usb` board table | block-driver came up on the xhci path |
+| seam members (`b78c8d79`, `3c75638e`) | 4 harts, 4 cores ready, dwmac PHY link up, shell at `gsh>` |
+
+## What stopped this recurring
+
+`scripts/line_ending_check.py` - reads the `eol=lf` patterns from `.gitattributes` (last-match-wins,
+so a later `binary` rule overrides) and refuses any of them containing a carriage return. Wired into
+`arm_build.py`, `riscv_build.py`, `build.yml` and `release.yml`.
+
+On its first run it found two more: `scripts/qemu_iommu.sh` was CRLF with `#!/usr/bin/env bash^M`
+(latent, would fail on Linux), and `boot/**  text eol=lf` had wrongly marked the 58 KB device tree
+blob as text, which git would eventually have "normalized". Both fixed in the same commit.
 
 ## What stays blocked
 

@@ -57,6 +57,12 @@ jobs:
       - name: "Dash check (ASCII hyphen only, CLAUDE.md section 21)"
         run: python3 scripts/dash_check.py
 
+      # A CRLF `extlinux.conf` boots nothing on the VisionFive while showing a perfect menu
+      # (backlog/26). CI runs on Linux, where a checkout is LF and this passes trivially - that is
+      # the point: it catches a CRLF file COMMITTED from a Windows tree before it reaches a card.
+      - name: "Line-ending check (files a bootloader reads must be LF)"
+        run: python3 scripts/line_ending_check.py
+
       - name: Doc reference check (no doc points at a file that does not exist)
         run: python3 scripts/doc_refs.py
 

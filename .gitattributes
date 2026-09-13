@@ -38,6 +38,12 @@
 # next board will bring a file type nobody thought to add.
 boot/**   text eol=lf
 
+# ...EXCEPT the binaries in it. `boot/**` above marks everything text, which would have git
+# "normalize" a device tree blob - 58 KB of binary silently rewritten. Caught by
+# `scripts/line_ending_check.py` on its first run, before any checkout acted on it. A later rule
+# wins in this file, so this must stay BELOW the line above.
+*.dtb    binary
+
 # ─── Binary: never normalize line endings, never diff as text ─────────────────
 *.img    binary
 *.bin    binary

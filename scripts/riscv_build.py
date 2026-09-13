@@ -83,7 +83,8 @@ def gates():
     """The same set `arm_build.py` runs. Listed explicitly, not discovered, so ADDING a checker is a
     decision each build path makes rather than something that silently changes what a build enforces."""
     for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
-                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py"):
+                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py",
+                  "line_ending_check.py"):
         r = subprocess.run([sys.executable, os.path.join("scripts", check)],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
