@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! net-stack - the model-AGNOSTIC half of networking (docs/networking.md, Phase 2).
 //!
 //! nic-driver knows one NIC and speaks raw Ethernet frames; net-stack knows no hardware and speaks
@@ -1643,6 +1650,7 @@ fn link_is_up(ctx: &ServiceContext) -> bool {
     }
 }
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is

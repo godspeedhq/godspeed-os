@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! `mem-pressure` - a spawn-on-demand memory pressure victim for the shell's `chaos mem-pressure`
 //! command. Idle until spawned; on spawn it allocates 4 MiB chunks up to its contract memory
 //! limit, asserting the §22 S7 invariant - once `AllocDenied` appears it must be STICKY (an `Ok`
@@ -14,6 +21,7 @@
 
 use godspeed_sdk::{ServiceContext, service_context::AllocError};
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Force the EL0 fault the kernel's recovery path is supposed to survive (see this crate's

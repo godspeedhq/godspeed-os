@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // SPDX-License-Identifier: GPL-2.0-only
 #![no_std]
 #![no_main]
@@ -312,6 +313,7 @@ impl core::ops::Deref for ShellCtx {
     fn deref(&self) -> &ServiceContext { &self.inner }
 }
 
+#[allow(unsafe_code)] // the exported entry symbol; see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),

@@ -1523,6 +1523,23 @@ hardware/ABI layer named in §18.1 - and all kernel code outside the four
 permitted layers. A driver service that writes `unsafe` directly (rather than
 going through the SDK's safe `Mmio`/`Dma` wrappers) is rejected.
 
+> **Amendment 2026-09-13: this is enforced by the COMPILER now, not only by a grep.** Every crate
+> under `services/`, `examples/` and `osdev/` carries `#![deny(unsafe_code)]`, so rustc refuses the
+> crate rather than a script noticing afterwards. That closes what a text scan cannot see - `unsafe`
+> produced by a macro expansion, or spelled across lines - and it fails at the author's keyboard
+> instead of at the next CI run.
+>
+> `deny` rather than `forbid`, for exactly one reason, stated so nobody "tightens" it and breaks the
+> build: a `#[no_mangle]` declaration is itself covered by the `unsafe_code` lint (an exported symbol
+> can collide, which is a soundness hole), and every service needs `#[no_mangle] service_main` because
+> `build.rs` links with `--entry=service_main`. `forbid` cannot be relaxed even for that. So the
+> crates carry `deny` plus ONE `#[allow(unsafe_code)]` on the entry symbol, and
+> `scripts/unsafe_check.py` asserts both halves: that the attribute is present, and that the only
+> `#[allow]` sits on `#[no_mangle]`. An `#[allow]` anywhere else fails the check - the exception
+> cannot become a door.
+>
+> No policy changes here. §18.2 already forbade this; what changed is who enforces it.
+
 ### 18.3 Documentation
 
 Every `unsafe` block carries a SAFETY comment:
