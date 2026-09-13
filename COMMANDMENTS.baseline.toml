@@ -524,3 +524,53 @@ SpawnImage               = 52
 # closed by the same piece of work. They are written here rather than fixed because the hardware cannot
 # yet support the fix - which is exactly the case CLAUDE.md §26.3 says to RECORD rather than pretend to
 # close.
+
+# --------------------------------------------------------------------------------------------------
+# Commandment VII - what each service may REACH. Read by `VII-service-grants`.
+#
+# `[kernel.service_configs]` above pins WHO the system knows by name. This pins WHAT each of them is
+# given, which until 2026-09-14 was pinned by nothing at all - `I-authorities` said so in its own
+# `does_not_prove` field ("that is Commandment VII, and it is not built yet"). Widening an EXISTING
+# service's reach therefore passed every check here: no new name, no cfg, no unsafe, no syscall.
+#
+# THIS MAY ONLY EVER SHRINK, on the same terms as the grandfathered unsafe floors (CLAUDE.md 18.5)
+# and SHARED-SURFACE.baseline.txt. A grant may be removed freely; adding one means editing this file
+# in a commit that says why the service needs it. A stale entry is also a violation - a pin not
+# tightened when authority shrinks rots into a permanent exemption, and the next widening back to it
+# would pass silently.
+#
+# TOKENS
+#   priv:X          a privilege bit in the supervisor's spawn request (services/supervisor/src/main.rs)
+#   peer:y          a service it may SEND to
+#   hw:Z            the device class its MMIO / DMA / IOMMU / bus-master grants are resolved from
+#   kernel-priv:f   still granted BY NAME inside the kernel (kernel/src/task/mod.rs). Only the
+#                   supervisor and the three USB keyboard drivers are left here; the set shrinks.
+#   irq:n           a hardware interrupt line routed to this service's endpoint. Currently none.
+#
+# Pinning is not endorsement: it records what IS, so that what is NEXT has to be argued for. The
+# arguments for the sharp ones live in CLAUDE.md 6.4 (SEC-2: a CONSOLE_PUSH holder is inside the
+# shell's trust perimeter, because keystrokes are commands).
+[kernel.service_grants]
+"asker" = ["peer:reply-server"]
+"block-driver" = ["hw:pci"]
+"chaos" = ["peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+"console" = ["hw:FRAMEBUFFER", "peer:events"]
+"control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+"counter" = ["peer:fs"]
+"dwc2" = ["hw:DWC2", "hw:PCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+"ehci" = ["hw:EHCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+"fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
+"greet" = ["peer:pong"]
+"hw-enumerator" = ["peer:events", "priv:PCI_CFG"]
+"net-stack" = ["peer:events", "peer:nic-driver", "peer:time", "priv:RESOURCE_MINT", "priv:SET_CLOCK"]
+"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci"]
+"observe" = ["priv:INTROSPECT"]
+"observe-live" = ["priv:INTROSPECT"]
+"observe-now" = ["priv:INTROSPECT"]
+"ping" = ["peer:pong"]
+"recorder" = ["peer:events", "peer:fs"]
+"resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
+"shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
+"supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
+"time" = ["peer:events", "peer:fs", "peer:net-stack"]
+"xhci" = ["hw:XHCI", "hw:pci_irq", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]

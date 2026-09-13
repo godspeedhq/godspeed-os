@@ -516,6 +516,144 @@ def check_kernel_service_table(check, pins):
 
 
 # --------------------------------------------------------------------------------------------------
+# Commandment VII - thou shalt not introduce ambient authority
+# --------------------------------------------------------------------------------------------------
+
+def _grant_decomment(text):
+    """Strip `//` comments. Every one of these files EXPLAINS its grants in prose beside them, so an
+    un-stripped scan reads `RESOURCE_MINT arrives in the spawn request` as a grant. `facts_check` and
+    `shared_surface_check` each shipped that same defect once; this is the third time, so it is worth
+    naming: a checker that reads a source file must read the CODE, and prose about authority looks
+    exactly like authority.
+    """
+    return re.sub(r'//[^\n]*', '', text)
+
+
+def _service_grants():
+    """Every authority the system hands a named service, and where it was handed over.
+
+    Returns `{service: {token: path}}`. TWO sites, because authority moved between them and a pin on
+    one alone would have been obsolete on arrival:
+
+      - `services/supervisor/src/main.rs` - the IMAGES / USB_IMAGES rows. Since step C this is where
+        authority is actually decided: the supervisor names each service's privilege word, its send
+        peers and its device class, and the kernel refuses anything the supervisor does not itself
+        hold. This is the live grant site and most of the surface.
+      - `kernel/src/task/mod.rs` - what the kernel still grants BY NAME: the `service_privileges`
+        `matches!(name, ..)` arms, any `service_hw` arm, and the `service_config` fields that are
+        authority rather than resource (`hw_irqs` routes real interrupt lines to a service's endpoint;
+        `has_console_read` is the keyboard; `send_peers_grant` lets the holder RE-DELEGATE). This set
+        is deliberately shrinking and the pin is what keeps it shrinking.
+    """
+    grants = {}
+
+    def add(name, token, path):
+        grants.setdefault(name, {})[token] = path
+
+    # ---- the supervisor's spawn tables -----------------------------------------------------------
+    sup_path = "services/supervisor/src/main.rs"
+    sup = _grant_decomment(read(os.path.join(ROOT, sup_path)))
+    rows = list(re.finditer(r'\(\s*"([a-z0-9-]+)"\s*,\s*[A-Z0-9_]+_ELF\b', sup))
+    for i, m in enumerate(rows):
+        name = m.group(1)
+        end = rows[i + 1].start() if i + 1 < len(rows) else len(sup)
+        span = sup[m.end():end]
+        for priv in re.findall(r'privbits::([A-Z_0-9]+)', span):
+            add(name, f"priv:{priv}", sup_path)
+        for hw in re.findall(r'hwclass::([A-Za-z_0-9]+)', span):
+            add(name, f"hw:{hw}", sup_path)
+        # The peer slice is the first `&[..]` of the row: (name, image, flags, mem, core, PEERS, ..).
+        peers = re.search(r'&\[([^\]]*)\]', span)
+        if peers:
+            for peer in re.findall(r'"([a-z0-9-]+)"', peers.group(1)):
+                add(name, f"peer:{peer}", sup_path)
+
+    # ---- what the kernel still grants by name ----------------------------------------------------
+    ker_path = "kernel/src/task/mod.rs"
+    ker = _grant_decomment(read(os.path.join(ROOT, ker_path)))
+    for m in re.finditer(r'(\w+):\s*matches!\(\s*name\s*,([^)]*)\)', ker):
+        for name in re.findall(r'"([a-z0-9-]+)"', m.group(2)):
+            add(name, f"kernel-priv:{m.group(1)}", ker_path)
+    for m in re.finditer(r'"([a-z0-9-]+)"\s*=>\s*\(\s*HwClass::(\w+)', ker):
+        add(m.group(1), f"kernel-hw:{m.group(2)}", ker_path)
+
+    cfgs = list(re.finditer(r'"([a-z0-9-]+)"\s*=>\s*Some\(\(', ker))
+    for i, m in enumerate(cfgs):
+        name = m.group(1)
+        end = cfgs[i + 1].start() if i + 1 < len(cfgs) else len(ker)
+        span = ker[m.end():end]
+        for field, token in (("has_console_read", "console_read"),
+                             ("send_peers_grant", "send_peers_grant"),
+                             ("has_recv_endpoint", "recv_endpoint")):
+            if re.search(rf'{field}:\s*true', span):
+                add(name, f"kernel-priv:{token}", ker_path)
+        irqs = re.search(r'hw_irqs:\s*&\[([^\]]*)\]', span)
+        if irqs:
+            for v in re.findall(r'0x[0-9a-fA-F]+|\b\d+\b', irqs.group(1)):
+                add(name, f"irq:{int(v, 0)}", ker_path)
+        peers = re.search(r'send_peers:\s*&\[([^\]]*)\]', span)
+        if peers:
+            for peer in re.findall(r'"([a-z0-9-]+)"', peers.group(1)):
+                add(name, f"peer:{peer}", ker_path)
+
+    return grants
+
+
+def check_service_grants(check, pins):
+    """Commandment VII: pin WHAT each service may reach, not merely THAT the system knows its name.
+
+    THE HOLE THIS CLOSES, and the repository said so itself before this existed. `I-service-table`
+    pins the set of services the kernel holds a config for - and its docstring says "Pinned by name".
+    `I-authorities` pins the authorities the kernel mints, and its own `does_not_prove` field read:
+    "that an admitted authority is granted to the right services - that is Commandment VII, and it is
+    not built yet". Between them, WHO is in the tables was pinned and WHAT the tables give them was
+    pinned by nothing.
+
+    So widening an EXISTING service's reach passed every check in this repository. Adding an IRQ line
+    to a driver, flipping `has_console_read` (the comment beside it says "Only the shell service sets
+    this", which is a comment and not a check), adding a privbit to a supervisor row, or adding a send
+    peer: none of those adds a name, a cfg, an `unsafe`, or a syscall. Nothing was watching the one
+    axis Commandment VII is about.
+
+    A ratchet, on the shape this repository already uses twice (the grandfathered unsafe floors of
+    CLAUDE.md 18.5, and `SHARED-SURFACE.baseline.txt`): a service's grant set may SHRINK freely and may
+    grow only by pinning it deliberately, in a commit that says why. Both directions are violations -
+    an unpinned grant because it is the widening this exists to catch, and a stale pin because a
+    baseline that is not tightened when the debt shrinks rots into a permanent exemption.
+
+    WHAT IT DOES NOT PROVE, stated plainly. It does not say a pinned grant is DESERVED - that is
+    review, and CLAUDE.md 6.4 and SEC-2 are where those arguments live. It reads two declaration sites
+    by pattern, so authority reaching a service by some third route is invisible to it: what a service
+    obtains at RUNTIME through an embedded-cap transfer (8.5) is the capability model working as
+    designed and is deliberately out of scope.
+    """
+    pinned = pins.get("service_grants", {}) or {}
+    found = _service_grants()
+    out = []
+
+    for name in sorted(found):
+        allowed = set(pinned.get(name, []))
+        for token in sorted(found[name]):
+            if token not in allowed:
+                out.append(Violation(
+                    found[name][token], 0,
+                    f"'{name}' is granted {token}, which is not pinned. Commandment VII: authority is "
+                    f"granted deliberately or not at all, and a service's reach may SHRINK freely but "
+                    f"may only grow by pinning it here in a commit that says why. If this grant is "
+                    f"right, add \"{token}\" to [kernel.service_grants].\"{name}\" and say what it is "
+                    f"for."))
+
+    for name in sorted(pinned):
+        for token in sorted(set(pinned[name]) - set(found.get(name, {}))):
+            out.append(Violation(
+                "COMMANDMENTS.baseline.toml", 0,
+                f"pinned grant {token} for '{name}' is gone from the source. Remove it: a pin not "
+                f"tightened when authority shrinks rots into a permanent exemption, and the next "
+                f"widening back to it would pass."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 # Commandment II - thou shalt love Chaos and trust in it
 # --------------------------------------------------------------------------------------------------
 
@@ -693,8 +831,10 @@ CHECKS = [
          kind="custom", fn=check_kernel_authorities,
          scope="kernel/src/capability/mod.rs, well-known ResourceIds",
          proves="the kernel mints authority over nothing that was not deliberately admitted",
-         does_not_prove="that an admitted authority is granted to the right services - that is "
-                        "Commandment VII, and it is not built yet",
+         does_not_prove="that an admitted authority is granted to the right services. That is "
+                        "Commandment VII, and as of 2026-09-14 it IS built: `VII-service-grants` "
+                        "pins each service's grant set. What stays unproven here is narrower and "
+                        "worth keeping separate - that a PINNED grant is deserved, which is review",
          probes=[
              dict(why="a new kernel authority must be caught", pins={"authorities": {}}, expect=True),
              dict(why="the real, fully pinned authority set must pass", pins=None, expect=False),
@@ -821,6 +961,21 @@ CHECKS = [
              # updated in the same commit rather than the fix being invisible.
              dict(why="no peripheral driver remains in arch/ - both were deleted in arm32 slice 5",
                   pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="VII-service-grants", commandment="VII",
+         title="what each service may reach is pinned, not just that it has a name",
+         kind="custom", fn=check_service_grants,
+         scope="services/supervisor/src/main.rs IMAGES/USB_IMAGES rows, and kernel/src/task/mod.rs "
+               "service_privileges / service_hw / service_config authority fields",
+         proves="no service's reach - privilege bits, send peers, device class, routed IRQ lines, the "
+                "console keyboard, the right to re-delegate - widens without being pinned deliberately",
+         does_not_prove="that a pinned grant is DESERVED (that is review, and 6.4 / SEC-2 are where "
+                        "those arguments live), nor anything about authority a service obtains at "
+                        "RUNTIME through an embedded-cap transfer, which is the capability model "
+                        "working as designed",
+         probes=[
+             dict(why="a widened grant must be caught", pins={"service_grants": {}}, expect=True),
+             dict(why="the real, fully pinned grant set must pass", pins=None, expect=False),
          ]),
     dict(nature="rule", id="II-chaos-exclusions", commandment="II",
          title="nothing escapes Maximum Carnage but chaos's own apparatus",
