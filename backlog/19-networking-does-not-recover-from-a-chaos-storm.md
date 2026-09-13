@@ -5,6 +5,49 @@
 record because the fix implements a documented sequence rather than pinpointing the faulty register -
 see *What is NOT established* below, which still stands.
 
+## REPRODUCIBLE 2026-09-13: the first ping of the POST-CHAOS selfcheck loses one packet
+
+**Two machines, two chipsets, the same counters.** This is a different and much sharper fingerprint
+than the symptom set below, and it is worth chasing because it is deterministic rather than flaky.
+
+|                  | T630 (AMD GX-420GI)  | Wyse 5070 (Intel Gemini Lake) |
+|------------------|----------------------|-------------------------------|
+| window closed after | 915,892 us        | 909,443 us                    |
+| **drains**       | **44**               | **44**                        |
+| **frames seen**  | **0**                | **0**                         |
+| to-our-mac / arp-for-us / nic timeouts | 0 / 0 / 0 | 0 / 0 / 0          |
+| tsc_hz           | 1,996,160,201        | 1,497,671,940                 |
+| next packet      | reply in 36 ms       | reply in 36 ms                |
+
+```
+net-stack: ping window closed after 909443 us (44 drains, 0 frames seen, 0 to-our-mac,
+           0 arp-for-us, 0 nic timeouts)  [budget 900000 us, tsc_hz 1497671940]
+Request timed out.
+Reply from 8.8.8.8: bytes=32 time=36ms TTL=117
+```
+
+**What makes it chaseable rather than noise:**
+
+- **44 drains on both**, at two completely different TSC rates. A timing coincidence would not land
+  on the same integer; that is a loop reaching a bound, not a race.
+- **0 frames seen**, not frames-seen-but-unmatched. The NIC handed up nothing at all for 900 ms and
+  then worked immediately.
+- **Position is fixed**: the first ping of selfcheck's net section, immediately after
+  `PASS net - the stack holds a lease`, in the POST-CHAOS run.
+- **The pre-chaos selfcheck is clean on both.** Verified on the Wyse: zero `ping window closed` lines
+  before the first `ran 461, failed 0`. So it needs the storm to have happened.
+
+**What it is NOT.** None of the defining symptoms below returned: no TX timeout, no RX SILENT, no
+DHCP failure, one boot to get networking back. `selfcheck` passed 461/0 three times on each machine,
+and pings either side of the failure were clean. So the `dd74d4c1` fix stands; this is a narrower
+residue that the fix does not cover.
+
+**Not established, and not to be guessed at:** whether the frames never arrived, arrived and were
+consumed by something else, or arrived before the window opened. The instrument says the NIC handed
+up nothing; it does not say why. The next step is an RX-side counter comparison across that window
+(MMC counters on the chip versus frames the driver handed to `net-stack`), which discriminates "the
+wire was silent" from "we dropped them".
+
 **One further observation, T630, 2026-09-13 (`b3054b53`), recorded as evidence and NOT as a
 recurrence.** After `chaos max-carnage all-services 100 yes` (658 kills, 567 flooded) the first
 post-chaos ping was clean 2/2. Twenty-eight seconds later, inside `selfcheck`, one ping lost its
