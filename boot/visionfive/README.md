@@ -91,6 +91,60 @@ config points at.
 | `Access to the path 'P:\...' is denied` on a partition that IS mounted | Windows ACLs an ESP to administrators. Read and write it from the elevated shell. |
 | Menu appears and seems to wait for input | It is a one-second countdown, not a question. `timeout` is in deciseconds. |
 | Menu label still says something you changed | The deploy did not run. Check `build\deploy_visionfive.log` and the kernel's byte count. |
+| `Retrieving file: /godspeed-riscv64-visionfive.img` then `Failed to load '...'`, while `extlinux.conf` read fine moments earlier | **OPEN, cause not established - `backlog/26`.** Do NOT conclude the card or the board from this: both have been measured good (a stock card boots Debian on the same board at 22 MiB/s, and the card returns our kernel byte-perfect to a cache-bypassed read). See the section below before theorising. |
+| A SECOND `Failed to load` for a Debian file, straight after the first | **Collateral, not a second data point.** It only ever happens after a failed load in the same session; on a stock card that same file loads fine. A control has to run FIRST, or in a session of its own. |
+
+## The 2026-09-13 incident: `Failed to load`, and what it is not
+
+Recorded here rather than only in `backlog/26` because this file is where somebody looks when a card
+will not boot, and because `build/` is gitignored - the captures below do not survive a clean.
+
+**The failure.** Deploying `db32b674`, by the five steps above, with the deploy log reporting every
+check green:
+
+```
+Retrieving file: /extlinux/extlinux.conf
+1605 bytes read in 3 ms (522.5 KiB/s)
+U-Boot menu
+3:  GodspeedOS riscv64
+Enter choice: 3:  GodspeedOS riscv64
+Retrieving file: /godspeed-riscv64-visionfive.img
+Failed to load '/godspeed-riscv64-visionfive.img'
+```
+
+**The control, on the same board, same slot, card freshly flashed to stock:**
+
+```
+Retrieving file: /initrd.img-6.12.5-starfive
+13981593 bytes read in 605 ms (22 MiB/s)
+Retrieving file: /vmlinuz-6.12.5-starfive
+10440372 bytes read in 452 ms (22 MiB/s)
+Starting kernel ...
+```
+
+So the board reads 13.9 MB at 22 MiB/s. **Anything that starts "the board cannot..." or "the card
+is failing" is contradicted by those four lines.** They cost a reflash and two rounds of hardware
+theory to obtain; do not spend them again.
+
+**What was also measured, and rules out the card itself:** `scripts/deploy_visionfive.ps1` re-reads
+the card with `FILE_FLAG_NO_BUFFERING`, so every read goes to the device rather than the Windows
+cache. Our kernel comes back as all 2,743,208 bytes hashing `190565C0450F9ABD...`, matching what was
+written; the stock initrd comes back complete at 19 MiB/s. That diagnostic runs on every deploy now,
+precisely so this does not have to be argued again.
+
+**The trap that produced the wrong answer, stated plainly because this file already warns about its
+general form one section down.** In the failing log a Debian file fails to load immediately after
+ours. That was read as an independent control - "even an untouched stock file fails, so it is not
+us". It is not independent: it happens only ever AFTER our failure, in the same U-Boot session, and
+the same file loads perfectly in a session where nothing failed first. A failed multi-megabyte read
+appears to leave U-Boot unable to read anything else.
+
+**Two entries failing does not make the second one a control. A control has to run FIRST, or in a
+session of its own.**
+
+`backlog/26` carries the open hypotheses and the one-boot experiment that separates them. What
+belongs here is only this: the two captures above, and the fact that the obvious readings of the
+first one are already disproved by the second.
 
 ## What is in this directory
 
