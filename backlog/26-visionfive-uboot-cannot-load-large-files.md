@@ -2,10 +2,21 @@
 
 **Severity:** blocks hardware verification of the riscv64 port. Not a GodspeedOS kernel defect - the
 failure is in U-Boot, before our first instruction runs.
-**Status: CLOSED 2026-09-13.** Cause was CRLF in `extlinux.conf`. Fixed, and the board booted
-GodspeedOS at `7fa2e2e2`: 4 harts, `xhci` before `block-driver`, no `ehci`, dwmac up, ping
-8.8.8.8 3/3 at 21-59 ms. Now enforced by `scripts/line_ending_check.py` in the build gates
-and in CI.
+**Status: CLOSED 2026-09-13.** Cause was CRLF in `extlinux.conf`. Fixed, enforced by
+`scripts/line_ending_check.py` in the build gates and in CI, and the port is now **fully validated on
+the board**:
+
+    selfcheck            ran 461, failed 0      (x3 - before chaos, after chaos, after hot-plug)
+    chaos max-carnage    100 rounds, 583 kills, 493 flooded, kernel alive
+    hot-plug             hub port 3 empty -> attached, 6 re-enumerations, recovered
+    ping 8.8.8.8         2/2, 0% loss
+    ls / file tree       good
+
+    0 kernel panics, 0 liveness wedges, 0 exceptions in 17,102 lines
+
+The 51 `PANIC in service` lines are all inside the chaos window and all carry the same designed
+reason - "dying so the supervisor restarts us" - which is the restart mechanism working, not a fault.
+The Pi 4 produced 50 of the same across its own storm.
 
 > **This entry previously concluded "board-side: the board cannot load large files, try another card
 > or PSU". THAT WAS WRONG and is corrected below.** It was written from a reading of the evidence that
