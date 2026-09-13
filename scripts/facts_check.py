@@ -217,12 +217,12 @@ DOC_GLOBS = ["docs/*.md", "utilities/*.md", "services/*/CLAUDE.md", "kernel/src/
              # The PUBLISHED site. Most of its pages are `{{#include}}` views of the files above and
              # cannot drift by construction - but four are written for the site and have no source to
              # be a view OF, so they are exactly where a restated number goes stale unwatched.
-             "website/src/*.md",
-             # RELEASE NOTES. The most public place a number is restated, written once and then
-             # read by everyone who installs the thing - and historically the last place anyone
-             # re-measures. ALMANAC.md is dated prose and is skipped by the HISTORICAL filter
-             # below; a prepared release note is a present-tense claim.
-             "milestones/RELEASE-*.md"]
+             "website/src/*.md"]
+
+# NOT SCANNED: `milestones/RELEASE-*.md`. Those files existed briefly as prepared tag messages and
+# were removed at v0.17.0 - release notes are written on the GitHub release now, and the tag body is
+# the immutable copy. A glob aimed at a convention the project has dropped is a check that can only
+# ever report a pass it did not earn, so it goes with the convention (26.2).
 
 # A SECTION REFERENCE IS NOT A VALUE. On this script's first run `queue depth (§8.5)` captured "8"
 # and a `0-16` range captured "0" - two false alarms out of two findings. A checker that cries wolf
