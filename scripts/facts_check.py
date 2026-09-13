@@ -57,8 +57,45 @@ def count_files(pattern_dir, pattern):
 
 # Each fact: a human name, the authoritative value, and the patterns that ASSERT it in prose.
 # A pattern must capture the number, so a wrong number is what fails - not a missing mention.
+def shared_surface():
+    """(total, neutral-kernel) from the ratchet's baseline, or (None, None).
+
+    CLAUDE.md 4.1 used to state this debt as a HAND COUNT - "neutral code still names `arm` in 8
+    places, `aarch64` in 4 and `x86_64` in 3" - which had drifted to 6, 4 and 2 before anybody
+    re-measured. The 2026-09-13 amendment replaces it with a measured figure, and a measured figure
+    restated in prose is exactly what this script exists to keep honest: without this entry the new
+    number would go stale the same way the old one did, only with more confidence behind it.
+    """
+    text = read("SHARED-SURFACE.baseline.txt")
+    if not text:
+        return None, None
+    total = 0
+    kern = 0
+    for line in text.split("\n"):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        n = int(parts[0])
+        total += n
+        if parts[1].strip().startswith("kernel/src"):
+            kern += n
+    return (total, kern) if total else (None, None)
+
+
 def facts():
     out = []
+
+    ss_total, ss_kern = shared_surface()
+    if ss_total:
+        out.append(("shared surface outside arch/", ss_total,
+                    "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
+                    [r"([0-9]+) arch-conditional sites outside"]))
+        out.append(("shared surface, neutral kernel", ss_kern,
+                    "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
+                    [r"([0-9]+) in the neutral kernel"]))
 
     qd = const("kernel/src/ipc/queue.rs", "QUEUE_DEPTH")
     if qd:

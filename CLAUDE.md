@@ -195,6 +195,38 @@ These are the laws that bound every design choice. Any change that violates an i
 > was added.** Where neutral code still enumerates ISAs by name - the supervisor's `#[cfg(any(...))]`
 > spawn arms, the SDK's `hwclass` list - that is acknowledged debt, not the model.
 
+> **Amendment 2026-09-13 (portability-hardening): the debt named above is MEASURED now, not counted by
+> hand, and both of its examples are out of date.** The amendment above states the bar correctly and
+> then points at two things as the standing debt. One is gone and the other was never an example of it:
+>
+> - **The supervisor's `#[cfg(any(...))]` spawn arms are gone.** That file carried 47 arch-conditional
+>   sites; it carries 4. The USB host table was FIVE tables, one per arch plus an empty catch-all, and
+>   is now one table whose rows are present exactly where their image is; the seven-times-repeated
+>   `any(x86_64, aarch64, riscv64)` was one question - is configuration space reachable - and is now
+>   one `build.rs` fact. Three service crates went the same way, and where the ISA still answers, it is
+>   asked ONCE per fact in a build script rather than at every site that needs it.
+> - **The SDK's `hwclass` list is not an ISA enumeration and never was.** It names DEVICE kinds -
+>   `NIC`, `XHCI`, `EHCI`, `DWC2`, `FRAMEBUFFER` - plus PCI class-code addressing. That is step D's
+>   answer to this problem, not an instance of it: a driver names a device class and the kernel
+>   resolves it, which is exactly what stops a new board needing a new name here.
+>
+> **And the count itself was the wrong instrument.** "Neutral code still names `arm` in 8 places,
+> `aarch64` in 4 and `x86_64` in 3" was true when written and had drifted to 6, 4 and 2 before anybody
+> re-measured, because a hand count is right on the day it is taken and silently wrong afterwards.
+> Worse, nothing was watching: `arch_boundary_check.py` forbids inline assembly and named arch modules
+> outside `arch/`, and a `#[cfg(target_arch = "arm")]` in `kernel/src/task/mod.rs` is neither, so the
+> debt this paragraph names could grow without failing anything. Userspace had a ratchet
+> (`shared_surface_check.py`); the neutral kernel had none.
+>
+> It does now - the same one, which is the honest shape since it is one property asked of two layers.
+> **The standing figure is 58 arch-conditional sites outside `arch/`: 14 in the neutral kernel, 44
+> above it.** It may fall freely and may not rise without a recorded reason. What is left is listed
+> rather than implied: the neutral kernel's 14 are mostly per-device interrupt vectors in
+> `task/mod.rs` that want an `arch::imp` member; above it, `nic-driver` picks its MAC by ISA on three
+> of four boards and needs a kernel query to stop (`backlog/21`), `hw-enumerator` packs a host-bridge
+> config selector that belongs in `arch/` (`backlog/25`), and the rest are the SDK's syscall seam,
+> which §18.1 designates and which is the one place the ISA is genuinely the question.
+
 ### 4.2 SMP View (Per-Core)
 
 ```text
