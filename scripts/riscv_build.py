@@ -45,10 +45,17 @@ TARGET = "riscv64imac-unknown-none-elf"
 # a hard panic rather than a placeholder, so this list either matches it or the build stops.
 #
 # `probe` is absent deliberately, and for the same reason it is absent on ARM: it is the adversarial
-# test service, and the SDK's fault primitives it calls (`fault_noncanonical_read`,
-# `fault_divide_by_zero`) are x86 instructions. The supervisor is therefore built with `bare-metal`,
-# which is the feature that drops `probe` from its embedded set - the same posture a real board takes
-# anyway, since a bare-metal image ships no adversary (§4.4).
+# test service, and the supervisor is built with `bare-metal`, which is the feature that drops it from
+# the embedded set. That IS the posture a real board takes - a bare-metal image ships no adversary
+# (4.4) - so this is the rule rather than an exception for this port.
+#
+# This used to give a second reason, that the SDK's fault primitives `probe` calls
+# (`fault_noncanonical_read`, `fault_divide_by_zero`) "are x86 instructions". That stopped being true
+# when the ARM ports wrote their own (`sdk/rust/src/adversarial.rs` has arm and aarch64 bodies using
+# the ARMv7 high-address abort, the AArch64 VA hole, and `udf #0`), and it read as the blocker - as
+# though this port could not run the adversarial suite until somebody wrote assembly. It could not run
+# it because no non-x86 build asks for `probe` at all, which is a different statement with a different
+# fix. riscv64 bodies are genuinely missing, and what that costs is recorded in `backlog/24`.
 SERVICES = [
     "events", "recorder", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
     # `hw-enumerator` joins the build now that this arch answers `pci_cfg_read32`. It was absent

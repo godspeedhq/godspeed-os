@@ -55,7 +55,12 @@ SHARED_ROOTS = ("services", "sdk")
 # 21 -> 1, not as 21 -> 0. A reduction that is really the instrument going blind is the exact failure
 # this branch keeps finding elsewhere - `arch_boundary_check` could not see two arches, `stack_fit`
 # censused zero frames on riscv64 and called it a pass. A ruler you can step off is not a ruler.
-ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"|CARGO_CFG_TARGET_ARCH')
+# `target_pointer_width` counts too. It is a BETTER axis than `target_arch` for anything that turns on
+# register width (the SDK's syscall-argument clamp), and it must still be counted, or moving to the
+# better question would read as the site disappearing - the third time on this branch that the ruler
+# could have been stepped off by improving the code. Counted, not exempt.
+ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"|target_pointer_width\s*=\s*"\d+"'
+                      r'|CARGO_CFG_TARGET_ARCH')
 
 # In a BUILD SCRIPT the arch is read once into a variable and then compared - `match arch.as_str()`,
 # `arch == "x86_64"` - so `CARGO_CFG_TARGET_ARCH` alone counts a fifty-arm table as ONE. That is the

@@ -11,7 +11,7 @@
 #
 # count  path
     6  sdk/rust/src/adversarial.rs
-    2  sdk/rust/src/ipc.rs
+    1  sdk/rust/src/ipc.rs
     4  sdk/rust/src/syscall.rs
     4  services/block-driver/build.rs
     3  services/hw-enumerator/src/main.rs
