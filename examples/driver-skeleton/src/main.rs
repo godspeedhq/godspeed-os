@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! driver-skeleton - an ANNOTATED TEMPLATE for "how do I write a device driver on
 //! Godspeed?". It is illustrative, not runnable: the kernel wires a driver's
 //! MMIO/DMA/IRQ per recognised driver at spawn, so a real one needs a small
@@ -33,6 +40,7 @@ const STATUS_READY: u32 = 1 << 0;
 const EXPECTED_ID:  u32 = 0xC0FF_EE00; // the device's identity magic (illustrative)
 const IRQ_VECTOR:   u8  = 11;          // must match `hw_interrupt` in the contract
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("driver-skeleton: starting");

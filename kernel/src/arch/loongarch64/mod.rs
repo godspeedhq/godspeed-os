@@ -4,6 +4,13 @@
 //! Same `arch::imp` surface as x86_64/aarch64/riscv64; the neutral kernel compiles for loongarch64 with
 //! only this file written. Bodies are stubs; real bodies (LoongArch page tables/DMW, CSR trap vector,
 //! extended IRQ controller, stable timer) come later.
+//!
+//! **BEFORE YOU WRITE THE TRAP HANDLER, read "How an arch implementation HALTS THE MACHINE" in
+//! `kernel/src/arch/CLAUDE.md`.** The single most expensive bug on the RISC-V port was a fault
+//! report that could itself fault: the handler re-entered, reported, faulted, forever - no output,
+//! no panic, one hart dark. The re-entrancy guard belongs in the handler from the first line of it,
+//! not after the first mystery halt, and the second report must say the least it possibly can
+//! through the lock-free writer below and then stop.
 
 #![allow(unused_variables, dead_code)]
 
@@ -146,8 +153,21 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
 /// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
 /// see the aarch64 implementation for the shape (a published flag, checked here).
+/// Called from the timer tick on every core so a panic can stop the machine rather than one core.
+///
+/// **STUB: a no-op here means the panic on another core never reaches this one.** Pairs with
+/// `halt_all_cores` above and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
 pub fn panic_halt_check() {}
 
+/// Stop EVERY core, not just this one. Called from the panic path (§6.2, §19).
+///
+/// **STUB, and the consequence is the point: a panic on one core currently leaves the others
+/// RUNNING**, executing against whatever state the panic was about - a machine in an undefined
+/// state, reporting nothing. This spins the CALLER and signals nobody.
+///
+/// A real body must reach the other cores (IPI, SBI HSM, SGI - whatever this ISA has), and it must
+/// do so BEFORE SMP is enabled, not after. See "How an arch implementation HALTS THE MACHINE" in
+/// `kernel/src/arch/CLAUDE.md`, item 5.
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
@@ -215,6 +235,21 @@ pub mod page_tables {
     ///
     /// # Safety
     /// `_root` must be a page-table root this task owns.
+    /// Make a service's freshly written TEXT visible to the INSTRUCTION fetcher, on every hart that
+    /// could run it.
+    ///
+    /// **STUB, and this is the one that executes GARBAGE rather than failing.** A loader writes text
+    /// through the DATA path; on a split-cache arch the instruction fetcher does not see it, and a
+    /// sync instruction is often HART-LOCAL - so a core that did not run the loader executes whatever
+    /// its I-cache still holds, which is a DEAD service's text out of a recycled frame.
+    ///
+    /// Boot spawns look fine; only RESPAWNS fail, because a boot spawn gets fresh frames. The
+    /// signature is unmistakable once known: the same faulting PC every time, only on SOME cores, and
+    /// the PC disassembles mid-instruction.
+    ///
+    /// x86-64 is a legitimate no-op here (coherent with respect to instruction fetch). **Copying that
+    /// no-op onto a weak arch is the mistake.** See `arch/CLAUDE.md`, item 3, and
+    /// `arch/aarch64/mod.rs` / `arch/arm/usermode.rs` for real bodies.
     pub unsafe fn finalize_service_address_space(_root: u64) {}
 
     /// Free a task's page-table root and the structure below it, at task death.
@@ -294,8 +329,62 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// Stop QUEUEING serial output; from here writes go straight to the wire.
+///
+/// A panic halts every core, so a line handed to a ring may never be drained by anyone - the last
+/// thing the machine says would be the thing that never arrives. An arch whose serial path does not
+/// queue has nothing to switch off and says so with an empty body, which is an ANSWER: `main.rs`
+/// called this under `#[cfg(all(target_arch = "aarch64", feature = "pi4"))]` and again under
+/// `#[cfg(target_arch = "arm")]`, so a fifth port would have panicked into a buffer nobody drains
+/// and nothing would have told it.
+pub fn serial_enter_panic_mode() {}
+
+/// Drain any queued console output NOW, blocking until it is on the wire.
+///
+/// Called once, from the panic path, after no tick will ever run again - so on an arch that drains
+/// its console from the timer the panic message would otherwise sit in a buffer forever. Blocking is
+/// correct here and nowhere else: there is nothing left to starve. An arch that does not queue has
+/// nothing to flush.
+pub fn tx_ring_flush_blocking() {}
+
+/// Page flags this arch wants ADDED when mapping a framebuffer, beyond the neutral set.
+///
+/// A framebuffer is RAM the display controller scans out, not device registers, and the two want
+/// opposite memory types - so the neutral mapper states the intent (`WRITE_COMBINE`) and the arch
+/// states what its own page tables need to express it.
+///
+/// This was `#[cfg(not(target_arch = "x86_64"))] flags |= PageFlags::PWT;` in `task/mod.rs`, with a
+/// comment explaining that arm32 and x86 read PCD and PWT in OPPOSITE senses. That is exactly a fact
+/// about silicon (26.14) and exactly what does not belong in a neutral file: the note was correct and
+/// the placement left a fifth port inheriting arm32's answer by default.
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::PWT
+}
+
 pub mod interrupts {
+    pub use crate::task::scheduler::Armed;
+    /// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
+    /// which is what every port but arm32 did anyway, previously by not being compiled at all.
+    /// `Full` is the ANSWER, not a stub: it says "no capacity", which is a state arm32 also reports.
+    pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
+    pub fn hires_release(_slot: u32) {}
+
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[];
+    pub const SOC_NIC_VECTORS: &[u8] = &[];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     pub fn enable_interrupts() {}                            // msr daifclr
     pub fn disable_interrupts() {}                           // msr daifset
@@ -327,6 +416,15 @@ pub mod interrupts {
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}
+
+    /// The pool of MSI vectors the kernel may hand to a driver, as (base, length).
+    ///
+    /// EMPTY here, which is the honest answer rather than a placeholder: a pool of zero says "ask me
+    /// for a vector and you get nothing", and the allocator treats that as "this machine cannot do
+    /// message-signalled interrupts" - true of a scaffold with no PCI. riscv64 answers the same way
+    /// for the same reason. A real LoongArch port replaces both when it has an interrupt controller.
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,9 +469,67 @@ pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
 
+    /// One device as the kernel's PCI scan records it. Shape borrowed from the ports that have a bus,
+    /// so the neutral callers compile unchanged; on this scaffold nothing ever constructs one.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+
+    /// A ceiling readable off the source (26.6.1).
+    ///
+    /// ONE, on a machine with no PCI bus at all - and that is a FINDING, not a choice. The truthful
+    /// answer here is zero, and zero does not build: `task/mod.rs` has
+    ///
+    ///     _ => &PCI_DMA_PHYS[0],
+    ///
+    /// whose own comment calls the arm "Unreachable ... returns a real slot rather than panicking".
+    /// It is unreachable at runtime, but a ZERO-LENGTH array makes the compiler evaluate the index
+    /// anyway and `unconditional_panic` refuses the build. So the neutral kernel carries an unstated
+    /// contract: an arch must offer at least one PCI slot, whether or not it has a bus.
+    ///
+    /// arm - a complete, hardware-verified port on a board with no PCI whatsoever - already pays it,
+    /// also with `MAX_DEVICES = 1`. This scaffold is simply the first to have tried saying zero. The
+    /// constraint is recorded here rather than worked around silently, and fixing it means editing
+    /// neutral code, which is exactly the kind of split the bounded-port test exists to find
+    /// (scripts/scaffold_check.py).
+    pub const MAX_DEVICES: usize = 1;
+
+    /// Find a device by its 24-bit PCI class code - the lookup that replaced per-driver names in
+    /// step D1. `None` on a machine with no bus, which is what the caller already handles.
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
+    /// Where an MSI should be delivered, as an interrupt-controller destination id.
+    ///
+    /// The name is x86's (a Local APIC id). It is the seam's, not this port's, and answering it
+    /// truthfully here means returning a destination no device will ever use.
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
+
+    /// Program a device's MSI / MSI-X to raise `vector` at `dest`. False = not programmed, so the
+    /// caller falls back to polling rather than waiting for an interrupt that cannot arrive.
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
     pub fn ehci() -> Option<PciDevice> { None }
+    /// Scaffold: no USB of any kind yet.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { false }
+
+    /// Take the EHCI controller off the firmware, if this arch's firmware ever held it.
+    ///
+    /// A no-op where there is no BIOS to hand off from. `task/mod.rs` called it under
+    /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
+    pub fn ehci_bios_handoff() {}
+
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
@@ -408,3 +564,68 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+// ---------------------------------------------------------------------------
+// Seam members the neutral kernel asks every arch for. Answered here so this scaffold COMPILES -
+// milestone M1 of the bounded-port test (scripts/scaffold_check.py). Each returns the value that is
+// TRUE of a machine with no bus and no userspace yet, never a value invented to make a caller happy:
+// a wrong answer that compiles is worse than a missing one, because the compiler stops asking.
+
+/// Copy from a user address into kernel memory, refusing anything not mapped to the caller.
+///
+/// FALSE until this port has user pages, and refusing is the safe direction: a caller that cannot
+/// read user memory fails its syscall, where one that wrongly SUCCEEDS reads someone else's memory.
+pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
+
+/// Per-core interrupt counters, as (count, last vector). `(0, 0)` here.
+///
+/// A STUB THAT RETURNS ZERO IS A KNOWN TRAP on this seam member: x86's was `(0, 0)` for the life of
+/// the port, and a liveness investigation could not tell "the timer stopped" from "the tick was
+/// skipped" because the instrument reported the same thing either way. It is acceptable only while
+/// this arch takes no interrupts at all. The moment it does, this must become real or the first
+/// wedge here is undiagnosable.
+pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
+
+/// What the CPU calls itself, for the boot line. An ARCH is not a MACHINE, so this is the ISA name
+/// until there is a way to read the model.
+pub fn cpu_identity(buf: &mut [u8]) -> usize {
+    let name = b"LoongArch64";
+    let n = name.len().min(buf.len());
+    buf[..n].copy_from_slice(&name[..n]);
+    n
+}
+
+/// Record that `vector` was taken on this core. No-op: nothing raises an interrupt here yet, and a
+/// counter that only ever counts zero is better left obviously empty than quietly wrong.
+pub fn note_irq(_vector: u32) {}
+
+/// Read one 32-bit PCI configuration register, or `None` where config space is unreachable.
+///
+/// `None` is load-bearing rather than lazy: this is the seam `hw-enumerator` reaches through, and the
+/// riscv64 port shipped with it returning `None` unconditionally - so the service was spawned, found
+/// nothing, and the failure looked like a missing driver rather than a missing seam answer. On this
+/// scaffold there is genuinely no config space, so `None` is the truth.
+pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+
+/// Publish the boot core's interrupt-controller id so the scheduler can address it.
+///
+/// The NAME is x86's - a Local APIC id - and LoongArch has no LAPIC. It is recorded here rather than
+/// renamed because the seam is shared: every arch answers this, so the vocabulary is the seam's debt,
+/// not this port's. No-op until secondary cores exist.
+pub fn publish_bsp_lapic_id() {}
+
+/// How many bytes the panic path emitted without taking the serial lock. Zero until this port has a
+/// lock to bypass.
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
+/// Is a driver's DMA arena mapped uncached?
+///
+/// FALSE, and on a scaffold that is the truthful answer rather than a deferral: nothing here grants a
+/// DMA arena, so there is no mapping whose cacheability could differ. Note this is a PER-MASTER fact
+/// on real silicon, not a per-arch one - the VisionFive's display is non-coherent while its USB is
+/// coherent - so a real port must not assume one answer covers the board.
+pub const DMA_ARENA_UNCACHED: bool = false;
+
+/// The virtual address a driver's DMA arena is mapped at. Matches the other ports' choice so the
+/// neutral layout code is unchanged; unused until something here grants an arena.
+pub const DRIVER_DMA_VA: u64 = 0x7000_0000;

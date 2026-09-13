@@ -57,8 +57,117 @@ def count_files(pattern_dir, pattern):
 
 # Each fact: a human name, the authoritative value, and the patterns that ASSERT it in prose.
 # A pattern must capture the number, so a wrong number is what fails - not a missing mention.
+def shared_surface():
+    """(total, neutral-kernel) from the ratchet's baseline, or (None, None).
+
+    CLAUDE.md 4.1 used to state this debt as a HAND COUNT - "neutral code still names `arm` in 8
+    places, `aarch64` in 4 and `x86_64` in 3" - which had drifted to 6, 4 and 2 before anybody
+    re-measured. The 2026-09-13 amendment replaces it with a measured figure, and a measured figure
+    restated in prose is exactly what this script exists to keep honest: without this entry the new
+    number would go stale the same way the old one did, only with more confidence behind it.
+    """
+    text = read("SHARED-SURFACE.baseline.txt")
+    if not text:
+        return None, None
+    total = 0
+    kern = 0
+    for line in text.split("\n"):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        n = int(parts[0])
+        total += n
+        if parts[1].strip().startswith("kernel/src"):
+            kern += n
+    return (total, kern) if total else (None, None)
+
+
+def porting_tree_problems():
+    """`docs/porting.md`'s tree annotates each file with its arch-conditional count. Check every one
+    against `SHARED-SURFACE.baseline.txt`, which is the ratchet's own file and the only source.
+
+    A tree of per-file numbers is exactly the shape that rots: CLAUDE.md 4.1 carried a hand count
+    ("neutral code still names `arm` in 8 places, `aarch64` in 4 and `x86_64` in 3") that had drifted
+    to 6, 4 and 2 before anybody re-measured, with nothing watching. The tree is more useful than that
+    paragraph and would rot the same way, so it is checked line by line rather than trusted.
+    """
+    import re as _re
+    base = read("SHARED-SURFACE.baseline.txt")
+    doc = read("docs/porting.md")
+    if not base or not doc:
+        return []
+    truth = {}
+    for line in base.split("\n"):
+        line = line.split("#", 1)[0].strip()
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            truth[parts[1].strip()] = int(parts[0])
+
+    problems = []
+    seen = set()
+    # Tree rows look like:  `│   ├── task/scheduler.rs               [ 2 ]   - NOT yours...`
+    for n, line in enumerate(doc.split("\n"), 1):
+        m = _re.search(r'([A-Za-z0-9_./-]+\.rs|[A-Za-z0-9_./-]*build\.rs)\s+\[\s*(\d+)\s*\]', line)
+        if not m:
+            continue
+        leaf, claimed = m.group(1), int(m.group(2))
+        # The tree shows leaves; the baseline holds full paths. Match on suffix, which is
+        # unambiguous here because no two baseline paths end the same way.
+        hits = [k for k in truth if k.endswith(leaf)]
+        if len(hits) != 1:
+            if claimed == 0:
+                continue  # "every other service [ 0 ]" and friends - a claim of absence, not a file
+            problems.append(f"docs/porting.md:{n}: `{leaf}` matches {len(hits)} baseline entries")
+            continue
+        seen.add(hits[0])
+        if truth[hits[0]] != claimed:
+            problems.append(f"docs/porting.md:{n}: `{hits[0]}` says {claimed}, baseline says {truth[hits[0]]}")
+
+    for path, n in sorted(truth.items()):
+        if path not in seen:
+            problems.append(f"docs/porting.md: `{path}` ({n} site(s)) is in the ratchet but ABSENT "
+                            f"from the tree - a porter would not know to look at it")
+    return problems
+
+
 def facts():
     out = []
+
+    # The SEAM's own size, imported from the checker that DISCOVERS it. `docs/porting.md` tells a
+    # porter how many members they owe, and that is precisely a number that moves every time one is
+    # added - which this branch did seven times in a day.
+    try:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import arch_seam_check
+        # `wanted()` returns (top-level names, {module: names}); the seam SIZE is both, which is
+        # what the checker's own "all N members" line counts. `len()` of the pair is 2 - a reading
+        # that looked plausible and was wrong, caught because this fact was checked rather than
+        # written down.
+        _top, _moded = arch_seam_check.wanted()
+        seam = len(_top) + sum(len(v) for v in _moded.values())
+    except Exception:
+        seam = 0
+    if seam:
+        out.append(("arch::imp seam members", seam,
+                    "scripts/arch_seam_check.py wanted() - discovered from neutral-kernel usage",
+                    [r"\*\*([0-9]+) members\*\* that the neutral kernel calls",
+                     r"every one of the ([0-9]+) `arch::imp` members"]))
+
+    ss_total, ss_kern = shared_surface()
+    if ss_total:
+        out.append(("shared surface outside arch/", ss_total,
+                    "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
+                    [r"([0-9]+) arch-conditional sites outside",
+                     # `| arch-conditional sites outside `arch/` | **143** | **46** |` - the AFTER
+                     # column. A release note states its numbers as a table, not as a sentence.
+                     r"arch-conditional sites outside[^|]*\|[^|]*\|\s*\*\*([0-9]+)\*\*"]))
+        out.append(("shared surface, neutral kernel", ss_kern,
+                    "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
+                    [r"([0-9]+) in the neutral kernel",
+                     r"in the NEUTRAL KERNEL[^|]*\|[^|]*\|\s*\*\*([0-9]+)\*\*"]))
 
     qd = const("kernel/src/ipc/queue.rs", "QUEUE_DEPTH")
     if qd:
@@ -108,7 +217,12 @@ DOC_GLOBS = ["docs/*.md", "utilities/*.md", "services/*/CLAUDE.md", "kernel/src/
              # The PUBLISHED site. Most of its pages are `{{#include}}` views of the files above and
              # cannot drift by construction - but four are written for the site and have no source to
              # be a view OF, so they are exactly where a restated number goes stale unwatched.
-             "website/src/*.md"]
+             "website/src/*.md",
+             # RELEASE NOTES. The most public place a number is restated, written once and then
+             # read by everyone who installs the thing - and historically the last place anyone
+             # re-measures. ALMANAC.md is dated prose and is skipped by the HISTORICAL filter
+             # below; a prepared release note is a present-tense claim.
+             "milestones/RELEASE-*.md"]
 
 # A SECTION REFERENCE IS NOT A VALUE. On this script's first run `queue depth (§8.5)` captured "8"
 # and a `0-16` range captured "0" - two false alarms out of two findings. A checker that cries wolf
@@ -129,6 +243,8 @@ def main():
 
     checked = 0
     bad = []
+
+    tree = porting_tree_problems()
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))
@@ -148,8 +264,19 @@ def main():
                         if got != truth:
                             bad.append((name, source, rel, line_no, "says %d, code says %d" % (got, truth)))
 
+    if tree:
+        print("docs/porting.md's TREE disagrees with the ratchet it claims to reflect:")
+        print()
+        for t in tree:
+            print("  %s" % t)
+        print()
+        print("SHARED-SURFACE.baseline.txt is the only source for those counts. A tree of per-file")
+        print("numbers rots exactly like the hand count CLAUDE.md 4.1 used to carry, so it is checked.")
+        return 1
+
     if not bad:
-        print("facts: %d doc statement(s) agree with the code they restate" % checked)
+        print("facts: %d doc statement(s) agree with the code they restate, and the porting tree "
+              "matches the ratchet" % checked)
         return 0
 
     print("facts: %d doc statement(s) disagree with the code\n" % len(bad))

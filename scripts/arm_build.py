@@ -134,7 +134,8 @@ def main():
     # Failing the BUILD rather than warning is deliberate. A warning scrolls past above a successful
     # image; a build that refuses to produce one cannot be ignored, and cannot ship.
     for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
-                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py"):
+                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py",
+                  "line_ending_check.py"):
         r = subprocess.run([sys.executable, os.path.join("scripts", check)],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:

@@ -262,7 +262,29 @@ pub fn msi_pool_stub(i: usize) -> u64 {
 /// vector freely (it is written into the device's message-data register), so vector and
 /// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.
 /// Chosen clear of the timer (32), COM1 (36), syscall (0x80), and the IPIs (0xF0-0xF2).
+pub use crate::task::scheduler::Armed;
+/// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
+/// which is what every port but arm32 did anyway, previously by not being compiled at all.
+/// `Full` is the ANSWER, not a stub: it says "no capacity", which is a state arm32 also reports.
+pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
+pub fn hires_release(_slot: u32) {}
+
 pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+/// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+/// does not exist here.
+///
+/// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+/// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+/// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+/// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+/// right way round, which is why these are shaped to match it.
+///
+/// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+/// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+/// routes nothing for that class", which is a refusal, not a default.
+pub const DWC2_VECTORS: &[u8] = &[];
+pub const SOC_NIC_VECTORS: &[u8] = &[];
 
 /// Naked ISR stub for the xHCI MSI. Mirrors `uart_rx_isr_stub`: save caller-saved regs,
 /// call the handler, restore, iretq. No context switch - the handler just routes the IRQ

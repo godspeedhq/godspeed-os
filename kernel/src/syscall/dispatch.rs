@@ -593,17 +593,20 @@ fn handle_sleep(cycles: u64) -> i64 {
     // Withdrawing it was still right at the time. The evidence then pointed here, and shipping an
     // unproven mechanism into a machine that was panicking would have made the next measurement
     // unreadable. What changed is not confidence, it is evidence.
-    #[cfg(target_arch = "arm")]
+    // NO CFG. Every arch answers `hires_arm`; one that has no sub-tick timer returns `Armed::Full`
+    // and this falls through to the tick path below, which is exactly what those ports did before -
+    // previously by this block not being compiled at all, which meant a fifth port inherited the
+    // slower path silently and with nothing to tell it there was a faster one to wire up.
     {
         let us = scheduler::cycles_to_us(cycles);
         if us > 0 && us < 10_000 {
-            match crate::arch::imp::irq::hires_arm(my_slot as u32, us as u32) {
+            match crate::arch::imp::interrupts::hires_arm(my_slot as u32, us as u32) {
                 // The delay passed while we were arming it: the wait is already served, so return
                 // rather than block. Blocking here made a 125 us sleep take 8 ms, because the compare
                 // fires on EQUALITY and had nothing left to match.
-                crate::arch::imp::irq::Armed::Elapsed => return 0,
-                crate::arch::imp::irq::Armed::Full => {}   // fall through to the tick path
-                crate::arch::imp::irq::Armed::Pending => {
+                crate::arch::imp::interrupts::Armed::Elapsed => return 0,
+                crate::arch::imp::interrupts::Armed::Full => {}   // fall through to the tick path
+                crate::arch::imp::interrupts::Armed::Pending => {
                     // Tick backstop, always: if the compare interrupt never arrives the task must
                     // still wake. A timing optimisation that can hang `sleep` would hang every service
                     // that paces itself.
@@ -612,7 +615,7 @@ fn handle_sleep(cycles: u64) -> i64 {
                     scheduler::set_wake_deadline(my_slot, deadline);
                     let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
                     scheduler::clear_wake_deadline(my_slot);
-                    crate::arch::imp::irq::hires_release(my_slot as u32);
+                    crate::arch::imp::interrupts::hires_release(my_slot as u32);
                     return 0;
                 }
             }

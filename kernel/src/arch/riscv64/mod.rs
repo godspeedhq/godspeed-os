@@ -2127,6 +2127,38 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// Stop QUEUEING serial output; from here writes go straight to the wire.
+///
+/// A panic halts every core, so a line handed to a ring may never be drained by anyone - the last
+/// thing the machine says would be the thing that never arrives. An arch whose serial path does not
+/// queue has nothing to switch off and says so with an empty body, which is an ANSWER: `main.rs`
+/// called this under `#[cfg(all(target_arch = "aarch64", feature = "pi4"))]` and again under
+/// `#[cfg(target_arch = "arm")]`, so a fifth port would have panicked into a buffer nobody drains
+/// and nothing would have told it.
+pub fn serial_enter_panic_mode() {}
+
+/// Drain any queued console output NOW, blocking until it is on the wire.
+///
+/// Called once, from the panic path, after no tick will ever run again - so on an arch that drains
+/// its console from the timer the panic message would otherwise sit in a buffer forever. Blocking is
+/// correct here and nowhere else: there is nothing left to starve. An arch that does not queue has
+/// nothing to flush.
+pub fn tx_ring_flush_blocking() {}
+
+/// Page flags this arch wants ADDED when mapping a framebuffer, beyond the neutral set.
+///
+/// A framebuffer is RAM the display controller scans out, not device registers, and the two want
+/// opposite memory types - so the neutral mapper states the intent (`WRITE_COMBINE`) and the arch
+/// states what its own page tables need to express it.
+///
+/// This was `#[cfg(not(target_arch = "x86_64"))] flags |= PageFlags::PWT;` in `task/mod.rs`, with a
+/// comment explaining that arm32 and x86 read PCD and PWT in OPPOSITE senses. That is exactly a fact
+/// about silicon (26.14) and exactly what does not belong in a neutral file: the note was correct and
+/// the placement left a fifth port inheriting arm32's answer by default.
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::PWT
+}
+
 pub mod interrupts {
     /// MSI vector pool. Empty: RISC-V delivers device interrupts through the PLIC by wire, and MSI
     /// (via AIA/IMSIC) is a separate controller this port does not have yet. A zero-length pool means
@@ -2134,7 +2166,29 @@ pub mod interrupts {
     pub const MSI_POOL_BASE: u8 = 0;
     pub const MSI_POOL_LEN: usize = 0;
 
+    pub use crate::task::scheduler::Armed;
+    /// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
+    /// which is what every port but arm32 did anyway, previously by not being compiled at all.
+    /// `Full` is the ANSWER, not a stub: it says "no capacity", which is a state arm32 also reports.
+    pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
+    pub fn hires_release(_slot: u32) {}
+
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[];
+    pub const SOC_NIC_VECTORS: &[u8] = &[];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     /// `sstatus.SIE` - the one bit that admits interrupts at all while the kernel is running.
     ///
@@ -2868,6 +2922,17 @@ pub mod pci {
     /// the controller's DMA anywhere. What is bounded is the ACCIDENT surface - a restartable service
     /// rather than ring-0 code parsing descriptors supplied by whatever was plugged in - and the
     /// trust posture is not. Recorded here rather than implied.
+    /// The VisionFive 2's USB is a Cadence USB3 whose host half is an xHCI, not a DWC2.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { false }
+
+    /// Take the EHCI controller off the firmware, if this arch's firmware ever held it.
+    ///
+    /// A no-op where there is no BIOS to hand off from. `task/mod.rs` called it under
+    /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
+    pub fn ehci_bios_handoff() {}
+
     pub fn xhci() -> Option<PciDevice> {
         if let Some(d) = find_by_class(0x0c_03_30) {
             return Some(d);

@@ -161,10 +161,28 @@ def parse_kernel(name: str, source: str) -> dict | None:
 # not quietly escape the check. The table deliberately carries the same fields the kernel row did.
 SUPERVISOR_MAIN = SERVICES / "supervisor" / "src" / "main.rs"
 
-def _core_of(expr: str):
-    """A `preferred_core` expression as an int, or None for `u32::MAX` (no preference)."""
+def _core_of(expr: str, src: str = ""):
+    """A `preferred_core` expression as an int, or None for `u32::MAX` (no preference).
+
+    `src` is the file the expression came from, so ONE level of named-constant indirection resolves -
+    `board::SHELL_CORE` becomes the `const SHELL_CORE: u32 = ...` it names. Same treatment, for the
+    same reason, as the peer column below: the spawn table is data for this checker as well as for
+    the program, so a row that stops spelling its core inline takes the parser with it. Without this
+    the three placements that moved into `mod board` read as `None` and reported a mismatch against
+    contracts that were correct.
+
+    Deliberately one level and no more. A constant naming another constant does not resolve and
+    fails visibly as a mismatch, rather than quietly reading 0.
+    """
     if "u32::MAX" in expr:
         return None
+    named = re.match(r'(?:[A-Za-z_][A-Za-z_0-9]*::)*([A-Z][A-Z_0-9]*)\s*$', expr.strip())
+    if named and src:
+        cm = re.search(r'const\s+' + re.escape(named.group(1)) + r'\s*:\s*u32\s*=\s*(.*?);', src,
+                       re.DOTALL)
+        if not cm:
+            return None
+        expr = cm.group(1).strip()
     m = re.search(r'if cfg!\([^)]*\)\s*\{\s*\d+\s*\}\s*else\s*\{\s*(\d+)\s*\}', expr)
     if m:
         return int(m.group(1))
@@ -260,6 +278,25 @@ def parse_supervisor_images(name: str):
     # `["reply-server"]` and failed a check it should pass. Match the expression shape instead:
     # either a plain `&[...]`, or a complete `if cfg!(..) { &[..] } [else if ..] [else { &[..] }]`.
     tail = m.group(4).lstrip()
+    # A NAMED BOARD FACT rather than an inline expression: `board::STORAGE_PEERS`.
+    #
+    # The table's peer column is read here as TEXT, so the moment a row stopped spelling its peers
+    # inline and referred to a constant instead, this parser stopped finding the row at all - both
+    # `block-driver` and `nic-driver` reported "no config found" and the build was REFUSED. That is a
+    # real coupling worth naming: the spawn table is data for the enforcement layer as well as for the
+    # program, so making it less repetitive costs a parser change first.
+    #
+    # Resolving one level of indirection is enough and is deliberately not more: substitute the
+    # constant's right-hand side and let the existing branch-union logic below do its job unchanged.
+    # A constant that referred to another constant would not resolve, and would fail LOUDLY as "no
+    # config found" rather than silently reading an empty peer set.
+    path = re.match(r'(?:[A-Za-z_][A-Za-z_0-9]*::)*([A-Z][A-Z_0-9]*)\s*,', tail)
+    if path:
+        cm = re.search(r'const\s+' + re.escape(path.group(1)) + r'\s*:\s*&\[&str\]\s*=\s*(.*?);',
+                       src, re.DOTALL)
+        if not cm:
+            return None
+        tail = cm.group(1).strip()
     chain = re.match(
         r'if\s+cfg!\([^)]*\)\s*\{[^}]*\}'
         r'(?:\s*else\s+if\s+cfg!\([^)]*\)\s*\{[^}]*\})*'
@@ -279,7 +316,7 @@ def parse_supervisor_images(name: str):
         # { 0 }` takes the ELSE (x86) branch, because this check runs on the host and the .toml states
         # the x86-intended core. Without it the shell's row raised a ValueError rather than reporting a
         # mismatch - a checker that CRASHES is worse than one that fails, since it reports nothing at all.
-        "core":  _core_of(core_expr),
+        "core":  _core_of(core_expr, src),
         # DEDUPED, because the comment above says UNION and a union is a set. Concatenating the
         # branches was indistinguishable from a union until a peer appeared in MORE THAN ONE branch -
         # `events` is the first, since every port traces - and then `block-driver` read as

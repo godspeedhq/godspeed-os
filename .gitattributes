@@ -21,6 +21,29 @@
 # ─── Scripts that MUST stay LF even on a Windows checkout ─────────────────────
 *.sh     text eol=lf
 
+# ─── BOOT CONFIGS, read by a BOOTLOADER rather than by this machine ───────────
+#
+# Same class as `*.sh` above and for a sharper reason: nothing here is ever read by
+# Windows. `*.conf text` alone means "normalize to LF on commit, convert to NATIVE on
+# checkout" - and native on a Windows checkout is CRLF. The repo held LF, the working
+# tree held CRLF, and `Copy-Item` put CRLF on the card.
+#
+# U-Boot's extlinux parser then treated the trailing `\r` as part of the FILENAME and
+# every entry failed with `Failed to load '/godspeed-riscv64-visionfive.img'` - while
+# the MENU still rendered perfectly, because a trailing `\r` in a display string just
+# returns the cursor and is invisible. That cost two card reflashes and two wrong
+# theories (`backlog/26`).
+#
+# The boot directory is the whole rule rather than a list of extensions, because the
+# next board will bring a file type nobody thought to add.
+boot/**   text eol=lf
+
+# ...EXCEPT the binaries in it. `boot/**` above marks everything text, which would have git
+# "normalize" a device tree blob - 58 KB of binary silently rewritten. Caught by
+# `scripts/line_ending_check.py` on its first run, before any checkout acted on it. A later rule
+# wins in this file, so this must stay BELOW the line above.
+*.dtb    binary
+
 # ─── Binary: never normalize line endings, never diff as text ─────────────────
 *.img    binary
 *.bin    binary

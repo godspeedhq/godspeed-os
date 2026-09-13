@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! nic-driver - the userspace NIC driver service (docs/networking.md, Phase 1).
 //!
 //! Model-specific driver for the Intel 82540EM ("e1000"), the QEMU dev NIC. An ordinary restartable,
@@ -737,33 +744,36 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
 /// e1000/rtl serve loops - the frame IS the message; net-stack owns all protocol. A request payload of
 /// exactly 1 byte 3/4/5/6/7/8/9 is an opcode; any other payload is a raw ethernet frame to transmit.
 ///
-/// Used by both ARM ports, and deliberately named for the SEAM rather than the device behind it:
-/// - **Pi 2 (arm)**: an in-kernel DWC2 CDC-ECM USB-net device, pinned to core 0 by its contract
-///   because that is where the single-channel DWC2 is driven from.
-/// - **Pi 4 (aarch64)**: the on-board GENET Ethernet MAC, with no core constraint - GENET is reached
-///   by MMIO from whichever core makes the syscall, so it sits on core 1 with net-stack and fs.
+/// **Pi 2 (arm32) only.** The device is a DWC2 CDC-ECM USB-net adapter driven by the `dwc2` SERVICE,
+/// so this reaches it by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX) rather than by syscall.
 ///
-/// This function knows about neither. It was `usb_net_main` while USB was the only thing behind the
-/// syscalls; on the Pi 4 that name would have described the transport of a different board.
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+/// It used to compile on aarch64 too, and carried a SECOND body - `ctx.net_info` / `net_frame_tx` /
+/// `net_frame_rx`, the NET_DEVICE syscalls - selected by `#[cfg(not(target_arch = "arm"))]` for the
+/// Pi 4's in-kernel GENET. **That body has had no caller since GENET moved into this service**
+/// (CLAUDE.md 6.4, amendment 2026-08-09): `service_main` sends aarch64 to `genet::genet_main`, so the
+/// syscall body was compiled into every Pi 4 image and never once executed. Thirteen `#[cfg]` sites
+/// in this function existed to choose between a live path and a dead one.
+///
+/// It is deleted rather than kept for symmetry, for the reason this driver's own contract gives about
+/// the kernel's leftover GENET code: a second path that is not exercised does not stay working, and
+/// keeping it makes the file read as "one backend, two ARM ports" when it is one backend, one board.
+/// The NET_DEVICE syscalls (42-44) now have no caller anywhere in userspace - recorded in
+/// `backlog/21`, not quietly acted on here.
+#[cfg(target_arch = "arm")]
 fn kernel_net_main(ctx: ServiceContext) -> ! {
-    // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls via
-    // ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin).
-    // ONE check per request on arm32, eight elsewhere.
+    // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls
+    // via ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin). ONE.
     //
-    // Off arm a poll is a cheap syscall, so re-asking gives the device a moment at no real cost. On
-    // arm32 the device now lives behind IPC, and eight round trips is eight times the latency of the
-    // answer net-stack is BLOCKED waiting for - which is why the shell kept reporting "net-stack not
+    // The device lives behind IPC here, and eight round trips is eight times the latency of the answer
+    // net-stack is BLOCKED waiting for - which is why the shell kept reporting "net-stack not
     // responding" while ping ran. A service blocking its own caller past their patience is the failure
     // this system exists to avoid, and the poll loop was mine.
     //
-    // It is also pointless work now: the bulk-IN is armed CONTINUOUSLY in the background, so asking
-    // eight times in one request cannot make a frame arrive sooner. It either has one or it does not,
-    // and net-stack polls again immediately.
-    #[cfg(target_arch = "arm")]
+    // It is also pointless work: the bulk-IN is armed CONTINUOUSLY in the background, so asking eight
+    // times in one request cannot make a frame arrive sooner. It either has one or it does not, and
+    // net-stack polls again immediately. (This was 1 on arm and 8 on the `not(arm)` path the header
+    // describes. The 8 never ran.)
     const RX_TRIES: usize = 1;
-    #[cfg(not(target_arch = "arm"))]
-    const RX_TRIES: usize = 8;
     const FRAME_MAX: usize = 1600;
     const BATCH_MAX: u8 = 8;
     const BATCH_MSG_MAX: usize = 3072;
@@ -791,18 +801,13 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // reason `Call` carries a reply cap.
     //
     // Cells, not statics: this is the service's own state (Invariant 9), captured by the closure.
-    #[cfg(target_arch = "arm")]
     let rpc_timeouts = core::cell::Cell::new(0u32);
-    #[cfg(target_arch = "arm")]
     let rpc_mismatch = core::cell::Cell::new(0u32);
     // Sends that never left (dwc2 absent even after a reacquire) and stale caps recovered by one.
     // Separate from `rpc_timeouts` because they are opposite diagnoses: a timeout means dwc2 heard
     // us and did not answer, a send failure means it never heard us at all.
-    #[cfg(target_arch = "arm")]
     let rpc_sendfail = core::cell::Cell::new(0u32);
-    #[cfg(target_arch = "arm")]
     let rpc_restale = core::cell::Cell::new(0u32);
-    #[cfg(target_arch = "arm")]
     let dwc2_rpc = |ctx: &ServiceContext, msg: &Message| -> Option<Message> {
         // Bounded on the lean await: a dwc2 that is alive but silent hung this driver, net-stack
         // behind it, and the shell behind that.
@@ -926,7 +931,6 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         }
         Some(got)
     };
-    #[cfg(target_arch = "arm")]
     let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool {
         // Replies are [op, body...]; `dwc2_rpc` has already checked the op, so the body starts at 1.
         match dwc2_rpc(ctx, &Message::from_bytes(&[0x10])) {
@@ -940,7 +944,6 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             None => false,
         }
     };
-    #[cfg(target_arch = "arm")]
     let dev_tx = |ctx: &ServiceContext, frame: &[u8]| -> bool {
         // C3-1: these were bare 1514 literals - a SEVENTH copy of the frame size, and the one the
         // compiler could not even see disagreeing. Use the module's FRAME_MAX so there is one fewer.
@@ -953,7 +956,6 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             None => false,
         }
     };
-    #[cfg(target_arch = "arm")]
     let dev_rx = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
         match dwc2_rpc(ctx, &Message::from_bytes(&[0x12])) {
             Some(r) => {
@@ -969,13 +971,6 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             None => 0,
         }
     };
-    #[cfg(not(target_arch = "arm"))]
-    let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool { ctx.net_info(out) };
-    #[cfg(not(target_arch = "arm"))]
-    let dev_tx = |ctx: &ServiceContext, frame: &[u8]| -> bool { ctx.net_frame_tx(frame) };
-    #[cfg(not(target_arch = "arm"))]
-    let dev_rx = |ctx: &ServiceContext, buf: &mut [u8]| -> usize { ctx.net_frame_rx(buf) };
-
     let mut info = [0u8; 7];
     if dev_info(&ctx, &mut info) {
         ctx.log_fmt(format_args!(
@@ -1106,6 +1101,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     }
 }
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
@@ -1116,31 +1112,52 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.trace_as("nic-driver");
     ctx.log("nic-driver: starting");
 
-    // Pi 4, with the driver where it belongs: the GENET MAC is ours, reached through the register
-    // window and DMA arena the kernel granted this service by name. No NET_DEVICE syscall is involved
-    // and the kernel drives no ethernet at all - which is the whole point (Commandment I, §4.4).
+    // ---- WHICH MAC IS ON THIS BOARD. The one decision in this service that is still asked of the
+    // instruction set, kept in one place and labelled, rather than spread through the file.
+    //
+    // Every backend below takes `ServiceContext` and diverges, so this is a dispatch and nothing more;
+    // no backend is reachable from another and none of them returns. Each one is a whole MAC, so the
+    // module is gated too (line 33) - compiling GENET's ~1,450 lines into a RISC-V image would be dead
+    // weight in a service with a 16 MiB limit, not just dead code.
+    //
+    // THE TWO HALVES OF THIS ARE NOT THE SAME KIND OF QUESTION, and the difference is the whole point:
+    //
+    //   * The x86 arm asks the DEVICE (`nic_vendor_device()`, a PCI identity the kernel discovered at
+    //     runtime). Put a third NIC in that machine and this service picks it up without a rebuild -
+    //     it is the shape `hw_pci_class = "020000"` in the contract exists to enable (step D).
+    //   * The other three ask the ISA, because their MAC is on the SoC and there is nothing to ask.
+    //     A SoC MAC has no enumerable identity: no bus to scan, no vendor/device pair, and probing a
+    //     version register means reading an address that may not be a register at all on the next
+    //     board. So the ISA stands in for the board, which is the wrong axis - a second aarch64 board
+    //     with a different MAC would take the GENET arm and drive the wrong silicon.
+    //
+    // WHAT WOULD ACTUALLY CLOSE IT, recorded rather than half-started (26.7): the kernel already knows
+    // which controller its boot probe found - it is what decides whether to grant this service an MMIO
+    // window at all - and does not publish it. One InspectKernel query ("which network controller did
+    // you find") turns all three ISA arms into one runtime match, the same shape the x86 arm already
+    // has. That is a new kernel query, so it is a decision to take deliberately and not a tidy-up.
+    // `backlog/21` carries it.
+
+    // Pi 4: the GENET MAC is ours, reached through the register window and DMA arena the kernel
+    // granted this service by name. No NET_DEVICE syscall is involved and the kernel drives no
+    // ethernet at all - which is the whole point (Commandment I, §4.4).
     #[cfg(target_arch = "aarch64")]
     genet::genet_main(ctx);
 
-    // Both ARM ports, otherwise: there is no PCIe NIC to scan for. The device is driven in-kernel
-    // (Pi 2: a DWC2 CDC-ECM USB adapter; Pi 4: the on-board GENET MAC) and this backend bridges the
-    // same frame IPC net-stack speaks to the NET_DEVICE syscalls. Same request/reply contract,
-    // different transport - exactly the block-driver x86/ARM split.
+    // Pi 2: a DWC2 CDC-ECM USB adapter, driven by the `dwc2` SERVICE. This backend bridges the frame
+    // IPC net-stack speaks to dwc2's own IPC ops. Same request/reply contract, different transport.
     #[cfg(target_arch = "arm")]
     kernel_net_main(ctx);
 
-    // The VisionFive 2's on-SoC DesignWare MAC, with the driver where it belongs: the kernel grants
-    // this service the controller's window and a DMA arena by name, and drives no ethernet itself.
-    // Same posture as GENET on the Pi 4.
+    // VisionFive 2: the on-SoC DesignWare MAC, same posture as GENET on the Pi 4 - the kernel grants
+    // the controller's window and a DMA arena by name and drives no ethernet itself.
     #[cfg(target_arch = "riscv64")]
     dwmac::dwmac_main(ctx);
 
-    // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
-    // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
-    // riscv64 is excluded here for the same reason arm and aarch64 are: its NIC is on the SoC, not
-    // on PCI, so there is no vendor/device pair to sort by and the backend above has already taken
-    // the call. Left in the `not(...)` list it compiles as unreachable code, which is a warning
-    // today and a misleading read of the dispatch forever.
+    // x86: ask the device. An Intel e1000 (the QEMU dev NIC) or a Realtek RTL8168 (the T630) - the
+    // kernel maps whichever one's BAR and this sorts by the PCI identity. The three SoC ports are
+    // excluded because each has already taken the call above; left in, this arm would compile as
+    // unreachable code, which is a warning today and a misleading read of the dispatch forever.
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
     if ctx.nic_vendor_device() == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
@@ -1237,9 +1254,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         m.write32(REG_RCTL, RCTL_VALUE);
         ctx.log("nic-driver: serving the frame interface");
     } else {
-        #[cfg(target_arch = "riscv64")]
-        ctx.log("nic-driver: dwmac has no frame path yet - serving empty replies (identification above is the state of the port)");
-        #[cfg(not(target_arch = "riscv64"))]
+        // No riscv64 arm here. `dwmac::dwmac_main` diverges, so nothing below the backend selector
+        // is reachable on that port: the riscv64 message this used to carry could never print, while
+        // reading as a description of the state of a port. A message nobody can observe is worse than
+        // no message, because it is evidence of a path that is not taken.
         ctx.log("nic-driver: no Intel e1000 mapped (absent, or a different NIC) - serving empty replies");
     }
 

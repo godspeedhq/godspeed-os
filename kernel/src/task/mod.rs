@@ -459,10 +459,12 @@ impl HwClass {
         use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
-            // The DWC2 is SOLDERED to the BCM283x - there is no bus to discover it on, and no PCI
-            // at all on this board. Its presence is a property of the SoC, so it is `true` on arm32
-            // and `false` everywhere else. This is the one HwClass whose answer is not a scan result.
-            HwClass::Dwc2 => cfg!(target_arch = "arm"),
+            // The DWC2 is SOLDERED to the SoC - there is no bus to discover it on. Its presence is
+            // a property of the chip, so the ARCH answers rather than this file asking which ISA it
+            // was built for; it read `cfg!(target_arch = "arm")` until every arch answered. Still the
+            // one HwClass whose answer is not a scan result, which is why it is a seam member and not
+            // a `pci::` scan like the three below it.
+            HwClass::Dwc2 => pci::dwc2_present(),
             // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
             // mailbox call on the Pi) and the floor that brought it up is the one that knows.
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
@@ -840,17 +842,21 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
     match class {
         HwClass::Xhci => &[crate::arch::imp::interrupts::XHCI_MSI_VECTOR],
         HwClass::Ehci => &[crate::arch::imp::interrupts::EHCI_MSI_VECTOR],
-        // The DWC2 is the ARM board's USB host; on any other arch there is no such controller.
-        #[cfg(target_arch = "arm")]
-        HwClass::Dwc2 => &[crate::arch::imp::irq::USB_VECTOR],
-        #[cfg(not(target_arch = "arm"))]
-        HwClass::Dwc2 => &[],
-        // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a PCIe
-        // NIC with no such route, so the grant is arch-gated rather than unconditional.
-        #[cfg(target_arch = "aarch64")]
-        HwClass::Nic  => &[0x2A],
-        #[cfg(not(target_arch = "aarch64"))]
-        HwClass::Nic  => &[],
+        // THROUGH THE SEAM, like the two above it. These read
+        //
+        //     #[cfg(target_arch = "arm")]      HwClass::Dwc2 => &[arch::imp::irq::USB_VECTOR],
+        //     #[cfg(not(target_arch = "arm"))] HwClass::Dwc2 => &[],
+        //
+        // and the same again for aarch64 and GENET - four `#[cfg]`s in a NEUTRAL file, which is the
+        // leak §4.1 is about: a fifth port has to edit this function to be routed anything, and
+        // nothing would have told it so. `XHCI_MSI_VECTOR` on the line above was always done the
+        // right way round; these two simply were not, because at the time only one arch answered.
+        //
+        // The aarch64 arm also carried a bare `0x2A` while `arch/aarch64/exceptions.rs` already
+        // defined `GENET_VECTOR = 0x2A` - a second copy of a constant, inside the leak (Commandment
+        // III). The seam answer names the constant.
+        HwClass::Dwc2 => crate::arch::imp::interrupts::DWC2_VECTORS,
+        HwClass::Nic  => crate::arch::imp::interrupts::SOC_NIC_VECTORS,
         // The SOFTWARE test interrupt (§22 IR1): `control` raises vector 33 with FireIrq and the
         // kernel must route it to the registered driver's endpoint. It is a vector like any other -
         // the caller names the class and the kernel states the number - which is what lets the probe
@@ -1088,10 +1094,21 @@ fn service_privileges(name: &str) -> Privileges {
         // in-kernel USB-net bridge does, so `nic-driver` needs the same grant to reach it. Without it
         // the service loads and runs and every frame call is denied, which looks like a dead network
         // rather than a missing capability.
-        // ARM32 has LEFT this set: its USB-net device moved into the `dwc2` SERVICE (slice 4b), so
-        // nic-driver reaches frames over IPC and the syscalls have nothing behind them. Keeping the
-        // grant would be authority it cannot use - the exact over-grant the audits keep finding.
-        net_device: cfg!(target_arch = "aarch64") && matches!(name, "nic-driver"),
+        // NOTHING HOLDS NET_DEVICE ANY MORE, for the same two reasons `usb_disk` below reads
+        // `false`, and this arm is now dead in exactly the same way that one is.
+        //
+        // (a) It named `nic-driver` alone, and `nic-driver`'s image moved to the SUPERVISOR - this
+        //     table is only the fallback for a catalogue spawn (`None => service_privileges(name)`)
+        //     and the kernel catalogue is `supervisor` alone, so the arm could not fire even if the
+        //     authority were still wanted.
+        // (b) It is not wanted. arm32 left this set when its USB-net device moved into the `dwc2`
+        //     service; aarch64 left it when GENET moved into `nic-driver` itself (CLAUDE.md §6.4,
+        //     2026-08-09) and the service began driving the MAC through its own register window. The
+        //     NetFrame syscalls 42-44 have had no caller in any service since - `backlog/21` - and
+        //     the supervisor stopped requesting the privilege in `10d3b43e`, which booted on the Pi 4
+        //     with DHCP, ARP, ping and SNTP all working. So the capability has already been absent on
+        //     hardware for a boot; this removes the dead arm rather than changing anything.
+        net_device: false,
         // No service in the KERNEL's catalogue holds PCI_CFG. `hw-enumerator` is a moved service -
         // the supervisor owns its image and requests this privilege in the spawn request, which the
         // kernel grants only because the supervisor itself holds a GRANT cap for it. That is step C's
@@ -2015,7 +2032,8 @@ fn spawn_service_with_image(
         // Idempotent, bounded, and it reports whether the firmware actually let go. Done at the
         // GRANT rather than once at boot so a restarted driver - which chaos does constantly - also
         // gets a controller nobody else is running.
-        #[cfg(target_arch = "x86_64")]
+        // No cfg: whether there is firmware to take the controller FROM is a fact about this
+        // machine's firmware, and the arch states it (an empty body where there is no BIOS).
         if hw == HwClass::Ehci && bar != 0 {
             crate::arch::imp::pci::ehci_bios_handoff();
         }
@@ -2084,11 +2102,14 @@ fn spawn_service_with_image(
                         // 1920x1080 repaint measured 582 ms, about 14 MB/s, which is the slow and
                         // jittery rendering reported from the television. An arch with nothing better
                         // ignores this bit and keeps its uncached-MMIO type, so x86 is unchanged.
-                        | PageFlags::WRITE_COMBINE;
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        flags |= PageFlags::PWT;
-                    }
+                        | PageFlags::WRITE_COMBINE
+                        // WHAT THIS ARCH'S PAGE TABLES NEED to express that intent. The long note
+                        // above is a fact about silicon - arm32 and x86 read PCD and PWT in OPPOSITE
+                        // senses - and it lived here as `#[cfg(not(target_arch = "x86_64"))] flags |=
+                        // PageFlags::PWT`, which left a fifth port inheriting arm32's answer by
+                        // default. The arch says which bits it wants; this file says what it wants
+                        // them to MEAN (26.14).
+                        | crate::arch::imp::fb_extra_page_flags();
                     let pages = g.len.div_ceil(PAGE_SIZE as u64);
                     // The framebuffer is DEVICE memory the kernel is about to map into a service.
                     // The kill-path reclaim walks a dead task's leaves and frees them, so without a

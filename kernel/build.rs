@@ -35,8 +35,27 @@ fn main() {
     println!("cargo:rustc-env=GODSPEED_GIT_SHA={}", sha);
     // The same source builds for several ISAs, so a serial log must say which one it came from -
     // exactly the reason the shell's `version` reports it (utilities/0_conventions.md rule 7).
-    println!("cargo:rustc-env=GODSPEED_TARGET_ARCH={}",
-             std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".into()));
+    //
+    // AND IT MUST SAY THE SAME WORD. This passed `CARGO_CFG_TARGET_ARCH` straight through, so on the
+    // Pi 2 the boot banner read `GodspeedOS 0.16.1 arm (sha) - kernel` while `version` two seconds
+    // later read `GodspeedOS 0.16.1 arm32 (sha)` - one machine, two names, in the two lines whose
+    // whole job is to identify it. The sentence above already calls them the same fact; the SHA width
+    // was made to agree for exactly this reason and the arch was left behind.
+    //
+    // `arm32` is the project's name and the banner is the outlier: 95 boot lines in
+    // `kernel/src/arch/arm/` print `arm32:`, as do `docs/multi-arch.md`, `docs/arm32-status.md` and
+    // the README. Nothing parses this token (checked: no test, script or harness matches it), so the
+    // change is to the word a human reads.
+    // THE PROJECT'S NAME FOR THIS ARCHITECTURE, derived rather than listed.
+    //
+    // `CARGO_CFG_TARGET_ARCH` is already the answer for every target that exists or ever will, so
+    // there is no arch list here and a new port needs no edit - it reports its real name the day it
+    // first builds. One rename: Rust calls 32-bit ARMv7 `arm`, and this project calls it **arm32**
+    // everywhere else - 95 boot lines in `kernel/src/arch/arm/` print `arm32:`, plus
+    // `docs/multi-arch.md`, `docs/arm32-status.md` and the README.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".into());
+    let arch = if arch == "arm" { "arm32".to_string() } else { arch };
+    println!("cargo:rustc-env=GODSPEED_TARGET_ARCH={arch}");
     if std::path::Path::new(".git/logs/HEAD").exists() {
         println!("cargo:rerun-if-changed=.git/logs/HEAD");
     }

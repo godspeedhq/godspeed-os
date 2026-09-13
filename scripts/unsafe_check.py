@@ -20,6 +20,27 @@ from pathlib import Path
 REPO_ROOT   = Path(__file__).parent.parent
 KERNEL_SRC  = REPO_ROOT / "kernel" / "src"
 SERVICES    = REPO_ROOT / "services"
+SDK         = REPO_ROOT / "sdk"
+
+# 18.1 names the SDK files where `unsafe` is PERMITTED: the syscall ABI, the MMIO/DMA accessors a
+# userspace driver cannot do without, and the adversarial test module. Everything else under `sdk/`
+# is forbidden by 18.2 exactly as a service is.
+SDK_PERMITTED = {"syscall.rs", "mmio.rs", "dma.rs", "adversarial.rs"}
+
+# ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
+# to the SDK). These are NOT 90 separate defects: 86 of the 90 are `unsafe { raw_syscall(..) }` call
+# sites. `raw_syscall` is an `unsafe fn` because it issues the trap instruction, so every caller must
+# open a block - and these two files ARE the wrapper layer that exists to keep services unsafe-free.
+# The isolation 18.1 describes worked (services/ is at ZERO) and stopped one layer short of itself.
+#
+# Freezing them makes the debt visible and bounded. The real fix is a SAFE `raw_syscall` wrapper -
+# the kernel validates every user pointer, so passing integers to a validating callee is sound - which
+# would collapse ~86 of these to nothing. That is an SDK redesign on every service's call path, so it
+# is recorded rather than done here.
+SDK_GRANDFATHERED = {
+    "sdk/rust/src/service_context.rs": 82,
+    "sdk/rust/src/ipc.rs": 8,
+}
 AUDIT_FILE  = REPO_ROOT / "audits" / "unsafe-audit.md"
 
 INVENTORY_START = "<!-- unsafe-inventory-start -->"
@@ -64,6 +85,66 @@ def parse_audit() -> dict[str, int]:
             continue
 
     return inventory
+
+
+# Roots where 18.2 FORBIDS unsafe outright. Every crate under one of these must say so to the
+# COMPILER, not merely avoid the word.
+DENY_ROOTS = ("services", "examples", "osdev")
+DENY_ATTR = "#![deny(unsafe_code)]"
+
+
+def deny_unsafe_crates() -> list:
+    """Every crate under a forbidden root must carry `#![deny(unsafe_code)]`, and the only
+    `#[allow(unsafe_code)]` in it must sit on the exported entry symbol.
+
+    WHY THIS IS NOT REDUNDANT WITH THE GREP ABOVE. The scan looks for the TEXT `unsafe` in these
+    trees and requires zero. That is a real check and it has held, but it is a grep: it cannot see
+    `unsafe` produced by a macro expansion, and it reasons about characters rather than about what
+    the compiler will accept. `#![deny(unsafe_code)]` makes rustc refuse the crate outright, which is
+    the same rule enforced by the thing that actually knows.
+
+    `deny` and not `forbid`, for exactly one reason: a `#[no_mangle]` declaration is itself covered by
+    the `unsafe_code` lint - an exported symbol can collide, which is a soundness hole - and every
+    service needs `#[no_mangle] service_main` because `build.rs` links with `--entry=service_main`.
+    `forbid` cannot be relaxed even for that, so the crates would not compile. `deny` plus ONE
+    targeted `#[allow]` is the strongest form available, and this function is what stops that
+    exception being used anywhere else.
+    """
+    problems = []
+    for root_name in DENY_ROOTS:
+        root = REPO_ROOT / root_name
+        if not root.is_dir():
+            continue
+        crates = ([root] if (root / "Cargo.toml").exists()
+                  else [d for d in sorted(root.iterdir())
+                        if d.is_dir() and (d / "Cargo.toml").exists()])
+        for crate in crates:
+            for stem in ("main.rs", "lib.rs"):
+                f = crate / "src" / stem
+                if not f.exists():
+                    continue
+                text = f.read_text(encoding="utf-8", errors="replace")
+                rel = f.relative_to(REPO_ROOT).as_posix()
+                if DENY_ATTR not in text:
+                    problems.append(f"{rel}: missing {DENY_ATTR} (18.2 forbids unsafe in this tree)")
+                    continue
+                # The only sanctioned escape is the entry symbol. Anything else is the exception
+                # being used as a door.
+                # COMMENTS STRIPPED FIRST. Without this the crate note directly above - which
+                # EXPLAINS the one sanctioned `#[allow(unsafe_code)]` - was itself counted as one,
+                # so every crate reported a violation on the very line describing the rule. Same
+                # defect `shared_surface_check.py` had (prose counted as code) and the same fix.
+                lines = [ln.split("//", 1)[0] for ln in text.split("\n")]
+                for i, line in enumerate(lines):
+                    if "#[allow(unsafe_code)]" not in line:
+                        continue
+                    nxt = lines[i + 1] if i + 1 < len(lines) else ""
+                    if not nxt.startswith("#[no_mangle]"):
+                        problems.append(
+                            f"{rel}:{i + 1}: #[allow(unsafe_code)] that is NOT on the exported entry "
+                            f"symbol. The one sanctioned exception is `#[no_mangle] service_main`; "
+                            f"everything else must satisfy the deny.")
+    return problems
 
 
 def main() -> int:
@@ -134,6 +215,33 @@ def main() -> int:
                 f"move it behind a safe SDK wrapper (§18.1, e.g. sdk `adversarial`/`mmio`/`dma`)"
             )
 
+    # 18.1/18.2 for the SDK. THIS WAS SCANNED BY NOTHING: the script defined two roots, kernel/src
+    # and services, so `sdk/`'s ~125 unsafe lines were audited by no tool at all - while 18.4 says
+    # "CI checks the file matches source" and the audit's own header implied the SDK's unsafe lived
+    # only in the four permitted files. It does not (backlog/18).
+    for rs_file in sorted(SDK.rglob("*.rs")):
+        rel = rs_file.relative_to(REPO_ROOT).as_posix()
+        if "target" in rel.split("/"):
+            continue
+        n = count_unsafe(rs_file)
+        if n == 0 or rs_file.name in SDK_PERMITTED:
+            continue
+        frozen = SDK_GRANDFATHERED.get(rel)
+        if frozen is None:
+            failures.append(
+                f"  FAIL  {rel}: {n} unsafe line(s) - 18.2 forbids `unsafe` outside the SDK's "
+                f"audited layer ({', '.join(sorted(SDK_PERMITTED))}); put it there behind a safe "
+                f"wrapper, or record a floor in SDK_GRANDFATHERED with a rationale"
+            )
+        elif n > frozen:
+            failures.append(
+                f"  FAIL  {rel}: {n} unsafe line(s), frozen at {frozen} - a grandfathered SDK floor "
+                f"may DECREASE freely and may increase only by an amendment (18.5)"
+            )
+        elif n < frozen:
+            infos.append(f"  INFO  {rel}: unsafe count shrank {frozen} -> {n} "
+                         f"(lower SDK_GRANDFATHERED to lock in the reduction)")
+
     if infos:
         print("Unsafe audit - reductions detected (update audit to capture them):")
         for msg in infos:
@@ -151,10 +259,26 @@ def main() -> int:
         )
         return 1
 
+    deny_problems = deny_unsafe_crates()
+    if deny_problems:
+        print("CRATES THAT MUST REFUSE UNSAFE AT COMPILE TIME:")
+        print()
+        for pr in deny_problems:
+            print(f"  {pr}")
+        print()
+        print("18.2 forbids `unsafe` in services, examples and osdev. Grepping for the word is not")
+        print("the same as the compiler refusing it, so every crate in those trees carries")
+        print(f"`{DENY_ATTR}` and rustc enforces the rule.")
+        return 1
+
     total = sum(audit.values())
     print(
         f"Unsafe audit passed - {len(audit)} audited files, "
         f"{total} total unsafe lines, no unaccounted additions."
+    )
+    print(
+        f"Compile-time deny: every crate under {'/'.join(DENY_ROOTS)} carries {DENY_ATTR}, "
+        f"with the only #[allow] on the exported entry symbol."
     )
     return 0
 

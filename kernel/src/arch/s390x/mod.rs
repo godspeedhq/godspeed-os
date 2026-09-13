@@ -4,6 +4,13 @@
 //! Same `arch::imp` surface; the neutral kernel compiles for s390x with only this file written - the
 //! boundary generalised to a big-endian mainframe ISA. The console is SCLP (a Service-Call protocol),
 //! not a memory-mapped UART, so `sclp_putc` is a real (still-stubbed) body, not a register poke.
+//!
+//! **BEFORE YOU WRITE THE TRAP HANDLER, read "How an arch implementation HALTS THE MACHINE" in
+//! `kernel/src/arch/CLAUDE.md`.** The single most expensive bug on the RISC-V port was a fault
+//! report that could itself fault: the handler re-entered, reported, faulted, forever - no output,
+//! no panic, one hart dark. The re-entrancy guard belongs in the handler from the first line of it,
+//! not after the first mystery halt, and the second report must say the least it possibly can
+//! through the lock-free writer below and then stop.
 
 #![allow(unused_variables, dead_code)]
 
@@ -103,8 +110,21 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
 /// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
 /// see the aarch64 implementation for the shape (a published flag, checked here).
+/// Called from the timer tick on every core so a panic can stop the machine rather than one core.
+///
+/// **STUB: a no-op here means the panic on another core never reaches this one.** Pairs with
+/// `halt_all_cores` above and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
 pub fn panic_halt_check() {}
 
+/// Stop EVERY core, not just this one. Called from the panic path (§6.2, §19).
+///
+/// **STUB, and the consequence is the point: a panic on one core currently leaves the others
+/// RUNNING**, executing against whatever state the panic was about - a machine in an undefined
+/// state, reporting nothing. This spins the CALLER and signals nobody.
+///
+/// A real body must reach the other cores (IPI, SBI HSM, SGI - whatever this ISA has), and it must
+/// do so BEFORE SMP is enabled, not after. See "How an arch implementation HALTS THE MACHINE" in
+/// `kernel/src/arch/CLAUDE.md`, item 5.
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
@@ -172,6 +192,21 @@ pub mod page_tables {
     ///
     /// # Safety
     /// `_root` must be a page-table root this task owns.
+    /// Make a service's freshly written TEXT visible to the INSTRUCTION fetcher, on every hart that
+    /// could run it.
+    ///
+    /// **STUB, and this is the one that executes GARBAGE rather than failing.** A loader writes text
+    /// through the DATA path; on a split-cache arch the instruction fetcher does not see it, and a
+    /// sync instruction is often HART-LOCAL - so a core that did not run the loader executes whatever
+    /// its I-cache still holds, which is a DEAD service's text out of a recycled frame.
+    ///
+    /// Boot spawns look fine; only RESPAWNS fail, because a boot spawn gets fresh frames. The
+    /// signature is unmistakable once known: the same faulting PC every time, only on SOME cores, and
+    /// the PC disassembles mid-instruction.
+    ///
+    /// x86-64 is a legitimate no-op here (coherent with respect to instruction fetch). **Copying that
+    /// no-op onto a weak arch is the mistake.** See `arch/CLAUDE.md`, item 3, and
+    /// `arch/aarch64/mod.rs` / `arch/arm/usermode.rs` for real bodies.
     pub unsafe fn finalize_service_address_space(_root: u64) {}
 
     /// Free a task's page-table root and the structure below it, at task death.
@@ -251,8 +286,62 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// Stop QUEUEING serial output; from here writes go straight to the wire.
+///
+/// A panic halts every core, so a line handed to a ring may never be drained by anyone - the last
+/// thing the machine says would be the thing that never arrives. An arch whose serial path does not
+/// queue has nothing to switch off and says so with an empty body, which is an ANSWER: `main.rs`
+/// called this under `#[cfg(all(target_arch = "aarch64", feature = "pi4"))]` and again under
+/// `#[cfg(target_arch = "arm")]`, so a fifth port would have panicked into a buffer nobody drains
+/// and nothing would have told it.
+pub fn serial_enter_panic_mode() {}
+
+/// Drain any queued console output NOW, blocking until it is on the wire.
+///
+/// Called once, from the panic path, after no tick will ever run again - so on an arch that drains
+/// its console from the timer the panic message would otherwise sit in a buffer forever. Blocking is
+/// correct here and nowhere else: there is nothing left to starve. An arch that does not queue has
+/// nothing to flush.
+pub fn tx_ring_flush_blocking() {}
+
+/// Page flags this arch wants ADDED when mapping a framebuffer, beyond the neutral set.
+///
+/// A framebuffer is RAM the display controller scans out, not device registers, and the two want
+/// opposite memory types - so the neutral mapper states the intent (`WRITE_COMBINE`) and the arch
+/// states what its own page tables need to express it.
+///
+/// This was `#[cfg(not(target_arch = "x86_64"))] flags |= PageFlags::PWT;` in `task/mod.rs`, with a
+/// comment explaining that arm32 and x86 read PCD and PWT in OPPOSITE senses. That is exactly a fact
+/// about silicon (26.14) and exactly what does not belong in a neutral file: the note was correct and
+/// the placement left a fifth port inheriting arm32's answer by default.
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::PWT
+}
+
 pub mod interrupts {
+    pub use crate::task::scheduler::Armed;
+    /// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
+    /// which is what every port but arm32 did anyway, previously by not being compiled at all.
+    /// `Full` is the ANSWER, not a stub: it says "no capacity", which is a state arm32 also reports.
+    pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
+    pub fn hires_release(_slot: u32) {}
+
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[];
+    pub const SOC_NIC_VECTORS: &[u8] = &[];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     pub fn enable_interrupts() {}                            // msr daifclr
     pub fn disable_interrupts() {}                           // msr daifset
@@ -331,6 +420,17 @@ pub mod pci {
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
     pub fn ehci() -> Option<PciDevice> { None }
+    /// Scaffold: no USB of any kind yet.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { false }
+
+    /// Take the EHCI controller off the firmware, if this arch's firmware ever held it.
+    ///
+    /// A no-op where there is no BIOS to hand off from. `task/mod.rs` called it under
+    /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
+    pub fn ehci_bios_handoff() {}
+
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }

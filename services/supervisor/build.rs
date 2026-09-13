@@ -67,6 +67,51 @@ fn main() {
         &[]
     };
 
+    // ---- ONE CFG PER IMAGE THIS BUILD ACTUALLY EMBEDS. ------------------------------------------
+    //
+    // Derived from the SAME two lists that decide the embedding, three lines above - so `main.rs`
+    // cannot disagree with this file. That mattered: `main.rs` restated the arch split for the USB
+    // images FIVE times (a `USB_IMAGES` table per arch, plus one empty catch-all) and for
+    // `hw-enumerator` SEVEN times, and its own comment says what that cost - "four places had to
+    // agree, and each one was silent about the others", written after `spawn xhci FAILED` survived
+    // three separate fixes on the VisionFive.
+    //
+    // The cfgs name the BOARD FACT rather than the instruction set, which is the axis that actually
+    // decides these:
+    //
+    //   has_xhci / has_ehci / has_dwc2   this board has that host controller, so its driver is here
+    //   has_hw_enumerator                configuration space is reachable, so the reporter is here
+    //
+    // A fifth ISA therefore adds ONE arm to `usb` / `enumerator` above and touches nothing in
+    // `main.rs`. Note also that these are STRICTLY more correct than what they replace, not just
+    // tidier: `main.rs` gated the ehci spawn on `not(any(arm, aarch64))`, which is TRUE on riscv64 -
+    // a board that has never had an EHCI image embedded.
+    //
+    // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
+    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "xhci_msi", "nic_on_pci"] {
+        println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
+    }
+    for name in usb.iter().chain(enumerator.iter()) {
+        println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
+    }
+    // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
+    // between the `pci_irq` hardware class and the plain one. NOT the same question as "is it on
+    // PCI": the Pi 4's VL805 is a PCIe device and still takes the plain class, because what it lacks
+    // is the routable vector, not the bus. Asking for an interrupt that can never arrive is the
+    // failure invariant 12 exists to prevent, which is why this is its own fact.
+    if arch == "x86_64" {
+        println!("cargo:rustc-cfg=xhci_msi");
+        // This board's ethernet controller is on the PCI bus, so `nic-driver` is addressed by CLASS
+        // CODE (0x020000) and the kernel resolves the BAR from its own scan. Everywhere else the MAC
+        // is on the SoC and there is no class code to name: GENET on the Pi 4, dwmac on the
+        // VisionFive, a LAN9514 behind USB on the Pi 2.
+        //
+        // A board fact, not an ISA one, and the distinction is the whole point of class addressing:
+        // an aarch64 board with a PCIe NIC would want the class form, and would get it here by
+        // saying so rather than by being an exception inside `main.rs`.
+        println!("cargo:rustc-cfg=nic_on_pci");
+    }
+
     // Find the PROFILE directory, which is where the service binaries sit.
     //
     // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so this used to take

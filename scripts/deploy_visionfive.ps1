@@ -20,6 +20,31 @@
     The whole run is transcribed to build\deploy_visionfive.log so the result can be read from
     the file rather than copied out of a console.
 
+    IT ALSO RE-READS THE KERNEL FROM THE CARD, because the verification above was NOT ENOUGH: it
+    hashes the file immediately after copying it, and Windows serves that read from its own cache.
+    It proves the right bytes were WRITTEN; it does not prove the card RETURNS them. Section 7 reads
+    it back with FILE_FLAG_NO_BUFFERING so every read goes to the device.
+
+    A LARGER DIAGNOSTIC SECTION LIVED HERE BRIEFLY AND IS GONE. It also re-read the stock Debian
+    initrd, timed everything, reported disk health and printed a verdict about PSUs and reseating -
+    apparatus built to test the theory that the card was not returning its data. On 2026-09-13 the
+    board said:
+
+        Retrieving file: /godspeed-riscv64-visionfive.img
+        Failed to load '/godspeed-riscv64-visionfive.img'
+        Retrieving file: /initrd.img-6.12.5-starfive
+        Failed to load '/initrd.img-6.12.5-starfive'      <- DEBIAN'S OWN, never written by us
+
+    while the small files on the same partition read fine. THE THEORY WAS WRONG. The cause was CRLF
+    in `extlinux.conf` (see section 5): U-Boot read the trailing carriage return as part of every
+    FILENAME, so nothing the config named could be opened, while the menu rendered perfectly because
+    a stray CR in a display string only returns the cursor.
+
+    So the card was never at fault, and the apparatus built to prove it was is deleted - a feature is
+    pulled into existence by a real problem (CLAUDE.md 26.2), and that problem never existed. What
+    survives is the one check that fixes a defect actually demonstrated: the cached-hash gap above.
+    `backlog/26` has the full account, including the reasoning error that produced the wrong theory.
+
     Usage:  pwsh -File scripts\deploy_visionfive.ps1 [-Esp P:] [-Repo <path>] [-Log <path>]
 #>
 
@@ -86,8 +111,37 @@ try {
     if ($srcH -ne $dstH) { throw "kernel differs after copying. Card may be full or failing." }
     Ok ("kernel copied and verified by SHA256, {0} bytes, {1}" -f (Get-Item $dst).Length, $dstH.Substring(0,16))
 
-    # ---- 5. the config, parsed back ------------------------------------------------------
-    Copy-Item $Conf $ConfPath -Force
+    # ---- 5. the config, WRITTEN AS LF and parsed back --------------------------------------
+    #
+    # NOT `Copy-Item`, and this is the whole of the 2026-09-13 failure. The repository stores this
+    # file as LF, but `.gitattributes` marked it `*.conf text`, which means "normalize on commit,
+    # convert to NATIVE on checkout" - and native on a Windows checkout is CRLF. A plain copy put
+    # CRLF on the card. U-Boot's extlinux parser then read the trailing `\r` as part of each
+    # FILENAME and every entry failed:
+    #
+    #     Retrieving file: /godspeed-riscv64-visionfive.img
+    #     Failed to load '/godspeed-riscv64-visionfive.img'
+    #
+    # while the MENU rendered perfectly, because a trailing `\r` in a display string only returns
+    # the cursor. So it looked like a load failure and not a config fault, and it cost two card
+    # reflashes and two wrong theories (`backlog/26`).
+    #
+    # `.gitattributes` now pins `boot/** text eol=lf`, which fixes the checkout. This does NOT rely
+    # on that: whether the board boots must not depend on a contributor's git settings, an editor
+    # that helpfully "fixed" the file, or a copy through a tool that rewrites line endings. The
+    # bytes are normalized HERE, and then checked on the card below.
+    $confText = [System.IO.File]::ReadAllText($Conf) -replace "`r`n", "`n" -replace "`r", "`n"
+    [System.IO.File]::WriteAllText($ConfPath, $confText, (New-Object System.Text.UTF8Encoding($false)))
+
+    # VERIFIED ON THE CARD, not assumed from what we just wrote. A single CR in this file is a card
+    # that shows a perfect menu and cannot boot anything on it.
+    $onCard = [System.IO.File]::ReadAllBytes($ConfPath)
+    $crs    = @($onCard | Where-Object { $_ -eq 13 }).Count
+    if ($crs -gt 0) {
+        throw "installed extlinux.conf contains $crs carriage return(s). U-Boot would read them as part of each filename and every entry would fail to load."
+    }
+    Ok ("extlinux.conf written LF-only, {0} bytes, no CR on the card" -f $onCard.Length)
+
     $c = Get-Content $ConfPath -Raw
     if ($c -notmatch '(?m)^default\s+godspeed\s*$') { throw "installed config does not say 'default godspeed'" }
     if ($c -notmatch '(?m)^label\s+godspeed\s*$')   { throw "installed config has no 'label godspeed'" }
@@ -106,9 +160,52 @@ try {
     Write-Host '--- extlinux.conf as installed ---'
     Get-Content $ConfPath | ForEach-Object { Write-Host $_ }
     Write-Host ''
+    # ---- 7. the kernel, RE-READ FROM THE CARD ---------------------------------------------
+    #
+    # Section 4 hashes the file immediately after copying it, and Windows serves that read from its
+    # own cache - so it verifies a write it never actually read back. That is a real gap whatever
+    # else is going on, and this closes it: FILE_FLAG_NO_BUFFERING (0x20000000) sends every read to
+    # the device.
+    #
+    # This is deliberately ONLY our kernel. An earlier version of this section also re-read the stock
+    # Debian initrd, timed both, and printed a verdict about card health, PSUs and reseating - all of
+    # it built to test the theory that the card was not returning its data. That theory was WRONG
+    # (the fault was CRLF in the config, `backlog/26`), so the apparatus built for it is gone: a
+    # feature is pulled into existence by a real problem, and this one never existed (26.2). What
+    # remains is the check that fixes a defect we actually demonstrated.
+    try {
+        $len   = (Get-Item $dst).Length
+        $chunk = 1MB
+        $fs    = New-Object System.IO.FileStream(
+                    $dst, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::ReadWrite, $chunk, [System.IO.FileOptions]0x20000000)
+        $sha   = [System.Security.Cryptography.SHA256]::Create()
+        $buf   = New-Object byte[] $chunk
+        $done  = 0L
+        try {
+            while ($done -lt $len) {
+                $n = $fs.Read($buf, 0, $chunk)
+                if ($n -le 0) { break }
+                $use = [Math]::Min([long]$n, $len - $done)
+                [void]$sha.TransformBlock($buf, 0, $use, $null, 0)
+                $done += $use
+            }
+            [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+        } finally { $fs.Dispose() }
+        $cold = -join ($sha.Hash | ForEach-Object { $_.ToString('X2') })
+        if ($done -ne $len)   { throw "short read: $done of $len bytes came back from the card" }
+        if ($cold -ne $srcH)  { throw "cold read differs: card returned $($cold.Substring(0,16)), wrote $($srcH.Substring(0,16))" }
+        Ok ("kernel re-read from the card (cache bypassed), {0} bytes, hash matches" -f $done)
+    }
+    catch {
+        Write-Host ("FAIL  {0}" -f $_.Exception.Message) -ForegroundColor Red
+        Write-Host '      The card did not return what was written to it. Replace it.'
+        throw
+    }
+
     Write-Host 'READY. Eject the card, put it in the board, power on.'
     Write-Host 'Expect:  riscv64: usable harts 1   then   smp: 1 core ready   (singular)'
-    Write-Host 'If it fails, press any key during the 5 second countdown for the Debian menu.'
+    Write-Host 'If it fails, press any key during the ONE second countdown for the Debian menu (extlinux timeout is 10 DECISECONDS, not 10 seconds, so it goes past quickly).'
     Write-Host ("To restore the stock card:  Copy-Item '{0}' '{1}' -Force" -f $OrigPath, $ConfPath)
 }
 catch {

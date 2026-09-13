@@ -1,0 +1,6 @@
+# The bounded-port test: how far each scaffold ISA gets with ONLY arch/<isa>/
+# written. See scripts/scaffold_check.py. A milestone may ADVANCE (bless it) and
+# may never go backwards - a regression means a fresh ISA lost ground, which is
+# the bound eroding.
+loongarch64    1
+riscv32        0

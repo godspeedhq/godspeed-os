@@ -195,6 +195,41 @@ These are the laws that bound every design choice. Any change that violates an i
 > was added.** Where neutral code still enumerates ISAs by name - the supervisor's `#[cfg(any(...))]`
 > spawn arms, the SDK's `hwclass` list - that is acknowledged debt, not the model.
 
+> **Amendment 2026-09-13 (portability-hardening): the debt named above is MEASURED now, not counted by
+> hand, and both of its examples are out of date.** The amendment above states the bar correctly and
+> then points at two things as the standing debt. One is gone and the other was never an example of it:
+>
+> - **The supervisor's `#[cfg(any(...))]` spawn arms are gone.** That file carried 49 arch-conditional
+>   sites when this branch began; it carries 4. (47 when the spawn-table work itself started - two had
+>   already gone in the commit that named the board facts. The 49 is the figure `milestones/` uses, so
+>   this says the same thing they do.) The USB host table was FIVE tables, one per arch plus an empty catch-all, and
+>   is now one table whose rows are present exactly where their image is; the seven-times-repeated
+>   `any(x86_64, aarch64, riscv64)` was one question - is configuration space reachable - and is now
+>   one `build.rs` fact. Three service crates went the same way, and where the ISA still answers, it is
+>   asked ONCE per fact in a build script rather than at every site that needs it.
+> - **The SDK's `hwclass` list is not an ISA enumeration and never was.** It names DEVICE kinds -
+>   `NIC`, `XHCI`, `EHCI`, `DWC2`, `FRAMEBUFFER` - plus PCI class-code addressing. That is step D's
+>   answer to this problem, not an instance of it: a driver names a device class and the kernel
+>   resolves it, which is exactly what stops a new board needing a new name here.
+>
+> **And the count itself was the wrong instrument.** "Neutral code still names `arm` in 8 places,
+> `aarch64` in 4 and `x86_64` in 3" was true when written and had drifted to 6, 4 and 2 before anybody
+> re-measured, because a hand count is right on the day it is taken and silently wrong afterwards.
+> Worse, nothing was watching: `arch_boundary_check.py` forbids inline assembly and named arch modules
+> outside `arch/`, and a `#[cfg(target_arch = "arm")]` in `kernel/src/task/mod.rs` is neither, so the
+> debt this paragraph names could grow without failing anything. Userspace had a ratchet
+> (`shared_surface_check.py`); the neutral kernel had none.
+>
+> It does now - the same one, which is the honest shape since it is one property asked of two layers.
+> **The standing figure is 46 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 44
+> above it.** It may fall freely and may not rise without a recorded reason. What is left is listed
+> rather than implied. **The neutral kernel is down to 2**, and both are `target_pointer_width` on
+> one constant - a 32-bit address space genuinely cannot hold a 4 GiB virtual address, so the width
+> IS the question rather than an ISA standing in for one. Above the kernel, `nic-driver` picks its MAC by ISA on three
+> of four boards and needs a kernel query to stop (`backlog/21`), `hw-enumerator` packs a host-bridge
+> config selector that belongs in `arch/` (`backlog/25`), and the rest are the SDK's syscall seam,
+> which §18.1 designates and which is the one place the ISA is genuinely the question.
+
 ### 4.2 SMP View (Per-Core)
 
 ```text
@@ -312,6 +347,11 @@ os/
     site_check.py        #   the 4 hand-written site pages still match the repository
     arch_boundary_check.py #  neutral layers reach hardware ONLY through the `arch::imp` seam
     arch_seam_check.py   #   ...and every arch ANSWERS every member of it (the other direction)
+    scaffold_check.py    #   ...and the BOUNDED-PORT TEST: how far a fresh ISA gets with only
+                         #   `arch/<isa>/` written. The two above prove no RULE is broken; this one
+                         #   exercises the claim, because a count is a proxy and a build is not
+    shared_surface_check.py #  ratchets arch-conditional code ABOVE the kernel (the other axis:
+                         #   `target_arch` there is usually "which BOARD am I on")
     dash_check.py        #   no em/en dashes anywhere (§21)
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds
@@ -1485,6 +1525,23 @@ hardware/ABI layer named in §18.1 - and all kernel code outside the four
 permitted layers. A driver service that writes `unsafe` directly (rather than
 going through the SDK's safe `Mmio`/`Dma` wrappers) is rejected.
 
+> **Amendment 2026-09-13: this is enforced by the COMPILER now, not only by a grep.** Every crate
+> under `services/`, `examples/` and `osdev/` carries `#![deny(unsafe_code)]`, so rustc refuses the
+> crate rather than a script noticing afterwards. That closes what a text scan cannot see - `unsafe`
+> produced by a macro expansion, or spelled across lines - and it fails at the author's keyboard
+> instead of at the next CI run.
+>
+> `deny` rather than `forbid`, for exactly one reason, stated so nobody "tightens" it and breaks the
+> build: a `#[no_mangle]` declaration is itself covered by the `unsafe_code` lint (an exported symbol
+> can collide, which is a soundness hole), and every service needs `#[no_mangle] service_main` because
+> `build.rs` links with `--entry=service_main`. `forbid` cannot be relaxed even for that. So the
+> crates carry `deny` plus ONE `#[allow(unsafe_code)]` on the entry symbol, and
+> `scripts/unsafe_check.py` asserts both halves: that the attribute is present, and that the only
+> `#[allow]` sits on `#[no_mangle]`. An `#[allow]` anywhere else fails the check - the exception
+> cannot become a door.
+>
+> No policy changes here. §18.2 already forbade this; what changed is who enforces it.
+
 ### 18.3 Documentation
 
 Every `unsafe` block carries a SAFETY comment:
@@ -1503,10 +1560,31 @@ A PR with an unsafe block lacking a SAFETY comment is rejected without review.
 ### 18.5 Grandfathered Floors
 
 `unsafe` outside the four permitted layers (§18.1) is tolerated only as
-**grandfathered** lines in `task/`, `syscall/`, and `interrupt/`, frozen at the
-counts in `audits/unsafe-audit.md`. Those counts may **decrease** freely but may
+**grandfathered** lines in `task/`, `syscall/`, `interrupt/`, `loader.rs` and
+`main.rs`, and in the two SDK files named below, frozen at the counts in
+`audits/unsafe-audit.md`. Those counts may **decrease** freely but may
 **increase** only by an amendment recorded here and in the audit, with a written
 safety + necessity rationale.
+
+> **Amendment 2026-09-12: the SDK's `service_context.rs` (82) and `ipc.rs` (8) are recorded as
+> grandfathered floors, and this list gains `loader.rs` and `main.rs`, which it had always omitted.**
+> Neither is new `unsafe` - both are the state of the tree being written down for the first time.
+> `scripts/unsafe_check.py` scanned only `kernel/src/` and `services/`, so the SDK's ~125 `unsafe`
+> lines were audited by nothing at all while §18.4 claimed CI checks the audit against source
+> (`backlog/18`). The scan now covers `sdk/`, which is what makes these floors enforceable rather
+> than merely stated.
+>
+> **They are one design consequence, not 90 violations.** 86 of the 90 are `unsafe { raw_syscall(..) }`
+> call sites: `raw_syscall` is an `unsafe fn` because it issues the trap instruction, so every caller
+> opens a block - and these two files ARE the wrapper layer §18.1 describes, the one that exists so
+> that driver and application services need no `unsafe` of their own. **That worked: `services/` is at
+> ZERO**, mechanically enforced. The isolation stopped one layer short of itself.
+>
+> The fix that would actually close this is a SAFE `raw_syscall` wrapper - the kernel validates every
+> user pointer, so passing integers to a validating callee is sound - which collapses ~86 of them and
+> leaves the SDK at roughly the 35 lines §18.1 sanctions. That is an SDK redesign on every service's
+> call path, so per §26.7 it is recorded here as the known route rather than half-done. Until then the
+> floors may only fall.
 
 New `unsafe` that a feature or hardening needs must first try to live in a permitted
 layer (`arch/`, `memory/`, `capability/`, `smp/`) rather than grow a grandfathered

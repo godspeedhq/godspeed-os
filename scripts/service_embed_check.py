@@ -110,6 +110,12 @@ def embedded_arms(root, arch):
     body = _block(src, head, "`" + arch + "_built`", "kernel/build.rs")
     arms = body.split("} else {")
     out = []
+    # THE KERNEL LIST IS NOT ALWAYS THE ROSTER. A port that has finished step C embeds one image - the
+    # supervisor - and its services live in the supervisor's own embed list. Ask that file instead, or
+    # every managed service reads as missing. See _supervisor_embedded().
+    if len(arms) == 1 and [n for n in re.findall(NAME, arms[0])] == ["supervisor"]:
+        return [(arch + " (via the supervisor: the kernel embeds only `supervisor`)",
+                 _supervisor_embedded(root, arch))]
     for i, arm in enumerate(arms):
         seen, names = set(), []
         for n in re.findall(NAME, arm):
@@ -118,6 +124,51 @@ def embedded_arms(root, arch):
                 names.append(n)
         label = arch if len(arms) == 1 else arch + " arm " + str(i + 1) + " of " + str(len(arms))
         out.append((label, names))
+    return out
+
+
+def _supervisor_embedded(root, arch):
+    """The roster the SUPERVISOR embeds, for the ports where the kernel no longer holds one.
+
+    Step C moved every service image out of the kernel and into the supervisor, and riscv64 is the
+    first port to ship on that model: `riscv64_built` in kernel/build.rs is literally `["supervisor"]`.
+    Checking the KERNEL's list on such a port asks the wrong file - every managed service is "missing"
+    from a list that is correct at one entry, which is a FALSE FAILURE on the only port that has
+    finished the migration. (arm and aarch64 still embed ~25 images in the kernel; they are the ones
+    yet to move.)
+
+    So when the kernel's arm is supervisor-only, the roster comes from services/supervisor/build.rs
+    instead: its flat `EMBEDDED` array, plus the two arch-conditional groups it adds - the USB host
+    (per-controller, not per-ISA) and the PCI enumerator (only where config space is reachable).
+    """
+    src = io.open(os.path.join(root, "services", "supervisor", "build.rs"), encoding="utf-8").read()
+    names = list(re.findall(NAME, _block(src, "const EMBEDDED: &[&str] = ",
+                                         "`EMBEDDED`", "services/supervisor/build.rs")))
+
+    # `let usb: &[&str] = match arch.as_str() { "x86_64" => &["xhci", "ehci"], ... }` - take only the
+    # arm for THIS arch, for the same reason embedded_arms() refuses to union the aarch64 arms: a name
+    # present in some other arch's arm is not present in the build being checked.
+    usb = _block(src, "let usb: &[&str] = ", "`usb`", "services/supervisor/build.rs")
+    stripped = _strip_comments(usb)
+    for line in stripped.split(chr(10)):
+        if (chr(34) + arch + chr(34)) in line and "=>" in line:
+            names += re.findall(NAME, line.split("=>", 1)[1])
+            break
+
+    # The enumerator group is an `if arch == "a" || arch == "b" ...` rather than a match, so the test
+    # is simply whether this arch is named in its condition.
+    enum_src = _strip_comments(src)
+    marker = "let enumerator: &[&str] = if "
+    if marker in enum_src:
+        cond = enum_src.split(marker, 1)[1].split("{", 1)[0]
+        if (chr(34) + arch + chr(34)) in cond:
+            names.append("hw-enumerator")
+
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
     return out
 
 
@@ -132,6 +183,12 @@ def embedded(root, arch):
     return out
 
 
+def arches(root):
+    """Every arch that declares an embed list in kernel/build.rs, in source order."""
+    src = io.open(os.path.join(root, "kernel", "build.rs"), encoding="utf-8").read()
+    return re.findall(r"let ([a-z0-9_]+)_built: &\[&str\] = ", src)
+
+
 def check(root, arch):
     """Return a list of failure lines; empty means every arm embeds every managed service."""
     names = managed(root)
@@ -139,13 +196,26 @@ def check(root, arch):
     for label, have in embedded_arms(root, arch):
         have = set(have)
         exempt = ARCH_EXEMPT.get(arch, {})
+        # NAME THE FILE THAT IS ACTUALLY SHORT. On a port that has finished step C the roster comes
+        # from the supervisor, so telling the reader to edit `<arch>_built` in kernel/build.rs sends
+        # them to a list that is correct at one entry. A checker that reports the wrong location is
+        # only marginally better than one that says nothing.
+        via_supervisor = "via the supervisor" in label
+        if via_supervisor:
+            where = ("`EMBEDDED` (or the `usb` / `enumerator` arm for this arch) in "
+                     "services/supervisor/build.rs")
+            effect = ("the supervisor embeds no image for it and `spawn " + "%s" + " FAILED` is the "
+                      "whole of the boot symptom")
+        else:
+            where = "that arm of `" + arch + "_built` in kernel/build.rs"
+            effect = ("the kernel embeds an empty placeholder and the boot fails with "
+                      "LoadFailed(TooSmall)")
         for name in names:
             if name in have or name in exempt:
                 continue
             bad.append(
-                "  " + name + " [" + label + "]: the supervisor SPAWNS it, but it is not in that "
-                "arm of `" + arch + "_built` in kernel/build.rs, so the kernel embeds an empty "
-                "placeholder and the boot fails with LoadFailed(TooSmall)."
+                "  " + name + " [" + label + "]: the supervisor SPAWNS it, but it is not in "
+                + where + ", so " + (effect % name if via_supervisor else effect) + "."
             )
     return bad
 
@@ -166,7 +236,10 @@ if __name__ == "__main__":
     import sys
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     failed = False
-    for a in ("arm", "aarch64"):
+    # Every arch with an embed list in kernel/build.rs, discovered rather than restated - riscv64 was
+    # absent from this pair for its whole life, so running this file directly checked two of the three
+    # ports that have one.
+    for a in arches(here):
         try:
             enforce(here, a)
         except SystemExit as e:

@@ -435,10 +435,44 @@ static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX
 /// Same class as the arm32 `resource_invoke` truncation: a 64-bit constant that a 32-bit port silently
 /// narrows. On 32-bit the region sits at 1.25 GiB - clear of the 1 GiB RAM identity map and the
 /// peripheral window below it, and clear of `USER_STACK_TOP` (0x8000_0000) above.
+///
+/// THE LAST TWO ARCH CONDITIONALS IN THE NEUTRAL KERNEL, AND THEY STAY. `shared_surface_check.py`
+/// counts these, which is right - they are measured, not exempt - but they are not the leak the rest
+/// of the sweep removed. A 32-bit address space cannot hold a 4 GiB virtual address, so this is not
+/// an ISA question standing in for something else: the address width IS the question, asked of the
+/// property that answers it. There is no seam member that would improve it, because the choice is
+/// about the neutral kernel's own address-space layout rather than about any hardware.
 #[cfg(target_pointer_width = "64")]
 pub const TASK_HEAP_VA_START: u64 = 0x1_0000_0000; // 4 GiB
 #[cfg(target_pointer_width = "32")]
 pub const TASK_HEAP_VA_START: u64 = 0x5000_0000;   // 1.25 GiB
+
+/// What arming a SUB-TICK one-shot wake concluded.
+///
+/// Neutral, though only one arch can do anything but `Full` today. It was `arch/arm/irq.rs`'s enum,
+/// and `syscall/dispatch.rs` matched on it under `#[cfg(target_arch = "arm")]` - so the sleep path
+/// had an ARM-shaped hole in a neutral file, and every other port silently took the tick backstop
+/// with nothing saying it could do better. The concept is not ARM's: "the arch may be able to wake a
+/// task sooner than the next tick; if it cannot, fall through" is a scheduler question, and an arch
+/// with a comparator (x86's TSC-deadline, RISC-V's `stimecmp`) answers it the day someone wires one.
+pub enum Armed {
+    /// Registered; the caller should block and will be woken by the compare interrupt.
+    Pending,
+    /// The requested time ELAPSED while we were arming it. The caller must NOT block.
+    ///
+    /// This is the whole short-sleep bug that produced the type. The compare fires on EQUALITY, and
+    /// on the Pi 2 every System Timer access is an uncached Device read, so programming a 125 us
+    /// deadline can itself take longer than 125 us. The counter is then already past the value
+    /// written, the match never happens, and the task waits out the 10 ms tick backstop instead.
+    /// Measured on hardware exactly as that predicts - 2000 us sleeps land within 28 us, 125 us
+    /// sleeps average 8160 us.
+    ///
+    /// Returning immediately is not an approximation, it is the correct answer: the caller asked to
+    /// wait 125 us and 125 us has passed.
+    Elapsed,
+    /// No capacity, or this arch has no sub-tick timer at all; the caller falls back to the tick.
+    Full,
+}
 
 /// Bytes dynamically allocated so far by each task (via AllocMem).
 static mut TASK_ALLOC_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];

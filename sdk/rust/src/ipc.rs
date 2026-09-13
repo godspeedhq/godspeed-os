@@ -126,8 +126,7 @@ pub fn recv_timeout_into(
 ) -> Result<Option<usize>, IpcError> {
     const RECV_TIMED_OUT: i64 = -1001;
     let packed = ((buf.len() as u64) << 16) | (endpoint.0 as u64 & 0xFFFF);
-    #[cfg(target_arch = "arm")]
-    let timeout_cycles = if timeout_cycles == 0 { 0 } else { timeout_cycles.min(u32::MAX as u64).max(1) };
+    let timeout_cycles = abi_timeout(timeout_cycles);
     // SAFETY: raw_syscall(35) = RecvTimeout; `buf` is a valid caller-owned slice in user space and its
     // true length is what is passed, so the kernel cannot write past it.
     let ret = unsafe { raw_syscall(35, packed, buf.as_mut_ptr() as u64, timeout_cycles) };
@@ -145,16 +144,7 @@ pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<M
     let mut payload = [0u8; MAX_PAYLOAD];
     // arg0 packs the buffer length (high) and the cap slot (low) to fit the 3-arg ABI.
     let packed = ((MAX_PAYLOAD as u64) << 16) | (endpoint.0 as u64 & 0xFFFF);
-    // ARM's 32-bit syscall ABI carries each argument in ONE register, and `raw_syscall` truncates a
-    // u64 arg to u32. Every OTHER arg (pointer, handle, length) genuinely fits in 32 bits, but a timeout
-    // in generic-timer ticks does NOT: at the Pi 2's ~62.5 MHz CNTFRQ, u32::MAX ticks is only ~68 s, so
-    // a longer finite timeout would truncate to a tiny value (premature wake) or - if it landed on a
-    // multiple of 2^32 - to 0, which the kernel reads as "block forever": a bounded VIII deadline turning
-    // into an infinite hang. Saturate to u32::MAX so a long finite request becomes the longest
-    // REPRESENTABLE timeout (~68 s), never a tiny one and never 0; keep a genuine 0 (block-forever) as 0.
-    // x86-64 (64-bit registers) passes the full value. (userspace-audit Audit 4, A-U1.)
-    #[cfg(target_arch = "arm")]
-    let timeout_cycles = if timeout_cycles == 0 { 0 } else { timeout_cycles.min(u32::MAX as u64).max(1) };
+    let timeout_cycles = abi_timeout(timeout_cycles);
     // SAFETY: raw_syscall(35) = RecvTimeout; buf is a valid stack slice within user space.
     let ret = unsafe { raw_syscall(35, packed, payload.as_mut_ptr() as u64, timeout_cycles) };
     if ret == RECV_TIMED_OUT {
@@ -163,6 +153,33 @@ pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<M
         Err(i64_to_ipc_error(ret))
     } else {
         Ok(Some(Message::from_bytes(&payload[..ret as usize])))
+    }
+}
+
+/// Fit a timeout to what one syscall argument can actually carry.
+///
+/// A 32-bit ABI carries each argument in ONE register and `raw_syscall` truncates a `u64` arg to
+/// `u32`. Every OTHER argument (pointer, handle, length) genuinely fits in 32 bits, but a timeout in
+/// generic-timer ticks does NOT: at the Pi 2's ~62.5 MHz CNTFRQ, `u32::MAX` ticks is only ~68 s. A
+/// longer finite timeout would truncate to a tiny value (premature wake) or - if it landed on a
+/// multiple of 2^32 - to **0**, which the kernel reads as "block forever". A bounded Commandment VIII
+/// deadline turning into an infinite hang is the worst possible way for this to fail, which is why it
+/// saturates: a long finite request becomes the longest REPRESENTABLE timeout, never a tiny one and
+/// never 0. A genuine 0 (block forever) stays 0. (userspace-audit Audit 4, A-U1.)
+///
+/// ASKED AS REGISTER WIDTH, NOT AS `target_arch = "arm"`, which is what both call sites said
+/// separately. arm32 was never the reason - a 32-bit argument register was, and arm32 merely happens
+/// to be the only 32-bit port that currently builds userspace. A future 32-bit port inherits the
+/// clamp instead of inheriting the hang, and that is not hypothetical: the failure mode here is
+/// SILENT on the port that lacks it. (`target_pointer_width` is a proxy for argument-register width;
+/// they coincide on every target this SDK builds for, and `kernel/src/task/scheduler.rs` already uses
+/// the same proxy for the same reason.)
+#[inline]
+fn abi_timeout(timeout_cycles: u64) -> u64 {
+    if cfg!(target_pointer_width = "32") && timeout_cycles != 0 {
+        timeout_cycles.min(u32::MAX as u64).max(1)
+    } else {
+        timeout_cycles
     }
 }
 

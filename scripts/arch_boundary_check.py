@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Enforce the arch boundary: NO arch-specific code in the kernel's arch-neutral layers (aarch64 Phase 0).
+"""Enforce the arch boundary: NO arch-specific code in the kernel's arch-neutral layers.
 
 The whole kernel reaches hardware through ONE seam, `crate::arch::imp` (`kernel/src/arch/mod.rs`), which
-`#[cfg(target_arch)]`-selects the implementation module (`arch/x86_64/`, later `arch/aarch64/`,
-`arch/riscv64/`, ...). For a new architecture to be BOUNDED - "implement `arch/<new>/` to the same
-surface, touch zero neutral files" - two invariants must hold in every kernel file OUTSIDE `arch/`:
+`#[cfg(target_arch)]`-selects the implementation module - one directory per ISA under `arch/`. For an
+architecture to be BOUNDED - "implement `arch/<new>/` to the same surface, touch zero neutral files" -
+two invariants must hold in every kernel file OUTSIDE `arch/`:
 
   1. No inline assembly (`asm!` / `naked_asm!`). Arch-specific instructions live only in `arch/`, reached
      through `arch::imp` primitives (e.g. `read_page_table_base`, `invalidate_tlb_page`, `local_irq_save`).
@@ -13,8 +13,16 @@ surface, touch zero neutral files" - two invariants must hold in every kernel fi
 
 This is the arch-boundary counterpart to `unsafe_check.py` (the unsafe boundary) and `contract_check.py`
 (the contract<->kernel reconcile): a boundary survives only if it is mechanically enforced (CLAUDE.md
-§26 - the architecture survives only if the discipline survives). A violation here means a future
-RISC-V/AArch64 port would be forced to edit a neutral file; fix it by adding an `arch::imp` primitive.
+§26 - the architecture survives only if the discipline survives). A violation here means the NEXT port
+would be forced to edit a neutral file; fix it by adding an `arch::imp` primitive.
+
+THE ARCH LIST IS DERIVED, NOT RESTATED. It used to be a hand-written alternation with the comment
+"Extend the arch list as arches are added" - and that manual step was missed: `loongarch64` and `s390x`
+have directories under `arch/` and were absent from the pattern, so `arch::loongarch64::` in a neutral
+file would have passed while this script printed an unqualified all-clear. A check that cannot see two
+of the seven arches it guards is worse than no check, because it is believed. The list now comes from
+the directory listing, which is the thing that actually defines what an arch IS here, so the next port
+is covered the moment its directory exists and nobody has to remember this file.
 
 Exit: 0 if the neutral layers are arch-clean, 1 otherwise.
 """
@@ -27,9 +35,30 @@ REPO_ROOT = Path(__file__).parent.parent
 KERNEL_SRC = REPO_ROOT / "kernel" / "src"
 ARCH_DIR = KERNEL_SRC / "arch"
 
-# Any named arch module - via the crate's own `arch::` tree OR `core::arch::<arch>::` intrinsics.
-# Neutral code must use `arch::imp::` instead. Extend the arch list as arches are added.
-_ARCHES = r"x86_64|x86|aarch64|arm|riscv64|riscv32"
+# `core::arch` submodules that are NOT a directory under `arch/`. `x86` is the 32-bit intrinsic module
+# that accompanies `x86_64` (`core::arch::x86::__cpuid`); we build no 32-bit x86 kernel, so no directory
+# names it, but a neutral file could still reach for it.
+_EXTRA_INTRINSIC_ARCHES = ["x86"]
+
+
+def _arch_names() -> list[str]:
+    """Every ISA name this repository knows, derived from the directories under `kernel/src/arch/`.
+
+    Sorted LONGEST FIRST so the alternation cannot match a prefix: with `x86|x86_64`, the regex engine
+    takes `x86` and reports the wrong arch in the violation message. Longest-first makes `x86_64` win.
+    """
+    dirs = [p.name for p in ARCH_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    if not dirs:
+        # LOUD, never a silent pass (invariant 12). An empty alternation would build the regex
+        # `arch::()::` - which matches nothing, so every violation would slip through while this
+        # script still printed "passed". A check that cannot find its own subject must say so.
+        raise SystemExit(f"arch_boundary_check: no arch directories under {ARCH_DIR} - refusing to "
+                         f"report a pass against an empty arch list")
+    return sorted(set(dirs + _EXTRA_INTRINSIC_ARCHES), key=lambda n: (-len(n), n))
+
+
+_ARCH_NAMES = _arch_names()
+_ARCHES = "|".join(_ARCH_NAMES)
 NAMED_ARCH = re.compile(rf"\barch::({_ARCHES})::")
 CORE_ARCH_INTRINSIC = re.compile(rf"\bcore::arch::({_ARCHES})::")  # e.g. core::arch::x86_64::__cpuid
 INLINE_ASM = re.compile(r"\b(?:core::arch::)?(?:naked_)?asm!")
@@ -70,11 +99,12 @@ def main() -> int:
         print()
         print(f"{len(violations)} violation(s). The neutral layers must reach hardware only through the "
               "`arch::imp` seam (docs/aarch64.md); add an `arch::imp` primitive rather than inlining asm "
-              "or naming a specific arch. This keeps a future RISC-V/AArch64 port BOUNDED.")
+              "or naming a specific arch. This keeps the NEXT port BOUNDED.")
         return 1
 
-    print("Arch-boundary check passed - no inline asm and no named-arch references outside kernel/src/arch/. "
-          "The neutral layers reach hardware only through the `arch::imp` seam; a new arch is a drop-in.")
+    print(f"Arch-boundary check passed - no inline asm and no named-arch references outside "
+          f"kernel/src/arch/, across all {len(_ARCH_NAMES)} arch names ({', '.join(_ARCH_NAMES)}). "
+          f"The neutral layers reach hardware only through the `arch::imp` seam; a new arch is a drop-in.")
     return 0
 
 

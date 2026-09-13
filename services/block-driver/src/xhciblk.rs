@@ -8,10 +8,14 @@
 //! that used to select between the two drivers, so on this port the service below is the only route
 //! and Commandment I is closed (CLAUDE.md §6.4, amendment 2026-08-09).
 //!
-//! The syscall route survives for ARM32 (Pi 2), which has no PCIe and no device-IRQ routing to
-//! userspace, so its DWC2 stack remains in the kernel. `usbdisk.rs` picks between the two on
-//! `cfg(target_arch)` - it used to be a build FEATURE, which was a footgun: the switch had to reach
-//! three crates and setting only some gave two drivers on one controller, or none.
+//! The syscall route in `usbdisk.rs` survives for a board with no such service, and **no shipping
+//! port is one**: arm32's DWC2 stack left the kernel a week after aarch64's xHCI did (CLAUDE.md §6.4,
+//! amendment 2026-08-17), so every USB board now comes through here.
+//!
+//! Which service to ask is `STORAGE_HOST`, set by `build.rs` from the target. It used to be a build
+//! FEATURE, which was a footgun - the switch had to reach three crates by hand, and setting only some
+//! gave two drivers on one controller, or none. A value DERIVED from the target cargo is already
+//! building for cannot be half-set, which is the property that was actually wanted.
 //!
 //! This module is the other route. Same four operations, addressed to the `xhci` service by name
 //! over IPC, using the block protocol that service already serves (`services/xhci/src/msc.rs`).
@@ -38,16 +42,18 @@ use godspeed_sdk::{Message, ServiceContext};
 
 use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
 
-/// The service that owns the host controller, addressed by name so a restart is transparent (§3.11).
-/// The USB host-controller SERVICE that owns the disk, by name.
+/// The USB host-controller SERVICE that owns the disk, by name - so a restart is transparent (§3.11).
 ///
-/// Different service, identical protocol. On AArch64 that is `xhci` driving the Pi 4's VL805; on
-/// arm32 it is `dwc2` driving the Pi 2's DesignWare core. The wire format is byte-for-byte the same,
-/// which is the whole reason this client needed no porting - only the name it asks for.
-#[cfg(target_arch = "arm")]
-const XHCI: &str = "dwc2";
-#[cfg(not(target_arch = "arm"))]
-const XHCI: &str = "xhci";
+/// Different service, identical protocol: `xhci` drives the Pi 4's VL805 and the VisionFive 2's
+/// Cadence core, `dwc2` drives the Pi 2's DesignWare core. The wire format is byte-for-byte the same,
+/// which is the whole reason this client needed no porting - only the name it asks for. That name is
+/// one entry in `build.rs`'s board table rather than a `cfg` here, so a new board states its host
+/// once, beside the rest of what makes it a board.
+///
+/// `"none"` on a machine whose disk is not on USB at all (x86: AHCI over PCI). Nothing reaches this
+/// module there - the AHCI backend takes the call and never returns - and a name that resolves to
+/// nothing fails loudly rather than reaching some other service by accident.
+pub(crate) const XHCI: &str = env!("STORAGE_HOST");
 
 /// One request/reply to `xhci`, with a single reacquire-and-retry.
 ///

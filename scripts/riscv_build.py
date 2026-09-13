@@ -19,7 +19,9 @@ USERSPACE IS BUILT HERE TOO, and in the right order. The kernel embeds ONE image
 and the supervisor embeds every service it spawns, so a supervisor built before the services it
 carries embeds STALE ones. That is not a hypothetical: it shipped on both Pi ports and made several
 "confirmations" tests of code that was not running. `embed_order_check.py` is the guard, and it only
-guards a path that runs it.
+guards a path that runs it - which, until 2026-09-12, this path did not. It named the guard in this
+very sentence and called none of the three; the ARM paths ran all three. The sentence was right and
+the file was the counter-example to it.
 
 RELEASE, for userspace, always. A debug service carries frames many times larger than its user stack
 - the arm32 port found this as `fs` crash-looping on a 503 KiB `service_main` frame against a 256 KiB
@@ -43,10 +45,17 @@ TARGET = "riscv64imac-unknown-none-elf"
 # a hard panic rather than a placeholder, so this list either matches it or the build stops.
 #
 # `probe` is absent deliberately, and for the same reason it is absent on ARM: it is the adversarial
-# test service, and the SDK's fault primitives it calls (`fault_noncanonical_read`,
-# `fault_divide_by_zero`) are x86 instructions. The supervisor is therefore built with `bare-metal`,
-# which is the feature that drops `probe` from its embedded set - the same posture a real board takes
-# anyway, since a bare-metal image ships no adversary (§4.4).
+# test service, and the supervisor is built with `bare-metal`, which is the feature that drops it from
+# the embedded set. That IS the posture a real board takes - a bare-metal image ships no adversary
+# (4.4) - so this is the rule rather than an exception for this port.
+#
+# This used to give a second reason, that the SDK's fault primitives `probe` calls
+# (`fault_noncanonical_read`, `fault_divide_by_zero`) "are x86 instructions". That stopped being true
+# when the ARM ports wrote their own (`sdk/rust/src/adversarial.rs` has arm and aarch64 bodies using
+# the ARMv7 high-address abort, the AArch64 VA hole, and `udf #0`), and it read as the blocker - as
+# though this port could not run the adversarial suite until somebody wrote assembly. It could not run
+# it because no non-x86 build asks for `probe` at all, which is a different statement with a different
+# fix. riscv64 bodies are genuinely missing, and what that costs is recorded in `backlog/24`.
 SERVICES = [
     "events", "recorder", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
     # `hw-enumerator` joins the build now that this arch answers `pci_cfg_read32`. It was absent
@@ -74,14 +83,22 @@ def gates():
     """The same set `arm_build.py` runs. Listed explicitly, not discovered, so ADDING a checker is a
     decision each build path makes rather than something that silently changes what a build enforces."""
     for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
-                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py"):
+                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py",
+                  "line_ending_check.py"):
         r = subprocess.run([sys.executable, os.path.join("scripts", check)],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             print(r.stdout + r.stderr)
             sys.exit("BUILD REFUSED: %s failed. Fix the violation, or amend CLAUDE.md and cite\n"
                      "the amendment - those are the only two ways past this, by design." % check)
-    print("commandments + dash + unsafe + arch-boundary + arch-seam + contracts: pass")
+    # Is every service the supervisor spawns actually EMBEDDED for this arch? On this port the kernel
+    # embeds one image - the supervisor - so the roster lives in services/supervisor/build.rs, and the
+    # checker asks that file rather than `riscv64_built`. `xhci` missing from it is the whole of
+    # "supervisor: spawn xhci FAILED", which cost a hardware round to find by hand.
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import service_embed_check
+    service_embed_check.enforce(ROOT, "riscv64")
+    print("commandments + dash + unsafe + arch-boundary + arch-seam + contracts + service-embed: pass")
 
 
 def main():
@@ -115,6 +132,24 @@ def main():
         if not os.path.exists(sup):
             sys.exit("supervisor did not build; the kernel would silently embed a placeholder")
         print("OK  userspace: %d services + supervisor (%d bytes)" % (len(SERVICES), os.path.getsize(sup)))
+
+        # The two gates that need the BINARIES, so they run here rather than in gates(). Services and
+        # the supervisor are both built `--release` above regardless of the kernel's profile, so the
+        # profile passed here is "release" and not `prof`.
+        #
+        # embed_order: the supervisor `include_bytes!`s every service, so one built AFTER it ships the
+        # PREVIOUS build of itself - the image looks perfect and runs code nobody changed. That is how
+        # several ARM "confirmations" tested stale binaries.
+        #
+        # stack_fit: every frame must fit the 256 KiB user stack (USER_STACK_PAGES, kernel/src/task/mod.rs).
+        # This checker matched only the ARM `sub sp, sp, #N` prologue until 2026-09-12 and censused ZERO
+        # of this arch's 412 `addi sp, sp, -N` frames; it now knows both, and refuses to report a pass
+        # when it recognises nothing.
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import embed_order_check, stack_fit_check
+        embed_order_check.enforce(ROOT, TARGET, "release", SERVICES)
+        stack_fit_check.enforce(shutil.which("rust-objdump") or "rust-objdump",
+                                ROOT, TARGET, "release", SERVICES, 64 * 4096)
 
     run(["cargo", "build", "-p", "kernel", "--target", TARGET] + feats + rel)
 

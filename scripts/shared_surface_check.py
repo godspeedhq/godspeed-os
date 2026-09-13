@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
-"""The SHARED SURFACE above the kernel: what a port may touch, and what it must not grow.
+"""The SHARED SURFACE: everything OUTSIDE `arch/` that still knows which ISA it was built for.
 
-The kernel's arch seam is enforced from both directions already - `arch_boundary_check.py` proves the
+The kernel's arch seam is enforced from two directions already - `arch_boundary_check.py` proves the
 neutral layers reach hardware only through `arch::imp`, and `arch_seam_check.py` proves every arch
-answers every member of it. Above the kernel there was nothing, and that is where the cost actually
-lands: a port that edits a shared SERVICE invalidates every other board's testing, silently, and the
-operator finds out either by re-testing everything or by shipping a regression.
+answers every member of it. Neither counts `#[cfg(target_arch)]`, and that is the gap this closes.
+
+A port that edits a shared SERVICE invalidates every other board's testing, silently, and the operator
+finds out either by re-testing everything or by shipping a regression.
+
+THE NEUTRAL KERNEL IS SCANNED TOO, AND IT WAS NOT BEFORE. `arch_boundary_check.py` forbids exactly two
+things outside `arch/`: inline assembly, and naming an arch MODULE (`arch::aarch64::`). A line like
+
+    #[cfg(target_arch = "arm")]
+    HwClass::Dwc2 => &[crate::arch::imp::irq::USB_VECTOR],      // kernel/src/task/mod.rs
+
+breaks neither rule and passes - while being precisely what that script's own header says must not
+exist: "implement `arch/<new>/` to the same surface, touch zero neutral files". CLAUDE.md 4.1 names
+this debt and counts it BY HAND ("neutral code still names `arm` in 8 places, `aarch64` in 4 and
+`x86_64` in 3"), which is the shape that drifts: a hand count is right on the day it is written and
+silently wrong afterwards. Measured here instead, so it can only fall.
+
+The two halves are the same property asked of two layers, which is why they share a ratchet rather
+than getting a second script: code outside `arch/` that knows the ISA is what makes a port unbounded,
+whether it sits in `kernel/src/task/` or in `services/`. What differs is the DIAGNOSIS, and only the
+services half gets the "which BOARD am I on" reading below - in the neutral kernel the ISA usually is
+the real question, and the fix is a new `arch::imp` member rather than a board fact.
 
 This does two separate jobs, and they answer different questions.
 
@@ -45,27 +64,76 @@ BASELINE = os.path.join(ROOT, "SHARED-SURFACE.baseline.txt")
 
 # Where shared code lives. `sdk/` is the seam and is EXPECTED to carry arch cfgs - counted so a reader
 # can see the shape, but it is the one place they are the right answer rather than a smell.
-SHARED_ROOTS = ("services", "sdk")
-ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"')
+# The neutral kernel is `kernel/src` MINUS `arch/`, which is the one directory allowed to know.
+SHARED_ROOTS = ("services", "sdk", "kernel/src")
+EXCLUDED_DIRS = ("target", ".git", "arch")
+# Two spellings of the SAME question, because a build script asks it differently and the answer is
+# just as arch-conditional. `CARGO_CFG_TARGET_ARCH` is the environment variable cargo sets for a
+# `build.rs`, and matching on it there is how a crate maps the ISA to a board fact once instead of
+# repeating a `#[cfg(any(...))]` list at every site (`services/block-driver/build.rs`).
+#
+# It is counted, and that is the point: concentrating seven lists into one table should read as
+# 21 -> 1, not as 21 -> 0. A reduction that is really the instrument going blind is the exact failure
+# this branch keeps finding elsewhere - `arch_boundary_check` could not see two arches, `stack_fit`
+# censused zero frames on riscv64 and called it a pass. A ruler you can step off is not a ruler.
+# `target_pointer_width` counts too. It is a BETTER axis than `target_arch` for anything that turns on
+# register width (the SDK's syscall-argument clamp), and it must still be counted, or moving to the
+# better question would read as the site disappearing - the third time on this branch that the ruler
+# could have been stepped off by improving the code. Counted, not exempt.
+ARCH_CFG = re.compile(r'target_arch\s*=\s*"([a-z0-9_]+)"|target_pointer_width\s*=\s*"\d+"'
+                      r'|CARGO_CFG_TARGET_ARCH')
+
+# In a BUILD SCRIPT the arch is read once into a variable and then compared - `match arch.as_str()`,
+# `arch == "x86_64"` - so `CARGO_CFG_TARGET_ARCH` alone counts a fifty-arm table as ONE. That is the
+# ruler going blind in the slower way: not missing the file, but reporting a number that cannot grow
+# no matter how much arch-conditional code the file accumulates.
+#
+# So a build script ALSO counts each arch it names. A new ISA's real cost there is one arm per
+# question the file asks, and that is what this measures. Only in `build.rs`, where an arch name in a
+# string is a decision; in ordinary source it would match prose and paths.
+ARCH_NAME = re.compile(r'"(x86_64|x86|aarch64|arm|riscv64|riscv32|loongarch64|s390x)"')
 
 
 def rel(path):
     return os.path.relpath(path, ROOT).replace(os.sep, "/")
 
 
+def _strip_comments(text):
+    """Drop `//` line comments before counting.
+
+    This counted RAW FILE TEXT, so a comment that MENTIONED `target_arch` counted as an
+    arch-conditional site. Two ways that bites, and the second is the bad one:
+
+      * prose alone could trip the ratchet and refuse a change that added no conditional code
+        (this file's own fix did exactly that - a comment quoting the cfg it had just DELETED kept
+        the count level and hid a genuine reduction);
+      * and the reverse - deleting a conditional while describing it in a comment leaves the number
+        unmoved, so the ratchet reports no progress for real progress, which is the slower poison.
+
+    `arch_boundary_check.py`, the sibling that enforces the same boundary inside the kernel, has
+    stripped comments since it was written. This is that, applied to the other side of the seam.
+    Block comments and string literals are rare enough here that a line-comment strip suffices; a
+    miss is a count that is too HIGH, which fails loudly rather than passing quietly.
+    """
+    return chr(10).join(line.split("//", 1)[0] for line in text.splitlines())
+
+
 def scan_counts():
-    """Occurrences of an arch cfg per shared file, as {path: count}."""
+    """Occurrences of an arch cfg per shared file, as {path: count}. Comments do not count."""
     counts = {}
     for root_name in SHARED_ROOTS:
         root = os.path.join(ROOT, root_name)
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in ("target", ".git")]
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
             for fn in filenames:
                 if not fn.endswith(".rs"):
                     continue
                 full = os.path.join(dirpath, fn)
                 with open(full, encoding="utf-8", errors="replace") as fh:
-                    n = len(ARCH_CFG.findall(fh.read()))
+                    text = _strip_comments(fh.read())
+                n = len(ARCH_CFG.findall(text))
+                if fn == "build.rs":
+                    n += len(ARCH_NAME.findall(text))
                 if n:
                     counts[rel(full)] = n
     return counts
@@ -284,16 +352,24 @@ def main():
 
     grew = [(p, baseline.get(p, 0), n) for p, n in sorted(counts.items()) if n > baseline.get(p, 0)]
     if grew:
-        print("SHARED SURFACE GREW - arch-conditional code was ADDED above the kernel:")
+        print("SHARED SURFACE GREW - arch-conditional code was ADDED outside `arch/`:")
         print()
         for path, was, now in grew:
             print("  %s: %d -> %d" % (path, was, now))
         print()
-        print("Above the kernel, `target_arch` is usually standing in for 'which BOARD am I on' - a")
-        print("different question on a wrong axis, since a board with different hardware on the SAME")
-        print("instruction set breaks it. Genuinely ISA-dependent code belongs in the SDK, which is")
-        print("the seam services already have (CLAUDE.md 18.1).")
-        print()
+        if any(p.startswith("kernel/src") for p, _, _ in grew):
+            print("In the NEUTRAL KERNEL the ISA usually IS the real question - and the answer is a new")
+            print("`arch::imp` member, not a cfg here. A neutral file that knows the ISA is a file the")
+            print("NEXT port has to edit, which is the whole of what `bounded to arch/<isa>/` means")
+            print("(CLAUDE.md 4.1). `arch_boundary_check.py` will not catch this: a `#[cfg]` is neither")
+            print("inline asm nor a named arch module, so it passes both of that script's rules.")
+            print()
+        if any(not p.startswith("kernel/src") for p, _, _ in grew):
+            print("Above the kernel, `target_arch` is usually standing in for 'which BOARD am I on' - a")
+            print("different question on a wrong axis, since a board with different hardware on the SAME")
+            print("instruction set breaks it. Genuinely ISA-dependent code belongs in the SDK, which is")
+            print("the seam services already have (CLAUDE.md 18.1).")
+            print()
         print("If the port really needs it, run `python scripts/shared_surface_check.py --bless` and")
         print("say why in the commit. Refusing quietly is the point: this is the surface that makes")
         print("every other board's testing uncertain.")
@@ -301,7 +377,9 @@ def main():
 
     shrank = sum(1 for p, n in counts.items() if n < baseline.get(p, 0))
     total = sum(counts.values())
-    print("Shared-surface check passed - %d arch-conditional site(s) above the kernel, none added%s."
+    kern = sum(n for p, n in counts.items() if p.startswith("kernel/src"))
+    print("  (%d in the neutral kernel, %d above it)" % (kern, total - kern))
+    print("Shared-surface check passed - %d arch-conditional site(s) outside `arch/`, none added%s."
           % (total, (", %d file(s) shrank" % shrank) if shrank else ""))
     if "--report" in sys.argv:
         print()

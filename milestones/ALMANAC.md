@@ -55,6 +55,7 @@
 - [2026-09-03 to 2026-09-04 - The day the kernel stopped interpreting the bus](#2026-09-03-to-2026-09-04---the-day-the-kernel-stopped-interpreting-the-bus)
 - [2026-09-05 to 2026-09-06 - The day five bugs stood in a line, each hiding the one behind it](#2026-09-05-to-2026-09-06---the-day-five-bugs-stood-in-a-line-each-hiding-the-one-behind-it)
 - [2026-09-06 - The day the second core stopped being an answer](#2026-09-06---the-day-the-second-core-stopped-being-an-answer)
+- [2026-09-12 to 2026-09-13 - The day "it boots" stopped being the standard](#2026-09-12-to-2026-09-13---the-day-it-boots-stopped-being-the-standard)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -1228,6 +1229,93 @@ that falls through to one. Absence has to be expressible - `None`, an error, a r
 caller downstream treats a placeholder as data and the failure surfaces somewhere it cannot be traced
 back from. And when porting, the code that compiles unchanged is exactly the code to distrust: it
 brought its author's address space with it, and that is the part no compiler checks.
+
+## 2026-09-12 to 2026-09-13 - The day "it boots" stopped being the standard
+
+Five machines ran GodspeedOS in one day - Raspberry Pi 2, Raspberry Pi 4, StarFive VisionFive 2 Lite,
+HP T630, Dell Wyse 5070 - across three instruction sets, each surviving a hundred rounds of chaos and
+three self-check runs with zero failures. Four of them reported **the same number**: `ran 461,
+failed 0`. That coincidence is the whole point of the entry, and it is not a coincidence.
+
+**The realization: a portability claim measured in ports is measured in the wrong unit.** The project
+had four working ports and said so proudly. What it could not say was what the FIFTH would cost. "It
+boots on four architectures" is a statement about the past; the rule the operator set is a statement
+about the future - *an ISA port is not complete when it boots, it is complete when
+architecture-neutral code no longer knows that the ISA was added.* Nothing measured that. So the
+branch stopped counting ports and started counting the thing a new port actually pays: every place
+outside `arch/<isa>/` that still knows which machine it was built for.
+
+| | before | after |
+|---|---|---|
+| arch-conditional sites outside `arch/` | **143** | **46** |
+| of which, in the NEUTRAL KERNEL | 14 | **2** |
+| `services/supervisor/src/main.rs` | 49 | 4 |
+| `services/nic-driver/src/main.rs` | 26 | 10 |
+| `services/block-driver/` (3 files) | 21 | 0 |
+| `services/shell/src/main.rs` | 7 | 0 |
+| `arch::imp` seam members, all answered by all ports | 122 | 131 |
+| checker scripts (`scripts/*check*.py`) | 11 | 13 |
+| a test that BUILDS a fresh ISA | none | `scaffold_check.py` |
+| `unsafe` in services | 0, by grep | 0, refused by the compiler in 34 crates |
+
+The two that stayed are the honest part: both are `target_pointer_width` on one constant, where a
+32-bit address space genuinely cannot hold a 4 GiB virtual address. The width IS the question. They
+are counted, not exempted, so a reader can see them and see why.
+
+**What made the reduction possible was noticing that the question was usually wrong, not the answer.**
+Above the kernel, `target_arch` almost never means "which instruction set" - it means "which BOARD am
+I on", and those come apart. `nic-driver` picks its MAC by ISA, so a different NIC on a board of the
+same ISA drives the wrong silicon. The supervisor asked "am I ARM?" when it meant "does my disk hang
+off a USB host?". Five per-arch tables in one file existed because nobody had named the fact they all
+encoded. Once the fact was named once - in a `build.rs` table, or a seam member every arch answers -
+the arms collapsed. Five `USB_IMAGES` tables became one. Seven copies of "is configuration space
+reachable" became one `has_hw_enumerator`.
+
+**And three times, improving the code would have let us step off the ruler.** The shared-surface
+check matched only the literal `target_arch = "..."`, so moving a question into a build script, or
+onto `target_pointer_width` where it belonged, would have read as the site disappearing. Each time,
+the ruler was widened BEFORE the change landed. The third time it immediately found eight sites in
+`services/supervisor/build.rs` that had never been counted at all, and a whole layer - the neutral
+kernel - that had no ratchet while userspace had had one for a week.
+
+> **A measurement that gets better when you improve the code is not measuring the code.**
+
+**The lesson that cost the most had nothing to do with architecture.** The VisionFive would not boot.
+Its `extlinux.conf` was CRLF, because `.gitattributes` said `*.conf text` and "text" on a Windows
+checkout means CRLF - so U-Boot read the trailing carriage return as part of every FILENAME and could
+open nothing the config named. The menu rendered perfectly the whole time, because a stray CR in a
+display string only returns the cursor.
+
+In the failing log, a Debian file fails to load immediately after ours. I read that as an independent
+control - *even an untouched stock file fails, so it is not us* - and built two rounds of hardware
+theory on it: a dying card, a marginal supply, buy another card. Two reflashes later a stock card
+booted Debian at 22 MiB/s and disproved all of it. The second failure was never independent: with a
+CRLF config every label's filename carries the CR, Debian's included. Both were failing for one
+reason, and the second one was mine.
+
+> **Two entries failing does not make the second one a control. A control has to run FIRST, or in a
+> session of its own.**
+
+The card's own README already carried the general form of that warning, from the PREVIOUS VisionFive
+incident: *a measurement that contradicts something the project says out loud is the moment to stop
+and reconcile, not to write the measurement down and move on.* The project said out loud that this
+board boots GodspeedOS. I reasoned around it instead of reading the record.
+
+**So the branch ends with a document rather than a number.** `docs/porting.md` says what you write
+(one directory and five wiring lines), what you will unavoidably touch anyway - all 46, by kind, with
+what each would take to close - which of the five checkers tells you where you are, and the rule:
+*if you find yourself editing anything else, stop and ask why.* Both of its headline figures are owned
+by `facts_check.py`, so they cannot rot the way the hand count in §4.1 already had, from 8/4/3 to
+6/4/2, with nothing watching.
+
+What is still NOT proven is written in it too, because the alternative is a document that flatters
+itself: the bounded-port test measures **M1 only**. It proves a fresh ISA COMPILES. Whether one boots,
+reaches steady state, or spawns a supervisor is listed and not asserted. And no new ISA was added on
+this branch - the surface was shrunk, not tested in the direction that matters. The experiment that
+would settle it is named: take `loongarch64`, already at M1, and drive it to M4, counting every file
+outside `arch/loongarch64/` that has to change. That number is the answer, and nothing else is.
+
+---
 
 ## The Named Bugs - the teachers
 

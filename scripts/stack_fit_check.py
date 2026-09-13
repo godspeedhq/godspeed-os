@@ -28,11 +28,22 @@ import subprocess
 # `sub sp, sp, #N` on ARM; `sub sp, sp, #0xN` and `#0xN, lsl #12` on AArch64. objdump helpfully
 # appends `// =0x...` with the effective value for the shifted form, which is preferred when present.
 SUB_SP = re.compile(r"\bsub\s+sp,\s*sp,\s*#(0x[0-9a-f]+|\d+)(?:,\s*lsl\s*#(\d+))?")
+
+# RISC-V grows the stack with `addi sp, sp, -N` (and the compressed `c.addi16sp`, which objdump
+# renders in the same form). The ARM pattern above requires a `#` immediate, so it matches ZERO of
+# them: run unchanged against a riscv64 service it censused 0 frames out of 412 real prologues and
+# reported a pass. That is precisely what this file's header calls "a gate that is blind to the case
+# it was written for", so the arch is TAUGHT rather than the call site skipped.
+SUB_SP_RV = re.compile(r"\baddi\s+sp,\s*sp,\s*-(0x[0-9a-f]+|\d+)")
 EFFECTIVE = re.compile(r"//\s*=(0x[0-9a-f]+)")
 FUNC = re.compile(r"^[0-9a-f]+\s+<(.+)>:")
 
 
 def _amount(line):
+    rv = SUB_SP_RV.search(line)
+    if rv:
+        raw = rv.group(1)
+        return int(raw, 16) if raw.startswith("0x") else int(raw)
     m = SUB_SP.search(line)
     if not m:
         return 0
@@ -104,15 +115,31 @@ def frames(objdump, elf):
 
 def check(objdump, root, target, profile, services, stack_limit, top=5):
     """Report the deepest frames; return the list of (service, function, bytes) that do not fit."""
-    over, census = [], []
+    over, census, mute = [], [], []
     for svc in services:
         elf = os.path.join(root, "target", target, profile, svc)
         if not os.path.exists(elf):
             continue
-        for name, size in frames(objdump, elf).items():
+        f = frames(objdump, elf)
+        # MEASURED NOTHING, SAID NOTHING. A binary full of functions, not one of which adjusts the
+        # stack pointer, does not mean "no deep frames" - it means the prologue form on this target is
+        # not one this file matches, which is exactly how an unsupported arch earns a pass. The
+        # instrument must report that it is blind rather than report a zero it did not earn
+        # (invariant 12). This guard is the general fix; SUB_SP_RV above is the specific one.
+        if f and not any(f.values()):
+            mute.append(svc)
+        for name, size in f.items():
             if size > stack_limit:
                 over.append((svc, name, size))
             census.append((size, svc, name))
+    if mute:
+        raise SystemExit(
+            "\nSTACK-FIT CHECK IS BLIND on target %s: %s\n"
+            "Every function in those binaries has a zero frame, which no real service has. The\n"
+            "stack-pointer prologue on this target is a form this checker does not match, so it\n"
+            "measured nothing and would have reported a pass. Add the pattern (see SUB_SP /\n"
+            "SUB_SP_RV) before trusting this gate here."
+            % (target, ", ".join(mute)))
     census.sort(reverse=True)
     if census:
         print("stack fit: deepest single frames (limit %d KiB)" % (stack_limit // 1024))

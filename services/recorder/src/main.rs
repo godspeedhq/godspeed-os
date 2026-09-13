@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 #![no_std]
 #![no_main]
 //! `recorder` - drains the `events` log to a file, so a capture survives the screen scrolling away.
@@ -541,6 +548,7 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
     }
 }
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.trace_as("recorder");

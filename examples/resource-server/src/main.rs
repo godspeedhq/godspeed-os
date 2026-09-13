@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! resource-server - MINT a delegated resource capability a service OWNS (§7.10, P2).
 //!
 //! This is the third capability operation the examples teach. Capability USE is in
@@ -39,6 +46,7 @@ const OP_CLOSE: u8 = 4; // retire the resource: revoke it (any holder may close 
 const OK:     u8 = 0;
 const DENIED: u8 = 1; // op required a right the validated cap lacked (non-escalation)
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("resource-server: starting");

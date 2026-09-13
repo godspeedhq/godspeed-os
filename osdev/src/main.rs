@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! `osdev` - host-side developer CLI (§17).
 //!
 //! Commands:
@@ -384,6 +391,11 @@ const EXTRA_CHECKS: &[&str] = &[
     "scripts/arch_boundary_check.py",
     "scripts/arch_seam_check.py",
     "scripts/contract_check.py",
+    // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/26). x86 does not
+    // use extlinux, but this path is where an image is built on the machine that PRODUCES the CRLF,
+    // and the rule above is the whole reason this list exists: a checker on one build path is a
+    // checker on none.
+    "scripts/line_ending_check.py",
 ];
 
 fn commandment_check() {
@@ -1179,6 +1191,19 @@ fn cmd_run(smp: u32) {
 }
 
 fn cmd_image(mode: &str) {
+    // GATE THE PATH THAT PRODUCES HARDWARE IMAGES, which this one did not.
+    //
+    // `commandment_check()` was called from `cmd_build()` and from nowhere else, so all twelve
+    // `cmd_build_*` variants ran NO checkers - including `cmd_build_bare_metal()`, which is what
+    // this function dispatches to and what every USB image booted on real hardware came from. The
+    // comment above `EXTRA_CHECKS` describes exactly this failure ("four of those were enforced on
+    // one build path and therefore on none") and the list it guards was itself reachable from only
+    // one command.
+    //
+    // Here rather than in each `cmd_build_*`: this is the funnel every mode passes through, so a
+    // thirteenth mode is covered the day it is added.
+    commandment_check();
+
     // Each dispatched `cmd_build_*` calls `clean_supervisor()` first, which forces
     // the kernel to re-embed the supervisor this mode built (see that helper for
     // the stale-embed rationale). So no clean is needed here.

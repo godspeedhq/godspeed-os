@@ -91,6 +91,67 @@ config points at.
 | `Access to the path 'P:\...' is denied` on a partition that IS mounted | Windows ACLs an ESP to administrators. Read and write it from the elevated shell. |
 | Menu appears and seems to wait for input | It is a one-second countdown, not a question. `timeout` is in deciseconds. |
 | Menu label still says something you changed | The deploy did not run. Check `build\deploy_visionfive.log` and the kernel's byte count. |
+| `Retrieving file: /godspeed-riscv64-visionfive.img` then `Failed to load '...'`, while the MENU rendered perfectly | **CRLF in `extlinux.conf`.** U-Boot reads the trailing `\r` as part of the FILENAME, so every entry fails; the menu looks fine because a `\r` in a display string just returns the cursor. Fixed at three layers (`.gitattributes` `boot/** text eol=lf`, the deploy script normalizing and then CR-checking the card, and this row). If it recurs: `file boot/visionfive/*.conf` must say `ASCII text`, never `with CRLF line terminators`. |
+| A SECOND `Failed to load` for a Debian file, straight after the first | **The same cause, not a second data point.** With a CRLF config EVERY label's filename carries the `\r`, Debian's included - so both fail for one reason. It was misread as an independent control proving the fault was not ours, and two rounds of hardware theory were built on that. A control has to run FIRST, or in a session of its own. |
+
+## The 2026-09-13 incident: `Failed to load`, and what it is not
+
+Recorded here rather than only in `backlog/26` because this file is where somebody looks when a card
+will not boot, and because `build/` is gitignored - the captures below do not survive a clean.
+
+**The failure.** Deploying `db32b674`, by the five steps above, with the deploy log reporting every
+check green:
+
+```
+Retrieving file: /extlinux/extlinux.conf
+1605 bytes read in 3 ms (522.5 KiB/s)
+U-Boot menu
+3:  GodspeedOS riscv64
+Enter choice: 3:  GodspeedOS riscv64
+Retrieving file: /godspeed-riscv64-visionfive.img
+Failed to load '/godspeed-riscv64-visionfive.img'
+```
+
+**The control, on the same board, same slot, card freshly flashed to stock:**
+
+```
+Retrieving file: /initrd.img-6.12.5-starfive
+13981593 bytes read in 605 ms (22 MiB/s)
+Retrieving file: /vmlinuz-6.12.5-starfive
+10440372 bytes read in 452 ms (22 MiB/s)
+Starting kernel ...
+```
+
+So the board reads 13.9 MB at 22 MiB/s. **Anything that starts "the board cannot..." or "the card
+is failing" is contradicted by those four lines.** They cost a reflash and two rounds of hardware
+theory to obtain; do not spend them again.
+
+**What was also measured, and rules out the card itself:** `scripts/deploy_visionfive.ps1` re-reads
+the card with `FILE_FLAG_NO_BUFFERING`, so every read goes to the device rather than the Windows
+cache. Our kernel comes back as all 2,743,208 bytes hashing `190565C0450F9ABD...`, matching what was
+written; the stock initrd comes back complete at 19 MiB/s. That diagnostic runs on every deploy now,
+precisely so this does not have to be argued again.
+
+**THE CAUSE: the config was CRLF.** `file(1)` on the working-tree copy said
+`ASCII text, with CRLF line terminators`; the stock 916-byte config that boots is plain `ASCII text`.
+U-Boot's extlinux parser takes the trailing `\r` as part of each FILENAME, so it tries to open
+`/godspeed-riscv64-visionfive.img\r` and fails - while the menu renders perfectly, because a `\r` in
+a display string only returns the cursor. It looked like a load failure and was a config fault.
+
+It came from `.gitattributes`, which marked `*.conf text` - "normalize to LF on commit, convert to
+NATIVE on checkout", and native on a Windows checkout is CRLF. The repository held LF and the working
+tree held CRLF. That file already carried the same rule for `*.sh` ("scripts that MUST stay LF even
+on a Windows checkout") and it had never been extended to files a BOOTLOADER reads.
+
+**The trap that cost the time, stated plainly because this file already warns about its general form
+one section down.** In the failing log a Debian file fails to load immediately after ours, and that
+was read as an independent control - "even an untouched stock file fails, so it is not us" - with two
+rounds of hardware theory built on it. It was never independent: with a CRLF config every label's
+filename carries the `\r`, Debian's included, so both were failing for one reason. The card was
+reflashed twice chasing it.
+
+**Two entries failing does not make the second one a control. A control has to run FIRST, or in a
+session of its own.**
 
 ## What is in this directory
 

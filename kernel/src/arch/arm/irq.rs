@@ -188,24 +188,10 @@ fn hires_report() {
         HR_WOKE.load(Ordering::Relaxed));
 }
 
-/// What arming a short sleep concluded.
-pub enum Armed {
-    /// Registered; the caller should block and will be woken by the compare interrupt.
-    Pending,
-    /// The requested time ELAPSED while we were arming it. The caller must NOT block.
-    ///
-    /// This is the whole short-sleep bug. The compare fires on EQUALITY, and every System Timer
-    /// access is an uncached Device read, so programming a 125 us deadline can itself take longer
-    /// than 125 us. The counter is then already past the value written, the match never happens, and
-    /// the task waits out the 10 ms tick backstop instead. Measured on hardware exactly as that
-    /// predicts - 2000 us sleeps land within 28 us, 125 us sleeps average 8160 us.
-    ///
-    /// Returning immediately is not an approximation, it is the correct answer: the caller asked to
-    /// wait 125 us and 125 us has passed.
-    Elapsed,
-    /// No free entry; the caller falls back to the tick, as it did before this existed.
-    Full,
-}
+// `Armed` is NEUTRAL now (`task::scheduler`), because `syscall/dispatch.rs` matched on it under
+// `#[cfg(target_arch = "arm")]` - an ARM-shaped hole in a neutral file. The doc that was here moved
+// with the type; the hardware reason for `Elapsed` is this port's and is recorded there.
+pub use crate::task::scheduler::Armed;
 
 /// Register `slot` to wake in `us` microseconds.
 pub fn hires_arm(slot: u32, us: u32) -> Armed {

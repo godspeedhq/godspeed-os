@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! `fs` - userspace filesystem service (persistence, v2; §15, docs/persistence.md).
 //!
 //! **GSFS0008 - checksummed scalable format with extent lists (docs/persistence.md §6.4 +
@@ -409,6 +416,7 @@ const MOUNT_MAX_MS: u64 = 20_000;
 /// the binding bound and the attempt count a backstop that never fires.
 const MOUNT_RETRY_MS: u64 = 20;
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),

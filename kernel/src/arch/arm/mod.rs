@@ -2103,22 +2103,13 @@ pub fn autochaos_tick() {
 /// `timer_tick_from_irq` (core 0).
 pub fn uart_rx_poll() {
     pl011_rx_drain();
-    // Advance USB enumeration one transaction per tick, on core 0 only (it is the single writer of the
-    // DWC2 channel + DMA buffer). Reached both from the Core-0 tick and from the idle loop; the MPIDR
-    // gate keeps an AP that idles here from racing core 0 on the controller.
-    {
-        let mpidr: u32;
-        // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
-        unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
-        // STAND DOWN when a userspace service owns the controller (Phase 3, Slice 0).
-        //
-        // These are the in-kernel driver's periodic hooks. The controller has exactly ONE owner: two
-        // drivers programming the same channels would corrupt each other's transfers, and the failure
-        // would look like flaky hardware rather than two owners. Gating them on the same predicate the
-        // IRQ dispatch uses means ownership is decided in one place from one fact.
-        if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() {
-        }
-    }
+    // The in-kernel USB enumeration hooks that used to run here are GONE (arm32 slice 5 deleted
+    // `arch/arm/dwc2.rs`; `services/dwc2` drives the controller off USB_VECTOR). What survived the
+    // deletion was their SCAFFOLDING: an `if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() { }`
+    // with an empty body, and an `unsafe` MPIDR read that existed only to feed that dead condition -
+    // so every timer tick on this port paid for a coprocessor read whose result was discarded. The
+    // ownership predicate it consulted is still the right one and is still used where it matters
+    // (`irq::usb_owned_by_userspace`, the IRQ dispatch); there is simply nothing left here to gate.
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
         let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
         if waiter != u32::MAX {
@@ -2423,6 +2414,20 @@ fn push_hex(buf: &mut [u8], mut n: usize, v: u32) -> usize {
 
 pub fn serial_unlocked_emit_count() -> u64 { 0 }
 
+/// Page flags this arch wants ADDED when mapping a framebuffer, beyond the neutral set.
+///
+/// A framebuffer is RAM the display controller scans out, not device registers, and the two want
+/// opposite memory types - so the neutral mapper states the intent (`WRITE_COMBINE`) and the arch
+/// states what its own page tables need to express it.
+///
+/// This was `#[cfg(not(target_arch = "x86_64"))] flags |= PageFlags::PWT;` in `task/mod.rs`, with a
+/// comment explaining that arm32 and x86 read PCD and PWT in OPPOSITE senses. That is exactly a fact
+/// about silicon (26.14) and exactly what does not belong in a neutral file: the note was correct and
+/// the placement left a fifth port inheriting arm32's answer by default.
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::PWT
+}
+
 pub mod interrupts {
     /// The MSI vector pool is x86-only (`arch/x86_64/interrupts.rs`, step D1b). Neither Pi has one:
     /// a pool hands vectors to devices found on a PCI bus, and there is no PCI bus here to find them
@@ -2431,7 +2436,26 @@ pub mod interrupts {
     /// range of vectors this arch does not route.
     pub const MSI_POOL_BASE: u8 = 0;
     pub const MSI_POOL_LEN: usize = 0;
+    pub use crate::task::scheduler::Armed;
+    /// arm32 HAS one: the BCM2835 System Timer's free compare channels, driven from `irq.rs`.
+    pub use super::irq::{hires_arm, hires_release};
+
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[super::irq::USB_VECTOR];
+    pub const SOC_NIC_VECTORS: &[u8] = &[];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
 
     /// Unmask IRQs (`cpsie i`). Real, not a stub: the neutral `SpinLock` masks interrupts while held
@@ -2606,6 +2630,17 @@ pub mod pci {
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
     pub fn ehci() -> Option<PciDevice> { None }
+    /// The Pi 2's DWC2 is SOLDERED to the BCM283x - on-SoC, no bus to discover it on.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { true }
+
+    /// Take the EHCI controller off the firmware, if this arch's firmware ever held it.
+    ///
+    /// A no-op where there is no BIOS to hand off from. `task/mod.rs` called it under
+    /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
+    pub fn ehci_bios_handoff() {}
+
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }

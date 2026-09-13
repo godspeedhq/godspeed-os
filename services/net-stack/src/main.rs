@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
 //! net-stack - the model-AGNOSTIC half of networking (docs/networking.md, Phase 2).
 //!
 //! nic-driver knows one NIC and speaks raw Ethernet frames; net-stack knows no hardware and speaks
@@ -1121,13 +1128,30 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     // generous ceiling. Exceeding it means the clock is dead - return 0 (RTT then reports 0, the same
     // fallback as an out-of-range result) rather than block the whole service on a broken clock.
     const SPIN_MAX: u64 = 50_000_000;
+    // Both bailouts SAY SO rather than returning a bare 0, for the same reason the range rejection
+    // below does: "the wall clock never advanced" and "the counter reads implausibly" are different
+    // faults with different fixes, and both used to arrive at `ping` as the identical symptom.
     let s0 = ctx.epoch_secs_monotonic();
     let mut n = 0u64;
-    while ctx.epoch_secs_monotonic() == s0 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
+    while ctx.epoch_secs_monotonic() == s0 {
+        ctx.yield_cpu(); n += 1;
+        if n > SPIN_MAX {
+            ctx.log("net-stack: TSC calibration ABANDONED - the wall clock never advanced past its \
+                     first reading (it is frozen or unavailable). RTT will read 0.");
+            return 0;
+        }
+    }
     let t0 = ctx.read_tsc();
     let s1 = ctx.epoch_secs_monotonic();
     n = 0;
-    while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
+    while ctx.epoch_secs_monotonic() == s1 {
+        ctx.yield_cpu(); n += 1;
+        if n > SPIN_MAX {
+            ctx.log("net-stack: TSC calibration ABANDONED - the wall clock advanced once and then \
+                     stopped. RTT will read 0.");
+            return 0;
+        }
+    }
     let hz = ctx.read_tsc().wrapping_sub(t0);
     // The floor is PER-ARCH, not one range widened to cover both. The ARM generic timer advances ~1 MHz
     // (the old 100 MHz floor rejected it, returning 0 -> the ping poll window `tsc_hz/3` collapsed to ~0
@@ -1158,16 +1182,31 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     // it is x86's own tick rate leaking into a portability check. 500 kHz is the honest floor for
     // every arch whose counter is a wall clock rather than a CPU cycle count, and x86 keeps the
     // higher one only because `deglitch_epoch` lets a CMOS misread yield a few MHz on a GHz TSC.
-    let floor: u64 = if cfg!(any(
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    )) {
-        500_000
-    } else {
-        100_000_000
-    };
-    if (floor..=10_000_000_000).contains(&hz) { hz } else { 0 }
+    //
+    // SO THE DEFAULT IS NOW THE SAFE ONE AND X86 OPTS IN, rather than a list of three arches that a
+    // fourth had to be added to. The paragraphs above are the record of that list being wrong three
+    // times in a row, each time SILENTLY and each time surfacing as something else entirely: RTT
+    // reported as 0 on the Pi 4, "33% packet loss" that was one constant presenting as two faults,
+    // "ping feels slow" on the VisionFive. Written this way round, a fifth port that nobody has
+    // thought about gets the floor that fits a wall-clock counter - which is what every non-x86
+    // counter here has turned out to be - instead of inheriting x86's tick rate as a portability
+    // check and failing in a way that does not name itself.
+    //
+    // x86 keeps the high floor by ASKING for it, with the reason attached, which is the only part of
+    // this that was ever a real claim about a machine.
+    let floor: u64 = if cfg!(target_arch = "x86_64") { 100_000_000 } else { 500_000 };
+    if (floor..=10_000_000_000).contains(&hz) { return hz; }
+    // AND IT SAYS SO. This returned 0 silently, and 0 means "RTT unavailable" three layers away - so
+    // every one of the three failures above was diagnosed from its symptom (a wrong number in `ping`)
+    // rather than from its cause, which was sitting right here as a measured value and a bound. A
+    // rejected measurement is a failure, and invariant 12 says a failure is loud.
+    ctx.log_fmt(format_args!(
+        "net-stack: TSC calibration REJECTED - measured {} Hz, outside {}..=10000000000. RTT will \
+         read 0 until this is resolved. A counter far BELOW the floor usually means this port's \
+         read_tsc() is a fixed-rate wall clock rather than a CPU cycle count, and the floor above \
+         needs to know that; far ABOVE means the wall-clock window was short (a misread epoch).",
+        hz, floor));
+    0
 }
 
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
@@ -1611,6 +1650,7 @@ fn link_is_up(ctx: &ServiceContext) -> bool {
     }
 }
 
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
@@ -1711,6 +1751,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // this service answered nobody, and two seconds of a permanently-runnable task on the core it
     // shares with `fs` and `block-driver`. Paid now by whoever actually asks for an RTT, once.
     let mut tsc_hz: u64 = 0;
+    // BOUNDED (26.6). `calibrate_tsc_hz` costs two full seconds of spinning, and the call site below
+    // re-ran it on EVERY ping while it kept returning 0 - so on a port whose floor was wrong, each
+    // ping paid two seconds to fail again. That is a second, larger cause of the "ping feels slow"
+    // report the floor comment records, and nobody named it because the failure was silent.
+    //
+    // Not zero retries, though: an early ping can genuinely precede a usable wall clock (the `time`
+    // service sets it from SNTP later), so a later attempt can legitimately succeed. Three attempts,
+    // then stop asking and say so once.
+    const TSC_CAL_TRIES: u8 = 3;
+    let mut tsc_cal_tries: u8 = 0;
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets every
     // iteration and reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
@@ -2055,7 +2105,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut frames = 0u16;
                 let mut timeouts = 0u16;
                 ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
-                if tsc_hz == 0 { tsc_hz = calibrate_tsc_hz(&ctx); }
+                if tsc_hz == 0 && tsc_cal_tries < TSC_CAL_TRIES {
+                    tsc_cal_tries += 1;
+                    tsc_hz = calibrate_tsc_hz(&ctx);
+                    if tsc_hz == 0 && tsc_cal_tries == TSC_CAL_TRIES {
+                        ctx.log("net-stack: TSC calibration failed 3 times - not retrying. RTT is \
+                                 reported as 0 from here; ping itself is unaffected.");
+                    }
+                }
                 match if gw_known { ping(&ctx, &gw_mac, &our_ip, &our_mac, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
                     Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
                     // No reply: re-check the link. If it dropped DURING the poll it is "no link" (fast
