@@ -61,5 +61,5 @@ each `arch/<isa>/cfg_read_gated` translate it to its own host bridge's format. T
 translation belongs and where a fifth port would already be writing code.
 
 Cost: one SDK signature, three arch translations, and this service's two lines become zero. It
-re-widens testing to all four boards because it touches the path every PCI driver's spawn depends on,
+re-widens testing to all five machines because it touches the path every PCI driver's spawn depends on,
 which is why it is a deliberate piece of work rather than a tidy-up.

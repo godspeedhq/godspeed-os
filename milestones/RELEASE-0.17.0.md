@@ -25,7 +25,7 @@ same rulers, not remembered:
 | `services/block-driver/` (3 files) | 21 | 0 |
 | `services/shell/src/main.rs` | 7 | 0 |
 | `arch::imp` seam members, all answered by all ports | 122 | 131 |
-| enforcement scripts | 11 | 13 |
+| checker scripts (`scripts/*check*.py`) | 11 | 13 |
 | a test that BUILDS a fresh ISA | none | `scripts/scaffold_check.py` |
 | `unsafe` in services, examples, osdev | 0, by grep | 0, refused by rustc in 34 crates |
 

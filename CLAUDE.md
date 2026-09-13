@@ -199,8 +199,10 @@ These are the laws that bound every design choice. Any change that violates an i
 > hand, and both of its examples are out of date.** The amendment above states the bar correctly and
 > then points at two things as the standing debt. One is gone and the other was never an example of it:
 >
-> - **The supervisor's `#[cfg(any(...))]` spawn arms are gone.** That file carried 47 arch-conditional
->   sites; it carries 4. The USB host table was FIVE tables, one per arch plus an empty catch-all, and
+> - **The supervisor's `#[cfg(any(...))]` spawn arms are gone.** That file carried 49 arch-conditional
+>   sites when this branch began; it carries 4. (47 when the spawn-table work itself started - two had
+>   already gone in the commit that named the board facts. The 49 is the figure `milestones/` uses, so
+>   this says the same thing they do.) The USB host table was FIVE tables, one per arch plus an empty catch-all, and
 >   is now one table whose rows are present exactly where their image is; the seven-times-repeated
 >   `any(x86_64, aarch64, riscv64)` was one question - is configuration space reachable - and is now
 >   one `build.rs` fact. Three service crates went the same way, and where the ISA still answers, it is

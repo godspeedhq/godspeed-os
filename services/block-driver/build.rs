@@ -12,15 +12,17 @@ fn main() {
 
     // ---- WHICH STORAGE TOPOLOGY THIS BOARD HAS. --------------------------------------------------
     //
-    // This crate asks two questions about its machine, and both used to be asked as an ISA, in seven
+    // This crate asks two questions about its machine, and both used to be asked as an ISA, in EIGHT
     // places across three files:
     //
     //     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
     //
     // repeated six times in `src/main.rs` (module gate, two `backend_run` definitions, the call
-    // site), plus `#[cfg(target_arch = "arm")]` in `src/xhciblk.rs` for the host service's NAME.
-    // Adding a fifth ISA meant editing all seven lists, and getting one wrong is a build that either
-    // has two backends or none.
+    // site), plus `#[cfg(target_arch = "arm")]` in `src/xhciblk.rs` for the host service's NAME, plus
+    // an eighth spelling of the same question inline in a log line in `src/usbdisk.rs`.
+    //
+    // Adding a fifth ISA meant editing all eight, and getting one wrong is a build that either has
+    // two backends or none.
     //
     // Neither question is about an instruction set. They are:
     //

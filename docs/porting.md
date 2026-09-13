@@ -19,18 +19,22 @@ list. Four separate checkers exist to tell you when that is happening; they are 
 
 ## The seam: what you write
 
-**One directory, and five wiring lines.** None of the five is a neutral kernel file.
+**One directory, and five wiring files.** The directory is the work; the five below are a line or a
+block each, and none of them is a neutral kernel file.
 
-1. **`kernel/src/arch/<isa>/`** - the implementation. Start from the nearest existing stub
+**The directory.** **`kernel/src/arch/<isa>/`** - the implementation. Start from the nearest existing stub
    (`riscv32/`, `loongarch64/` and `s390x/` are deliberately kept as three DIFFERENT probes: a
    32-bit one, a clean 64-bit control, and a big-endian one). This is the only directory in the
    kernel where new `unsafe` and inline `asm!` belong (CLAUDE.md §18.1).
 
-2. **`kernel/src/arch/mod.rs`** - two `#[cfg(target_arch = "<isa>")]` lines: `pub mod <isa>;` and
+**And the five wiring files.**
+
+1. **`kernel/src/arch/mod.rs`** - two `#[cfg(target_arch = "<isa>")]` lines: `pub mod <isa>;` and
    `pub use <isa> as imp;`.
 
-3. **`kernel/kernel-<isa>.ld` + `kernel/build.rs`** - a linker script for your load address and
-   PHDRS, and a target-matching block that passes `-T` for it.
+2. **`kernel/kernel-<isa>.ld`** - a new linker script for your load address and PHDRS.
+
+3. **`kernel/build.rs`** - a target-matching block that passes `-T` for that script.
 
 4. **`.cargo/config.toml`** - a `[target.<triple>]` block with the rustflags your target needs.
 
@@ -115,7 +119,7 @@ that the ISA was added.*
 | `services/block-driver/build.rs` (4) | is the disk on a USB host, and which service owns it | **Add one arm.** Same shape. |
 | `services/shell/build.rs` (2) | what to call your arch in `version` | **Nothing** - it is derived from `CARGO_CFG_TARGET_ARCH`. Only add a line if your ISA needs a project-specific name, as arm32 does. |
 | `services/supervisor/src/main.rs` (4) | which peers `block-driver` and `nic-driver` need | **Add an arm** if your storage or NIC sits behind a USB host. |
-| `services/nic-driver/src/main.rs` (10) | which MAC driver to run | **Add an arm, and know that this is the worst one.** Three of the four boards pick their NIC by instruction set, which fails on its own terms: a different NIC on a board of the same ISA drives the wrong silicon. `backlog/21` has the fix (a kernel query reporting which controller the boot probe found) and the reason it is not done. |
+| `services/nic-driver/src/main.rs` (10) | which MAC driver to run | **Add an arm, and know that this is the worst one.** Three of the four PORTS pick their NIC by instruction set, which fails on its own terms: a different NIC on a board of the same ISA drives the wrong silicon. `backlog/21` has the fix (a kernel query reporting which controller the boot probe found) and the reason it is not done. |
 | `services/hw-enumerator/src/main.rs` (3) | mechanism #1 or ECAM config-space selector | **Add an arm** if you have PCI. A port that is neither fails to COMPILE, which is deliberate - a wrong default would silently address the wrong registers. `backlog/25` has the clean form. |
 | `services/net-stack/src/main.rs` (1) | is this counter a CPU cycle count or a wall clock | **Nothing.** The default is the wall-clock floor, which is what every non-x86 port has turned out to need. If calibration fails it now says so in one line rather than surfacing as "ping feels slow" three layers away. |
 
@@ -183,8 +187,12 @@ yourself doing so, that is [the rule](#adding-an-isa-the-seam-the-edges-and-the-
 **Totals, and they are the honest ones.** 46 arch-conditional sites outside `arch/`: 2 in the neutral
 kernel and 44 above it. Of the 44, **15 are "add one arm to a build table"** - designed, expected,
 and cheap. The other 29 split into the SDK's syscall body you will write anyway (4), the seam the SDK
-is designated for (7), and three files with an open backlog entry each explaining what would close
-them for good.
+is designated for (7), and 18 across FOUR service files - `nic-driver` (10), `supervisor/src/main.rs`
+(4), `hw-enumerator` (3) and `net-stack` (1). Two of those four have an open backlog entry saying what
+would close them for good: `backlog/21` for `nic-driver` and `backlog/25` for `hw-enumerator`. The
+other two do not, and that is honest rather than an omission - the supervisor's four are peer lists
+whose only alternative is a second copy of a fact `block-driver/build.rs` already owns, and
+`net-stack`'s one needs nothing from a porter at all.
 
 ## How you know where you are
 

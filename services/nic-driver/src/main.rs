@@ -1117,7 +1117,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // Every backend below takes `ServiceContext` and diverges, so this is a dispatch and nothing more;
     // no backend is reachable from another and none of them returns. Each one is a whole MAC, so the
-    // module is gated too (line 33) - compiling GENET's 1,200 lines into a RISC-V image would be dead
+    // module is gated too (line 33) - compiling GENET's ~1,450 lines into a RISC-V image would be dead
     // weight in a service with a 16 MiB limit, not just dead code.
     //
     // THE TWO HALVES OF THIS ARE NOT THE SAME KIND OF QUESTION, and the difference is the whole point:

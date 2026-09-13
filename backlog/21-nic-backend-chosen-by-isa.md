@@ -1,9 +1,10 @@
 # 21. The NIC backend is chosen by instruction set, and NET_DEVICE has no caller left
 
-**Severity:** low today, structural. Nothing is broken on any of the four boards; what is recorded
-here is an axis that is wrong and a kernel surface that is now unused.
-**Status: OPEN.** Both items need a decision rather than a tidy-up, which is why neither was taken on
-`portability-hardening`.
+**Severity:** low today, structural. Nothing is broken on any of the five machines (four ports); what
+is recorded here is an axis that is wrong and a kernel surface that is now unused.
+**Status: OPEN, one of three steps done.** Item 1 needs a new kernel query and is untouched. Item 2's
+first step - stop GRANTING NET_DEVICE - landed on `portability-hardening` and is hardware-confirmed;
+the SDK wrappers and the syscalls themselves remain.
 
 ---
 
@@ -51,7 +52,7 @@ board of an ISA we already support. Recorded here so the next person meets the a
 the symptom.
 
 The module gates (`#[cfg(target_arch = "aarch64")] mod genet;`) stay regardless. Each backend is a
-whole MAC; compiling GENET's ~1,200 lines into a RISC-V image would be dead weight in a service with
+whole MAC; compiling GENET's ~1,450 lines into a RISC-V image would be dead weight in a service with
 a 16 MiB limit, not merely dead code.
 
 ## 2. NET_DEVICE (syscalls 42-44) has no caller anywhere in userspace
@@ -67,17 +68,22 @@ one.
 What remains is the other end of it:
 
 - `sdk/rust/src/service_context.rs` still exposes `net_info`, `net_frame_tx`, `net_frame_rx`.
-- The kernel still implements syscalls 42-44 and still grants NET_DEVICE by name on `arm` and
-  `aarch64` (`service_privileges`, `task/mod.rs`).
+- ~~The kernel still grants NET_DEVICE by name on `arm` and `aarch64`.~~ **DONE 2026-09-13.** The
+  supervisor stopped requesting it (`10d3b43e`) and the kernel's by-name arm is `net_device: false`
+  (`3c75638e`). Confirmed on all five machines: the Pi 4 and both x86 boxes boot with DHCP, ARP,
+  ping and SNTP working, and the Pi 2 and VisionFive likewise.
+- The kernel still IMPLEMENTS syscalls 42-44, and the SDK still exposes the wrappers. Nothing holds
+  the capability, so nothing can call them.
 - `nic-driver`'s contract already says the aarch64 grant "simply goes unused".
 
-So a capability is granted on two ports for a path that no longer exists, and a syscall surface is
-maintained for no caller. Neither is a bug - an unused grant is a smaller problem than a driver that
-cannot reach its device, which is the reasoning the contract records - but §26.2's preferred state for
-an unneeded feature is that it not be there.
+So a SYSCALL SURFACE is maintained for no caller. That is what is left: the capability half is
+closed, and nothing can reach syscalls 42-44 because nothing holds the authority to. Not a bug -
+dead code that cannot be invoked harms nothing - but §26.2's preferred state for an unneeded feature
+is that it not be there.
 
 **Deliberately not done here** because removing a syscall is a kernel change and this branch is about
 bounding what a new ISA has to touch, not about shrinking the kernel. The order matters too: the
-grant should go first (it is a one-line change and provable by boot), the SDK wrappers second, the
-syscalls last, and each wants a Pi 2 and Pi 4 boot behind it. Note that the Pi 2 path does **not**
+grant went first (done - see above, and it was provable by boot exactly as predicted); the SDK
+wrappers are second and the syscalls last, each wanting a boot behind it. Two steps remain, not
+three. Note that the Pi 2 path does **not**
 use these syscalls either - it reaches `dwc2` by IPC - so this is all four ports, not three.
