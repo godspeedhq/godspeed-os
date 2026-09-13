@@ -296,6 +296,21 @@ pub mod syscall_entry {
 // ---------------------------------------------------------------------------
 pub mod interrupts {
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[];
+    pub const SOC_NIC_VECTORS: &[u8] = &[];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     pub fn enable_interrupts() {}                            // msr daifclr
     pub fn disable_interrupts() {}                           // msr daifset
@@ -430,6 +445,11 @@ pub mod pci {
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
     pub fn ehci() -> Option<PciDevice> { None }
+    /// Scaffold: no USB of any kind yet.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { false }
+
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }

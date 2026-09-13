@@ -193,6 +193,11 @@ pub fn first_memory_bar(d: &PciDevice) -> u64 {
 /// being TAUGHT that "EHCI" is a thing to hold four variables for. 0x0C0320 is the device's own claim.
 pub fn ehci() -> Option<PciDevice> { find_by_class(0x0C_03_20) }
 
+/// No PC has a DWC2.
+/// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+/// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+pub fn dwc2_present() -> bool { false }
+
 pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
 pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }

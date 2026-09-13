@@ -2135,6 +2135,21 @@ pub mod interrupts {
     pub const MSI_POOL_LEN: usize = 0;
 
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[];
+    pub const SOC_NIC_VECTORS: &[u8] = &[];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     /// `sstatus.SIE` - the one bit that admits interrupts at all while the kernel is running.
     ///
@@ -2868,6 +2883,11 @@ pub mod pci {
     /// the controller's DMA anywhere. What is bounded is the ACCIDENT surface - a restartable service
     /// rather than ring-0 code parsing descriptors supplied by whatever was plugged in - and the
     /// trust posture is not. Recorded here rather than implied.
+    /// The VisionFive 2's USB is a Cadence USB3 whose host half is an xHCI, not a DWC2.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { false }
+
     pub fn xhci() -> Option<PciDevice> {
         if let Some(d) = find_by_class(0x0c_03_30) {
             return Some(d);

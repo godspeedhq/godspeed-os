@@ -2646,6 +2646,22 @@ pub mod interrupts {
     pub const MSI_POOL_BASE: u8 = 0;
     pub const MSI_POOL_LEN: usize = 0;
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+
+    /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
+    /// does not exist here.
+    ///
+    /// These answer `task::hw_irqs_for`, which used to ask `#[cfg(target_arch)]` directly - one arm
+    /// naming the vector and a `not(...)` arm returning `&[]` - for the two classes that only one
+    /// port routes. That is the leak CLAUDE.md 4.1 is about: a neutral file knowing which ISA it was
+    /// built for, so the NEXT port has to edit it. `XHCI_MSI_VECTOR` beside them was always done the
+    /// right way round, which is why these are shaped to match it.
+    ///
+    /// An IRQ vector is AUTHORITY, not a setting (`hw_irqs_for`'s own header): routing one to a task
+    /// is what makes that task receive the device's interrupts. `&[]` therefore means "this arch
+    /// routes nothing for that class", which is a refusal, not a default.
+    pub const DWC2_VECTORS: &[u8] = &[];
+    /// GENET's macirq on the Pi 4 (SPI 157, mapped to neutral vector 0x2A).
+    pub const SOC_NIC_VECTORS: &[u8] = &[super::exceptions::GENET_VECTOR];
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
     /// `DAIF.I` is the IRQ mask. It is a MASK, so **clearing** it enables interrupts and setting it
     /// disables them - the opposite polarity to x86's `IF`, and an easy place to write a plausible
@@ -2847,6 +2863,11 @@ pub mod pci {
     /// answers only "is there one, and what is it" when nobody said.
     /// No EHCI on this port - the Pi 4's USB is the VL805 xHCI.
     pub fn ehci() -> Option<PciDevice> { None }
+    /// The Pi 4's USB host is a VL805 xHCI over PCIe, not a DWC2.
+    /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
+    /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
+    pub fn dwc2_present() -> bool { false }
+
     pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
     pub fn nic() -> Option<PciDevice> { None }
