@@ -2,7 +2,7 @@
 
 **Severity:** blocks hardware verification of the riscv64 port. Not a GodspeedOS kernel defect - the
 failure is in U-Boot, before our first instruction runs.
-**Status: OPEN, cause NOT established.**
+**Status: CAUSE FOUND (CRLF in `extlinux.conf`), FIXED, awaiting one confirming boot.**
 
 > **This entry previously concluded "board-side: the board cannot load large files, try another card
 > or PSU". THAT WAS WRONG and is corrected below.** It was written from a reading of the evidence that
@@ -62,9 +62,38 @@ VisionFive incident: *"a measurement that contradicts something the project says
 moment to stop and reconcile, not to write the measurement down and move on."* The project said out
 loud that this board boots GodspeedOS. It was not reconciled with; it was reasoned around.
 
-## What is left, as hypotheses and labelled as such
+## THE CAUSE
 
-Nothing below is established. No third theory gets written down as fact in this file.
+**`extlinux.conf` was CRLF.** `file(1)`: `ASCII text, with CRLF line terminators`, 61 CR bytes. The
+stock 916-byte config that boots is plain `ASCII text`.
+
+U-Boot's extlinux parser takes the trailing `\r` as part of the FILENAME, so it opens
+`/godspeed-riscv64-visionfive.img\r`, which does not exist. The MENU still renders perfectly because
+a `\r` in a display string only returns the cursor - which is exactly why this read as a load failure
+rather than a config fault, and why the label looked right in every log.
+
+It also explains the "collateral" Debian failure without any theory about U-Boot state: with a CRLF
+config, EVERY label's filename carries the `\r`. Both entries were failing for one reason.
+
+**Where the CRLF came from.** The repository stores the file as LF. `.gitattributes` marked it
+`*.conf text`, which means "normalize on commit, convert to NATIVE on checkout" - and native on a
+Windows checkout is CRLF. `Copy-Item` then put those bytes on the card. The same file already
+carried `*.sh text eol=lf` under the heading "Scripts that MUST stay LF even on a Windows checkout";
+the rule had simply never been extended to a file a BOOTLOADER reads.
+
+**Fixed at three layers**, because any one of them alone would leave the trap for someone else:
+
+1. `.gitattributes` gains `boot/** text eol=lf` - the whole directory, not a list of extensions,
+   because the next board will bring a file type nobody thought to add.
+2. The four checked-out boot configs are renormalized (visionfive x2, pi2, pi4 - all four were CRLF;
+   the Pi firmware tolerates it, which is why only this board ever complained).
+3. `deploy_visionfive.ps1` no longer `Copy-Item`s the config. It normalizes the bytes itself and
+   then COUNTS CR BYTES ON THE CARD, refusing the deploy if any survive. Whether the board boots must
+   not depend on a contributor's git settings or an editor that helpfully fixed a file.
+
+Proven before committing: 2 CRs in, 0 out, and the script parses.
+
+## The hypotheses this replaced, kept because the disproofs cost real time
 
 1. **Our file is not loadable by U-Boot's FAT driver** even though Windows reads it perfectly. The
    stock files were laid down contiguously by an image writer onto an empty filesystem; ours is
@@ -78,18 +107,14 @@ Nothing below is established. No third theory gets written down as fact in this 
    2.7 MB file through Windows into the populated ESP does not damage it for U-Boot. That also means
    the file is sitting on a card that boots, which is what makes the next step a single command.
 
-## The next concrete step: ONE command, and the file is already in place
+## The one confirming boot
 
-Hypothesis 3 is disproved (above), so the card now holds our kernel AND boots Debian. Nothing more
-needs writing. At the `StarFive #` prompt (hit a key during `Hit any key to stop autoboot: 2 1 0`, which is the
-two-second window BEFORE the one-second menu):
+Re-run `scripts\deploy_visionfive.ps1` (it now writes the config LF-only and refuses if a CR reaches
+the card), then boot. Expect the menu to select `GodspeedOS riscv64` and the kernel to load instead of
+"Failed to load".
 
-```
-fatload mmc 0:3 ${kernel_addr_r} godspeed-riscv64-visionfive.img
-```
-
-That prints the real error instead of the pxe wrapper's generic "Failed to load", and is the single
-most informative command available.
+That boot is also the FIRST time this port runs any of `portability-hardening` on hardware, so it
+confirms far more than this entry: see "What stays blocked" below.
 
 ## What stays blocked
 

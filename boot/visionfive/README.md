@@ -91,8 +91,8 @@ config points at.
 | `Access to the path 'P:\...' is denied` on a partition that IS mounted | Windows ACLs an ESP to administrators. Read and write it from the elevated shell. |
 | Menu appears and seems to wait for input | It is a one-second countdown, not a question. `timeout` is in deciseconds. |
 | Menu label still says something you changed | The deploy did not run. Check `build\deploy_visionfive.log` and the kernel's byte count. |
-| `Retrieving file: /godspeed-riscv64-visionfive.img` then `Failed to load '...'`, while `extlinux.conf` read fine moments earlier | **OPEN, cause not established - `backlog/26`.** Do NOT conclude the card or the board from this: both have been measured good (a stock card boots Debian on the same board at 22 MiB/s, and the card returns our kernel byte-perfect to a cache-bypassed read). See the section below before theorising. |
-| A SECOND `Failed to load` for a Debian file, straight after the first | **Collateral, not a second data point.** It only ever happens after a failed load in the same session; on a stock card that same file loads fine. A control has to run FIRST, or in a session of its own. |
+| `Retrieving file: /godspeed-riscv64-visionfive.img` then `Failed to load '...'`, while the MENU rendered perfectly | **CRLF in `extlinux.conf`.** U-Boot reads the trailing `\r` as part of the FILENAME, so every entry fails; the menu looks fine because a `\r` in a display string just returns the cursor. Fixed at three layers (`.gitattributes` `boot/** text eol=lf`, the deploy script normalizing and then CR-checking the card, and this row). If it recurs: `file boot/visionfive/*.conf` must say `ASCII text`, never `with CRLF line terminators`. |
+| A SECOND `Failed to load` for a Debian file, straight after the first | **The same cause, not a second data point.** With a CRLF config EVERY label's filename carries the `\r`, Debian's included - so both fail for one reason. It was misread as an independent control proving the fault was not ours, and two rounds of hardware theory were built on that. A control has to run FIRST, or in a session of its own. |
 
 ## The 2026-09-13 incident: `Failed to load`, and what it is not
 
@@ -132,19 +132,26 @@ cache. Our kernel comes back as all 2,743,208 bytes hashing `190565C0450F9ABD...
 written; the stock initrd comes back complete at 19 MiB/s. That diagnostic runs on every deploy now,
 precisely so this does not have to be argued again.
 
-**The trap that produced the wrong answer, stated plainly because this file already warns about its
-general form one section down.** In the failing log a Debian file fails to load immediately after
-ours. That was read as an independent control - "even an untouched stock file fails, so it is not
-us". It is not independent: it happens only ever AFTER our failure, in the same U-Boot session, and
-the same file loads perfectly in a session where nothing failed first. A failed multi-megabyte read
-appears to leave U-Boot unable to read anything else.
+**THE CAUSE: the config was CRLF.** `file(1)` on the working-tree copy said
+`ASCII text, with CRLF line terminators`; the stock 916-byte config that boots is plain `ASCII text`.
+U-Boot's extlinux parser takes the trailing `\r` as part of each FILENAME, so it tries to open
+`/godspeed-riscv64-visionfive.img\r` and fails - while the menu renders perfectly, because a `\r` in
+a display string only returns the cursor. It looked like a load failure and was a config fault.
+
+It came from `.gitattributes`, which marked `*.conf text` - "normalize to LF on commit, convert to
+NATIVE on checkout", and native on a Windows checkout is CRLF. The repository held LF and the working
+tree held CRLF. That file already carried the same rule for `*.sh` ("scripts that MUST stay LF even
+on a Windows checkout") and it had never been extended to files a BOOTLOADER reads.
+
+**The trap that cost the time, stated plainly because this file already warns about its general form
+one section down.** In the failing log a Debian file fails to load immediately after ours, and that
+was read as an independent control - "even an untouched stock file fails, so it is not us" - with two
+rounds of hardware theory built on it. It was never independent: with a CRLF config every label's
+filename carries the `\r`, Debian's included, so both were failing for one reason. The card was
+reflashed twice chasing it.
 
 **Two entries failing does not make the second one a control. A control has to run FIRST, or in a
 session of its own.**
-
-`backlog/26` carries the open hypotheses and the one-boot experiment that separates them. What
-belongs here is only this: the two captures above, and the fact that the obvious readings of the
-first one are already disproved by the second.
 
 ## What is in this directory
 

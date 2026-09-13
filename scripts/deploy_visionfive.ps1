@@ -115,8 +115,37 @@ try {
     if ($srcH -ne $dstH) { throw "kernel differs after copying. Card may be full or failing." }
     Ok ("kernel copied and verified by SHA256, {0} bytes, {1}" -f (Get-Item $dst).Length, $dstH.Substring(0,16))
 
-    # ---- 5. the config, parsed back ------------------------------------------------------
-    Copy-Item $Conf $ConfPath -Force
+    # ---- 5. the config, WRITTEN AS LF and parsed back --------------------------------------
+    #
+    # NOT `Copy-Item`, and this is the whole of the 2026-09-13 failure. The repository stores this
+    # file as LF, but `.gitattributes` marked it `*.conf text`, which means "normalize on commit,
+    # convert to NATIVE on checkout" - and native on a Windows checkout is CRLF. A plain copy put
+    # CRLF on the card. U-Boot's extlinux parser then read the trailing `\r` as part of each
+    # FILENAME and every entry failed:
+    #
+    #     Retrieving file: /godspeed-riscv64-visionfive.img
+    #     Failed to load '/godspeed-riscv64-visionfive.img'
+    #
+    # while the MENU rendered perfectly, because a trailing `\r` in a display string only returns
+    # the cursor. So it looked like a load failure and not a config fault, and it cost two card
+    # reflashes and two wrong theories (`backlog/26`).
+    #
+    # `.gitattributes` now pins `boot/** text eol=lf`, which fixes the checkout. This does NOT rely
+    # on that: whether the board boots must not depend on a contributor's git settings, an editor
+    # that helpfully "fixed" the file, or a copy through a tool that rewrites line endings. The
+    # bytes are normalized HERE, and then checked on the card below.
+    $confText = [System.IO.File]::ReadAllText($Conf) -replace "`r`n", "`n" -replace "`r", "`n"
+    [System.IO.File]::WriteAllText($ConfPath, $confText, (New-Object System.Text.UTF8Encoding($false)))
+
+    # VERIFIED ON THE CARD, not assumed from what we just wrote. A single CR in this file is a card
+    # that shows a perfect menu and cannot boot anything on it.
+    $onCard = [System.IO.File]::ReadAllBytes($ConfPath)
+    $crs    = @($onCard | Where-Object { $_ -eq 13 }).Count
+    if ($crs -gt 0) {
+        throw "installed extlinux.conf contains $crs carriage return(s). U-Boot would read them as part of each filename and every entry would fail to load."
+    }
+    Ok ("extlinux.conf written LF-only, {0} bytes, no CR on the card" -f $onCard.Length)
+
     $c = Get-Content $ConfPath -Raw
     if ($c -notmatch '(?m)^default\s+godspeed\s*$') { throw "installed config does not say 'default godspeed'" }
     if ($c -notmatch '(?m)^label\s+godspeed\s*$')   { throw "installed config has no 'label godspeed'" }
