@@ -650,7 +650,7 @@ pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
 /// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
 /// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 /// Messages accepted into a queue and then lost when that endpoint died.
-static QUEUED_LOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static QUEUED_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     let mut table = TABLE.lock_irq();

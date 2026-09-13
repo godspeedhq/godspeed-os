@@ -2465,11 +2465,11 @@ pub fn kill_task_by_slot(slot: usize) {
 
         // How many death notifications the supervisor never received. A COUNT, not a resource: it
         // only grows, and what it costs is promptness, which the reconcile sweep eventually restores.
-        static DEATH_NOTIFY_DROPPED: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
+        static DEATH_NOTIFY_DROPPED: portable_atomic::AtomicU64 =
+            portable_atomic::AtomicU64::new(0);
         /// Deaths that reached no supervisor at all, because its endpoint was gone at that instant.
-        static DEATH_NOTIFY_UNHEARD: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
+        static DEATH_NOTIFY_UNHEARD: portable_atomic::AtomicU64 =
+            portable_atomic::AtomicU64::new(0);
         use core::sync::atomic::Ordering;
 
         // RESTART count (the observe RESTARTS column): only the restartable/managed set accrues a

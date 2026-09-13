@@ -10,6 +10,10 @@ two invariants must hold in every kernel file OUTSIDE `arch/`:
      through `arch::imp` primitives (e.g. `read_page_table_base`, `invalidate_tlb_page`, `local_irq_save`).
   2. No reference to a NAMED arch module (`arch::x86_64::`, `arch::aarch64::`, ...). Neutral code names
      only `arch::imp::`; naming a specific arch is exactly the leak that makes a port unbounded.
+  3. No `core::sync::atomic::AtomicU64` / `AtomicI64`. RV32 has no 64-bit atomic so the `core` type
+     does not exist there; `portable_atomic` supplies it at zero cost everywhere else. This is the
+     WORD-SIZE half of portability, and `arch/CLAUDE.md` calls it one of the two rules the boundary
+     rests on - while nothing enforced it until a 32-bit port hit it as a compile error.
 
 This is the arch-boundary counterpart to `unsafe_check.py` (the unsafe boundary) and `contract_check.py`
 (the contract<->kernel reconcile): a boundary survives only if it is mechanically enforced (CLAUDE.md
@@ -63,6 +67,25 @@ NAMED_ARCH = re.compile(rf"\barch::({_ARCHES})::")
 CORE_ARCH_INTRINSIC = re.compile(rf"\bcore::arch::({_ARCHES})::")  # e.g. core::arch::x86_64::__cpuid
 INLINE_ASM = re.compile(r"\b(?:core::arch::)?(?:naked_)?asm!")
 
+# WORD SIZE, not instruction set - the second of the two rules `kernel/src/arch/CLAUDE.md` says the
+# boundary is built on, and until 2026-09-13 the only one of them nothing enforced.
+#
+# 32-bit RISC-V (RV32A) has no 64-bit atomic, so `core::sync::atomic::AtomicU64` DOES NOT EXIST there.
+# `portable_atomic::AtomicU64` is the native, zero-cost type on every ISA that has one and a small
+# lock-based shim only on RV32, which is what makes this kernel word-size portable as well as
+# ISA-portable.
+#
+# EIGHT neutral-kernel sites were violating this when the check was written, in `interrupt/route.rs`,
+# `ipc/routing.rs`, `syscall/dispatch.rs` and `task/scheduler.rs`. The rule had been documented for
+# months; nothing read it. They surfaced only when a 32-bit port was actually attempted, as part of
+# its 46 compile errors - which is the worst way to find a rule you already wrote down, because the
+# porter has to work out that the fault is OURS and not theirs.
+#
+# `AtomicI64` is included though nothing uses it today: the hardware limitation is about WIDTH, so the
+# signed type would arrive with the identical bug and a checker that waited for it would be pedantry
+# rather than enforcement.
+CORE_ATOMIC_64 = re.compile(r"\bcore::sync::atomic::(AtomicU64|AtomicI64)\b")
+
 
 def strip_comments(text: str) -> str:
     """Drop // line comments so a doc-comment mentioning `asm!` or `arch::x86_64::` never trips the check.
@@ -87,6 +110,12 @@ def main() -> int:
             if m:
                 violations.append(f"  {rel}:{i}: names `arch::{m.group(1)}::` directly - use "
                                   f"`arch::imp::` (the seam) so a new arch stays a drop-in")
+            a64 = CORE_ATOMIC_64.search(line)
+            if a64:
+                violations.append(f"  {rel}:{i}: uses `core::sync::atomic::{a64.group(1)}` in a "
+                                  f"neutral file - use `portable_atomic::{a64.group(1)}`. RV32 has "
+                                  f"no 64-bit atomic, so the `core` type does not exist there and "
+                                  f"this file cannot compile for a 32-bit port.")
             ci = CORE_ARCH_INTRINSIC.search(line)
             if ci:
                 violations.append(f"  {rel}:{i}: uses `core::arch::{ci.group(1)}::` intrinsics in a "

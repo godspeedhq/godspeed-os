@@ -113,8 +113,8 @@ pub fn unregister(irq: u8) {
 
 /// One bit per IDT vector: has `deliver` ever run for it? Read and set by the one-shot inside
 /// `deliver`, below.
-static VECTOR_SEEN: [core::sync::atomic::AtomicU64; 4] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+static VECTOR_SEEN: [portable_atomic::AtomicU64; 4] =
+    [const { portable_atomic::AtomicU64::new(0) }; 4];
 
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
 ///

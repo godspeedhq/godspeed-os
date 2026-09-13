@@ -133,7 +133,12 @@ counterpart to `unsafe_check.py` (the unsafe boundary) and `contract_check.py`: 
 only because it is enforced, not because it is remembered (§26 - the architecture survives only if the
 discipline survives).
 
-**Never reach for `core::sync::atomic::AtomicU64` directly - use `portable_atomic::AtomicU64`.** This
+**Never reach for `core::sync::atomic::AtomicU64` directly - use `portable_atomic::AtomicU64`.**
+`scripts/arch_boundary_check.py` enforces this, as of 2026-09-13 and not before: it was written here
+as one of the two rules the boundary rests on, and for months the script beside it enforced only the
+other one. EIGHT neutral-kernel sites were violating it, and they surfaced only when a 32-bit port was
+attempted and hit them as compile errors - which is the worst way to find a rule you already wrote
+down, because the porter must first work out that the fault is yours and not theirs. This
 is what makes the kernel *word-size* portable as well as ISA-portable. 32-bit RISC-V (RV32A) has no
 64-bit atomic, so the `core` type does not exist there; `portable-atomic` (in `kernel/Cargo.toml`) is
 the native, zero-cost `AtomicU64` on every ISA that has one and a small lock-based shim only on RV32.

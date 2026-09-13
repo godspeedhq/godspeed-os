@@ -1826,7 +1826,7 @@ fn do_call(
     // grandfathered `unsafe` floor here (18.5) is untouched.
     let call_us = scheduler::cycles_to_us(read_cycle_counter().wrapping_sub(call_c0));
     if call_us >= 100_000 {
-        static SLOW_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        static SLOW_CALLS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
         let n = SLOW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 3 || n % 256 == 0 {
             crate::kprintln!(
