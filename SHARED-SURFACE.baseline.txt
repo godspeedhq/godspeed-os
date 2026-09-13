@@ -17,6 +17,6 @@
     3  services/hw-enumerator/src/main.rs
     3  services/net-stack/src/main.rs
    10  services/nic-driver/src/main.rs
-    7  services/shell/src/main.rs
+    2  services/shell/build.rs
     9  services/supervisor/build.rs
     4  services/supervisor/src/main.rs

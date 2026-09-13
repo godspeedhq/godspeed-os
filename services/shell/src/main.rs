@@ -5023,14 +5023,19 @@ fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 /// Raspberry Pi 2 port is called everywhere else in the tree (`docs/arm32-status.md`,
 /// `kernel/src/arch/arm/`). One source tree now builds for several ISAs, so a version string without
 /// the architecture cannot say which machine produced it - the same reason `uname -m` exists.
-const ARCH: &str = if cfg!(target_arch = "x86_64") { "x86_64" }
-    else if cfg!(target_arch = "arm") { "arm32" }
-    else if cfg!(target_arch = "aarch64") { "aarch64" }
-    else if cfg!(target_arch = "riscv64") { "riscv64" }
-    else if cfg!(target_arch = "riscv32") { "riscv32" }
-    else if cfg!(target_arch = "loongarch64") { "loongarch64" }
-    else if cfg!(target_arch = "s390x") { "s390x" }
-    else { "unknown-arch" };
+///
+/// THIS IS THE ONE LEGITIMATE ARCH QUESTION ABOVE THE KERNEL, and it is worth saying why, because
+/// every other one this branch removed was illegitimate. Elsewhere `target_arch` stands in for a
+/// BOARD fact and is therefore on the wrong axis. Here the ISA IS the fact being reported: nothing
+/// branches on it, it is printed.
+///
+/// What WAS wrong is that it was a hand-kept list of seven arms with an `else { "unknown-arch" }`
+/// floor - so a fresh port did not fail, it reported a plausible lie in every version string, serial
+/// log and bug report until somebody noticed. `CARGO_CFG_TARGET_ARCH` is already the answer for every
+/// target that will ever exist, so `build.rs` derives this with no list at all and one rename. Same
+/// source, same rename, as the kernel's boot banner - which is the point, since the kernel's own
+/// build script says the two are "the same fact stated twice".
+const ARCH: &str = env!("GODSPEED_ARCH");
 
 /// `version` - the GodspeedOS version, architecture, and build stamp:
 /// `GodspeedOS <ver> <arch> (<git-sha>)`. Distinct from `<util> version` (which reports a single

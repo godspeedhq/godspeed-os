@@ -30,6 +30,17 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GODSPEED_GIT_SHA={}", sha);
+
+    // THE PROJECT'S NAME FOR THIS ARCHITECTURE, derived rather than listed.
+    //
+    // `CARGO_CFG_TARGET_ARCH` is already the answer for every target that exists or ever will, so
+    // there is no arch list here and a new port needs no edit - it reports its real name the day it
+    // first builds. One rename: Rust calls 32-bit ARMv7 `arm`, and this project calls it **arm32**
+    // everywhere else - 95 boot lines in `kernel/src/arch/arm/` print `arm32:`, plus
+    // `docs/multi-arch.md`, `docs/arm32-status.md` and the README.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".into());
+    let arch = if arch == "arm" { "arm32".to_string() } else { arch };
+    println!("cargo:rustc-env=GODSPEED_ARCH={arch}");
     let git_log = workspace.join(".git").join("logs").join("HEAD");
     if git_log.exists() {
         println!("cargo:rerun-if-changed={}", git_log.display());
