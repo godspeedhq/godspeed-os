@@ -85,6 +85,54 @@ def shared_surface():
     return (total, kern) if total else (None, None)
 
 
+def porting_tree_problems():
+    """`docs/porting.md`'s tree annotates each file with its arch-conditional count. Check every one
+    against `SHARED-SURFACE.baseline.txt`, which is the ratchet's own file and the only source.
+
+    A tree of per-file numbers is exactly the shape that rots: CLAUDE.md 4.1 carried a hand count
+    ("neutral code still names `arm` in 8 places, `aarch64` in 4 and `x86_64` in 3") that had drifted
+    to 6, 4 and 2 before anybody re-measured, with nothing watching. The tree is more useful than that
+    paragraph and would rot the same way, so it is checked line by line rather than trusted.
+    """
+    import re as _re
+    base = read("SHARED-SURFACE.baseline.txt")
+    doc = read("docs/porting.md")
+    if not base or not doc:
+        return []
+    truth = {}
+    for line in base.split("\n"):
+        line = line.split("#", 1)[0].strip()
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            truth[parts[1].strip()] = int(parts[0])
+
+    problems = []
+    seen = set()
+    # Tree rows look like:  `│   ├── task/scheduler.rs               [ 2 ]   - NOT yours...`
+    for n, line in enumerate(doc.split("\n"), 1):
+        m = _re.search(r'([A-Za-z0-9_./-]+\.rs|[A-Za-z0-9_./-]*build\.rs)\s+\[\s*(\d+)\s*\]', line)
+        if not m:
+            continue
+        leaf, claimed = m.group(1), int(m.group(2))
+        # The tree shows leaves; the baseline holds full paths. Match on suffix, which is
+        # unambiguous here because no two baseline paths end the same way.
+        hits = [k for k in truth if k.endswith(leaf)]
+        if len(hits) != 1:
+            if claimed == 0:
+                continue  # "every other service [ 0 ]" and friends - a claim of absence, not a file
+            problems.append(f"docs/porting.md:{n}: `{leaf}` matches {len(hits)} baseline entries")
+            continue
+        seen.add(hits[0])
+        if truth[hits[0]] != claimed:
+            problems.append(f"docs/porting.md:{n}: `{hits[0]}` says {claimed}, baseline says {truth[hits[0]]}")
+
+    for path, n in sorted(truth.items()):
+        if path not in seen:
+            problems.append(f"docs/porting.md: `{path}` ({n} site(s)) is in the ratchet but ABSENT "
+                            f"from the tree - a porter would not know to look at it")
+    return problems
+
+
 def facts():
     out = []
 
@@ -186,6 +234,8 @@ def main():
 
     checked = 0
     bad = []
+
+    tree = porting_tree_problems()
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))
@@ -205,8 +255,19 @@ def main():
                         if got != truth:
                             bad.append((name, source, rel, line_no, "says %d, code says %d" % (got, truth)))
 
+    if tree:
+        print("docs/porting.md's TREE disagrees with the ratchet it claims to reflect:")
+        print()
+        for t in tree:
+            print("  %s" % t)
+        print()
+        print("SHARED-SURFACE.baseline.txt is the only source for those counts. A tree of per-file")
+        print("numbers rots exactly like the hand count CLAUDE.md 4.1 used to carry, so it is checked.")
+        return 1
+
     if not bad:
-        print("facts: %d doc statement(s) agree with the code they restate" % checked)
+        print("facts: %d doc statement(s) agree with the code they restate, and the porting tree "
+              "matches the ratchet" % checked)
         return 0
 
     print("facts: %d doc statement(s) disagree with the code\n" % len(bad))

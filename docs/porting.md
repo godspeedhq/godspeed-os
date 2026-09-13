@@ -103,6 +103,71 @@ that the ISA was added.*
 
 ---
 
+## The whole map, as a tree
+
+Every file below is either something you write, something you add one line to, or something you do
+not touch. The counts are arch-conditional sites, and they come from
+`SHARED-SURFACE.baseline.txt` - the ratchet's own file - so this tree cannot quietly drift from
+what is enforced. `scripts/facts_check.py` compares the two on every run.
+
+```text
+godspeed/
+├── kernel/
+│   ├── src/
+│   │   ├── arch/
+│   │   │   ├── <isa>/                              ★ YOU WRITE THIS, and essentially only this.
+│   │   │   │                                         131 `arch::imp` members; the compiler and
+│   │   │   │                                         arch_seam_check.py name every one you owe.
+│   │   │   └── mod.rs                              + 2 lines: `pub mod <isa>;`
+│   │   │                                                      `pub use <isa> as imp;`
+│   │   ├── task/scheduler.rs               [ 2 ]   - NOT yours. `target_pointer_width` on one
+│   │   │                                             constant; a 32-bit space cannot hold a 4 GiB
+│   │   │                                             VA, so the width IS the question.
+│   │   └── everything else                 [ 0 ]   - do not touch. If you must, that is a finding.
+│   ├── kernel-<isa>.ld                             + new file: your load address and PHDRS
+│   └── build.rs                                    + one target block, passing -T for it
+├── .cargo/config.toml                              + one [target.<triple>] block
+├── rust-toolchain.toml                             + your triple, if a shipping build needs it
+│
+├── sdk/rust/src/                                   the seam CLAUDE.md 18.1 designates by hand
+│   ├── syscall.rs                          [ 4 ]   + YOUR `raw_syscall`. One body per ISA: the trap
+│   │                                                 instruction and its register convention. This
+│   │                                                 one you WILL write, and it is expected.
+│   ├── adversarial.rs                      [ 6 ]   - not needed to boot. §22 fault primitives; see
+│   │                                                 backlog/24 for why none runs off x86 anyway.
+│   └── ipc.rs                              [ 1 ]   - nothing. Keys on register width, not on you.
+│
+└── services/                                       above the kernel, where the real work is left
+    ├── supervisor/build.rs                 [ 9 ]   + ONE ARM per table. The designed place to
+    │                                                 answer; it sets has_xhci / has_dwc2 /
+    │                                                 has_hw_enumerator so main.rs needs nothing.
+    ├── supervisor/src/main.rs              [ 4 ]   + one arm IF your storage or NIC sits behind a
+    │                                                 USB host (block-driver / nic-driver peers).
+    ├── block-driver/build.rs               [ 4 ]   + one arm: is the disk on USB, and whose host.
+    ├── nic-driver/src/main.rs              [10 ]   + one arm, AND KNOW THIS IS THE WORST ONE. It
+    │                                                 picks the MAC by instruction set, so a
+    │                                                 different NIC on a board of YOUR ISA drives
+    │                                                 the wrong silicon. backlog/21 has the fix.
+    ├── hw-enumerator/src/main.rs           [ 3 ]   + one arm IF you have PCI. A port that is
+    │                                                 neither mechanism #1 nor ECAM fails to
+    │                                                 COMPILE, deliberately. backlog/25.
+    ├── shell/build.rs                      [ 2 ]   - nothing. Derived from CARGO_CFG_TARGET_ARCH.
+    │                                                 Add a line only for a project-specific name,
+    │                                                 as arm32 has.
+    ├── net-stack/src/main.rs               [ 1 ]   - nothing. The default is the wall-clock TSC
+    │                                                 floor, which every non-x86 port has needed.
+    └── every other service                 [ 0 ]   - do not touch.
+```
+
+**Legend.** `★` write it. `+` add to it, and the guide above says what. `-` do not, and if you find
+yourself doing so, that is [the rule](#adding-an-isa-the-seam-the-edges-and-the-rule).
+
+**Totals, and they are the honest ones.** 46 arch-conditional sites outside `arch/`: 2 in the neutral
+kernel and 44 above it. Of the 44, **15 are "add one arm to a build table"** - designed, expected,
+and cheap. The other 29 split into the SDK's syscall body you will write anyway (4), the seam the SDK
+is designated for (7), and three files with an open backlog entry each explaining what would close
+them for good.
+
 ## How you know where you are
 
 Four checkers, and each answers a different question. None of them is optional and all of them run
