@@ -2127,12 +2127,51 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// Stop QUEUEING serial output; from here writes go straight to the wire.
+///
+/// A panic halts every core, so a line handed to a ring may never be drained by anyone - the last
+/// thing the machine says would be the thing that never arrives. An arch whose serial path does not
+/// queue has nothing to switch off and says so with an empty body, which is an ANSWER: `main.rs`
+/// called this under `#[cfg(all(target_arch = "aarch64", feature = "pi4"))]` and again under
+/// `#[cfg(target_arch = "arm")]`, so a fifth port would have panicked into a buffer nobody drains
+/// and nothing would have told it.
+pub fn serial_enter_panic_mode() {}
+
+/// Drain any queued console output NOW, blocking until it is on the wire.
+///
+/// Called once, from the panic path, after no tick will ever run again - so on an arch that drains
+/// its console from the timer the panic message would otherwise sit in a buffer forever. Blocking is
+/// correct here and nowhere else: there is nothing left to starve. An arch that does not queue has
+/// nothing to flush.
+pub fn tx_ring_flush_blocking() {}
+
+/// Page flags this arch wants ADDED when mapping a framebuffer, beyond the neutral set.
+///
+/// A framebuffer is RAM the display controller scans out, not device registers, and the two want
+/// opposite memory types - so the neutral mapper states the intent (`WRITE_COMBINE`) and the arch
+/// states what its own page tables need to express it.
+///
+/// This was `#[cfg(not(target_arch = "x86_64"))] flags |= PageFlags::PWT;` in `task/mod.rs`, with a
+/// comment explaining that arm32 and x86 read PCD and PWT in OPPOSITE senses. That is exactly a fact
+/// about silicon (26.14) and exactly what does not belong in a neutral file: the note was correct and
+/// the placement left a fifth port inheriting arm32's answer by default.
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::PWT
+}
+
 pub mod interrupts {
     /// MSI vector pool. Empty: RISC-V delivers device interrupts through the PLIC by wire, and MSI
     /// (via AIA/IMSIC) is a separate controller this port does not have yet. A zero-length pool means
     /// the neutral allocator hands out nothing rather than handing out vectors nobody routes.
     pub const MSI_POOL_BASE: u8 = 0;
     pub const MSI_POOL_LEN: usize = 0;
+
+    pub use crate::task::scheduler::Armed;
+    /// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
+    /// which is what every port but arm32 did anyway, previously by not being compiled at all.
+    /// `Full` is the ANSWER, not a stub: it says "no capacity", which is a state arm32 also reports.
+    pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
+    pub fn hires_release(_slot: u32) {}
 
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
@@ -2887,6 +2926,12 @@ pub mod pci {
     /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
     /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
     pub fn dwc2_present() -> bool { false }
+
+    /// Take the EHCI controller off the firmware, if this arch's firmware ever held it.
+    ///
+    /// A no-op where there is no BIOS to hand off from. `task/mod.rs` called it under
+    /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
+    pub fn ehci_bios_handoff() {}
 
     pub fn xhci() -> Option<PciDevice> {
         if let Some(d) = find_by_class(0x0c_03_30) {

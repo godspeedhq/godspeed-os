@@ -2414,6 +2414,20 @@ fn push_hex(buf: &mut [u8], mut n: usize, v: u32) -> usize {
 
 pub fn serial_unlocked_emit_count() -> u64 { 0 }
 
+/// Page flags this arch wants ADDED when mapping a framebuffer, beyond the neutral set.
+///
+/// A framebuffer is RAM the display controller scans out, not device registers, and the two want
+/// opposite memory types - so the neutral mapper states the intent (`WRITE_COMBINE`) and the arch
+/// states what its own page tables need to express it.
+///
+/// This was `#[cfg(not(target_arch = "x86_64"))] flags |= PageFlags::PWT;` in `task/mod.rs`, with a
+/// comment explaining that arm32 and x86 read PCD and PWT in OPPOSITE senses. That is exactly a fact
+/// about silicon (26.14) and exactly what does not belong in a neutral file: the note was correct and
+/// the placement left a fifth port inheriting arm32's answer by default.
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::PWT
+}
+
 pub mod interrupts {
     /// The MSI vector pool is x86-only (`arch/x86_64/interrupts.rs`, step D1b). Neither Pi has one:
     /// a pool hands vectors to devices found on a PCI bus, and there is no PCI bus here to find them
@@ -2422,6 +2436,10 @@ pub mod interrupts {
     /// range of vectors this arch does not route.
     pub const MSI_POOL_BASE: u8 = 0;
     pub const MSI_POOL_LEN: usize = 0;
+    pub use crate::task::scheduler::Armed;
+    /// arm32 HAS one: the BCM2835 System Timer's free compare channels, driven from `irq.rs`.
+    pub use super::irq::{hires_arm, hires_release};
+
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
     /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
@@ -2616,6 +2634,12 @@ pub mod pci {
     /// Not a scan result: there is no bus to scan for an on-SoC part, which is why
     /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
     pub fn dwc2_present() -> bool { true }
+
+    /// Take the EHCI controller off the firmware, if this arch's firmware ever held it.
+    ///
+    /// A no-op where there is no BIOS to hand off from. `task/mod.rs` called it under
+    /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
+    pub fn ehci_bios_handoff() {}
 
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }

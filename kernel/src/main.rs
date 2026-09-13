@@ -463,9 +463,11 @@ fn panic(info: &PanicInfo) -> ! {
     // without any of them waiting. A panic halts every core, so a queued line may never be drained by
     // anyone: the last thing the machine says would be the thing that never arrives. From here writes
     // go straight to the UART. They can interleave; that is a fair price for output that exists.
-    #[cfg(all(target_arch = "aarch64", feature = "pi4"))]
-    crate::arch::imp::serial_enter_panic_mode();
-    #[cfg(target_arch = "arm")]
+    //
+    // Asked of EVERY arch. This was two calls to the same function under two `#[cfg]`s - one for
+    // aarch64-with-pi4, one for arm - so a fifth port would have panicked into a buffer nobody
+    // drains, silently. An arch whose serial path does not queue answers with an empty body, which
+    // is a statement rather than an omission.
     crate::arch::imp::serial_enter_panic_mode();
     kprintln!("KERNEL PANIC: {}", info);
     // FLUSH THE CONSOLE RING BEFORE HALTING. Console writes are queued and drained by the timer tick
@@ -473,7 +475,6 @@ fn panic(info: &PanicInfo) -> ! {
     // panic message, the single most important output the kernel ever produces, would sit in a buffer
     // and never reach the wire. Blocking is correct here and nowhere else: there is nothing left to
     // starve.
-    #[cfg(target_arch = "arm")]
     arch::imp::tx_ring_flush_blocking();
     arch::imp::halt_all_cores();
 }

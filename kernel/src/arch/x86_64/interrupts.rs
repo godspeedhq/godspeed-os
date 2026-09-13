@@ -262,6 +262,13 @@ pub fn msi_pool_stub(i: usize) -> u64 {
 /// vector freely (it is written into the device's message-data register), so vector and
 /// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.
 /// Chosen clear of the timer (32), COM1 (36), syscall (0x80), and the IPIs (0xF0-0xF2).
+pub use crate::task::scheduler::Armed;
+/// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
+/// which is what every port but arm32 did anyway, previously by not being compiled at all.
+/// `Full` is the ANSWER, not a stub: it says "no capacity", which is a state arm32 also reports.
+pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
+pub fn hires_release(_slot: u32) {}
+
 pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
 /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller

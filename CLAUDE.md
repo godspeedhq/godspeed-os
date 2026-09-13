@@ -219,10 +219,11 @@ These are the laws that bound every design choice. Any change that violates an i
 > (`shared_surface_check.py`); the neutral kernel had none.
 >
 > It does now - the same one, which is the honest shape since it is one property asked of two layers.
-> **The standing figure is 58 arch-conditional sites outside `arch/`: 14 in the neutral kernel, 44
+> **The standing figure is 46 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 44
 > above it.** It may fall freely and may not rise without a recorded reason. What is left is listed
-> rather than implied: the neutral kernel's 14 are mostly per-device interrupt vectors in
-> `task/mod.rs` that want an `arch::imp` member; above it, `nic-driver` picks its MAC by ISA on three
+> rather than implied. **The neutral kernel is down to 2**, and both are `target_pointer_width` on
+> one constant - a 32-bit address space genuinely cannot hold a 4 GiB virtual address, so the width
+> IS the question rather than an ISA standing in for one. Above the kernel, `nic-driver` picks its MAC by ISA on three
 > of four boards and needs a kernel query to stop (`backlog/21`), `hw-enumerator` packs a host-bridge
 > config selector that belongs in `arch/` (`backlog/25`), and the rest are the SDK's syscall seam,
 > which §18.1 designates and which is the one place the ISA is genuinely the question.

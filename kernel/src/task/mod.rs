@@ -2032,7 +2032,8 @@ fn spawn_service_with_image(
         // Idempotent, bounded, and it reports whether the firmware actually let go. Done at the
         // GRANT rather than once at boot so a restarted driver - which chaos does constantly - also
         // gets a controller nobody else is running.
-        #[cfg(target_arch = "x86_64")]
+        // No cfg: whether there is firmware to take the controller FROM is a fact about this
+        // machine's firmware, and the arch states it (an empty body where there is no BIOS).
         if hw == HwClass::Ehci && bar != 0 {
             crate::arch::imp::pci::ehci_bios_handoff();
         }
@@ -2101,11 +2102,14 @@ fn spawn_service_with_image(
                         // 1920x1080 repaint measured 582 ms, about 14 MB/s, which is the slow and
                         // jittery rendering reported from the television. An arch with nothing better
                         // ignores this bit and keeps its uncached-MMIO type, so x86 is unchanged.
-                        | PageFlags::WRITE_COMBINE;
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        flags |= PageFlags::PWT;
-                    }
+                        | PageFlags::WRITE_COMBINE
+                        // WHAT THIS ARCH'S PAGE TABLES NEED to express that intent. The long note
+                        // above is a fact about silicon - arm32 and x86 read PCD and PWT in OPPOSITE
+                        // senses - and it lived here as `#[cfg(not(target_arch = "x86_64"))] flags |=
+                        // PageFlags::PWT`, which left a fifth port inheriting arm32's answer by
+                        // default. The arch says which bits it wants; this file says what it wants
+                        // them to MEAN (26.14).
+                        | crate::arch::imp::fb_extra_page_flags();
                     let pages = g.len.div_ceil(PAGE_SIZE as u64);
                     // The framebuffer is DEVICE memory the kernel is about to map into a service.
                     // The kill-path reclaim walks a dead task's leaves and frees them, so without a

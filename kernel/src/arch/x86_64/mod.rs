@@ -13,6 +13,35 @@ pub mod fb;
 pub use fb::fb_commit;
 pub mod iommu;
 pub mod ioapic;
+/// Stop QUEUEING serial output; from here writes go straight to the wire.
+///
+/// A panic halts every core, so a line handed to a ring may never be drained by anyone - the last
+/// thing the machine says would be the thing that never arrives. An arch whose serial path does not
+/// queue has nothing to switch off and says so with an empty body, which is an ANSWER: `main.rs`
+/// called this under `#[cfg(all(target_arch = "aarch64", feature = "pi4"))]` and again under
+/// `#[cfg(target_arch = "arm")]`, so a fifth port would have panicked into a buffer nobody drains
+/// and nothing would have told it.
+pub fn serial_enter_panic_mode() {}
+
+/// Drain any queued console output NOW, blocking until it is on the wire.
+///
+/// Called once, from the panic path, after no tick will ever run again - so on an arch that drains
+/// its console from the timer the panic message would otherwise sit in a buffer forever. Blocking is
+/// correct here and nowhere else: there is nothing left to starve. An arch that does not queue has
+/// nothing to flush.
+pub fn tx_ring_flush_blocking() {}
+
+/// Page flags this arch wants ADDED when mapping a framebuffer: NONE.
+///
+/// x86-64 reads the neutral `PCD` alone as UC-, which is defined to yield write-combining where the
+/// firmware's MTRR says WC - and firmware routinely marks a framebuffer WC. Adding `PWT` would select
+/// strong uncacheable instead, the one memory type an MTRR can never upgrade, and a 1920x1080 repaint
+/// measured 596 ms that way. arm32 reads the same two bits in the OPPOSITE sense, which is why this
+/// is per-arch rather than a constant (26.14).
+pub fn fb_extra_page_flags() -> page_tables::PageFlags {
+    page_tables::PageFlags::empty()
+}
+
 pub mod interrupts;
 pub mod page_tables;
 pub mod pci;
