@@ -88,6 +88,26 @@ def shared_surface():
 def facts():
     out = []
 
+    # The SEAM's own size, imported from the checker that DISCOVERS it. `docs/porting.md` tells a
+    # porter how many members they owe, and that is precisely a number that moves every time one is
+    # added - which this branch did seven times in a day.
+    try:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import arch_seam_check
+        # `wanted()` returns (top-level names, {module: names}); the seam SIZE is both, which is
+        # what the checker's own "all N members" line counts. `len()` of the pair is 2 - a reading
+        # that looked plausible and was wrong, caught because this fact was checked rather than
+        # written down.
+        _top, _moded = arch_seam_check.wanted()
+        seam = len(_top) + sum(len(v) for v in _moded.values())
+    except Exception:
+        seam = 0
+    if seam:
+        out.append(("arch::imp seam members", seam,
+                    "scripts/arch_seam_check.py wanted() - discovered from neutral-kernel usage",
+                    [r"\*\*([0-9]+) members\*\* that the neutral kernel calls",
+                     r"every one of the ([0-9]+) `arch::imp` members"]))
+
     ss_total, ss_kern = shared_surface()
     if ss_total:
         out.append(("shared surface outside arch/", ss_total,

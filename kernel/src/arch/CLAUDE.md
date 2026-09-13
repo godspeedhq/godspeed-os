@@ -82,7 +82,15 @@ userspace SDK/services) is the rest of the work; `docs/aarch64.md` tracks how on
 
 ## Adding an architecture: the checklist
 
-Everything you touch is in one of five places. None of them is a neutral kernel file.
+> **The full map is [`docs/porting.md`](../../../docs/porting.md)** - the seam, the edges you will
+> unavoidably touch OUTSIDE the kernel (the supervisor's tables, the SDK's syscall body, the service
+> that picks a NIC), the four checkers that tell you where you are, and the rule: if you find
+> yourself editing anything else, stop and ask why. This section is the kernel half of it.
+
+Everything you touch in the KERNEL is in one of five places. None of them is a neutral kernel file -
+which is a claim `scripts/shared_surface_check.py` now measures rather than asserts: the neutral
+kernel is down to 2 arch-conditional sites, both `target_pointer_width` on one constant, and neither
+is something a new port edits.
 
 1. **`kernel/src/arch/<isa>/mod.rs`** - the implementation module. Start from the nearest existing
    stub. It begins with a `_start` (the boot handoff for your platform) and brings the CPU far enough
@@ -100,9 +108,14 @@ Everything you touch is in one of five places. None of them is a neutral kernel 
 4. **`.cargo/config.toml`** - a `[target.<triple>]` block with the rustflags your target needs (for
    example `relocation-model=static` on the bare-metal ARM/RISC-V targets).
 
-5. **`scripts/arch_boundary_check.py`** - extend the `_ARCHES` regex with your arch name so the guard
-   *also* forbids neutral code from naming your arch directly. A boundary that does not know about
-   your arch cannot protect it.
+5. **`rust-toolchain.toml`** - add your triple to `targets` if a shipping build will need it, so a
+   fresh clone can build your port without a separate install step.
+
+   (This step used to read "extend the `_ARCHES` regex in `scripts/arch_boundary_check.py` with your
+   arch name". **There is nothing to extend any more** - that list is derived from the directory
+   listing of `arch/`, so the guard covers your arch the moment its directory exists. It was changed
+   because the manual step had already been missed: `loongarch64` and `s390x` had directories and
+   were absent from the pattern, so the check printed an unqualified all-clear it could not back.)
 
 Then: `cargo check -p kernel --target <triple>`. Any error **outside `arch/<isa>/`** is a boundary
 leak - a neutral file made an arch-specific assumption. Fix it by adding an `arch::imp` primitive, not
