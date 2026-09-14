@@ -320,26 +320,31 @@ pub struct Displaced {
     n: u32,
     warned: bool,
 
-    /// ONE held request, and only while `holding` says it is safe to hold one.
+    /// Client requests displaced by a conversation with `nic-driver`, kept in arrival order.
     ///
-    /// **Deferring a request is safe exactly when net-stack is doing its OWN work, and unsafe when it
-    /// is serving somebody.** That distinction is not a refinement; it is the whole difference
-    /// between this and the four-slot stash that was built, measured and withdrawn a commit earlier
-    /// (`docs/net-tags-design.md` §7.2). Holding across a long client operation means answering after
-    /// the client gave up and re-sent, so it reads the late reply as the answer to its next question
-    /// and every exchange afterwards is one behind. Holding across net-stack's own unsolicited work
-    /// has no such copy in flight: the client asked once and is still waiting.
+    /// **This is `docs/net-tags-design.md` phase 3, and it is safe now for one reason: the CLIENT HOP
+    /// CARRIES A CORRELATION TAG.** It was built without one, measured, and withdrawn the same day
+    /// (§7.2 there, with the log). The hazard was not the holding - it was answering LATE: a client
+    /// that gives up RE-SENDS, so a late answer arrived as a second reply to a question already asked
+    /// again, was read as the answer to the NEXT question, and every exchange afterwards was
+    /// permanently one behind. A DNS lookup displaced twice, served twice, and a `net` status two
+    /// commands later answered with a hostname.
     ///
-    /// One slot, not four, because the situation it covers is one client speaking into one bounded
-    /// moment. A second would mean two clients collided with the same moment, which the counter
-    /// records and the drop handles exactly as before.
-    held: Option<Held>,
+    /// A tag removes that entirely. The re-send carries a FRESH tag, so when the held copy is finally
+    /// answered the client sees a tag it is not waiting for, discards it, and keeps waiting for its
+    /// own. The two replies stop being interchangeable, which is the whole property that was missing.
+    ///
+    /// So the gate that scoped holding to net-stack's own unsolicited work is GONE, and holding is
+    /// now unconditional. The distinction it drew was real while a late answer could mislead; once it
+    /// cannot, it only costs work that would otherwise be lost.
+    held: [Option<Held>; STASH_N],
+    /// Index of the oldest live entry. A ring, so serving in ARRIVAL ORDER costs nothing - clients
+    /// are answered in the order they asked, which is the only order that cannot surprise them.
+    head: usize,
+    live: usize,
     /// The expiry is reported once, for the same reason the drop is: the condition repeats by nature
     /// and a report that floods the console is how a real signal gets lost among its own copies.
     expired_said: bool,
-    /// Set only around the work net-stack does UNASKED. Off by default, so the safe behaviour is the
-    /// one you get by forgetting.
-    holding: bool,
 }
 
 /// A held request, with everything needed to answer it later.
@@ -357,74 +362,123 @@ pub struct Held {
     body: [u8; HELD_BYTES],
 }
 
-/// The largest request body that can be held. A status query is one byte, a DNS lookup a hostname, a
+/// How many displaced requests are kept.
+///
+/// Four. The endpoint queue behind this is 16 deep (CLAUDE.md §8.5), and a stash as deep as the queue
+/// would just be the queue again in this service's stack - four slots is 4 KiB of `service_main`'s
+/// frame and covers the realistic case, which is one client re-sending into one busy moment.
+const STASH_N: usize = 4;
+
+/// The largest request body that can be held. A status query is two bytes, a DNS lookup a hostname, a
 /// TCP transact a shell command line. A socket send may legitimately be larger, and one that does not
 /// fit is dropped rather than truncated - a request half-kept would be served as a DIFFERENT request.
 const HELD_BYTES: usize = 1024;
 
 /// How long a held request may wait before it is dropped instead of answered.
 ///
-/// A LATE ANSWER IS WORSE THAN NO ANSWER: a client that gives up re-sends, and answering the held
-/// copy too gives it two replies to one question. Half a second is comfortably inside the shortest
-/// client deadline in the tree (3 seconds, the shell's status query) and comfortably longer than the
-/// work this covers when it goes well - an SNTP exchange that answers takes about 200 ms. When that
-/// work drags on instead, the hold expires and the behaviour degrades exactly to dropping, which is
-/// the measured, shipped baseline rather than a guess.
+/// **The bound is set by LATENCY, not by correctness, and getting that backwards is a measured
+/// mistake rather than a hypothetical one.** Before the client hop carried a tag, answering late
+/// corrupted the channel and this was the only thing preventing a permanent desync. The tag removed
+/// that: a late reply now carries a tag the client is not waiting for and is discarded.
+///
+/// So the first version of this constant after the tag was widened to 3 s - the shortest client
+/// deadline - on the reasoning that anything inside it was safe. It IS safe, and it is slower. A
+/// request held for 2.9 s is still served, by which time the client has given up at 3.0 s and
+/// re-sent; net-stack then does the work TWICE and the duplicate delays the copy that is actually
+/// wanted. The shell suite went from zero `net-stack unavailable` to one, with the same 174/0 either
+/// way - a regression only the before/after comparison showed.
+///
+/// The bound must therefore be well UNDER the shortest client deadline, not equal to it, so that a
+/// held request is either served promptly (which is the whole point) or abandoned early enough that
+/// only the re-send is served. Half a second against a three-second deadline leaves the client five
+/// times the hold to still be waiting.
 ///
 /// On a board whose cycle counter is not calibrated, `duration_cycles` floors to one quantum
 /// (`backlog/27`), so the budget collapses and every held request expires at once - the stack then
-/// behaves as it did before this existed, which is the right way for it to fail.
+/// behaves as it did before the stash existed, which is the right way for it to fail.
 const HOLD_MS: u64 = 500;
 
 impl Displaced {
-    fn new() -> Self { Displaced { n: 0, warned: false, held: None, expired_said: false, holding: false } }
+    fn new() -> Self {
+        Displaced {
+            n: 0,
+            warned: false,
+            held: [const { None }; STASH_N],
+            head: 0,
+            live: 0,
+            expired_said: false,
+        }
+    }
 
-    /// Mark the region where net-stack is working for ITSELF rather than for a client.
-    fn holding(&mut self, on: bool) { self.holding = on; }
-
-    /// A client request met during a driver conversation: hold it if that is safe, else drop it.
+    /// A client request met during a driver conversation: keep it, so the work is not lost.
     fn note(&mut self, ctx: &ServiceContext, m: &Message, badge: Option<(u64, u8)>, cap: CapHandle) {
         let pl = m.payload_bytes();
-        if self.holding && self.held.is_none() && pl.len() <= HELD_BYTES {
-            let mut h = Held { len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), body: [0u8; HELD_BYTES] };
-            h.body[..pl.len()].copy_from_slice(pl);
-            self.held = Some(h);
+        if pl.len() > HELD_BYTES {
+            // REFUSED, not truncated. See HELD_BYTES.
+            self.drop_one(ctx, cap, "it is larger than a stash slot");
             return;
         }
+        if self.live == STASH_N {
+            // Full. Evict the OLDEST - the client that has been waiting longest, and therefore the
+            // one likeliest to have given up already. Its capability goes back first (§8.5).
+            let old = self.head;
+            if let Some(h) = self.held[old].take() {
+                self.drop_one(ctx, h.reply, "the stash was full");
+            }
+            self.head = (self.head + 1) % STASH_N;
+            self.live -= 1;
+        }
+        let slot = (self.head + self.live) % STASH_N;
+        let mut h = Held {
+            len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), body: [0u8; HELD_BYTES],
+        };
+        h.body[..pl.len()].copy_from_slice(pl);
+        self.held[slot] = Some(h);
+        self.live += 1;
+    }
+
+    /// Take the oldest request still worth answering, for the serve loop.
+    ///
+    /// Entries are expired from the FRONT only, which is sound because they were kept in arrival
+    /// order: once the head is young enough, so is everything behind it.
+    fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
+            -> Option<(usize, Option<(u64, u8)>, CapHandle)> {
+        let budget = ctx.duration_cycles(HOLD_MS);
+        let now = ctx.read_tsc();
+        while self.live > 0 {
+            let h = match self.held[self.head].take() { Some(h) => h, None => return None };
+            self.head = (self.head + 1) % STASH_N;
+            self.live -= 1;
+            // wrapping_sub, so a counter that wraps while something is held reads as a small elapsed
+            // rather than an enormous one that expires a request which just arrived.
+            if now.wrapping_sub(h.at) >= budget {
+                ctx.remove_cap(h.reply);
+                self.n = self.n.saturating_add(1);
+                if !self.expired_said {
+                    self.expired_said = true;
+                    ctx.log_fmt(format_args!(
+                        "net-stack: a held client request waited more than {} ms and was \
+                         dropped - past that the client has re-sent, so answering it would only \
+                         delay the copy that is still wanted (said once)", HOLD_MS));
+                }
+                continue;
+            }
+            out[..h.len].copy_from_slice(&h.body[..h.len]);
+            return Some((h.len, h.badge, h.reply));
+        }
+        None
+    }
+
+    /// Reclaim a capability for a request that will not be answered, and report the first one.
+    fn drop_one(&mut self, ctx: &ServiceContext, cap: CapHandle, why: &str) {
         ctx.remove_cap(cap);
         self.n = self.n.saturating_add(1);
         if !self.warned {
             self.warned = true;
-            ctx.log("net-stack: a client asked while this service was mid-question to nic-driver and \
-                     could not be held - dropped, so it times out and retries rather than being \
-                     answered wrongly (said once)");
+            ctx.log_fmt(format_args!(
+                "net-stack: a client request met mid-question to nic-driver was dropped \
+                 because {} - it times out and retries (said once)", why));
         }
-    }
-
-    /// Take the held request, if there is one and it is still worth answering.
-    fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
-            -> Option<(usize, Option<(u64, u8)>, CapHandle)> {
-        let h = self.held.take()?;
-        // wrapping_sub, so a counter that wraps while something is held reads as a small elapsed
-        // rather than an enormous one that expires a request which just arrived.
-        if ctx.read_tsc().wrapping_sub(h.at) >= ctx.duration_cycles(HOLD_MS) {
-            ctx.remove_cap(h.reply);
-            self.n = self.n.saturating_add(1);
-            // SAY SO. A bound that is silently exceeded is the unbounded behaviour 26.6 forbids, and
-            // this one is reached by a real and unremarkable event: an SNTP server that does not
-            // answer costs this service its whole query budget, which is far longer than a client
-            // will wait. Without this line the client's timeout has no explanation anywhere.
-            if !self.expired_said {
-                self.expired_said = true;
-                ctx.log_fmt(format_args!(
-                    "net-stack: a held client request waited more than {} ms while this service \
-                     was busy with its own work - dropped, so it times out and retries rather \
-                     than being answered too late to be wanted (said once)", HOLD_MS));
-            }
-            return None;
-        }
-        out[..h.len].copy_from_slice(&h.body[..h.len]);
-        Some((h.len, h.badge, h.reply))
     }
 }
 
@@ -2339,12 +2393,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // It sits in the capless arm because that is precisely what identifies it. There is no
                         // reply to send, so there is no cap, and no legitimate request can be confused with it.
                         if req.payload_bytes().first() == Some(&11) {
-                            // THE ONE PLACE net-stack works UNASKED, and therefore the one place a displaced
-                            // client can be held rather than dropped: nobody is waiting on us for this, so a
-                            // request met during it has no re-sent copy in flight to collide with. Cleared
-                            // again the moment this arm is done, at every exit, so the safe behaviour is the
-                            // default everywhere else.
-                            pending.holding(true);
                             let mut configured_now = false;
                             // Only worth attempting with a resolved gateway - SNTP needs somewhere to send.
                             // `time` asks repeatedly while unsynced, so a refusal here costs nothing and the
@@ -2380,9 +2428,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             } else {
                                 ctx.log("net-stack: `time` asked for the clock - no route yet, will retry");
                             }
-                            // Our own work is over: anything displaced from here on belongs to a client we
-                            // are serving, and must be dropped rather than deferred.
-                            pending.holding(false);
                             continue;
                         }
                         if !capless_logged {

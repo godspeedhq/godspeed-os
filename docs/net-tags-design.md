@@ -426,3 +426,50 @@ dropping the message leaves an entry that the next socket `open` reads as its ow
 Fixed here. **Two more blind `while ctx.try_recv().is_some() {}` drains remain in the shell with the
 same hole**; they are on other paths and are left recorded rather than swept up in a networking
 change.
+
+---
+
+## 9. Phase 3 is built (2026-09-14), and this time it is measured both ways
+
+The bounded stash of §3 is in, unconditional, four slots. What makes it safe is §8: the client hop
+carries a tag, so a held request answered late arrives with a tag the client is not waiting for and
+is discarded instead of being read as the answer to its next question. That was the entire hazard
+§7.2 records, and it is gone.
+
+**The tag's discard path is now OBSERVED FIRING**, which closes the gap §8 left open. The shell log,
+during an ordinary suite run:
+
+```
+shell: discarded a net-stack reply for tag 3 while awaiting 4 (overtaken)
+net-stack: a held client request waited more than 500 ms and was dropped
+```
+
+So the correlation is not merely wired: it is doing the job, on the exact configuration that
+desynchronised without it. Zero occurrences of `gave a short reply`, the symptom §7.2 was killed by.
+
+### The bound is set by LATENCY, and that was got wrong first
+
+The first version after the tag widened `HOLD_MS` to 3 s - the shortest client deadline - reasoning
+that anything inside it was now safe. It is safe, and it is slower, and only a before/after
+comparison showed it:
+
+| | baseline (tag, no stash) | stash, hold 3 s | stash, hold 500 ms |
+|---|---|---|---|
+| `net: net-stack unavailable` | 0 | **1** | 0 |
+| tag discard fired | 0 | 2 | 1 |
+| `gave a short reply` | 0 | 0 | 0 |
+| shell suite | 174/0 | 174/0 | 174/0 |
+
+A request held for 2.9 s is still served, by which time the client gave up at 3.0 s and re-sent -
+net-stack then does the work twice and the duplicate delays the copy that is actually wanted. **The
+suite passes at 174/0 in all three columns**, so nothing but the comparison would have caught it.
+
+The rule, stated so it is not widened again: **the hold must be well UNDER the shortest client
+deadline, not equal to it**, so a held request is either served promptly or abandoned early enough
+that only the re-send is served.
+
+### What this does and does not unblock
+
+The background poll step is now unblocked in the sense that matters: a client met during unsolicited
+driver traffic is kept and served rather than lost. §4's list - the idle link tick, staying
+responsive during the DHCP dance, any periodic work at all - is buildable. None of it is built here.
