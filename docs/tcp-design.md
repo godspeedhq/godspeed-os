@@ -165,7 +165,7 @@ number. That is recorded here rather than discovered later.
 
 | board | ISA | NIC | small exchange | 2884 bytes |
 |-------|-----|-----|----------------|------------|
-| Raspberry Pi 2 | ARMv7 | LAN9514 over USB (dwc2) | 200 ms | 500 ms |
+| Raspberry Pi 2 | ARMv7 | LAN9514 over USB (dwc2) | 200 ms -> 205 ms | 500 ms -> **237 ms** |
 | Raspberry Pi 4 | AArch64 | GENET, on-SoC | 94 ms | 79 ms |
 | StarFive VisionFive 2 Lite | riscv64 | dwmac | 189 ms | 189 ms |
 | HP T630 | x86-64 | RTL8168 | 130 ms | 173 ms |
@@ -182,6 +182,39 @@ before this run.
 
 **ALL FIVE MACHINES PASS.** Four instruction sets, four ethernet controllers, and the same set of
 fixes on every one.
+
+### The protocol work, re-measured on the Pi 2 (2026-09-14)
+
+The second figure in each row above is the same board, same cable, same host, after the maximum
+segment size option, RFC 5681 congestion control and the persist timer landed. The small exchange is
+unchanged; the 2884-byte one halved.
+
+| | ARP | TCP | total |
+|---|---|---|---|
+| 10-byte echo | 158 ms | 47 ms | 205 ms |
+| 2884-byte reply | 222 ms | **15 ms** | 237 ms |
+
+**The TCP phase of the large transfer is 15 ms.** Both sides logged the same exchange, as always: the
+board reported `ok - 2884 byte(s)` and the host `[20] from 192.168.4.64:49153 - 3 byte(s): b'big'`
+followed by 2884 sent.
+
+**What this is evidence of, stated carefully.** The explanation that fits is the MSS option: this
+stack now advertises 1460 where it previously advertised nothing, so a peer that had to assume the
+RFC 1122 default of 536 sends roughly two segments instead of six - and on dwc2 every segment costs a
+USB round trip, which is why this board gains more from it than any other. That is INFERENCE from a
+timing change, not proof: neither log shows an option on the wire. What is proven separately is that
+the option is emitted at all, by `scripts/tcp_qemu_test.py`, which decodes it out of a packet capture
+QEMU writes outside the guest and asserts its value. The mechanism is pinned; the attribution of this
+particular speedup to it is not, and a capture on this board is what would close that.
+
+Congestion control cannot be responsible: the board SENDS 3 and 5 bytes in these exchanges, so the
+congestion window never binds. It is the inbound direction that got faster, which is governed by what
+we told the peer it could send us.
+
+Also verified here, and not reachable from any test that uses a network: `net-stack: tcp selftest
+PASS - 31 checks`, 47 ms on ARMv7. Fast retransmit, the persist timer and the congestion arithmetic
+react to loss, reordering and a shut window, none of which a healthy LAN or the QEMU backend
+produces, so they are proven against a synthesised peer at startup on every board instead.
 
 ### One cost this measured, recorded rather than smoothed over
 
