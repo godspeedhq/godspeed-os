@@ -636,6 +636,80 @@ def check_contract_authority(check, pins):
 
 
 # --------------------------------------------------------------------------------------------------
+# Commandment IX - thou shalt always plan for recovery, for thy service shall fail
+# --------------------------------------------------------------------------------------------------
+
+def check_peer_reacquire(check, pins):
+    """Commandment IX: a service that sends to a peer must be able to REACQUIRE that peer.
+
+    "A client whose dependency restarts must reacquire and retry, not crash." Every peer in this
+    system is restartable - that is the whole of Commandment V, and chaos kills them all (nothing
+    escapes, `II-chaos-exclusions`). So a send cap is a wasting asset: the instant its peer respawns
+    the generation moves and the cap is dead forever. `find_send_slot` never resolves a name; only an
+    explicit reacquisition does.
+
+    THE FAILURE IS SILENT, WHICH IS WHY A CHECK IS WORTH MORE HERE THAN A REVIEW. A stale cap does not
+    crash the holder and does not log. It returns `EndpointDead` to a caller that usually discards it
+    (trace and metric emission is `try_send` with the result dropped, deliberately, so the sink can
+    never slow the service down). The service goes on running, correct in every other respect, quietly
+    talking to nobody. The recorded fingerprint from the last time this bit: a driver "enumerated and
+    UP, with 0 register reads even ATTEMPTED".
+
+    WHAT IT CHECKS. For every service the system actually spawns with a declared send peer: does its
+    source contain any of the SDK's reacquisition entry points at all. That is a coarse question and
+    deliberately so - it is the difference between a service that HAS a recovery path and one that has
+    none, which is the difference the commandment's own last line draws ("if recovery cannot be
+    tested, it does not exist"). Whether an existing path is reached on the right error is review.
+
+    WHAT IT DOES NOT PROVE, said plainly: that the path is CORRECT. A reacquire must be driven by
+    `Err` (the send failed) and never by `Ok(None)` (a deadline passed) - retrying a live peer that is
+    merely slow is a different bug, and this check cannot see it. Nor does it look at anything the
+    dead instance handed over - a socket id, a file cap, a cached view - which paragraph two of the
+    commandment is about and which no pattern reaches.
+    """
+    apis = pins.get("reacquire_api", []) or []
+    debt = set(pins.get("peer_reacquire_debt", []) or [])
+    grants = _service_grants()
+    out, seen_debt, skipped = [], set(), []
+
+    for name in sorted(grants):
+        if not any(t.startswith("peer:") for t in grants[name]):
+            continue
+        sdir = os.path.join(ROOT, "services", name, "src")
+        if not os.path.isdir(sdir):
+            # One binary serving several names (`observe` / `observe-now` / `observe-live` differ only
+            # by probe_mode), or an example. Counted and reported rather than passed over in silence.
+            skipped.append(name)
+            continue
+        text = ""
+        for dirpath, _, filenames in os.walk(sdir):
+            for fn in filenames:
+                if fn.endswith(".rs"):
+                    with open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace") as fh:
+                        text += fh.read()
+        if any(api in text for api in apis):
+            continue
+        peers = ", ".join(sorted(t[5:] for t in grants[name] if t.startswith("peer:")))
+        if name in debt:
+            seen_debt.add(name)
+            continue
+        out.append(Violation(
+            f"services/{name}/src", 0,
+            f"'{name}' sends to [{peers}] and has NO reacquisition path. Every peer here is "
+            f"restartable and chaos kills them all, so this cap dies the first time its peer respawns "
+            f"- and the death is silent, because a discarded `try_send` error looks exactly like "
+            f"success. Reacquire by name on `Err` (never on `Ok(None)`, which is a deadline, not a "
+            f"dead peer)."))
+
+    for stale in sorted(debt - seen_debt):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"peer_reacquire_debt lists '{stale}', which now has a reacquisition "
+                             f"path or no peer. Delete the entry - a list not tightened when the debt "
+                             f"shrinks rots into a permanent exemption."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 # Commandment VII - thou shalt not introduce ambient authority
 # --------------------------------------------------------------------------------------------------
 
@@ -647,6 +721,22 @@ def _grant_decomment(text):
     exactly like authority.
     """
     return re.sub(r'//[^\n]*', '', text)
+
+
+def _peer_consts(sup_src):
+    """`{CONST_NAME: [peer, ...]}` for every `pub const NAME: &[&str] = ..` in the supervisor.
+
+    The body may be a `cfg!` chain choosing a different slice per board; every branch's peers are
+    collected, because the pin is a statement about what this service may be granted anywhere, not
+    about the machine that happened to run the check.
+    """
+    out = {}
+    for m in re.finditer(r'pub const ([A-Z][A-Z0-9_]*)\s*:\s*&\[&str\]\s*=(.*?);',
+                         sup_src, re.S):
+        slices = re.findall(r'&\[([^\]]*)\]', m.group(2))
+        out[m.group(1)] = sorted({q for sl in slices
+                                  for q in re.findall(r'"([a-z0-9-]+)"', sl)})
+    return out
 
 
 def _service_grants():
@@ -683,10 +773,33 @@ def _service_grants():
         for hw in re.findall(r'hwclass::([A-Za-z_0-9]+)', span):
             add(name, f"hw:{hw}", sup_path)
         # The peer slice is the first `&[..]` of the row: (name, image, flags, mem, core, PEERS, ..).
+        #
+        # OR A NAMED CONSTANT, and missing that was a real blind spot in this check for two days.
+        # `nic-driver` and `block-driver` pass `board::NIC_PEERS` / `board::STORAGE_PEERS`, which are
+        # `pub const .. : &[&str]` chosen by `cfg!` per board. The `&[..]` pattern does not match an
+        # identifier, so those two rows silently contributed NO peers - the check reported a pass over
+        # a grant it could not see, which is the exact defect it exists to catch, in its own code.
+        #
+        # A constant resolves to the UNION of every branch's peers. That is the right thing to pin for
+        # authority: it is what a service may be granted on SOME board, and a per-arch pin would make
+        # this file's answer depend on which machine ran it.
         peers = re.search(r'&\[([^\]]*)\]', span)
         if peers:
             for peer in re.findall(r'"([a-z0-9-]+)"', peers.group(1)):
                 add(name, f"peer:{peer}", sup_path)
+        else:
+            # Look for a KNOWN peer constant BY NAME. An earlier version took the first all-caps
+            # identifier in the row and got `SPAWN_FLAG_REQ_RECV` - the FLAGS field, which comes
+            # before the peers field - so every such row resolved to a flag instead of its peers.
+            consts = _peer_consts(sup)
+            hit = next((c for c in consts if re.search(r'\b' + c + r'\b', span)), None)
+            if hit:
+                for peer in consts[hit]:
+                    add(name, f"peer:{peer}", sup_path)
+            elif (named := re.search(r'\b([A-Z][A-Z0-9_]*_PEERS)\b', span)):
+                # LOUD, never silent. An unresolvable peer slot becomes a token that must be pinned,
+                # so the gap is visible in the baseline instead of reading as "no peers".
+                add(name, f"peer-unresolved:{named.group(1)}", sup_path)
 
     # ---- what the kernel still grants by name ----------------------------------------------------
     ker_path = "kernel/src/task/mod.rs"
@@ -1100,6 +1213,22 @@ CHECKS = [
              dict(why="a contract claiming authority it is not granted must be caught",
                   pins={"contract_privileges": {"log_write": "SERVICE_CONTROL"}}, expect=True),
              dict(why="the real map against the real tree must pass", pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="IX-peer-reacquire", commandment="IX",
+         title="a service that sends to a peer can reacquire it after the peer restarts",
+         kind="custom", fn=check_peer_reacquire,
+         scope="every spawned service with a `peer:` grant, against its own services/<name>/src",
+         proves="no service holds a send cap it has no way to refresh - which matters because every "
+                "peer is restartable, chaos kills them all, and a stale cap fails SILENTLY",
+         does_not_prove="that an existing path is CORRECT. A reacquire must be driven by `Err` (the "
+                        "send failed) and never by `Ok(None)` (a deadline), and this cannot see the "
+                        "difference. Nor does it look at what the dead instance handed over - a "
+                        "socket id, a file cap, a cached view - which is paragraph two of the "
+                        "commandment and reaches no pattern",
+         probes=[
+             dict(why="a service with no recovery path must be caught",
+                  pins={"reacquire_api": []}, expect=True),
+             dict(why="the real API list against the real tree must pass", pins=None, expect=False),
          ]),
     dict(nature="rule", id="VII-service-grants", commandment="VII",
          title="what each service may reach is pinned, not just that it has a name",

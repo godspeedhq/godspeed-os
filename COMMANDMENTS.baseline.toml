@@ -261,6 +261,27 @@ contract_authority_debt = [
   # precedent.
 ]
 
+# Commandment IX - what counts as REACQUIRING a peer. Read by `IX-peer-reacquire`.
+# The SDK's five entry points. A sixth added to the SDK should be added here deliberately, because
+# widening this list is how a check stops catching things.
+reacquire_api = [
+  "reacquire_by_name", "reacquire_cap", "reacquire_cap_detail",
+  "acquire_send_cap", "acquire_send_grant_cap",
+]
+
+# Services that send to a peer and have NO reacquisition path, as of 2026-09-14. SHRINK ONLY, and a
+# stale entry is itself a violation.
+#
+# All five send only to `events`, as fire-and-forget trace and metric emission (`try_send`, result
+# deliberately discarded so the sink can never slow a driver down). So the consequence is not a hang:
+# it is that after the first time chaos kills `events` - which it does, since nothing escapes - these
+# five stop emitting traces PERMANENTLY and say nothing about it. Observability that quietly switches
+# itself off is the §11.4 argument one layer up: logs stay on the kernel floor precisely so that
+# watching a failure never depends on a service that can fail, and traces do not have that protection.
+#
+# Recorded rather than fixed because the fix is Rust in five services, and that is the operator's
+# call. Each is small: reacquire `events` on `Err` from the emit path.
+peer_reacquire_debt = ["console", "dwc2", "ehci", "hw-enumerator", "xhci"]
 [kernel.kernel_support_roles]
 arch-layer       = "§4.1 architecture layer; §18.1 (the unsafe boundary)"
 syscall-entry    = "§8.2 - the entry to the six, not a seventh"
@@ -569,7 +590,7 @@ SpawnImage               = 52
 # shell's trust perimeter, because keystrokes are commands).
 [kernel.service_grants]
 "asker" = ["peer:reply-server"]
-"block-driver" = ["hw:pci"]
+"block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
 "chaos" = ["peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "console" = ["hw:FRAMEBUFFER", "peer:events"]
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
@@ -580,7 +601,7 @@ SpawnImage               = 52
 "greet" = ["peer:pong"]
 "hw-enumerator" = ["peer:events", "priv:PCI_CFG"]
 "net-stack" = ["peer:events", "peer:nic-driver", "peer:time", "priv:RESOURCE_MINT", "priv:SET_CLOCK"]
-"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci"]
+"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events"]
 "observe" = ["priv:INTROSPECT"]
 "observe-live" = ["priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
