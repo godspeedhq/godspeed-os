@@ -860,12 +860,14 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
     let start = t.now_ms(ctx).unwrap_or(0);
     let deadline = start + budget_ms;
 
+    t.stat_seen = 0; t.stat_matched = 0; t.stat_sent = 0;
     let i = match t.connect(ctx, 1, dst, dport) { Some(i) => i, None => return Err(tcp::Fault::None) };
 
     // The opening SYN. Sent through the same path every other frame uses, and its reply may already
     // carry the SYN-ACK - nic-driver answers a TX with whatever it has received.
     let n = t.syn_frame(ctx, net, i, &mut frame);
-    if n > 0 { feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS)); }
+    if n > 0 { t.stat_sent = t.stat_sent.saturating_add(1);
+               feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS)); }
 
     let mut wrote = false;
     let mut got = 0usize;
@@ -886,6 +888,7 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
         // Emit. `poll_one` returns at most one frame, so this is bounded by MAX_CONNS trivially.
         let n = t.poll_one(ctx, net, i, &mut frame);
         if n > 0 {
+            t.stat_sent = t.stat_sent.saturating_add(1);
             feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS));
             empty = 0;
         } else {
@@ -989,6 +992,7 @@ fn feed_frame(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, f: &[u8]) 
     if n > 0 {
         // The answer (an ACK, or a RST). Its own reply may carry the next segment, so that one frame
         // is fed back - ONE level, deliberately, rather than recursing at a remote peer's pace.
+        t.stat_sent = t.stat_sent.saturating_add(1);
         if let Some(m) = nic_req(ctx, &Message::from_bytes(&out[..n]), LINK_SECS) {
             let f2 = m.payload_bytes();
             if f2.len() >= tcp::HDR {
@@ -2331,6 +2335,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                              ({} retransmission(s)); no fault was recorded, so the budget expired",
                             dip[0], dip[1], dip[2], dip[3], dport,
                             tcpst.last_state.name(), tcpst.last_retx));
+                        ctx.log_fmt(format_args!(
+                            "net-stack: tcp frames - {} offered to the state machine, {} matched a \
+                             connection, {} sent",
+                            tcpst.stat_seen, tcpst.stat_matched, tcpst.stat_sent));
                         0
                     }
                     Ok(got) => {

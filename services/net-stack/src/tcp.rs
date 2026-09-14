@@ -408,6 +408,16 @@ pub struct Tcp {
     /// empty reply to a client and completely different faults to diagnose.
     pub last_state: State,
     pub last_retx: u8,
+    /// Frames handed to `on_frame` during the last transaction, and how many of those it RECOGNISED
+    /// as a segment for one of our connections. The gap between the two is the whole diagnosis when a
+    /// connection stalls: frames arriving but none matching means the peer is talking to a
+    /// four-tuple we do not have.
+    pub stat_seen: u16,
+    pub stat_matched: u16,
+    /// Frames this table asked to be TRANSMITTED. If a connection reaches Established and this is
+    /// still only the SYN count, the acknowledgement was never built - which is a different fault
+    /// from one that was built and lost.
+    pub stat_sent: u16,
 }
 
 impl Tcp {
@@ -420,6 +430,7 @@ impl Tcp {
             warned_no_clock: false,
             last_state: State::Closed,
             last_retx: 0,
+            stat_seen: 0, stat_matched: 0, stat_sent: 0,
         }
     }
 
@@ -603,11 +614,16 @@ impl Tcp {
     /// "make our own progress" separable, and means a flood of inbound segments cannot make this
     /// function do unbounded work.
     pub fn on_frame(&mut self, ctx: &ServiceContext, net: &Net, f: &[u8], out: &mut [u8]) -> usize {
+        self.stat_seen = self.stat_seen.saturating_add(1);
         let seg = match parse(f) { Some(s) => s, None => return 0 };
         if seg.dst_ip != net.our_ip { return 0; }
         let now = self.now_ms(ctx).unwrap_or(0);
 
         let (lp, rip, rp) = (seg.dst_port, seg.src_ip, seg.src_port);
+        // Counted BEFORE the borrow: `find` takes `&mut self`, so the counter cannot be touched
+        // while `c` is alive. Asking first and incrementing on the answer keeps both.
+        let matched = self.find(lp, &rip, rp).is_some();
+        if matched { self.stat_matched = self.stat_matched.saturating_add(1); }
         let c = match self.find(lp, &rip, rp) { Some(c) => c, None => return 0 };
 
         // A RST ends the connection, and the reason is kept. Anything else about this segment is
