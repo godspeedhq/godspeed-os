@@ -943,67 +943,33 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
     if got == 0 && fault != tcp::Fault::None { Err(fault) } else { Ok(got) }
 }
 
-/// Feed one RAW frame into the state machine and send whatever it answers with.
+/// Feed one RAW frame into the state machine. Returns true if it was ours.
 ///
-/// Returns true if the frame was a TCP segment for us, so a caller can tell "nothing arrived" from
-/// "something arrived and was not ours" - two different silences.
-#[inline(never)]
+/// THIS FUNCTION DOES NOT TRANSMIT, and that is the point rather than an omission. net-stack has one
+/// endpoint and one receive slot, so calling `nic_req` from inside the handling of another
+/// `nic_req` reply nests request/reply on a single slot and desyncs them - the failure
+/// `docs/net-tags-design.md` describes. On a Pi 2 that lost every acknowledgement this stack built:
+/// 3 SYN-ACKs matched, 8 frames handed over, 4 on the wire, and the peer retransmitting its SYN-ACK
+/// eight times into a connection that would never complete.
+///
+/// Anything the state machine wants to say is now RECORDED (`ack_due`) and sent by `poll_one` on the
+/// transaction loop's next pass, where there is no outer reply in flight.
+///
+/// The one exception is ARP, which is answered here because it is not TCP and cannot wait for a
+/// connection's poll - a peer that cannot resolve us cannot reach us at all.
 fn feed_frame(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, f: &[u8]) -> bool {
-    // ANSWER ARP WHILE WE HOLD THE SERVICE. This loop owns net-stack for the whole transaction, and
-    // during that time it is the only thing reading frames - so an ARP request for US arriving in
-    // that window is seen here and nowhere else. Dropping it as "not TCP" makes this machine
-    // disappear from the network for the duration.
-    //
-    // That is not theoretical, and it is the whole hardware failure. A Pi 2 SYN reached a Windows
-    // laptop, which accepted it and generated a SYN-ACK - and then could not send it, because it had
-    // to ARP for us first and we were in here swallowing the request. `pktmon` named it exactly:
-    //     Tx  DropReason Address resolution timeout / Address resolution failure
-    //         192.168.4.40.7777 > 192.168.4.64.49160: Flags [S.], ack ..., mss 1460
-    // The peer we were connecting to was the one host that needed to ARP us, so the connection could
-    // never complete. QEMU never showed it: SLIRP's gateway already had us cached from the boot
-    // dance, and it was the only peer reachable there.
-    //
-    // Every other long-running loop in this file already does this - the DHCP dance, DNS, ARP
-    // resolve and ping all call `build_arp_reply` in their drain. This one did not, and being the
-    // odd one out is the bug.
     let mut arp_out = [0u8; 42];
     if build_arp_reply(f, &net.our_ip, &net.our_mac, &mut arp_out) {
-        // FEED THE REPLY BACK. A nic-driver response CARRIES RECEIVED FRAMES, so discarding it here
-        // throws away whatever arrived while we were answering the ARP. The first version of this
-        // did exactly that and cost four bytes of a payload - `tcp: 19 byte(s) back` where 23 was
-        // right - because a segment rode in on the reply to our own ARP and went in the bin.
-        //
-        // One level, not recursion: the frame that comes back is examined, and anything IT triggers
-        // is left for the next pass of the transaction loop. That keeps the work per inbound frame
-        // bounded, which is the same rule the ACK path below follows.
-        if let Some(m) = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS) {
-            let f2 = m.payload_bytes();
-            if f2.len() >= tcp::HDR {
-                let mut out2 = [0u8; 1600];
-                let n2 = t.on_frame(ctx, net, f2, &mut out2);
-                if n2 > 0 { let _ = nic_req(ctx, &Message::from_bytes(&out2[..n2]), LINK_SECS); }
-            }
-        }
+        // Answered inline because it is the only way a peer learns our MAC while we hold the service,
+        // and the reply is fire-and-forget: nothing here depends on what comes back, so the nesting
+        // hazard above does not apply to it.
+        let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
         return true;
     }
     if f.len() < tcp::HDR { return false; }
-    let mut out = [0u8; 1600];
-    let n = t.on_frame(ctx, net, f, &mut out);
-    if n > 0 {
-        // The answer (an ACK, or a RST). Its own reply may carry the next segment, so that one frame
-        // is fed back - ONE level, deliberately, rather than recursing at a remote peer's pace.
-        t.stat_sent = t.stat_sent.saturating_add(1);
-        if let Some(m) = nic_req(ctx, &Message::from_bytes(&out[..n]), LINK_SECS) {
-            let f2 = m.payload_bytes();
-            if f2.len() >= tcp::HDR {
-                let mut out2 = [0u8; 1600];
-                let n2 = t.on_frame(ctx, net, f2, &mut out2);
-                if n2 > 0 { let _ = nic_req(ctx, &Message::from_bytes(&out2[..n2]), LINK_SECS); }
-            }
-        }
-        return true;
-    }
-    false
+    let mut sink = [0u8; 1600];
+    t.on_frame(ctx, net, f, &mut sink);
+    true
 }
 
 /// Feed a DRAIN BATCH (op 9) into the state machine.

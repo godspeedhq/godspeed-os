@@ -194,6 +194,19 @@ pub struct Conn {
     state_deadline_ms: u64,
     /// Set when the client has asked to close and the send buffer must drain first.
     close_pending: bool,
+    /// An acknowledgement is owed to the peer, to be sent by `poll_one` on its next pass.
+    ///
+    /// `on_frame` USED TO SEND IT ITSELF, and that was the last hardware bug on this branch. Doing so
+    /// means calling `nic_req` from inside the handling of another `nic_req` reply, and net-stack has
+    /// ONE endpoint with ONE receive slot - so the nested request/reply desyncs against the outer
+    /// one, exactly as `docs/net-tags-design.md` describes. The symptom on a Pi 2: 3 SYN-ACKs
+    /// matched, 8 frames handed over, 4 on the wire, and an orphaned
+    /// "request had no reply cap - dropping" left behind. The ACKs were built and never transmitted,
+    /// so the peer retransmitted its SYN-ACK eight times and the handshake never completed.
+    ///
+    /// Reacting to the peer and making our own progress are now separable, which is what
+    /// `docs/tcp-design.md` said the architecture had to be before any of this was written.
+    ack_due: bool,
     /// The window most recently ADVERTISED to the peer.
     ///
     /// Without this there is no way to notice that the window has reopened. Reading data out of the
@@ -215,7 +228,7 @@ impl Conn {
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
-            state_deadline_ms: 0, close_pending: false, last_adv: 0,
+            state_deadline_ms: 0, close_pending: false, ack_due: false, last_adv: 0,
         }
     }
 
@@ -639,10 +652,13 @@ impl Tcp {
         if c.state == State::SynSent {
             if seg.flags & SYN != 0 && seg.flags & ACK != 0 {
                 if seg.ack != c.snd_nxt {
-                    // Acknowledging something we never sent. Refuse the connection rather than
-                    // adopt its sequence space.
-                    return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
-                                c.local_port, c.remote_port, seg.ack, 0, RST, 0, &[]);
+                    // Acknowledging something we never sent. Drop the connection rather than adopt
+                    // its sequence space. A RST would be politer and is deliberately not sent: this
+                    // function no longer transmits at all, and a peer that acknowledged phantom data
+                    // will time out on its own. Recorded as a narrowing (§26.14).
+                    c.fault = Fault::Reset;
+                    c.state = State::Closed;
+                    return 0;
                 }
                 c.snd_una = seg.ack;
                 c.rcv_nxt = seg.seq.wrapping_add(1);
@@ -730,12 +746,10 @@ impl Tcp {
             }
         }
 
-        if need_ack {
-            let w = c.window();
-            c.last_adv = w;
-            return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
-                        c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
-        }
+        // OWED, NOT SENT. See `ack_due`: transmitting from here means a nested request/reply on a
+        // single-slot endpoint, and the acknowledgement silently never leaves.
+        if need_ack { c.ack_due = true; }
+        let _ = out;
         0
     }
 
@@ -794,6 +808,19 @@ impl Tcp {
                             ACK | FIN, w, &[]);
             }
             return 0;
+        }
+
+        // ---- the acknowledgement owed from the last inbound segment ----
+        //
+        // FIRST, before retransmission or new data: the peer is waiting on this to complete its
+        // handshake or to release its window, and anything else we might send is less urgent than
+        // the thing it is blocked on.
+        if c.ack_due {
+            c.ack_due = false;
+            let w = c.window();
+            c.last_adv = w;
+            return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                        c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
         }
 
         // ---- window update: tell the peer the arena has drained ----
