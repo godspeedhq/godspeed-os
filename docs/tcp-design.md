@@ -161,6 +161,52 @@ number. That is recorded here rather than discovered later.
 
 # Where this stands (2026-09-14)
 
+## HARDWARE VERIFIED - Raspberry Pi 2, 2026-09-14
+
+A Pi 2 (ARMv7, LAN9514 ethernet over USB/dwc2) completed TCP transactions across a real LAN to a
+Windows peer. Both ends logged the same exchange, which is stronger than either log alone:
+
+    board    net-stack: tcp 192.168.4.40 on-link at 44:1c:a8:e3:72:61 - direct
+             net-stack: tcp 192.168.4.40:7777 ok - 2884 byte(s)
+             tcp: 2884 byte(s) back
+             BIG:0123456789abcdef...
+
+    peer     [7] from 192.168.4.64:49152 - 5 byte(s): b'hello'
+             [8] from 192.168.4.64:49153 - 3 byte(s): b'big'
+
+Handshake, data in both directions, 2884 bytes reassembled across several segments with window
+updates, and an orderly close. 0.2 s for the small exchange, 0.5 s for the large one.
+
+### Four bugs QEMU could not have found
+
+Every one of these passed the full QEMU suite and failed on hardware, and the reason is the same in
+each case: SLIRP's only reachable peer IS the gateway, it answers in under a millisecond, and it
+already knows our MAC.
+
+| bug | why QEMU was blind to it |
+|-----|--------------------------|
+| no window update when the arena drained | the reply fitted the buffer, so the window never shut |
+| the transaction loop spun through its budget in 0.4 s | a SLIRP peer answers faster than the loop can spin |
+| ARP requests swallowed during a transaction | the gateway already had us cached from the boot dance |
+| every frame addressed to the GATEWAY | the peer and the gateway are the same host there |
+
+The last one is the sharpest: on SLIRP the right answer and the wrong one are byte-identical, so no
+amount of QEMU testing could distinguish them. It took a second machine on a real subnet.
+
+### And the lesson about diagnosis
+
+Five theories were advanced from outside the machine - gateway MAC, IP identification and DF flags,
+Malwarebytes, Windows Firewall, and gateway MAC again - and all five were wrong. Each was killed by a
+measurement that took minutes: verifying checksums out of the capture, a pktmon trace naming
+`Address resolution failure` in one line, and a transmit journal showing `SSSADDDD` with every frame
+accepted by the driver.
+
+Five instruments misreported along the way, three of them written for this very investigation: an
+echo server whose log was block-buffered, a capture script that read UTF-16 as ASCII, `netstat -s`
+counters swamped by 34,000 packets of ordinary traffic, a QEMU test run against a stale image, and a
+harness that closed its socket before the line it was asserting on arrived. **An instrument is a
+claim, and it needs checking like any other.**
+
 ## Working, and verified on the wire
 
 `tcp <ip> <port> [text]` performs a complete TCP transaction. `scripts/tcp_qemu_test.py` boots QEMU,
