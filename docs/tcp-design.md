@@ -169,6 +169,7 @@ number. That is recorded here rather than discovered later.
 | Raspberry Pi 4 | AArch64 | GENET, on-SoC | 94 ms | 79 ms |
 | StarFive VisionFive 2 Lite | riscv64 | dwmac | 189 ms | 189 ms |
 | HP T630 | x86-64 | RTL8168 | 130 ms | 173 ms |
+| Dell Wyse 5070 | x86-64 | RTL8168 | 142 ms | 79 ms + 1.39 s of ARP |
 
 **Every board after the first worked FIRST TIME, with no new bugs.** That is the portability
 claim earning its keep: every one of the four hardware-only failures was in `net-stack`, which is
@@ -179,7 +180,17 @@ The T630 is the second-sharpest piece of evidence after the VisionFive: its RTL8
 QEMU cannot exercise at all (it emulates an e1000), so that path had never carried a TCP segment
 before this run.
 
-The Dell Wyse 5070 is the one board still untested.
+**ALL FIVE MACHINES PASS.** Four instruction sets, four ethernet controllers, and the same set of
+fixes on every one.
+
+### One cost this measured, recorded rather than smoothed over
+
+On the Wyse the large transfer took 1.47 s, of which **1.39 s was the ARP resolve** and 79 ms was the
+TCP exchange. The on-link lookup runs once per transaction and can be slow on a cold cache, so it
+dominates a short connection. It is correctness-neutral - the alternative is the gateway-routing bug
+this replaced - but a cache keyed on the destination would remove it, and a background engine would
+pay it once per peer rather than once per request. Not built, because nothing yet needs it (§26.2);
+recorded so the next person reading a 1.5-second `tcp` does not go looking for it in the protocol.
 
 The VisionFive is the sharpest of the three as evidence, because its networking has a history of
 board-specific trouble (`project_riscv64_dwmac_unicast_loss`) and this needed none of it.
