@@ -347,3 +347,67 @@ BLOCKS THE SERVE LOOP, which `docs/tcp-design.md` already quotes this service's 
 ("making the dance incremental so net-stack answers THROUGHOUT it is the real fix, and that is a
 rework of the state machine rather than a constant"). The hold covers the common case and reports the
 uncommon one; it does not pretend to have fixed the loop.
+
+---
+
+## 8. The CLIENT hop is tagged now (2026-09-14)
+
+§7.3 named correlation on the net-stack <-> client hop as the real prerequisite for deferring a
+request at all. It is built.
+
+**One byte at offset 0 of every name-addressed request, echoed back and never interpreted.** It is
+the same wire change this document describes for the driver hop, applied to the other side of the
+service - and the reason it could be done in one pass, where that one cannot, is the shape `fs`
+found:
+
+- **net-stack strips the tag in ONE place** (the serve loop, right after the badge decision) and
+  **echoes it in ONE place** (`Reply::send`). Not one of the thirteen op arms knows the tag exists.
+- **the shell strips it in ONE place** (`ns_take_tagged`), so every call site still reads
+  `r.payload_bytes()` with byte 0 meaning exactly what it always meant.
+
+That is why the forty-edit-point warning in §3 does not apply here. There is no per-op shift to get
+wrong, because no op moved. `fs`'s own comment says it plainly: *"the tag is handled here and nowhere
+else, which is why adding it did not touch a single arm."*
+
+### What is deliberately NOT tagged, and why
+
+- **Badged socket invocations.** A capability invoking its owner; the badge already names the
+  socket, so there is nothing to correlate. `fs` makes the identical exception for file caps.
+- **The capless clock nudge (op 11).** One-way, from `time`, with no reply cap and no reply. It is
+  identified precisely BY having no reply cap, and it is handled before the strip.
+- **The nic-driver hop.** A different channel with a different problem; `net_query` takes the tag as
+  an `Option` and its nic-driver callers pass `None`.
+
+### Why the type, not the byte
+
+Thirteen places in net-stack answer a client. Hand-writing the tag at each is the "plausible-looking
+wrong value, not a crash" failure this document warns about: a missed site still compiles, still
+sends, and is one byte out forever. So the reply capability was given a TYPE - `Reply { cap, tag }` -
+and every one of those sites became a build error until converted. The compiler enumerated them
+instead of a person. On the shell side the same job was done by promoting the request helpers to
+`&ShellCtx`, which the compiler then propagated up the call tree through six more functions.
+
+The tag counter lives in `ShellCtx` beside `fs_tag`, NOT in a `static`: audit C6-1 had to undo
+exactly that mistake on the fs channel, and Invariant 9 forbids the unowned global it would be.
+
+### What this unblocks, and what it does not
+
+It removes the blocker §7.3 records. A request can now be deferred and answered late, because the
+client can tell a late answer from its own. **The stash, the background poll and listen/accept are
+now unblocked work rather than blocked work** - none of them is built by this change.
+
+**It is proven wired, and not proven to fire.** Matching is mandatory - a reply is returned only if
+its tag matches - so if net-stack were not echoing correctly, every network command would time out
+rather than quietly work; 174/0 with `net`, `net dns`, `net arp`, `net renew`, `sock`, `tcp`, `ping`
+and `date sync` all passing is therefore positive evidence the byte makes the round trip. What has
+NOT been observed is the discard path actually firing, because that needs a real desync to provoke
+and nothing provokes one on demand. Recorded rather than claimed (§26.7).
+
+### One thing found on the way
+
+`net_query`'s pre-send drain discarded messages without reclaiming their embedded capabilities. That
+is SEC-35 one channel over: the kernel has already installed the cap and queued its slot, so
+dropping the message leaves an entry that the next socket `open` reads as its own - the `fcap` bug.
+Fixed here. **Two more blind `while ctx.try_recv().is_some() {}` drains remain in the shell with the
+same hole**; they are on other paths and are left recorded rather than swept up in a networking
+change.

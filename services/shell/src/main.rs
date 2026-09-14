@@ -302,6 +302,11 @@ pub struct ShellCtx {
     inner: ServiceContext,
     /// The fs request correlation tag (see `next_fs_tag`).
     fs_tag: core::cell::Cell<u8>,
+    /// The net-stack request correlation tag (see `next_net_tag`). A SECOND counter, not a shared
+    /// one: the two channels are independent, and a tag only has to be unique against the other
+    /// requests on its own channel. Sharing one would also make an fs request advance the net tag,
+    /// which is a coupling with no benefit.
+    net_tag: core::cell::Cell<u8>,
     /// Deepest `pipe_run` frame seen so far, in bytes. OWNED here rather than kept in a module-level
     /// `static`, which is the anonymous singleton Invariant 9 forbids - the same mistake that had to be
     /// undone in `xhci` an hour ago, and one this file already avoids for `fs_tag`.
@@ -321,6 +326,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.trace_as("shell");
     // `fs` requests carry a correlation tag at byte 0 (`req[0] = tag`), so the opcode is at byte 1.
     ctx.trace_op_at("fs", 1);
+    // Same for net-stack, which now carries a tag at byte 0 too - without this the trace ring would
+    // read the TAG as the opcode and label every net request by a number that changes every time.
+    ctx.trace_op_at("net-stack", 1);
     // C6-1: wrap the SDK context in the shell's own, which owns the fs correlation tag. Everything
     // below still calls `ctx.log(...)` unchanged - `ShellCtx` derefs to `ServiceContext` - and deref
     // coercion lets it pass to anything expecting the SDK type. The tag now has an owner with the same
@@ -328,6 +336,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let ctx = ShellCtx {
         inner: ctx,
         fs_tag: core::cell::Cell::new(0),
+        net_tag: core::cell::Cell::new(0),
         pipe_stack_hwm: core::cell::Cell::new(0),
     };
     let ctx = &ctx;
@@ -5314,18 +5323,13 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // in service_main for what that cost.
         clock_floor_seed(ctx);
         out.line_fmt(ctx, format_args!("Asking the network for the time now (SNTP)... (q aborts)"));
-        let msg = Message::from_bytes(&[10u8]);
         // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
         // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
         // and RE-SENDING would queue a second full sync behind the first, and net-stack's serve loop is
         // single-threaded - so every other client op (net/ping/dns) would block behind our own retry.
         // `net renew`, the sibling that also triggers the boot dance, uses 30 s for exactly this reason.
         const SYNC_SECS: i64 = 30;
-        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, SYNC_SECS) {
-            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") =>
-                ctx.request_with_reply_abortable("net-stack", &msg, SYNC_SECS),
-            other => other,
-        };
+        let outcome = ns_abortable(ctx, &[10u8], SYNC_SECS);
         // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
         if let ReqOutcome::Aborted = outcome {
             out.line_fmt(ctx, format_args!("date sync: aborted"));
@@ -5489,7 +5493,7 @@ fn cmd_wait(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
 /// `ping [bytes N] [count N] <ip>` - a Windows-style continuous ICMP echo to a raw IPv4, via net-stack.
 /// One `Reply from ...` line per echo (round-trip time + TTL), `q` quits, then a statistics summary.
 /// `count N` sends N and stops; `bytes N` sets the ICMP data size (default 32). No DNS - raw IP only.
-fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let usage = "usage: ping [bytes N] [count N] <ip>   e.g. ping 8.8.8.8   ping bytes 64 192.168.4.1   (q quits)";
     let mut bytes: usize = 32;
     let mut count: Option<u32> = None;
@@ -5515,7 +5519,6 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     };
     let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
     let bl = (b as u16).to_le_bytes();
-    let msg = Message::from_bytes(&[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]]);
     // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
     if count.is_none() {
         out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data (press q to quit):", ip[0], ip[1], ip[2], ip[3], b));
@@ -5529,10 +5532,7 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
         sent += 1;
         // ABORTABLE per echo, so q quits DURING the wait for a reply, not only in the pace between echoes
         // (a blocking request_with_reply here left q feeling unresponsive). Reacquire once on a timeout.
-        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, 5) {
-            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &msg, 5),
-            other => other,
-        };
+        let outcome = ns_abortable(ctx, &[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]], 5);
         match outcome {
             ReqOutcome::Reply(r) => {
                 let p = r.payload_bytes();
@@ -5611,7 +5611,7 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
 /// whether frames are sitting in the ring.
 fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     let req = Message::from_bytes(&[5u8]);
-    let reply = match net_query(ctx, "nic-driver", &req, 3) {
+    let reply = match net_query(ctx, "nic-driver", &req, 3, None) {
         NetQ::Reply(r) => r,
         NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
         NetQ::Timeout => { ctx.console_writeln("net: nic-driver did not answer the register dump"); return Ok(()); }
@@ -5664,7 +5664,7 @@ fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError>
     Ok(())
 }
 
-fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg == "dns" {
         ctx.console_writeln("net: usage: net dns <hostname>  (e.g. net dns example.com)");
@@ -5706,13 +5706,9 @@ fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellEr
 
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
-fn net_renew(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to abort)"));
-    let req = Message::from_bytes(&[8u8]);
-    let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 30) {
-        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &req, 30),
-        other => other,
-    };
+    let outcome = ns_abortable(ctx, &[8u8], 30);
     match outcome {
         ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
@@ -5734,18 +5730,14 @@ fn net_renew(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 }
 
 /// `net arp <ip>` - resolve one host's hardware address by ARP (net-stack op 6).
-fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), ShellError> {
+fn net_arp(ctx: &ShellCtx, ip_str: &str, out: &mut Out) -> Result<(), ShellError> {
     let ip = match parse_ipv4(ip_str) {
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
     out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to abort)", ip[0], ip[1], ip[2], ip[3]));
-    let req = Message::from_bytes(&[6, ip[0], ip[1], ip[2], ip[3]]);
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
-    let outcome = match ctx.request_with_reply_abortable("net-stack", &req, 8) {
-        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &req, 8),
-        other => other,
-    };
+    let outcome = ns_abortable(ctx, &[6, ip[0], ip[1], ip[2], ip[3]], 8);
     match outcome {
         ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
@@ -5765,15 +5757,11 @@ fn net_arp(ctx: &ServiceContext, ip_str: &str, out: &mut Out) -> Result<(), Shel
 /// `net scan` - ARP-sweep the local /24 (derived from our own IP) and list the hosts that answer.
 /// ARP-based, so it is fast and LAN-reliable. net-stack does the whole sweep in one op (op 7) and
 /// returns a 32-byte up-bitmap - one round trip per host, not a per-host poll from the shell.
-fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+fn net_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // Reacquire net-stack by name on a clean miss/timeout - it may have come up late (its boot dance
     // stalls ~26s on a dead link) and not be in our cap cache yet, exactly as net_arp does. Without this,
     // running `net scan` before any other net command reported a bogus "net-stack unavailable".
-    let status0 = Message::from_bytes(&[0u8]);
-    let our0 = match ctx.request_with_reply_abortable("net-stack", &status0, 5) {
-        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &status0, 5),
-        other => other,
-    };
+    let our0 = ns_abortable(ctx, &[0u8], 5);
     let our = match our0 {
         ReqOutcome::Reply(r) => { let p = r.payload_bytes(); if p.len() >= 4 { [p[0], p[1], p[2], p[3]] } else { [0u8; 4] } }
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
@@ -5786,8 +5774,7 @@ fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // host's wait is itself abortable, so q lands instantly, and responders print as they are found.
     let mut found = 0u32;
     for x in 1..=254u16 {
-        let req = Message::from_bytes(&[6, our[0], our[1], our[2], x as u8]);
-        match ctx.request_with_reply_abortable("net-stack", &req, 3) {
+        match ns_abortable(ctx, &[6, our[0], our[1], our[2], x as u8], 3) {
             ReqOutcome::Reply(r) => {
                 let p = r.payload_bytes();
                 if p.first() == Some(&1) && p.len() >= 7 {
@@ -5805,7 +5792,7 @@ fn net_scan(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 
 /// `net dns <host>` - resolve a hostname to an IPv4 address. net-stack sends the DNS query to slirp's
 /// resolver; DNS depends on the host's own resolver, so "no answer" is a legitimate result, not a bug.
-fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellError> {
+fn net_dns(ctx: &ShellCtx, host: &str, out: &mut Out) -> Result<(), ShellError> {
     // Request byte 0 = 1 (DNS), then the hostname. net-stack replies 5 bytes: [ok, ip0, ip1, ip2, ip3].
     let hb = host.as_bytes();
     if hb.len() > 255 {
@@ -5815,13 +5802,12 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
     let mut req = [0u8; 256];
     req[0] = 1;
     req[1..1 + hb.len()].copy_from_slice(hb);
-    let msg = Message::from_bytes(&req[..1 + hb.len()]);
     // A DNS resolve waits on the server, which can take a moment. Route it through net_query (not a
     // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to abort"
     // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
     // silent hang.
     ctx.console_writeln("net: resolving ...");
-    let reply = match net_query(ctx, "net-stack", &msg, 8) {
+    let reply = match ns_query(ctx, &req[..1 + hb.len()], 8) {
         NetQ::Reply(r)   => r,
         // A q-aborted resolve did NOT succeed, so it is Err (not Ok): a probe's Result is its verdict,
         // and `online`'s `if net dns ...` must not print a false "dns ok" for an aborted probe (audit U4).
@@ -5866,18 +5852,39 @@ enum NetQ { Reply(Message), Timeout, Aborted }
 /// be escaped back to the prompt. Sends the (idempotent) query once per second, checking the console for
 /// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
 /// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
-fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> NetQ {
+fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64, tag: Option<u8>) -> NetQ {
     // Drain any STALE reply left in our endpoint by a PRIOR command before we send ours - otherwise the
     // request_with_reply below reads that leftover as if it were our answer. A q-aborted continuous `ping`
     // leaves its last net-stack reply (a 4-byte [alive,rtt,ttl]) here; without this drain the next `net`
     // reads it and prints a bogus DNS / "gave a short reply". Same class as the `net scan -> 0.0.0.0` bug;
     // the abortable request variants already drain, but net_query (a deadline loop) did not.
-    while ctx.try_recv().is_some() {}
+    while ctx.try_recv().is_some() {
+        // SEC-35: a discarded message may carry an EMBEDDED CAP that the kernel has already installed
+        // and queued. Dropping the message does not drop the cap - it leaves an entry in the FIFO
+        // `take_pending_cap()` reads from, so the next socket `open` receives the capability belonging
+        // to this discarded reply. That is the `fcap` bug, one channel over. This drain never
+        // reclaimed them; the fs drain does, and says so.
+        while let Some(h) = ctx.take_pending_cap() { ctx.remove_cap(h); }
+    }
     for i in 0..=max_secs {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
         }
-        if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) { return NetQ::Reply(r); }
+        if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) {
+            // A TAGGED channel checks the answer belongs to the question. An overtaken reply is
+            // discarded and the poll continues rather than being believed - which is the entire point
+            // of the tag, and is what `net_query`'s blind drain above could only approximate.
+            match tag {
+                None => return NetQ::Reply(r),
+                Some(t) => {
+                    let pb = r.payload_bytes();
+                    if pb.first() == Some(&t) { return NetQ::Reply(Message::from_bytes(&pb[1..])); }
+                    ctx.log_fmt(format_args!(
+                        "shell: discarded a net-stack reply for tag {} while awaiting {} (overtaken)",
+                        pb.first().copied().unwrap_or(0), t));
+                }
+            }
+        }
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
         if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
@@ -5914,18 +5921,14 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
 /// slots 16, 17, then 18), after which this shell reported "no lease" while net-stack was resolving
 /// DNS and SNTP perfectly well over the lease it still held. The network was fine; the question was
 /// being asked down a dead cap.
-fn net_status_reply(ctx: &ServiceContext) -> Option<Message> {
-    let req = Message::from_bytes(&[0u8]);
-    if let Some(r) = ctx.request_with_reply_deadline("net-stack", &req, 3) {
-        return Some(r);
-    }
-    if ctx.reacquire_by_name("net-stack") {
-        return ctx.request_with_reply_deadline("net-stack", &req, 3);
-    }
-    None
+fn net_status_reply(ctx: &ShellCtx) -> Option<Message> {
+    // The reacquire-and-retry that used to live here is inside `ns_deadline` now, with a FRESH tag on
+    // the second attempt - which is the part the old code could not do: it re-sent the same untagged
+    // request, so the first attempt's late reply and the retry's answer were indistinguishable.
+    ns_deadline(ctx, &[0u8], 3)
 }
 
-fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
+fn net_unconfigured_reason(ctx: &ShellCtx) -> Option<&'static str> {
     match net_link_up(ctx) {
         Some(true) => {}
         Some(false) => return Some("no link (cable unplugged?)"),
@@ -5999,7 +6002,7 @@ fn read_link(p: &[u8]) -> Option<bool> {
 /// - `ok`   - DHCP granted the address, OR there is no link so there is nothing to lease
 /// - `none` - the link is up and we are on the fallback address, which routes nowhere
 /// - (silence) - net-stack did not reply, so the caller can retry rather than conclude anything
-fn net_lease(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+fn net_lease(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     match net_link_up(ctx) {
         Some(true) => {}
         Some(false) => {
@@ -6028,7 +6031,7 @@ fn net_lease(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     }
 }
 
-fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // Diagnostic FIRST (independent of net-stack, so it shows even if net-stack is down): the NIC the
     // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
     // should be driving (Phase 4).
@@ -6042,7 +6045,7 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // MMIO reaches the NIC (Phase 4). Abortable: press q if it stalls.
     let mut nic_link_up = true;   // the LIVE link (p[7]); ties net-stack's gateway/ping lines to reality
     let nreq = Message::from_bytes(&[3u8]);
-    match net_query(ctx, "nic-driver", &nreq, 3) {
+    match net_query(ctx, "nic-driver", &nreq, 3, None) {
         NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
         NetQ::Timeout => {} // no nic diagnostic this time - fall through to the net-stack status
         NetQ::Reply(r) => {
@@ -6091,8 +6094,7 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // ACQUIRE_ANY, so reacquire by name and retry, then give up loudly (Commandment VIII / IX). The
     // request body is ignored by net-stack - the embedded reply cap IS the ask (§8.2).
     // Abortable, bounded (3s): net-stack can wedge (e.g. on a degraded NIC); press q to escape a stall.
-    let req = Message::from_bytes(&[0u8]);
-    let reply = match net_query(ctx, "net-stack", &req, 3) {
+    let reply = match ns_query(ctx, &[0u8], 3) {
         NetQ::Reply(r) => r,
         NetQ::Aborted => { ctx.console_writeln("net: aborted"); return Ok(()); }
         NetQ::Timeout => {
@@ -6145,16 +6147,12 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 
 /// A name-addressed request to net-stack, with the reacquire-on-miss prime (net-stack is not a wired
 /// send-peer; the shell holds ACQUIRE_ANY). Mirrors `fs_request`.
-fn netstack_request(ctx: &ServiceContext, payload: &[u8]) -> Option<Message> {
-    let msg = Message::from_bytes(payload);
-    match ctx.request_with_reply("net-stack", &msg) {
-        Some(r) => Some(r),
-        None => if ctx.reacquire_by_name("net-stack") { ctx.request_with_reply("net-stack", &msg) } else { None },
-    }
+fn netstack_request(ctx: &ShellCtx, payload: &[u8]) -> Option<Message> {
+    ns_request(ctx, payload)
 }
 
 /// Open a UDP socket: net-stack mints a socket cap and grants it to us (mirrors `fc_open`).
-fn sock_open(ctx: &ServiceContext) -> Option<CapHandle> {
+fn sock_open(ctx: &ShellCtx) -> Option<CapHandle> {
     let r = netstack_request(ctx, &[2])?;
     if r.payload_bytes().first() == Some(&1) { ctx.take_pending_cap() } else { None }
 }
@@ -6209,7 +6207,7 @@ fn dns_query_bytes(host: &str, buf: &mut [u8]) -> usize {
 /// needs `docs/net-tags-design.md` phase 2/3 first, because net-stack receives driver replies and
 /// client requests on one untagged endpoint. This exercises the whole state machine - handshake,
 /// sequencing, cumulative ACK, retransmission, FIN - against a real peer.
-fn cmd_tcp(ctx: &ServiceContext, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
+fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     if args.len() < 3 || args[1] == "help" {
         out.line(ctx, "usage: tcp <ip> <port> [text]   - one TCP transaction; prints the reply");
         return Ok(());
@@ -6262,7 +6260,7 @@ fn cmd_tcp(ctx: &ServiceContext, args: &[&str], out: &mut Out) -> Result<(), She
     }
 }
 
-fn cmd_sock(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let sock = match sock_open(ctx) {
         Some(c) => c,
         None => { ctx.console_writeln("sock: net-stack would not open a socket (no NIC?)"); return Err(ShellError::Unknown); }
@@ -10103,9 +10101,9 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     for cycle in 1..=cycles {
         ctx.console_writeln_fmt(format_args!(
             "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
-        match net_query(ctx, "nic-driver", &down, 3) {
+        match net_query(ctx, "nic-driver", &down, 3, None) {
             NetQ::Aborted => {
-                let _ = net_query(ctx, "nic-driver", &clr, 2);
+                let _ = net_query(ctx, "nic-driver", &clr, 2, None);
                 ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
                 return Ok(());
             }
@@ -10130,20 +10128,20 @@ recovery for real.");
             _ => {}
         }
         if hold_or_abort(ctx, HOLD_SECS) {
-            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            let _ = net_query(ctx, "nic-driver", &clr, 2, None);
             ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
             return Ok(());
         }
         ctx.console_writeln("chaos link-flap: forcing link UP - net-stack should self-configure");
-        let _ = net_query(ctx, "nic-driver", &up, 3);
+        let _ = net_query(ctx, "nic-driver", &up, 3, None);
         if hold_or_abort(ctx, HOLD_SECS) {
-            let _ = net_query(ctx, "nic-driver", &clr, 2);
+            let _ = net_query(ctx, "nic-driver", &clr, 2, None);
             ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
             return Ok(());
         }
     }
     // Clear the override so the REAL link state is reported again (a real unplug must not stay masked).
-    let _ = net_query(ctx, "nic-driver", &clr, 2);
+    let _ = net_query(ctx, "nic-driver", &clr, 2, None);
     ctx.console_writeln_fmt(format_args!(
         "chaos link-flap: done ({} cycle(s)); override cleared - net now reflects the real link", cycles));
     Ok(())
@@ -11178,6 +11176,121 @@ const HIST_LOAD_SECS: i64 = 2;
 /// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
 /// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
 /// max-carnage … save` hanging). Reacquire + retry once on a miss, then give up.
+/// The net-stack request correlation tag.
+///
+/// Its own counter in `ShellCtx` for the same reason `fs_tag` has one: a `static` here is the
+/// unowned global mutable state Invariant 9 forbids, and audit C6-1 already had to undo exactly that
+/// mistake on the fs channel. Never 0 - a zero tag can only come from a sender that does not tag.
+fn next_net_tag(ctx: &ShellCtx) -> u8 {
+    let t = ctx.net_tag.get().wrapping_add(1);
+    let t = if t == 0 { 1 } else { t };
+    ctx.net_tag.set(t);
+    t
+}
+
+/// How many overtaken net-stack replies to discard before calling the channel lost.
+const NET_STALE_MAX: usize = 8;
+
+/// Build a tagged net-stack request into `out`, returning its length and the tag to match.
+fn ns_build(ctx: &ShellCtx, body: &[u8], out: &mut [u8; 4096]) -> (usize, u8) {
+    let tag = next_net_tag(ctx);
+    let n = body.len().min(out.len() - 1);
+    out[0] = tag;
+    out[1..1 + n].copy_from_slice(&body[..n]);
+    (1 + n, tag)
+}
+
+/// Take the reply whose tag matches, discarding any that overtook it. Strips the tag.
+///
+/// **The tag is removed here so that no call site has to know it exists.** Every caller below still
+/// reads `r.payload_bytes()` exactly as it did before, with byte 0 meaning what it always meant -
+/// which is the whole reason this is safe to add to a hop that works. `fs_take_tagged` is the same
+/// function for the other channel, and the reasoning is written out there.
+#[inline(never)]
+fn ns_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+    let t0 = ctx.epoch_secs_monotonic();
+    let mut outcome = first;
+    for _ in 0..NET_STALE_MAX {
+        match outcome {
+            ReqOutcome::Reply(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&tag) { return ReqOutcome::Reply(Message::from_bytes(&p[1..])); }
+                // SAY IT. A discarded reply is the proof that this correlation is load-bearing, and a
+                // guard nobody has seen fire is not evidence that it works (§26.4).
+                ctx.log_fmt(format_args!(
+                    "shell: discarded a net-stack reply for tag {} while awaiting {} (an earlier request was overtaken)",
+                    p.first().copied().unwrap_or(0), tag));
+                // Wait again WITHOUT re-sending - the request is already with net-stack - but only for
+                // the time the caller has left.
+                let spent = ctx.epoch_secs_monotonic().saturating_sub(t0);
+                let left = max_secs.saturating_sub(spent);
+                if left <= 0 { return ReqOutcome::Timeout; }
+                outcome = ctx.recv_abortable_deadline(left);
+            }
+            other => return other,
+        }
+    }
+    ctx.console_writeln("net: too many out-of-order replies - the network protocol is out of step");
+    ReqOutcome::Timeout
+}
+
+/// A tagged, abortable net-stack request. Reacquires and retries ONCE on a clean timeout, with a
+/// FRESH tag - the first request may still be in flight, and its late reply must not be mistaken for
+/// the retry's answer.
+fn ns_abortable(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> ReqOutcome {
+    let mut buf = [0u8; 4096];
+    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let first = ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&buf[..n]), max_secs);
+    match ns_take_tagged(ctx, tag, first, max_secs) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => {
+            let (n2, tag2) = ns_build(ctx, body, &mut buf);
+            let again = ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&buf[..n2]), max_secs);
+            ns_take_tagged(ctx, tag2, again, max_secs)
+        }
+        other => other,
+    }
+}
+
+/// A tagged, deadline-bounded net-stack request (no `q` handling).
+fn ns_deadline(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
+    let mut buf = [0u8; 4096];
+    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let first = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&buf[..n]), max_secs)
+        .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag, first, max_secs) { return Some(r); }
+    if ctx.reacquire_by_name("net-stack") {
+        let (n2, tag2) = ns_build(ctx, body, &mut buf);
+        let again = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&buf[..n2]), max_secs)
+            .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+        if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
+    }
+    None
+}
+
+/// A tagged `net_query` - the once-a-second, `q`-abortable poll used by `net` and `net dns`.
+fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
+    let mut buf = [0u8; 4096];
+    let (n, tag) = ns_build(ctx, body, &mut buf);
+    net_query(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs, Some(tag))
+}
+
+/// A tagged, UNBOUNDED net-stack request (the TCP transaction path, which sets its own budget inside
+/// net-stack and must not be cut short from here).
+fn ns_request(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
+    let mut buf = [0u8; 4096];
+    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let msg = Message::from_bytes(&buf[..n]);
+    let first = ctx.request_with_reply("net-stack", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag, first, 60) { return Some(r); }
+    if ctx.reacquire_by_name("net-stack") {
+        let (n2, tag2) = ns_build(ctx, body, &mut buf);
+        let again = ctx.request_with_reply("net-stack", &Message::from_bytes(&buf[..n2]))
+            .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+        if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag2, again, 60) { return Some(r); }
+    }
+    None
+}
+
 fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];

@@ -247,6 +247,65 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
     })
 }
 
+/// A client's reply capability, bound together with the correlation tag its request carried.
+///
+/// **A separate TYPE rather than a second variable, and that is the whole safety argument.** Thirteen
+/// places in the serve loop answer a client. Adding a tag byte by hand at each of them is the failure
+/// `docs/net-tags-design.md` warns about in capitals - "a plausible-looking wrong value, not a crash"
+/// - because a site that is missed still compiles, still sends, and is simply one byte out for the
+/// rest of time. Changing the TYPE of what a reply is sent through makes every one of those sites a
+/// build error until it is converted, so the compiler enumerates them instead of me.
+///
+/// The tag is `None` for the paths that are deliberately untagged, which is the same split `fs` makes:
+/// a BADGED invocation is a capability calling its own owner and the badge already says which
+/// resource, so there is nothing to correlate. `fs`'s note for the identical case reads "badged
+/// file-cap invocations take the other path and are untagged".
+#[derive(Clone, Copy)]
+struct Reply {
+    cap: CapHandle,
+    tag: Option<u8>,
+}
+
+impl Reply {
+    /// Answer the client, putting the tag back at byte 0 where it came from.
+    ///
+    /// `#[inline(never)]`: this carries a 4 KiB buffer, and inlining it into the serve loop would add
+    /// that to `service_main`'s frame at every one of the thirteen call sites. The SDK has already
+    /// paid for that mistake once - see `await_slice`, where a one-line wrapper returning a `Message`
+    /// by value cost `fs` a stack frame per request and took it over its limit on hardware.
+    #[inline(never)]
+    fn send(&self, ctx: &ServiceContext, body: &[u8]) {
+        match self.tag {
+            None => { let _ = ctx.try_send_by_handle(self.cap, &Message::from_bytes(body)); }
+            Some(t) => {
+                let mut out = [0u8; 4096];
+                let n = body.len().min(out.len() - 1);
+                out[0] = t;
+                out[1..1 + n].copy_from_slice(&body[..n]);
+                let _ = ctx.try_send_by_handle(self.cap, &Message::from_bytes(&out[..1 + n]));
+            }
+        }
+    }
+
+    /// Answer the client with a capability embedded (the socket `open` path). `true` if it was sent.
+    #[inline(never)]
+    fn send_with_cap(&self, ctx: &ServiceContext, granted: CapHandle, body: &[u8]) -> bool {
+        match self.tag {
+            None => ctx.send_with_cap_by_handle(self.cap, granted, &Message::from_bytes(body)).is_ok(),
+            Some(t) => {
+                let mut out = [0u8; 64];
+                let n = body.len().min(out.len() - 1);
+                out[0] = t;
+                out[1..1 + n].copy_from_slice(&body[..n]);
+                ctx.send_with_cap_by_handle(self.cap, granted, &Message::from_bytes(&out[..1 + n])).is_ok()
+            }
+        }
+    }
+
+    /// Reclaim the capability once the request is answered (§8.5 - an unreclaimed slot leaks).
+    fn done(&self, ctx: &ServiceContext) { ctx.remove_cap(self.cap); }
+}
+
 /// How many client requests were displaced by a conversation with `nic-driver`, and dropped.
 ///
 /// A counter and a once-only report, not a queue. It exists because the drop is the one cost of
@@ -2253,7 +2312,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // downwards this loop cannot tell the difference - which is what keeps this from needing a
         // second copy of every op.
         let req;
-        let (pl, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
+        let (pl_raw, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
             Some((len, badge, reply)) => (&heldbuf[..len], badge, reply),
             None => {
                 req = ctx.recv();
@@ -2335,6 +2394,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 };
                 (req.payload_bytes(), badge, reply_cap)
             }
+        };
+        // ---- THE CORRELATION TAG, stripped HERE and nowhere else ----
+        //
+        // Every name-addressed request carries one byte at offset 0 that this service echoes back
+        // and never interprets. It exists so a client can tell an answer to THIS question from an
+        // answer to one it has already given up on and re-asked - the hazard that made
+        // `docs/net-tags-design.md` phase 3 unsafe, written up in its §7.2 with the log that killed
+        // the first attempt.
+        //
+        // Stripped in ONE place, echoed in ONE place (`Reply::send`), so not a single op arm below
+        // knows the tag exists and there is no per-op shift to get wrong. That is the shape `fs`
+        // arrived at, and its comment says exactly why: "the tag is handled here and nowhere else,
+        // which is why adding it did not touch a single arm".
+        //
+        // A BADGED request is untagged: it is a socket capability invoking its owner, the badge
+        // already names the socket, and the client holds no ambiguity to resolve.
+        let (pl, reply) = match badge {
+            Some(_) => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            None => match pl_raw.split_first() {
+                Some((t, rest)) => (rest, Reply { cap: reply_cap, tag: Some(*t) }),
+                // No payload at all. Nothing to strip and nothing to echo; the default arm answers
+                // status, exactly as it did before there were tags.
+                None => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            },
         };
         // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a
         // dead link), a request that needs the network first checks the NIC link; if it has come up
@@ -2504,8 +2587,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 } else { None }
             } else { None };
             match n {
-                Some(len) => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&resp[..len])); }
-                None      => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])); }
+                Some(len) => { reply.send(&ctx, &resp[..len]); }
+                None      => { reply.send(&ctx, &[]); }
             }
         } else if pl.first() == Some(&2) {
             // OPEN a UDP socket: mint a delegated socket cap (READ|WRITE) and GRANT it to the client -
@@ -2516,7 +2599,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 Some((sl, (rid, cap))) => {
                     sockets[sl] = Socket { rid, port: 40000 + sl as u16 };
                     let granted = ctx.derive_cap(cap)
-                        .map(|c| ctx.send_with_cap_by_handle(reply_cap, c, &Message::from_bytes(&[1])).is_ok())
+                        .map(|c| reply.send_with_cap(&ctx, c, &[1]))
                         .unwrap_or(false);
                     ctx.remove_cap(cap);        // net-stack drops its own copy; the client holds it now
                     if !granted {
@@ -2526,10 +2609,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Tell the caller loudly (audit U10) instead of leaving it blocked on a reply
                         // that will never come (inv12 / VIII). A failed [0] send is fine - the caller's
                         // own reply-cap death wakes it as ReplyDead if net-stack itself then dies.
-                        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0]));
+                        reply.send(&ctx, &[0]);
                     }
                 }
-                None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
+                None => { reply.send(&ctx, &[0]); }
             }
         } else if pl.first() == Some(&21) {
             // TCP TRANSACT (op 21): [21, ip(4), port_hi, port_lo, request bytes...].
@@ -2632,7 +2715,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if !gw_known { ctx.log("net-stack: tcp asked for before the stack is configured"); }
                 0
             };
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&resp[..n]));
+            reply.send(&ctx, &resp[..n]);
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
             // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +
@@ -2658,7 +2741,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             rb[5] = frames.min(255) as u8;
             rb[6] = udp.min(255) as u8;
             rb[7] = timeouts.min(255) as u8;
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+            reply.send(&ctx, &rb);
         } else if pl.first() == Some(&3) && pl.len() >= 5 {
             // Ping an IP (byte 0 = 3, then 4 IP bytes, then an OPTIONAL le-u16 payload size): ICMP echo,
             // no DNS. Runs HERE in the serve loop, so `ping <gateway>` proves the post-boot request path
@@ -2691,7 +2774,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     None => if link_is_up(&ctx, pending) { [0u8, 0, 0, 0] } else { [2u8, 0, 0, 0] },
                 }
             };
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+            reply.send(&ctx, &rb);
         } else if pl.first() == Some(&6) && pl.len() >= 5 {
             // ARP (op 6, then 4 IP bytes): resolve one host's MAC. Reply [found, mac(6)]. `net arp` uses
             // it directly; `net scan` calls it across the subnet.
@@ -2700,7 +2783,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 Some(m) => [1u8, m[0], m[1], m[2], m[3], m[4], m[5]],
                 None    => [0u8; 7],
             };
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rb));
+            reply.send(&ctx, &rb);
         } else if pl.first() == Some(&8) {
             // RENEW (op 8): re-run the boot dance IN PLACE so a link that came up after boot - a cable
             // plugged in later - reconfigures the stack without a reboot. Nothing is special; the link
@@ -2713,7 +2796,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             gw_known = d.gw_known;
             dns_server = d.dns_server;
             status = d.status;
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+            reply.send(&ctx, &status);
         } else if pl.first() == Some(&10) {
             // SYNC (op 10): re-fetch the time from the network (SNTP) and set the wall clock - the shell
             // `date sync`. Reply: [1, epoch(4 LE)] on success, [0] on failure (no NIC / server silent).
@@ -2727,9 +2810,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     r[0] = 1;
                     r[1..5].copy_from_slice(&unix.to_le_bytes());
                     ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
-                    let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&r));
+                    reply.send(&ctx, &r);
                 }
-                None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
+                None => { reply.send(&ctx, &[0]); }
             }
         } else {
             // Status request (default): reply the CURRENT state, not just the frozen record. Read the link
@@ -2738,8 +2821,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // gateway MAC persists, so `net`/`ping` resume on replug without re-dancing).
             let mut s = status;
             if !link_is_up(&ctx, pending) { s[14] = 0; }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
+            reply.send(&ctx, &s);
         }
-        ctx.remove_cap(reply_cap);
+        reply.done(&ctx);
     }
 }
