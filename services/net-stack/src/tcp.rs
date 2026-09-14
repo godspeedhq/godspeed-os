@@ -20,10 +20,13 @@ use godspeed_sdk::service_context::ServiceContext;
 
 // ── Bounds. Every one of these is a hard ceiling, not a hint. ───────────────────────────────────
 
-/// Connections held at once. Four rather than a larger round number because each costs its two
-/// arenas below, and this table lives in `service_main`'s frame - a service stack is 256 KiB and a
-/// debug ARM build has already overflowed one (see `feedback_arm_release_build`).
-pub const MAX_CONNS: usize = 4;
+/// Connections held at once. TWO, not a larger round number, because the transaction model uses
+/// exactly one at a time and a table sized for concurrency that does not exist yet is the
+/// speculative abstraction §26.2 forbids. Each connection costs its two arenas plus its held
+/// out-of-order segments, and this table lives in `service_main`'s frame: on the Pi 2 that stack is
+/// 256 KiB, a debug ARM build has already overflowed one, and four connections put this service's
+/// entry frame at 98 KiB. Raise it when concurrent connections exist to need it.
+pub const MAX_CONNS: usize = 2;
 /// Per-connection send arena: data handed to us that the peer has not acknowledged yet. A segment
 /// cannot be dropped from here until its ACK arrives, because retransmission is reading from it.
 pub const SND_BUF: usize = 2048;

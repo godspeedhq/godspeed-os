@@ -841,6 +841,12 @@ const TCP_STEPS: usize = 400;
 /// Bounded twice over: `budget_ms` caps the whole transaction, and every inner loop has its own
 /// iteration ceiling, so a peer that answers slowly costs a deadline and a peer that answers never
 /// costs the same.
+/// `#[inline(never)]` DELIBERATELY. Inlined into `service_main` this carried its 1600-byte frame
+/// buffer, and `feed_*`'s two more, into the one frame the whole service lives in - measured at 98 KiB
+/// against the Pi 2's 256 KiB user stack, the deepest single frame in the system. `stack_fit_check`
+/// bounds ONE frame and says so; it cannot see the sum along a call path, which is what a 98 KiB entry
+/// frame plus nested callees actually is. Same idiom the shell already uses for its record builders.
+#[inline(never)]
 fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
                 dst: [u8; 4], dport: u16, req: &[u8], out: &mut [u8],
                 budget_ms: u64) -> Result<usize, tcp::Fault> {
@@ -910,6 +916,7 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
 ///
 /// Returns true if the frame was a TCP segment for us, so a caller can tell "nothing arrived" from
 /// "something arrived and was not ours" - two different silences.
+#[inline(never)]
 fn feed_frame(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, f: &[u8]) -> bool {
     if f.len() < tcp::HDR { return false; }
     let mut out = [0u8; 1600];
@@ -937,6 +944,7 @@ fn feed_frame(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, f: &[u8]) 
 /// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
 /// The pcap is what made that readable, because the guest's own log could only say "nothing came".
 /// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
+#[inline(never)]
 fn feed_batch(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     let m = match reply { Some(m) => m, None => return false };
     let p = m.payload_bytes();
@@ -957,6 +965,7 @@ fn feed_batch(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, reply: Opt
 
 /// Feed the reply to a TRANSMISSION, which carries at most one raw frame (the shape
 /// `udp_roundtrip` already relies on).
+#[inline(never)]
 fn feed_tx(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     match reply {
         Some(m) => feed_frame(ctx, t, net, m.payload_bytes()),
