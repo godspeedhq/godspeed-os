@@ -516,6 +516,126 @@ def check_kernel_service_table(check, pins):
 
 
 # --------------------------------------------------------------------------------------------------
+# Commandment IV - thou shalt honor service contracts
+# --------------------------------------------------------------------------------------------------
+
+def _contracts():
+    """`{service name: (relative path, capabilities dict)}` for every `.toml` contract in the tree.
+
+    A contract that does not PARSE is returned with `None` capabilities rather than skipped. Skipping
+    it would be the defect this whole file exists to catch: a check that quietly reads nothing and
+    then reports a pass.
+    """
+    import tomllib
+    out = {}
+    for base in ("services", "examples"):
+        root = os.path.join(ROOT, base)
+        if not os.path.isdir(root):
+            continue
+        for d in sorted(os.listdir(root)):
+            cdir = os.path.join(root, d, "contracts")
+            if not os.path.isdir(cdir):
+                continue
+            for fn in sorted(os.listdir(cdir)):
+                if not fn.endswith(".toml"):
+                    continue
+                full = os.path.join(cdir, fn)
+                rel = os.path.relpath(full, ROOT).replace("\\", "/")
+                try:
+                    with open(full, "rb") as f:
+                        data = tomllib.load(f)
+                except Exception:
+                    out[rel] = (rel, None)
+                    continue
+                name = data.get("name")
+                if name:
+                    out[name] = (rel, data.get("capabilities", {}) or {})
+    return out
+
+
+def check_contract_authority(check, pins):
+    """Commandment IV: a contract's claim of AUTHORITY must match what the system actually grants.
+
+    WHY THIS EXISTS, and it is not a hypothetical. Set a weak model the task "let `recorder` restart a
+    service it sees stop responding" and it added `service_control = true` to `recorder`'s contract,
+    wrote the restart logic, and reported that it worked. The change compiled, `osdev validate` passed
+    it (`service_control` is a legitimate schema key), and all TWELVE checkers in this repository
+    stayed silent - including `VII-service-grants`, correctly, because nothing that grants authority
+    had been touched.
+
+    It does not work. `recorder`'s privilege word in the supervisor's spawn row is still `0`, so every
+    restart call is DENIED - and the denial is discarded twice over (the SDK's `restart` swallows its
+    own `kill` error, and the caller wrote `let _ = ctx.restart(..)`), with the log line printed BEFORE
+    the call. The result is a service that looks authorised on paper, silently cannot act, and writes
+    a log asserting that it did.
+
+    That is worse than the widening `VII-service-grants` catches. A wrongly GRANTED authority is at
+    least visible in the grant table and on a ratchet. An authority CLAIMED but never granted is
+    visible nowhere.
+
+    And the documentation invites it: CLAUDE.md 14.1 step 5 says "Kernel mints capabilities per
+    contract" and 13.6 says the capability table is "populated from the contract at spawn time".
+    Neither is how it works - authority comes from the supervisor's spawn request and the kernel's
+    `service_config`, which is exactly why `contract_check.py` had to be written. A contributor adding
+    a line to a `.toml` is doing what the constitution tells them to.
+
+    BOTH DIRECTIONS, because they are different failures:
+      - CLAIMED but not granted: the lie above.
+      - GRANTED but not claimed: undeclared authority (26.9 - a reviewer must be able to read what a
+        service may do from its contract). Found one on the first run, in the example whose entire
+        purpose is to demonstrate capability minting.
+
+    The key-to-bit map lives in `[kernel.contract_privileges]` rather than here, so that adding a
+    capability key to the schema forces a decision about whether it is reconcilable.
+    """
+    mapping = pins.get("contract_privileges", {}) or {}
+    debt = set(pins.get("contract_authority_debt", []) or [])
+    grants = _service_grants()
+    out, seen_debt = [], set()
+
+    for name, (path, caps) in sorted(_contracts().items()):
+        if caps is None:
+            out.append(Violation(path, 0,
+                                 "this contract does not parse as TOML, so nothing can be reconciled "
+                                 "against it. A contract that cannot be read is not a weaker "
+                                 "declaration, it is no declaration at all."))
+            continue
+        if name not in grants:
+            continue  # nothing spawns it, so there is no grant to reconcile against
+        held = grants[name]
+        for key in sorted(mapping):
+            bit = mapping[key]
+            claims = caps.get(key) is True
+            granted = f"priv:{bit}" in held or f"kernel-priv:{key}" in held
+            if claims and not granted:
+                out.append(Violation(
+                    path, 0,
+                    f"declares `{key} = true`, and NOTHING GRANTS IT. The contract is not read at "
+                    f"runtime (13.6): authority comes from the supervisor's spawn row and the "
+                    f"kernel's `service_config`. A service claiming an authority it is never given "
+                    f"loads, runs, and has every such call DENIED - and a denial is easy to discard, "
+                    f"so it fails silently. Either grant {bit} in services/supervisor/src/main.rs "
+                    f"(and pin it under [kernel.service_grants]), or delete the claim."))
+            elif granted and not claims:
+                if f"{name}:{key}" in debt:
+                    seen_debt.add(f"{name}:{key}")
+                    continue
+                out.append(Violation(
+                    path, 0,
+                    f"is granted {bit}, and its contract does not declare it. Commandment IV / 26.9: "
+                    f"a reviewer must be able to read what a service may do from its contract, and "
+                    f"undeclared authority is invisible exactly where someone would look for it. Add "
+                    f"`{key} = true` with a note saying what it is for."))
+
+    for stale in sorted(debt - seen_debt):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"contract_authority_debt lists {stale}, which no longer mismatches. "
+                             f"Delete the entry - the debt is paid, and a list not tightened when it "
+                             f"shrinks rots into a permanent exemption."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 # Commandment VII - thou shalt not introduce ambient authority
 # --------------------------------------------------------------------------------------------------
 
@@ -961,6 +1081,25 @@ CHECKS = [
              # updated in the same commit rather than the fix being invisible.
              dict(why="no peripheral driver remains in arch/ - both were deleted in arm32 slice 5",
                   pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="IV-contract-authority", commandment="IV",
+         title="a contract's claim of authority matches what is actually granted",
+         kind="custom", fn=check_contract_authority,
+         scope="every services/*/contracts/*.toml and examples/*/contracts/*.toml, against the grant "
+               "set VII-service-grants reads",
+         proves="no contract claims an authority nothing grants (which fails SILENTLY at runtime), "
+                "and no service holds a reconcilable authority its contract does not declare",
+         does_not_prove="anything about hw_mmio / hw_pci_* / hw_interrupt. A driver's interrupt "
+                        "vector is resolved from its DEVICE CLASS by the arch seam, so the contract's "
+                        "number and the grant are different kinds of fact and pretending to reconcile "
+                        "them would be the very thing this check exists to catch. Nor does it cover "
+                        "the kernel-only privileges (CONSOLE_PUSH, INTROSPECT, REBOOT, GPIO, "
+                        "SET_CLOCK, NET_DEVICE) - the U15 doctrine makes the kernel their single "
+                        "source and they have no contract key by design",
+         probes=[
+             dict(why="a contract claiming authority it is not granted must be caught",
+                  pins={"contract_privileges": {"log_write": "SERVICE_CONTROL"}}, expect=True),
+             dict(why="the real map against the real tree must pass", pins=None, expect=False),
          ]),
     dict(nature="rule", id="VII-service-grants", commandment="VII",
          title="what each service may reach is pinned, not just that it has a name",

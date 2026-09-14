@@ -244,6 +244,23 @@ arch_permitted_roles = [
 # the affordance cannot leak back in.
 kernel_spawned_service = "supervisor"
 
+# Granted-but-undeclared authority as it stood on 2026-09-14, when `IV-contract-authority` was first
+# run. THIS LIST MAY ONLY EVER SHRINK, and a stale entry is itself a violation. Each is a one-line fix
+# to the named contract - declaring authority the service ALREADY holds - which changes no behaviour,
+# because no contract is compiled into any image or read at runtime (13.6). Recorded rather than fixed
+# because fixing them edits product files, and that is the operator's call and not the checker's.
+#
+# These are not obscure corners: SPAWN and SERVICE_CONTROL are the authority to start and restart any
+# service. Four services hold one or both and no contract says so, which is exactly the 26.9 failure -
+# a reviewer reading a contract to learn what a service may do gets an incomplete answer.
+contract_authority_debt = [
+  "shell:spawn", "shell:service_control",
+  "chaos:spawn", "chaos:service_control",
+  "control:spawn", "control:service_control",
+  "supervisor:spawn",
+  "resource-server:resource_mint",
+]
+
 [kernel.kernel_support_roles]
 arch-layer       = "§4.1 architecture layer; §18.1 (the unsafe boundary)"
 syscall-entry    = "§8.2 - the entry to the six, not a seventh"
@@ -574,3 +591,25 @@ SpawnImage               = 52
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
 "xhci" = ["hw:XHCI", "hw:pci_irq", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+
+# --------------------------------------------------------------------------------------------------
+# Commandment IV - which contract capability key corresponds to which privilege bit. Read by
+# `IV-contract-authority`, which reconciles what a contract CLAIMS against what is actually granted.
+#
+# Only these four are reconcilable, and the omissions are deliberate:
+#   hw_mmio / hw_pci_* / hw_interrupt   a driver's vector and BARs are resolved from its DEVICE CLASS
+#                                       by the arch seam at spawn. The contract's number and the grant
+#                                       are different kinds of fact; pretending to reconcile them
+#                                       would be the defect this check exists to catch.
+#   CONSOLE_PUSH, INTROSPECT, REBOOT,   sanctioned kernel-only grants (the U15 doctrine, see
+#   GPIO, SET_CLOCK*, NET_DEVICE        kernel/src/task/mod.rs). The kernel is their single source and
+#                                       they have no contract key by design.
+#
+# Adding a capability key to contracts/schema/service.schema.json should force a decision here:
+# reconcilable, or deliberately not, with the reason written down.
+[kernel.contract_privileges]
+spawn = "SPAWN"
+service_control = "SERVICE_CONTROL"
+resource_mint = "RESOURCE_MINT"
+pci_cfg = "PCI_CFG"
+

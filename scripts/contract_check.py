@@ -13,6 +13,12 @@ kernel `service_config` for that name and fails CI on any mismatch of the reconc
 Structural fields (elf, probe_mode, has_recv_endpoint) are kernel-only and not reconciled. Test/probe
 fixtures have no `.toml` (single source, the kernel) and are not checked.
 
+IT DOES NOT RECONCILE AUTHORITY, and that is worth saying here so nobody reads this file and concludes
+the contract is fully checked. `service_control`, `spawn`, `resource_mint` and `pci_cfg` are reconciled
+by `IV-contract-authority` in `scripts/commandments.py`, against the grant set that `VII-service-grants`
+reads (the supervisor's spawn rows plus the kernel's by-name table) rather than against `service_config`.
+Until 2026-09-14 nothing reconciled them at all, and a contract could claim an authority nothing granted.
+
 Exit: 0 if every contract matches its kernel config, 1 otherwise.
 """
 
