@@ -861,13 +861,18 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
     let deadline = start + budget_ms;
 
     t.stat_seen = 0; t.stat_matched = 0; t.stat_sent = 0;
+    t.tx_n = 0; t.tx_log = [0u8; 24];
     let i = match t.connect(ctx, 1, dst, dport) { Some(i) => i, None => return Err(tcp::Fault::None) };
 
     // The opening SYN. Sent through the same path every other frame uses, and its reply may already
     // carry the SYN-ACK - nic-driver answers a TX with whatever it has received.
     let n = t.syn_frame(ctx, net, i, &mut frame);
-    if n > 0 { t.stat_sent = t.stat_sent.saturating_add(1);
-               feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS)); }
+    if n > 0 {
+        t.stat_sent = t.stat_sent.saturating_add(1);
+        let r = nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS);
+        t.note_tx(&frame[..n], r.is_some());
+        feed_tx(ctx, t, net, r);
+    }
 
     let mut wrote = false;
     let mut got = 0usize;
@@ -889,7 +894,9 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
         let n = t.poll_one(ctx, net, i, &mut frame);
         if n > 0 {
             t.stat_sent = t.stat_sent.saturating_add(1);
-            feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS));
+            let r = nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS);
+            t.note_tx(&frame[..n], r.is_some());
+            feed_tx(ctx, t, net, r);
             empty = 0;
         } else {
             // Nothing to send: ask for received frames explicitly, or a peer that is talking while
@@ -2288,7 +2295,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log_fmt(format_args!(
                     "net-stack: tcp -> {}.{}.{}.{}:{}, {} byte request",
                     dip[0], dip[1], dip[2], dip[3], dport, pl.len() - 7));
-                let net = tcp::Net { our_mac, gw_mac, our_ip };
+                // WHO GOES ON THE WIRE? A host on our own subnet must be addressed DIRECTLY, not
+                // through the router. Sending a neighbour's traffic to the gateway makes the path
+                // asymmetric - it answers us direct, so the router sees only our half of the flow and
+                // drops everything after the first packet as invalid.
+                //
+                // AN ARP REPLY IS THE TEST, and it needs no netmask: a host that answers is on-link
+                // by definition, whatever the prefix happens to be. That matters because net-stack
+                // does not keep the mask from the DHCP lease, and assuming /24 would be a guess that
+                // breaks on anything else. No answer means it is not a neighbour, so the gateway is
+                // right and we fall back to it.
+                let peer_mac = match arp_resolve(&ctx, &our_ip, &our_mac, &dip, None) {
+                    Some(mac) => {
+                        ctx.log_fmt(format_args!(
+                            "net-stack: tcp {}.{}.{}.{} on-link at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - direct",
+                            dip[0], dip[1], dip[2], dip[3],
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+                        mac
+                    }
+                    None => {
+                        ctx.log_fmt(format_args!(
+                            "net-stack: tcp {}.{}.{}.{} did not answer ARP - routing via the gateway",
+                            dip[0], dip[1], dip[2], dip[3]));
+                        gw_mac
+                    }
+                };
+                let net = tcp::Net { our_mac, peer_mac, our_ip };
                 match tcp_transact(&ctx, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp, 8_000) {
                     // A SUCCESSFUL-BUT-EMPTY transaction used to log NOTHING, while the shell told
                     // the user to "see its log for the reason". A message that points at an absent
@@ -2305,6 +2337,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             "net-stack: tcp frames - {} offered to the state machine, {} matched a \
                              connection, {} sent",
                             tcpst.stat_seen, tcpst.stat_matched, tcpst.stat_sent));
+                        // The journal, in order. Upper case = the driver answered, lower case = it
+                        // did not. `SSSS` with no `A` means no acknowledgement was ever built;
+                        // `SSSSaaa` means three were built and none was taken.
+                        let n = tcpst.tx_n.min(tcpst.tx_log.len());
+                        if let Ok(j) = core::str::from_utf8(&tcpst.tx_log[..n]) {
+                            ctx.log_fmt(format_args!(
+                                "net-stack: tcp transmit journal - {} (S=syn A=ack F=fin D=data, \
+                                 lower case = driver did not answer)", j));
+                        }
                         0
                     }
                     Ok(got) => {

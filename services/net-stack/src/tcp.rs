@@ -342,14 +342,14 @@ fn tcp_checksum(src: &[u8; 4], dst: &[u8; 4], tcp: &[u8]) -> u16 {
 /// segment instead of taking down the service (Commandment V: nothing above the kernel halts the
 /// machine, including by panic).
 #[allow(clippy::too_many_arguments)]
-pub fn emit(out: &mut [u8], gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4],
+pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4],
             dst_ip: &[u8; 4], src_port: u16, dst_port: u16,
             seq: u32, ack: u32, flags: u8, wnd: u16, payload: &[u8]) -> usize {
     let total = HDR + payload.len();
     if total > out.len() || payload.len() > MSS { return 0; }
     for b in out[..total].iter_mut() { *b = 0; }
 
-    out[0..6].copy_from_slice(gw_mac);
+    out[0..6].copy_from_slice(peer_mac);
     out[6..12].copy_from_slice(our_mac);
     out[12] = 0x08; out[13] = 0x00;
 
@@ -431,6 +431,16 @@ pub struct Tcp {
     /// still only the SYN count, the acknowledgement was never built - which is a different fault
     /// from one that was built and lost.
     pub stat_sent: u16,
+    /// One character per frame this transaction handed to the driver, in order, so the log can show
+    /// WHICH frames were built rather than only how many.
+    ///
+    ///   S/A/F/D  a SYN, a bare acknowledgement, a FIN, or a segment carrying data
+    ///   lower case   the same frame, where `nic_req` did NOT come back with a reply
+    ///
+    /// The distinction is the whole point: a stack that builds an acknowledgement and a stack whose
+    /// acknowledgement never leaves look identical in a count, and they are different bugs.
+    pub tx_log: [u8; 24],
+    pub tx_n: usize,
 }
 
 impl Tcp {
@@ -444,6 +454,7 @@ impl Tcp {
             last_state: State::Closed,
             last_retx: 0,
             stat_seen: 0, stat_matched: 0, stat_sent: 0,
+            tx_log: [0u8; 24], tx_n: 0,
         }
     }
 
@@ -457,6 +468,22 @@ impl Tcp {
     }
 
     pub fn have_clock(&self) -> bool { self.cyc_per_ms != 0 }
+
+    /// Record one transmitted frame by its TCP flags, and whether the driver answered.
+    ///
+    /// Reads the flags out of the frame that is actually going out, not from what the caller
+    /// believes it built - the two have differed on this branch already.
+    pub fn note_tx(&mut self, frame: &[u8], delivered: bool) {
+        if self.tx_n >= self.tx_log.len() || frame.len() < HDR { return; }
+        let fl = frame[ETH_LEN + IP_LEN + 13];
+        let mut ch = if fl & SYN != 0 { b'S' }
+                     else if fl & FIN != 0 { b'F' }
+                     else if frame.len() > HDR { b'D' }
+                     else { b'A' };
+        if !delivered { ch = ch.to_ascii_lowercase(); }
+        self.tx_log[self.tx_n] = ch;
+        self.tx_n += 1;
+    }
 
     /// Any connection not closed. The serve loop uses this to decide whether it may block in
     /// `recv()` (nothing to poll) or must use a bounded wait - so TCP costs nothing at all when it
@@ -615,7 +642,16 @@ fn hold_ooo(c: &mut Conn, seq: u32, data: &[u8]) {
 #[derive(Clone, Copy)]
 pub struct Net {
     pub our_mac: [u8; 6],
-    pub gw_mac: [u8; 6],
+    /// The MAC to address frames to for THIS connection - the peer's own if it is on-link, the
+    /// gateway's otherwise.
+    ///
+    /// It was `gw_mac` and was always the gateway, which is wrong for a host on our own subnet and
+    /// cost a day of hardware debugging. Routing to a neighbour makes the path asymmetric: our half
+    /// goes through the router while the peer answers us directly, so the router sees only one side
+    /// of the flow and drops everything after the first packet. The symptom was a handshake that
+    /// reached Established and then silence - the SYN through, every later segment swallowed - while
+    /// `ping` to the same host worked, because ICMP is stateless and gets forwarded regardless.
+    pub peer_mac: [u8; 6],
     pub our_ip: [u8; 4],
 }
 
@@ -788,7 +824,7 @@ impl Tcp {
             c.rtt_timing = false;                         // Karn: this ACK cannot be timed
 
             if c.state == State::SynSent {
-                return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[]);
             }
             if c.snd_len > 0 {
@@ -796,14 +832,14 @@ impl Tcp {
                 let mut tmp = [0u8; MSS];
                 tmp[..n].copy_from_slice(&c.snd_buf[..n]);
                 let w = c.window();
-                return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_una, c.rcv_nxt,
                             ACK | PSH, w, &tmp[..n]);
             }
             // Nothing buffered, so the unacknowledged thing is our FIN.
             if matches!(c.state, State::FinWait1 | State::LastAck) {
                 let w = c.window();
-                return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_nxt.wrapping_sub(1), c.rcv_nxt,
                             ACK | FIN, w, &[]);
             }
@@ -819,7 +855,7 @@ impl Tcp {
             c.ack_due = false;
             let w = c.window();
             c.last_adv = w;
-            return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+            return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
         }
 
@@ -842,7 +878,7 @@ impl Tcp {
             let w = c.window();
             if w.saturating_sub(c.last_adv) >= WND_STEP {
                 c.last_adv = w;
-                return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
             }
         }
@@ -869,7 +905,7 @@ impl Tcp {
                     if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
                     let w = c.window();
                     c.last_adv = w;
-                    return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                    return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | PSH, w, &tmp[..n]);
                 }
             }
@@ -887,7 +923,7 @@ impl Tcp {
             c.state = if c.state == State::CloseWait { State::LastAck } else { State::FinWait1 };
             if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
             let w = c.window();
-            return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+            return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | FIN, w, &[]);
         }
         0
@@ -901,7 +937,7 @@ impl Tcp {
         c.rtt_timing = true;
         c.rtt_timed_seq = c.snd_nxt;
         c.rtt_timed_at_ms = now;
-        emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+        emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
              c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[])
     }
 
