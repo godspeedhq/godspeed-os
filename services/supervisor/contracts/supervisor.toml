@@ -10,6 +10,10 @@ limit   = "64MiB"   # the kernel's tested grant (audit T1 reconcile); the superv
 [capabilities]
 # service_control is the exclusive restart/kill capability (§14.4).
 service_control = true
+# SPAWN, IMAGE_SPAWN, INTROSPECT and ACQUIRE_ANY, which this service also holds, have no contract
+# key: the kernel is their single source (U15). The schema HAS a `spawn` key and marks it a DEAD
+# KEY - `init` was removed in Path C / Phase 5 and the privilege rides the spawn request instead -
+# so declaring it here would be both wrong and schema-invalid (it is typed as an array).
 log_write       = true
 # No ipc_send: the supervisor holds no contract SEND peer. It ADOPTS/wires services by name via
 # `acquire_send_grant_cap` (the kernel directory, §14.3), not a static contract peer, so the kernel

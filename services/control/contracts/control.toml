@@ -28,4 +28,10 @@ limit   = "8MiB"
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
 ipc_send    = ["supervisor", "events"]
+# DECLARED, not newly granted. `control` is the operator channel on COM2: the harness drives
+# kill/spawn through it, which is how sections 22 Test 11/13/15 kill a service on demand.
+#   `service_control` - kill one (14.4)
+# SPAWN and FIRE_IRQ, which this service also holds, have no contract key - the kernel and the
+# supervisor's spawn request are their single source (U15), so their absence is by design.
+service_control = true
 log_write   = true

@@ -16,7 +16,7 @@ The granter side, using only real `ServiceContext` methods:
 
 | Step | Call | What happens |
 |------|------|--------------|
-| Hold a grantable cap | `ctx.self_grant_handle()` | our own SEND\|GRANT cap to our endpoint (minted from the contract at spawn) - the cap others use to call us back |
+| Hold a grantable cap | `ctx.self_grant_handle()` | our own SEND\|GRANT cap to our endpoint (minted at spawn, from the supervisor's spawn request) - the cap others use to call us back |
 | Make a copy to give | `ctx.derive_cap(self_cap)` | a derived cap; rights can only narrow, never widen (§7.3) |
 | Find the peer | `ctx.acquire_send_cap("receiver")` | a SEND cap to the service we will grant to |
 | Transfer it | `ctx.send_with_cap_by_handle(receiver, gift, &note)` | the kernel checks the cap carries GRANT, then **moves** it into the receiver's table and removes it from ours (§7.6, §8.5) |

@@ -342,7 +342,7 @@ ultimate case, not an exception.
 
 > **No kernel grant-snapshot is needed (or wanted).** The grant *topology* -
 > who-holds-what authority - is already captured **declaratively in the contracts**
-> (§13); the supervisor respawns and the kernel re-mints per contract on boot. Caps
+> (§13); the supervisor respawns and the kernel re-mints per the spawn request on boot. Caps
 > can't be "restored" anyway - they are generationed (`ResourceId + Rights +
 > Generation`) and bound to specific resource instances that are recreated fresh on
 > reboot, so old caps are stale by definition; authority is **re-minted**, not

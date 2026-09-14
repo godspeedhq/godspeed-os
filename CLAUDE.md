@@ -1351,7 +1351,49 @@ The developer declares **what the service needs**. The OS decides **whether to g
 
 ### 13.6 Runtime Enforcement
 
-Every syscall checks the calling task's capability table, populated *from* the contract at spawn time. The kernel does not consult the contract at runtime.
+Every syscall checks the calling task's capability table, populated at spawn time from the **spawn request**. The kernel does not consult the contract at runtime, and never has.
+
+> **Amendment 2026-09-14: the capability table is populated from the SPAWN REQUEST, not from the
+> contract, and this section said otherwise for long enough that it led a contributor into a change
+> that compiles, validates, passes every checker, and does nothing.**
+>
+> **What actually grants authority.** The supervisor holds each service's image and sends the kernel a
+> spawn request carrying its privilege word, send peers, memory limit, core and device class; the
+> kernel mints exactly that, after refusing any privilege the supervisor does not itself hold
+> (`SUPERVISOR_DELEGATABLE`, `privileges_caller_lacks`) - which is what keeps delegation from being
+> ambient authority (§3.1). The kernel's own `service_config` table covers its ONE direct spawn, the
+> supervisor (§11.1). Those two are the whole of it.
+>
+> **The kernel cannot read a contract.** It is `no_std` and cannot parse TOML at spawn. That is not a
+> new fact and not an implementation shortcut - `scripts/contract_check.py` has opened with it since
+> it was written, and that script exists PRECISELY because the `.toml` is a second, human-facing
+> declaration that can drift from the first.
+>
+> **So what is a contract?** A build-time declaration: schema-validated by `osdev validate` (§13.4),
+> and reconciled against what is really granted by `contract_check.py` (memory limit, placement,
+> send peers) and by `IV-contract-authority` in `scripts/commandments.py` (the authority
+> capabilities). It is the reviewable statement of what a service may do (§26.9). It is not the
+> mechanism.
+>
+> **Why this was worth amending rather than leaving as a near-enough shorthand.** A weak model was
+> given "let `recorder` restart a service it sees stop responding", with no mention of any checker. It
+> added `service_control = true` to `recorder`'s contract and reported that the kernel would grant it
+> at spawn - which is what this section and §14.1 both told it. The change compiled, `osdev validate`
+> passed it, and all twelve checkers stayed silent. It does not work: `recorder`'s privilege word is
+> `0`, every call is denied, and the denial is discarded twice (the SDK's `restart` swallows its own
+> `kill` error and the caller wrote `let _ = ...`) while the log line printed BEFORE the call asserts
+> a restart that never happened. A service that looks authorised on paper, cannot act, and says it
+> did.
+>
+> **And it had been caught before.** `audits/userspace-audit.md` flagged exactly this in 2026-07-12 -
+> quoting this section's own words back at it, that "the contract stops being the authority's source
+> of truth" - and marked it RESOLVED. The resolution changed the CODE and left the constitution
+> saying the wrong thing, which is how a corrected defect goes on causing the error it was corrected
+> for. Four other documents repeated the claim and are fixed in the same change.
+>
+> That is this document leading someone into a silent failure, which is invariant 12 broken at the
+> documentation layer rather than the kernel one. The gate that now catches it is
+> `IV-contract-authority`; this amendment removes the reason it would be needed a second time.
 
 ---
 
@@ -1359,24 +1401,24 @@ Every syscall checks the calling task's capability table, populated *from* the c
 
 ### 14.1 Spawn
 
-1. Supervisor reads service binary + contract.
-2. Validates contract against schema.
-3. Determines core placement (round-robin or contract override per §9.2; rejected if contracted core unavailable).
-4. Asks kernel to create a new task on that core with declared resources.
-5. Kernel mints capabilities per contract (each tagged with current resource generation).
+1. Supervisor takes the service's image and its row in the spawn table (the contract was validated at BUILD time, §13.4 - nothing parses TOML here).
+2. Determines core placement (round-robin or contract override per §9.2; rejected if contracted core unavailable).
+3. Asks the kernel to create a new task on that core, in a **spawn request** carrying the privilege word, send peers, memory limit and device class.
+4. Kernel refuses any privilege the supervisor does not itself hold (`SUPERVISOR_DELEGATABLE`), so a spawner passes on what it has and never mints.
+5. Kernel mints capabilities per the **spawn request** (each tagged with current resource generation).
 6. Kernel maps service binary into new address space.
 7. Service registers any owned endpoints in the kernel name directory (`ipc::names`).
 8. Service enters main loop on its assigned core.
 
 ```text
-  Supervisor ─── spawn(name, contract) ──▶  Kernel
+  Supervisor ─── spawn(name, request) ───▶  Kernel
                                                │
                               resolve placement (§9.2):
                               contract core or round-robin
                                                │
                         Err(PlacementInvalid) ◀─┤  (core unavailable: stop here)
                                                │
-                              allocate Task + CapTable from contract
+                              allocate Task + CapTable from the request
                               map binary into new address space
                               enqueue task on target core run queue
                                                │

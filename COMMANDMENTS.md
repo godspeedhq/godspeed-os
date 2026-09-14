@@ -98,7 +98,8 @@ communication paths. If a service cannot express its needs through its declared 
 the contract - not the architecture.**
 
 > *Grounded in:* §13 (service contracts), §3.7 / Invariant 7 (contracts are enforced, not
-> interpreted), §13.6 (runtime enforcement from the contract at spawn).
+> interpreted), §13.6 (runtime enforcement from the SPAWN REQUEST at spawn; the contract is the
+> build-time declaration reconciled against it, never the runtime source - amended 2026-09-14).
 
 ---
 

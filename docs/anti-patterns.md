@@ -121,7 +121,7 @@ GRANT), §7.5 (revocation). The transfer three-checks are in §8.5.
 ## Contract Violations
 
 The explicit contract is bypassed or false.
-**Grounds:** Commandment IV; §13 (service contracts), §13.6 (runtime enforcement from the contract),
+**Grounds:** Commandment IV; §13 (service contracts), §13.6 (runtime enforcement from the spawn request),
 Invariant 7.
 
 | Violation | The correct pattern |

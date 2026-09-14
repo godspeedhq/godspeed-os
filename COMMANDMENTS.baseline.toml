@@ -254,11 +254,11 @@ kernel_spawned_service = "supervisor"
 # service. Four services hold one or both and no contract says so, which is exactly the 26.9 failure -
 # a reviewer reading a contract to learn what a service may do gets an incomplete answer.
 contract_authority_debt = [
-  "shell:spawn", "shell:service_control",
-  "chaos:spawn", "chaos:service_control",
-  "control:spawn", "control:service_control",
-  "supervisor:spawn",
-  "resource-server:resource_mint",
+  # PAID, all eight, on the day they were found. Each was a one-line declaration of authority
+  # the service already held, so nothing about what RUNS changed - which is exactly why they
+  # could sit undeclared for so long. Kept as an empty list rather than deleted: the ratchet
+  # stays armed at zero, and the next entry has to be argued for instead of inheriting a
+  # precedent.
 ]
 
 [kernel.kernel_support_roles]
@@ -607,8 +607,13 @@ SpawnImage               = 52
 #
 # Adding a capability key to contracts/schema/service.schema.json should force a decision here:
 # reconcilable, or deliberately not, with the reason written down.
+# `spawn` is NOT here, and the omission cost a false finding before it was noticed. The schema
+# types it as an ARRAY and its own description calls it a "DEAD KEY": `init` was removed in Path
+# C / Phase 5, and the SPAWN privilege rides the supervisor's spawn REQUEST rather than being
+# declared by a contract. Reconciling it flagged four services that are correct as written, and
+# `spawn = true` would have failed `osdev validate` on the type. Read the schema before adding a
+# key here.
 [kernel.contract_privileges]
-spawn = "SPAWN"
 service_control = "SERVICE_CONTROL"
 resource_mint = "RESOURCE_MINT"
 pci_cfg = "PCI_CFG"

@@ -22,6 +22,15 @@ limit   = "8MiB"
 # This is SIX peers, which is MAX_SEND_PEERS. A seventh needs that bound raised deliberately.
 ipc_send    = ["block-driver", "fs", "time", "console", "events", "supervisor"]
 ipc_receive = ["shell"]
+# DECLARED, not newly granted. The comment above has said for months that the shell "already
+# holds SPAWN, SERVICE_CONTROL, ACQUIRE_ANY and REBOOT" - in prose, where nothing mechanical
+# could read it. These two lines state the reconcilable half of that, so `IV-contract-authority`
+# can check the claim against what the supervisor's spawn row actually grants.
+#   `service_control` - `kill`, and the restart path behind it (14.4)
+# SPAWN, ACQUIRE_ANY and REBOOT have no contract key: the kernel and the supervisor's spawn
+# REQUEST are their single source (U15), so their absence here is by design. `spawn` exists in the
+# schema but is marked a DEAD KEY there for exactly this reason.
+service_control = true
 log_write   = true
 
 [placement]

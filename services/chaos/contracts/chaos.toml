@@ -18,6 +18,11 @@ limit   = "8MiB"
 # act on it.
 ipc_send    = ["supervisor"]
 ipc_receive = ["chaos"]
+# DECLARED, not newly granted - the comment above already says chaos "holds SPAWN and
+# SERVICE_CONTROL", and now the machine can read it too.
+#   `service_control` - killing services is the entire point of Maximum Carnage (Commandment II)
+# SPAWN has no contract key (schema: DEAD KEY); it rides the supervisor's spawn request.
+service_control = true
 log_write   = true
 
 [placement]
