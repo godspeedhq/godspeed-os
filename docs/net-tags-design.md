@@ -238,3 +238,79 @@ Two things follow for THIS hop:
 - the approach is validated on hardware, at a cost of one byte per reply
 - the argument that "one outstanding request makes a tag unnecessary" is now known to be wrong in
   practice, because that is exactly the assumption the lower hop was making when it lost frames
+
+---
+
+## 7. What was done on 2026-09-14: phase 2 everywhere, and phase 3 BUILT AND WITHDRAWN
+
+Two things happened, and the second is the more useful.
+
+### 7.1 Phase 2 now covers every conversation, not one of them
+
+§6 records the 2026-08-18 drain, which fixed the observed defect by clearing the channel before a
+STATUS query. It says plainly what it did not cover, and the biggest gap was this: the drain only
+guarded `nic_status_req`. **Every other `nic_req` still returned whatever landed next**, so a client
+that spoke during an ordinary frame send or drain was CONSUMED as the driver's reply, parsed as a link
+status or a frame batch, and silently mis-served - the original bug, still present in fifteen of the
+sixteen call sites.
+
+That is closed. The SDK grew `request_with_reply_deadline_sifted` (and a millisecond twin), a bounded
+wait that asks the caller about each message as it arrives instead of believing the first one. Every
+conversation with `nic-driver` goes through it. A displaced client request is now **identified**, and
+dropped with its capability reclaimed and counted - phase-2 behaviour, which this document explicitly
+sanctions ("ship it here if phase 3 has to wait").
+
+**The discriminator is the one §6 already found**: a client request carries a reply capability, a
+driver reply does not. So none of this needed the wire tag, and the forty-edit-point change this
+document warns about was not attempted. The tag is still owed for the case the discriminator cannot
+see - two driver requests outstanding at once, which nothing currently makes - and that is unchanged.
+
+### 7.2 Phase 3 was built, measured, and taken back out
+
+The bounded stash of §3 was implemented in full: a fixed ring of four displaced requests, each
+carrying the payload, the badge and the reply capability captured at arrival, drained by the serve
+loop before it blocked, dropping the oldest on overflow and saying so once. It is what this document
+asks for, and it does not work.
+
+**A request answered LATE is worse than one never answered.** A client that gives up RE-SENDS - the
+shell reacquires net-stack and asks again, with deadlines from 3 to 30 seconds depending on the
+command. Answer the held copy as well and the client has two replies to one question: it reads the
+first as the answer to THIS request and the second as the answer to the NEXT one, and every exchange
+afterwards is permanently one behind. That is the same desync this document was written to remove,
+reintroduced from the other end.
+
+It is not a theory. The shell log says it directly:
+
+```
+DIAG sift: kept a client request op=1 badge=0 len=12
+DIAG sift: kept a client request op=1 badge=0 len=12     <- the same lookup, re-sent
+DIAG serve: from the stash, op=1 len=12
+example.com is 172.66.147.243                            <- one copy answered
+...
+DIAG serve: from the stash, op=1 len=12                  <- the other copy, two commands later
+net: net-stack gave a short reply                        <- a `net` status answered with a hostname
+```
+
+**A hold bound does not close it.** Expiring entries after half a second was tried and measured next;
+it turned a reproducible failure into an intermittent one, which is worse to own and no better to
+rely on. The reason is that the hold and the SERVE are separate: take a displaced lookup after 400 ms,
+spend three seconds resolving it, and the reply still lands after the client's deadline. net-stack
+cannot bound its own serve time, and it does not know the client's deadline.
+
+### 7.3 What phase 3 actually needs, stated so it is not rediscovered
+
+**Correlation on the CLIENT hop** - net-stack <-> its clients - which is a different hop from the one
+this whole document is about. The client tags its request, net-stack echoes the tag, and the client
+discards a reply to a question it is no longer asking. That is exactly what `fs` carries
+(`project_fs_reply_correlation`, and the shell's `drain_stale_fs_replies` / `reclaim_late_fs_reply`),
+and exactly what this hop does not.
+
+Until then, deferral is unsafe and dropping is correct: the client times out, retries, and exactly
+one request is ever outstanding. Recorded rather than half-built (§26.7).
+
+**A note for whoever builds it:** the hold is safe in one regime, and it is the regime the stash was
+wanted for in the first place - SHORT background work, where the displaced request is served within
+milliseconds and no client is anywhere near its deadline. It is long, client-initiated operations
+(a DHCP dance, a DNS lookup that times out) that make a held request stale. So the correlation tag and
+the stash are worth building together with the background poll of §4, not before it, and the stash
+should hold only while net-stack is doing its OWN work.

@@ -1642,6 +1642,45 @@ impl ServiceContext {
         out
     }
 
+    /// [`Self::request_with_reply_deadline_sifted`], bounded in MILLISECONDS.
+    ///
+    /// The same reason the unsifted `_ms` form exists: a sub-second window cannot be built out of a
+    /// whole-second bound, and the drain inside `net-stack`'s ~900 ms ping window is exactly such a
+    /// window. Bounded by the CYCLE counter for the same reason too - it is the only clock here with
+    /// sub-second resolution, and it is the one the caller's own budget is measured in.
+    #[inline]
+    pub fn request_with_reply_ms_sifted(
+        &self, peer: &str, msg: &crate::ipc::Message, max_ms: u64,
+        mut mine: impl FnMut(&crate::ipc::Message) -> bool,
+    ) -> Option<crate::ipc::Message> {
+        let op = self.trace_in(peer, msg);
+        let target = CapHandle(self.find_send_slot(peer)?);
+        let self_grant = self.self_grant_handle()?;
+        let reply_cap = self.derive_cap(self_grant)?;
+        if self.offer_request(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);
+            self.trace_out(peer, op, crate::trace::KIND_PEER_LOST);
+            return None;
+        }
+        let t0 = self.read_tsc();
+        let budget = self.duration_cycles(max_ms);
+        loop {
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS.min(max_ms.max(1))) {
+                if mine(&r) {
+                    self.trace_out(peer, op, crate::trace::KIND_REPLY);
+                    return Some(r);
+                }
+            }
+            // wrapping_sub, so a counter that wraps mid-wait reads as a small elapsed rather than as
+            // an enormous one that expires the deadline instantly.
+            if self.read_tsc().wrapping_sub(t0) >= budget {
+                self.remove_cap(reply_cap);
+                self.trace_out(peer, op, crate::trace::KIND_TIMEOUT);
+                return None;
+            }
+        }
+    }
+
     /// Bounded request/reply the user can abandon with `q`.
     #[inline]
     pub fn request_with_reply_abortable(

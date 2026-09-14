@@ -274,7 +274,9 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 
 | | |
 |---|---|
-| **next** | `docs/net-tags-design.md` phase 3 - the bounded stash. A client request met while awaiting a driver reply is KEPT and served after, instead of dropped. Built on the discriminator that already exists (a client request carries a reply cap; a driver reply does not), so it does NOT need the 40-edit wire-tag change that document warns against doing in one pass. Sized: a `&mut` threaded through 15 `nic_req` call sites, every one compiler-checked |
+| **done** | every conversation with `nic-driver` goes through a SIFTING wait, so a client request met during one is identified rather than consumed and mis-served. Dropped with its capability reclaimed and counted - `docs/net-tags-design.md` phase 2, which previously guarded one call site out of sixteen |
+| **next** | correlation on the CLIENT hop: a tag net-stack echoes, so a client can discard a reply to a question it is no longer asking. This is the real prerequisite for deferring a request at all, and it is NOT the tag `docs/net-tags-design.md` describes - that one is for the driver hop |
+| then | the bounded stash (net-tags phase 3), which needs the above. It was built, measured and withdrawn first; §7.2 there has the log that killed it |
 | then | the poll step, and connections that progress with no client asking |
 | then | listen and accept, so the machine can serve rather than only fetch |
 | then | congestion control: slow start, congestion avoidance, fast retransmit and recovery |
@@ -282,14 +284,20 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 Until the stash lands, one transaction per request is the honest ceiling, and `utilities/48_tcp.md`
 says so where a user would otherwise wonder.
 
-**And the stash needs an SDK change, which the estimate above did not include.** net-stack cannot
-write its own send-and-await today: `find_send_slot` and `await_slice` are both private to
-`sdk/rust/src/service_context.rs`, and `request_with_reply_deadline_outcome` does the send AND the
-wait in one call with no way to inspect what arrives. So phase 3 needs either those two made public,
-or - better, because it keeps the policy in the SDK where every other caller can use it - a bounded
-await that hands back messages it did not expect, rather than returning the first thing that lands.
-That is a change to a file every service links, so it is a decision to take deliberately and in
-daylight, not an incidental part of a TCP branch.
+**The SDK change this predicted has been made, and it was the right one of the two.** net-stack could
+not write its own send-and-await: `find_send_slot` and `await_slice` are private, and
+`request_with_reply_deadline_outcome` does the send AND the wait in one call with no way to inspect
+what arrives. The choice was between making those two public and adding a bounded await that hands
+back messages it did not expect. The second was taken, because it keeps the policy in the SDK where
+every other caller can reach it: `request_with_reply_deadline_sifted` and its millisecond twin ask the
+caller about each message as it arrives and continue waiting on a no.
+
+Two details of that primitive are load-bearing rather than incidental. The closure is called AT THE
+MOMENT OF ARRIVAL, because `take_pending_cap` and `last_recv_badge` describe the message just received
+and are overwritten by the next one - so the discriminator net-stack needs is only readable from
+inside the wait. And it hands the message back rather than taking a disposition, because the thing
+being handed back usually carries a reply capability that must be reclaimed or answered; deciding
+which is policy, and policy does not belong in the SDK (§26.10).
 
 ## What the tests caught, recorded because each is a class rather than an incident
 
