@@ -161,18 +161,23 @@ number. That is recorded here rather than discovered later.
 
 # Where this stands (2026-09-14)
 
-## HARDWARE VERIFIED - three instruction sets, 2026-09-14
+## HARDWARE VERIFIED - four instruction sets, 2026-09-14
 
 | board | ISA | NIC | small exchange | 2884 bytes |
 |-------|-----|-----|----------------|------------|
 | Raspberry Pi 2 | ARMv7 | LAN9514 over USB (dwc2) | 200 ms | 500 ms |
 | Raspberry Pi 4 | AArch64 | GENET, on-SoC | 94 ms | 79 ms |
 | StarFive VisionFive 2 Lite | riscv64 | dwmac | 189 ms | 189 ms |
+| Dell Wyse 5070 | x86-64 | RTL8168 | 130 ms | 173 ms |
 
-**The Pi 4 and the VisionFive both worked FIRST TIME, with no new bugs.** That is the portability
+**Every board after the first worked FIRST TIME, with no new bugs.** That is the portability
 claim earning its keep: every one of the four hardware-only failures was in `net-stack`, which is
-architecture-neutral, so fixing them on one board fixed the rest. Three instruction sets and three
+architecture-neutral, so fixing them on one board fixed the rest. Four instruction sets and four
 entirely unrelated ethernet controllers, one set of fixes.
+
+The Wyse is the second-sharpest piece of evidence after the VisionFive: its RTL8168 is the one NIC
+driver in the set that QEMU cannot exercise at all (it emulates an e1000), so that path had never
+carried a TCP segment before this run.
 
 The VisionFive is the sharpest of the three as evidence, because its networking has a history of
 board-specific trouble (`project_riscv64_dwmac_unicast_loss`) and this needed none of it.
