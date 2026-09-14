@@ -161,7 +161,22 @@ number. That is recorded here rather than discovered later.
 
 # Where this stands (2026-09-14)
 
-## HARDWARE VERIFIED - Raspberry Pi 2, 2026-09-14
+## HARDWARE VERIFIED - Raspberry Pi 2 and Raspberry Pi 4, 2026-09-14
+
+| board | ISA | NIC | small exchange | 2884 bytes |
+|-------|-----|-----|----------------|------------|
+| Raspberry Pi 2 | ARMv7 | LAN9514 over USB (dwc2) | 200 ms | 500 ms |
+| Raspberry Pi 4 | AArch64 | GENET, on-SoC | 94 ms | 79 ms |
+
+**The Pi 4 worked first time, with no new bugs.** That is the portability claim earning its keep:
+every one of the four hardware-only failures was in `net-stack`, which is architecture-neutral, so
+fixing them on one board fixed the other. Two instruction sets and two entirely unrelated ethernet
+controllers, one set of fixes.
+
+Both boards were verified the same way - the board's log and the peer's log showing the same exchange,
+which is worth more than either alone.
+
+
 
 A Pi 2 (ARMv7, LAN9514 ethernet over USB/dwc2) completed TCP transactions across a real LAN to a
 Windows peer. Both ends logged the same exchange, which is stronger than either log alone:
