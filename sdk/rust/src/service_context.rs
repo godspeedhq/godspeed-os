@@ -1600,6 +1600,48 @@ impl ServiceContext {
         out
     }
 
+    /// Bounded request/reply that SIFTS what arrives instead of believing the first thing that lands.
+    ///
+    /// Every other variant on this page returns whatever message turns up next, which is correct for a
+    /// caller whose endpoint carries nothing but its own replies and WRONG for a caller that also
+    /// SERVES on it. `net-stack` is the second kind: it receives client requests and `nic-driver`
+    /// replies in one mailbox, so a client that spoke while it was waiting for the driver was consumed
+    /// as the driver's answer, misparsed, and never served - the failure `docs/net-tags-design.md`
+    /// opens with, and the reason that service still cannot do any background work.
+    ///
+    /// `mine` is asked about each message as it arrives, BEFORE anything else is done with it, and
+    /// answers one question: is this the reply I sent for? Say `true` and the wait ends with it. Say
+    /// `false` and the wait continues - the message is the caller's to deal with, and the caller is
+    /// the only thing that can, because only it knows whether that means stashing a client request or
+    /// discarding a reply that arrived too late. This is deliberately not an enum of dispositions: the
+    /// SDK would then be deciding what to keep, which is policy, and the thing being kept usually has
+    /// a reply capability that must be reclaimed or answered rather than merely stored (26.10, 8.5).
+    ///
+    /// The kernel's per-task pending cap and receive badge are both readable from inside `mine`
+    /// (`take_pending_cap`, `last_recv_badge`), which is the point of calling it at the moment of
+    /// arrival rather than afterwards: they describe THE MESSAGE JUST RECEIVED and are overwritten by
+    /// the next one. A discriminator built on the pending cap is what `net-stack` uses, and it is free
+    /// - a client request carries a reply cap, a driver reply does not.
+    ///
+    /// Everything else matches [`Self::request_with_reply_deadline_outcome`] exactly, including the
+    /// reply-cap reclaim on every failure path and the warning attached to `Timeout`: the request was
+    /// SENT, so a late reply is still coming and re-sending desyncs the protocol.
+    #[inline]
+    pub fn request_with_reply_deadline_sifted(
+        &self, peer: &str, msg: &crate::ipc::Message, max_secs: i64,
+        mine: impl FnMut(&crate::ipc::Message) -> bool,
+    ) -> DeadlineOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_deadline_sifted_inner(peer, msg, max_secs, mine);
+        self.trace_out(peer, op, match &out {
+            DeadlineOutcome::Reply(_)   => crate::trace::KIND_REPLY,
+            DeadlineOutcome::SendFailed => crate::trace::KIND_PEER_LOST,
+            DeadlineOutcome::QueueFull  => crate::trace::KIND_QUEUE_FULL,
+            DeadlineOutcome::Timeout    => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
     /// Bounded request/reply the user can abandon with `q`.
     #[inline]
     pub fn request_with_reply_abortable(
@@ -2074,6 +2116,53 @@ impl ServiceContext {
                 // own top; this variant cannot drain blindly, because a service that also SERVES on this
                 // endpoint (net-stack) would discard live client requests. So a caller that can time out
                 // must reclaim the late reply itself - see the shell's `reclaim_late_fs_reply`.
+                return DeadlineOutcome::Timeout;
+            }
+            self.yield_cpu();
+        }
+    }
+
+    /// The sifting wait. A deliberate near-copy of `request_with_reply_deadline_outcome_inner`
+    /// rather than a shared body that one of them passes a closure into.
+    ///
+    /// Folding the two together would put a generic parameter on the hot path of every service that
+    /// makes a bounded request, for the benefit of the one that sifts. The SDK has been bitten by
+    /// exactly that kind of tidying before: a one-line wrapper returning a 4 KiB `Message` by value
+    /// cost `fs` a whole extra stack frame per request and took it over its stack limit on hardware
+    /// while every QEMU run stayed green (see `await_slice`). The duplication is four lines of loop,
+    /// it is visible, and both copies are right here.
+    fn request_with_reply_deadline_sifted_inner(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_secs: i64,
+        mut mine: impl FnMut(&crate::ipc::Message) -> bool,
+    ) -> DeadlineOutcome {
+        let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return DeadlineOutcome::SendFailed };
+        let self_grant = match self.self_grant_handle() { Some(g) => g, None => return DeadlineOutcome::SendFailed };
+        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
+        if let Err(e) = self.send_with_cap_by_handle(target, reply_cap, msg) {
+            self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
+            return match e {
+                crate::ipc::IpcError::QueueFull => DeadlineOutcome::QueueFull,
+                _ => DeadlineOutcome::SendFailed,
+            };
+        }
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
+                // Asked at the moment of arrival, so `take_pending_cap` and `last_recv_badge` inside
+                // it still describe THIS message. A `false` hands ownership to the caller and the
+                // wait goes on; the deadline below is unchanged by how many arrive, so a flood of
+                // other traffic cannot extend it.
+                if mine(&r) { return DeadlineOutcome::Reply(r); }
+            }
+            if self.epoch_secs_monotonic() - t0 >= max_secs {
+                self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
+                // Same caveat as the unsifted twin: the request WAS sent, so the peer answers whether
+                // or not anyone is still listening, and that answer will arrive later. A caller that
+                // times out must expect to meet it - here, `mine` will simply be asked about it and
+                // can say no.
                 return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();
