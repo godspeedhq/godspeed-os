@@ -403,6 +403,21 @@ and `date sync` all passing is therefore positive evidence the byte makes the ro
 NOT been observed is the discard path actually firing, because that needs a real desync to provoke
 and nothing provokes one on demand. Recorded rather than claimed (§26.7).
 
+### Hardware-verified on the Pi 2 (2026-09-14)
+
+Same board, same host, straight after the change. TCP 15 ms and 16 ms for the two transactions,
+against 47 ms and 15 ms before it - the same band, with the variation living in ARP (158-222 ms)
+rather than in the protocol. **A correlation tag that changed any observable behaviour on a healthy
+channel would mean it was wrong**, so the result being dull is the result.
+
+What the run proves beyond "nothing broke": `net` answered with a lease, a resolved gateway and a
+successful ping, so the byte makes the round trip in both directions; and the wall clock was set
+from the network, which is the CAPLESS op-11 nudge from `time` and therefore proof that the
+deliberately-untagged path was not shifted by one.
+
+Not covered by that run: the badged socket path (`sock`), which is exercised by the x86 shell suite
+but was not typed on this board.
+
 ### One thing found on the way
 
 `net_query`'s pre-send drain discarded messages without reclaiming their embedded capabilities. That
