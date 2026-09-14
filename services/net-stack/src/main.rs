@@ -9,7 +9,7 @@
 //! net-stack - the model-AGNOSTIC half of networking (docs/networking.md, Phase 2).
 //!
 //! nic-driver knows one NIC and speaks raw Ethernet frames; net-stack knows no hardware and speaks
-//! ARP/IPv4/ICMP/UDP/TCP over those frames. The seam between them is the **frame interface**: a
+//! ARP/IPv4/ICMP/UDP over those frames. The seam between them is the **frame interface**: a
 //! request/reply (§8.2) where the request payload IS a frame to transmit and the reply payload IS the
 //! frame that came back. So the protocols live HERE, in net-stack, over raw frames - not in the
 //! driver. This is Commandment X: the driver is mechanism (put bytes on the wire), the protocol is
