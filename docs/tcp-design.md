@@ -312,7 +312,7 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 | **done** | the protocol itself: a maximum-segment-size option on every SYN and the peer's honoured, RFC 5681 congestion control (slow start, congestion avoidance, fast retransmit, NewReno fast recovery), and the persist timer this page used to record as missing |
 | **next** | correlation on the CLIENT hop: a tag net-stack echoes, so a client can discard a reply to a question it is no longer asking. This is the real prerequisite for deferring a request at all, and it is NOT the tag `docs/net-tags-design.md` describes - that one is for the driver hop |
 | then | the bounded stash (net-tags phase 3), which needs the above. It was built, measured and withdrawn first; §7.2 there has the log that killed it |
-| then | the poll step, and connections that progress with no client asking |
+| **done** | the poll step. While configured, the serve loop waits at most `POLL_MS` for a client and otherwise drains the NIC once, answering ARP and ICMP for itself and running one pass of the connection table. This is the tick that was REVERTED; it is safe now because the two phases above are in |
 | then | listen and accept, so the machine can serve rather than only fetch |
 | then | congestion control: slow start, congestion avoidance, fast retransmit and recovery |
 
@@ -333,6 +333,43 @@ and are overwritten by the next one - so the discriminator net-stack needs is on
 inside the wait. And it hands the message back rather than taking a disposition, because the thing
 being handed back usually carries a reply capability that must be reclaimed or answered; deciding
 which is policy, and policy does not belong in the SDK (§26.10).
+
+## The machine answers for itself now (2026-09-15)
+
+Two things this stack could not do, both of which are how one machine ordinarily checks another is
+alive:
+
+- **Answer ARP while idle.** All five ARP-reply sites were inside drain loops, so between commands a
+  peer asking "who has this address" got nothing.
+- **Answer a ping at all.** Every ICMP path built or matched our OWN outbound echoes; there was no
+  echo-REQUEST handler anywhere, busy or idle.
+
+The poll step fixes the first and `build_icmp_reply` the second. A reply is the request REFLECTED -
+same identifier, sequence and payload, which is what makes the sender's matching work - with only
+the direction fields changed and both checksums recomputed. It takes its length from the IP header
+rather than the frame, so the ethernet minimum padding is not echoed back as extra data.
+
+### Two guards that refuse to poll rather than poll wrongly
+
+- **Unconfigured**: with no address of our own, nothing on the wire is ours to answer, so the loop
+  blocks exactly as it did before. Verified: on arm32 under QEMU, which has no NIC, the poll never
+  ran and the driver saw the same three messages as the pre-poll baseline.
+- **No calibrated clock**: `duration_cycles` floors to one quantum when the counter is uncalibrated
+  (`backlog/27`), so a bounded wait silently becomes a SPIN and this loop would ask the driver for
+  frames as fast as it is scheduled. A missing clock means no poll, not a fast one.
+
+### And one landmine defused on the way
+
+`poll_one` emitted to `Net::peer_mac`, which is per CALL. A connection's peer MAC is per CONNECTION -
+the peer's own when it is on-link, the gateway's otherwise - and getting that wrong is the bug that
+cost a day on the Pi 2 (a handshake reaching Established and then silence, while `ping` to the same
+host worked). It was fixed once, per transaction; the moment a connection outlives the request that
+opened it, a background poll would have rebuilt `Net` from the gateway and reintroduced it. `peer_mac`
+now lives on `Conn`, set at `connect`, so that is impossible rather than merely unlikely.
+
+**What this is NOT proven to do yet.** SLIRP gives the host no route to the guest, so no QEMU test can
+ping this machine. The poll's effect is proven on hardware or not at all; what QEMU proves is that it
+breaks nothing (174/0 with the stack configured, so the poll is running throughout).
 
 ## What the tests caught, recorded because each is a class rather than an incident
 

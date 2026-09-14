@@ -1163,7 +1163,7 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
 
     t.stat_seen = 0; t.stat_matched = 0; t.stat_sent = 0;
     t.tx_n = 0; t.tx_log = [0u8; 24];
-    let i = match t.connect(ctx, 1, dst, dport) { Some(i) => i, None => return Err(tcp::Fault::None) };
+    let i = match t.connect(ctx, 1, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
 
     // The opening SYN. Sent through the same path every other frame uses, and its reply may already
     // carry the SYN-ACK - nic-driver answers a TX with whatever it has received.
@@ -1291,6 +1291,86 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
 /// The pcap is what made that readable, because the guest's own log could only say "nothing came".
 /// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
+/// How often the serve loop wakes to answer for itself when no client is asking.
+///
+/// A hundred milliseconds. The things it has to be quick enough for are an ARP request (a peer
+/// retries about once a second), an inbound ping (one a second, and the poll interval lands directly
+/// in the reported round trip), and later a TCP retransmission timer whose floor is `RTO_MIN_MS` =
+/// 200 ms. Ten wakes a second is also the ceiling on what this costs: each is ONE drain request to
+/// `nic-driver`, and only when nothing else woke us.
+const POLL_MS: u64 = 100;
+
+/// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
+///
+/// **This is the tick that was reverted, and it is only safe to bring back now.** The revert note in
+/// this file says why it went: net-stack serves clients and receives driver replies on one endpoint,
+/// so anything that talked to the driver unasked stole client messages, and a once-a-second tick
+/// turned a latent race into a permanent one. `docs/net-tags-design.md` set the precondition in
+/// capitals - do not add a tick before the correlation is fixed. Phase 2 (sifting) and phase 3 (the
+/// bounded stash) are both in, and the client hop carries a tag, so a client met here is identified,
+/// kept, and served by the loop below rather than consumed.
+///
+/// What it buys today, which is not speculative: the machine ANSWERS FOR ITSELF while idle. Every
+/// ARP reply this service builds is inside a drain loop, so between commands a peer asking "who has
+/// this address" got nothing; and an inbound ping was never answered at all, because no echo-request
+/// handler existed. Both are the ordinary way one machine checks another is alive.
+///
+/// Bounded in every direction: one drain, at most the frames it returns, one pass of the connection
+/// table. Returns whether anything arrived, so the caller can keep polling while the wire is busy
+/// instead of sleeping through a burst.
+fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
+             t: &mut tcp::Tcp, net: &tcp::Net) -> bool {
+    let batch = nic_drain(ctx, pending);
+    let m = match batch { Some(m) => m, None => return false };
+    let p = m.payload_bytes();
+    if p.is_empty() { return false; }
+    let count = p[0] as usize;
+    let mut pos = 1usize;
+    let mut any = false;
+    let mut out = [0u8; 1600];
+    for _ in 0..count {
+        if pos + 2 > p.len() { break; }
+        let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+        pos += 2;
+        if pos + fl > p.len() { break; }
+        let f = &p[pos..pos + fl];
+        pos += fl;
+        any = true;
+
+        // ARP for us. Answered first because without it nothing else can reach us at all.
+        let mut arp_out = [0u8; 42];
+        if build_arp_reply(f, &st.our_ip, &st.our_mac, &mut arp_out) {
+            let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), LINK_SECS);
+            continue;
+        }
+        // A ping addressed to us.
+        let n = build_icmp_reply(f, &st.our_ip, &st.our_mac, &mut out);
+        if n > 0 {
+            let _ = nic_req(ctx, pending, &Message::from_bytes(&out[..n]), LINK_SECS);
+            continue;
+        }
+        // Anything else that is TCP for one of our connections. `on_frame` never transmits - it
+        // records what is owed and `poll_one` below sends it, which is the separation that took a
+        // day of hardware debugging to find (see `Conn::ack_due`).
+        if fl >= tcp::HDR {
+            let mut sink = [0u8; 1600];
+            t.on_frame(ctx, net, f, &mut sink);
+        }
+    }
+
+    // Now let every live connection make its own progress: an acknowledgement owed, a retransmission
+    // due, a window probe, a FIN to answer. This is the half that makes a connection able to outlive
+    // the request that opened it.
+    for i in 0..tcp::MAX_CONNS {
+        let n = t.poll_one(ctx, net, i, &mut out);
+        if n > 0 {
+            let _ = nic_req(ctx, pending, &Message::from_bytes(&out[..n]), LINK_SECS);
+            any = true;
+        }
+    }
+    any
+}
+
 #[inline(never)]
 fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     let m = match reply { Some(m) => m, None => return false };
@@ -1502,6 +1582,46 @@ fn sntp_sync(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState) -> Op
 /// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
 /// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
 /// where a blind gratuitous ARP before every query was not.
+/// Turn an inbound ICMP ECHO REQUEST addressed to us into the echo REPLY. Returns its length, or 0
+/// if `f` is not an echo request for this machine.
+///
+/// **This machine could not be pinged.** Every ICMP path here built or matched our OWN outbound
+/// echoes; nothing ever answered one addressed to us, busy or idle. A host that cannot be pinged
+/// cannot be checked for liveness by the most ordinary tool there is, and on a LAN that reads as "the
+/// machine is down" when it is running perfectly.
+///
+/// The reply is the request REFLECTED: same identifier, same sequence, same payload, which is what
+/// makes the sender's round-trip matching work. Only the direction fields change - the MACs and IPs
+/// swap, the type becomes 0, the TTL becomes ours - and both checksums are recomputed because the
+/// bytes they cover have moved.
+fn build_icmp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8]) -> usize {
+    // IPv4, 20-byte header, ICMP, echo REQUEST (type 8), addressed to us.
+    if f.len() < 42 || f[12] != 0x08 || f[13] != 0x00 || f[14] != 0x45 || f[23] != 1 || f[34] != 8 {
+        return 0;
+    }
+    if f[30..34] != our_ip[..] { return 0; }
+    // The IP header's own length, not the frame's: a short frame is padded to the 60-byte ethernet
+    // minimum, and echoing the padding back would make the reply longer than the request.
+    let ip_total = ((f[16] as usize) << 8) | f[17] as usize;
+    let flen = (14 + ip_total).min(f.len()).min(out.len());
+    if flen < 42 { return 0; }
+    out[..flen].copy_from_slice(&f[..flen]);
+
+    out[0..6].copy_from_slice(&f[6..12]);            // to whoever asked
+    out[6..12].copy_from_slice(our_mac);
+    out[26..30].copy_from_slice(our_ip);             // from us
+    out[30..34].copy_from_slice(&f[26..30]);         // to them
+    out[22] = 64;                                    // our TTL, not theirs
+    out[34] = 0;                                     // echo REPLY
+    out[24] = 0; out[25] = 0;
+    let ip_ck = checksum(&out[14..34]);
+    out[24] = (ip_ck >> 8) as u8; out[25] = ip_ck as u8;
+    out[36] = 0; out[37] = 0;
+    let ic_ck = checksum(&out[34..flen]);
+    out[36] = (ic_ck >> 8) as u8; out[37] = ic_ck as u8;
+    flen
+}
+
 fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8; 42]) -> bool {
     if f.len() < 42 { return false; }
     if f[12] != 0x08 || f[13] != 0x06 { return false; }              // not ARP
@@ -2369,7 +2489,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let (pl_raw, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
             Some((len, badge, reply)) => (&heldbuf[..len], badge, reply),
             None => {
-                req = ctx.recv();
+                // WAIT FOR A CLIENT, BUT NOT FOREVER - answer for ourselves in the gaps.
+                //
+                // Two guards, and both of them refuse to poll rather than poll wrongly:
+                //
+                // UNCONFIGURED. With no address of our own there is nothing on the wire that is ours
+                // to answer, so blocking is both correct and free.
+                //
+                // NO CALIBRATED CLOCK. `duration_cycles` floors to ONE QUANTUM when the counter is
+                // uncalibrated (`backlog/27`), so a bounded wait silently becomes a spin and this
+                // loop would ask the driver for frames as fast as it can be scheduled - saturating
+                // `nic-driver` and, behind it, the USB stack. That is the silent-clock trap the
+                // backlog item is about, and the honest response to a missing clock is to not use it.
+                req = loop {
+                    if !gw_known || !tcpst.have_clock() { break ctx.recv(); }
+                    match ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) {
+                        Some(m) => break m,
+                        None => {
+                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
+                                                dns_server, status };
+                            // The gateway is the FALLBACK address for anything this poll originates;
+                            // every established connection carries its own peer MAC on the `Conn`,
+                            // so `poll_one` addresses its frames correctly whatever is passed here.
+                            let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                            poll_step(&ctx, pending, &st, &mut tcpst, &net);
+                        }
+                    }
+                };
                 // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
                 // name-addressed request (status / DNS / open-socket) carries no badge.
                 let badge = ctx.last_recv_badge();

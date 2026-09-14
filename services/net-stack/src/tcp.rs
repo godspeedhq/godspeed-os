@@ -171,6 +171,20 @@ pub struct Conn {
     /// it. 0 when the slot is free.
     pub rid: u64,
 
+    /// Where to address this connection's frames: the peer's own MAC when it is on-link, the
+    /// gateway's when it is not.
+    ///
+    /// **Per CONNECTION, not per service, and that distinction cost a day of hardware debugging.**
+    /// It was a single field on `Net` meaning "the gateway", which is wrong for a host on our own
+    /// subnet: our half of the flow goes through the router while the peer answers us directly, the
+    /// router sees one side and drops the rest, and the symptom is a handshake that reaches
+    /// Established and then nothing while `ping` to the same host works. Resolving it per connection
+    /// fixed that - but it was still being carried on `Net`, which is per CALL. The moment a
+    /// connection outlives the request that opened it, a background poll would emit with whatever
+    /// `Net` the caller happened to build, which is the gateway again. Storing it here makes that
+    /// impossible rather than merely unlikely.
+    pub peer_mac: [u8; 6],
+
     pub local_port: u16,
     pub remote_ip: [u8; 4],
     pub remote_port: u16,
@@ -277,7 +291,7 @@ pub struct Conn {
 impl Conn {
     pub const fn free() -> Self {
         Conn {
-            state: State::Closed, fault: Fault::None, rid: 0,
+            state: State::Closed, fault: Fault::None, rid: 0, peer_mac: [0; 6],
             local_port: 0, remote_ip: [0; 4], remote_port: 0,
             snd_una: 0, snd_nxt: 0, snd_wnd: 0, iss: 0, rcv_nxt: 0,
             snd_buf: [0u8; SND_BUF], snd_len: 0,
@@ -622,8 +636,8 @@ impl Tcp {
     /// unpredictable so a delayed segment from an old incarnation of the same connection cannot be
     /// accepted as current; a constant ISS makes that failure reachable on a machine that reboots
     /// fast, which this one does.
-    pub fn connect(&mut self, ctx: &ServiceContext, rid: u64, dst: [u8; 4], dport: u16)
-                   -> Option<usize> {
+    pub fn connect(&mut self, ctx: &ServiceContext, rid: u64, dst: [u8; 4], dport: u16,
+                   peer_mac: [u8; 6]) -> Option<usize> {
         let iss = (ctx.read_tsc() as u32) ^ 0x5a5a_0000;
         let port = self.next_port;
         self.next_port = if self.next_port >= 65000 { 49152 } else { self.next_port + 1 };
@@ -632,6 +646,7 @@ impl Tcp {
         let c = &mut self.conns[i];
         *c = Conn::free();
         c.rid = rid;
+        c.peer_mac = peer_mac;
         c.state = State::SynSent;
         c.local_port = port;
         c.remote_ip = dst;
@@ -767,7 +782,7 @@ pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
     // ---- fast retransmit, driven through the real state machine ----
     let mut t = Tcp::new(0, 0);          // no clock: timers are inert, which is what this wants
     let peer = [10, 0, 0, 2];
-    let Some(i) = t.connect(ctx, 7, peer, 80) else {
+    let Some(i) = t.connect(ctx, 7, peer, 80, net.peer_mac) else {
         check(false, "a connection slot is available for the self-test", &mut pass, &mut fail);
         return (pass, fail);
     };
@@ -824,7 +839,7 @@ pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
     t = Tcp::new(0, 0);
     {
         let t2 = &mut t;
-        if let Some(j) = t2.connect(ctx, 8, peer, 80) {
+        if let Some(j) = t2.connect(ctx, 8, peer, 80, net.peer_mac) {
             let (lp2, ack2) = { let c = &t2.conns[j]; (c.local_port, c.snd_nxt) };
             // Hand-built so the SYN flag is set but no option follows - `emit` always adds one.
             let m = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
@@ -850,7 +865,7 @@ pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
     // ---- the persist timer arms when the peer shuts its window ----
     t = Tcp::new(0, 0);
     let t3 = &mut t;
-    if let Some(j) = t3.connect(ctx, 9, peer, 80) {
+    if let Some(j) = t3.connect(ctx, 9, peer, 80, net.peer_mac) {
         let (lp3, ack3) = { let c = &t3.conns[j]; (c.local_port, c.snd_nxt) };
         let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
                      80, lp3, pseq, ack3, SYN | ACK, 8000, &[]);
@@ -1228,7 +1243,7 @@ impl Tcp {
                 c.last_adv = w;
                 c.rtt_timing = false;              // Karn: a resent segment cannot be timed
                 if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
-                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_una, c.rcv_nxt,
                             ACK | PSH, w, &tmp[..n]);
             }
@@ -1260,7 +1275,7 @@ impl Tcp {
             c.fast_retx = false;
 
             if c.state == State::SynSent {
-                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[]);
             }
             if c.snd_len > 0 {
@@ -1268,14 +1283,14 @@ impl Tcp {
                 let mut tmp = [0u8; MSS];
                 tmp[..n].copy_from_slice(&c.snd_buf[..n]);
                 let w = c.window();
-                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_una, c.rcv_nxt,
                             ACK | PSH, w, &tmp[..n]);
             }
             // Nothing buffered, so the unacknowledged thing is our FIN.
             if matches!(c.state, State::FinWait1 | State::LastAck) {
                 let w = c.window();
-                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_nxt.wrapping_sub(1), c.rcv_nxt,
                             ACK | FIN, w, &[]);
             }
@@ -1291,7 +1306,7 @@ impl Tcp {
             c.ack_due = false;
             let w = c.window();
             c.last_adv = w;
-            return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+            return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
         }
 
@@ -1314,7 +1329,7 @@ impl Tcp {
             let w = c.window();
             if w.saturating_sub(c.last_adv) >= WND_STEP {
                 c.last_adv = w;
-                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
             }
         }
@@ -1346,7 +1361,7 @@ impl Tcp {
                     if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
                     let w = c.window();
                     c.last_adv = w;
-                    return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                    return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | PSH, w, &tmp[..n]);
                 }
             }
@@ -1385,7 +1400,7 @@ impl Tcp {
                     if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
                     let w = c.window();
                     c.last_adv = w;
-                    return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                    return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK, w, &b);
                 }
             }
@@ -1400,7 +1415,7 @@ impl Tcp {
             c.state = if c.state == State::CloseWait { State::LastAck } else { State::FinWait1 };
             if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
             let w = c.window();
-            return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+            return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | FIN, w, &[]);
         }
         0
@@ -1414,7 +1429,7 @@ impl Tcp {
         c.rtt_timing = true;
         c.rtt_timed_seq = c.snd_nxt;
         c.rtt_timed_at_ms = now;
-        emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+        emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
              c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[])
     }
 
