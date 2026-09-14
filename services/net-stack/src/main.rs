@@ -821,9 +821,15 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_m
     None
 }
 
-/// Passes of the TCP transaction loop. A ceiling on work, not on time - `budget_ms` bounds the
-/// duration; this bounds how hard we may try inside it.
-const TCP_STEPS: usize = 400;
+/// Passes of the TCP transaction loop. A BACKSTOP on work, not the bound - `budget_ms` bounds the
+/// duration and is meant to be what actually stops us.
+///
+/// It was 400, and on hardware 400 unpaced passes took 0.4 SECONDS against an 8 second budget: the
+/// loop spun through its whole allowance while a 7 to 35 ms round trip was still in flight, then
+/// reported "the budget expired" having used a twentieth of it. QEMU hid this completely, because a
+/// SLIRP peer answers faster than the loop can spin. The real fix is the pacing below; this number is
+/// raised so that the TIME bound is the one that bites, which is what it always claimed to be.
+const TCP_STEPS: usize = 20_000;
 
 /// One complete TCP transaction, driven synchronously inside a client request.
 ///
@@ -863,6 +869,8 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
 
     let mut wrote = false;
     let mut got = 0usize;
+    // Consecutive passes that neither sent nor received anything.
+    let mut empty: u32 = 0;
 
     // ONE loop for the whole connection. Each pass: let the state machine emit whatever it owes
     // (retransmission, data, FIN), then drain one batch of frames into it.
@@ -879,10 +887,25 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
         let n = t.poll_one(ctx, net, i, &mut frame);
         if n > 0 {
             feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS));
+            empty = 0;
         } else {
             // Nothing to send: ask for received frames explicitly, or a peer that is talking while
             // we are silent would never be heard.
-            feed_batch(ctx, t, net, nic_drain(ctx));
+            if feed_batch(ctx, t, net, nic_drain(ctx)) { empty = 0; } else { empty += 1; }
+        }
+
+        // PACE AN EMPTY PASS. Without this the loop spins: nothing to send, nothing received, and
+        // another pass immediately - which burned 400 passes in 0.4 s on hardware while the peer's
+        // reply was still on the wire. The shape is `drain_scan`'s and the reasoning is the same one
+        // recorded there: yield for the first few, because a reply usually follows the frame that
+        // prompted it and the moments just after traffic are the worst time to go blind; only sleep
+        // once the wire really has nothing.
+        if empty > 0 {
+            if empty <= EMPTY_YIELDS {
+                ctx.yield_cpu();
+            } else {
+                ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+            }
         }
 
         // Collect whatever has been delivered in order.
