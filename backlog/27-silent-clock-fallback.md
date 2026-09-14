@@ -71,3 +71,47 @@ re-testing, so per 26.7 it is written down rather than half-started.
 2. A checker for the pattern - a measurement helper that converts "unavailable" into a plausible
    number - which is the mechanisable half of Commandment VIII and does not exist yet. The other
    half (wait on truth, bound it by a clock) this code already got right.
+
+---
+
+## Investigation 2026-09-14: which ports actually return 0, and why the fix was deferred
+
+Stopped before changing anything - the fix alters behaviour on a path every service uses, so it
+cannot be byte-identical and needs a run on all five boards. Recorded rather than half-made (26.7).
+
+**Query 16 is `arch::imp::boot::tsc_ticks_per_quantum()`** (`syscall/dispatch.rs:2103`). Per port:
+
+| port | answer | note |
+|------|--------|------|
+| x86_64 | calibrated | the T630's value is recorded elsewhere as roughly 1000x too small (CPUID 0x15/0x16 are Intel-only, this is AMD) - NON-zero, so `duration_cycles` does not fall back, it just lies |
+| arm | `timer_hz() / 100` | derived from the hardware |
+| aarch64 | **0 unless the `pi4` feature is set** | `#[cfg(not(feature = "pi4"))] pub fn tsc_ticks_per_quantum() -> u64 { 0 }` |
+| riscv64 | derived | |
+| riscv32, loongarch64, s390x | **0** | scaffolds, expected |
+
+**The aarch64 one is the live edge.** An aarch64 build without `pi4` answers 0, and the comment
+directly above that stub already spells out the consequence, in the project's own words: it
+"collapses EVERY timed wait to a single tick. Left stubbed, a service asking to sleep one second
+slept 10 ms - so `ping`, which sends once a second by contract, sent about a hundred times that and
+buried the shell's prompt under 96,000 log lines. The 32-bit port spent its whole bring-up with the
+same stub and the same silent 100x error."
+
+So this failure is not hypothetical and is not new - it has bitten twice, and the site documents it.
+What this entry adds is the layer above: `duration_cycles` turns that 0 into **1** and says nothing,
+and 88 call sites build deadlines on it. The kernel-side stub is honest about being a stub; the SDK
+converts it into a plausible number.
+
+**Also worth a porter's attention:** all three scaffolds answer 0. A scaffold that ever reaches
+userspace (M4 on the `scaffold_check` ladder) inherits collapsed deadlines everywhere before anyone
+has written a timer, which will present as "everything is instantaneous and nothing waits" rather
+than as a missing clock.
+
+**Shape of the fix, unchanged from above, with the cost now measured:**
+
+1. Cheapest and safest: keep the signature, make the uncalibrated case LOUD once per service, and
+   leave the returned value alone. Timing behaviour identical; a silent degradation becomes a
+   reported one (invariant 12). Still a retest, because it is new code on every service's path.
+2. Honest: `duration_cycles` returns `Option<u64>` (or `(cycles, calibrated)`) so a caller must decide
+   what to do with no clock. 88 call sites across ten service files, every board re-tested.
+
+Do 1 before 2. Neither is a constant-sized change, which is why this is scheduled rather than done.
