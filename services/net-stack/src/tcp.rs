@@ -386,6 +386,11 @@ pub struct Tcp {
     base_tsc: u64,
     /// Said once, when a clock is missing, so the operator learns why timers are inert.
     warned_no_clock: bool,
+    /// How far the LAST transaction got, kept after its slot is released. A connection that never
+    /// left `SynSent` and one that reached `Established` and was answered with nothing are the same
+    /// empty reply to a client and completely different faults to diagnose.
+    pub last_state: State,
+    pub last_retx: u8,
 }
 
 impl Tcp {
@@ -396,6 +401,8 @@ impl Tcp {
             cyc_per_ms: tsc_hz / 1000,
             base_tsc: now_tsc,
             warned_no_clock: false,
+            last_state: State::Closed,
+            last_retx: 0,
         }
     }
 

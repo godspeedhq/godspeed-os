@@ -902,6 +902,11 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
     }
 
     let fault = t.conns[i].fault;
+    // Carried out of the connection before the slot is released, so the op arm can say how far this
+    // got. Without it, a transaction that simply never connected is indistinguishable from one that
+    // connected and was answered with nothing.
+    t.last_state = t.conns[i].state;
+    t.last_retx = t.conns[i].retx_count;
     // Best effort: send our FIN if we still owe one, then let the slot go. A connection left in the
     // table would hold an arena for nothing.
     t.close(1);
@@ -2245,9 +2250,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let n = if pl.len() >= 7 && gw_known {
                 let dip = [pl[1], pl[2], pl[3], pl[4]];
                 let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
+                // LOG THE REQUEST AS RECEIVED, not as anyone believes they typed it. On the Pi 2 the
+                // console interleaves driver status with keystrokes, so a garbled line reaches here
+                // as a different address entirely - and without this the log shows an outcome for a
+                // destination nobody can confirm. This is the only place that knows what was
+                // actually asked for.
+                ctx.log_fmt(format_args!(
+                    "net-stack: tcp -> {}.{}.{}.{}:{}, {} byte request",
+                    dip[0], dip[1], dip[2], dip[3], dport, pl.len() - 7));
                 let net = tcp::Net { our_mac, gw_mac, our_ip };
                 match tcp_transact(&ctx, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp, 8_000) {
-                    Ok(got) => got,
+                    // A SUCCESSFUL-BUT-EMPTY transaction used to log NOTHING, while the shell told
+                    // the user to "see its log for the reason". A message that points at an absent
+                    // explanation is worse than silence: it sends the reader looking for something
+                    // that was never written (§26.7). `tcp_transact` now reports how far the
+                    // connection actually got, so "nothing came back" is always attributable.
+                    Ok(0) => {
+                        ctx.log_fmt(format_args!(
+                            "net-stack: tcp {}.{}.{}.{}:{} returned no data - reached state '{}' \
+                             ({} retransmission(s)); no fault was recorded, so the budget expired",
+                            dip[0], dip[1], dip[2], dip[3], dport,
+                            tcpst.last_state.name(), tcpst.last_retx));
+                        0
+                    }
+                    Ok(got) => {
+                        ctx.log_fmt(format_args!(
+                            "net-stack: tcp {}.{}.{}.{}:{} ok - {} byte(s)",
+                            dip[0], dip[1], dip[2], dip[3], dport, got));
+                        got
+                    }
                     Err(f) => {
                         ctx.log_fmt(format_args!(
                             "net-stack: tcp {}.{}.{}.{}:{} failed - {}",
