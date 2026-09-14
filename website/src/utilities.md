@@ -99,6 +99,7 @@ fails.
 | [`net`](utilities/net.md) | am I on the network? |
 | [`sock`](utilities/sock.md) | a UDP socket as a capability |
 | [`ping`](utilities/ping.md) | continuous ICMP echo |
+| [`tcp`](utilities/tcp.md) | one TCP transaction: connect, send, read, close |
 
 ### Scripting
 

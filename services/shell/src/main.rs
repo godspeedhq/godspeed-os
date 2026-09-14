@@ -794,7 +794,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace",
+    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -1622,6 +1622,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
+        "tcp"     => cmd_tcp(ctx, &args[..argc], out),
         "uptime"  => cmd_uptime(ctx),
         "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
         "gpio"    => cmd_gpio(ctx, if argc >= 2 { args[1] } else { "" }, if argc >= 3 { args[2] } else { "" }),
@@ -6202,6 +6203,65 @@ fn dns_query_bytes(host: &str, buf: &mut [u8]) -> usize {
 /// `sock` - demonstrate a UDP socket as a CAPABILITY (utilities/41_sock.md). Opens a socket cap from
 /// net-stack, sends a datagram through it, and reports the round-trip - proving a socket is a real
 /// kernel capability the client holds and invokes (§7.10), not an ambient channel. A pipe producer.
+/// `tcp <ip> <port> [text]` - open a TCP connection, send `text`, print what comes back, close.
+///
+/// One transaction per invocation, which is what net-stack can currently do: a background TCP engine
+/// needs `docs/net-tags-design.md` phase 2/3 first, because net-stack receives driver replies and
+/// client requests on one untagged endpoint. This exercises the whole state machine - handshake,
+/// sequencing, cumulative ACK, retransmission, FIN - against a real peer.
+fn cmd_tcp(ctx: &ServiceContext, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
+    if args.len() < 3 || args[1] == "help" {
+        out.line(ctx, "usage: tcp <ip> <port> [text]   - one TCP transaction; prints the reply");
+        return Ok(());
+    }
+    let ip = match parse_ipv4(args[1]) {
+        Some(v) => v,
+        None => { out.line(ctx, "tcp: first argument must be an IPv4 address, as 10.0.2.2"); return Err(ShellError::Unknown); }
+    };
+    let port: u16 = match args[2].parse() {
+        Ok(p) if p > 0 => p,
+        _ => { out.line(ctx, "tcp: second argument must be a port, 1 to 65535"); return Err(ShellError::Unknown); }
+    };
+
+    let mut payload = [0u8; 512];
+    payload[0] = 21;
+    payload[1..5].copy_from_slice(&ip);
+    payload[5] = (port >> 8) as u8;
+    payload[6] = port as u8;
+    let mut n = 7;
+    for (k, a) in args.iter().enumerate().skip(3) {
+        if k > 3 && n < payload.len() { payload[n] = b' '; n += 1; }
+        let b = a.as_bytes();
+        let take = b.len().min(payload.len() - n);
+        payload[n..n + take].copy_from_slice(&b[..take]);
+        n += take;
+    }
+
+    match netstack_request(ctx, &payload[..n]) {
+        Some(r) => {
+            let got = r.payload_bytes();
+            if got.is_empty() {
+                // NOT "no reply". net-stack answered; the connection produced nothing, and it has
+                // already logged why. Saying which of the two happened is the difference between a
+                // diagnosis and a shrug.
+                out.line(ctx, "tcp: connected to nothing - net-stack answered with no data (see its log for the reason)");
+            } else {
+                out.line_fmt(ctx, format_args!("tcp: {} byte(s) back", got.len()));
+                // Render printable bytes; anything else as a dot, so a binary reply does not spray
+                // control codes at a terminal that will act on them.
+                let mut line = [0u8; 256];
+                let take = got.len().min(line.len());
+                for i in 0..take {
+                    line[i] = if got[i] >= 0x20 && got[i] < 0x7f { got[i] } else { b'.' };
+                }
+                if let Ok(txt) = core::str::from_utf8(&line[..take]) { out.line(ctx, txt); }
+            }
+            Ok(())
+        }
+        None => { out.line(ctx, "tcp: net-stack did not answer"); Err(ShellError::Unknown) }
+    }
+}
+
 fn cmd_sock(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     let sock = match sock_open(ctx) {
         Some(c) => c,

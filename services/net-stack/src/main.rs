@@ -821,6 +821,146 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_m
     None
 }
 
+/// Passes of the TCP transaction loop. A ceiling on work, not on time - `budget_ms` bounds the
+/// duration; this bounds how hard we may try inside it.
+const TCP_STEPS: usize = 400;
+
+/// One complete TCP transaction, driven synchronously inside a client request.
+///
+/// **Why this shape, and what it is not.** `docs/net-tags-design.md` forbids any unsolicited driver
+/// traffic until its phase 2/3 land: net-stack serves clients and receives nic-driver replies on ONE
+/// untagged endpoint, so a background poll consumes client messages. That makes a BACKGROUND TCP
+/// engine a prerequisite-blocked change, and it is recorded as the next step rather than smuggled in
+/// here.
+///
+/// What is not blocked is driving the same state machine from inside a request, which is exactly how
+/// `udp_roundtrip` and `ping` already work and opens no window that is not already open. So this
+/// connects, sends, reads until the peer closes or the budget expires, and closes - exercising the
+/// handshake, sequencing, cumulative ACK, retransmission and the FIN exchange end to end.
+///
+/// Bounded twice over: `budget_ms` caps the whole transaction, and every inner loop has its own
+/// iteration ceiling, so a peer that answers slowly costs a deadline and a peer that answers never
+/// costs the same.
+fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
+                dst: [u8; 4], dport: u16, req: &[u8], out: &mut [u8],
+                budget_ms: u64) -> Result<usize, tcp::Fault> {
+    let mut frame = [0u8; 1600];
+    let start = t.now_ms(ctx).unwrap_or(0);
+    let deadline = start + budget_ms;
+
+    let i = match t.connect(ctx, 1, dst, dport) { Some(i) => i, None => return Err(tcp::Fault::None) };
+
+    // The opening SYN. Sent through the same path every other frame uses, and its reply may already
+    // carry the SYN-ACK - nic-driver answers a TX with whatever it has received.
+    let n = t.syn_frame(ctx, net, i, &mut frame);
+    if n > 0 { feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS)); }
+
+    let mut wrote = false;
+    let mut got = 0usize;
+
+    // ONE loop for the whole connection. Each pass: let the state machine emit whatever it owes
+    // (retransmission, data, FIN), then drain one batch of frames into it.
+    for _ in 0..TCP_STEPS {
+        if t.now_ms(ctx).unwrap_or(0) >= deadline { break; }
+
+        // Hand the request over as soon as the handshake completes.
+        if !wrote && t.conns[i].state == tcp::State::Established {
+            t.write(1, req);
+            wrote = true;
+        }
+
+        // Emit. `poll_one` returns at most one frame, so this is bounded by MAX_CONNS trivially.
+        let n = t.poll_one(ctx, net, i, &mut frame);
+        if n > 0 {
+            feed_tx(ctx, t, net, nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS));
+        } else {
+            // Nothing to send: ask for received frames explicitly, or a peer that is talking while
+            // we are silent would never be heard.
+            feed_batch(ctx, t, net, nic_drain(ctx));
+        }
+
+        // Collect whatever has been delivered in order.
+        if t.conns[i].readable() > 0 && got < out.len() {
+            got += t.read(1, &mut out[got..]);
+        }
+
+        let st = t.conns[i].state;
+        if st == tcp::State::Closed { break; }
+        // The peer said it is done sending. Take what is left and close from our side.
+        if st == tcp::State::CloseWait && wrote {
+            t.close(1);
+        }
+    }
+
+    let fault = t.conns[i].fault;
+    // Best effort: send our FIN if we still owe one, then let the slot go. A connection left in the
+    // table would hold an arena for nothing.
+    t.close(1);
+    let n = t.poll_one(ctx, net, i, &mut frame);
+    if n > 0 { let _ = nic_req(ctx, &Message::from_bytes(&frame[..n]), LINK_SECS); }
+    t.forget(1);
+
+    if got == 0 && fault != tcp::Fault::None { Err(fault) } else { Ok(got) }
+}
+
+/// Feed one RAW frame into the state machine and send whatever it answers with.
+///
+/// Returns true if the frame was a TCP segment for us, so a caller can tell "nothing arrived" from
+/// "something arrived and was not ours" - two different silences.
+fn feed_frame(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, f: &[u8]) -> bool {
+    if f.len() < tcp::HDR { return false; }
+    let mut out = [0u8; 1600];
+    let n = t.on_frame(ctx, net, f, &mut out);
+    if n > 0 {
+        // The answer (an ACK, or a RST). Its own reply may carry the next segment, so that one frame
+        // is fed back - ONE level, deliberately, rather than recursing at a remote peer's pace.
+        if let Some(m) = nic_req(ctx, &Message::from_bytes(&out[..n]), LINK_SECS) {
+            let f2 = m.payload_bytes();
+            if f2.len() >= tcp::HDR {
+                let mut out2 = [0u8; 1600];
+                let n2 = t.on_frame(ctx, net, f2, &mut out2);
+                if n2 > 0 { let _ = nic_req(ctx, &Message::from_bytes(&out2[..n2]), LINK_SECS); }
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Feed a DRAIN BATCH (op 9) into the state machine.
+///
+/// A drain reply is `[count, (len_u16_le, frame) x count]` - NOT a bare frame. Treating it as one is
+/// what made the first end-to-end run fail with the peer retransmitting its SYN-ACK six times while
+/// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
+/// The pcap is what made that readable, because the guest's own log could only say "nothing came".
+/// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
+fn feed_batch(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
+    let m = match reply { Some(m) => m, None => return false };
+    let p = m.payload_bytes();
+    if p.is_empty() { return false; }
+    let count = p[0] as usize;
+    let mut pos = 1usize;
+    let mut any = false;
+    for _ in 0..count {
+        if pos + 2 > p.len() { break; }
+        let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+        pos += 2;
+        if pos + fl > p.len() { break; }
+        if feed_frame(ctx, t, net, &p[pos..pos + fl]) { any = true; }
+        pos += fl;
+    }
+    any
+}
+
+/// Feed the reply to a TRANSMISSION, which carries at most one raw frame (the shape
+/// `udp_roundtrip` already relies on).
+fn feed_tx(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
+    match reply {
+        Some(m) => feed_frame(ctx, t, net, m.payload_bytes()),
+        None => false,
+    }
+}
+
 /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
 /// A fixed anycast NTP server (time.cloudflare.com) used if DNS cannot resolve a pool name - so a DNS
@@ -1678,7 +1818,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // console AFTER the shell had already printed its prompt - leaving `gsh> net-stack: ...` on one
     // line at boot. Announcing first is also the more honest order: this reports that the service came
     // up, and the dance below reports its own result (offer/no offer) as it happens.
-    ctx.log("net-stack: serving the client API (status/dns/socket)");
+    ctx.log("net-stack: serving the client API (status/dns/socket/tcp)");
+
+    // THE TCP TABLE, owned here rather than in a static: a service holds no unowned global mutable
+    // state (Commandment VI). This struct IS the memory cost of TCP in this service, and its bounds
+    // are the constants at the top of `tcp.rs`.
+    //
+    // The clock is read ONCE, here, and its absence is reported once. `backlog/27`: a deadline built
+    // from an uncalibrated clock collapses to now, so a stack that asked per-timer would silently
+    // retransmit instantly and forever on a port without calibration.
+    let mut tcpst = tcp::Tcp::new(calibrate_tsc_hz(&ctx), ctx.read_tsc());
+    tcpst.warn_if_no_clock(&ctx);
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
@@ -2066,6 +2216,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
             }
+        } else if pl.first() == Some(&21) {
+            // TCP TRANSACT (op 21): [21, ip(4), port_hi, port_lo, request bytes...].
+            // Connect, send, read until the peer closes or the budget expires, close. Reply carries
+            // whatever came back, or is EMPTY on failure - and the failure is logged with its reason
+            // rather than folded into "nothing came back" (§26.7: a reported failure beats a
+            // detected one).
+            //
+            // Driven inside the request, not from a background poll, because
+            // `docs/net-tags-design.md` forbids unsolicited driver traffic until its phase 2/3 land.
+            // That is the next step and it is recorded, not smuggled in here.
+            let mut resp = [0u8; 1400];
+            let n = if pl.len() >= 7 && gw_known {
+                let dip = [pl[1], pl[2], pl[3], pl[4]];
+                let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
+                let net = tcp::Net { our_mac, gw_mac, our_ip };
+                match tcp_transact(&ctx, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp, 8_000) {
+                    Ok(got) => got,
+                    Err(f) => {
+                        ctx.log_fmt(format_args!(
+                            "net-stack: tcp {}.{}.{}.{}:{} failed - {}",
+                            dip[0], dip[1], dip[2], dip[3], dport,
+                            match f {
+                                tcp::Fault::Reset => "peer reset the connection",
+                                tcp::Fault::RetxExhausted => "no acknowledgement after 6 retransmissions",
+                                tcp::Fault::ConnectTimeout => "no answer to our SYN",
+                                tcp::Fault::None => "no data and no fault (budget expired)",
+                            }));
+                        0
+                    }
+                }
+            } else {
+                if !gw_known { ctx.log("net-stack: tcp asked for before the stack is configured"); }
+                0
+            };
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&resp[..n]));
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
             // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +
