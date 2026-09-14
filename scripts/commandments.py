@@ -516,6 +516,130 @@ def check_kernel_service_table(check, pins):
 
 
 # --------------------------------------------------------------------------------------------------
+# Commandment III - thou shalt not duplicate truth
+# --------------------------------------------------------------------------------------------------
+
+_CONST_DECL = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?const\s+([A-Z][A-Z0-9_]*)\s*:'
+                         r'\s*[A-Za-z0-9_:<>, ]+\s*=\s*(0x[0-9a-fA-F_]+|\d[\d_]*)\s*;')
+_FN_DECL = re.compile(r'\bfn\s+[A-Za-z_]')
+
+
+def _const_num(s):
+    s = s.replace("_", "")
+    return int(s, 16) if s.lower().startswith("0x") else int(s, 10)
+
+
+def _const_crate(path):
+    """Which trust domain a file belongs to. Each ISA under `arch/` is its own, because only one is
+    ever compiled - two arches naming the same constant are not duplicating anything."""
+    if path.startswith("kernel/src/arch/"):
+        return "arch/" + path.split("/")[3]
+    if path.startswith("kernel/src/"):
+        return "kernel"
+    if path.startswith("sdk/"):
+        return "sdk"
+    if path.startswith("services/"):
+        return "svc/" + path.split("/")[1]
+    return "?"
+
+
+def _module_level_consts(text):
+    """Integer consts declared at MODULE level, as [(NAME, value)].
+
+    A const inside a `fn` body is scoped to that call and is not a second copy of anything. Counting
+    them produced two confident false findings on the first run: `syscall/dispatch.rs` has a
+    function-local `NAME_MAX` and a function-local `MAX_ENTRIES`, and both were reported as
+    contradicting the module-level ones in `ipc/names.rs`, which mean entirely different things.
+    """
+    out, depth, fn_depths = [], 0, []
+    for line in re.sub(r'//[^\n]*', '', text).split("\n"):
+        m = _CONST_DECL.match(line)
+        if m and not fn_depths:
+            out.append((m.group(1), _const_num(m.group(2))))
+        opens, closes = line.count("{"), line.count("}")
+        if _FN_DECL.search(line) and opens:
+            fn_depths.append(depth)
+        depth += opens - closes
+        while fn_depths and depth <= fn_depths[-1]:
+            fn_depths.pop()
+    return out
+
+
+def check_duplicate_constants(check, pins):
+    """Commandment III: one fact, one place. A constant defined in two files of one crate is two.
+
+    THE TEST THE COMMANDMENT SETS is "does it reduce to one source, and does that source win?" - which
+    in general is undecidable, and no checker will ever answer it. What IS decidable is its crudest
+    and most common instance: the same module-level constant declared in two files of the same crate.
+    Whatever it means, it is now stored twice, and the two are free to drift with nothing to say which
+    is right. `use` the other one.
+
+    Two shapes, reported differently because they are different mistakes:
+      - SAME value: one fact, two copies. The classic. Change one and the system quietly disagrees
+        with itself. This repository has had it before, inside a portability leak: a bare `0x2A` in a
+        neutral arm list while `arch/aarch64/exceptions.rs` already defined `GENET_VECTOR = 0x2A`.
+      - DIFFERENT values: two facts wearing one name, in one crate. Not drift - worse to read, because
+        nothing is wrong at either site and a reader cannot tell which fact they have. `nic-driver`
+        has `RX_RING_OFF` at 0x100 (the dwmac arena) and at 0x2000 (the RTL8168 arena).
+
+    WHAT IT DELIBERATELY DOES NOT DO. An earlier draft matched by VALUE - any literal equal to a named
+    constant - and an earlier one still compared against every constant the arch seam defines. Both
+    were abandoned after measurement, and the numbers are worth recording so nobody rebuilds them:
+    value-matching produced 322 candidates at a threshold of 4096 and 3381 at 8, and seam-matching
+    produced 715, essentially all of them coincidence (`0x3F` is a mask in one place and
+    `PIN_DOEN_MASK` in another). A baseline of several hundred entries is not a gate, it is a
+    graveyard. Matching by NAME within one crate gives 31, every one of them readable.
+
+    Each ISA under `arch/` is its own crate here: only one is ever compiled, so two arches declaring
+    the same constant are not duplicating a thing.
+    """
+    debt = set(pins.get("duplicate_const_debt", []) or [])
+    by_key = {}
+    for root in ("kernel/src", "sdk/rust/src", "services"):
+        base = os.path.join(ROOT, root)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in ("target", ".git")]
+            for fn in filenames:
+                if not fn.endswith(".rs"):
+                    continue
+                full = os.path.join(dirpath, fn)
+                relp = os.path.relpath(full, ROOT).replace("\\", "/")
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    for nm, val in _module_level_consts(fh.read()):
+                        by_key.setdefault((_const_crate(relp), nm), set()).add((relp, val))
+
+    out, seen = [], set()
+    for (crate, nm), places in sorted(by_key.items()):
+        if len({f for f, _ in places}) < 2:
+            continue
+        key = f"{crate}:{nm}"
+        if key in debt:
+            seen.add(key)
+            continue
+        where = ", ".join(sorted(f for f, _ in places))
+        if len({v for _, v in places}) == 1:
+            out.append(Violation(sorted(places)[0][0], 0,
+                                 f"`{nm}` is declared in {len(places)} files of `{crate}` with the "
+                                 f"same value ({where}). One fact, stored twice, free to drift with "
+                                 f"nothing to say which is right - `use` the other."))
+        else:
+            vals = ", ".join(f"{f}={hex(v)}" for f, v in sorted(places))
+            out.append(Violation(sorted(places)[0][0], 0,
+                                 f"`{nm}` is declared in `{crate}` with DIFFERENT values ({vals}). "
+                                 f"Two facts wearing one name: nothing is wrong at either site and a "
+                                 f"reader cannot tell which fact they have. Rename one."))
+
+    for stale in sorted(debt - seen):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"duplicate_const_debt lists {stale}, which is no longer declared twice. "
+                             f"Delete the entry - a list not tightened when the debt shrinks rots into "
+                             f"a permanent exemption."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 # Commandment IV - thou shalt honor service contracts
 # --------------------------------------------------------------------------------------------------
 
@@ -1194,6 +1318,24 @@ CHECKS = [
              # updated in the same commit rather than the fix being invisible.
              dict(why="no peripheral driver remains in arch/ - both were deleted in arm32 slice 5",
                   pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="III-duplicate-constants", commandment="III",
+         title="one fact, one place - no constant declared twice in a crate",
+         kind="custom", fn=check_duplicate_constants,
+         scope="module-level integer consts in kernel/src, sdk/rust/src and services, grouped by "
+               "crate (each arch/<isa> its own)",
+         proves="no module-level constant is stored twice inside one crate, in either shape: two "
+                "copies of one fact (free to drift), or two facts under one name (unreadable)",
+         does_not_prove="the commandment itself. 'Does this reduce to one source, and does that "
+                        "source win' is undecidable; this catches its crudest instance only. It sees "
+                        "no derived VIEW without a repair path, nothing non-integer, and nothing "
+                        "duplicated across crates. Matching by VALUE instead was measured and "
+                        "abandoned: 322 candidates at a threshold of 4096, essentially all "
+                        "coincidence",
+         probes=[
+             dict(why="a stale debt entry must be caught",
+                  pins={"duplicate_const_debt": ["kernel:NO_SUCH_CONSTANT_EXISTS"]}, expect=True),
+             dict(why="the real debt list against the real tree must pass", pins=None, expect=False),
          ]),
     dict(nature="rule", id="IV-contract-authority", commandment="IV",
          title="a contract's claim of authority matches what is actually granted",

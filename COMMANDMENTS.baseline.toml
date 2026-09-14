@@ -282,6 +282,51 @@ reacquire_api = [
 # Recorded rather than fixed because the fix is Rust in five services, and that is the operator's
 # call. Each is small: reacquire `events` on `Err` from the emit path.
 peer_reacquire_debt = ["console", "dwc2", "ehci", "hw-enumerator", "xhci"]
+# Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
+# `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
+#
+# 29 are one fact stored twice with the SAME value - a `use` away from being one. Two are the other
+# shape, the same name carrying DIFFERENT facts in one crate:
+#   svc/nic-driver RX_RING_OFF   0x100 (the dwmac arena) and 0x2000 (the RTL8168 arena)
+#   svc/dwc2       DATA_OFF      0x40 and 0x400
+# Nothing is wrong at either site, which is what makes that shape worth a name: a reader of
+# `RX_RING_OFF` in nic-driver cannot tell which device arena they are holding.
+#
+# Recorded rather than fixed because every fix is Rust in a shipping service, and this tree is
+# hardware-verified on five machines.
+duplicate_const_debt = [
+  "arch/aarch64:ENTRIES",
+  "arch/aarch64:PAGE",
+  "arch/aarch64:PAGE_SIZE",
+  "arch/aarch64:USER_CODE_VA",
+  "arch/aarch64:USER_END",
+  "arch/aarch64:USER_STACK_VA",
+  "arch/aarch64:XHCI_MSI_VECTOR",
+  "arch/arm:LOCAL_BASE",
+  "arch/arm:PERIPH_BASE",
+  "svc/dwc2:CH_BULK",
+  "svc/dwc2:CH_KBD",
+  "svc/dwc2:CH_NET",
+  "svc/dwc2:CH_NET_RX",
+  "svc/dwc2:DATA_OFF",
+  "svc/dwc2:DESC_CONFIG",
+  "svc/dwc2:DESC_ENDPOINT",
+  "svc/dwc2:DESC_INTERFACE",
+  "svc/dwc2:EP_TYPE_BULK",
+  "svc/dwc2:PID_DATA0",
+  "svc/dwc2:PID_DATA1",
+  "svc/dwc2:PID_SETUP",
+  "svc/nic-driver:BATCH_MAX",
+  "svc/nic-driver:BATCH_MSG_MAX",
+  "svc/nic-driver:FRAME_MAX",
+  "svc/nic-driver:GMAC_ADDR_HIGH0",
+  "svc/nic-driver:GMAC_ADDR_LOW0",
+  "svc/nic-driver:RX_BUF_OFF",
+  "svc/nic-driver:RX_RING_OFF",
+  "svc/nic-driver:TX_BUF_OFF",
+  "svc/nic-driver:TX_RING_OFF",
+  "svc/nic-driver:UNCALIBRATED_POLLS",
+]
 [kernel.kernel_support_roles]
 arch-layer       = "§4.1 architecture layer; §18.1 (the unsafe boundary)"
 syscall-entry    = "§8.2 - the entry to the six, not a seventh"
