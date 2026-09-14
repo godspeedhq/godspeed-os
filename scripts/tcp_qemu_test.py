@@ -143,8 +143,33 @@ def decode_pcap(path):
         seq, ackn = struct.unpack(">II", pkt[t + 4:t + 12])
         flags = pkt[t + 13]
         plen = max(0, (14 + ip_total) - (t + doff))
-        segs.append((flags, seq, ackn, plen))
+        # The OPTIONS, not just their length. A stack can advertise a maximum segment size or fail to,
+        # and from the outside those look identical in every other field - so the only way to check it
+        # is to read the bytes off the wire.
+        opts = bytes(pkt[t + 20:t + doff])
+        segs.append((flags, seq, ackn, plen, opts))
     return segs, None
+
+
+def mss_option(opts):
+    """The MSS from a TCP option field, or None. Walks the list, as a receiver must."""
+    i = 0
+    while i < len(opts):
+        kind = opts[i]
+        if kind == 0:                      # End of Option List
+            return None
+        if kind == 1:                      # No-Operation
+            i += 1
+            continue
+        if i + 1 >= len(opts):
+            return None
+        ln = opts[i + 1]
+        if ln < 2 or i + ln > len(opts):
+            return None
+        if kind == 2 and ln == 4:
+            return struct.unpack(">H", opts[i + 2:i + 4])[0]
+        i += ln
+    return None
 
 
 def main():
@@ -272,6 +297,21 @@ def main():
             ok = False
 
     # ---- second scenario: a reply that spans several segments -----------------------------------
+    #
+    # DIAGNOSE A WRONG IMAGE BEFORE REPORTING SEVENTEEN FAILURES.
+    #
+    # `build/os.img` is written by several osdev subcommands and the last one wins. `osdev test
+    # identity` writes an IDENTITY-ONLY image, which boots perfectly and has no shell - so this
+    # script then reports every assertion failing, including ones about the wire, and none of them
+    # says why. It has already cost one debugging session on this branch. The file's existence is not
+    # the question; which build wrote it is, and the guest answers that by reaching a prompt or not.
+    if not ok_boot:
+        print("tcp-qemu: the guest never reached a shell prompt.")
+        print("tcp-qemu: build/os.img is written by SEVERAL osdev commands and the last one wins -")
+        print("tcp-qemu:   `osdev test identity` writes an identity-only image, which has no shell.")
+        print("tcp-qemu: run `cargo run -p osdev --release -- test shell` (which writes the full")
+        print("tcp-qemu:   image), then this script, with nothing in between.")
+        print("")
     print("tcp-qemu: guest side")
     check(ok_boot, "the guest booted, reached a prompt and took a DHCP lease")
     check(b"echo:" + PAYLOAD in r1, "single segment: the guest printed the echo the host sent back")
@@ -314,6 +354,32 @@ def main():
               % len(big))
         check(len(fins) >= 3, "FINs from both sides across both connections (%d)" % len(fins))
         check(len(rsts) == 0, "no RST anywhere (%d)" % len(rsts))
+
+        # OUR SYN MUST ADVERTISE A MAXIMUM SEGMENT SIZE.
+        #
+        # Checked on the wire rather than taken from the guest's word for it, because the failure
+        # this guards is entirely invisible from inside: a peer that receives no MSS option must
+        # assume 536 (RFC 1122 4.2.2.6), so a silent stack still WORKS - it just gets talked to in
+        # 536-byte pieces forever, on every connection, with nothing anywhere reporting it. That is
+        # the shape of bug this whole second instrument exists for.
+        ours = [mss_option(x[4]) for x in syn]
+        # `ours` NON-EMPTY, explicitly. `all()` over an empty list is True, so without this the three
+        # checks below would report OK on a capture containing no SYN at all - an instrument printing
+        # a pass it did not earn, which is the one failure mode a second instrument must not have.
+        check(len(ours) >= 2 and all(m is not None for m in ours),
+              "our SYN advertises a maximum segment size (%s)" % ours)
+        check(len(ours) >= 2 and all(m == 1460 for m in ours),
+              "the advertised MSS is the ethernet 1460, not a smaller guess (%s)" % ours)
+        # And the option field must still PARSE as a whole: a data offset that disagrees with the
+        # bytes after it is the classic way to get an option wrong, and it would be read by the peer
+        # as a corrupt header rather than as our MSS.
+        check(len(syn) >= 2 and all(len(x[4]) == 4 for x in syn),
+              "the SYN option field is exactly the 4-byte MSS option (%s)"
+              % [len(x[4]) for x in syn])
+        # The peer's, if it sent one: not asserted as a value, because it is the peer's business, but
+        # reported so a run that negotiated something unexpected says so instead of looking normal.
+        theirs = [mss_option(x[4]) for x in synack]
+        print("tcp-qemu:   (the peer offered %s)" % theirs)
         if syn and synack:
             check(synack[0][2] == (syn[0][1] + 1) & 0xFFFFFFFF,
                   "the peer acknowledged our ISS+1 (handshake sequencing is correct)")

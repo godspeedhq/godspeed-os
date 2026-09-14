@@ -275,6 +275,8 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 | | |
 |---|---|
 | **done** | every conversation with `nic-driver` goes through a SIFTING wait, so a client request met during one is identified rather than consumed and mis-served. Dropped with its capability reclaimed and counted - `docs/net-tags-design.md` phase 2, which previously guarded one call site out of sixteen |
+| **done** | a client displaced by net-stack's OWN unsolicited work (the clock nudge) is HELD for up to 500 ms and served, instead of lost. Scoped to that one region on purpose; net-tags §7.4 has the measurement and the reason the broad version was withdrawn |
+| **done** | the protocol itself: a maximum-segment-size option on every SYN and the peer's honoured, RFC 5681 congestion control (slow start, congestion avoidance, fast retransmit, NewReno fast recovery), and the persist timer this page used to record as missing |
 | **next** | correlation on the CLIENT hop: a tag net-stack echoes, so a client can discard a reply to a question it is no longer asking. This is the real prerequisite for deferring a request at all, and it is NOT the tag `docs/net-tags-design.md` describes - that one is for the driver hop |
 | then | the bounded stash (net-tags phase 3), which needs the above. It was built, measured and withdrawn first; §7.2 there has the log that killed it |
 | then | the poll step, and connections that progress with no client asking |

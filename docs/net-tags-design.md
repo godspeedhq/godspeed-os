@@ -314,3 +314,36 @@ milliseconds and no client is anywhere near its deadline. It is long, client-ini
 (a DHCP dance, a DNS lookup that times out) that make a held request stale. So the correlation tag and
 the stash are worth building together with the background poll of §4, not before it, and the stash
 should hold only while net-stack is doing its OWN work.
+
+### 7.4 And then phase 3 came back, scoped to where it is safe
+
+The withdrawal above is right about the hazard and was too broad about the remedy. Measuring the
+cost showed what the right scope is.
+
+**The measurement.** `scripts/tcp_qemu_test.py` failed about one run in three, on this host, BOTH
+before and after net-stack learned to sift - so the sifting did not cause it - and every failing run
+correlated exactly with one event: `time` nudges net-stack for the network clock (op 11, one-way,
+carrying no reply cap), net-stack runs an SNTP exchange inline, and the shell's `tcp` request lands
+inside it and is lost. Before sifting it was consumed and misparsed; after, it was dropped and said
+so. Either way the shell then waited out its whole deadline.
+
+**The distinction that makes deferral safe.** A request is unsafe to hold while net-stack is SERVING
+somebody, because that client may give up and re-send, and then two replies answer one question. It
+is safe to hold while net-stack is working for ITSELF, because nobody is waiting on that work and
+there is no re-sent copy in flight. The SNTP nudge is the only such work in the service, and it is
+exactly where the losses were.
+
+So: **one held slot, armed only around the nudge, expiring after 500 ms.** One, because the situation
+is one client speaking into one bounded moment. Armed only there, because off is the safe default and
+that is what you get by forgetting. Expiring, because the hold must end well inside the shortest
+client deadline in the tree - three seconds, the shell's status query - and because the work being
+waited on does not always go well.
+
+**What remains, recorded rather than smoothed over.** When the SNTP server does not answer, the
+exchange costs net-stack its whole query budget, which is seconds - far longer than the hold. The
+held request then expires, is dropped, and says so in one line naming the reason. The QEMU test still
+fails on those runs, and it should: the defect is real and it is not this one. It is that the DANCE
+BLOCKS THE SERVE LOOP, which `docs/tcp-design.md` already quotes this service's own comment about
+("making the dance incremental so net-stack answers THROUGHOUT it is the real fix, and that is a
+rework of the state machine rather than a constant"). The hold covers the common case and reports the
+uncommon one; it does not pretend to have fixed the loop.

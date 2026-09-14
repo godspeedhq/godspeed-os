@@ -26,7 +26,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
+use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome, CapHandle};
 
 // Our MAC is LEARNED from the NIC, never hardcoded (audit U9 / Commandment III). The controller's
 // burned-in MAC is the one source of truth for our hardware identity; nic-driver reads it (RTL8168
@@ -120,14 +120,13 @@ const PING_MAX_PAYLOAD: usize = 1024;
 /// is `docs/net-tags-design.md` phase-2 behaviour: it times out and retries, which is defined and
 /// recoverable, where consuming it corrupts both sides silently.
 fn nic_status_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
-    while ctx.try_recv().is_some() {
+    while let Some(m) = ctx.try_recv() {
         // Read the badge for EVERY message, not only the ones with a reply cap. It reads and CLEARS,
         // so a badge left unread here would still be sitting there when the next message arrives and
         // would be attributed to it - a socket invocation misread onto an unrelated request.
-        let _ = ctx.last_recv_badge();
+        let badge = ctx.last_recv_badge();
         if let Some(cap) = ctx.take_pending_cap() {
-            ctx.remove_cap(cap);
-            pending.note(ctx);
+            pending.note(ctx, &m, badge, cap);
         }
     }
     nic_req(ctx, pending, msg, secs)
@@ -211,10 +210,10 @@ fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i
 /// plausible-looking wrong value, not a crash". The tag is still owed for the case this cannot see
 /// (two outstanding driver requests, which nothing currently makes); it is not owed for this one.
 fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> DeadlineOutcome {
-    ctx.request_with_reply_deadline_sifted("nic-driver", msg, secs, |_m| {
+    ctx.request_with_reply_deadline_sifted("nic-driver", msg, secs, |m| {
         // Read and CLEAR the badge for every message, so a socket invocation's badge cannot survive
         // to be attributed to whatever arrives next.
-        let _ = ctx.last_recv_badge();
+        let badge = ctx.last_recv_badge();
         match ctx.take_pending_cap() {
             // A CLIENT. Drop it, with its capability reclaimed so the table slot does not leak
             // (§8.5), and tell the wait this is not what it asked for.
@@ -241,7 +240,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             // it now happens on EVERY driver conversation instead of one of them - before this, a
             // client met during an ordinary `nic_req` was not dropped but CONSUMED, parsed as a link
             // status or a frame batch, and silently mis-served.
-            Some(cap) => { ctx.remove_cap(cap); pending.note(ctx); false }
+            Some(cap) => { pending.note(ctx, m, badge, cap); false }
             // No reply cap: the driver's answer.
             None => true,
         }
@@ -261,19 +260,112 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
 pub struct Displaced {
     n: u32,
     warned: bool,
+
+    /// ONE held request, and only while `holding` says it is safe to hold one.
+    ///
+    /// **Deferring a request is safe exactly when net-stack is doing its OWN work, and unsafe when it
+    /// is serving somebody.** That distinction is not a refinement; it is the whole difference
+    /// between this and the four-slot stash that was built, measured and withdrawn a commit earlier
+    /// (`docs/net-tags-design.md` §7.2). Holding across a long client operation means answering after
+    /// the client gave up and re-sent, so it reads the late reply as the answer to its next question
+    /// and every exchange afterwards is one behind. Holding across net-stack's own unsolicited work
+    /// has no such copy in flight: the client asked once and is still waiting.
+    ///
+    /// One slot, not four, because the situation it covers is one client speaking into one bounded
+    /// moment. A second would mean two clients collided with the same moment, which the counter
+    /// records and the drop handles exactly as before.
+    held: Option<Held>,
+    /// The expiry is reported once, for the same reason the drop is: the condition repeats by nature
+    /// and a report that floods the console is how a real signal gets lost among its own copies.
+    expired_said: bool,
+    /// Set only around the work net-stack does UNASKED. Off by default, so the safe behaviour is the
+    /// one you get by forgetting.
+    holding: bool,
 }
 
-impl Displaced {
-    fn new() -> Self { Displaced { n: 0, warned: false } }
+/// A held request, with everything needed to answer it later.
+///
+/// All three are captured at the moment of arrival and none can be recovered afterwards: the badge
+/// and the pending capability are per-task kernel state describing THE MESSAGE JUST RECEIVED
+/// (`last_recv_badge` reads and clears it, `take_pending_cap` pops a FIFO), so both are overwritten
+/// by whatever lands next.
+pub struct Held {
+    len: usize,
+    badge: Option<(u64, u8)>,
+    reply: CapHandle,
+    /// The cycle counter when it was displaced. See `HOLD_MS`.
+    at: u64,
+    body: [u8; HELD_BYTES],
+}
 
-    fn note(&mut self, ctx: &ServiceContext) {
+/// The largest request body that can be held. A status query is one byte, a DNS lookup a hostname, a
+/// TCP transact a shell command line. A socket send may legitimately be larger, and one that does not
+/// fit is dropped rather than truncated - a request half-kept would be served as a DIFFERENT request.
+const HELD_BYTES: usize = 1024;
+
+/// How long a held request may wait before it is dropped instead of answered.
+///
+/// A LATE ANSWER IS WORSE THAN NO ANSWER: a client that gives up re-sends, and answering the held
+/// copy too gives it two replies to one question. Half a second is comfortably inside the shortest
+/// client deadline in the tree (3 seconds, the shell's status query) and comfortably longer than the
+/// work this covers when it goes well - an SNTP exchange that answers takes about 200 ms. When that
+/// work drags on instead, the hold expires and the behaviour degrades exactly to dropping, which is
+/// the measured, shipped baseline rather than a guess.
+///
+/// On a board whose cycle counter is not calibrated, `duration_cycles` floors to one quantum
+/// (`backlog/27`), so the budget collapses and every held request expires at once - the stack then
+/// behaves as it did before this existed, which is the right way for it to fail.
+const HOLD_MS: u64 = 500;
+
+impl Displaced {
+    fn new() -> Self { Displaced { n: 0, warned: false, held: None, expired_said: false, holding: false } }
+
+    /// Mark the region where net-stack is working for ITSELF rather than for a client.
+    fn holding(&mut self, on: bool) { self.holding = on; }
+
+    /// A client request met during a driver conversation: hold it if that is safe, else drop it.
+    fn note(&mut self, ctx: &ServiceContext, m: &Message, badge: Option<(u64, u8)>, cap: CapHandle) {
+        let pl = m.payload_bytes();
+        if self.holding && self.held.is_none() && pl.len() <= HELD_BYTES {
+            let mut h = Held { len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), body: [0u8; HELD_BYTES] };
+            h.body[..pl.len()].copy_from_slice(pl);
+            self.held = Some(h);
+            return;
+        }
+        ctx.remove_cap(cap);
         self.n = self.n.saturating_add(1);
         if !self.warned {
             self.warned = true;
-            ctx.log("net-stack: a client asked while this service was mid-question to nic-driver - \
-                     dropped, so the client times out and retries rather than being answered wrongly \
-                     (said once)");
+            ctx.log("net-stack: a client asked while this service was mid-question to nic-driver and \
+                     could not be held - dropped, so it times out and retries rather than being \
+                     answered wrongly (said once)");
         }
+    }
+
+    /// Take the held request, if there is one and it is still worth answering.
+    fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
+            -> Option<(usize, Option<(u64, u8)>, CapHandle)> {
+        let h = self.held.take()?;
+        // wrapping_sub, so a counter that wraps while something is held reads as a small elapsed
+        // rather than an enormous one that expires a request which just arrived.
+        if ctx.read_tsc().wrapping_sub(h.at) >= ctx.duration_cycles(HOLD_MS) {
+            ctx.remove_cap(h.reply);
+            self.n = self.n.saturating_add(1);
+            // SAY SO. A bound that is silently exceeded is the unbounded behaviour 26.6 forbids, and
+            // this one is reached by a real and unremarkable event: an SNTP server that does not
+            // answer costs this service its whole query budget, which is far longer than a client
+            // will wait. Without this line the client's timeout has no explanation anywhere.
+            if !self.expired_said {
+                self.expired_said = true;
+                ctx.log_fmt(format_args!(
+                    "net-stack: a held client request waited more than {} ms while this service \
+                     was busy with its own work - dropped, so it times out and retries rather \
+                     than being answered too late to be wanted (said once)", HOLD_MS));
+            }
+            return None;
+        }
+        out[..h.len].copy_from_slice(&h.body[..h.len]);
+        Some((h.len, h.badge, h.reply))
     }
 }
 
@@ -702,7 +794,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
     }
     if send_fail > 0 {
         ctx.log_fmt(format_args!(
-            "net-stack: DHCP - no offer within the budget, and {} of {} DISCOVERs never left the host -              the driver refused them, so this is not a silent server",
+            "net-stack: DHCP - no offer within the budget, and {} of {} DISCOVERs never left the host - the driver refused them, so this is not a silent server",
             send_fail, DANCE_TRIES));
     } else {
         ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
@@ -1698,7 +1790,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
             let spent = ctx.read_tsc().wrapping_sub(t1);
             let us = if tsc_hz > 0 { spent.saturating_mul(1_000_000) / tsc_hz } else { 0 };
             ctx.log_fmt(format_args!(
-                "net-stack: ping window closed after {} us ({} drains, {} frames seen, {} to-our-mac, {} arp-for-us, {} nic timeouts)                  [budget {} us, deadline {} cycles, tsc_hz {}]",
+                "net-stack: ping window closed after {} us ({} drains, {} frames seen, {} to-our-mac, {} arp-for-us, {} nic timeouts) [budget {} us, deadline {} cycles, tsc_hz {}]",
                 us, drains, *frames, to_our_mac, arp_for_us, *timeouts,
                 if tsc_hz > 0 { deadline_cycles.saturating_mul(1_000_000) / tsc_hz } else { 0 },
                 deadline_cycles, tsc_hz));
@@ -1918,10 +2010,10 @@ fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Optio
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment
     // for a client to speak into a wait that would have swallowed it.
-    ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |_m| {
-        let _ = ctx.last_recv_badge();
+    ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |m| {
+        let badge = ctx.last_recv_badge();
         match ctx.take_pending_cap() {
-            Some(cap) => { ctx.remove_cap(cap); pending.note(ctx); false }
+            Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
     })
@@ -1951,7 +2043,7 @@ fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
             // Still returns false, because unconfigured-and-responsive is the right POSTURE when the
             // link cannot be confirmed either way. What changes is that the reason is now on the
             // record instead of a guess presented as a fact.
-            ctx.log("net-stack: nic-driver did not answer the link query - treating as no link, but                      this is a TIMEOUT, not a reading (the cable may be fine)");
+            ctx.log("net-stack: nic-driver did not answer the link query - treating as no link, but this is a TIMEOUT, not a reading (the cable may be fine)");
             false
         }
     }
@@ -1983,6 +2075,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // up, and the dance below reports its own result (offer/no offer) as it happens.
     ctx.log("net-stack: serving the client API (status/dns/socket/tcp)");
 
+    // PROVE THE PARTS THE NETWORK CANNOT REACH, on every boot, on every board.
+    //
+    // Congestion control reacts to loss, fast retransmit to three duplicate acknowledgements and the
+    // persist timer to a window the peer has closed. The QEMU backend this branch is tested against
+    // drops nothing, reorders nothing and never shuts its window, so none of those paths is exercised
+    // by any test that uses a network - and a guard nobody has seen fire is not evidence.
+    //
+    // The same shape as the kernel's `iommu: selftest PASS`, and for the same reason: the property is
+    // negative and cannot be produced on demand, so it is asserted where it can be, at a cost worth
+    // paying. That cost is memory and arithmetic only - no frame is transmitted, no driver is asked
+    // anything - and it is paid once, before the first client can be served.
+    {
+        let (p, f) = tcp::selftest(&ctx);
+        if f == 0 {
+            ctx.log_fmt(format_args!("net-stack: tcp selftest PASS - {} checks", p));
+        } else {
+            // LOUD, and it does not stop the service: a stack with a broken congestion window still
+            // carries traffic, and refusing to serve would turn a degraded network into none at all
+            // (Commandment V). The failing checks named themselves on the lines above.
+            ctx.log_fmt(format_args!(
+                "net-stack: tcp selftest FAILED - {} of {} checks did not hold; TCP is DEGRADED",
+                f, p + f));
+        }
+    }
+
     // THE TCP TABLE, owned here rather than in a static: a service holds no unowned global mutable
     // state (Commandment VI). This struct IS the memory cost of TCP in this service, and its bounds
     // are the constants at the top of `tcp.rs`.
@@ -1995,6 +2112,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // binding because every call site below wants a `&mut` and reborrowing one binding is quieter
     // than writing `&mut pending` sixteen times.
     let pending = &mut Displaced::new();
+    // OUTSIDE the loop deliberately: inside, it is a kilobyte of zeroing on every single request, to
+    // hold something that is normally not there.
+    let mut heldbuf = [0u8; HELD_BYTES];
 
     let mut tcpst = tcp::Tcp::new(calibrate_tsc_hz(&ctx), ctx.read_tsc());
     tcpst.warn_if_no_clock(&ctx);
@@ -2121,75 +2241,101 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // up in `docs/net-tags-design.md` (three phases, each independently testable). A second
         // endpoint was considered and is NOT available: there is no CreateEndpoint syscall and the SDK
         // carries one recv_slot.
-        let req = ctx.recv();
-        // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
-        // name-addressed request (status / DNS / open-socket) carries no badge.
-        let badge = ctx.last_recv_badge();
-        let reply_cap = match ctx.take_pending_cap() {
-            Some(c) => c,
-            // A request with no reply cap cannot be answered - but dropping it SILENTLY means the
-            // client waits out its deadline and calls net-stack unresponsive while our log shows a
-            // clean run. Say it once (the condition repeats per request, and the report must not
-            // become the flood), then drop it.
+        // A REQUEST DISPLACED BY OUR OWN WORK IS SERVED FIRST, and only then the endpoint.
+        //
+        // The one case this covers, measured rather than imagined: `time` nudges this service for the
+        // network clock (op 11, one-way, no reply cap), net-stack runs an SNTP exchange inline, and a
+        // client that spoke during it used to be lost - the shell then waited out its whole deadline
+        // before retrying, and on a slow host the QEMU TCP test failed about one run in three because
+        // of it, both before and after this service learned to sift.
+        //
+        // The three things a request needs are the same whichever way it got here, so from `pl`
+        // downwards this loop cannot tell the difference - which is what keeps this from needing a
+        // second copy of every op.
+        let req;
+        let (pl, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
+            Some((len, badge, reply)) => (&heldbuf[..len], badge, reply),
             None => {
-                // OP_SYNC_NOW (11): a ONE-WAY nudge from `time`, deliberately carrying no reply cap.
-                //
-                // `time` owns the wall clock and must be the thing that pursues it, but it cannot ASK
-                // for a sync in the ordinary way: this service calls `time` after SNTP, so a request in
-                // the other direction would have two single-threaded services blocked on each other -
-                // which is why `time`'s contract says it may never send here. A message with nothing to
-                // answer breaks that: `time` sends and forgets, this service does the work and pushes
-                // the result back exactly as it already does, and neither ever waits on the other
-                // (§8.9 - one direction non-blocking is the whole requirement).
-                //
-                // It sits in the capless arm because that is precisely what identifies it. There is no
-                // reply to send, so there is no cap, and no legitimate request can be confused with it.
-                if req.payload_bytes().first() == Some(&11) {
-                    let mut configured_now = false;
-                    // Only worth attempting with a resolved gateway - SNTP needs somewhere to send.
-                    // `time` asks repeatedly while unsynced, so a refusal here costs nothing and the
-                    // next nudge finds the network ready.
-                    // CONFIGURE FIRST IF THERE IS A CABLE BUT NO ROUTE. Every other request that
-                    // needs the network gets this treatment further down the loop, and the nudge never
-                    // reached it - it answers here and continues. So a machine booted unplugged, then
-                    // plugged in, would sit unconfigured forever unless somebody typed a network
-                    // command: `time` asked every twenty seconds and was told "no route yet" every
-                    // time, which is true and useless. Asking for the clock IS a request that needs
-                    // the network, so it gets the same self-configure as the rest.
-                    if !gw_known && link_is_up(&ctx, pending) {
-                        ctx.log("net-stack: `time` asked for the clock and the cable is in - configuring");
-                        let d = run_dance(&ctx, pending, Some(&status));
-                        our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac;
-                        gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server;
-                        status = d.status;
-                        // THE DANCE ALREADY SYNCED. `run_dance` ends in its own SNTP exchange, so
-                        // falling through to another one queries the server twice in a fifth of a
-                        // second for an answer we have - the duplicate `querying` / `wall clock set`
-                        // pair in the log. Configuring IS resolving here; there is nothing left to ask.
-                        configured_now = true;
-                    }
-                    if !configured_now && gw_known && link_is_up(&ctx, pending) {
-                        let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
-                        match sntp_sync(&ctx, pending, &st) {
-                            Some(u) => ctx.log_fmt(format_args!(
-                                "net-stack: clock resolved at `time`'s request ({})", u)),
-                            // SAY SO. A nudge that arrived and got nowhere is a different fault from a
-                            // nudge that never arrived, and with both silent the two are one mystery.
-                            None => ctx.log("net-stack: `time` asked for the clock - no SNTP answer"),
+                req = ctx.recv();
+                // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
+                // name-addressed request (status / DNS / open-socket) carries no badge.
+                let badge = ctx.last_recv_badge();
+                let reply_cap = match ctx.take_pending_cap() {
+                    Some(c) => c,
+                    // A request with no reply cap cannot be answered - but dropping it SILENTLY means the
+                    // client waits out its deadline and calls net-stack unresponsive while our log shows a
+                    // clean run. Say it once (the condition repeats per request, and the report must not
+                    // become the flood), then drop it.
+                    None => {
+                        // OP_SYNC_NOW (11): a ONE-WAY nudge from `time`, deliberately carrying no reply cap.
+                        //
+                        // `time` owns the wall clock and must be the thing that pursues it, but it cannot ASK
+                        // for a sync in the ordinary way: this service calls `time` after SNTP, so a request in
+                        // the other direction would have two single-threaded services blocked on each other -
+                        // which is why `time`'s contract says it may never send here. A message with nothing to
+                        // answer breaks that: `time` sends and forgets, this service does the work and pushes
+                        // the result back exactly as it already does, and neither ever waits on the other
+                        // (§8.9 - one direction non-blocking is the whole requirement).
+                        //
+                        // It sits in the capless arm because that is precisely what identifies it. There is no
+                        // reply to send, so there is no cap, and no legitimate request can be confused with it.
+                        if req.payload_bytes().first() == Some(&11) {
+                            // THE ONE PLACE net-stack works UNASKED, and therefore the one place a displaced
+                            // client can be held rather than dropped: nobody is waiting on us for this, so a
+                            // request met during it has no re-sent copy in flight to collide with. Cleared
+                            // again the moment this arm is done, at every exit, so the safe behaviour is the
+                            // default everywhere else.
+                            pending.holding(true);
+                            let mut configured_now = false;
+                            // Only worth attempting with a resolved gateway - SNTP needs somewhere to send.
+                            // `time` asks repeatedly while unsynced, so a refusal here costs nothing and the
+                            // next nudge finds the network ready.
+                            // CONFIGURE FIRST IF THERE IS A CABLE BUT NO ROUTE. Every other request that
+                            // needs the network gets this treatment further down the loop, and the nudge never
+                            // reached it - it answers here and continues. So a machine booted unplugged, then
+                            // plugged in, would sit unconfigured forever unless somebody typed a network
+                            // command: `time` asked every twenty seconds and was told "no route yet" every
+                            // time, which is true and useless. Asking for the clock IS a request that needs
+                            // the network, so it gets the same self-configure as the rest.
+                            if !gw_known && link_is_up(&ctx, pending) {
+                                ctx.log("net-stack: `time` asked for the clock and the cable is in - configuring");
+                                let d = run_dance(&ctx, pending, Some(&status));
+                                our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac;
+                                gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server;
+                                status = d.status;
+                                // THE DANCE ALREADY SYNCED. `run_dance` ends in its own SNTP exchange, so
+                                // falling through to another one queries the server twice in a fifth of a
+                                // second for an answer we have - the duplicate `querying` / `wall clock set`
+                                // pair in the log. Configuring IS resolving here; there is nothing left to ask.
+                                configured_now = true;
+                            }
+                            if !configured_now && gw_known && link_is_up(&ctx, pending) {
+                                let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                                match sntp_sync(&ctx, pending, &st) {
+                                    Some(u) => ctx.log_fmt(format_args!(
+                                        "net-stack: clock resolved at `time`'s request ({})", u)),
+                                    // SAY SO. A nudge that arrived and got nowhere is a different fault from a
+                                    // nudge that never arrived, and with both silent the two are one mystery.
+                                    None => ctx.log("net-stack: `time` asked for the clock - no SNTP answer"),
+                                }
+                            } else {
+                                ctx.log("net-stack: `time` asked for the clock - no route yet, will retry");
+                            }
+                            // Our own work is over: anything displaced from here on belongs to a client we
+                            // are serving, and must be dropped rather than deferred.
+                            pending.holding(false);
+                            continue;
                         }
-                    } else {
-                        ctx.log("net-stack: `time` asked for the clock - no route yet, will retry");
+                        if !capless_logged {
+                            capless_logged = true;
+                            ctx.log("net-stack: request had no reply cap - dropping (cannot answer without one)");
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                if !capless_logged {
-                    capless_logged = true;
-                    ctx.log("net-stack: request had no reply cap - dropping (cannot answer without one)");
-                }
-                continue;
+                };
+                (req.payload_bytes(), badge, reply_cap)
             }
         };
-        let pl = req.payload_bytes();
         // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a
         // dead link), a request that needs the network first checks the NIC link; if it has come up
         // (cable plugged in), re-run the dance IN PLACE so the network self-configures - no `net renew`.

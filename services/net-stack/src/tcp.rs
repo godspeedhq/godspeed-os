@@ -39,6 +39,30 @@ pub const RCV_BUF: usize = 2048;
 pub const MAX_OOO: usize = 4;
 /// Maximum segment size we announce and honour. 1460 = 1500 MTU - 20 IP - 20 TCP, the Ethernet case.
 pub const MSS: usize = 1460;
+
+/// What a peer that sent us NO maximum-segment-size option is assumed to accept (RFC 1122 §4.2.2.6).
+///
+/// Deliberately the conservative standard value rather than something convenient. A stack that
+/// assumes 1460 from a peer that never said so is guessing about a path it cannot see, and the cost
+/// of being wrong is silent: segments too large for some link in the middle are dropped, and the
+/// connection stalls on retransmissions that will never succeed. Every peer worth talking to sends
+/// the option, so this is the floor for the ones that do not.
+pub const MSS_DEFAULT: u16 = 536;
+
+/// The MSS option itself: kind 2, length 4, then the value. Four bytes, which is exactly one 32-bit
+/// word, so it needs no padding and moves the data offset from 5 to 6.
+const OPT_MSS_LEN: usize = 4;
+
+/// Congestion control, RFC 5681.
+///
+/// Before this, sending was bounded only by the PEER'S advertised window - which says what the peer
+/// can buffer, and nothing at all about what the path between us can carry. A stack with only that
+/// bound answers its first window by putting the whole thing on the wire at once, and on a link that
+/// cannot take it the result is loss, then a retransmission burst of the same size. The window is the
+/// receiver's limit; the congestion window is the network's, and a correct stack respects both.
+///
+/// Slow start's initial window, RFC 5681 §3.1 equation 1: `min(4*SMSS, max(2*SMSS, 4380))`.
+const IW_CEIL: u32 = 4380;
 /// Retransmission bounds (RFC 6298 §2.4-2.5). The floor is 200 ms rather than the RFC's 1 s because
 /// this is a LAN-and-QEMU stack and a one-second floor makes every lost segment feel like a hang;
 /// the ceiling is the thing that actually matters for boundedness.
@@ -214,6 +238,40 @@ pub struct Conn {
     /// otherwise - so a reply larger than the arena stalls partway and the connection then closes
     /// with the rest unread. Measured, not theorised: a 2888-byte reply arrived as 1440 bytes.
     last_adv: u16,
+
+    // ── Congestion control (RFC 5681) ──────────────────────────────────────────────────────────
+    /// What the PEER will accept in one segment, from its SYN's option or the RFC 1122 default.
+    /// Distinct from `MSS`, which is what WE will accept: the two are independent and a correct
+    /// stack sends by the smaller.
+    pub snd_mss: u16,
+    /// The congestion window, in bytes. The NETWORK's limit on what may be outstanding, as opposed
+    /// to `snd_wnd`, which is the RECEIVER's. Sending is bounded by the smaller of the two.
+    pub cwnd: u32,
+    /// Slow start ends and congestion avoidance begins when `cwnd` reaches this. Starts effectively
+    /// infinite: nothing is known about the path until something is lost, and guessing a limit
+    /// before the first loss would be exactly the invented number 26.4 objects to.
+    pub ssthresh: u32,
+    /// Consecutive acknowledgements that acknowledged nothing new. Three is the signal to
+    /// retransmit without waiting for the timer (RFC 5681 3.2) - the peer is telling us, through
+    /// the only channel it has, that it is receiving segments with a hole in front of them.
+    dup_acks: u8,
+    /// NewReno: the highest sequence sent when fast recovery began. Recovery ends when this is
+    /// acknowledged, not when the first new acknowledgement arrives - otherwise a second loss in the
+    /// same window halves the window twice for one event.
+    recover: u32,
+    in_recovery: bool,
+    /// Set by fast retransmit, cleared when `poll_one` acts on it.
+    fast_retx: bool,
+    /// Persist timer: when to probe a window the peer has closed. 0 = not armed.
+    ///
+    /// A window update is a bare acknowledgement, and a bare acknowledgement is not retransmitted by
+    /// anybody. So if the one that reopens a shut window is lost, the sender waits for a message
+    /// that will never come and the receiver waits for data that will never be sent - a deadlock out
+    /// of two correct implementations. The code here said this was missing and left the retransmit
+    /// timer to cover it; the retransmit timer does not cover it, because with everything
+    /// acknowledged and the window at zero there is nothing armed to retransmit.
+    probe_at_ms: u64,
+    probe_backoff_ms: u64,
 }
 
 impl Conn {
@@ -225,6 +283,10 @@ impl Conn {
             snd_buf: [0u8; SND_BUF], snd_len: 0,
             rcv_buf: [0u8; RCV_BUF], rcv_len: 0,
             ooo: [Ooo::empty(); MAX_OOO],
+            snd_mss: MSS_DEFAULT,
+            cwnd: 0, ssthresh: u32::MAX / 2,
+            dup_acks: 0, recover: 0, in_recovery: false, fast_retx: false,
+            probe_at_ms: 0, probe_backoff_ms: 0,
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
@@ -270,6 +332,9 @@ pub struct Seg<'a> {
     pub ack: u32,
     pub flags: u8,
     pub wnd: u16,
+    /// The peer's maximum segment size, when this is a SYN that carried the option. `None` on every
+    /// other segment, and on a SYN that offered nothing - which RFC 1122 says to read as 536.
+    pub mss: Option<u16>,
     pub payload: &'a [u8],
 }
 
@@ -299,6 +364,14 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
 
     let doff = ((f[t + 12] >> 4) as usize) * 4;
     if doff < TCP_LEN || t + doff > ip_end { return None; }
+    // The peer's maximum segment size, if it offered one. Only ever present on a SYN, so only ever
+    // looked for there - options on an ordinary segment are somebody else's extension and are
+    // skipped by `doff` above, which is the whole reason that field exists.
+    let mss = if f[t + 13] & SYN != 0 && doff > TCP_LEN {
+        parse_mss(&f[t + TCP_LEN..t + doff])
+    } else {
+        None
+    };
 
     let mut src_ip = [0u8; 4]; src_ip.copy_from_slice(&f[ETH_LEN + 12..ETH_LEN + 16]);
     let mut dst_ip = [0u8; 4]; dst_ip.copy_from_slice(&f[ETH_LEN + 16..ETH_LEN + 20]);
@@ -311,6 +384,7 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
         ack: be32(&f[t + 8..t + 12]),
         flags: f[t + 13],
         wnd: be16(&f[t + 14..t + 16]),
+        mss,
         payload: &f[t + doff..ip_end],
     })
 }
@@ -336,6 +410,33 @@ fn tcp_checksum(src: &[u8; 4], dst: &[u8; 4], tcp: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Read a maximum-segment-size option out of a SYN's option field, if one is there.
+///
+/// Walks the list properly rather than looking at the first four bytes, because the option that
+/// matters is not guaranteed to be first and rarely is: Linux leads with MSS, Windows does too, but
+/// a peer is entitled to put a No-Operation or a window-scale option ahead of it. A malformed list
+/// stops the walk instead of being interpreted - a length byte of 0 or 1 would otherwise loop
+/// forever on a frame a hostile peer controls entirely (Commandment V).
+fn parse_mss(opts: &[u8]) -> Option<u16> {
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => return None,                       // End of Option List
+            1 => i += 1,                            // No-Operation, one byte, no length
+            kind => {
+                if i + 1 >= opts.len() { return None; }
+                let len = opts[i + 1] as usize;
+                if len < 2 || i + len > opts.len() { return None; }
+                if kind == 2 && len == 4 {
+                    return Some(((opts[i + 2] as u16) << 8) | opts[i + 3] as u16);
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
 /// Build one Ethernet/IPv4/TCP frame into `out`, returning its length.
 ///
 /// Returns 0 rather than panicking if the payload cannot fit, so a caller that miscounts loses a
@@ -345,7 +446,11 @@ fn tcp_checksum(src: &[u8; 4], dst: &[u8; 4], tcp: &[u8]) -> u16 {
 pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4],
             dst_ip: &[u8; 4], src_port: u16, dst_port: u16,
             seq: u32, ack: u32, flags: u8, wnd: u16, payload: &[u8]) -> usize {
-    let total = HDR + payload.len();
+    // A SYN, and only a SYN, carries our maximum segment size. Announcing it is not a nicety: a
+    // peer that receives no option must assume 536 (RFC 1122 §4.2.2.6), so a stack that stays silent
+    // is asking every peer on the internet to talk to it in 536-byte pieces. We were silent.
+    let opt_len = if flags & SYN != 0 { OPT_MSS_LEN } else { 0 };
+    let total = HDR + opt_len + payload.len();
     if total > out.len() || payload.len() > MSS { return 0; }
     for b in out[..total].iter_mut() { *b = 0; }
 
@@ -355,7 +460,7 @@ pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8;
 
     let ip = ETH_LEN;
     out[ip] = 0x45;                                              // IPv4, 20-byte header
-    let ip_total = (IP_LEN + TCP_LEN + payload.len()) as u16;
+    let ip_total = (IP_LEN + TCP_LEN + opt_len + payload.len()) as u16;
     out[ip + 2] = (ip_total >> 8) as u8; out[ip + 3] = ip_total as u8;
     // IP IDENTIFICATION AND FLAGS, MATCHED TO THE FRAME THAT DEMONSTRABLY WORKS ON A REAL LAN.
     //
@@ -389,10 +494,16 @@ pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8;
     out[t + 6] = (seq >> 8) as u8;  out[t + 7] = seq as u8;
     out[t + 8] = (ack >> 24) as u8; out[t + 9] = (ack >> 16) as u8;
     out[t + 10] = (ack >> 8) as u8; out[t + 11] = ack as u8;
-    out[t + 12] = 0x50;                                          // data offset 5 words, no options
+    // Data offset in 32-BIT WORDS, so the option's four bytes are one word: 5 without, 6 with.
+    out[t + 12] = (((TCP_LEN + opt_len) / 4) as u8) << 4;
     out[t + 13] = flags;
     out[t + 14] = (wnd >> 8) as u8; out[t + 15] = wnd as u8;
-    out[t + 20..total].copy_from_slice(payload);
+    if opt_len == OPT_MSS_LEN {
+        out[t + 20] = 2;                                         // kind: maximum segment size
+        out[t + 21] = 4;                                         // length, including these two bytes
+        out[t + 22] = (MSS >> 8) as u8; out[t + 23] = MSS as u8;
+    }
+    out[t + TCP_LEN + opt_len..total].copy_from_slice(payload);
 
     let ck = tcp_checksum(our_ip, dst_ip, &out[t..total]);
     out[t + 16] = (ck >> 8) as u8; out[t + 17] = ck as u8;
@@ -572,6 +683,233 @@ impl Tcp {
         if let Some(c) = self.by_rid(rid) { *c = Conn::free(); }
     }
 }
+// ── Proving the parts QEMU cannot reach ────────────────────────────────────────────────────────
+
+/// Drive the state machine against frames built in memory, and report what held.
+///
+/// **This exists because the interesting new behaviour cannot be reached from a test that uses the
+/// network.** Congestion control reacts to LOSS, fast retransmit to three duplicate acknowledgements,
+/// the persist timer to a window the peer has closed - and the QEMU user-mode backend the branch is
+/// tested against drops nothing, reorders nothing and never shuts its window. A guard that has never
+/// been observed firing is not evidence that it works; it is evidence that nothing has asked.
+///
+/// So the peer is synthesised. Every frame handed to `on_frame` here is built by `emit`, the same
+/// function that builds the ones that go on the wire, and read back by `parse`, the same one that
+/// reads the ones that arrive - which makes this a round trip through the real encoders rather than
+/// a test of a mock. No NIC is involved and nothing is transmitted.
+///
+/// Returns `(passed, failed)`. Each failure is logged with what it expected, because a self-test that
+/// reports only a count tells you something is wrong and nothing about what.
+#[inline(never)]
+pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    let mut check = |ok: bool, what: &str, p: &mut u32, f: &mut u32| {
+        if ok { *p += 1; } else { *f += 1; ctx.log_fmt(format_args!("tcp selftest: FAIL - {}", what)); }
+    };
+
+    // ---- the option encoder and decoder agree ----
+    //
+    // Round trip, not a fixed byte string: a fixed string would keep passing if both sides moved
+    // together, and both sides moving together is exactly what a data-offset mistake looks like.
+    let net = Net { our_mac: [2, 0, 0, 0, 0, 1], peer_mac: [2, 0, 0, 0, 0, 2], our_ip: [10, 0, 0, 1] };
+    let mut buf = [0u8; 1600];
+    let n = emit(&mut buf, &net.peer_mac, &net.our_mac, &net.our_ip, &[10, 0, 0, 2],
+                 1234, 80, 100, 0, SYN, 2048, &[]);
+    check(n == HDR + 4, "a SYN is four bytes longer than a bare header (the MSS option)", &mut pass, &mut fail);
+    match parse(&buf[..n]) {
+        Some(sg) => {
+            check(sg.mss == Some(MSS as u16), "the MSS we emit is the MSS we parse", &mut pass, &mut fail);
+            check(sg.payload.is_empty(), "a SYN's options are not mistaken for payload", &mut pass, &mut fail);
+        }
+        None => check(false, "a SYN carrying options parses at all", &mut pass, &mut fail),
+    }
+    // A segment that is NOT a SYN must carry no option and stay 20 bytes of header.
+    let n2 = emit(&mut buf, &net.peer_mac, &net.our_mac, &net.our_ip, &[10, 0, 0, 2],
+                  1234, 80, 100, 1, ACK, 2048, b"hi");
+    check(n2 == HDR + 2, "an ordinary segment carries no options", &mut pass, &mut fail);
+
+    // ---- the option WALKER handles what a real peer sends, and what a hostile one does ----
+    check(parse_mss(&[1, 1, 2, 4, 0x05, 0xb4]) == Some(1460),
+          "an MSS option behind two No-Operations is still found", &mut pass, &mut fail);
+    check(parse_mss(&[3, 3, 7, 2, 4, 0x02, 0x18]) == Some(536),
+          "an MSS option behind a window-scale option is still found", &mut pass, &mut fail);
+    check(parse_mss(&[0, 2, 4, 0x05, 0xb4]).is_none(),
+          "nothing is read past an End of Option List", &mut pass, &mut fail);
+    // The two that matter for not hanging on a frame the peer controls entirely (Commandment V).
+    check(parse_mss(&[2, 0, 0, 0]).is_none(), "a zero option length terminates the walk", &mut pass, &mut fail);
+    check(parse_mss(&[2, 40, 0, 0]).is_none(), "an option length past the end terminates the walk", &mut pass, &mut fail);
+
+    // ---- the congestion arithmetic ----
+    let mut c = Conn::free();
+    c.snd_mss = MSS as u16;
+    c.cc_open();
+    check(c.cwnd == IW_CEIL, "the initial window is RFC 5681's min(4*SMSS, max(2*SMSS, 4380))", &mut pass, &mut fail);
+    // Slow start: one segment's worth per acknowledged segment.
+    let before = c.cwnd;
+    c.cc_acked(MSS as u32);
+    check(c.cwnd == before + MSS as u32, "slow start grows by a segment per acknowledgement", &mut pass, &mut fail);
+    // Congestion avoidance: far slower, but never zero. The `.max(1)` is the thing being pinned -
+    // integer division gives zero once cwnd passes SMSS squared, and a window that cannot grow is a
+    // stall that looks like a slow network.
+    c.ssthresh = 1;
+    c.cwnd = 4_000_000;
+    let before = c.cwnd;
+    c.cc_acked(MSS as u32);
+    check(c.cwnd > before, "congestion avoidance still grows when cwnd exceeds SMSS squared", &mut pass, &mut fail);
+    check(c.cwnd - before < MSS as u32, "congestion avoidance grows far slower than slow start", &mut pass, &mut fail);
+    // Loss halves, with a two-segment floor.
+    c.cc_lost(20_000);
+    check(c.ssthresh == 10_000, "loss halves what the path is believed to carry", &mut pass, &mut fail);
+    c.cc_lost(100);
+    check(c.ssthresh == 2 * MSS as u32, "the floor after loss is two segments, not the halved value", &mut pass, &mut fail);
+
+    // ---- fast retransmit, driven through the real state machine ----
+    let mut t = Tcp::new(0, 0);          // no clock: timers are inert, which is what this wants
+    let peer = [10, 0, 0, 2];
+    let Some(i) = t.connect(ctx, 7, peer, 80) else {
+        check(false, "a connection slot is available for the self-test", &mut pass, &mut fail);
+        return (pass, fail);
+    };
+    let (lport, iss_plus1) = { let c = &t.conns[i]; (c.local_port, c.snd_nxt) };
+    // The peer's SYN-ACK, built by the same encoder. Its own sequence is arbitrary.
+    let pseq: u32 = 0x1000_0000;
+    let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                 80, lport, pseq, iss_plus1, SYN | ACK, 8000, &[]);
+    let mut sink = [0u8; 1600];
+    t.on_frame(ctx, &net, &buf[..n], &mut sink);
+    check(t.conns[i].state == State::Established, "the synthetic SYN-ACK establishes the connection", &mut pass, &mut fail);
+    check(t.conns[i].snd_mss == MSS as u16, "the peer's advertised MSS is adopted", &mut pass, &mut fail);
+    check(t.conns[i].cwnd == IW_CEIL, "the congestion window opens on establishment", &mut pass, &mut fail);
+
+    // Queue data and put a segment on the wire, so there is something to acknowledge.
+    let payload = [0x41u8; 200];
+    let wrote = t.write(7, &payload);
+    check(wrote == payload.len(), "the send arena accepted the self-test's data", &mut pass, &mut fail);
+    // POLL UNTIL THERE IS DATA, not once. `poll_one` pays the acknowledgement owed from the SYN-ACK
+    // before it sends anything of its own - deliberately, because the peer is waiting on that to
+    // finish its handshake - so the first pass carries no payload. Asserting on one pass is how this
+    // self-test failed the first time it ran, which is a fair demonstration that it is looking.
+    let mut sent = 0usize;
+    for _ in 0..4 {
+        let n = t.poll_one(ctx, &net, i, &mut sink);
+        if n == 0 { break; }
+        if parse(&sink[..n]).map(|sg| !sg.payload.is_empty()).unwrap_or(false) { sent = n; break; }
+    }
+    check(sent > HDR, "a data segment reaches the wire once the owed acknowledgement is paid", &mut pass, &mut fail);
+    let una = t.conns[i].snd_una;
+
+    // Three bare, window-unchanged, nothing-new acknowledgements: the peer reporting a hole.
+    let ss_before = t.conns[i].ssthresh;
+    for k in 0..3 {
+        let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                     80, lport, pseq.wrapping_add(1), una, ACK, 8000, &[]);
+        t.on_frame(ctx, &net, &buf[..n], &mut sink);
+        if k < 2 {
+            check(!t.conns[i].in_recovery,
+                  "one or two duplicates are NOT treated as loss (reordering is likelier)", &mut pass, &mut fail);
+        }
+    }
+    check(t.conns[i].in_recovery, "three duplicate acknowledgements enter fast recovery", &mut pass, &mut fail);
+    check(t.conns[i].ssthresh < ss_before, "entering recovery lowers the slow-start threshold", &mut pass, &mut fail);
+    check(t.conns[i].retx_count == 0, "a fast retransmit is NOT counted as a timeout", &mut pass, &mut fail);
+    // And it actually resends, from the hole, on the next poll.
+    let again = t.poll_one(ctx, &net, i, &mut sink);
+    check(again > HDR, "fast retransmit puts the missing segment back on the wire", &mut pass, &mut fail);
+    if let Some(sg) = parse(&sink[..again]) {
+        check(sg.seq == una, "the retransmission starts at the hole, not at snd_nxt", &mut pass, &mut fail);
+    }
+
+    // A peer that offers NO option must leave us at the RFC 1122 default rather than our own 1460.
+    t = Tcp::new(0, 0);
+    {
+        let t2 = &mut t;
+        if let Some(j) = t2.connect(ctx, 8, peer, 80) {
+            let (lp2, ack2) = { let c = &t2.conns[j]; (c.local_port, c.snd_nxt) };
+            // Hand-built so the SYN flag is set but no option follows - `emit` always adds one.
+            let m = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                         80, lp2, pseq, ack2, SYN | ACK, 8000, &[]);
+            buf[ETH_LEN + IP_LEN + 12] = 0x50;                       // data offset back to 5 words
+            let ip_total = (IP_LEN + TCP_LEN) as u16;
+            buf[ETH_LEN + 2] = (ip_total >> 8) as u8; buf[ETH_LEN + 3] = ip_total as u8;
+            buf[ETH_LEN + 10] = 0; buf[ETH_LEN + 11] = 0;
+            let ck = super::checksum(&buf[ETH_LEN..ETH_LEN + IP_LEN]);
+            buf[ETH_LEN + 10] = (ck >> 8) as u8; buf[ETH_LEN + 11] = ck as u8;
+            let end = ETH_LEN + IP_LEN + TCP_LEN;
+            buf[ETH_LEN + IP_LEN + 16] = 0; buf[ETH_LEN + IP_LEN + 17] = 0;
+            let tck = tcp_checksum(&peer, &net.our_ip, &buf[ETH_LEN + IP_LEN..end]);
+            buf[ETH_LEN + IP_LEN + 16] = (tck >> 8) as u8; buf[ETH_LEN + IP_LEN + 17] = tck as u8;
+            let _ = m;
+            t2.on_frame(ctx, &net, &buf[..end], &mut sink);
+            check(t2.conns[j].state == State::Established, "a SYN-ACK with no options still establishes", &mut pass, &mut fail);
+            check(t2.conns[j].snd_mss == MSS_DEFAULT,
+                  "a peer that offers no MSS is assumed to accept 536, not our own 1460", &mut pass, &mut fail);
+        }
+    }
+
+    // ---- the persist timer arms when the peer shuts its window ----
+    t = Tcp::new(0, 0);
+    let t3 = &mut t;
+    if let Some(j) = t3.connect(ctx, 9, peer, 80) {
+        let (lp3, ack3) = { let c = &t3.conns[j]; (c.local_port, c.snd_nxt) };
+        let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                     80, lp3, pseq, ack3, SYN | ACK, 8000, &[]);
+        t3.on_frame(ctx, &net, &buf[..n], &mut sink);
+        t3.write(9, &payload);
+        let _ = t3.poll_one(ctx, &net, j, &mut sink);
+        let una3 = t3.conns[j].snd_una;
+        // An acknowledgement of nothing new that SHUTS the window. Deliberately not a duplicate for
+        // congestion purposes - the window changed, which RFC 5681 says disqualifies it - so this
+        // also pins that the two paths do not collide.
+        let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                     80, lp3, pseq.wrapping_add(1), una3, ACK, 0, &[]);
+        t3.on_frame(ctx, &net, &buf[..n], &mut sink);
+        check(t3.conns[j].snd_wnd == 0, "a zero-window acknowledgement is recorded", &mut pass, &mut fail);
+        check(t3.conns[j].dup_acks == 0, "a window change disqualifies an acknowledgement as a duplicate", &mut pass, &mut fail);
+    }
+
+    (pass, fail)
+}
+
+
+// ── Congestion control (RFC 5681) ──────────────────────────────────────────────────────────────
+
+impl Conn {
+    /// The segment size to SEND with: the smaller of what we can build and what the peer will take.
+    fn smss(&self) -> usize { (self.snd_mss as usize).min(MSS).max(1) }
+
+    /// Open the congestion window for a new connection. RFC 5681 3.1, equation 1.
+    fn cc_open(&mut self) {
+        let s = self.smss() as u32;
+        self.cwnd = (4 * s).min((2 * s).max(IW_CEIL));
+        self.ssthresh = u32::MAX / 2;
+        self.dup_acks = 0;
+        self.in_recovery = false;
+        self.fast_retx = false;
+    }
+
+    /// An acknowledgement of new data: grow the window.
+    ///
+    /// Slow start doubles it per round trip; congestion avoidance adds roughly one segment per round
+    /// trip, which is the `SMSS*SMSS/cwnd` per acknowledgement of RFC 5681 3.1. The `.max(1)` on the
+    /// increment is not cosmetic - integer division gives zero once `cwnd` exceeds `SMSS` squared,
+    /// and a window that can never grow again is a stall that looks like a slow network.
+    fn cc_acked(&mut self, acked: u32) {
+        let s = self.smss() as u32;
+        if self.cwnd < self.ssthresh {
+            self.cwnd = self.cwnd.saturating_add(acked.min(s));
+        } else {
+            let inc = (s.saturating_mul(s) / self.cwnd.max(1)).max(1);
+            self.cwnd = self.cwnd.saturating_add(inc);
+        }
+    }
+
+    /// Loss: halve what we believe the path carries, with a floor of two segments (RFC 5681 3.1).
+    fn cc_lost(&mut self, inflight: u32) {
+        let s = self.smss() as u32;
+        self.ssthresh = (inflight / 2).max(2 * s);
+    }
+}
 
 // ── Receiving ──────────────────────────────────────────────────────────────────────────────────
 
@@ -699,6 +1037,14 @@ impl Tcp {
                 c.snd_una = seg.ack;
                 c.rcv_nxt = seg.seq.wrapping_add(1);
                 c.snd_wnd = seg.wnd;
+                // The peer's segment size is settled HERE and nowhere else: the SYN-ACK is the only
+                // segment that carries it, and everything sent afterwards is sized by it. A peer
+                // that offered nothing keeps the RFC 1122 default of 536 rather than our own 1460,
+                // which would be a guess about a path we cannot see.
+                if let Some(m) = seg.mss { if m >= 88 { c.snd_mss = m; } }
+                // Slow start begins now, not at `connect`: the initial window is a multiple of the
+                // segment size, and until this moment the segment size was unknown.
+                c.cc_open();
                 c.state = State::Established;
                 c.retx_at_ms = 0;
                 c.retx_count = 0;
@@ -728,6 +1074,30 @@ impl Tcp {
                     }
                     c.snd_una = seg.ack;
                     c.retx_count = 0;
+                    // The window has moved, so a shut-window probe is no longer owed.
+                    c.probe_at_ms = 0;
+                    c.probe_backoff_ms = 0;
+
+                    // ---- congestion control: an acknowledgement of new data ----
+                    //
+                    // In fast recovery the rule is NewReno's, and the distinction it draws is the
+                    // whole reason it exists: recovery ends when everything outstanding when the
+                    // loss was detected has been acknowledged, NOT at the first new acknowledgement.
+                    // Ending early on a partial acknowledgement treats a second loss in the same
+                    // window as a second congestion event and halves the window twice for one.
+                    if c.in_recovery {
+                        if seq_le(c.recover, seg.ack) {
+                            c.in_recovery = false;
+                            c.cwnd = c.ssthresh;
+                        } else {
+                            // A partial acknowledgement: the next hole is now at `snd_una`, so
+                            // retransmit from there immediately rather than waiting out the timer.
+                            c.fast_retx = true;
+                        }
+                    } else {
+                        c.cc_acked(acked as u32);
+                    }
+                    c.dup_acks = 0;
 
                     // KARN'S ALGORITHM: a sample is only valid if the segment being timed was never
                     // retransmitted. `rtt_timing` is cleared on every retransmission, so reaching
@@ -745,6 +1115,38 @@ impl Tcp {
                     } else if c.state == State::LastAck && c.snd_una == c.snd_nxt {
                         c.state = State::Closed;
                         return 0;
+                    }
+                } else if seg.ack == c.snd_una
+                    && seg.payload.is_empty()
+                    && seg.flags & (SYN | FIN) == 0
+                    && seg.wnd == c.snd_wnd
+                    && c.snd_nxt != c.snd_una
+                {
+                    // ---- a DUPLICATE acknowledgement (RFC 5681 3.2) ----
+                    //
+                    // All five conditions matter, and RFC 5681 lists them for a reason: an
+                    // acknowledgement that carries data, or opens the window, or acknowledges
+                    // something new, is doing a job of its own and is not evidence of loss. Only a
+                    // bare repeat, while data is outstanding, means the peer is receiving segments
+                    // with a hole in front of them.
+                    c.dup_acks = c.dup_acks.saturating_add(1);
+                    if c.in_recovery {
+                        // Each further duplicate is one segment that has LEFT the network, so the
+                        // window may open by one to keep data flowing during recovery.
+                        let s = c.smss() as u32;
+                        c.cwnd = c.cwnd.saturating_add(s);
+                    } else if c.dup_acks == 3 {
+                        // FAST RETRANSMIT. Three duplicates is the point at which reordering stops
+                        // being the likelier explanation, and waiting for the retransmission timer
+                        // costs at least RTO_MIN_MS for something the peer has already told us
+                        // about. This is the single largest practical win in this whole change on a
+                        // link that drops anything.
+                        let inflight = c.snd_nxt.wrapping_sub(c.snd_una);
+                        c.cc_lost(inflight);
+                        c.recover = c.snd_nxt;
+                        c.in_recovery = true;
+                        c.cwnd = c.ssthresh.saturating_add(3 * c.smss() as u32);
+                        c.fast_retx = true;
                     }
                 }
                 c.snd_wnd = seg.wnd;
@@ -809,6 +1211,29 @@ impl Tcp {
             }
         }
 
+        // ---- fast retransmit ----
+        //
+        // Before the timer below, deliberately: the whole value of fast retransmit is that it does
+        // not wait for it. Three duplicate acknowledgements are the peer saying it has a hole, and
+        // the hole is always at `snd_una` - so that is what goes back out, once, without touching
+        // the retransmission counter. This is not a timeout and must not be counted as one, or a
+        // link that reorders would close a healthy connection on `MAX_RETX`.
+        if c.fast_retx {
+            c.fast_retx = false;
+            if c.snd_len > 0 {
+                let n = c.snd_len.min(c.smss());
+                let mut tmp = [0u8; MSS];
+                tmp[..n].copy_from_slice(&c.snd_buf[..n]);
+                let w = c.window();
+                c.last_adv = w;
+                c.rtt_timing = false;              // Karn: a resent segment cannot be timed
+                if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
+                return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                            c.local_port, c.remote_port, c.snd_una, c.rcv_nxt,
+                            ACK | PSH, w, &tmp[..n]);
+            }
+        }
+
         // ---- retransmission ----
         if has_clock && c.retx_at_ms != 0 && now >= c.retx_at_ms {
             c.retx_count += 1;
@@ -823,12 +1248,23 @@ impl Tcp {
             c.retx_at_ms = now + c.rto_ms;
             c.rtt_timing = false;                         // Karn: this ACK cannot be timed
 
+            // RFC 5681 3.1: a timeout is the strongest evidence of congestion there is, so the
+            // window collapses to ONE segment and slow start begins again. Fast recovery, if it was
+            // running, is abandoned - the duplicate acknowledgements it was built on have stopped
+            // arriving, which is what the timeout means.
+            let inflight = c.snd_nxt.wrapping_sub(c.snd_una);
+            c.cc_lost(inflight);
+            c.cwnd = c.smss() as u32;
+            c.dup_acks = 0;
+            c.in_recovery = false;
+            c.fast_retx = false;
+
             if c.state == State::SynSent {
                 return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[]);
             }
             if c.snd_len > 0 {
-                let n = c.snd_len.min(MSS);
+                let n = c.snd_len.min(c.smss());
                 let mut tmp = [0u8; MSS];
                 tmp[..n].copy_from_slice(&c.snd_buf[..n]);
                 let w = c.window();
@@ -889,9 +1325,14 @@ impl Tcp {
         let sent_off = c.snd_nxt.wrapping_sub(c.snd_una) as usize;
         if sent_off < c.snd_len {
             let inflight = sent_off;
-            let allowed = (c.snd_wnd as usize).saturating_sub(inflight);
+            // BOTH windows. `snd_wnd` is what the receiver can hold; `cwnd` is what the path has
+            // been shown to carry. Sending by the receiver's alone is what this stack did, and it
+            // means answering the first window by putting all of it on the wire at once.
+            let usable = (c.snd_wnd as usize).min(c.cwnd as usize);
+            let allowed = usable.saturating_sub(inflight);
             if allowed > 0 {
-                let n = (c.snd_len - sent_off).min(MSS).min(allowed);
+                c.probe_at_ms = 0;
+                let n = (c.snd_len - sent_off).min(c.smss()).min(allowed);
                 if n > 0 {
                     let mut tmp = [0u8; MSS];
                     tmp[..n].copy_from_slice(&c.snd_buf[sent_off..sent_off + n]);
@@ -909,9 +1350,45 @@ impl Tcp {
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | PSH, w, &tmp[..n]);
                 }
             }
-            // The peer's window is shut. A real stack probes it here so a lost window update cannot
-            // deadlock the connection; this one does not yet, and the retransmit timer is what stops
-            // it hanging forever. Recorded rather than implied (§26.7).
+            // ---- the peer's window is shut: PROBE it (RFC 1122 §4.2.2.17) ----
+            //
+            // This used to return 0 and say a real stack probes here. It does, and this one now
+            // does, because the gap was real rather than theoretical: a window update is a bare
+            // acknowledgement, nobody retransmits a bare acknowledgement, and with everything we
+            // sent already acknowledged there is no retransmission timer armed to cover its loss.
+            // Both sides then wait forever, each correctly.
+            //
+            // Only when it is the RECEIVER holding us, not the congestion window - a shut congestion
+            // window is our own doing and its timer is the retransmission timer.
+            if has_clock && c.snd_wnd == 0 {
+                if c.probe_at_ms == 0 {
+                    c.probe_backoff_ms = c.rto_ms;
+                    c.probe_at_ms = now + c.probe_backoff_ms;
+                } else if now >= c.probe_at_ms {
+                    // Backoff, clamped, so an unresponsive peer costs a probe now and then rather
+                    // than a stream of them (§26.6).
+                    c.probe_backoff_ms = (c.probe_backoff_ms * 2).max(RTO_MIN_MS).min(RTO_MAX_MS);
+                    c.probe_at_ms = now + c.probe_backoff_ms;
+                    // ONE byte, deliberately beyond the window the peer advertised. That is what
+                    // makes it a probe: the peer must answer it, either by accepting the byte (the
+                    // window had reopened and the update was lost) or by repeating the zero window
+                    // (it really is still full). Either answer un-sticks us.
+                    //
+                    // `snd_nxt` advances, because this is real data and not a ghost - an
+                    // acknowledgement for it must pass the `seq_le(seg.ack, c.snd_nxt)` test above
+                    // or it would be discarded as acknowledging something never sent. Advancing it
+                    // also arms the retransmission timer, which is what bounds this against a peer
+                    // that has silently gone away.
+                    let b = [c.snd_buf[sent_off]];
+                    let seq = c.snd_nxt;
+                    c.snd_nxt = c.snd_nxt.wrapping_add(1);
+                    if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
+                    let w = c.window();
+                    c.last_adv = w;
+                    return emit(out, &net.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                                c.local_port, c.remote_port, seq, c.rcv_nxt, ACK, w, &b);
+                }
+            }
             return 0;
         }
 
