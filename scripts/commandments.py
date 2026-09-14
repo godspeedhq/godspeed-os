@@ -516,6 +516,102 @@ def check_kernel_service_table(check, pins):
 
 
 # --------------------------------------------------------------------------------------------------
+# Commandment X - thou shalt place complexity where it belongs
+# --------------------------------------------------------------------------------------------------
+
+def check_user_vocabulary(check, pins):
+    """Commandment X, the half nothing was watching: do not push complexity onto USERS.
+
+    "Do not move complexity into the kernel because it is convenient" is already enforced, four times
+    over, filed under Commandment I - `I-responsibilities` pins the kernel's module set,
+    `I-arch-drivers` keeps peripheral drivers out of ring 0, `I-syscalls` pins the surface and
+    `I-kernel-deps` pins what links into it. The OTHER sentence of X had nothing, and it is the one
+    about the person at the prompt.
+
+    THE MECHANISABLE PART OF IT is that the vocabulary and its documentation must agree.
+    `utilities/` holds one spec per utility and is described as canonical; the shell holds the verbs
+    that actually answer. A disagreement pushes the cost onto the user in one of two directions:
+
+      - a spec with no command teaches a verb that does not exist. The user types it, gets
+        `unknown:`, and learns that the documentation cannot be trusted - which is more expensive
+        than the missing feature.
+      - a command with no spec can only be found by reading the source. That is the `30-minute
+        whiteboard rule` (26.11) failing at the surface a user actually touches.
+
+    A SPEC MAY DOCUMENT AN ABSENCE, and the check is inverted for those rather than blind to them.
+    `utilities/14_poweroff.md` opens "not provided (considered and rejected)" and exists so the next
+    person does not re-attempt it. That spec is CORRECT precisely because no command answers it, so
+    the rule flips: if a command ever appears for one of these, the doc has silently become a lie.
+
+    WHAT IS LEFT OVER, and it is genuinely not mechanisable. "Place complexity in the layer that
+    naturally owns it" is a judgement about layers, and no pattern reads it. `docs/x-residue.md`
+    records what that leaves unguarded and why, rather than implying this check covers X.
+    """
+    aliases = pins.get("utility_spec_aliases", {}) or {}
+    debt = set(pins.get("utility_vocab_debt", []) or [])
+    udir = os.path.join(ROOT, "utilities")
+    shell = os.path.join(ROOT, "services/shell/src/main.rs")
+    if not os.path.isdir(udir) or not os.path.exists(shell):
+        return [Violation("utilities/", 0, "the utility specs or the shell are missing, so the "
+                                           "user-facing vocabulary cannot be reconciled at all")]
+
+    sh = re.sub(r'//[^\n]*', '', read(shell))
+    # BOTH a `help_block` registration and a DISPATCH ARM count as "the shell answers this verb".
+    # help_block alone missed `fcap`, which is dispatched as `"fcap" => cmd_fcap(..)` and registers
+    # no help block - so the check reported a documented command as missing when it is present. A
+    # wrong finding is worse than a missing one: it costs the reader their trust in the whole list.
+    commands = set(re.findall(r'"([a-z][a-z0-9-]*)"\s*=>\s*help_block\(ctx,\s*"\1"', sh))
+    commands |= set(re.findall(r'"([a-z][a-z0-9-]*)"\s*=>\s*cmd_[a-z_]+\s*\(', sh))
+
+    spec_cmds, absent_cmds, out, seen = {}, {}, [], set()
+    for fn in sorted(os.listdir(udir)):
+        m = re.match(r'^(\d+)_([a-z0-9-]+)\.md$', fn)
+        if not m or m.group(1) == "0":
+            continue
+        rel = f"utilities/{fn}"
+        head = "\n".join(read(os.path.join(udir, fn)).split("\n")[:6]).lower()
+        names = aliases.get(m.group(2), [m.group(2)])
+        target = absent_cmds if ("not provided" in head or "**removed" in head) else spec_cmds
+        for n in names:
+            target[n] = rel
+
+    for name, rel in sorted(spec_cmds.items()):
+        if name in commands or name in debt:
+            seen.add(name)
+            continue
+        out.append(Violation(rel, 0,
+                             f"`{name}` has a utility spec and the shell answers no such verb. A "
+                             f"documented command that does not exist costs the user more than a "
+                             f"missing feature: they learn the documentation cannot be trusted. "
+                             f"Implement it, delete the spec, or rewrite the spec to document the "
+                             f"ABSENCE (as utilities/14_poweroff.md does)."))
+
+    for name, rel in sorted(absent_cmds.items()):
+        if name in commands:
+            out.append(Violation(rel, 0,
+                                 f"`{name}` is documented as NOT PROVIDED, and the shell now answers "
+                                 f"it. The spec exists so nobody re-attempts this; it has silently "
+                                 f"become a lie. Update it."))
+
+    for name in sorted(commands - set(spec_cmds) - set(absent_cmds)):
+        if name in debt:
+            seen.add(name)
+            continue
+        out.append(Violation("utilities/", 0,
+                             f"the shell answers `{name}` and no spec in utilities/ describes it. A "
+                             f"verb discoverable only by reading the source is complexity pushed onto "
+                             f"the user (26.11). Write the spec, or if it is not a user-facing verb, "
+                             f"record it."))
+
+    for stale in sorted(debt - seen):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"utility_vocab_debt lists '{stale}', which now reconciles. Delete the "
+                             f"entry - a list not tightened when the debt shrinks rots into a "
+                             f"permanent exemption."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 # Commandment III - thou shalt not duplicate truth
 # --------------------------------------------------------------------------------------------------
 
@@ -1318,6 +1414,22 @@ CHECKS = [
              # updated in the same commit rather than the fix being invisible.
              dict(why="no peripheral driver remains in arch/ - both were deleted in arm32 slice 5",
                   pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="X-user-vocabulary", commandment="X",
+         title="the user-facing vocabulary and its documentation agree",
+         kind="custom", fn=check_user_vocabulary,
+         scope="utilities/*.md against the verbs the shell answers (help_block)",
+         proves="no documented command is missing from the shell, no shell command is undocumented, "
+                "and a spec that documents an ABSENCE stays true",
+         does_not_prove="X itself. 'Place complexity in the layer that naturally owns it' is a "
+                        "judgement about layers that no pattern reads; the kernel half of X is "
+                        "enforced under Commandment I (responsibilities, drivers, syscalls, deps), "
+                        "and what neither covers is written down in docs/x-residue.md rather than "
+                        "implied to be covered",
+         probes=[
+             dict(why="a spec with no command must be caught",
+                  pins={"utility_spec_aliases": {}, "utility_vocab_debt": []}, expect=True),
+             dict(why="the real tree, with its aliases and debt, must pass", pins=None, expect=False),
          ]),
     dict(nature="rule", id="III-duplicate-constants", commandment="III",
          title="one fact, one place - no constant declared twice in a crate",
