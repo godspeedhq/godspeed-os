@@ -946,6 +946,43 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
 /// "something arrived and was not ours" - two different silences.
 #[inline(never)]
 fn feed_frame(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net, f: &[u8]) -> bool {
+    // ANSWER ARP WHILE WE HOLD THE SERVICE. This loop owns net-stack for the whole transaction, and
+    // during that time it is the only thing reading frames - so an ARP request for US arriving in
+    // that window is seen here and nowhere else. Dropping it as "not TCP" makes this machine
+    // disappear from the network for the duration.
+    //
+    // That is not theoretical, and it is the whole hardware failure. A Pi 2 SYN reached a Windows
+    // laptop, which accepted it and generated a SYN-ACK - and then could not send it, because it had
+    // to ARP for us first and we were in here swallowing the request. `pktmon` named it exactly:
+    //     Tx  DropReason Address resolution timeout / Address resolution failure
+    //         192.168.4.40.7777 > 192.168.4.64.49160: Flags [S.], ack ..., mss 1460
+    // The peer we were connecting to was the one host that needed to ARP us, so the connection could
+    // never complete. QEMU never showed it: SLIRP's gateway already had us cached from the boot
+    // dance, and it was the only peer reachable there.
+    //
+    // Every other long-running loop in this file already does this - the DHCP dance, DNS, ARP
+    // resolve and ping all call `build_arp_reply` in their drain. This one did not, and being the
+    // odd one out is the bug.
+    let mut arp_out = [0u8; 42];
+    if build_arp_reply(f, &net.our_ip, &net.our_mac, &mut arp_out) {
+        // FEED THE REPLY BACK. A nic-driver response CARRIES RECEIVED FRAMES, so discarding it here
+        // throws away whatever arrived while we were answering the ARP. The first version of this
+        // did exactly that and cost four bytes of a payload - `tcp: 19 byte(s) back` where 23 was
+        // right - because a segment rode in on the reply to our own ARP and went in the bin.
+        //
+        // One level, not recursion: the frame that comes back is examined, and anything IT triggers
+        // is left for the next pass of the transaction loop. That keeps the work per inbound frame
+        // bounded, which is the same rule the ACK path below follows.
+        if let Some(m) = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS) {
+            let f2 = m.payload_bytes();
+            if f2.len() >= tcp::HDR {
+                let mut out2 = [0u8; 1600];
+                let n2 = t.on_frame(ctx, net, f2, &mut out2);
+                if n2 > 0 { let _ = nic_req(ctx, &Message::from_bytes(&out2[..n2]), LINK_SECS); }
+            }
+        }
+        return true;
+    }
     if f.len() < tcp::HDR { return false; }
     let mut out = [0u8; 1600];
     let n = t.on_frame(ctx, net, f, &mut out);

@@ -101,7 +101,12 @@ if ($stop) {
     # Count DATA lines, not file lines: etl2txt writes a header, and reporting its lines as packets
     # would turn an empty capture into a reassuring non-zero number. An instrument that reads a zero
     # it did not earn is the failure mode this whole exercise keeps running into.
-    $lines = Get-Content $txt
+    # READ IT AS UTF-16. `pktmon etl2txt` writes UTF-16, and reading it as ASCII made every line a
+    # run of NUL-separated characters that matched nothing - so this reported "0 packet line(s)" over
+    # a file containing the exact SYNs we were hunting. An instrument that reads a zero it did not
+    # earn is the failure this whole exercise kept tripping over; it should not have been reproduced
+    # here.
+    $lines = Get-Content $txt -Encoding Unicode
     $pkts  = @($lines | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' })
 
     Write-Host ""

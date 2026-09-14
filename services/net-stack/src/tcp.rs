@@ -344,7 +344,24 @@ pub fn emit(out: &mut [u8], gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4
     out[ip] = 0x45;                                              // IPv4, 20-byte header
     let ip_total = (IP_LEN + TCP_LEN + payload.len()) as u16;
     out[ip + 2] = (ip_total >> 8) as u8; out[ip + 3] = ip_total as u8;
-    out[ip + 6] = 0x40;                                          // don't fragment
+    // IP IDENTIFICATION AND FLAGS, MATCHED TO THE FRAME THAT DEMONSTRABLY WORKS ON A REAL LAN.
+    //
+    // This used to send identification 0 with the Don't Fragment bit set. Both are legal - RFC 6864
+    // explicitly allows a zero id when DF is set - and QEMU never cared. On a Raspberry Pi 2 behind a
+    // consumer router, a SYN built that way never reached a host on the same subnet, while `ping` to
+    // that same host worked: and `ping` sends identification 1 with DF CLEAR, through the same
+    // gateway MAC, from the same source, over the same driver.
+    //
+    // Verified from the capture rather than assumed: our TCP checksums, IP header checksums and runt
+    // padding are all correct, so the header fields were the only difference left. Matching the
+    // working frame is an evidence-led change, not a cargo-culted one - but it is a HYPOTHESIS about
+    // that router's behaviour, and if it turns out not to be the cause this comment should say so
+    // rather than be quietly deleted.
+    // Derived, not threaded: the sequence number already varies per segment, so mixing it with the
+    // source port gives a non-zero, changing identification without a counter to carry through ten
+    // call sites. The field only has to differ between packets that could be fragments of each other.
+    let ip_id = (seq as u16) ^ src_port ^ 0x1000;
+    out[ip + 4] = (ip_id >> 8) as u8; out[ip + 5] = ip_id as u8;
     out[ip + 8] = 64;                                            // TTL
     out[ip + 9] = IP_PROTO_TCP;
     out[ip + 12..ip + 16].copy_from_slice(our_ip);
