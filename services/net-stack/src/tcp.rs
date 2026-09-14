@@ -191,6 +191,13 @@ pub struct Conn {
     state_deadline_ms: u64,
     /// Set when the client has asked to close and the send buffer must drain first.
     close_pending: bool,
+    /// The window most recently ADVERTISED to the peer.
+    ///
+    /// Without this there is no way to notice that the window has reopened. Reading data out of the
+    /// arena frees space, and a peer that was told 608 bytes stays limited to 608 until it is told
+    /// otherwise - so a reply larger than the arena stalls partway and the connection then closes
+    /// with the rest unread. Measured, not theorised: a 2888-byte reply arrived as 1440 bytes.
+    last_adv: u16,
 }
 
 impl Conn {
@@ -205,7 +212,7 @@ impl Conn {
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
-            state_deadline_ms: 0, close_pending: false,
+            state_deadline_ms: 0, close_pending: false, last_adv: 0,
         }
     }
 
@@ -682,6 +689,7 @@ impl Tcp {
 
         if need_ack {
             let w = c.window();
+            c.last_adv = w;
             return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
         }
@@ -745,6 +753,30 @@ impl Tcp {
             return 0;
         }
 
+        // ---- window update: tell the peer the arena has drained ----
+        //
+        // RFC 1122 4.2.2.17, and the reason it is not optional here: the advertised window IS the
+        // free space in a FIXED arena, so a reply larger than the arena necessarily shuts the window
+        // partway through. Once the client reads, the space is back - and a peer that is not told
+        // stays throttled at the old figure until something else makes it ask. Sent when at least a
+        // segment's worth has opened up, so a byte-at-a-time reader cannot turn this into a storm of
+        // ACKs (the silly-window problem, from the other side).
+        if matches!(c.state, State::Established | State::CloseWait | State::FinWait1 | State::FinWait2) {
+            // THE THRESHOLD IS min(MSS, RCV_BUF/2), not MSS (RFC 1122 4.2.2.17). With MSS 1460 and
+            // a 2048-byte arena the window can NEVER reopen by a full MSS after a single segment -
+            // 2048 - 1440 = 608, then 1440 - which is less than 1460. So an MSS-only threshold makes
+            // this branch unreachable on exactly the buffer sizes this stack uses, and the first
+            // version of it was: the fix changed nothing and the reply still arrived truncated at
+            // 1440 of 2888 bytes.
+            const WND_STEP: u16 = if MSS < RCV_BUF / 2 { MSS as u16 } else { (RCV_BUF / 2) as u16 };
+            let w = c.window();
+            if w.saturating_sub(c.last_adv) >= WND_STEP {
+                c.last_adv = w;
+                return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                            c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
+            }
+        }
+
         if !matches!(c.state, State::Established | State::CloseWait) { return 0; }
 
         // ---- new data, within the peer's window ----
@@ -766,6 +798,7 @@ impl Tcp {
                     }
                     if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
                     let w = c.window();
+                    c.last_adv = w;
                     return emit(out, &net.gw_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | PSH, w, &tmp[..n]);
                 }

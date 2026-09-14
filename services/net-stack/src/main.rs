@@ -885,7 +885,10 @@ fn tcp_transact(ctx: &ServiceContext, t: &mut tcp::Tcp, net: &tcp::Net,
         }
 
         let st = t.conns[i].state;
-        if st == tcp::State::Closed { break; }
+        // DRAIN BEFORE LEAVING. A closed connection may still hold delivered bytes the client has
+        // not taken, and `forget` below reclaims the arena. Breaking on the state alone threw away
+        // whatever arrived in the same pass as the FIN.
+        if st == tcp::State::Closed && t.conns[i].readable() == 0 { break; }
         // The peer said it is done sending. Take what is left and close from our side.
         if st == tcp::State::CloseWait && wrote {
             t.close(1);
@@ -2226,7 +2229,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Driven inside the request, not from a background poll, because
             // `docs/net-tags-design.md` forbids unsolicited driver traffic until its phase 2/3 land.
             // That is the next step and it is recorded, not smuggled in here.
-            let mut resp = [0u8; 1400];
+            // 3 KiB, not 1.4 KiB: a reply that fits in ONE segment never exercises the receive
+            // path's reassembly, window updates or ACK-driven advancement. The Message ceiling is
+            // 4 KiB (§8.5), so this leaves headroom while guaranteeing more than one segment.
+            let mut resp = [0u8; 3072];
             let n = if pl.len() >= 7 && gw_known {
                 let dip = [pl[1], pl[2], pl[3], pl[4]];
                 let dport = ((pl[5] as u16) << 8) | pl[6] as u16;

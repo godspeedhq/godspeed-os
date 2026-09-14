@@ -34,6 +34,11 @@ PAYLOAD = b"godspeed-tcp-probe"
 
 FIN, SYN, RST, PSH, ACK = 0x01, 0x02, 0x04, 0x08, 0x10
 
+# The multi-segment reply, defined ONCE. Restating its length as a literal is how this test spent a
+# run reporting a 4-byte shortfall that was its own arithmetic: 16 x 180 is 2880, and "BIG:" makes
+# 2884, not the 2888 the assertion claimed. Derive, do not restate.
+BIG_REPLY = b"BIG:" + (b"0123456789abcdef" * 180)
+
 
 def free_port():
     s = socket.socket()
@@ -70,7 +75,14 @@ class Echo(threading.Thread):
                 data = c.recv(4096)
                 if data:
                     self.got += data
-                    c.sendall(b"echo:" + data)
+                    # A payload asking for BIG gets a reply that cannot fit in one segment, so the
+                    # guest's receive path has to reassemble across segments, advance its window as
+                    # the arena drains, and acknowledge each one. A single-segment echo proves none
+                    # of that.
+                    if b"big" in data:
+                        c.sendall(BIG_REPLY)
+                    else:
+                        c.sendall(b"echo:" + data)
                 # Close from this side so the guest sees a FIN and must complete the exchange.
                 c.shutdown(socket.SHUT_WR)
                 try:
@@ -178,39 +190,64 @@ def main():
         return 1
 
     sock.settimeout(1.0)
-    out = b""
-    deadline = time.time() + 180
-    sent = False
-    while time.time() < deadline:
-        try:
-            chunk = sock.recv(4096)
-            if not chunk:
+    out = bytearray()
+
+    def pump(seconds):
+        """Read for `seconds`, appending to `out`. Returns what arrived in this window."""
+        before = len(out)
+        stop = time.time() + seconds
+        while time.time() < stop:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                out.extend(chunk)
+            except socket.timeout:
+                pass
+        return bytes(out[before:])
+
+    def wait_for(needle, seconds):
+        stop = time.time() + seconds
+        while time.time() < stop:
+            if needle in out:
+                return True
+            pump(0.5)
+        return needle in out
+
+    def run(cmd, seconds):
+        """Send one shell command and read until it has clearly finished.
+
+        Reading until the NEXT prompt rather than until a keyword: a command that fails prints
+        something this harness did not predict, and waiting for a keyword would then sit until its
+        deadline and report the wrong thing. The prompt is the one marker every outcome shares.
+        """
+        mark = len(out)
+        sock.sendall((cmd + "\r\n").encode())
+        stop = time.time() + seconds
+        while time.time() < stop:
+            pump(0.5)
+            after = bytes(out[mark:])
+            # The echoed command line ends with a prompt of its own, so look for a prompt AFTER
+            # some output has followed it.
+            if after.count(b"gsh>") >= 1 and len(after) > len(cmd) + 12:
+                pump(1.0)
                 break
-            out += chunk
-        except socket.timeout:
-            pass
-        # Wait for the network to be configured before asking for a connection, so a failure is
-        # about TCP rather than about DHCP not having finished.
-        if not sent and (b"lease" in out or b"net-stack: serving" in out) and b"gsh>" in out:
-            time.sleep(2.0)
-            cmd = "tcp 10.0.2.2 %d %s\r\n" % (echo_port, PAYLOAD.decode())
-            sock.sendall(cmd.encode())
-            sent = True
-            deadline = time.time() + 60
-        if sent and (b"byte(s) back" in out or b"connected to nothing" in out):
-            # DRAIN, do not just sleep. The byte count is printed before the content line, so
-            # breaking on the count and closing the socket loses the very thing being asserted - the
-            # first run of this harness reported a stack failure that was entirely its own.
-            end = time.time() + 2.0
-            while time.time() < end:
-                try:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    out += chunk
-                except socket.timeout:
-                    pass
-            break
+        return bytes(out[mark:])
+
+    # The network must be configured first, or a TCP failure would really be a DHCP failure.
+    # WAIT FOR THE DANCE TO FINISH, not for the lease to be offered. `10.0.2.15` appears in the DHCP
+    # OFFER, which is early: ARP and the ICMP check still follow, net-stack is single-threaded, and a
+    # request issued in that window finds it busy. The ICMP reply is the line that ends the dance, so
+    # it is the only honest "ready" marker. Getting this wrong reported a total TCP failure - zero
+    # connections, zero segments - for a stack that was working.
+    ok_boot = (wait_for(b"gsh>", 180)
+               and wait_for(b"ICMP - 10.0.2.2 echo reply", 150))
+    time.sleep(3.0)
+
+    r1 = run("tcp 10.0.2.2 %d %s" % (echo_port, PAYLOAD.decode()), 45)
+    time.sleep(1.0)
+    r2 = run("tcp 10.0.2.2 %d big" % echo_port, 45)
+    out_b = bytes(out)
 
     try:
         sock.close()
@@ -222,7 +259,7 @@ def main():
             child.kill()
         echo.stop()
 
-    text = out.decode("utf-8", "replace")
+    text = out_b.decode("utf-8", "replace")
     tail = "\n".join(text.splitlines()[-25:])
     print("---- guest tail ----\n%s\n--------------------" % tail)
 
@@ -234,12 +271,23 @@ def main():
         if not cond:
             ok = False
 
+    # ---- second scenario: a reply that spans several segments -----------------------------------
     print("tcp-qemu: guest side")
-    check(sent, "the shell reached a prompt and the command was issued")
-    check(b"echo:" + PAYLOAD in out, "the guest printed the echo the host sent back")
+    check(ok_boot, "the guest booted, reached a prompt and took a DHCP lease")
+    check(b"echo:" + PAYLOAD in r1, "single segment: the guest printed the echo the host sent back")
+    check(b"BIG:" in r2, "multi-segment: the guest printed the large reply")
+    import re as _re
+    m2 = _re.search(rb"tcp: (\d+) byte\(s\) back", r2)
+    got2 = int(m2.group(1)) if m2 else -1
+    # SAY THE NUMBER. "did not equal 2888" sends the reader back to the guest to find out what it
+    # was; printing it turns a failed assertion into a measurement.
+    check(got2 == len(BIG_REPLY),
+          "multi-segment: all %d bytes arrived, reassembled in order (guest reported %d)"
+          % (len(BIG_REPLY), got2))
     print("tcp-qemu: host side")
-    check(echo.connections >= 1, "the host echo server accepted a connection")
+    check(echo.connections >= 2, "the host accepted BOTH connections (%d)" % echo.connections)
     check(PAYLOAD in echo.got, "the host received exactly the payload the guest was told to send")
+    check(b"big" in echo.got, "the host received the second request too")
 
     print("tcp-qemu: the wire (build/net-tx.pcap), decoded independently of the guest")
     segs, err = (None, "pcap missing") if not os.path.exists(PCAP) else decode_pcap(PCAP)
@@ -255,10 +303,16 @@ def main():
         data = [s for s in segs if s[3] > 0]
         fins = [s for s in segs if s[0] & FIN]
         rsts = [s for s in segs if s[0] & RST]
-        check(len(syn) >= 1, "a SYN opened the connection (%d)" % len(syn))
-        check(len(synack) >= 1, "the peer's SYN-ACK is on the wire (%d)" % len(synack))
-        check(len(data) >= 2, "data segments in both directions (%d)" % len(data))
-        check(len(fins) >= 2, "both sides sent FIN (%d)" % len(fins))
+        check(len(syn) >= 2, "a SYN opened each connection (%d)" % len(syn))
+        check(len(synack) >= 2, "the peer's SYN-ACK for each (%d)" % len(synack))
+        check(len(data) >= 5, "data segments in both directions (%d)" % len(data))
+        # The large reply cannot fit in one segment, so several MUST carry a full MSS. If this fails
+        # while the byte count passed, the reply came as one jumbo frame and the reassembly path
+        # was never exercised - a green test that proved nothing, which is the thing to catch.
+        big = [x for x in data if x[3] > 1000]
+        check(len(big) >= 2, "the large reply really did span several segments (%d over 1000 bytes)"
+              % len(big))
+        check(len(fins) >= 3, "FINs from both sides across both connections (%d)" % len(fins))
         check(len(rsts) == 0, "no RST anywhere (%d)" % len(rsts))
         if syn and synack:
             check(synack[0][2] == (syn[0][1] + 1) & 0xFFFFFFFF,
