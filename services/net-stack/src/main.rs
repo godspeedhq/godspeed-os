@@ -40,6 +40,10 @@ const GATEWAY_IP:  [u8; 4] = [10, 0, 2, 2];
 
 /// The 16-bit one's-complement checksum used by IPv4 and ICMP (RFC 1071): sum the 16-bit big-endian
 /// words, fold the carries, invert. The field being covered must be zero when this is computed.
+/// TCP lives in its own module: `docs/tcp-design.md` explains why, and it keeps the protocol
+/// separable from the request/response services around it.
+mod tcp;
+
 fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
