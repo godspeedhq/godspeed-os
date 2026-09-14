@@ -56,6 +56,7 @@
 - [2026-09-05 to 2026-09-06 - The day five bugs stood in a line, each hiding the one behind it](#2026-09-05-to-2026-09-06---the-day-five-bugs-stood-in-a-line-each-hiding-the-one-behind-it)
 - [2026-09-06 - The day the second core stopped being an answer](#2026-09-06---the-day-the-second-core-stopped-being-an-answer)
 - [2026-09-12 to 2026-09-13 - The day "it boots" stopped being the standard](#2026-09-12-to-2026-09-13---the-day-it-boots-stopped-being-the-standard)
+- [2026-09-13 to 2026-09-14 - The day the enforcement layer was pointed at itself](#2026-09-13-to-2026-09-14---the-day-the-enforcement-layer-was-pointed-at-itself)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -1316,6 +1317,111 @@ would settle it is named: take `loongarch64`, already at M1, and drive it to M4,
 outside `arch/loongarch64/` that has to change. That number is the answer, and nothing else is.
 
 ---
+
+## 2026-09-13 to 2026-09-14 - The day the enforcement layer was pointed at itself
+
+The previous entry ends with five machines and `ran 461, failed 0`. This one starts the morning
+after, with a question that had no instrument behind it: the project had ten commandments and five of
+them mechanised, and everyone assumed the other five were the unmechanisable ones.
+
+They were not. They were the ones nobody had tried.
+
+**The realization: you do not find an absent gate by reading the rules. You find it by making the
+shortcut tempting and watching where a contributor goes.** The method was to hand a deliberately weak
+model a task whose correct answer is harder than its shortcut, with no mention of any checker, and
+then read the diff. Four tasks, four different commandments, and every one of them found something
+that twelve green checkers had been walking past.
+
+| | before | after |
+|---|---|---|
+| Commandments mechanised | **5 of 10** | **10 of 10** |
+| checker scripts | 11 | 13 |
+| self-test probes ("prove the guard fires") | 61 | 73 |
+| ratcheted units | 1 (arch NAMES) | 2 (arch NAMES + cfg SITES) |
+| shipped binaries changed | | **none** |
+
+That last row is the honest frame for the rest. Not one byte of any of the four shipping kernels
+changed in two days. Everything here is the layer that decides whether the next change is allowed.
+
+### What each gate found the first time it was run
+
+Not one of them found nothing, which is itself the finding - these were not hypothetical rules.
+
+- **A rule written down beside an enforced rule, enforced by nothing.** `kernel/src/arch/CLAUDE.md`
+  names "two rules the boundary is built on", and `arch_boundary_check.py` sat next to it enforcing
+  only the first. Eight neutral-kernel sites were violating the second, and they surfaced only when a
+  32-bit port hit them as compile errors - which is the worst way to find a rule you already wrote
+  down, because the porter must first work out that the fault is yours.
+- **Authority pinned by NAME, not by CONTENT.** `I-service-table` pinned which services the kernel
+  knows; nothing pinned what those services are *given*. Adding an IRQ line, flipping
+  `has_console_read`, or adding a privilege bit changed no name, no cfg, no `unsafe`, and no syscall.
+  The enforcement layer had said so about itself for months, in a field nobody read:
+  *"that is Commandment VII, and it is not built yet."*
+- **A contract that claims authority nothing grants.** The weak model added `service_control = true`
+  to a service's `.toml`, wrote the restart logic, and reported success. It compiled, `osdev validate`
+  passed it, and all twelve checkers stayed silent - correctly, because nothing that *grants*
+  authority had been touched. The service would have had every call denied, the denial discarded
+  twice, and a log line printed *before* the call asserting a restart that never happened.
+- **Five services holding a send cap they cannot refresh.** Every peer here is restartable and chaos
+  kills them all, so a stale cap is a wasting asset. The failure is silent by construction: trace
+  emission is `try_send` with the result deliberately dropped, so a dead peer looks exactly like a
+  live one.
+- **Seven user-facing verbs with no specification**, in a folder whose own conventions document
+  declares itself canonical for *every* utility. One of them is `selfcheck` - the most-used verb in
+  the project, the one every hardware run in this repository reports through.
+
+### The one that was our fault, not the model's
+
+The contract finding was the sharpest, because the model was *following the constitution*. CLAUDE.md
+said, in two places, that the kernel mints capabilities from the contract at spawn. It does not, and
+never has: the kernel is `no_std` and cannot parse TOML, and authority arrives in the supervisor's
+spawn request. `contract_check.py` exists *because* the `.toml` is a second declaration that drifts.
+
+And it had been caught before. An audit flagged it on 2026-07-12, quoting the section's own words back
+at it, and marked it **RESOLVED**. The resolution changed the code and left the document. Two months
+later a contributor read the document and did exactly what it said.
+
+**A fix that closes a defect and leaves the text that caused it has not finished.** That is the rule
+this day earned, and it is why §13.6 and §14.1 now carry a dated amendment instead of a shorthand that
+was nearly true.
+
+### The dominant failure mode of an enforcement layer
+
+Three times in two days, an instrument reported a clean pass while reading nothing:
+
+- a regex alternative written as `\bcfg!` inside a **non-raw** Python string, where `\b` is the
+  BACKSPACE character. That branch matched nothing; every `cfg!` site counted zero. `print()` of the
+  pattern looked correct, because a backspace is invisible. Only `repr()` showed it;
+- a site scan that counted `#[cfg]` attributes and silently ignored `cfg!()` expressions, reporting
+  22 where the answer was 28;
+- a peer parser that matched a literal `&[..]` and therefore read **no peers at all** for the two
+  services whose row passes a named constant - so the authority gate shipped two days earlier had
+  been passing over grants it could not see.
+
+None of these fails loudly. A checker that has stopped matching is indistinguishable from a codebase
+that has stopped violating, and the second reading is the flattering one. The only defence that
+worked was making the instrument assert itself against a known-matching input at load time, and
+refusing to run when it cannot. `shared_surface_check.py` now does exactly that, with the incident in
+the comment.
+
+**A count you did not watch change is not a measurement.** The corollary the project already knew for
+hardware counters turns out to apply to its own checkers, and more sharply, because a checker is
+believed by definition.
+
+### What was deliberately NOT built
+
+Three designs were measured and thrown away rather than shipped: matching duplicate constants by
+VALUE gave 3,381 candidates, restricting to values the arch seam names gave 715, and both were
+essentially coincidence. Matching by NAME within one crate gave 31, every one readable. **A baseline
+of several hundred entries is not a gate, it is a graveyard.**
+
+And Commandment X was not closed by inventing a tenth check. Its kernel half was already enforced four
+times over under Commandment I; its user half genuinely had nothing, and now has one narrow check that
+reconciles the vocabulary against its documentation. What remains - *place complexity in the layer that
+naturally owns it* - is a judgement no pattern reads, and it is written down in
+[`docs/x-residue.md`](../docs/x-residue.md) rather than implied to be covered. The number reached 10 of
+10 because a real gap closed. A number optimised instead of a property secured is the failure §26.3
+exists to prevent, and the residue document is how that stays true.
 
 ## The Named Bugs - the teachers
 
