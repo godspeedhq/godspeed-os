@@ -62,6 +62,51 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "SHARED-SURFACE.baseline.txt")
 
+# A SECOND baseline, in its own file, counting `#[cfg` ATTRIBUTES rather than arch NAMES.
+#
+# WHY TWO UNITS. The name count above is the better headline - it is what CLAUDE.md 4.1 quotes and
+# what `docs/porting.md` puts in its tree - and it has one blind spot that an experiment walked
+# straight into. On 2026-09-14 a model was asked to support a second NIC on the Pi 4. It rewrote
+#     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
+# as
+#     #[cfg(target_arch = "x86_64")]
+# which is the SAME BRANCH spelled with fewer arch names. The name count fell 11 -> 9 and this script
+# reported an improvement. Nothing about the file's portability changed: the number of places that
+# decide something by instruction set was 10 before and 10 after.
+#
+# So a fall in the name count is not by itself evidence that an arch-conditional DECISION went away.
+# Ratcheting both closes it: a genuine removal lowers both, a re-spelling lowers neither, and a
+# negative cfg rewritten as a positive one can no longer bank a win it did not earn.
+#
+# It is a separate FILE rather than a second column because `SHARED-SURFACE.baseline.txt`'s format is
+# parsed by `facts_check.porting_tree_problems` and drives the tree in `docs/porting.md`. Widening
+# that line would have to be done in three places at once, and getting it wrong makes the tree
+# cross-check skip lines rather than fail - the exact silent-pass shape this layer exists to prevent.
+SITES_BASELINE = os.path.join(ROOT, "SHARED-SURFACE-SITES.baseline.txt")
+# Both forms are a compile-time branch on the ISA and both count once, however many names they
+# list: the `#[cfg(..)]` ATTRIBUTE and the `cfg!(..)` EXPRESSION (`net-stack` and the SDK's
+# `ipc.rs` each use the latter, and an attribute-only scan reported them as zero).
+#
+# A `build.rs` matching `CARGO_CFG_TARGET_ARCH` scores zero here, and that is CORRECT rather
+# than a blind spot: `docs/porting.md` names those tables as the designed place to answer, one
+# question asked ONCE, and this unit is meant to reward exactly that over a scatter of cfgs.
+def _cfg_site_re():
+    """One compile-time ISA branch, in either spelling, counted once however many names it lists:
+    the `#[cfg(..)]` attribute and the `cfg!(..)` expression."""
+    return re.compile(r'#\[\s*cfg' + '|' + r'cfg!\s*\(')
+
+
+CFG_SITE = _cfg_site_re()
+if not CFG_SITE.search('x = cfg!(target_arch = "x86_64");'):
+    # LOUD, never a silent pass. This alternation was first written with a `\b` inside a NON-RAW
+    # string, which Python reads as the BACKSPACE character (0x08) - so the `cfg!` branch matched
+    # nothing, every `cfg!` site counted as zero, and this script printed a clean pass over a regex
+    # that was reading nothing. `print()` of the pattern looked right because a backspace is
+    # invisible; only `repr()` showed it. A regex that has stopped matching is the same defect as a
+    # counter nobody increments, so it is asserted against a known-matching line rather than trusted.
+    raise SystemExit('shared_surface_check: CFG_SITE no longer matches a `cfg!` site - refusing to '
+                     'report a count it cannot measure')
+
 # Where shared code lives. `sdk/` is the seam and is EXPECTED to carry arch cfgs - counted so a reader
 # can see the shape, but it is the one place they are the right answer rather than a smell.
 # The neutral kernel is `kernel/src` MINUS `arch/`, which is the one directory allowed to know.
@@ -137,6 +182,58 @@ def scan_counts():
                 if n:
                     counts[rel(full)] = n
     return counts
+
+
+def scan_sites():
+    """`#[cfg` attributes that mention an arch, per shared file, as {path: count}.
+
+    An attribute is counted once no matter how many arch names it lists, which is the whole point:
+    this unit asks HOW MANY PLACES decide by instruction set, not how many names they spell.
+    """
+    counts = {}
+    for root_name in SHARED_ROOTS:
+        root = os.path.join(ROOT, root_name)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+            for fn in filenames:
+                if not fn.endswith(".rs"):
+                    continue
+                full = os.path.join(dirpath, fn)
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    text = _strip_comments(fh.read())
+                n = sum(1 for line in text.splitlines()
+                        if CFG_SITE.search(line) and ARCH_CFG.search(line))
+                if n:
+                    counts[rel(full)] = n
+    return counts
+
+
+def read_sites_baseline():
+    if not os.path.exists(SITES_BASELINE):
+        return None
+    out = {}
+    with open(SITES_BASELINE, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                out[parts[1].strip()] = int(parts[0])
+    return out
+
+
+def write_sites_baseline(counts):
+    with open(SITES_BASELINE, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("# Arch-conditional `#[cfg` ATTRIBUTES outside kernel/src/arch, frozen. The companion\n"
+                 "# to SHARED-SURFACE.baseline.txt, which counts arch NAMES.\n"
+                 "#\n"
+                 "# This unit asks HOW MANY PLACES decide by instruction set. The name count can fall\n"
+                 "# without this one moving - rewrite `not(any(arm, aarch64, riscv64))` as `x86_64` and\n"
+                 "# you have spelled the same branch with two fewer names. That really happened, and\n"
+                 "# this script reported it as an improvement, which is why this file exists.\n"
+                 "#\n"
+                 "# SHRINK ONLY, on the same terms as its companion.\n\n")
+        for path in sorted(counts):
+            fh.write("%4d  %s\n" % (counts[path], path))
 
 
 def read_baseline():
@@ -340,7 +437,8 @@ def report_against_main():
 def main():
     if "--bless" in sys.argv:
         write_baseline(scan_counts())
-        print("shared-surface: baseline rewritten from the working tree - say why in the commit.")
+        write_sites_baseline(scan_sites())
+        print("shared-surface: BOTH baselines rewritten from the working tree - say why in the commit.")
         return 0
 
     counts = scan_counts()
@@ -349,6 +447,30 @@ def main():
         write_baseline(counts)
         print("shared-surface: no baseline; wrote one from the working tree.")
         return 0
+
+    sites = scan_sites()
+    sites_base = read_sites_baseline()
+    if sites_base is None:
+        write_sites_baseline(sites)
+        print("shared-surface: no SITES baseline; wrote one from the working tree.")
+        sites_base = sites
+
+    sites_grew = [(p, sites_base.get(p, 0), n) for p, n in sorted(sites.items())
+                  if n > sites_base.get(p, 0)]
+    if sites_grew:
+        print("SHARED SURFACE GREW - more PLACES now decide by instruction set, outside `arch/`:")
+        print()
+        for path, was, now in sites_grew:
+            print("  %s: %d -> %d arch `#[cfg` attribute(s)" % (path, was, now))
+        print()
+        print("This is the SITE count, not the name count: how many places branch on the ISA at all.")
+        print("It is checked separately because the name count has a blind spot - rewriting")
+        print("`not(any(arm, aarch64, riscv64))` as `x86_64` drops two names while leaving the same")
+        print("branch exactly where it was, and this script used to call that an improvement.")
+        print()
+        print("If the port really needs it, run `python scripts/shared_surface_check.py --bless` and")
+        print("say why in the commit.")
+        return 1
 
     grew = [(p, baseline.get(p, 0), n) for p, n in sorted(counts.items()) if n > baseline.get(p, 0)]
     if grew:

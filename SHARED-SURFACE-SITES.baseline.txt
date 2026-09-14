@@ -1,0 +1,18 @@
+# Arch-conditional `#[cfg` ATTRIBUTES outside kernel/src/arch, frozen. The companion
+# to SHARED-SURFACE.baseline.txt, which counts arch NAMES.
+#
+# This unit asks HOW MANY PLACES decide by instruction set. The name count can fall
+# without this one moving - rewrite `not(any(arm, aarch64, riscv64))` as `x86_64` and
+# you have spelled the same branch with two fewer names. That really happened, and
+# this script reported it as an improvement, which is why this file exists.
+#
+# SHRINK ONLY, on the same terms as its companion.
+
+   2  kernel/src/task/scheduler.rs
+   6  sdk/rust/src/adversarial.rs
+   1  sdk/rust/src/ipc.rs
+   4  sdk/rust/src/syscall.rs
+   2  services/hw-enumerator/src/main.rs
+   1  services/net-stack/src/main.rs
+   8  services/nic-driver/src/main.rs
+   4  services/supervisor/src/main.rs
