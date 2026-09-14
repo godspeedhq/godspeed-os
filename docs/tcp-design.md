@@ -156,3 +156,62 @@ So the poll loop checks `tsc_ticks_per_10ms()` **once, explicitly**, and if ther
 so loudly and paces on yields instead of a deadline. TCP timers genuinely require a clock; on a port
 without one the honest report is that retransmission timing is unavailable, not a silently wrong
 number. That is recorded here rather than discovered later.
+
+---
+
+# Where this stands (2026-09-14)
+
+## Working, and verified on the wire
+
+`tcp <ip> <port> [text]` performs a complete TCP transaction. `scripts/tcp_qemu_test.py` boots QEMU,
+runs it against a real echo server on the host, and checks the result twice: once from the guest's
+output and once by decoding `build/net-tx.pcap`, which QEMU writes outside the guest entirely.
+
+All 17 assertions pass, over two connections including one whose reply spans several segments:
+
+    guest   single-segment echo returned; 2884-byte reply reassembled in order
+    host    both connections accepted; both payloads received intact
+    wire    SYN and SYN-ACK per connection, six data segments (two over 1000 bytes),
+            four FINs, no RST, and the peer acknowledging our ISS+1
+
+Implemented: segment parse and emit, the TCP checksum with its pseudo-header, the active-open state
+machine through to TIME_WAIT, cumulative ACK with the send arena draining behind it, in-order
+delivery, a bounded out-of-order queue, window updates, retransmission with clamped backoff, and RTO
+estimation per RFC 6298 with Karn's algorithm.
+
+## The prerequisite this design missed, and the plan it changes
+
+**A background TCP engine is blocked**, and not by effort. `docs/net-tags-design.md` records that
+net-stack receives client requests and nic-driver replies on **one untagged endpoint**, so any
+unsolicited driver traffic consumes client messages. An idle tick was tried here before, caused
+exactly that, and was reverted; the comment it left says *"fix the correlation BEFORE adding a tick,
+not after"*. The poll step specified earlier on this page is that tick.
+
+So the phase order changes. What was P0 is now this, and everything after it depends on it:
+
+| | |
+|---|---|
+| **next** | `docs/net-tags-design.md` phase 3 - the bounded stash. A client request met while awaiting a driver reply is KEPT and served after, instead of dropped. Built on the discriminator that already exists (a client request carries a reply cap; a driver reply does not), so it does NOT need the 40-edit wire-tag change that document warns against doing in one pass. Sized: a `&mut` threaded through 15 `nic_req` call sites, every one compiler-checked |
+| then | the poll step, and connections that progress with no client asking |
+| then | listen and accept, so the machine can serve rather than only fetch |
+| then | congestion control: slow start, congestion avoidance, fast retransmit and recovery |
+
+Until the stash lands, one transaction per request is the honest ceiling, and `utilities/48_tcp.md`
+says so where a user would otherwise wonder.
+
+## What the tests caught, recorded because each is a class rather than an incident
+
+- **A drain reply is a batch**, `[count, (len_u16le, frame) x count]`, not a bare frame. Treating it
+  as one meant the peer's SYN-ACK arrived six times and was parsed as garbage six times. The guest's
+  own log could only say "nothing came back"; the pcap said exactly what had happened. This is the
+  argument for the second instrument, in one incident.
+- **The window is the arena, and that only works with window updates.** A reply larger than the arena
+  shuts the window; reading reopens it; a peer that is not told stays throttled. Found by asking for
+  a reply bigger than the buffer, which the first version of the test never did.
+- **A fix that cannot fire.** The first window-update threshold was one MSS, which with MSS 1460 and
+  a 2048-byte arena is unreachable by construction. It looked right, changed nothing, and the
+  symptom was unchanged. The rule is min(MSS, RCV_BUF/2).
+- **Two of the three failures the harness reported were the harness.** It closed the serial socket
+  before the content line arrived, and later compared against a hand-computed length that was wrong
+  by four bytes. Both are now commented at the site, and the expected length is derived rather than
+  restated.
