@@ -199,6 +199,15 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 Until the stash lands, one transaction per request is the honest ceiling, and `utilities/48_tcp.md`
 says so where a user would otherwise wonder.
 
+**And the stash needs an SDK change, which the estimate above did not include.** net-stack cannot
+write its own send-and-await today: `find_send_slot` and `await_slice` are both private to
+`sdk/rust/src/service_context.rs`, and `request_with_reply_deadline_outcome` does the send AND the
+wait in one call with no way to inspect what arrives. So phase 3 needs either those two made public,
+or - better, because it keeps the policy in the SDK where every other caller can use it - a bounded
+await that hands back messages it did not expect, rather than returning the first thing that lands.
+That is a change to a file every service links, so it is a decision to take deliberately and in
+daylight, not an incidental part of a TCP branch.
+
 ## What the tests caught, recorded because each is a class rather than an incident
 
 - **A drain reply is a batch**, `[count, (len_u16le, frame) x count]`, not a bare frame. Treating it
