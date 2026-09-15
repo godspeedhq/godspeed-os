@@ -371,6 +371,53 @@ now lives on `Conn`, set at `connect`, so that is impossible rather than merely 
 ping this machine. The poll's effect is proven on hardware or not at all; what QEMU proves is that it
 breaks nothing (174/0 with the stack configured, so the poll is running throughout).
 
+## The Raspberry Pi 4, and the bug it found (2026-09-15)
+
+The second board to see the protocol work of this branch - MSS negotiation, RFC 5681 congestion
+control, the persist timer, the client-hop correlation tag, the bounded stash, the poll step and
+passive open. AArch64, GENET on-SoC ethernet.
+
+| | Pi 4 | Pi 2, for comparison |
+|---|---|---|
+| ping, ARP cache cleared | 6/6, 33-189 ms, TTL 64 | 4/4 |
+| `tcp hello` | ARP 16 ms, TCP **47 ms** | 205 ms total |
+| `tcp big`, 2884 bytes | ARP 47 ms, TCP **16 ms** | 174 ms total |
+| `serve`, three connections | 3/3 echoed | 2/3, twice |
+| `tcp selftest` | 53 checks | 53 checks |
+
+**No new bugs from the port.** The one defect it found is in neutral code and would have bitten every
+board equally - the Pi 2 was hiding it behind its own slowness.
+
+### A zero-length reply cannot be sent, and three paths tried to
+
+Every `serve` close took five seconds, `FILTER_WAIT_SECS` to the millisecond, while the close itself
+had plainly worked: net-stack reaped the connection 400 ms later, which only happens once it reaches
+`Closed`. The echo before it took 11 ms.
+
+The kernel's `validate_user_ptr` rejects `len == 0`, so a zero-length `try_send` fails, the reply
+never leaves, and the caller waits out its entire deadline for a message that could not have been
+sent. Silent at both ends: the sender discards the failed send, the receiver sees only a timeout.
+
+`COP_CLOSE` replied with nothing, and so did the refusal path and the UDP socket path when a datagram
+drew no answer. Every other reply in the service happens to carry a byte, which is the only reason
+this took until the fourth board to surface. All three now answer with a status byte, and
+`Reply::send` debug-asserts a non-empty body - deliberately asserting rather than padding, because
+"no data" and "no answer" are different things and the sender should have to choose between them.
+
+Confirmed by re-measuring the same three connections:
+
+| | before | after |
+|---|---|---|
+| echo to close, on the board | 4916 ms | **201 ms** |
+| client total, connection 2 | 4086 ms | **366 ms** |
+| client total, connection 3 | 4195 ms | **379 ms** |
+
+### One theory retired
+
+The Pi 2's small-transfer latency - a reproducible ~346 ms where a 2884-byte reply took 15 ms - does
+NOT reproduce here: 47 ms for the same exchange against the same peer. So it is a dwc2 property, not
+anything in the TCP close sequence, which is where the transmit-journal diagnostic had been pointing.
+
 ## What the tests caught, recorded because each is a class rather than an incident
 
 - **A drain reply is a batch**, `[count, (len_u16le, frame) x count]`, not a bare frame. Treating it
