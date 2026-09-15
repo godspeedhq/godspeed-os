@@ -109,6 +109,12 @@ pub fn seq_gt(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) > 0 }
 pub enum State {
     Closed,
     SynSent,
+    /// A peer's SYN arrived for a port we are listening on; our SYN-ACK is owed or in flight, and we
+    /// are waiting for the acknowledgement that completes the handshake.
+    ///
+    /// The passive half of the open. Until this existed the machine could dial out and never answer,
+    /// which is the difference between a client and a host.
+    SynReceived,
     Established,
     /// We sent FIN, waiting for its ACK and for the peer's FIN.
     FinWait1,
@@ -127,6 +133,7 @@ impl State {
     pub fn name(self) -> &'static str {
         match self {
             State::Closed => "closed", State::SynSent => "syn-sent",
+            State::SynReceived => "syn-received",
             State::Established => "established", State::FinWait1 => "fin-wait-1",
             State::FinWait2 => "fin-wait-2", State::CloseWait => "close-wait",
             State::LastAck => "last-ack", State::TimeWait => "time-wait",
@@ -170,6 +177,11 @@ pub struct Conn {
     /// The resource id of the capability this connection was minted as, so a badged invocation finds
     /// it. 0 when the slot is free.
     pub rid: u64,
+
+    /// This connection arrived from a LISTENER rather than from `connect`, so it has no owner until
+    /// a client accepts it. Distinguishes an unclaimed inbound connection from a free slot, both of
+    /// which have `rid == 0`.
+    pub accepted: bool,
 
     /// Where to address this connection's frames: the peer's own MAC when it is on-link, the
     /// gateway's when it is not.
@@ -291,7 +303,7 @@ pub struct Conn {
 impl Conn {
     pub const fn free() -> Self {
         Conn {
-            state: State::Closed, fault: Fault::None, rid: 0, peer_mac: [0; 6],
+            state: State::Closed, fault: Fault::None, rid: 0, accepted: false, peer_mac: [0; 6],
             local_port: 0, remote_ip: [0; 4], remote_port: 0,
             snd_una: 0, snd_nxt: 0, snd_wnd: 0, iss: 0, rcv_nxt: 0,
             snd_buf: [0u8; SND_BUF], snd_len: 0,
@@ -529,8 +541,35 @@ pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8;
 /// Everything TCP owns. Passed by `&mut` from `service_main` rather than living in a static, because
 /// a service may hold no unowned global mutable state (Commandment VI, and `VI-static-mut` enforces
 /// it). That also makes the footprint honest: this struct IS the memory cost of TCP here.
+/// A port this machine answers on.
+///
+/// **Deliberately not a `Conn`.** BSD gives a listener a full socket and so does most of the
+/// literature, but a `Conn` here carries a 2 KiB send arena, a 2 KiB receive arena and four
+/// out-of-order slots - about ten kilobytes that a listener never touches, on a service whose entry
+/// frame is already a third of its stack. A listener needs a port and an owner, so that is what it
+/// is: ten bytes, and `MAX_CONNS` stays available for actual connections.
+#[derive(Clone, Copy)]
+pub struct Listener {
+    /// The port being answered on. 0 = this slot is free.
+    pub port: u16,
+    /// The capability this listener was minted as, so its owner can be found and so closing it is
+    /// an ordinary revoke.
+    pub rid: u64,
+}
+
+impl Listener {
+    pub const fn free() -> Self { Listener { port: 0, rid: 0 } }
+}
+
+/// How many ports can be listened on at once. Two, matching `MAX_CONNS`: a machine that can hold two
+/// connections has no use for more listening ports than that, and each is checked on every inbound
+/// segment that matches no connection.
+pub const MAX_LISTEN: usize = 2;
+
 pub struct Tcp {
     pub conns: [Conn; MAX_CONNS],
+    /// Ports this machine answers on. See `Listener`.
+    pub listeners: [Listener; MAX_LISTEN],
     /// Ephemeral port allocator. Starts high to stay clear of anything well known.
     next_port: u16,
     /// Cycles per millisecond, or 0 when the clock is not calibrated. `backlog/27`: a deadline built
@@ -572,6 +611,7 @@ impl Tcp {
     pub fn new(tsc_hz: u64, now_tsc: u64) -> Self {
         Tcp {
             conns: [Conn::free(); MAX_CONNS],
+            listeners: [Listener::free(); MAX_LISTEN],
             next_port: 49152,
             cyc_per_ms: tsc_hz / 1000,
             base_tsc: now_tsc,
@@ -627,6 +667,49 @@ impl Tcp {
         self.conns.iter_mut().find(|c| {
             c.state != State::Closed && c.local_port == lport
                 && c.remote_port == rport && &c.remote_ip == rip
+        })
+    }
+
+    /// Answer on `port` from now on. Returns false if every listener slot is taken, or if that port
+    /// is already being listened on - a second listener on one port would make which one receives a
+    /// connection a matter of array order, which is exactly the kind of implicit behaviour §26.5
+    /// refuses.
+    pub fn listen(&mut self, port: u16, rid: u64) -> bool {
+        if port == 0 { return false; }
+        if self.listeners.iter().any(|l| l.port == port) { return false; }
+        match self.listeners.iter_mut().find(|l| l.port == 0) {
+            Some(l) => { l.port = port; l.rid = rid; true }
+            None => false,
+        }
+    }
+
+    /// Stop answering on the port this listener owns.
+    ///
+    /// Connections already ACCEPTED from it are untouched and keep running, which is the same
+    /// separation `fs` makes between a directory and the files opened from it: closing the listener
+    /// closes the door, not the conversations already inside.
+    pub fn unlisten(&mut self, rid: u64) -> bool {
+        match self.listeners.iter_mut().find(|l| l.rid == rid && l.port != 0) {
+            Some(l) => { *l = Listener::free(); true }
+            None => false,
+        }
+    }
+
+    /// Is this port being listened on?
+    fn listening_on(&self, port: u16) -> bool {
+        self.listeners.iter().any(|l| l.port == port)
+    }
+
+    /// A connection that has completed its handshake and has not been handed to a client yet.
+    ///
+    /// `rid == 0` is what marks it unclaimed: a connection opened by `connect` is minted with its
+    /// client's resource id from the start, while an accepted one has no owner until somebody takes
+    /// it.
+    pub fn pending_accept(&self) -> Option<usize> {
+        (0..MAX_CONNS).find(|&i| {
+            let c = &self.conns[i];
+            c.rid == 0 && c.accepted && matches!(c.state,
+                State::Established | State::CloseWait | State::FinWait1 | State::FinWait2)
         })
     }
 
@@ -862,6 +945,88 @@ pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
         }
     }
 
+    // ---- PASSIVE OPEN: the machine answers a connection it did not start ----
+    //
+    // Driven entirely through the real entry points - `listen`, then `on_frame` with a SYN built by
+    // `emit`, then `poll_one` - so this exercises the same code an inbound connection takes and not
+    // a paraphrase of it.
+    t = Tcp::new(0, 0);
+    {
+        let lst = &mut t;
+        check(lst.listen(8080, 42), "a port can be listened on", &mut pass, &mut fail);
+        check(!lst.listen(8080, 43), "the same port cannot be listened on twice", &mut pass, &mut fail);
+        check(lst.listen(9090, 44), "a second, different port can be listened on", &mut pass, &mut fail);
+        check(!lst.listen(7070, 45), "a third listener is refused - the bound is MAX_LISTEN", &mut pass, &mut fail);
+        check(lst.pending_accept().is_none(), "nothing is waiting to be accepted before any SYN", &mut pass, &mut fail);
+
+        // A peer dials in. Its MAC is one we never resolved - the point being that the reply is
+        // addressed from the FRAME, so no ARP is needed for an inbound connection.
+        let their_mac = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let their_ip = [10, 0, 0, 9];
+        let their_seq: u32 = 0x2000_0000;
+        let n = emit(&mut buf, &net.our_mac, &their_mac, &their_ip, &net.our_ip,
+                     55000, 8080, their_seq, 0, SYN, 4096, &[]);
+        lst.on_frame(ctx, &net, &buf[..n], &mut sink);
+
+        let idx = (0..MAX_CONNS).find(|&k| lst.conns[k].state == State::SynReceived);
+        check(idx.is_some(), "a SYN to a listening port opens a connection", &mut pass, &mut fail);
+        let Some(k) = idx else { return (pass, fail) };
+        check(lst.conns[k].accepted, "the connection is marked as one we did not start", &mut pass, &mut fail);
+        check(lst.conns[k].rid == 0, "and it has no owner until somebody accepts it", &mut pass, &mut fail);
+        check(lst.conns[k].peer_mac == their_mac,
+              "its peer MAC is taken from the frame, so no ARP is needed", &mut pass, &mut fail);
+        check(lst.conns[k].rcv_nxt == their_seq.wrapping_add(1),
+              "the peer's SYN consumed one sequence number", &mut pass, &mut fail);
+        check(lst.pending_accept().is_none(),
+              "a half-open connection is NOT offered for accept", &mut pass, &mut fail);
+
+        // The SYN-ACK is owed, not sent, and `poll_one` is what sends it.
+        let n = lst.poll_one(ctx, &net, k, &mut sink);
+        check(n > 0, "poll_one sends the SYN-ACK the handshake owes", &mut pass, &mut fail);
+        let mut our_iss = 0u32;
+        if let Some(sg) = parse(&sink[..n]) {
+            check(sg.flags & SYN != 0 && sg.flags & ACK != 0,
+                  "and it is a SYN-ACK, not a bare acknowledgement", &mut pass, &mut fail);
+            check(sg.ack == their_seq.wrapping_add(1),
+                  "acknowledging exactly the peer's SYN", &mut pass, &mut fail);
+            check(sg.mss == Some(MSS as u16),
+                  "carrying our maximum segment size, as every SYN must", &mut pass, &mut fail);
+            our_iss = sg.seq;
+        }
+
+        // The peer completes the handshake, with data riding on the same segment - the common case.
+        let n = emit(&mut buf, &net.our_mac, &their_mac, &their_ip, &net.our_ip,
+                     55000, 8080, their_seq.wrapping_add(1), our_iss.wrapping_add(1),
+                     ACK, 4096, b"GET /");
+        lst.on_frame(ctx, &net, &buf[..n], &mut sink);
+        check(lst.conns[k].state == State::Established,
+              "the peer's acknowledgement completes the passive open", &mut pass, &mut fail);
+        check(lst.conns[k].readable() == 5,
+              "data arriving WITH that acknowledgement is delivered, not dropped", &mut pass, &mut fail);
+        check(lst.pending_accept() == Some(k),
+              "an established inbound connection is offered for accept", &mut pass, &mut fail);
+
+        // A wrong acknowledgement must not complete a handshake. Fresh connection, same listener.
+        let n = emit(&mut buf, &net.our_mac, &their_mac, &their_ip, &net.our_ip,
+                     55001, 9090, their_seq, 0, SYN, 4096, &[]);
+        lst.on_frame(ctx, &net, &buf[..n], &mut sink);
+        if let Some(k2) = (0..MAX_CONNS).find(|&x| lst.conns[x].state == State::SynReceived) {
+            let n = emit(&mut buf, &net.our_mac, &their_mac, &their_ip, &net.our_ip,
+                         55001, 9090, their_seq.wrapping_add(1), 0xdead_beef, ACK, 4096, &[]);
+            lst.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(lst.conns[k2].state == State::SynReceived,
+                  "an acknowledgement of something we never sent does NOT complete the handshake",
+                  &mut pass, &mut fail);
+        }
+
+        // Closing the listener stops new connections without disturbing established ones.
+        check(lst.unlisten(42), "a listener can be closed by its owner", &mut pass, &mut fail);
+        check(!lst.unlisten(42), "and closing it twice is refused", &mut pass, &mut fail);
+        check(lst.conns[k].state == State::Established,
+              "closing the listener leaves connections already accepted from it running",
+              &mut pass, &mut fail);
+    }
+
     // ---- the persist timer arms when the peer shuts its window ----
     t = Tcp::new(0, 0);
     let t3 = &mut t;
@@ -1026,6 +1191,59 @@ impl Tcp {
         // while `c` is alive. Asking first and incrementing on the answer keeps both.
         let matched = self.find(lp, &rip, rp).is_some();
         if matched { self.stat_matched = self.stat_matched.saturating_add(1); }
+
+        // ---- PASSIVE OPEN: a SYN for a port we answer on ----
+        //
+        // No connection matches, so before dropping the segment, ask whether we are LISTENING on the
+        // port it is addressed to. This is the whole of accept as far as the protocol is concerned:
+        // a slot is taken, the peer's sequence space is adopted, and a SYN-ACK is owed.
+        //
+        // A SYN with ACK set is not an opening SYN - it is an answer to a connection we never
+        // started, which RFC 793 says to reject rather than adopt. Dropping it is the narrower
+        // response and costs the peer only its own timeout.
+        if !matched && seg.flags & SYN != 0 && seg.flags & ACK == 0 && self.listening_on(lp) {
+            // THE PEER'S MAC COMES FROM THE FRAME, not from ARP. The segment arrived from that
+            // address, so it is by construction the right one to answer - no resolution, no
+            // gateway-versus-on-link question, and none of the day this cost when `connect` had to
+            // work it out. The source MAC of a frame that reached us is the one fact we never have
+            // to ask for.
+            let mut pmac = [0u8; 6];
+            pmac.copy_from_slice(&f[6..12]);
+            let iss = (ctx.read_tsc() as u32) ^ 0x7a7a_0000;
+            let mss = seg.mss;
+            let wnd = seg.wnd;
+            let sseq = seg.seq;
+            let i = match self.free_slot() {
+                Some(i) => i,
+                // The table is full. Dropping is correct and deliberate: the peer retries, and by
+                // then a slot may have freed. A RST would be ruder and tells it nothing useful.
+                None => return 0,
+            };
+            let c = &mut self.conns[i];
+            *c = Conn::free();
+            c.accepted = true;
+            c.peer_mac = pmac;
+            c.local_port = lp;
+            c.remote_ip = rip;
+            c.remote_port = rp;
+            c.iss = iss;
+            c.snd_una = iss;
+            c.snd_nxt = iss.wrapping_add(1);       // our SYN takes one sequence number
+            c.rcv_nxt = sseq.wrapping_add(1);      // ...and so does theirs
+            c.snd_wnd = wnd;
+            if let Some(m) = mss { if m >= 88 { c.snd_mss = m; } }
+            c.cc_open();
+            c.state = State::SynReceived;
+            c.rto_ms = RTO_MIN_MS;
+            c.retx_at_ms = now + RTO_MIN_MS;
+            c.state_deadline_ms = now + 10_000;    // a handshake that never completes must end
+            // OWED, NOT SENT - `on_frame` never transmits. `poll_one` sends the SYN-ACK on its next
+            // pass, which is the separation that cost a day of hardware debugging to find.
+            c.ack_due = true;
+            self.stat_matched = self.stat_matched.saturating_add(1);
+            return 0;
+        }
+
         let c = match self.find(lp, &rip, rp) { Some(c) => c, None => return 0 };
 
         // A RST ends the connection, and the reason is kept. Anything else about this segment is
@@ -1075,6 +1293,37 @@ impl Tcp {
             // than half-handling it: the peer's retransmitted SYN will find us still in SynSent and
             // our own SYN retransmission continues, so the connection fails on its deadline rather
             // than entering a state this stack does not implement.
+        } else if c.state == State::SynReceived {
+            // ---- the third leg of a PASSIVE open ----
+            //
+            // Their acknowledgement of our SYN-ACK. It must acknowledge exactly the sequence number
+            // our SYN consumed; anything else is for a connection we do not have.
+            if seg.flags & ACK != 0 && seg.ack == c.snd_nxt {
+                c.snd_una = seg.ack;
+                c.snd_wnd = seg.wnd;
+                c.state = State::Established;
+                c.retx_at_ms = 0;
+                c.retx_count = 0;
+                c.state_deadline_ms = 0;
+                if c.rtt_timing && now >= c.rtt_timed_at_ms {
+                    let r = now - c.rtt_timed_at_ms;
+                    c.rtt_sample(r);
+                    c.rtt_timing = false;
+                }
+                // The same segment may carry data, and a client that sends immediately after
+                // connecting is the common case rather than an exotic one. Falling through to the
+                // data path below would mean re-entering this match arm, so it is delivered here.
+                if !seg.payload.is_empty() && seg.seq == c.rcv_nxt {
+                    deliver(c, seg.seq, seg.payload);
+                    c.ack_due = true;
+                }
+                if seg.flags & FIN != 0
+                    && seg.seq.wrapping_add(seg.payload.len() as u32) == c.rcv_nxt {
+                    c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+                    c.state = State::CloseWait;
+                    c.ack_due = true;
+                }
+            }
         } else if c.state != State::Closed {
             // ---- acknowledgement ----
             if seg.flags & ACK != 0 {
@@ -1295,6 +1544,30 @@ impl Tcp {
                             ACK | FIN, w, &[]);
             }
             return 0;
+        }
+
+        // ---- the SYN-ACK a passive open owes, and its retransmission ----
+        //
+        // Before the ordinary acknowledgement path, because in `SynReceived` there is no ordinary
+        // acknowledgement to send: the peer is waiting on a SYN-ACK and nothing else will do.
+        if c.state == State::SynReceived {
+            let due = c.ack_due || (has_clock && c.retx_at_ms != 0 && now >= c.retx_at_ms);
+            if !due { return 0; }
+            if has_clock && c.retx_at_ms != 0 && now >= c.retx_at_ms {
+                c.retx_count += 1;
+                if c.retx_count > MAX_RETX {
+                    c.fault = Fault::RetxExhausted;
+                    c.state = State::Closed;
+                    return 0;
+                }
+                c.rto_ms = (c.rto_ms * 2).min(RTO_MAX_MS);
+                c.retx_at_ms = now + c.rto_ms;
+            }
+            c.ack_due = false;
+            let w = c.window();
+            c.last_adv = w;
+            return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                        c.local_port, c.remote_port, c.iss, c.rcv_nxt, SYN | ACK, w, &[]);
         }
 
         // ---- the acknowledgement owed from the last inbound segment ----
