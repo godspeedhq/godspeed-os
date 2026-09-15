@@ -273,8 +273,20 @@ impl Reply {
     /// that to `service_main`'s frame at every one of the thirteen call sites. The SDK has already
     /// paid for that mistake once - see `await_slice`, where a one-line wrapper returning a `Message`
     /// by value cost `fs` a stack frame per request and took it over its limit on hardware.
+    /// Answering with NOTHING is not possible, so it is not allowed to be attempted.
+    ///
+    /// The kernel's `validate_user_ptr` rejects a zero-length buffer, so a zero-length send fails
+    /// and the reply never leaves - the caller then waits out its entire deadline for a message that
+    /// could not have been sent. On a Pi 4 that was five seconds on every `serve` close, while the
+    /// close itself had worked (net-stack reaped the connection 400 ms later).
+    ///
+    /// Debug-asserted rather than silently padded: a caller that means "nothing" should say so with
+    /// a byte that means it, because the receiver has to distinguish "no data" from "no answer"
+    /// anyway. Padding here would hide the decision instead of forcing it.
     #[inline(never)]
     fn send(&self, ctx: &ServiceContext, body: &[u8]) {
+        debug_assert!(!body.is_empty(),
+            "a zero-length reply cannot be sent - the kernel refuses it and the caller hangs");
         match self.tag {
             None => { let _ = ctx.try_send_by_handle(self.cap, &Message::from_bytes(body)); }
             Some(t) => {
@@ -3008,7 +3020,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         resp[1] = (took >> 8) as u8;
                         2
                     }
-                    COP_CLOSE if right & RIGHT_WRITE != 0 => { tcpst.close(rid); 0 }
+                    // ONE BYTE, NOT ZERO. An empty reply cannot be sent at all: the kernel's
+                    // `validate_user_ptr` rejects `len == 0`, so `try_send` fails, the reply is
+                    // discarded, and the caller waits out its whole deadline. Every other reply here
+                    // happens to carry a byte; this one did not, and it cost five seconds per close
+                    // on a Pi 4 - the close itself worked, which is why the connection was reaped
+                    // 400 ms later while the client sat waiting.
+                    //
+                    // A status byte is the better answer anyway: the caller learns whether the close
+                    // was accepted rather than inferring it from silence.
+                    COP_CLOSE if right & RIGHT_WRITE != 0 => { tcpst.close(rid); resp[0] = 1; 1 }
                     COP_STAT => {
                         let c = &tcpst.conns[i];
                         let rd = c.readable().min(0xffff) as u16;
@@ -3019,7 +3040,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         resp[5] = c.fault as u8;
                         6
                     }
-                    _ => 0,
+                    // A refused operation answers `[0]` rather than nothing, for the same
+                    // reason: an empty reply is undeliverable and reads as a hang.
+                    _ => { resp[0] = 0; 1 }
                 };
                 reply.send(&ctx, &resp[..n]);
                 reply.done(&ctx);
@@ -3048,8 +3071,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 } else { None }
             } else { None };
             match n {
-                Some(len) => { reply.send(&ctx, &resp[..len]); }
-                None      => { reply.send(&ctx, &[]); }
+                // A zero-length UDP response is as undeliverable as a refusal, for the same reason -
+                // the kernel rejects a zero-length send - so both answer with a single zero byte.
+                // `sock` already reads an empty payload as "nothing came back"; it now gets a reply
+                // saying so instead of waiting out its deadline for one that could never arrive.
+                Some(len) if len > 0 => { reply.send(&ctx, &resp[..len]); }
+                _ => { reply.send(&ctx, &[0]); }
             }
         } else if pl.first() == Some(&2) {
             // OPEN a UDP socket: mint a delegated socket cap (READ|WRITE) and GRANT it to the client -
