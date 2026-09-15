@@ -109,7 +109,9 @@ def main():
         time.sleep(1.0)
 
         sock.sendall(b"serve %d\n" % GUEST_PORT)
-        listening = read_until(sock, "listening on port", 20, out)
+        # "listening on <ip>:<port>" when the stack knows its address, "listening on port <n>"
+        # when it does not - match the part common to both rather than one spelling of it.
+        listening = read_until(sock, "listening on", 20, out)
 
         # Connect from OUTSIDE the guest and speak first, which is what a client does.
         got = b""
@@ -129,10 +131,20 @@ def main():
             print("tcp-serve: host-side connection failed: %s" % e)
 
         read_until(sock, "closed", 20, out)
+
+        # RUN IT AGAIN ON THE SAME PORT. The listener has to have been released, and it is not
+        # released by the client dropping its capability - net-stack's listener table is its own
+        # state. Found on a Pi 2, where the second `serve 8080` was refused and stayed refused.
+        # MAX_LISTEN is small, so this leak is two runs deep.
+        out.append("\n---- second run, same port ----\n")
+        sock.sendall(b"serve %d\n" % GUEST_PORT)
+        again = read_until(sock, "listening on", 20, out)
+        sock.sendall(b"q")
+        read_until(sock, "aborted", 15, out)
         text = "".join(out)
 
         print("---- guest tail ----")
-        print("\n".join(text.strip().splitlines()[-18:]))
+        print("\n".join(text.strip().splitlines()[-40:]))
         print("--------------------")
 
         print("tcp-serve: guest side")
@@ -146,6 +158,8 @@ def main():
         check(re.search(r"echoed (\d+) byte\(s\) back", text) is not None,
               "the guest echoed it back")
         check("tcp selftest PASS" in text, "the startup self-test passed")
+        check(again and "would not listen" not in text.split("second run")[-1],
+              "the SAME port can be listened on again - the listener was released, not leaked")
 
         print("tcp-serve: host side, decoded outside the guest")
         check(connected, "the host could connect to the guest's listening port")

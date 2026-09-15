@@ -6276,6 +6276,12 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
 
 /// Listener op: take the next completed connection. Mirrors `LOP_ACCEPT` in net-stack.
 const LOP_ACCEPT: u8 = 0;
+/// Listener: stop answering and release the port. Mirrors `LOP_CLOSE` in net-stack.
+///
+/// Dropping the capability is NOT enough - net-stack's listener table is its own state and nothing
+/// walks back to it from a dropped cap. Without this the port stays registered forever and the
+/// second `serve` on it is refused, which is what the Pi 2 showed.
+const LOP_CLOSE: u8 = 1;
 /// Connection ops. Mirror `COP_*` in net-stack.
 const COP_RECV: u8 = 0;
 const COP_SEND: u8 = 1;
@@ -6285,7 +6291,21 @@ const COP_CLOSE: u8 = 2;
 ///
 /// A bound rather than a wait forever (§26.6), and `q` aborts it at any point - `serve` is an
 /// interactive command and the conventions require an escape from any blocking wait.
-const SERVE_SECS: i64 = 30;
+///
+/// Two minutes rather than thirty seconds, because thirty is shorter than a person takes to switch
+/// to another machine and type. The bound is there to stop the shell waiting forever, not to hurry
+/// anybody, and `q` is the real escape.
+const SERVE_SECS: i64 = 120;
+
+/// Tell net-stack to stop listening, THEN drop the capability.
+///
+/// Both halves, in that order, on every exit path. Dropping the cap alone leaves the port registered
+/// in net-stack forever - the leak the Pi 2 found, where the second `serve` on a port was refused
+/// and stayed refused until the service restarted.
+fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
+    let _ = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_CLOSE]);
+    ctx.remove_cap(listener);
+}
 
 /// `serve <port>` - listen, accept ONE connection, echo what arrives, close.
 ///
@@ -6319,7 +6339,26 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
             return Err(ShellError::Unknown);
         }
     };
-    out.line_fmt(ctx, format_args!("listening on port {} - waiting for one connection (q aborts)", port));
+    // SAY THE ADDRESS, not just the port. Whoever is about to connect needs `<ip>:<port>`, and
+    // making them run `net` first to find out is the kind of small friction that turns a working
+    // feature into an awkward one. Asked of net-stack rather than remembered, so it is the address
+    // the stack actually holds right now - a lease can change (§26.4: a derived copy that can drift
+    // is worse than no copy).
+    let mut shown = false;
+    if let Some(r) = net_status_reply(ctx) {
+        let st = r.payload_bytes();
+        // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
+        if st.len() >= 4 && st[..4] != [0, 0, 0, 0] {
+            out.line_fmt(ctx, format_args!(
+                "listening on {}.{}.{}.{}:{} - waiting for one connection (q aborts)",
+                st[0], st[1], st[2], st[3], port));
+            shown = true;
+        }
+    }
+    if !shown {
+        out.line_fmt(ctx, format_args!(
+            "listening on port {} - waiting for one connection (q aborts)", port));
+    }
 
     // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.
     let mut conn = None;
@@ -6327,7 +6366,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     while ctx.epoch_secs_monotonic() - t0 < SERVE_SECS {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b {
-                ctx.remove_cap(listener);
+                serve_release(ctx, listener);
                 out.line(ctx, "serve: aborted");
                 return Ok(());
             }
@@ -6342,7 +6381,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     let conn = match conn {
         Some(c) => c,
         None => {
-            ctx.remove_cap(listener);
+            serve_release(ctx, listener);
             out.line_fmt(ctx, format_args!("serve: nobody connected within {}s", SERVE_SECS));
             return Ok(());
         }
@@ -6396,7 +6435,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     // by net-stack's poll step, which needs a pass to put the FIN on the wire.
     ctx.sleep(ctx.duration_cycles(200));
     ctx.remove_cap(conn);
-    ctx.remove_cap(listener);
+    serve_release(ctx, listener);
     out.line(ctx, "closed");
     Ok(())
 }

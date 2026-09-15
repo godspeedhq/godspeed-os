@@ -1090,6 +1090,17 @@ struct Socket { rid: u64, port: u16 }
 /// Listener: take the next connection that completed its handshake. Reply carries the connection
 /// capability, or is empty when nothing is waiting.
 const LOP_ACCEPT: u8 = 0;
+/// Listener: stop answering on this port and release the slot.
+///
+/// **This has to be an explicit operation, and its absence was a real leak.** Dropping the client's
+/// capability does NOT tell the owner - the kernel revokes the holder's authority, but net-stack's
+/// listener table is its own state and nothing walks back from a dropped cap to it. So a `serve`
+/// that finished left the port registered forever, and after `MAX_LISTEN` runs the machine could
+/// never listen again until net-stack restarted. Found on the Pi 2: the second `serve 8080` was
+/// refused, which is exactly right and exactly unhelpful.
+///
+/// The same rule `fs` follows for a file: the holder closes it, and the owner reclaims.
+const LOP_CLOSE: u8 = 1;
 
 /// Connection: read whatever has been delivered in order and not yet taken.
 const COP_RECV: u8 = 0;
@@ -1380,6 +1391,30 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
         if fl >= tcp::HDR {
             let mut sink = [0u8; 1600];
             t.on_frame(ctx, net, f, &mut sink);
+        }
+    }
+
+    // ---- REAP finished connections ----
+    //
+    // A connection that has reached `Closed` with nothing left to read is done, but its slot is NOT
+    // free: `in_use` is `state != Closed || rid != 0`, so an owned connection holds its slot even
+    // after the protocol has finished with it. With `MAX_CONNS` slots that is a leak measured in
+    // twos - the table fills and no further connection, inbound or outbound, can be made.
+    //
+    // Revoking is the right way to tell the client, rather than a reply it has to ask for: its next
+    // invocation gets `CapRevoked` from the KERNEL, which is the same answer a deleted file gives
+    // and needs no cooperation from a client that may already have moved on (§7.5, §7.10).
+    //
+    // `readable() == 0` is the guard that matters: a peer's last bytes and its FIN can arrive
+    // together, and reaping on the state alone would discard data the client has not taken yet -
+    // the same mistake the transaction loop's "DRAIN BEFORE LEAVING" comment records.
+    for i in 0..tcp::MAX_CONNS {
+        let c = &t.conns[i];
+        if c.rid != 0 && c.state == tcp::State::Closed && c.readable() == 0 {
+            let rid = c.rid;
+            t.forget(rid);
+            let _ = ctx.resource_revoke(rid);
+            ctx.log("net-stack: a finished connection was reaped and its slot released");
         }
     }
 
@@ -2796,6 +2831,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Accepting hands over authority, so it needs WRITE - the same bar as sending. A
                 // read-only listener cap can be held and inspected but cannot take connections.
                 let op = pl.first().copied().unwrap_or(LOP_ACCEPT);
+                if op == LOP_CLOSE {
+                    // Closing takes WRITE - the same bar as accepting, because both change what the
+                    // machine does on the wire.
+                    let closed = right & RIGHT_WRITE != 0 && tcpst.unlisten(rid);
+                    if closed {
+                        let _ = ctx.resource_revoke(rid);
+                        ctx.log("net-stack: a listener was closed and its port released");
+                    }
+                    reply.send(&ctx, &[if closed { 1 } else { 0 }]);
+                    reply.done(&ctx);
+                    continue;
+                }
                 let mut granted = false;
                 if op == LOP_ACCEPT && right & RIGHT_WRITE != 0 {
                     if let Some(i) = tcpst.pending_accept() {
