@@ -1,11 +1,23 @@
 # Utility: `serve` - accept one TCP connection
 
 **Status:** Built. Verified end to end in QEMU (`scripts/tcp_serve_test.py`), checked on both sides -
-the guest's own report and the bytes this machine received over a socket outside the guest.
+the guest's own report and the bytes the test machine received over a socket outside the guest. That
+test also runs `serve` twice on the same port, which is the regression for the listener leak below.
 
-    serve <port>
+    serve <port> [for]
 
 Listen on `<port>`, accept ONE connection, print what arrives, echo it back, close.
+
+**Waits until you press `q`.** A duration bounds it instead: `30s`, `5m`, `2h`, `1d`, or a plain
+number of seconds.
+
+    serve 8080           wait until q
+    serve 8080 5m        give up after five minutes
+    serve 8080 90        or after ninety seconds
+
+The first version of this capped the wait at 30 seconds, which is shorter than walking to another
+machine and typing - a server that stops listening because a timer ran out was not listening when
+somebody called. A duration is now something you ask for, not something imposed on you.
 
 ## Why this is the interesting one
 
@@ -29,26 +41,50 @@ the preferred state of an unneeded feature is *not implemented*.
 | | |
 |---|---|
 | `<port>` | 1 to 65535. The port to answer on |
+| `[for]` | optional. How long to wait: `30s`, `5m`, `2h`, `1d`, or a plain number of seconds. Omitted, it waits until you press `q` |
 
 ## Output
 
 ```
 gsh> serve 8080
-listening on port 8080 - waiting for one connection (q aborts)
+listening on 192.168.4.37:8080 - waiting for one connection (q aborts)
+still listening - 10s (q aborts)
 accepted a connection
 received 11 byte(s): knock knock
 echoed 11 byte(s) back
 closed
 ```
 
+The address is asked of `net-stack` rather than remembered, so it is the one the stack holds now and
+cannot drift from a changed lease. `net-stack` logs the other side of the same story - an inbound SYN
+by address and port, the handshake completing, and a connection refused for want of a slot - so "the
+SYN never arrived" and "the SYN arrived and we never answered" are not the same silence.
+
 Bytes outside printable ASCII render as `.`, so a peer cannot spray control codes at the terminal.
 
 ## Bounds
 
-Waits at most 30 seconds for somebody to connect and at most 10 seconds for that peer to send
-something; `q`, `Q` or ESC abandons the wait at any point. At most `MAX_LISTEN` ports are listened on
-across the whole system, and an accepted connection takes one of the connection slots - so a machine
-already holding its maximum connections refuses new ones by dropping the SYN, and the peer retries.
+Waits for as long as you asked - by default until `q`, `Q` or ESC - and at most 10 seconds for an
+accepted peer to send something. A duration over a year is refused as a typo rather than honoured.
+
+While it waits it says so every ten seconds, because two minutes of a mute prompt is
+indistinguishable from a wedged one.
+
+At most `MAX_LISTEN` ports are listened on across the whole system, and an accepted connection takes
+one of the connection slots - so a machine already holding its maximum connections refuses new ones
+by dropping the SYN (saying so in its log) and the peer retries.
+
+### The port is RELEASED, on every exit
+
+Closing the listener is an explicit operation, and `serve` performs it whether it finished, timed
+out, or you pressed `q`.
+
+**This is not automatic and its absence was a real leak.** Dropping the client's capability does not
+tell net-stack anything - the kernel revokes the holder's authority, but net-stack's listener table
+is its own state and nothing walks back to it from a dropped cap. Found on a Raspberry Pi 2: the
+second `serve 8080` was refused, and stayed refused until the service restarted. With `MAX_LISTEN` at
+2, that leak is two runs deep. Connections are released the same way - net-stack reaps one that has
+finished and revokes it, so the holder's next call gets `CapRevoked` from the kernel.
 
 ## What it is made of
 
@@ -72,7 +108,8 @@ all: the segment reached us from that address, which is the one fact that never 
 |---|---|
 | the stack has no address yet | `net-stack would not listen on that port`, and net-stack's log says which of the three reasons it was |
 | the port is already listened on, or every listener slot is in use | the same line; net-stack's log distinguishes them |
-| nobody connected in time | `nobody connected within 30s` |
+| nobody connected in time | `nobody connected within <n>s`, when a duration was given |
+| you pressed `q` | `serve: aborted`, and the port is released |
 | the peer connected and sent nothing | `the peer connected but sent nothing` |
 
 ## Conventions

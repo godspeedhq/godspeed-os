@@ -137,10 +137,14 @@ def main():
         # state. Found on a Pi 2, where the second `serve 8080` was refused and stayed refused.
         # MAX_LISTEN is small, so this leak is two runs deep.
         out.append("\n---- second run, same port ----\n")
-        sock.sendall(b"serve %d\n" % GUEST_PORT)
+        # A DURATION, not an unbounded wait. `serve <port>` now waits for `q`, and driving that over
+        # a serial socket is a race the test does not need to run: the keystroke has to land while
+        # the accept loop is between polls, and it flaked PASS/FAIL on consecutive runs. A short
+        # bound ends the command deterministically and tests the same thing - that the port could be
+        # listened on again at all.
+        sock.sendall(b"serve %d 3s\n" % GUEST_PORT)
         again = read_until(sock, "listening on", 20, out)
-        sock.sendall(b"q")
-        read_until(sock, "aborted", 15, out)
+        read_until(sock, "nobody connected", 25, out)
         text = "".join(out)
 
         print("---- guest tail ----")

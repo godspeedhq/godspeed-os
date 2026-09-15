@@ -2405,6 +2405,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // binding because every call site below wants a `&mut` and reborrowing one binding is quieter
     // than writing `&mut pending` sixteen times.
     let pending = &mut Displaced::new();
+    /// When the last poll step ran. The poll is owed every `POLL_MS`, and this is what makes that a
+    /// schedule rather than a hope - see the loop below.
+    let mut last_poll: u64 = 0;
     // OUTSIDE the loop deliberately: inside, it is a kilobyte of zeroing on every single request, to
     // hold something that is normally not there.
     let mut heldbuf = [0u8; HELD_BYTES];
@@ -2563,18 +2566,38 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // backlog item is about, and the honest response to a missing clock is to not use it.
                 req = loop {
                     if !gw_known || !tcpst.have_clock() { break ctx.recv(); }
-                    match ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) {
-                        Some(m) => break m,
-                        None => {
-                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
-                                                dns_server, status };
-                            // The gateway is the FALLBACK address for anything this poll originates;
-                            // every established connection carries its own peer MAC on the `Conn`,
-                            // so `poll_one` addresses its frames correctly whatever is passed here.
-                            let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
-                            poll_step(&ctx, pending, &st, &mut tcpst, &net);
-                        }
+                    // ---- THE POLL IS A PERIODIC OBLIGATION, NOT AN IDLE-TIME FILLER ----
+                    //
+                    // Checked BEFORE the wait, and on every pass, so it happens at least every
+                    // `POLL_MS` no matter how busy this service is.
+                    //
+                    // **It used to run only when `recv_timeout` EXPIRED, and hardware found what
+                    // that costs.** `serve` polls accept about ten times a second, which is roughly
+                    // the poll interval - so the timeout almost never fired, the poll almost never
+                    // ran, and the machine stopped answering ARP while it was waiting to be
+                    // connected to. The accept polling starved the very poll step that makes accept
+                    // possible: a laptop could not even resolve the board's address to send it a
+                    // SYN. `ping` to it went from twenty replies out of twenty to `Destination host
+                    // unreachable`, with nothing in the log to say why.
+                    //
+                    // QEMU hid it. There the guest never answers ARP for the host at all - SLIRP
+                    // does that - and the timing is fast enough that a poll always slipped through,
+                    // so `tcp_serve_test` passed while the same code was starving on a Pi 2.
+                    //
+                    // Any work owed on a schedule has to be driven by the schedule. Gating it on the
+                    // service being idle means the busier it gets, the less it keeps its promises -
+                    // which is exactly backwards.
+                    if ctx.read_tsc().wrapping_sub(last_poll) >= ctx.duration_cycles(POLL_MS) {
+                        last_poll = ctx.read_tsc();
+                        let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
+                                            dns_server, status };
+                        // The gateway is the FALLBACK address for anything this poll originates;
+                        // every established connection carries its own peer MAC on the `Conn`,
+                        // so `poll_one` addresses its frames correctly whatever is passed here.
+                        let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                        poll_step(&ctx, pending, &st, &mut tcpst, &net);
                     }
+                    if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) { break m; }
                 };
                 // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
                 // name-addressed request (status / DNS / open-socket) carries no badge.

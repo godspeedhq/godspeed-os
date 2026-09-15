@@ -1217,7 +1217,16 @@ impl Tcp {
                 Some(i) => i,
                 // The table is full. Dropping is correct and deliberate: the peer retries, and by
                 // then a slot may have freed. A RST would be ruder and tells it nothing useful.
-                None => return 0,
+                //
+                // SAID OUT LOUD, though: from the peer's side a refused connection and a machine
+                // that is not there look identical, and from this side it is the difference between
+                // "nobody called" and "somebody called and we had no room" (§26.7).
+                None => {
+                    ctx.log_fmt(format_args!(
+                        "net-stack: refused a connection from {}.{}.{}.{}:{} on port {} - the                          connection table is full",
+                        rip[0], rip[1], rip[2], rip[3], rp, lp));
+                    return 0;
+                }
             };
             let c = &mut self.conns[i];
             *c = Conn::free();
@@ -1241,6 +1250,13 @@ impl Tcp {
             // pass, which is the separation that cost a day of hardware debugging to find.
             c.ack_due = true;
             self.stat_matched = self.stat_matched.saturating_add(1);
+            // ANNOUNCE THE ATTEMPT, not just the success. A SYN that arrives and a handshake that
+            // completes are different events, and the gap between them is where a passive open
+            // fails - so both are logged. Without this, "the SYN never arrived" and "the SYN
+            // arrived and we never answered" are the same silence.
+            ctx.log_fmt(format_args!(
+                "net-stack: inbound connection from {}.{}.{}.{}:{} on port {} - answering",
+                rip[0], rip[1], rip[2], rip[3], rp, lp));
             return 0;
         }
 
@@ -1305,6 +1321,9 @@ impl Tcp {
                 c.retx_at_ms = 0;
                 c.retx_count = 0;
                 c.state_deadline_ms = 0;
+                ctx.log_fmt(format_args!(
+                    "net-stack: connection from {}.{}.{}.{}:{} is established - waiting to be accepted",
+                    rip[0], rip[1], rip[2], rip[3], rp));
                 if c.rtt_timing && now >= c.rtt_timed_at_ms {
                     let r = now - c.rtt_timed_at_ms;
                     c.rtt_sample(r);

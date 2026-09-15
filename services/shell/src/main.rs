@@ -6287,15 +6287,31 @@ const COP_RECV: u8 = 0;
 const COP_SEND: u8 = 1;
 const COP_CLOSE: u8 = 2;
 
-/// How long to wait for somebody to connect, in whole seconds, before giving up.
+/// Read a duration written the way a person writes one: `30s`, `5m`, `2h`, `1d`, or a bare number
+/// of seconds.
 ///
-/// A bound rather than a wait forever (§26.6), and `q` aborts it at any point - `serve` is an
-/// interactive command and the conventions require an escape from any blocking wait.
-///
-/// Two minutes rather than thirty seconds, because thirty is shorter than a person takes to switch
-/// to another machine and type. The bound is there to stop the shell waiting forever, not to hurry
-/// anybody, and `q` is the real escape.
-const SERVE_SECS: i64 = 120;
+/// Returns `None` for anything it does not understand, so a typo is refused rather than silently
+/// read as some other number - `serve 8080 5x` must not quietly become five seconds.
+fn parse_duration(a: &str) -> Option<i64> {
+    let b = a.as_bytes();
+    if b.is_empty() { return None; }
+    let (digits, mult) = match b[b.len() - 1] {
+        b's' => (&b[..b.len() - 1], 1i64),
+        b'm' => (&b[..b.len() - 1], 60),
+        b'h' => (&b[..b.len() - 1], 3600),
+        b'd' => (&b[..b.len() - 1], 86_400),
+        b'0'..=b'9' => (&b[..], 1),
+        _ => return None,
+    };
+    if digits.is_empty() { return None; }
+    let mut n: i64 = 0;
+    for &c in digits {
+        if !c.is_ascii_digit() { return None; }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+        if n > 365 * 86_400 { return None; }          // a year is a typo, not a plan
+    }
+    n.checked_mul(mult)
+}
 
 /// Tell net-stack to stop listening, THEN drop the capability.
 ///
@@ -6318,12 +6334,29 @@ fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
 /// implemented).
 fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     if args.len() < 2 || args[1] == "help" {
-        out.line(ctx, "usage: serve <port>   - accept ONE connection on <port>, echo what arrives, close");
+        out.line(ctx, "usage: serve <port> [for]   - accept ONE connection on <port>, echo it, close");
+        out.line(ctx, "       waits until you press q; `for` bounds it: 30s, 5m, 2h, 1d");
+        out.line(ctx, "       e.g. serve 8080        serve 8080 5m");
         return Ok(());
     }
     let port: u16 = match args[1].parse() {
         Ok(p) if p > 0 => p,
         _ => { out.line(ctx, "serve: the argument must be a port, 1 to 65535"); return Err(ShellError::Unknown); }
+    };
+    // NO DEADLINE BY DEFAULT. A server that stops listening because a timer ran out is a server that
+    // was not listening when somebody called, and the first version of this had a 30-second cap that
+    // was shorter than walking to another machine. `q` is the escape an interactive command owes
+    // (`0_conventions.md`), and it is a better one than a guess at how long the operator meant.
+    let limit: Option<i64> = match args.get(2) {
+        None => None,
+        Some(a) => match parse_duration(a) {
+            Some(n) if n > 0 => Some(n),
+            _ => {
+                out.line_fmt(ctx, format_args!(
+                    "serve: `{}` is not a duration - try 30s, 5m, 2h, 1d, or a plain number of seconds", a));
+                return Err(ShellError::Unknown);
+            }
+        },
     };
 
     // 1. Ask net-stack to listen. The reply carries a LISTENER capability.
@@ -6362,8 +6395,9 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
 
     // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.
     let mut conn = None;
+    let mut last_note: i64 = -1;
     let t0 = ctx.epoch_secs_monotonic();
-    while ctx.epoch_secs_monotonic() - t0 < SERVE_SECS {
+    while limit.map_or(true, |n| ctx.epoch_secs_monotonic() - t0 < n) {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b {
                 serve_release(ctx, listener);
@@ -6376,13 +6410,34 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
                 if let Some(c) = ctx.take_pending_cap() { conn = Some(c); break; }
             }
         }
-        ctx.sleep(ctx.duration_cycles(100));
+        // A LIVE SIGN while nothing is happening. Two minutes of a mute prompt is
+        // indistinguishable from a wedged one, and the operator has no way to tell whether the
+        // command is still waiting or the machine has stopped (§26.7). Once every ten seconds is
+        // often enough to reassure and rare enough not to become the output.
+        let waited = ctx.epoch_secs_monotonic() - t0;
+        if waited > 0 && waited % 10 == 0 && waited != last_note {
+            last_note = waited;
+            match limit {
+                Some(n) => out.line_fmt(ctx, format_args!(
+                    "still listening - {}s of {}s (q aborts)", waited, n)),
+                None => out.line_fmt(ctx, format_args!(
+                    "still listening - {}s (q aborts)", waited)),
+            }
+        }
+        // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four times
+        // a second instead of ten leaves that service more of its own time for the poll step that
+        // answers ARP and notices the inbound SYN. A connection arriving is not made faster by
+        // asking about it more often.
+        ctx.sleep(ctx.duration_cycles(250));
     }
     let conn = match conn {
         Some(c) => c,
         None => {
             serve_release(ctx, listener);
-            out.line_fmt(ctx, format_args!("serve: nobody connected within {}s", SERVE_SECS));
+            match limit {
+                Some(n) => out.line_fmt(ctx, format_args!("serve: nobody connected within {}s", n)),
+                None => out.line(ctx, "serve: stopped"),
+            }
             return Ok(());
         }
     };
