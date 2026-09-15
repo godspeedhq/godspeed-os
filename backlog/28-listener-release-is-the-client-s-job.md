@@ -60,6 +60,36 @@ compile-time assertion rather than a comment - a comment is what failed.
 That was almost certainly the cause of the two hardware failures. A residual flake remains in QEMU,
 about one run in seven, and is NOT explained by it.
 
+## The residual flake is SNTP blocking the serve loop (2026-09-15, Pi 2)
+
+Not a listener problem at all, and not new. The board:
+
+```
+19:29:59.811  net-stack: SNTP - querying 139.162.219.252:123
+19:30:05.501  net-stack: `time` asked for the clock - no SNTP answer
+19:30:05.503  net-stack: a held client request waited more than 1500 ms and was dropped
+19:30:07.783  accepted a connection (1)
+19:30:12.514  the peer connected but sent nothing
+```
+
+**net-stack was blocked for 5.7 seconds inside one SNTP query.** For that whole window it served
+nobody: the held request expired, the next connection's handshake took 3.3 s, and its data segment
+was lost. Two of three connections failed; the two that succeeded did not overlap an SNTP attempt.
+
+This is the limitation the service already documents about itself, quoted in `docs/tcp-design.md`:
+
+> the in-loop dance still blocks this service while it runs ... Making the dance incremental so
+> net-stack answers THROUGHOUT it is the real fix, and that is a rework of the state machine rather
+> than a constant.
+
+`serve` is simply the first long-running command that overlaps `time`'s periodic clock nudges, so it
+is the first thing to make the cost visible. The same correlation is present in the QEMU flake.
+
+**So the fix is the incremental dance, not anything in this file's title.** Until then a `serve`
+session will lose a connection whenever an SNTP query stalls, and the board says so on both lines.
+The parts of this entry above - the release being the client's job, and the two budgets that
+collided - are real and separate; this is what remains after both.
+
 ## What is NOT established
 
 Why the call fails. Candidates not yet separated: a race with `net-stack` reaping and revoking the
