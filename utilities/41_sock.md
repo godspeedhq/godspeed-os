@@ -96,3 +96,7 @@ the generation). This first slice exercises the mint + invoke + send; the forged
 Conforms to `0_conventions.md`: `sock version` / `sock help`, words-not-flags, raw facts. Pinned by
 `osdev test shell` (open + invoke a socket capability, and `net`'s tab-completion adjusted for the new
 `so`-prefixed verb).
+
+**Rule 10: opening the socket is `q`-escapable.** It goes through the shell's net-stack transaction
+helper, which polls `q` while it waits, advertises `(q to quit)` once the wait lingers, and gives up
+after 20 seconds. It used to block in the syscall with no way out (`backlog/29`).

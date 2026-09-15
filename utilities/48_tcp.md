@@ -88,8 +88,23 @@ can hold (`docs/tcp-design.md`).
 `service_main`'s stack frame reached 37% of the 256 KiB user stack on arm32, and the spec was not
 brought with it - the kind of drift `scripts/facts_check.py` exists to catch.)*
 
+## Escaping it
+
+`q`, `Q` or ESC aborts the wait and returns to the prompt, and `(q to quit)` is advertised once the
+wait lingers past about two seconds. A transaction that gets no answer at all gives up after 20
+seconds with `net-stack did not answer within 20s`.
+
+**This was not always true, and its absence cost a power cycle.** The request used a bare
+`request_with_reply`, which parks the shell inside the syscall where it cannot read the keyboard - so
+on a Dell Wyse a `tcp` net-stack never answered froze the prompt with no way out (`backlog/29`).
+
+What `q` stops is the SHELL'S wait, not net-stack's transaction: net-stack keeps working its own 8 s
+budget out. That is rule 11's concern and it is named here rather than glossed. It does not wedge the
+next command - the abandoned reply is discarded by its correlation tag when it lands - but a `tcp`
+issued immediately after an abort can wait behind the one you abandoned.
+
 ## Conventions
 
 Obeys `utilities/0_conventions.md`: `tcp help` prints usage, arguments are words rather than flags,
 and the command reports raw facts without editorialising. Its arguments are an address and a port,
-never a path, so it is in the shell's `NO_PATH_CMDS` (rule 9).
+never a path, so it is in the shell's `NO_PATH_CMDS` (rule 9). Rule 10: the wait is `q`-escapable.
