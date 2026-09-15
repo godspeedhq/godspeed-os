@@ -1075,6 +1075,31 @@ const RIGHT_GRANT: u8 = 1 << 4;
 #[derive(Clone, Copy)]
 struct Socket { rid: u64, port: u16 }
 
+// ── Operations on a TCP capability ─────────────────────────────────────────────────────────────
+//
+// A badged invocation already names its resource, so the payload's first byte is the OPERATION and
+// nothing else has to be threaded through it. Which set applies is decided by what the resource IS -
+// a listener, a connection, or a UDP socket - which the service looks up rather than the client
+// asserting. A client cannot claim a listener is a connection: it holds a capability to one specific
+// resource, and net-stack knows what that resource is.
+//
+// UDP sockets keep their existing wire shape (`[dest_ip(4), dest_port(2), data..]`, no op byte),
+// because they are identified the same way and changing a working surface to look symmetrical is
+// the kind of tidying §26.2 asks not to do.
+
+/// Listener: take the next connection that completed its handshake. Reply carries the connection
+/// capability, or is empty when nothing is waiting.
+const LOP_ACCEPT: u8 = 0;
+
+/// Connection: read whatever has been delivered in order and not yet taken.
+const COP_RECV: u8 = 0;
+/// Connection: queue the rest of the payload for sending.
+const COP_SEND: u8 = 1;
+/// Connection: begin an orderly close.
+const COP_CLOSE: u8 = 2;
+/// Connection: report state, bytes readable, and bytes unacknowledged - without moving any of it.
+const COP_STAT: u8 = 3;
+
 /// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
 /// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
 fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
@@ -2766,6 +2791,78 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         if let Some((rid, right)) = badge {
+            // ---- a TCP LISTENER capability ----
+            if tcpst.listeners.iter().any(|l| l.rid == rid && l.port != 0) {
+                // Accepting hands over authority, so it needs WRITE - the same bar as sending. A
+                // read-only listener cap can be held and inspected but cannot take connections.
+                let op = pl.first().copied().unwrap_or(LOP_ACCEPT);
+                let mut granted = false;
+                if op == LOP_ACCEPT && right & RIGHT_WRITE != 0 {
+                    if let Some(i) = tcpst.pending_accept() {
+                        // Mint the connection's own capability and hand it to the caller. From here
+                        // the connection is a thing the client HOLDS: closing it is a revoke, and a
+                        // stale handle gets `CapRevoked` from the kernel rather than a wrong answer
+                        // from us (§7.10, exactly as `fs` does for a file).
+                        if let Some((crid, cap)) = ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
+                            tcpst.conns[i].rid = crid;
+                            granted = ctx.derive_cap(cap)
+                                .map(|c| reply.send_with_cap(&ctx, c, &[1]))
+                                .unwrap_or(false);
+                            ctx.remove_cap(cap);
+                            if !granted {
+                                // The cap did not reach the client, so neither did the success
+                                // reply. Put the connection back to unclaimed rather than stranding
+                                // it owned by nobody, and tell the caller (§26.7).
+                                tcpst.conns[i].rid = 0;
+                                let _ = ctx.resource_revoke(crid);
+                            }
+                        }
+                    }
+                }
+                if !granted { reply.send(&ctx, &[0]); }
+                reply.done(&ctx);
+                continue;
+            }
+
+            // ---- a TCP CONNECTION capability ----
+            if let Some(i) = (0..tcp::MAX_CONNS).find(|&k| {
+                tcpst.conns[k].rid == rid && rid != 0 && tcpst.conns[k].state != tcp::State::Closed
+            }) {
+                let op = pl.first().copied().unwrap_or(COP_STAT);
+                let body = if pl.len() > 1 { &pl[1..] } else { &[][..] };
+                let mut resp = [0u8; 2048];
+                let n = match op {
+                    // Reading takes READ; sending takes WRITE. The kernel has already checked the
+                    // cap carries `right`; this enforces that the OPERATION is within it, which is
+                    // the `op <= right` check `fs` makes for files.
+                    COP_RECV if right & RIGHT_READ != 0 => tcpst.read(rid, &mut resp),
+                    COP_SEND if right & RIGHT_WRITE != 0 => {
+                        let took = tcpst.write(rid, body);
+                        // SHORT WRITES ARE REPORTED, not silently truncated. The send arena is
+                        // fixed, and a client that offered more than fits has to know how much was
+                        // taken or it will lose the tail without being told (§26.7).
+                        resp[0] = (took & 0xff) as u8;
+                        resp[1] = (took >> 8) as u8;
+                        2
+                    }
+                    COP_CLOSE if right & RIGHT_WRITE != 0 => { tcpst.close(rid); 0 }
+                    COP_STAT => {
+                        let c = &tcpst.conns[i];
+                        let rd = c.readable().min(0xffff) as u16;
+                        let un = c.unacked().min(0xffff) as u16;
+                        resp[0] = c.state as u8;
+                        resp[1..3].copy_from_slice(&rd.to_le_bytes());
+                        resp[3..5].copy_from_slice(&un.to_le_bytes());
+                        resp[5] = c.fault as u8;
+                        6
+                    }
+                    _ => 0,
+                };
+                reply.send(&ctx, &resp[..n]);
+                reply.done(&ctx);
+                continue;
+            }
+
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
             // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
             // Sending needs WRITE; the kernel already checked the cap holds `right`, we enforce op<=right.
@@ -2804,6 +2901,42 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
                 None => { reply.send(&ctx, &[0]); }
+            }
+        } else if pl.first() == Some(&22) {
+            // TCP LISTEN (op 22): [22, port_hi, port_lo]. Mints a LISTENER capability and grants it
+            // to the client. Reply carries [1] plus the embedded cap on success, [0] otherwise.
+            //
+            // The same shape as opening a UDP socket (op 2) and opening a file, because it is the
+            // same mechanism: the service mints a delegated resource capability (§7.10), the kernel
+            // badges every invocation with its ResourceId, and the holder's authority is the cap
+            // rather than a number it was told. Closing the listener is a revoke.
+            let ok = pl.len() >= 3 && gw_known;
+            let port = if ok { ((pl[1] as u16) << 8) | pl[2] as u16 } else { 0 };
+            let minted = if ok && port != 0 {
+                ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT)
+            } else { None };
+            let mut granted = false;
+            if let Some((rid, cap)) = minted {
+                if tcpst.listen(port, rid) {
+                    granted = ctx.derive_cap(cap)
+                        .map(|c| reply.send_with_cap(&ctx, c, &[1]))
+                        .unwrap_or(false);
+                    if !granted { tcpst.unlisten(rid); }
+                }
+                ctx.remove_cap(cap);
+                if !granted { let _ = ctx.resource_revoke(rid); }
+            }
+            if granted {
+                ctx.log_fmt(format_args!("net-stack: listening on TCP port {}", port));
+            } else {
+                // WHY it failed, not just that it did: an unconfigured stack, a port already taken
+                // and a full listener table are three different things for the operator to fix.
+                ctx.log_fmt(format_args!(
+                    "net-stack: cannot listen on TCP port {} - {}", port,
+                    if !gw_known { "the stack is not configured yet" }
+                    else if port == 0 { "port 0 is not a port" }
+                    else { "that port is already taken, or every listener slot is in use" }));
+                reply.send(&ctx, &[0]);
             }
         } else if pl.first() == Some(&21) {
             // TCP TRANSACT (op 21): [21, ip(4), port_hi, port_lo, request bytes...].

@@ -803,7 +803,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp",
+    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -1632,6 +1632,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
+        "serve"   => cmd_serve(ctx, &args[..argc], out),
         "uptime"  => cmd_uptime(ctx),
         "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
         "gpio"    => cmd_gpio(ctx, if argc >= 2 { args[1] } else { "" }, if argc >= 3 { args[2] } else { "" }),
@@ -6159,7 +6160,20 @@ fn sock_open(ctx: &ShellCtx) -> Option<CapHandle> {
 
 /// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
 fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
-    while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
+    // Clear any stale late-reply a prior aborted invoke left behind - AND RECLAIM ITS CAPABILITY.
+    //
+    // SEC-35: the kernel installs an embedded cap and queues its slot BEFORE the receiver looks at
+    // the message, so discarding the message does not discard the cap - it leaves an entry in the
+    // FIFO that `take_pending_cap()` reads from, and the next open receives the capability
+    // belonging to this discarded reply. That is how `fcap`'s read-only handle came to name an
+    // earlier open's read-write cap.
+    //
+    // It was harmless-looking here while every reply through this path was plain bytes. It stopped
+    // being harmless the moment ACCEPT began returning a connection capability through exactly this
+    // function.
+    while ctx.try_recv().is_some() {
+        while let Some(h) = ctx.take_pending_cap() { ctx.remove_cap(h); }
+    }
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
@@ -6258,6 +6272,133 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
         }
         None => { out.line(ctx, "tcp: net-stack did not answer"); Err(ShellError::Unknown) }
     }
+}
+
+/// Listener op: take the next completed connection. Mirrors `LOP_ACCEPT` in net-stack.
+const LOP_ACCEPT: u8 = 0;
+/// Connection ops. Mirror `COP_*` in net-stack.
+const COP_RECV: u8 = 0;
+const COP_SEND: u8 = 1;
+const COP_CLOSE: u8 = 2;
+
+/// How long to wait for somebody to connect, in whole seconds, before giving up.
+///
+/// A bound rather than a wait forever (§26.6), and `q` aborts it at any point - `serve` is an
+/// interactive command and the conventions require an escape from any blocking wait.
+const SERVE_SECS: i64 = 30;
+
+/// `serve <port>` - listen, accept ONE connection, echo what arrives, close.
+///
+/// **This is the machine acting as a host rather than a client**, and it is the first command that
+/// does. Everything networking has done until now dialled out; this answers.
+///
+/// One connection and then done, deliberately: it is a demonstration of the passive-open path and
+/// the capability API around it, not a daemon. A server that stays up is a service with a contract
+/// of its own, not a shell built-in (§26.2 - the preferred state of an unneeded feature is not
+/// implemented).
+fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
+    if args.len() < 2 || args[1] == "help" {
+        out.line(ctx, "usage: serve <port>   - accept ONE connection on <port>, echo what arrives, close");
+        return Ok(());
+    }
+    let port: u16 = match args[1].parse() {
+        Ok(p) if p > 0 => p,
+        _ => { out.line(ctx, "serve: the argument must be a port, 1 to 65535"); return Err(ShellError::Unknown); }
+    };
+
+    // 1. Ask net-stack to listen. The reply carries a LISTENER capability.
+    let lo = (port & 0xff) as u8;
+    let hi = (port >> 8) as u8;
+    let listener = match netstack_request(ctx, &[22, hi, lo]) {
+        Some(r) if r.payload_bytes().first() == Some(&1) => match ctx.take_pending_cap() {
+            Some(c) => c,
+            None => { ctx.console_writeln("serve: net-stack agreed to listen but sent no capability"); return Err(ShellError::Unknown); }
+        },
+        _ => {
+            ctx.console_writeln("serve: net-stack would not listen on that port - see its log for why");
+            return Err(ShellError::Unknown);
+        }
+    };
+    out.line_fmt(ctx, format_args!("listening on port {} - waiting for one connection (q aborts)", port));
+
+    // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.
+    let mut conn = None;
+    let t0 = ctx.epoch_secs_monotonic();
+    while ctx.epoch_secs_monotonic() - t0 < SERVE_SECS {
+        while let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b {
+                ctx.remove_cap(listener);
+                out.line(ctx, "serve: aborted");
+                return Ok(());
+            }
+        }
+        if let Some(r) = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_ACCEPT]) {
+            if r.payload_bytes().first() == Some(&1) {
+                if let Some(c) = ctx.take_pending_cap() { conn = Some(c); break; }
+            }
+        }
+        ctx.sleep(ctx.duration_cycles(100));
+    }
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            ctx.remove_cap(listener);
+            out.line_fmt(ctx, format_args!("serve: nobody connected within {}s", SERVE_SECS));
+            return Ok(());
+        }
+    };
+    out.line(ctx, "accepted a connection");
+
+    // 3. Read whatever the peer sends, echo it back, close. Bounded on both sides.
+    let mut got = 0usize;
+    let mut buf = [0u8; 512];
+    let t1 = ctx.epoch_secs_monotonic();
+    while ctx.epoch_secs_monotonic() - t1 < 10 {
+        match sock_invoke(ctx, conn, RIGHT_READ, &[COP_RECV]) {
+            Some(r) => {
+                let p = r.payload_bytes();
+                if !p.is_empty() {
+                    let n = p.len().min(buf.len() - got);
+                    buf[got..got + n].copy_from_slice(&p[..n]);
+                    got += n;
+                    break;
+                }
+            }
+            None => break,
+        }
+        ctx.sleep(ctx.duration_cycles(100));
+    }
+    if got > 0 {
+        // Printable only - a peer's bytes are not to be sprayed at the terminal as control codes.
+        let mut show = [0u8; 512];
+        for i in 0..got {
+            show[i] = if buf[i] >= 0x20 && buf[i] < 0x7f { buf[i] } else { b'.' };
+        }
+        out.line_fmt(ctx, format_args!("received {} byte(s): {}", got,
+                                       core::str::from_utf8(&show[..got]).unwrap_or("?")));
+        let mut echo = [0u8; 520];
+        echo[0] = COP_SEND;
+        echo[1..1 + got].copy_from_slice(&buf[..got]);
+        match sock_invoke(ctx, conn, RIGHT_WRITE, &echo[..1 + got]) {
+            Some(r) => {
+                let p = r.payload_bytes();
+                let took = if p.len() >= 2 { ((p[1] as usize) << 8) | p[0] as usize } else { 0 };
+                out.line_fmt(ctx, format_args!("echoed {} byte(s) back", took));
+            }
+            None => out.line(ctx, "serve: the echo was not accepted"),
+        }
+    } else {
+        out.line(ctx, "the peer connected but sent nothing");
+    }
+
+    let _ = sock_invoke(ctx, conn, RIGHT_WRITE, &[COP_CLOSE]);
+    // Give the close a moment to go out before the capability is dropped - the connection is driven
+    // by net-stack's poll step, which needs a pass to put the FIN on the wire.
+    ctx.sleep(ctx.duration_cycles(200));
+    ctx.remove_cap(conn);
+    ctx.remove_cap(listener);
+    out.line(ctx, "closed");
+    Ok(())
 }
 
 fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {

@@ -100,6 +100,7 @@ fails.
 | [`sock`](utilities/sock.md) | a UDP socket as a capability |
 | [`ping`](utilities/ping.md) | continuous ICMP echo |
 | [`tcp`](utilities/tcp.md) | one TCP transaction: connect, send, read, close |
+| [`serve`](utilities/serve.md) | accept one TCP connection and echo what arrives |
 
 ### Scripting
 

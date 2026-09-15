@@ -71,6 +71,8 @@ def check_intro_counts():
     """
     WORDS = {"sixty": 60, "seventy": 70, "seventy-four": 74, "seventy-three": 73,
              "seventy-five": 75, "sixty-nine": 69, "seventy-one": 71, "three": 3,
+             "seventy-two": 72, "seventy-six": 76, "seventy-seven": 77,
+             "seventy-eight": 78, "seventy-nine": 79, "eighty": 80,
              "four": 4, "five": 5}
     page = read(os.path.join(SITE, "introduction.md"))
     total = inc = 0
