@@ -1,0 +1,73 @@
+# 28. A listener's port is released by the CLIENT, and sometimes is not
+
+**Status: OPEN.** Intermittent, measured, diagnosable, and not fixed. The workaround is a bounded
+retry that did not measurably help; the real fix is a design change, described below.
+
+## What happens
+
+`serve <port>` asks `net-stack` to listen, and asks it to stop on the way out. When that second ask
+does not land, the port stays registered and the next `serve` on it is refused:
+
+```
+net-stack: cannot listen on TCP port 8080 - that port is already taken, or every listener slot is in use
+serve: net-stack would not listen on that port - see its log for why
+```
+
+`MAX_LISTEN` is 2, so two leaked ports and the machine cannot listen at all until `net-stack`
+restarts.
+
+## How often
+
+Measured with `scripts/tcp_serve_test.py`, which runs `serve` twice on one port and connects to each:
+
+| | runs | failures |
+|---|---|---|
+| before the retry | 10 | 3 |
+| after the retry (3 attempts, 150 ms apart) | 12 | 2 |
+
+**The retry did not measurably help**, and the sample is too small to prove it did anything at all.
+It is kept because it cannot hurt and because §26.7 asks for a failed recovery to be retried, not
+because it is evidence of a fix.
+
+## What is established
+
+- The failure is real and reproducible in aggregate, not a test artefact. A failing run shows the
+  second connection answered by the FIRST run's listener, which is still registered.
+- It is visible now. `serve` prints `the port was NOT released` when its release call fails, and
+  `net-stack` logs a badged invocation that matched no resource it owns. Before those, a release
+  that never happened was indistinguishable from one that did.
+- On at least one failing run NEITHER line printed, so the release was not merely refused - it was
+  not reached. That path is not yet understood.
+
+## What is NOT established
+
+Why the call fails. Candidates not yet separated: a race with `net-stack` reaping and revoking the
+CONNECTION alongside it, the shell's pending-capability FIFO being disturbed by the reap's revoke, or
+the invocation timing out against a `net-stack` that is mid-poll. Guessing has been wrong three times
+on this already; the next step is instrumentation on the failing path, not another patch.
+
+## The real fix, and why it is a design change
+
+**A port cannot release itself, because the kernel does not tell a service when a capability is
+dropped.** So `net-stack` has to trust a client to say "I am done", and a client that dies, is
+killed, or simply races will always leak the port. The retry narrows the window; it cannot close it.
+
+That asymmetry is the actual defect. `fs` has the same shape for files and lives with it; a listener
+is worse, because there are only two of them and they are named by a number a user picks.
+
+Two honest routes:
+
+1. **`net-stack` owns the lifetime.** A listener expires unless the holder renews it, or is released
+   when its resource generation is bumped by something the service can observe. Needs a mechanism
+   the kernel does not currently offer.
+2. **A way to reclaim by name.** `serve 8080 stop`, or a `net listeners` verb that shows what is
+   registered and can drop one. Ugly, but it makes the leak recoverable without a restart, which is
+   the part that actually hurts.
+
+Neither is a constant, so per §26.7 this is recorded rather than half-built.
+
+## Not to be confused with
+
+The listener leak fixed in `9f160761`, which was unconditional: dropping the capability told
+`net-stack` nothing and `unlisten` was wired to nothing at all. That is fixed and verified on a
+Raspberry Pi 2. This item is the residue - the release now exists and usually works.

@@ -585,6 +585,11 @@ pub struct Tcp {
     /// empty reply to a client and completely different faults to diagnose.
     pub last_state: State,
     pub last_retx: u8,
+    /// Frames the poll step built that the driver would not accept inside `POLL_TX_MS`.
+    ///
+    /// A number rather than only a log line, because the log line is said once and this is the
+    /// figure the deadline should be chosen from. Zero on a board whose driver keeps up.
+    pub poll_tx_slow: u32,
     /// Frames handed to `on_frame` during the last transaction, and how many of those it RECOGNISED
     /// as a segment for one of our connections. The gap between the two is the whole diagnosis when a
     /// connection stalls: frames arriving but none matching means the peer is talking to a
@@ -618,6 +623,7 @@ impl Tcp {
             warned_no_clock: false,
             last_state: State::Closed,
             last_retx: 0,
+            poll_tx_slow: 0,
             stat_seen: 0, stat_matched: 0, stat_sent: 0,
             tx_log: [0u8; 24], tx_n: 0,
         }

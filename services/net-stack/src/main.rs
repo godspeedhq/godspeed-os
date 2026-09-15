@@ -1338,14 +1338,24 @@ const POLL_MS: u64 = 100;
 
 /// How long ONE frame the poll step sends may wait on the driver.
 ///
-/// Well under `POLL_MS`, so a poll that sends a few frames still finishes inside its own interval.
-/// A frame the driver will not take right now is dropped rather than waited for: the peer retransmits,
-/// and this service stays answerable to the client in front of it.
-const POLL_TX_MS: u64 = 20;
+/// **Set from what the hardware costs, not from what looks tidy.** The first version of this was
+/// 20 ms, chosen because it is comfortably under `POLL_MS` - and it broke a connection that had been
+/// working: on a Pi 2 the dwc2 driver needs longer than that for an ordinary frame, so every frame
+/// the poll sent timed out, including the one carrying an echo. A bound that the normal case cannot
+/// meet is not a bound, it is an outage.
+///
+/// 200 ms gives the slowest driver in the tree room while still being a fifth of a client's
+/// patience. `poll_tx_slow` counts what actually happens, so the next person sets this from a
+/// measurement rather than from my estimate.
+const POLL_TX_MS: u64 = 200;
 
 /// The whole poll step's budget. Checked between frames, so the step stops issuing new work once it
 /// is spent rather than running to completion however long that takes.
-const POLL_BUDGET_MS: u64 = 60;
+///
+/// Half a second: long enough for a few frames on a slow driver, and a tenth of the five seconds a
+/// client waits before it gives up. The failure this exists to prevent is a poll outlasting the
+/// request it is keeping waiting.
+const POLL_BUDGET_MS: u64 = 500;
 
 /// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
 ///
@@ -1373,7 +1383,7 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     let budget = ctx.duration_cycles(POLL_BUDGET_MS);
     let spent = |ctx: &ServiceContext| ctx.read_tsc().wrapping_sub(t0) >= budget;
 
-    let batch = nic_drain_ms(ctx, pending, POLL_TX_MS * 2);
+    let batch = nic_drain_ms(ctx, pending, POLL_TX_MS);
     let m = match batch { Some(m) => m, None => return false };
     let p = m.payload_bytes();
     if p.is_empty() { return false; }
@@ -1452,7 +1462,17 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
         if spent(ctx) { break; }
         let n = t.poll_one(ctx, net, i, &mut out);
         if n > 0 {
-            let _ = nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS);
+            // REPORT A FRAME THE DRIVER WOULD NOT TAKE IN TIME. This is the measurement that
+            // `POLL_TX_MS` should be set from, and its absence is why the first value was a guess
+            // that broke a working connection. A silent drop here looks exactly like a network
+            // that lost the frame, which is the one thing it must not be confused with (§26.7).
+            if nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS).is_none() {
+                t.poll_tx_slow = t.poll_tx_slow.saturating_add(1);
+                if t.poll_tx_slow == 1 || t.poll_tx_slow % 64 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "net-stack: a polled frame was not taken by the driver within {} ms                          ({} so far) - the peer will retransmit, but POLL_TX_MS may be too tight                          for this board", POLL_TX_MS, t.poll_tx_slow));
+                }
+            }
             any = true;
         }
     }
@@ -2980,6 +3000,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 reply.send(&ctx, &resp[..n]);
                 reply.done(&ctx);
                 continue;
+            }
+
+            // NOTHING WE OWN. A badged invocation reaching here matched no listener, no connection
+            // and - below - possibly no socket either. That is either a capability whose resource we
+            // have already released, or a client holding one we never minted, and both are worth
+            // saying: a silent empty reply is indistinguishable from a successful no-op, which is
+            // how a release that never happened looked like one that did (§26.7).
+            if !sockets.iter().any(|sk| sk.rid == rid && sk.rid != 0) {
+                ctx.log_fmt(format_args!(
+                    "net-stack: a capability invocation named resource {} which is not a listener,                      a connection or a socket here - answering empty", rid));
             }
 
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =

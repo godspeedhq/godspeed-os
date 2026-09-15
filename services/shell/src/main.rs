@@ -6319,7 +6319,32 @@ fn parse_duration(a: &str) -> Option<i64> {
 /// in net-stack forever - the leak the Pi 2 found, where the second `serve` on a port was refused
 /// and stayed refused until the service restarted.
 fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
-    let _ = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_CLOSE]);
+    // RETRIED, AND REPORTED IF IT STILL FAILS. §26.7: a recovery step that itself fails is still a
+    // failure, and must stay as visible as the thing it was recovering from.
+    //
+    // This was one attempt with `let _ =` on it - a swallowed failed recovery, which is exactly what
+    // that section forbids. Measured over six QEMU runs it failed one in three: the port stayed
+    // listening, the next `serve` was refused, and nothing said why. The round trip is the fragile
+    // part (net-stack may be mid-poll, or have just revoked the connection alongside it), and a
+    // round trip that sometimes fails is precisely what a bounded retry is for.
+    //
+    // Three attempts, spaced. Still the client's job to ask - the kernel does not tell a service
+    // when a capability is dropped, so a port cannot release itself. That asymmetry is worth naming
+    // rather than papering over: a `serve` killed outright still leaks its port until net-stack
+    // restarts, and the honest fix is for net-stack to own a listener's lifetime rather than trust a
+    // client to end it. Recorded, not built (§26.2).
+    const TRIES: u32 = 3;
+    let mut ok = false;
+    for _ in 0..TRIES {
+        ok = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_CLOSE])
+            .map(|r| r.payload_bytes().first() == Some(&1))
+            .unwrap_or(false);
+        if ok { break; }
+        ctx.sleep(ctx.duration_cycles(150));
+    }
+    if !ok {
+        ctx.console_writeln("serve: the port was NOT released - the next `serve` on it will be refused");
+    }
     ctx.remove_cap(listener);
 }
 

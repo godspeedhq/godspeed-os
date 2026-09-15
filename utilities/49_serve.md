@@ -86,6 +86,13 @@ second `serve 8080` was refused, and stayed refused until the service restarted.
 2, that leak is two runs deep. Connections are released the same way - net-stack reaps one that has
 finished and revokes it, so the holder's next call gets `CapRevoked` from the kernel.
 
+**It does not always land, and that is recorded rather than hidden** (`backlog/28`). The release is a
+round trip, and measured over a dozen QEMU runs it failed a couple of times - leaving the port
+registered and the next `serve` on it refused. `serve` retries three times and says
+`the port was NOT released` if it still fails, so the condition is visible; the underlying asymmetry
+is that the kernel does not tell a service when a capability is dropped, so a port cannot release
+itself and a client that dies will always leak one.
+
 ## What it is made of
 
 Three capabilities, each minted by `net-stack` and held by the shell (§7.10, the same delegated
