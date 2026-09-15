@@ -90,6 +90,34 @@ session will lose a connection whenever an SNTP query stalls, and the board says
 The parts of this entry above - the release being the client's job, and the two budgets that
 collided - are real and separate; this is what remains after both.
 
+## It reaches the x86 shell suite too (2026-09-15)
+
+`ping count 3` and `net stats` fail intermittently in `osdev test shell` - 174/0 twice and 172/2
+twice on the same build, so it is load-dependent rather than deterministic. The new diagnostics make
+the whole chain legible in five lines:
+
+```
+shell: discarded a net-stack reply for tag 4 while awaiting 5 (an earlier request was overtaken)
+net-stack: a client request met mid-question to nic-driver was dropped because the stash was full
+No reply from 10.0.2.2: net-stack not responding
+No reply from 10.0.2.2: net-stack not responding
+net-stack: SNTP - querying 185.51.192.62:123
+```
+
+`time` nudges net-stack for the clock, the SNTP dance blocks it for seconds, the shell's ping
+requests pile into the stash, `STASH_N` (4) fills, and the rest are dropped. Same root cause as the
+section above.
+
+**Raising `STASH_N` would hide this rather than fix it.** The queue behind it is 16 deep and a
+multi-second block will fill any bound worth having; the fix is for the dance not to block.
+
+Worth noting what the tag bought here: every one of those overtaken replies would previously have
+been READ as the answer to the wrong request. A visible timeout and a retry is the better failure,
+and it is the one the test now reports.
+
+**Not attributed to a commit.** The suite passed on this branch earlier the same day, so something
+made it more likely, but that was not established by bisection and is not claimed.
+
 ## What is NOT established
 
 Why the call fails. Candidates not yet separated: a race with `net-stack` reaping and revoking the
