@@ -396,7 +396,7 @@ const HELD_BYTES: usize = 1024;
 /// On a board whose cycle counter is not calibrated, `duration_cycles` floors to one quantum
 /// (`backlog/27`), so the budget collapses and every held request expires at once - the stack then
 /// behaves as it did before the stash existed, which is the right way for it to fail.
-const HOLD_MS: u64 = 500;
+const HOLD_MS: u64 = 1_500;
 
 impl Displaced {
     fn new() -> Self {
@@ -1358,7 +1358,28 @@ const POLL_TX_MS: u64 = 200;
 /// Half a second: long enough for a few frames on a slow driver, and a tenth of the five seconds a
 /// client waits before it gives up. The failure this exists to prevent is a poll outlasting the
 /// request it is keeping waiting.
-const POLL_BUDGET_MS: u64 = 500;
+const POLL_BUDGET_MS: u64 = 250;
+
+// ── The three budgets, and the order they MUST be in ───────────────────────────────────────────
+//
+// **These collided, and hardware paid for it twice.** `HOLD_MS` (how long a displaced client
+// request is kept) and `POLL_BUDGET_MS` (how long a poll step may run) were both 500 ms, set an
+// hour apart and never compared: a request stashed at the START of a poll expired at exactly the
+// moment that poll finished. On a Pi 2 that ate the echo of a `serve` session - the board logged
+// `received 14 byte(s)`, held the reply request, dropped it, and the client timed out against a
+// connection that was working perfectly.
+//
+//     POLL_BUDGET_MS  <  HOLD_MS  <  the shortest client deadline
+//
+// A held request must outlive the longest thing that can delay it being served (one poll step), and
+// must be served well before the client stops waiting (3 s, the shell's status query).
+//
+// ASSERTED, not written down, because a comment is what failed: two numbers that had to relate were
+// recorded separately and drifted into collision. Breaking the ordering now stops the build.
+const _: () = assert!(POLL_BUDGET_MS < HOLD_MS,
+    "a held request must outlive a poll step, or the poll drops the very request it delays");
+const _: () = assert!(HOLD_MS < 3_000,
+    "a held request must be served before the shortest client deadline, or it is answered too late");
 
 /// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
 ///
