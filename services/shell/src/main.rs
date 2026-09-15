@@ -6270,7 +6270,13 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
             }
             Ok(())
         }
-        None => { out.line(ctx, "tcp: net-stack did not answer"); Err(ShellError::Unknown) }
+        // NAME THE BOUND. "did not answer" alone reads as a refusal, which is a different thing
+        // and sends the reader to the wrong log. Saying how long it waited says which it was.
+        None => {
+            out.line_fmt(ctx, format_args!(
+                "tcp: net-stack did not answer within {}s - see its log", NET_TXN_SECS));
+            Err(ShellError::Unknown)
+        }
     }
 }
 
@@ -11546,21 +11552,33 @@ fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
     net_query(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs, Some(tag))
 }
 
-/// A tagged, UNBOUNDED net-stack request (the TCP transaction path, which sets its own budget inside
-/// net-stack and must not be cut short from here).
+/// How long the shell will wait for net-stack on the transaction path (`tcp`, `sock`, `serve`'s
+/// listen) before reporting it unavailable.
+///
+/// **This used to be UNBOUNDED, and that is a Commandment V violation: nothing above the kernel may
+/// halt.** The comment that stood here argued net-stack "sets its own budget inside and must not be
+/// cut short from here" - which is an argument for making this bound GENEROUS, not for having none.
+/// A dependency that is slow, wedged, or simply never got the message must produce a message, and an
+/// unbounded wait produces a dead prompt instead. Found on a Dell Wyse: `tcp <host> <port> big` froze
+/// the shell outright, with no `net-stack: tcp ->` line ever logged - so net-stack never even saw the
+/// request, and the shell waited on a reply that was never going to exist.
+///
+/// The number is set from what the far side can legitimately take, so a healthy-but-slow transaction
+/// is never cut off:
+///   - `tcp_transact` bounds itself at 8 s (`budget_ms`), the longest single thing net-stack does for
+///     this path;
+///   - the request may queue behind an SNTP dance that blocks net-stack for seconds - measured at 5.7
+///     s on a Pi 2 (`backlog/28`).
+/// 8 + 6 is 14, so 20 leaves real slack and still returns while a person is still watching.
+const NET_TXN_SECS: i64 = 20;
+
+/// A tagged net-stack request on the transaction path, bounded by `NET_TXN_SECS`.
+///
+/// Identical to `ns_deadline` in every other respect, which is why it is now written as a call to it
+/// rather than a second copy of the same reacquire-and-retry: the only thing that ever distinguished
+/// the two was the missing bound.
 fn ns_request(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
-    let mut buf = [0u8; 4096];
-    let (n, tag) = ns_build(ctx, body, &mut buf);
-    let msg = Message::from_bytes(&buf[..n]);
-    let first = ctx.request_with_reply("net-stack", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
-    if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag, first, 60) { return Some(r); }
-    if ctx.reacquire_by_name("net-stack") {
-        let (n2, tag2) = ns_build(ctx, body, &mut buf);
-        let again = ctx.request_with_reply("net-stack", &Message::from_bytes(&buf[..n2]))
-            .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
-        if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag2, again, 60) { return Some(r); }
-    }
-    None
+    ns_deadline(ctx, body, NET_TXN_SECS)
 }
 
 fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
