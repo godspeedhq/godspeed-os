@@ -412,6 +412,38 @@ Confirmed by re-measuring the same three connections:
 | client total, connection 2 | 4086 ms | **366 ms** |
 | client total, connection 3 | 4195 ms | **379 ms** |
 
+### The VisionFive 2, third instruction set and third NIC (2026-09-15)
+
+riscv64, StarFive dwmac ethernet. Everything first time, no new bugs.
+
+| | result |
+|---|---|
+| ping, ARP cache cleared | 8/8, 7-143 ms, TTL 64 |
+| `tcp hello` | ARP 174 ms, TCP **16 ms** |
+| `tcp big`, 2884 bytes | ARP 94 ms, TCP **16 ms** |
+| `serve`, three connections | 3/3, echo to close 200/206/219 ms |
+| `tcp selftest` | 53 checks |
+
+The zero-length reply fix travelled: closes are the deliberate 200 ms sleep, not the five-second
+timeout the Pi 4 exposed.
+
+Worth noting for this board specifically: every ping reply and every TCP segment here is UNICAST, and
+this is the hardware whose dwmac driver once dropped 60% of unicast frames
+(`project_riscv64_dwmac_unicast_loss`). 8/8 and two clean transfers say that repair is holding under
+a protocol that did not exist when it was made.
+
+### The same protocol work, three drivers
+
+| | Pi 2, dwc2 | Pi 4, GENET | VisionFive, dwmac |
+|---|---|---|---|
+| `hello` TCP phase | 346 ms median | 47 ms | 16 ms |
+| `big` TCP phase, 2884 bytes | 15 ms | 16 ms | 16 ms |
+
+**The large transfer is 15-16 ms on all three.** Identical protocol work across three instruction
+sets and three ethernet controllers, which is the portability claim measured rather than asserted.
+The spread on the small transfer is entirely the driver: the Pi 2's dwc2 pays a USB round trip per
+frame, and the other two do not.
+
 ### One theory retired
 
 The Pi 2's small-transfer latency - a reproducible ~346 ms where a 2884-byte reply took 15 ms - does
