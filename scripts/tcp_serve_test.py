@@ -131,25 +131,17 @@ def main():
         except OSError as e:
             print("tcp-serve: host-side connection failed: %s" % e)
 
-        read_until(sock, "closed", 20, out)
+        read_until(sock, "waiting for the next connection", 20, out)
 
-        # RUN IT AGAIN ON THE SAME PORT. The listener has to have been released, and it is not
-        # released by the client dropping its capability - net-stack's listener table is its own
-        # state. Found on a Pi 2, where the second `serve 8080` was refused and stayed refused.
-        # MAX_LISTEN is small, so this leak is two runs deep.
-        out.append("\n---- second run, same port ----\n")
-        # A DURATION, not an unbounded wait. `serve <port>` now waits for `q`, and driving that over
-        # a serial socket is a race the test does not need to run: the keystroke has to land while
-        # the accept loop is between polls, and it flaked PASS/FAIL on consecutive runs. A short
-        # bound ends the command deterministically and tests the same thing - that the port could be
-        # listened on again at all.
-        sock.sendall(b"serve %d 30s\n" % GUEST_PORT)
-        again = read_until(sock, "listening on", 20, out)
-
-        # AND CONNECT AGAIN, which is the case hardware broke on. The first connection worked and
-        # the second was accepted, received its bytes, and then timed out trying to echo them:
-        # net-stack was inside a poll step that outlasted the client's five-second patience. A
-        # listener that can be re-created is not the same as a session that works twice.
+        # CONNECT AGAIN TO THE SAME, STILL-RUNNING `serve`. This is the case hardware broke on
+        # twice: the second connection was accepted, received its bytes, and then failed to echo
+        # them - first because the poll step outlasted the client's patience, then because the
+        # request sat in net-stack's stash until it expired. Both were invisible until the board
+        # was made to say so.
+        #
+        # No second `serve` any more: the command keeps serving until `q`, so one invocation covers
+        # both connections and the listener is never released in between.
+        out.append("\n---- second connection, same serve ----\n")
         got2 = b""
         try:
             c2 = socket.create_connection(("127.0.0.1", fwd_port), timeout=20)
@@ -163,7 +155,10 @@ def main():
             c2.close()
         except OSError as e:
             print("tcp-serve: second host-side connection failed: %s" % e)
-        read_until(sock, "closed", 25, out)
+        read_until(sock, "accepted a connection (2)", 25, out)
+        again = "accepted a connection (2)" in "".join(out)
+        sock.sendall(b"q")
+        read_until(sock, "stopped after", 20, out)
         text = "".join(out)
 
         print("---- guest tail ----")
@@ -181,8 +176,8 @@ def main():
         check(re.search(r"echoed (\d+) byte\(s\) back", text) is not None,
               "the guest echoed it back")
         check("tcp selftest PASS" in text, "the startup self-test passed")
-        check(again and "would not listen" not in text.split("second run")[-1],
-              "the SAME port can be listened on again - the listener was released, not leaked")
+        check(again,
+              "ONE `serve` accepted a second connection - it keeps serving, not one-and-done")
 
         print("tcp-serve: host side, decoded outside the guest")
         check(connected, "the host could connect to the guest's listening port")

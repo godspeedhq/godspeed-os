@@ -39,6 +39,27 @@ because it is evidence of a fix.
 - On at least one failing run NEITHER line printed, so the release was not merely refused - it was
   not reached. That path is not yet understood.
 
+## One real cause found and fixed (2026-09-15)
+
+**Two budgets collided.** `HOLD_MS` (how long net-stack keeps a displaced client request) and
+`POLL_BUDGET_MS` (how long a poll step may run) were both 500 ms, set an hour apart and never
+compared. A request stashed at the START of a poll expired at exactly the moment that poll finished.
+
+The board named it, once the drop was made loud:
+
+```
+received 10 byte(s): second run
+net-stack: a held client request waited more than 500 ms and was dropped
+serve: the echo was not accepted
+```
+
+The echo request was eaten by the very stash meant to protect it. Fixed: `HOLD_MS` 1500,
+`POLL_BUDGET_MS` 250, and the ordering `POLL_BUDGET_MS < HOLD_MS < shortest client deadline` is now a
+compile-time assertion rather than a comment - a comment is what failed.
+
+That was almost certainly the cause of the two hardware failures. A residual flake remains in QEMU,
+about one run in seven, and is NOT explained by it.
+
 ## What is NOT established
 
 Why the call fails. Candidates not yet separated: a race with `net-stack` reaping and revoking the

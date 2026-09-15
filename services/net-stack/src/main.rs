@@ -457,9 +457,12 @@ impl Displaced {
                 if !self.expired_said {
                     self.expired_said = true;
                     ctx.log_fmt(format_args!(
+                        // NOT "the client has re-sent" - that asserted something this service
+                        // cannot know, and on the Pi 2 it was false: the client was still waiting,
+                        // and this line was the only trace of why its request vanished.
                         "net-stack: a held client request waited more than {} ms and was \
-                         dropped - past that the client has re-sent, so answering it would only \
-                         delay the copy that is still wanted (said once)", HOLD_MS));
+                         dropped - it may still be waiting, and will now time out (said once)",
+                        HOLD_MS));
                 }
                 continue;
             }

@@ -6,7 +6,8 @@ test also runs `serve` twice on the same port, which is the regression for the l
 
     serve <port> [for]
 
-Listen on `<port>`, accept ONE connection, print what arrives, echo it back, close.
+Listen on `<port>` and KEEP ANSWERING: each connection is accepted, printed, echoed back and closed,
+then it waits for the next one.
 
 **Waits until you press `q`.** A duration bounds it instead: `30s`, `5m`, `2h`, `1d`, or a plain
 number of seconds.
@@ -30,11 +31,15 @@ connection, and a SYN-ACK owed and sent by the poll step - none of which existed
 (`docs/tcp-design.md`). It also needs the poll step itself: a connection accepted here makes progress
 with no client asking, which is exactly what net-stack could not do before.
 
-## One connection, then done
+## It keeps serving
 
-Deliberately. This demonstrates the passive-open path and the capability API around it; it is not a
-daemon. A server that stays up is a service with a contract of its own, not a shell built-in - §26.2,
-the preferred state of an unneeded feature is *not implemented*.
+The first version handled exactly one connection and exited, which made every use a coordination
+exercise: start it, race to connect before it gave up, start it again. It now serves until you stop
+it.
+
+Still not a daemon, and the distinction is worth keeping: it runs in the foreground, holds the
+prompt, and ends when you press `q`. A server that outlives its shell is a service with a contract of
+its own (§26.2).
 
 ## Arguments
 

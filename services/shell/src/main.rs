@@ -6348,15 +6348,20 @@ fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
     ctx.remove_cap(listener);
 }
 
-/// `serve <port>` - listen, accept ONE connection, echo what arrives, close.
+/// `serve <port> [for]` - answer connections on `<port>` until you quit.
 ///
 /// **This is the machine acting as a host rather than a client**, and it is the first command that
 /// does. Everything networking has done until now dialled out; this answers.
 ///
-/// One connection and then done, deliberately: it is a demonstration of the passive-open path and
-/// the capability API around it, not a daemon. A server that stays up is a service with a contract
-/// of its own, not a shell built-in (§26.2 - the preferred state of an unneeded feature is not
-/// implemented).
+/// It KEEPS answering. Each connection is accepted, read, echoed and closed, and then it waits for
+/// the next one - so a port stays served for as long as the operator wants it, rather than needing
+/// the command retyped between callers. The first version handled exactly one connection and exited,
+/// which made every test a two-machine coordination exercise: start it, race to connect before it
+/// gave up, start it again.
+///
+/// Still not a daemon, and the distinction is worth keeping: it runs in the foreground, holds the
+/// prompt, and ends when you press `q`. A server that outlives its shell is a service with a
+/// contract of its own (§26.2).
 fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     if args.len() < 2 || args[1] == "help" {
         out.line(ctx, "usage: serve <port> [for]   - accept ONE connection on <port>, echo it, close");
@@ -6422,101 +6427,108 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     let mut conn = None;
     let mut last_note: i64 = -1;
     let t0 = ctx.epoch_secs_monotonic();
-    while limit.map_or(true, |n| ctx.epoch_secs_monotonic() - t0 < n) {
-        while let Some(b) = ctx.try_console_read() {
-            if b == b'q' || b == b'Q' || b == 0x1b {
-                serve_release(ctx, listener);
-                out.line(ctx, "serve: aborted");
-                return Ok(());
-            }
-        }
-        if let Some(r) = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_ACCEPT]) {
-            if r.payload_bytes().first() == Some(&1) {
-                if let Some(c) = ctx.take_pending_cap() { conn = Some(c); break; }
-            }
-        }
-        // A LIVE SIGN while nothing is happening. Two minutes of a mute prompt is
-        // indistinguishable from a wedged one, and the operator has no way to tell whether the
-        // command is still waiting or the machine has stopped (§26.7). Once every ten seconds is
-        // often enough to reassure and rare enough not to become the output.
-        let waited = ctx.epoch_secs_monotonic() - t0;
-        if waited > 0 && waited % 10 == 0 && waited != last_note {
-            last_note = waited;
-            match limit {
-                Some(n) => out.line_fmt(ctx, format_args!(
-                    "still listening - {}s of {}s (q aborts)", waited, n)),
-                None => out.line_fmt(ctx, format_args!(
-                    "still listening - {}s (q aborts)", waited)),
-            }
-        }
-        // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four times
-        // a second instead of ten leaves that service more of its own time for the poll step that
-        // answers ARP and notices the inbound SYN. A connection arriving is not made faster by
-        // asking about it more often.
-        ctx.sleep(ctx.duration_cycles(250));
-    }
-    let conn = match conn {
-        Some(c) => c,
-        None => {
-            serve_release(ctx, listener);
-            match limit {
-                Some(n) => out.line_fmt(ctx, format_args!("serve: nobody connected within {}s", n)),
-                None => out.line(ctx, "serve: stopped"),
-            }
-            return Ok(());
-        }
-    };
-    out.line(ctx, "accepted a connection");
-
-    // 3. Read whatever the peer sends, echo it back, close. Bounded on both sides.
-    let mut got = 0usize;
-    let mut buf = [0u8; 512];
-    let t1 = ctx.epoch_secs_monotonic();
-    while ctx.epoch_secs_monotonic() - t1 < 10 {
-        match sock_invoke(ctx, conn, RIGHT_READ, &[COP_RECV]) {
-            Some(r) => {
-                let p = r.payload_bytes();
-                if !p.is_empty() {
-                    let n = p.len().min(buf.len() - got);
-                    buf[got..got + n].copy_from_slice(&p[..n]);
-                    got += n;
-                    break;
+    let mut served: u32 = 0;
+    'serving: while limit.map_or(true, |n| ctx.epoch_secs_monotonic() - t0 < n) {
+        // ---- wait for the next caller ----
+        conn = None;
+        while limit.map_or(true, |n| ctx.epoch_secs_monotonic() - t0 < n) {
+            while let Some(b) = ctx.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b {
+                    serve_release(ctx, listener);
+                    out.line_fmt(ctx, format_args!(
+                        "serve: stopped after {} connection(s)", served));
+                    return Ok(());
                 }
             }
-            None => break,
-        }
-        ctx.sleep(ctx.duration_cycles(100));
-    }
-    if got > 0 {
-        // Printable only - a peer's bytes are not to be sprayed at the terminal as control codes.
-        let mut show = [0u8; 512];
-        for i in 0..got {
-            show[i] = if buf[i] >= 0x20 && buf[i] < 0x7f { buf[i] } else { b'.' };
-        }
-        out.line_fmt(ctx, format_args!("received {} byte(s): {}", got,
-                                       core::str::from_utf8(&show[..got]).unwrap_or("?")));
-        let mut echo = [0u8; 520];
-        echo[0] = COP_SEND;
-        echo[1..1 + got].copy_from_slice(&buf[..got]);
-        match sock_invoke(ctx, conn, RIGHT_WRITE, &echo[..1 + got]) {
-            Some(r) => {
-                let p = r.payload_bytes();
-                let took = if p.len() >= 2 { ((p[1] as usize) << 8) | p[0] as usize } else { 0 };
-                out.line_fmt(ctx, format_args!("echoed {} byte(s) back", took));
+            if let Some(r) = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_ACCEPT]) {
+                if r.payload_bytes().first() == Some(&1) {
+                    if let Some(c) = ctx.take_pending_cap() { conn = Some(c); break; }
+                }
             }
-            None => out.line(ctx, "serve: the echo was not accepted"),
+            // A LIVE SIGN while nothing is happening. A mute prompt and a wedged one look
+            // identical, and the operator has no way to tell which this is (§26.7). Once every ten
+            // seconds is often enough to reassure and rare enough not to become the output.
+            let waited = ctx.epoch_secs_monotonic() - t0;
+            if waited > 0 && waited % 10 == 0 && waited != last_note {
+                last_note = waited;
+                match limit {
+                    Some(n) => out.line_fmt(ctx, format_args!(
+                        "still listening - {}s of {}s, {} served (q stops)", waited, n, served)),
+                    None => out.line_fmt(ctx, format_args!(
+                        "still listening - {}s, {} served (q stops)", waited, served)),
+                }
+            }
+            // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four
+            // times a second instead of ten leaves that service more of its own time for the poll
+            // step that answers ARP and notices the inbound SYN. A connection arriving is not made
+            // faster by asking about it more often.
+            ctx.sleep(ctx.duration_cycles(250));
         }
-    } else {
-        out.line(ctx, "the peer connected but sent nothing");
+        let conn_h = match conn {
+            Some(c) => c,
+            None => break 'serving,          // the duration ran out while waiting
+        };
+        served += 1;
+        out.line_fmt(ctx, format_args!("accepted a connection ({})", served));
+
+        // ---- read what it sends, echo it back, close ----
+        let mut got = 0usize;
+        let mut buf = [0u8; 512];
+        let t1 = ctx.epoch_secs_monotonic();
+        while ctx.epoch_secs_monotonic() - t1 < 10 {
+            match sock_invoke(ctx, conn_h, RIGHT_READ, &[COP_RECV]) {
+                Some(r) => {
+                    let p = r.payload_bytes();
+                    if !p.is_empty() {
+                        let n = p.len().min(buf.len() - got);
+                        buf[got..got + n].copy_from_slice(&p[..n]);
+                        got += n;
+                        break;
+                    }
+                }
+                None => break,
+            }
+            ctx.sleep(ctx.duration_cycles(100));
+        }
+        if got > 0 {
+            // Printable only - a peer's bytes are not to be sprayed at the terminal as control codes.
+            let mut show = [0u8; 512];
+            for i in 0..got {
+                show[i] = if buf[i] >= 0x20 && buf[i] < 0x7f { buf[i] } else { b'.' };
+            }
+            out.line_fmt(ctx, format_args!("received {} byte(s): {}", got,
+                                           core::str::from_utf8(&show[..got]).unwrap_or("?")));
+            let mut echo = [0u8; 520];
+            echo[0] = COP_SEND;
+            echo[1..1 + got].copy_from_slice(&buf[..got]);
+            match sock_invoke(ctx, conn_h, RIGHT_WRITE, &echo[..1 + got]) {
+                Some(r) => {
+                    let p = r.payload_bytes();
+                    let took = if p.len() >= 2 { ((p[1] as usize) << 8) | p[0] as usize } else { 0 };
+                    out.line_fmt(ctx, format_args!("echoed {} byte(s) back", took));
+                }
+                None => out.line(ctx, "serve: the echo was not accepted"),
+            }
+        } else {
+            out.line(ctx, "the peer connected but sent nothing");
+        }
+
+        let _ = sock_invoke(ctx, conn_h, RIGHT_WRITE, &[COP_CLOSE]);
+        // Give the close a moment to go out before the capability is dropped - the connection is
+        // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
+        ctx.sleep(ctx.duration_cycles(200));
+        ctx.remove_cap(conn_h);
+        out.line(ctx, "closed - waiting for the next connection (q stops)");
+        // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
+        // connections and is released once, on the way out, by every exit path below.
     }
 
-    let _ = sock_invoke(ctx, conn, RIGHT_WRITE, &[COP_CLOSE]);
-    // Give the close a moment to go out before the capability is dropped - the connection is driven
-    // by net-stack's poll step, which needs a pass to put the FIN on the wire.
-    ctx.sleep(ctx.duration_cycles(200));
-    ctx.remove_cap(conn);
     serve_release(ctx, listener);
-    out.line(ctx, "closed");
+    match limit {
+        Some(n) => out.line_fmt(ctx, format_args!(
+            "serve: {}s elapsed, {} connection(s) served", n, served)),
+        None => out.line_fmt(ctx, format_args!("serve: stopped after {} connection(s)", served)),
+    }
     Ok(())
 }
 
