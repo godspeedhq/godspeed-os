@@ -2887,6 +2887,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         ctx.log_fmt(format_args!(
                             "net-stack: tcp {}.{}.{}.{}:{} ok - {} byte(s)",
                             dip[0], dip[1], dip[2], dip[3], dport, got));
+                        // WHERE DID THE TIME GO? Printed on success as well as failure, because a
+                        // transaction that returns the right bytes slowly is a different fault from
+                        // one that returns nothing, and only the failure arm could say anything at
+                        // all. Measured on a Pi 2: a 10-byte reply took ~346 ms where a 2884-byte
+                        // reply took ~15 ms, reproducibly, which is backwards and unexplained.
+                        //
+                        // The state at exit and the transmit journal separate the two candidate
+                        // explanations. A journal of a few frames ending in `F`, with the state
+                        // short of `Closed`, means the time was spent WAITING for the peer (its
+                        // delayed acknowledgement of our FIN, which it has no data to piggyback
+                        // on). A journal with repeated frames means we were RETRANSMITTING, which
+                        // is a different problem entirely.
+                        let n = tcpst.tx_n.min(tcpst.tx_log.len());
+                        if let Ok(j) = core::str::from_utf8(&tcpst.tx_log[..n]) {
+                            ctx.log_fmt(format_args!(
+                                "net-stack: tcp exit state {} after {} frame(s) - {} (S=syn A=ack F=fin D=data, lower case = the driver did not take it)",
+                                tcpst.last_state.name(), n, j));
+                        }
                         got
                     }
                     Err(f) => {
