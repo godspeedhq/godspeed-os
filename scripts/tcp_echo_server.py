@@ -13,6 +13,7 @@ test found bugs in. Every connection is logged with what arrived and what was se
 of a hardware test is to see both ends and compare.
 """
 
+import datetime
 import socket
 import sys
 import threading
@@ -44,19 +45,33 @@ def lan_addrs():
     return out
 
 
+def _ts():
+    """Wall clock to the millisecond, in the same shape the board's serial log uses."""
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
 def serve(conn, addr, n):
     try:
         conn.settimeout(15.0)
         data = conn.recv(4096)
-        print("  [%d] from %s:%d - %d byte(s): %r" % (n, addr[0], addr[1], len(data), data[:64]))
+        # WALL-CLOCK TIMESTAMPS, to the millisecond, so this log can be laid alongside the board's
+        # serial log and answer one question: when a transaction is slow, was the PEER late sending,
+        # or did the frame arrive and sit in the NIC un-harvested?
+        #
+        # Measured on a Pi 2: the same six frames (`SADAAF`) took 332 ms on one run and 15 ms on
+        # another. Identical sends, so the time is spent WAITING for something to arrive - and the
+        # two explanations are told apart from here rather than from inside the guest.
+        print("  [%d] %s from %s:%d - %d byte(s): %r"
+              % (n, _ts(), addr[0], addr[1], len(data), data[:64]))
         if b"big" in data:
             reply = BIG_REPLY
         else:
             reply = b"echo:" + data
         conn.sendall(reply)
-        print("  [%d] sent %d byte(s)%s" % (n, len(reply),
+        print("  [%d] %s sent %d byte(s)%s" % (n, _ts(), len(reply),
                                             " (multi-segment)" if len(reply) > 1460 else ""))
         conn.shutdown(socket.SHUT_WR)       # our FIN, so the board must complete the exchange
+        print("  [%d] %s our FIN is on the wire (shutdown SHUT_WR returned)" % (n, _ts()))
         try:
             conn.recv(64)
         except OSError:
