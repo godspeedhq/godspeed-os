@@ -1336,6 +1336,17 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// `nic-driver`, and only when nothing else woke us.
 const POLL_MS: u64 = 100;
 
+/// How long ONE frame the poll step sends may wait on the driver.
+///
+/// Well under `POLL_MS`, so a poll that sends a few frames still finishes inside its own interval.
+/// A frame the driver will not take right now is dropped rather than waited for: the peer retransmits,
+/// and this service stays answerable to the client in front of it.
+const POLL_TX_MS: u64 = 20;
+
+/// The whole poll step's budget. Checked between frames, so the step stops issuing new work once it
+/// is spent rather than running to completion however long that takes.
+const POLL_BUDGET_MS: u64 = 60;
+
 /// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
 ///
 /// **This is the tick that was reverted, and it is only safe to bring back now.** The revert note in
@@ -1356,7 +1367,13 @@ const POLL_MS: u64 = 100;
 /// instead of sleeping through a burst.
 fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
              t: &mut tcp::Tcp, net: &tcp::Net) -> bool {
-    let batch = nic_drain(ctx, pending);
+    // THE BUDGET. Everything below checks it before issuing more driver work, so this step cannot
+    // outlast its own interval and starve the client the service exists to answer.
+    let t0 = ctx.read_tsc();
+    let budget = ctx.duration_cycles(POLL_BUDGET_MS);
+    let spent = |ctx: &ServiceContext| ctx.read_tsc().wrapping_sub(t0) >= budget;
+
+    let batch = nic_drain_ms(ctx, pending, POLL_TX_MS * 2);
     let m = match batch { Some(m) => m, None => return false };
     let p = m.payload_bytes();
     if p.is_empty() { return false; }
@@ -1372,17 +1389,25 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
         let f = &p[pos..pos + fl];
         pos += fl;
         any = true;
+        // Out of budget: the frames already read are still fed to the state machine below, but no
+        // more REPLIES are sent this pass. Feeding is arithmetic; replying is a driver round trip,
+        // and only the second one can hold the service up.
+        let quiet = spent(ctx);
 
         // ARP for us. Answered first because without it nothing else can reach us at all.
         let mut arp_out = [0u8; 42];
         if build_arp_reply(f, &st.our_ip, &st.our_mac, &mut arp_out) {
-            let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), LINK_SECS);
+            if !quiet {
+                let _ = nic_req_ms(ctx, pending, &Message::from_bytes(&arp_out), POLL_TX_MS);
+            }
             continue;
         }
         // A ping addressed to us.
         let n = build_icmp_reply(f, &st.our_ip, &st.our_mac, &mut out);
         if n > 0 {
-            let _ = nic_req(ctx, pending, &Message::from_bytes(&out[..n]), LINK_SECS);
+            if !quiet {
+                let _ = nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS);
+            }
             continue;
         }
         // Anything else that is TCP for one of our connections. `on_frame` never transmits - it
@@ -1422,9 +1447,12 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     // due, a window probe, a FIN to answer. This is the half that makes a connection able to outlive
     // the request that opened it.
     for i in 0..tcp::MAX_CONNS {
+        // Out of budget: leave the rest for the next poll, a hundred milliseconds away. A
+        // retransmission or an acknowledgement is not urgent enough to hold a client's request.
+        if spent(ctx) { break; }
         let n = t.poll_one(ctx, net, i, &mut out);
         if n > 0 {
-            let _ = nic_req(ctx, pending, &Message::from_bytes(&out[..n]), LINK_SECS);
+            let _ = nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS);
             any = true;
         }
     }
@@ -2299,6 +2327,27 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 /// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
 /// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
 /// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
+/// A frame request bounded in MILLISECONDS, for work this service does unasked.
+///
+/// `nic_req` waits `LINK_SECS` (one second) and retries, so a single call can hold this service for
+/// seconds when the driver is slow. That is the right budget for a CLIENT'S request - the client is
+/// waiting and wants the answer - and the wrong one for the poll step, which is speculative: if the
+/// driver is busy right now, the poll can simply not happen and try again in a hundred milliseconds.
+///
+/// **A poll that blocks longer than a client's patience is worse than a poll that is skipped.** On a
+/// Pi 2 the shell asked net-stack to send ten bytes, net-stack was inside a poll, and the client's
+/// five-second budget expired before it was answered: `serve: the echo was not accepted`, on a
+/// connection that was working perfectly. Bounded in work is not bounded in time (§26.6).
+fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: u64) -> Option<Message> {
+    ctx.request_with_reply_ms_sifted("nic-driver", msg, ms, |m| {
+        let badge = ctx.last_recv_badge();
+        match ctx.take_pending_cap() {
+            Some(cap) => { pending.note(ctx, m, badge, cap); false }
+            None => true,
+        }
+    })
+}
+
 fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Option<Message> {
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment

@@ -27,6 +27,7 @@ IMAGE = os.path.join(ROOT, "build", "os.img")
 
 GUEST_PORT = 8080
 PROBE = b"knock knock"
+PROBE2 = b"second run"
 
 
 def free_port():
@@ -142,9 +143,27 @@ def main():
         # the accept loop is between polls, and it flaked PASS/FAIL on consecutive runs. A short
         # bound ends the command deterministically and tests the same thing - that the port could be
         # listened on again at all.
-        sock.sendall(b"serve %d 3s\n" % GUEST_PORT)
+        sock.sendall(b"serve %d 30s\n" % GUEST_PORT)
         again = read_until(sock, "listening on", 20, out)
-        read_until(sock, "nobody connected", 25, out)
+
+        # AND CONNECT AGAIN, which is the case hardware broke on. The first connection worked and
+        # the second was accepted, received its bytes, and then timed out trying to echo them:
+        # net-stack was inside a poll step that outlasted the client's five-second patience. A
+        # listener that can be re-created is not the same as a session that works twice.
+        got2 = b""
+        try:
+            c2 = socket.create_connection(("127.0.0.1", fwd_port), timeout=20)
+            c2.sendall(PROBE2)
+            c2.settimeout(20)
+            while len(got2) < len(PROBE2):
+                b = c2.recv(256)
+                if not b:
+                    break
+                got2 += b
+            c2.close()
+        except OSError as e:
+            print("tcp-serve: second host-side connection failed: %s" % e)
+        read_until(sock, "closed", 25, out)
         text = "".join(out)
 
         print("---- guest tail ----")
@@ -169,6 +188,8 @@ def main():
         check(connected, "the host could connect to the guest's listening port")
         check(got == PROBE,
               "the bytes that came back are the bytes sent (%r)" % got[:40])
+        check(got2 == PROBE2,
+              "a SECOND connection in the same session also echoed (%r)" % got2[:40])
     finally:
         try:
             sock.close()
