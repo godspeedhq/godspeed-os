@@ -1,6 +1,8 @@
 # 31. net-stack blocked 48 s waiting on a nic-driver that was ALIVE
 
-**Status: OPEN, measured, not diagnosed.** Found on a Dell Wyse 5070, 2026-09-16, by the slow-pass
+**Status: OPEN, and the CAUSE IS NOW CONFIRMED** (2026-09-16, see the section at the end).
+The fix is not: a correlation tag was built, proved the fault, and was REVERTED because rejecting a
+stale reply is not the same as recovering from one. Found on a Dell Wyse 5070, 2026-09-16, by the slow-pass
 instrument added in `backlog/29`. A restart of `net-stack` cleared it.
 
 ## What happened
@@ -71,3 +73,47 @@ reported fact instead of a candidate. It is already named as owed in `docs/net-t
 
 `backlog/28` (the in-loop dance blocking for seconds) and `backlog/29` (a held request never taken).
 Both are net-stack blocking ITSELF. This is net-stack blocked on a peer that was alive.
+
+## CONFIRMED: the reply stream runs chronically behind (2026-09-16)
+
+The correlation tag this entry asked for was implemented on the net-stack/nic-driver hop and run in
+QEMU. It found the fault immediately:
+
+```
+net-stack: discarded a nic-driver reply for tag 11 while awaiting 39 - an abandoned request was
+           answered late (stale #1)
+net: resolving ... cannot reach nic-driver (no answer) - link state unknown
+net-stack: ARP for 10.0.2.2 found nothing - 6 sent 0 SEND-FAILED, 0 frames scanned
+```
+
+**The driver's replies are running about 28 requests behind.** Every abandoned deadline leaves an
+orphan reply in net-stack's queue, and nothing ever removes it, so each wait finds the orphan of a
+long-dead request sitting in front of the answer it wants. Untagged, net-stack READ that orphan as its
+answer - reply N-28 served as the answer to request N - and the channel appeared to work while every
+exchange was tens of requests out of step. That is the 48 second stall at the top of this entry, and
+it is now a measured fact rather than a candidate.
+
+## Why the tag was reverted, and what the real fix has to be
+
+The tag does exactly what it was built to do: it refuses the stale reply. **Refusing is not
+recovering.** With the tag in and no resynchronisation, all four direct `net` ops (`dns`, `stats`,
+`arp`, `renew`) fail outright - net-stack correctly declines every answer it is offered and times out,
+where before it accepted a wrong one and limped. TCP kept passing, because its own retransmission
+covers a lost exchange.
+
+So the tag is necessary and **not sufficient**, and the missing half is a design question rather than
+a constant:
+
+- drain the channel to empty before issuing a request (bounded how? the orphans arrive asynchronously);
+- or resynchronise on the first mismatch - keep taking replies until the tag matches, within the
+  deadline already held;
+- or stop creating orphans at all, by not abandoning a driver request whose reply is still coming.
+
+The third is the root: an orphan exists only because a deadline expired on a request the driver later
+answered. That is the same shape as `backlog/29` one hop down.
+
+**Reverted at `87f1f358`'s state**, which is what all five boards passed, so the branch carries no
+half-built protocol change. The work is described here in enough detail to be redone deliberately.
+
+**Verified after the revert:** `osdev test shell` 174/0/2, and `git diff 87f1f358 -- services/ sdk/`
+empty - the services are byte-identical to the five-board-verified state.
