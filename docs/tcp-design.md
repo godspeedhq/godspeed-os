@@ -183,11 +183,24 @@ not. Re-run on the two x86 boards after the fix:
 | HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
 | StarFive VisionFive 2 Lite | 204 / 78 / 174 / 205 ms (4 runs) | under 20 ms | **ran 461, failed 0** |
 | Raspberry Pi 4 | **31 / 47 / 32 ms** (3 runs) | under 40 ms | **ran 461, failed 0** |
+| Raspberry Pi 2 | 47 to 236 ms, median ~95 ms (8 runs) | under 20 ms | **ran 452, failed 0** |
 
 The three boards with a real disk report **the same 461 checks and the same 0 failures on three
 different instruction sets** - x86-64 on AMD, riscv64, and AArch64 - with `drives check` and `drives
 scrub` green on each. That is the portability claim in its strongest available form: not "it builds
 everywhere" but one suite, one count, one result, across ISAs that share no arch code.
+
+**A warning about reading these timings out of a serial capture, because it nearly produced a false
+entry in this very table.** The Pi 2's numbers first read as a flat 31 to 48 ms - as fast as the Pi 4,
+on the one board whose NIC is behind USB, and 7x better than its own previous figure. It was an
+artifact. Those lines came from the `events` log ring being DUMPED and re-rendered, not from live
+output, and the giveaway is the format: a dumped line is column-padded (`net-stack  `, `shell      `,
+`fs         ` aligned to one width) where a live one carries a colon (`net-stack: `). The timestamps in
+a dump are when the HOST received the repaint, so five transactions appear inside 400 ms and every one
+of them "takes" the repaint interval.
+
+**Take timings only from the colon form.** A figure well BELOW the other boards is a measurement
+artifact until proven a difference - this table would otherwise have claimed the Pi 2 matched the Pi 4.
 
 The Pi 4 is the fastest in the fleet by a wide margin - a 2884-byte transfer in 31 ms against 159 ms
 on the T630 and 78 to 205 ms on the VisionFive - which is the GENET MAC being on-SoC rather than
