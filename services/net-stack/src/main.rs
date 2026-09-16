@@ -354,8 +354,9 @@ impl Reply {
 /// because a service holds no unowned global mutable state (Commandment VI). That threading is most
 /// of this change, and it is the same `&mut` phase 3 will need when it arrives.
 pub struct Displaced {
+    /// Every client request this service has thrown away, for any reason. Drops are reported by RATE
+    /// off this count rather than by a said-once latch - see `take`.
     n: u32,
-    warned: bool,
     /// Said-once latch for the one SILENT way a client request can be lost - see the `None` arm of
     /// `sifted_req`'s closure.
     ate_client_said: bool,
@@ -382,9 +383,6 @@ pub struct Displaced {
     /// are answered in the order they asked, which is the only order that cannot surprise them.
     head: usize,
     live: usize,
-    /// The expiry is reported once, for the same reason the drop is: the condition repeats by nature
-    /// and a report that floods the console is how a real signal gets lost among its own copies.
-    expired_said: bool,
 }
 
 /// A held request, with everything needed to answer it later.
@@ -399,6 +397,8 @@ pub struct Held {
     reply: CapHandle,
     /// The cycle counter when it was displaced. See `HOLD_MS`.
     at: u64,
+    /// How long THIS request's client said it will wait. See `HOLD_MS`.
+    hold_ms: u64,
     body: [u8; HELD_BYTES],
 }
 
@@ -442,12 +442,10 @@ impl Displaced {
     fn new() -> Self {
         Displaced {
             n: 0,
-            warned: false,
             ate_client_said: false,
             held: [const { None }; STASH_N],
             head: 0,
             live: 0,
-            expired_said: false,
         }
     }
 
@@ -470,8 +468,17 @@ impl Displaced {
             self.live -= 1;
         }
         let slot = (self.head + self.live) % STASH_N;
+        // THE CLIENT SAID HOW LONG IT WILL WAIT (byte 1 of a tagged request). Hold it for that,
+        // rather than for one global guess - see `HOLD_MS`. A badged invocation carries no header, so
+        // it gets the default. Holding longer than the client will wait is pure waste; holding for
+        // less is the bug this fixes.
+        let hold_ms = match badge {
+            None => pl.get(1).map(|p| (*p as u64).saturating_mul(1_000)).unwrap_or(HOLD_MS),
+            Some(_) => HOLD_MS,
+        };
         let mut h = Held {
-            len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), body: [0u8; HELD_BYTES],
+            len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), hold_ms,
+            body: [0u8; HELD_BYTES],
         };
         h.body[..pl.len()].copy_from_slice(pl);
         self.held[slot] = Some(h);
@@ -484,26 +491,30 @@ impl Displaced {
     /// order: once the head is young enough, so is everything behind it.
     fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
             -> Option<(usize, Option<(u64, u8)>, CapHandle)> {
-        let budget = ctx.duration_cycles(HOLD_MS);
         let now = ctx.read_tsc();
         while self.live > 0 {
             let h = match self.held[self.head].take() { Some(h) => h, None => return None };
             self.head = (self.head + 1) % STASH_N;
             self.live -= 1;
+            // Per request, not one budget for the whole stash - entries hold for different lengths
+            // now, so each is checked against its own client's word.
+            let budget = ctx.duration_cycles(h.hold_ms);
             // wrapping_sub, so a counter that wraps while something is held reads as a small elapsed
             // rather than an enormous one that expires a request which just arrived.
             if now.wrapping_sub(h.at) >= budget {
                 ctx.remove_cap(h.reply);
                 self.n = self.n.saturating_add(1);
-                if !self.expired_said {
-                    self.expired_said = true;
+                // REPORT EVERY ONE, not just the first. A "said once" latch is exactly what hid this
+                // for three sessions: the first drop was reported at boot and every later one - each
+                // costing a client its whole deadline - was silent, so the board looked healthy while
+                // commands took twenty seconds. Bounded by RATE, not by a latch (§26.7).
+                if self.n <= 8 || self.n % 8 == 0 {
                     ctx.log_fmt(format_args!(
                         // NOT "the client has re-sent" - that asserted something this service
                         // cannot know, and on the Pi 2 it was false: the client was still waiting,
                         // and this line was the only trace of why its request vanished.
-                        "net-stack: a held client request waited more than {} ms and was \
-                         dropped - it may still be waiting, and will now time out (said once)",
-                        HOLD_MS));
+                        "net-stack: dropped a held client request (op {}) after its client's own {} ms                          of patience - it is still waiting and will now time out (drop #{})",
+                        h.body.get(2).copied().unwrap_or(0), h.hold_ms, self.n));
                 }
                 continue;
             }
@@ -517,11 +528,9 @@ impl Displaced {
     fn drop_one(&mut self, ctx: &ServiceContext, cap: CapHandle, why: &str) {
         ctx.remove_cap(cap);
         self.n = self.n.saturating_add(1);
-        if !self.warned {
-            self.warned = true;
+        if self.n <= 8 || self.n % 8 == 0 {
             ctx.log_fmt(format_args!(
-                "net-stack: a client request met mid-question to nic-driver was dropped \
-                 because {} - it times out and retries (said once)", why));
+                "net-stack: a client request met mid-question to nic-driver was dropped                  because {} - it times out and retries (drop #{})", why, self.n));
         }
     }
 }
@@ -1430,8 +1439,14 @@ const _: () = assert!(SLOW_PASS_MS > POLL_MS + POLL_BUDGET_MS,
 // recorded separately and drifted into collision. Breaking the ordering now stops the build.
 const _: () = assert!(POLL_BUDGET_MS < HOLD_MS,
     "a held request must outlive a poll step, or the poll drops the very request it delays");
-const _: () = assert!(HOLD_MS < 3_000,
-    "a held request must be served before the shortest client deadline, or it is answered too late");
+// NO UPPER BOUND ANY MORE, and its removal is the fix rather than a relaxation. This used to assert
+// `HOLD_MS < 3_000` - "a held request must be served before the shortest client deadline" - which was
+// true when every client here waited 3 s and became a defect the moment the transaction path waited
+// 20 s: net-stack threw requests away at 1.5 s while their client sat patiently for eighteen seconds
+// more, timed out, re-sent, and had the re-send answered in milliseconds (`backlog/29`, measured at
+// 19.67 s and 19.99 s on a Dell Wyse). A constant cannot know a client's deadline, so it no longer
+// guesses: the CLIENT SAYS, in byte 1, and `HOLD_MS` is now only the default for a badged invocation
+// that carries no header. The ordering assertion above still binds, and is the one that matters.
 
 /// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
 ///
@@ -2866,11 +2881,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // already names the socket, and the client holds no ambiguity to resolve.
         let (pl, reply) = match badge {
             Some(_) => (pl_raw, Reply { cap: reply_cap, tag: None }),
-            None => match pl_raw.split_first() {
-                Some((t, rest)) => (rest, Reply { cap: reply_cap, tag: Some(*t) }),
-                // No payload at all. Nothing to strip and nothing to echo; the default arm answers
-                // status, exactly as it did before there were tags.
-                None => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            // TWO header bytes: the tag to echo, and how long the client will wait (used by the
+            // stash, in `Displaced::note`, and of no interest to any arm below). Stripped together
+            // here so that - exactly as with the tag alone - not one op arm knows either exists.
+            None => match (pl_raw.first(), pl_raw.len()) {
+                (Some(t), n) if n >= 2 => (&pl_raw[2..], Reply { cap: reply_cap, tag: Some(*t) }),
+                // A single byte, or none at all. Nothing to strip and nothing to echo; the default
+                // arm answers status, exactly as it did before there were tags.
+                _ => (pl_raw, Reply { cap: reply_cap, tag: None }),
             },
         };
         // ARRIVAL RECEIPT for the two ops a person waits on, and ONLY those two.

@@ -473,3 +473,37 @@ that only the re-send is served.
 The background poll step is now unblocked in the sense that matters: a client met during unsolicited
 driver traffic is kept and served rather than lost. §4's list - the idle link tick, staying
 responsive during the DHCP dance, any periodic work at all - is buildable. None of it is built here.
+
+## 10. The second header byte: how long the client will wait (2026-09-16)
+
+The tag solved correlation. It did not solve the other thing net-stack cannot know about its client,
+and that gap cost twenty seconds a command on a Dell Wyse.
+
+A request that arrives while net-stack is mid-conversation with `nic-driver` is held in a four-slot
+stash. A held request used to be dropped after a FIXED `HOLD_MS` of 1.5 s, and the constant carried a
+compile-time assertion saying why: `HOLD_MS < 3_000`, "a held request must be served before the
+shortest client deadline". That was correct when every client on this hop waited 3 s.
+
+Then the transaction path (`tcp`, `sock`, `serve`'s listen) was given a 20 s bound, and the assertion
+quietly became a defect. net-stack threw a request away at 1.5 s while its client sat patiently for
+another 18.5, the client timed out, reacquired, re-sent, and the re-send was answered in
+milliseconds. Measured as 19.67 s and 19.99 s to dispatch, twice, with the arrival receipt showing the
+served copy arriving "from the queue" - the retry, not the original (`backlog/29`).
+
+**A constant cannot know a client's deadline, so it stops guessing: the client says.** Byte 1 of a
+tagged request is how many seconds that client will wait, saturating into one byte. `Displaced::note`
+stores it per entry and `take` expires each against its own, so a 3 s status query is still dropped
+promptly and a 20 s transaction is held until it can be served.
+
+Three properties are deliberately preserved from the tag:
+
+- **Stripped in ONE place**, with the tag, so not a single op arm knows either byte exists.
+- **Badged invocations carry no header** - a capability invocation names its resource and needs no
+  correlation - so those keep `HOLD_MS` as the default.
+- **`time`'s one-way `[11]` nudge is untouched**: it is capless and handled before the strip.
+
+The latches went with it. Both drop reports were "said once", which is exactly what hid this for three
+debugging sessions: the first drop was reported at boot and every later one - each costing a client
+its whole deadline - was silent, so a board looked healthy while its commands took twenty seconds.
+They are bounded by RATE now (every one of the first eight, then every eighth), which is a bound that
+still reports the twentieth occurrence.

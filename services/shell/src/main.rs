@@ -11512,12 +11512,27 @@ fn next_net_tag(ctx: &ShellCtx) -> u8 {
 const NET_STALE_MAX: usize = 8;
 
 /// Build a tagged net-stack request into `out`, returning its length and the tag to match.
-fn ns_build(ctx: &ShellCtx, body: &[u8], out: &mut [u8; 4096]) -> (usize, u8) {
+///
+/// **Two header bytes now: the tag, and HOW LONG THIS CLIENT WILL WAIT.**
+///
+/// The second byte exists because net-stack cannot otherwise know, and it was guessing wrong in a way
+/// that cost twenty seconds a command. When a request arrives while net-stack is mid-conversation with
+/// `nic-driver` it is held in a small stash, and a held request was dropped after a FIXED 1.5 s -
+/// a bound chosen when every client here waited 3 s. The transaction path now waits 20 s, so net-stack
+/// was throwing away requests whose client would happily have waited eighteen seconds longer; the
+/// client then timed out, reacquired, re-sent, and THAT copy was answered in milliseconds. Measured on
+/// a Dell Wyse as 19.67 s and 19.99 s to dispatch, with the re-send served instantly (`backlog/29`).
+///
+/// Seconds in one byte, saturating: nothing here waits longer than 255 s and a client that wants to be
+/// dropped promptly can say 0. It is stripped in the SAME single place as the tag, so no net-stack op
+/// arm knows either byte exists.
+fn ns_build(ctx: &ShellCtx, body: &[u8], out: &mut [u8; 4096], patience_secs: i64) -> (usize, u8) {
     let tag = next_net_tag(ctx);
-    let n = body.len().min(out.len() - 1);
+    let n = body.len().min(out.len() - 2);
     out[0] = tag;
-    out[1..1 + n].copy_from_slice(&body[..n]);
-    (1 + n, tag)
+    out[1] = patience_secs.clamp(0, 255) as u8;
+    out[2..2 + n].copy_from_slice(&body[..n]);
+    (2 + n, tag)
 }
 
 /// Take the reply whose tag matches, discarding any that overtook it. Strips the tag.
@@ -11564,11 +11579,11 @@ fn ns_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
 /// the retry's answer.
 fn ns_abortable(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> ReqOutcome {
     let mut buf = [0u8; 4096];
-    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let (n, tag) = ns_build(ctx, body, &mut buf, max_secs);
     let first = ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&buf[..n]), max_secs);
     match ns_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => {
-            let (n2, tag2) = ns_build(ctx, body, &mut buf);
+            let (n2, tag2) = ns_build(ctx, body, &mut buf, max_secs);
             let again = ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&buf[..n2]), max_secs);
             ns_take_tagged(ctx, tag2, again, max_secs)
         }
@@ -11579,12 +11594,12 @@ fn ns_abortable(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> ReqOutcome {
 /// A tagged, deadline-bounded net-stack request (no `q` handling).
 fn ns_deadline(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     let mut buf = [0u8; 4096];
-    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let (n, tag) = ns_build(ctx, body, &mut buf, max_secs);
     let first = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&buf[..n]), max_secs)
         .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
     if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag, first, max_secs) { return Some(r); }
     if ctx.reacquire_by_name("net-stack") {
-        let (n2, tag2) = ns_build(ctx, body, &mut buf);
+        let (n2, tag2) = ns_build(ctx, body, &mut buf, max_secs);
         let again = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&buf[..n2]), max_secs)
             .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
         if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
@@ -11595,7 +11610,7 @@ fn ns_deadline(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
 /// A tagged `net_query` - the once-a-second, `q`-abortable poll used by `net` and `net dns`.
 fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
     let mut buf = [0u8; 4096];
-    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let (n, tag) = ns_build(ctx, body, &mut buf, max_secs);
     net_query(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs, Some(tag))
 }
 
@@ -11664,7 +11679,7 @@ fn drain_stale_net_replies(ctx: &ServiceContext) {
 fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
     let mut buf = [0u8; 4096];
     drain_stale_net_replies(ctx);         // an earlier abandoned reply must not be read as ours
-    let (n, tag) = ns_build(ctx, body, &mut buf);
+    let (n, tag) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
     let first = ctx.request_with_reply_qhint(
         "net-stack", &Message::from_bytes(&buf[..n]), NET_HINT_SECS, NET_TXN_SECS,
         || ctx.console_writeln("  (q to quit)"));
@@ -11673,7 +11688,7 @@ fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
         // once, with a FRESH tag - the first request may still be in flight, and its late reply must
         // not be mistaken for the retry's answer. An ABORT is the user's decision and is never retried.
         ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => {
-            let (n2, tag2) = ns_build(ctx, body, &mut buf);
+            let (n2, tag2) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
             let again = ctx.request_with_reply_qhint(
                 "net-stack", &Message::from_bytes(&buf[..n2]), NET_HINT_SECS, NET_TXN_SECS,
                 || ctx.console_writeln("  (q to quit)"));
