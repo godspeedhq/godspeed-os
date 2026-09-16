@@ -2761,9 +2761,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         let gap = now_pass.wrapping_sub(last_pass);
                         if gap >= ctx.duration_cycles(SLOW_PASS_MS) {
                             slow_passes = slow_passes.saturating_add(1);
+                            // BOUNDED BY RATE. Unbounded, this is one line per pass on any board
+                            // where `duration_cycles` under-reports - an uncalibrated counter floors
+                            // to a quantum (`backlog/27`), which would make every pass look slow and
+                            // bury the console in its own report. The same shape as the drop reports,
+                            // and for the same reason: never a latch (which hides the twentieth
+                            // occurrence), never unbounded (which hides everything else).
+                            if slow_passes <= 8 || slow_passes % 8 == 0 {
                             ctx.log_fmt(format_args!(
                                 "net-stack: a serve pass took {} ms (over {}) - not asking for client requests during it (slow pass #{})",
                                 gap / ctx.duration_cycles(1).max(1), SLOW_PASS_MS, slow_passes));
+                            }
                         }
                     }
                     last_pass = now_pass;
