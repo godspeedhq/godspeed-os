@@ -150,3 +150,31 @@ Neither is a constant, so per §26.7 this is recorded rather than half-built.
 The listener leak fixed in `9f160761`, which was unconditional: dropping the capability told
 `net-stack` nothing and `unlisten` was wired to nothing at all. That is fixed and verified on a
 Raspberry Pi 2. This item is the residue - the release now exists and usually works.
+
+## MEASURED at last: 22 s and 79 s blocks, on an unconfigured stack (2026-09-16)
+
+This item has always described the blocking dance qualitatively - "blocks this service while it runs",
+"seconds". The slow-pass report added for `backlog/29` puts numbers on it, and they are worse than the
+prose suggested. RISC-V under QEMU, which emulates **no NIC at all**, so the stack never configures:
+
+```
+net-stack: a serve pass took 22584 ms (over 1000) - not asking for client requests during it (slow pass #1)
+net-stack: a serve pass took 78850 ms (over 1000) - ...                                      (slow pass #2)
+net-stack: a serve pass took 22535 ms (over 1000) - ...                                      (slow pass #3)
+net-stack: a serve pass took 22482 ms (over 1000) - ...                                      (slow pass #4)
+```
+
+No panic, no wedge, and no dropped requests - nothing was asking during it. But a client that HAD asked
+would wait out its entire patience and be dropped, correctly and uselessly: **`backlog/29`'s fix cannot
+help here, because no plausible client deadline survives a 79 second block.** That is the honest limit
+of that work, and it is why the incremental dance remains the real fix rather than a nicety.
+
+**Two caveats, so the numbers are not over-read.** The duration is computed from the cycle counter, and
+an uncalibrated one under-reports `duration_cycles`, which would INFLATE the figure (`backlog/27`);
+the run's wall-clock length is consistent with these being roughly right, but they are not independently
+confirmed. And this is the NO-LINK path specifically - a configured stack does not take it. The three
+configured x86 boards show 1.5 to 4 s blocks, which is the same defect at the scale this item already
+described.
+
+What is new is that the cost is now REPORTED, per occurrence, on every board, instead of being
+rediscovered as a mystery per platform. That does not close this item; it sizes it.
