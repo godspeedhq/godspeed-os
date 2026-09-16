@@ -171,6 +171,28 @@ number. That is recorded here rather than discovered later.
 | HP T630 | x86-64 | RTL8168 | 130 ms | 173 ms |
 | Dell Wyse 5070 | x86-64 | RTL8168 | 142 ms | 79 ms + 1.39 s of ARP |
 
+### Re-verified end to end after the queue-latency work (2026-09-16)
+
+All five boards above were measured before `backlog/29` - three defects that made a command take
+twenty seconds rather than fail, so the transaction numbers were right and the time to START one was
+not. Re-run on the two x86 boards after the fix:
+
+| board | `tcp ... big`, dispatch to reply | queue wait before dispatch | selfcheck |
+|---|---|---|---|
+| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | n/a, no disk |
+| HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
+
+The T630 is the useful one here, for three reasons: it is AMD, so every timing bound in this service
+calibrates through a different path; it has a real AHCI disk, so `check` and `scrub` run for real (461
+checks against 349-354 on the diskless boards); and it had never run this branch at all - both earlier
+x86 sessions booted the Wyse in its place. It needed no change.
+
+**What it shows that a green run usually cannot.** Its log carries three genuinely slow serve passes -
+1981 ms, 1557 ms and 4001 ms - and **zero dropped requests and zero timeouts beside them.** The
+in-loop dance still blocks this service for seconds (`backlog/28`, open by design); what changed is
+that a request displaced by one is now served the moment it ends instead of ageing out. A four-second
+block used to be exactly what produced a discarded request and a twenty-second command.
+
 **Every board after the first worked FIRST TIME, with no new bugs.** That is the portability
 claim earning its keep: every one of the four hardware-only failures was in `net-stack`, which is
 architecture-neutral, so fixing them on one board fixed the rest. Four instruction sets and four
