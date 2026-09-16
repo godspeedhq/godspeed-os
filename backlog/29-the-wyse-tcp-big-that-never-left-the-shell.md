@@ -1,7 +1,13 @@
 # 29. A `tcp ... big` on the Wyse that never reached net-stack, and the unbounded wait behind it
 
-**Status: the HANG is fixed and the escape is restored. Why net-stack never answered is NOT
-established, and this records both halves so the second is not read as closed by the first.**
+**Status: CLOSED, hardware-verified on a Dell Wyse 2026-09-16.** Three defects, found in this order
+and each hidden by the one in front of it: an unbounded, unescapable wait in the shell; a held request
+expired against a guessed deadline instead of its client's; and - the actual cause - a wait that slept
+on work already sitting in its own stash. ~20 s per command to ~200 ms.
+
+Kept in full because the WRONG turns are the useful part: two readings were confidently wrong and the
+operator's one-keystroke test overturned the first. What moved it each time was an instrument, never
+an argument.
 
 ## What was reported
 
@@ -273,3 +279,37 @@ full stash during a burst, which is a different and bounded case.
   shell's input buffer is fine. Alongside `xhci: probes 0/2172 ok` (every hub probe failing) and `a
   HID report arrived with no interrupt - polling input at the 10ms tick`. Its own investigation.
 - The T630 has still not run this branch at all; the Wyse was booted in its place.
+
+## Closed on hardware (2026-09-16)
+
+```
+13:59:48.285  op 21 reached dispatch (from the queue)   ->  189 ms   big
+13:59:49.820  op 21 reached dispatch (from the stash)   ->  279 ms   hello
+13:59:51.288  op 21 reached dispatch (from the queue)   ->  252 ms   big
+```
+
+The middle line is the evidence that matters: **a request served FROM THE STASH in 279 ms**, the exact
+path that previously aged out its client's full patience and was dropped. Across the run: no
+`(q to quit)`, no drops, no timeouts.
+
+### What each fix was worth, in order
+
+| | |
+|---|---|
+| `NET_TXN_SECS` + `q` | a hang became a bounded, escapable failure. Necessary; not the cause |
+| the patience byte | net-stack stopped discarding a 20 s client's request after 1.5 s. Necessary; not the cause |
+| `if pending.has_work() { continue 'serve; }` | the cause |
+
+### What actually did the work
+
+Not reasoning - reasoning was wrong twice. Each step forward came from an instrument, and each
+instrument was cheap:
+
+- **the arrival receipt** showed the served copy was the RETRY ("from the queue"), not the original;
+- **the slow-pass report** killed the starvation theory by measuring 2 s of block inside a 20 s wait;
+- **un-latching the drop line** named the victim and its patience in one run.
+
+The two "said once" latches deserve their own note: both were added in good faith to stop a flood, and
+between them they hid this bug for three sessions. A latch reports the first occurrence and then
+asserts silence, which is indistinguishable from health. Rate-limiting reports the twentieth. §26.7
+asks for a failure to stay visible, and "visible once, at boot" is not that.
