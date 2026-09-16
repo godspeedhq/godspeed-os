@@ -97,20 +97,82 @@ fix, and it is the same rework `backlog/28` describes for the SNTP dance.
 - `grep -c 'ctx.request_with_reply('` in the shell is now **0**: no unbounded wait is left anywhere
   above the prompt.
 
+## Confirmed on hardware: the escape works (2026-09-16)
+
+The rebuilt image, run on the Wyse at 192.168.4.30:
+
+```
+10:11:21.528  net-stack: tcp 192.168.4.40:7777 ok - 10 byte(s)   <- `hello`, fine
+10:11:26.783    (q to quit)                                      <- `big`, the wait lingers
+10:11:44.244  tcp: aborted                                       <- q, prompt back
+10:13:10.997  tcp 192.168.4.40 7777 big                          <- retried, clean echo this time
+10:13:13.787    (q to quit)
+10:13:28.857  tcp: aborted                                       <- q, prompt back again
+```
+
+Twice, with no reboot. Conventions rule 10 is satisfied on this path now.
+
+**And the console echo is NOT the input.** Attempt 2 echoed as `tcp 192.168,4.40 7777 hello4.40 7777
+hello.4.40 7777 hello` - a comma in the address, the tail repeated three times - and net-stack
+received a clean `192.168.4.40` with a 5 byte `hello`. So the serial echo on this box is corrupted
+independently of what the shell parsed, which is why it supported a wrong reading above. It is a
+separate defect (see the still-open list).
+
 ## Still NOT established: why net-stack never answered
 
-Nothing here explains it. net-stack never logged `tcp ->` and the echo server never saw a `[26]`, so
-net-stack never entered the op-21 arm - but net-stack prints nothing when idle, so its silence is not
-itself evidence of a wedge. Candidates not separated: the request consumed into the displaced-request
-stash and lost, or net-stack blocked inside a nic-driver exchange. Guessing has now been wrong once on
-this; the next step is instrumentation.
+The bug is now reproducible and clean: `tcp 192.168.4.40 7777 big` twice, echoed correctly the second
+time, and **net-stack logged nothing at all** while `hello` seconds earlier worked end to end.
 
-**The fix above makes that diagnosable for the first time.** With the prompt escapable, the operator
-can press `q` and run `events blocked` - which reads in-flight calls live from the kernel - instead of
-power-cycling the evidence away.
+**net-stack is not wedged.** Pinging 192.168.4.30 from the host while the shell was blocked: 4/4
+replies, 28-111 ms. ARP and ICMP are answered only from `poll_step`, so the service was looping
+normally the whole time. It received the request and lost it.
 
-## What is still open
+Eliminated by reading the code, not by flashing:
 
-- Why the Wyse's HID path runs on the 10 ms tick with every hub probe failing (`probes 0/2160 ok`).
-  That is its own investigation and is not this branch's work.
+| candidate | why it is out |
+|---|---|
+| dropped for no reply cap | reports itself; the latch never fired this boot |
+| stash expired (`HOLD_MS`) | reports itself; latch never fired |
+| stash full, or body too large | reports itself; latch never fired |
+| a stray badge sending it down the capability path | would log AND reply; the shell would not still be waiting |
+| op 21 arm entered | its first statement is the `tcp ->` log |
+| the send never left | `offer_request` is eight `try_send`s then gives up, and the `(q to quit)` hint only prints from inside the wait, so the send succeeded |
+
+**One silent path remains, and it is the last one uninstrumented.** In `sifted_req`'s closure, a
+message with no pending reply cap is taken to BE the driver's answer:
+
+```rust
+Some(cap) => { pending.note(ctx, m, badge, cap); false }   // a client: stashed, loud on loss
+None      => true,                                          // "the driver's answer"
+```
+
+A client request whose reply cap has already been consumed is indistinguishable from a driver reply
+there, and taking the second for the first hands it to `nic_req`, which parses it as a frame batch,
+discards it, and says nothing. That is the only remaining way to lose a request with no log, and it
+fits every observation. **It is NOT asserted as the cause** - reasoning has been wrong twice on this
+board already, so it is being measured.
+
+## The instruments added for the next run
+
+1. **An arrival receipt at dispatch**, for ops 21 and 22 only: `net-stack: op 21 reached dispatch
+   (from the queue|stash)`. Those two are typed by hand and answered in one round trip, so one line
+   each is no flood - unlike the status and accept polls, left deliberately silent. It separates "the
+   request never reached dispatch" from "it reached dispatch and the work went wrong", which on this
+   board could not be told apart.
+2. **The silent path made loud**: the capless arm now reports, once, when it takes a message beginning
+   21 or 22 as the driver's answer.
+
+Both are verified to FIRE rather than merely to exist: `op 22 reached dispatch` in
+`tcp_serve_test.py`, `op 21 reached dispatch` twice in `tcp_qemu_test.py`, both suites still PASS.
+
+**What the next Wyse run decides.** If the receipt does NOT print for `big`, the request never reached
+dispatch and the loss is in the closure - and the second instrument should name it. If the receipt
+DOES print, the request arrived and the fault is downstream of it, which is a different and much
+smaller search.
+
+## Also still open
+
+- **The console echo corrupts characters on this box** - duplicated runs, inserted commas - while the
+  shell's input buffer is fine. Alongside `xhci: probes 0/2172 ok` (every hub probe failing) and `a
+  HID report arrived with no interrupt - polling input at the 10ms tick`. Its own investigation.
 - The T630 has still not run this branch at all; the Wyse was booted in its place.

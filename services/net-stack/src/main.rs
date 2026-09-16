@@ -241,8 +241,33 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             // client met during an ordinary `nic_req` was not dropped but CONSUMED, parsed as a link
             // status or a frame batch, and silently mis-served.
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
-            // No reply cap: the driver's answer.
-            None => true,
+            // No reply cap: the driver's answer. **THIS IS THE ONE SILENT WAY A CLIENT REQUEST CAN
+            // BE LOST, AND IT IS THE LAST ONE LEFT UNINSTRUMENTED.** A driver reply carries no reply
+            // cap - and neither does a client request whose cap has already been consumed, so the two
+            // are indistinguishable here. Taking the second for the first hands a client's request to
+            // `nic_req` as if it were a frame batch, which parses it, discards it, and says nothing:
+            // every other loss path in this service (stash full, stash expired, no reply cap at
+            // dispatch) reports itself, and this one does not.
+            //
+            // A client op is a poor proxy for "this is a client" in general, but 21 (tcp transact) and
+            // 22 (tcp listen) are decisive ENOUGH to name the case: a frame batch or a link status
+            // that happens to begin with either is possible, and it is far likelier that this is the
+            // request a shell is currently blocked on. Said once, like its siblings.
+            //
+            // Hunting a Wyse `tcp ... big` that net-stack never logged while it kept answering ping
+            // (backlog/29). Every other candidate was eliminated by reading; this one cannot be, so it
+            // is being measured rather than assumed.
+            None => {
+                if matches!(m.payload_bytes().first(), Some(&21) | Some(&22))
+                    && !pending.ate_client_said
+                {
+                    pending.ate_client_said = true;
+                    ctx.log_fmt(format_args!(
+                        "net-stack: took a capless message beginning {} as the driver's answer - if a                          client is blocked right now, THIS is where its request went (said once)",
+                        m.payload_bytes().first().copied().unwrap_or(0)));
+                }
+                true
+            }
         }
     })
 }
@@ -331,6 +356,9 @@ impl Reply {
 pub struct Displaced {
     n: u32,
     warned: bool,
+    /// Said-once latch for the one SILENT way a client request can be lost - see the `None` arm of
+    /// `sifted_req`'s closure.
+    ate_client_said: bool,
 
     /// Client requests displaced by a conversation with `nic-driver`, kept in arrival order.
     ///
@@ -415,6 +443,7 @@ impl Displaced {
         Displaced {
             n: 0,
             warned: false,
+            ate_client_said: false,
             held: [const { None }; STASH_N],
             head: 0,
             live: 0,
@@ -2654,6 +2683,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // downwards this loop cannot tell the difference - which is what keeps this from needing a
         // second copy of every op.
         let req;
+        // Which door the request came in by. A request served from the stash was displaced by a
+        // driver conversation and is arriving LATE; one from the queue arrived directly. When a
+        // client says it got no answer, that difference is the first thing worth knowing.
+        let mut from_stash = true;
         let (pl_raw, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
             Some((len, badge, reply)) => (&heldbuf[..len], badge, reply),
             None => {
@@ -2771,6 +2804,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         continue;
                     }
                 };
+                from_stash = false;
                 (req.payload_bytes(), badge, reply_cap)
             }
         };
@@ -2798,6 +2832,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None => (pl_raw, Reply { cap: reply_cap, tag: None }),
             },
         };
+        // ARRIVAL RECEIPT for the two ops a person waits on, and ONLY those two.
+        //
+        // `tcp` and `serve`'s listen are typed by hand and answered in one round trip, so one line
+        // each is no flood - unlike the status and accept polls, which run ten times a second and are
+        // deliberately left silent. Its whole job is to separate "the request never reached dispatch"
+        // from "it reached dispatch and the work went wrong", which on a Wyse could not be told apart:
+        // net-stack logged nothing for a `tcp ... big` while it went on answering ping, and every
+        // silent loss path was eliminated by reading except one (backlog/29).
+        if matches!(pl.first(), Some(&21) | Some(&22)) {
+            ctx.log_fmt(format_args!("net-stack: op {} reached dispatch (from the {})",
+                                     pl[0], if from_stash { "stash" } else { "queue" }));
+        }
         // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a
         // dead link), a request that needs the network first checks the NIC link; if it has come up
         // (cable plugged in), re-run the dance IN PLACE so the network self-configures - no `net renew`.
