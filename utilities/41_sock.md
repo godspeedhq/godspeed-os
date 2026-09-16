@@ -1,7 +1,8 @@
 # Utility: `sock` - a UDP socket as a capability
 
 **Utility:** `sock` - open a UDP socket capability and send a datagram through it
-**Status:** Built (first slice). As-built reference.
+**Status:** Built (first slice). As-built reference. Hardware-verified on the Raspberry Pi 2
+(2026-09-15): the mint, the grant and the badged invocation all complete on real hardware.
 **Shape:** shell built-in that opens a socket cap from `net-stack` and invokes it.
 
 ---
@@ -38,6 +39,24 @@ sock: UDP socket cap - sent 29 bytes to 10.0.2.3:53, received 45 bytes back (a r
 The datagram is a small DNS query (just data that elicits a UDP response); `sock` reports the
 round-trip - bytes out and back - which proves the cap does real UDP I/O. When there is no NIC, the
 invocation returns nothing and `sock` says so plainly.
+
+**The destination is hardcoded to `10.0.2.3:53`, which is a QEMU address, so on real hardware this
+reports 0 bytes back.** Measured on the Pi 2:
+
+```
+sock: UDP socket cap - sent 29 bytes to 10.0.2.3:53, received 0 bytes back (a round-trip through a capability)
+```
+
+That is the *capability* path working exactly as designed - minted, granted, invoked, badged, routed,
+answered - with the datagram sent to a host that does not exist on that LAN. `10.0.2.3` is the DNS
+server QEMU's user-mode network provides, and nothing else. The fix is for the demo to use the DNS
+server from the DHCP lease (`net` reports it) rather than a constant, and it is recorded here rather
+than left for the next person to diagnose from a zero.
+
+**The socket path is deliberately UNTAGGED.** Every other net-stack request carries a correlation
+byte at offset 0 (`docs/net-tags-design.md` §8); a badged socket invocation does not, because the
+badge already names the socket and there is nothing for the client to disambiguate. `fs` makes the
+identical exception for file capabilities.
 
 ## 4. Pipe behaviour
 
@@ -77,3 +96,7 @@ the generation). This first slice exercises the mint + invoke + send; the forged
 Conforms to `0_conventions.md`: `sock version` / `sock help`, words-not-flags, raw facts. Pinned by
 `osdev test shell` (open + invoke a socket capability, and `net`'s tab-completion adjusted for the new
 `so`-prefixed verb).
+
+**Rule 10: opening the socket is `q`-escapable.** It goes through the shell's net-stack transaction
+helper, which polls `q` while it waits, advertises `(q to quit)` once the wait lingers, and gives up
+after 20 seconds. It used to block in the syscall with no way out (`backlog/29`).

@@ -477,3 +477,11 @@ service-to-service with the kernel uninvolved.
 4. **`FOR` (blocked duration)** needs a per-task blocked-since stamp. One `u64` per task, written on
    block and cleared on wake - two stores on a path that already does several. Acceptable, or is the
    duration column not worth it?
+
+## The instrument must not hang on what it measures
+
+Every ask to `events` is bounded at 5 seconds and escapable with `q`, advertising `(q to quit)` once
+the wait lingers. That matters more here than for an ordinary command: `events blocked` is what you
+reach for WHEN something is wedged, so an instrument that can itself wedge takes the prompt with it
+and leaves you with a power button. It used to use a bare `request_with_reply`, which parks the shell
+inside the syscall where it cannot read the keyboard (`backlog/29`, conventions rule 10).

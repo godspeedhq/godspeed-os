@@ -81,6 +81,17 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     file-reading filters `match`/`count`/`sort`) use the delayed-hint variant `fs_request_q` (SDK
     `request_with_reply_qhint`): silent on a fast reply, it advertises `(q to quit)` only once the wait
     lingers past ~2s - the just-in-time form of the advertisement above, so a snappy op stays quiet.
+
+    **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
+    absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
+    `sock` and `serve`'s listen all go through - used a bare `request_with_reply`, which parks the
+    shell INSIDE the syscall where it cannot poll the console. On a Dell Wyse a `tcp` that net-stack
+    never answered froze the prompt: no echo, no `q`, and the machine had to be power-cycled. **A
+    deadline was not the fix and adding one first was not enough** - it made the freeze 20 seconds
+    instead of forever, and 20 seconds of a dead prompt is still a dead prompt. Only polling `q` while
+    waiting returns the machine to its operator. The `events` channel (`trace_ask`) had the same shape
+    and was worse for it, since `events blocked` is the instrument you reach for WHEN something is
+    wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
 11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
     escape must abort the actual WORK the utility set in motion - not merely stop the shell from
     *waiting* on it. If the utility handed a long job to a peer service and the escape only stops

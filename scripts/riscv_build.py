@@ -168,6 +168,21 @@ def main():
         print("         supervisor rather than the real one. Check kernel/build.rs `riscv64_built`.")
 
     if not board:
+        # WITHOUT `--visionfive` THIS LEAVES THE DEPLOYABLE IMAGE UNTOUCHED, and the deploy script
+        # writes THAT file, not the ELF built above. So a plain `--release` build followed by
+        # `deploy_visionfive.ps1` flashes whatever was built last time - the stale-image trap, one
+        # layer further out than the one `osdev build` already has a note about.
+        #
+        # Nearly cost a wasted flash and a false hardware result on 2026-09-16: the stale copy was a
+        # day old and BYTE-IDENTICAL IN SIZE to the fresh one, so a size check would have called it
+        # unchanged. Only the timestamp gave it away, which is why this compares timestamps.
+        flat = os.path.join(ROOT, "build", "godspeed-riscv64-visionfive.img")
+        if os.path.exists(flat) and os.path.getmtime(flat) < os.path.getmtime(elf):
+            print("")
+            print("WARNING: build/godspeed-riscv64-visionfive.img is OLDER than the kernel just built.")
+            print("         That file is what scripts/deploy_visionfive.ps1 writes to the card, so")
+            print("         deploying now would flash the PREVIOUS kernel and test the wrong code.")
+            print("         Re-run with --visionfive to regenerate it.")
         print("Boot in QEMU:  py scripts/riscv_run.py%s" % (" --release" if rel else ""))
         return
 

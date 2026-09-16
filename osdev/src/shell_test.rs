@@ -204,6 +204,20 @@ pub fn run(image_path: &Path, smp: u32) {
             // end to end by net-stack's ARP resolution below.
             check!(nicseen.contains("nic-driver: serving the frame interface"),
                    "phase1 step5: nic-driver serves the frame interface (mechanism, not protocol)");
+            // THE TCP SELF-TEST, asserted here because nothing else can assert it.
+            //
+            // Congestion control, fast retransmit and the persist timer react to loss, reordering and
+            // a shut window - none of which the QEMU user-mode backend ever produces. So those paths
+            // are proven against a synthesised peer at net-stack startup instead, and this is what
+            // stops that proof from quietly disappearing: a regression that broke the self-test, or
+            // one that removed it, would otherwise leave a green suite behind.
+            let tcpboot = collect_until(&buf, &mut cursor, b"net-stack: tcp selftest",
+                                        Duration::from_secs(20)).unwrap_or_default();
+            let tcpseen = format!("{nicseen}{tcpboot}");
+            check!(tcpseen.contains("net-stack: tcp selftest PASS"),
+                   "tcp: the startup self-test passed (congestion control, fast retransmit, persist, MSS)");
+            check!(!tcpseen.contains("tcp selftest: FAIL"),
+                   "tcp: no individual self-test check reported a failure");
         }
         None => {
             // Print what we did receive to help diagnose failures.

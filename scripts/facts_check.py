@@ -202,6 +202,17 @@ def facts():
             out.append(("syscall %s" % nm, v, "kernel/src/syscall/dispatch.rs enum",
                         [r"syscall\s+([0-9]+)\s*[-(]?\s*%s" % nm, r"%s\s*\(syscall\s+([0-9]+)\)" % nm]))
 
+    # The TCP connection table. Added 2026-09-15 because this one had ALREADY drifted: `MAX_CONNS`
+    # was cut from 4 to 2 when net-stack's `service_main` frame reached 37% of the arm32 user stack,
+    # and `utilities/48_tcp.md` went on saying "at most four connections exist at once" until a
+    # reader happened to check it against the source. A number a doc restates is exactly what this
+    # script is for, so it is pinned rather than merely corrected.
+    mc = const("services/net-stack/src/tcp.rs", "MAX_CONNS")
+    if mc:
+        out.append(("TCP connection table", mc, "services/net-stack/src/tcp.rs MAX_CONNS",
+                    [r"at most \*{0,2}([0-9]+) connections",
+                     r"([0-9]+) simultaneous TCP connections"]))
+
     n_util = count_files("utilities", "[0-9]*.md")
     out.append(("utility specs", n_util, "utilities/*.md on disk",
                 [r"([0-9]+) utility specs", r"([0-9]+) utilities\b"]))
