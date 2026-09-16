@@ -6432,14 +6432,14 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
         if st.len() >= 4 && st[..4] != [0, 0, 0, 0] {
             out.line_fmt(ctx, format_args!(
-                "listening on {}.{}.{}.{}:{} - waiting for one connection (q aborts)",
+                "listening on {}.{}.{}.{}:{} - answering connections until you press q",
                 st[0], st[1], st[2], st[3], port));
             shown = true;
         }
     }
     if !shown {
         out.line_fmt(ctx, format_args!(
-            "listening on port {} - waiting for one connection (q aborts)", port));
+            "listening on port {} - answering connections until you press q", port));
     }
 
     // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.

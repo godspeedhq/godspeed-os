@@ -1,4 +1,4 @@
-# Utility: `serve` - accept one TCP connection
+# Utility: `serve` - answer TCP connections until you quit
 
 **Status:** Built. Verified end to end in QEMU (`scripts/tcp_serve_test.py`), checked on both sides -
 the guest's own report and the bytes the test machine received over a socket outside the guest. That
@@ -52,7 +52,7 @@ its own (§26.2).
 
 ```
 gsh> serve 8080
-listening on 192.168.4.37:8080 - waiting for one connection (q aborts)
+listening on 192.168.4.37:8080 - answering connections until you press q
 still listening - 10s (q aborts)
 accepted a connection
 received 11 byte(s): knock knock

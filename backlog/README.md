@@ -69,6 +69,11 @@ direction.
 | [24](24-adversarial-faults-run-on-one-port.md) | The 22 A14/C2 ring-3 fault tests run only on x86-64 under QEMU; the arm and aarch64 fault primitives exist but no build reaches them, and riscv64 has none | Recorded (26.7) | - |
 | [25](25-pci-selector-layout-is-packed-above-the-kernel.md) | `hw-enumerator` packs a host-bridge config selector that each arch then unpacks - addressing is mechanism and belongs in `arch/` | Recorded (26.7) | - |
 | [26](26-visionfive-uboot-cannot-load-large-files.md) | VisionFive would not boot: `extlinux.conf` was CRLF, so U-Boot read the trailing CR as part of every FILENAME - **CLOSED**, and now enforced by `line_ending_check.py` | Closed | - |
+| [27](27-silent-clock-fallback.md) | `duration_cycles` floors to one quantum on an uncalibrated counter, so a bounded wait silently becomes a spin | Recorded (26.7) | - |
+| [28](28-listener-release-is-the-client-s-job.md) | A listener's port is released by the CLIENT and sometimes is not; and the in-loop dance blocks `net-stack` - **MEASURED**: 1.5 to 4 s configured, 22 to 79 s with no link | Recorded (26.7) | - |
+| [29](29-the-wyse-tcp-big-that-never-left-the-shell.md) | A `tcp` that took ~20 s to start: three defects, each hiding the one behind it - **CLOSED**, hardware-verified on five boards | Closed | - |
+| [30](30-chaos-flood-storm-xhci-flakes-under-host-load.md) | `chaos: flood-storm xhci` fails intermittently in `osdev test shell` and passes on a re-run - dismissed as host load twice, so recorded | Open / not diagnosed | - |
+| [31](31-net-stack-blocked-48s-on-a-live-nic-driver.md) | `net-stack` blocked 48 s on a `nic-driver` that was ALIVE - **cause CONFIRMED**: the reply stream runs ~28 requests behind. A correlation tag proved it and was reverted (refusing is not recovering) | Open / cause known | `backlog/28` |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.

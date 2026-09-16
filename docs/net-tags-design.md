@@ -212,7 +212,9 @@ surface.
 - It cannot support net-stack doing background work while a client is active (§4), because a client
   request met during a driver await is dropped rather than stashed. That is phase 3 and it needs the
   stash to be owned by the serve loop, which means threading it through the sixteen `nic_req` call
-  sites - the reason it is not done here.
+  sites - the reason it is not done here. **(Superseded: phase 3 was later built, withdrawn, and
+  built again once the client hop carried a tag - see §7.2 and §7.4. A displaced request is STASHED
+  today, not dropped.)**
 
 So §4's list is still blocked, and the phases below are still the plan. This is a narrowing of the bug,
 not its removal.
@@ -258,7 +260,8 @@ That is closed. The SDK grew `request_with_reply_deadline_sifted` (and a millise
 wait that asks the caller about each message as it arrives instead of believing the first one. Every
 conversation with `nic-driver` goes through it. A displaced client request is now **identified**, and
 dropped with its capability reclaimed and counted - phase-2 behaviour, which this document explicitly
-sanctions ("ship it here if phase 3 has to wait").
+sanctions ("ship it here if phase 3 has to wait"). **(Superseded by §7.4: once the client hop carried
+a tag, phase 3 came back and the request is STASHED rather than dropped.)**
 
 **The discriminator is the one §6 already found**: a client request carries a reply capability, a
 driver reply does not. So none of this needed the wire tag, and the forty-edit-point change this

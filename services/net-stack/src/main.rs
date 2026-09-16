@@ -215,31 +215,25 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
         // to be attributed to whatever arrives next.
         let badge = ctx.last_recv_badge();
         match ctx.take_pending_cap() {
-            // A CLIENT. Drop it, with its capability reclaimed so the table slot does not leak
-            // (§8.5), and tell the wait this is not what it asked for.
+            // A CLIENT, met mid-question to the driver. KEEP IT - stash the request with its reply
+            // capability - and tell this wait that it is not the answer it asked for.
             //
-            // Dropped rather than kept, and that is a MEASURED decision rather than a shortcut.
-            // Keeping it - phase 3 of `docs/net-tags-design.md` - was built first and taken out
-            // again, because a request answered LATE is worse than one never answered: a client that
-            // gives up RE-SENDS, so the late answer is a second reply to a question already asked
-            // again, and the client reads it as the answer to its NEXT request. Every exchange
-            // afterwards is permanently one behind. The shell log showed exactly that - a DNS lookup
-            // displaced twice, answered twice, and a `net` status two commands later answered with a
-            // hostname.
+            // **This is phase 3 of `docs/net-tags-design.md`, and it is only safe because the CLIENT
+            // HOP CARRIES A TAG.** Phase 3 was built once WITHOUT one, measured, and withdrawn the
+            // same day (§7.2 there, with the log): answering late corrupted the channel, because a
+            // client that gives up RE-SENDS, so the late answer arrived as a second reply to a
+            // question already asked again and was read as the answer to the NEXT one. A DNS lookup
+            // was displaced twice, served twice, and a `net` status two commands later answered with
+            // a hostname.
             //
-            // A hold bound does not close it either. The hold can be short and the SERVE still long:
-            // take a displaced lookup after 400 ms, spend three seconds resolving it, and the reply
-            // lands after the client's deadline anyway. What actually closes it is correlation on the
-            // CLIENT hop - a tag the client can use to recognise an answer to a question it is no
-            // longer asking, which is what `fs` carries and what this hop does not. That is the real
-            // prerequisite for phase 3, and it is recorded rather than half-built (§26.7).
+            // The tag closes exactly that: a re-send carries a fresh tag, so a late answer to the
+            // abandoned question is recognised and discarded by the client instead of being believed.
+            // With it, keeping the request is strictly better than dropping it - the work is not lost
+            // and the client is answered rather than made to time out and ask again.
             //
-            // So the behaviour here is phase 2, which the design note explicitly sanctions ("ship it
-            // here if phase 3 has to wait"): the client times out and retries, exactly one request is
-            // ever outstanding, and the outcome is defined, loud and recoverable. What is NEW is that
-            // it now happens on EVERY driver conversation instead of one of them - before this, a
-            // client met during an ordinary `nic_req` was not dropped but CONSUMED, parsed as a link
-            // status or a frame batch, and silently mis-served.
+            // `Displaced::take` at the top of the serve loop is the ONLY thing that drains this, so
+            // the wait below must not sleep while it holds one - see its `has_work` call site, which
+            // is the bug `backlog/29` was.
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             // No reply cap: the driver's answer. **THIS IS THE ONE SILENT WAY A CLIENT REQUEST CAN
             // BE LOST, AND IT IS THE LAST ONE LEFT UNINSTRUMENTED.** A driver reply carries no reply
@@ -352,7 +346,8 @@ impl Reply {
 ///
 /// Threaded by `&mut` through everything that talks to the driver rather than kept in a static,
 /// because a service holds no unowned global mutable state (Commandment VI). That threading is most
-/// of this change, and it is the same `&mut` phase 3 will need when it arrives.
+/// of this change, and it is what let phase 3 arrive: the stash below IS phase 3, and it needed
+/// exactly this `&mut` to be owned by the serve loop rather than by a driver conversation.
 pub struct Displaced {
     /// Every client request this service has thrown away, for any reason. Drops are reported by RATE
     /// off this count rather than by a said-once latch - see `take`.
@@ -414,24 +409,24 @@ const STASH_N: usize = 4;
 /// fit is dropped rather than truncated - a request half-kept would be served as a DIFFERENT request.
 const HELD_BYTES: usize = 1024;
 
-/// How long a held request may wait before it is dropped instead of answered.
+/// The DEFAULT hold for a request that does not say how long its client will wait.
 ///
-/// **The bound is set by LATENCY, not by correctness, and getting that backwards is a measured
-/// mistake rather than a hypothetical one.** Before the client hop carried a tag, answering late
-/// corrupted the channel and this was the only thing preventing a permanent desync. The tag removed
-/// that: a late reply now carries a tag the client is not waiting for and is discarded.
+/// **This used to be the bound for every held request, and that is no longer what it is.** A tagged
+/// request carries the client's own patience in byte 1 and is held for that (`Displaced::note`); this
+/// constant now applies only to a BADGED invocation, which carries no header because a capability
+/// invocation names its resource and needs no correlation.
 ///
-/// So the first version of this constant after the tag was widened to 3 s - the shortest client
-/// deadline - on the reasoning that anything inside it was safe. It IS safe, and it is slower. A
-/// request held for 2.9 s is still served, by which time the client has given up at 3.0 s and
-/// re-sent; net-stack then does the work TWICE and the duplicate delays the copy that is actually
-/// wanted. The shell suite went from zero `net-stack unavailable` to one, with the same 174/0 either
-/// way - a regression only the before/after comparison showed.
+/// The history is kept because it is the reasoning that was wrong, not merely old. The bound was
+/// first set well under "the shortest client deadline" - 3 s at the time - so that a held request was
+/// either served promptly or abandoned early enough that only the re-send was served. That was
+/// correct arithmetic against one deadline and became a defect the moment different clients had
+/// different ones: the transaction path waits 20 s, so a fixed 1.5 s threw away requests whose client
+/// would have waited eighteen seconds more (`backlog/29`, measured at 19.67 s and 19.99 s to dispatch
+/// on a Dell Wyse, with the re-send answered in milliseconds). A constant cannot know a client's
+/// deadline, so it stopped guessing and the client now says.
 ///
-/// The bound must therefore be well UNDER the shortest client deadline, not equal to it, so that a
-/// held request is either served promptly (which is the whole point) or abandoned early enough that
-/// only the re-send is served. Half a second against a three-second deadline leaves the client five
-/// times the hold to still be waiting.
+/// 1500 ms remains a sensible default for the badged case: a capability invocation is a single round
+/// trip against a client that is actively holding the capability, not a long transaction.
 ///
 /// On a board whose cycle counter is not calibrated, `duration_cycles` floors to one quantum
 /// (`backlog/27`), so the budget collapses and every held request expires at once - the stack then
