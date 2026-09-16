@@ -41,7 +41,7 @@ Three attack surfaces, all driven from QEMU:
 Driven from the shell over serial, so it exercises exactly the path a user reaches:
 
 | case | what it probes |
-|---|---|
+| --- | --- |
 | a component longer than `NAME_MAX` (38), and exactly 38 | the four separate length checks agreeing |
 | a path longer than the `plen` byte can describe (255+) | truncation being refused, not silently clamped |
 | an empty path, and `/` itself | the root's `loc.is_none()` guards |
@@ -140,8 +140,8 @@ the floor. Format bump is reformat-only, in the house pattern of 0005 -> 0008.
 
 Timestamps exist to be seen. `ls` today lists names; this makes it a tool.
 
-| | |
-|---|---|
+| command | what it shows |
+| --- | --- |
 | `ls` | names, as now - the default stays terse |
 | `ls long` | type, size, mtime, one entry per line |
 | `ls all` | include entries the terse form elides |
@@ -179,7 +179,7 @@ Recorded so it is not rediscovered as an omission (§26.7):
 ## 6. How each phase is verified, all in QEMU
 
 | phase | suite |
-|---|---|
+| --- | --- |
 | M - adversarial | `osdev test fs-fuzz` (new), plus no regression across the eleven existing fs suites |
 | N - rights | `osdev test file-cap` extended |
 | O - timestamps | `osdev test fs-time` (new): stamp, survive a reboot, survive a restart, migrate a 0008 volume |
