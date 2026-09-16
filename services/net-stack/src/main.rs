@@ -1401,6 +1401,17 @@ const POLL_TX_MS: u64 = 200;
 /// request it is keeping waiting.
 const POLL_BUDGET_MS: u64 = 250;
 
+/// A serve pass slower than this is REPORTED. It is not a bound and nothing is aborted - it is the
+/// instrument that separates "this loop was starved" from "this loop was running and the message was
+/// not delivered", which no existing line could distinguish.
+///
+/// One second, because a healthy pass is `POLL_MS` (100) plus at most `POLL_BUDGET_MS` (250), so a
+/// second is four times the worst legitimate pass and cannot fire on an ordinary busy moment. A
+/// `nic_req` waiting out its full `LINK_SECS` is exactly the kind of pass worth hearing about.
+const SLOW_PASS_MS: u64 = 1_000;
+const _: () = assert!(SLOW_PASS_MS > POLL_MS + POLL_BUDGET_MS,
+    "a healthy pass must not trip the slow-pass report, or the report is noise");
+
 // ── The three budgets, and the order they MUST be in ───────────────────────────────────────────
 //
 // **These collided, and hardware paid for it twice.** `HOLD_MS` (how long a displaced client
@@ -2542,6 +2553,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     /// When the last poll step ran. The poll is owed every `POLL_MS`, and this is what makes that a
     /// schedule rather than a hope - see the loop below.
     let mut last_poll: u64 = 0;
+    // When this service last reached the top of its wait. See `SLOW_PASS_MS`.
+    let mut last_pass: u64 = 0;
+    let mut slow_passes: u32 = 0;
     // OUTSIDE the loop deliberately: inside, it is a kilobyte of zeroing on every single request, to
     // hold something that is normally not there.
     let mut heldbuf = [0u8; HELD_BYTES];
@@ -2703,6 +2717,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // `nic-driver` and, behind it, the USB stack. That is the silent-clock trap the
                 // backlog item is about, and the honest response to a missing clock is to not use it.
                 req = loop {
+                    // ---- IS THIS SERVICE ACTUALLY LOOPING? ----
+                    //
+                    // A request that sits in the endpoint queue for seconds has exactly two
+                    // explanations, and they are different bugs with different fixes: this loop is
+                    // STARVED (blocked inside a driver conversation or a long op, so it never asks
+                    // for the message), or this loop is RUNNING and the message was not delivered to
+                    // it. Nothing in the log could tell them apart - the service is silent when
+                    // healthy, and silence is also what a stall looks like.
+                    //
+                    // So: measure the gap between consecutive arrivals HERE. It covers both halves,
+                    // because `last_pass` is not updated while a request is being served either - a
+                    // slow dispatch shows up as the next pass being late.
+                    //
+                    // Measured on a Dell Wyse, where the SAME command took 0.49 s, 4.8 s and 20 s to
+                    // reach dispatch on one boot (backlog/29). Reported rather than counted silently,
+                    // and only when it is genuinely slow, so a healthy service still prints nothing.
+                    let now_pass = ctx.read_tsc();
+                    if last_pass != 0 {
+                        let gap = now_pass.wrapping_sub(last_pass);
+                        if gap >= ctx.duration_cycles(SLOW_PASS_MS) {
+                            slow_passes = slow_passes.saturating_add(1);
+                            ctx.log_fmt(format_args!(
+                                "net-stack: a serve pass took {} ms (over {}) - not asking for client requests during it (slow pass #{})",
+                                gap / ctx.duration_cycles(1).max(1), SLOW_PASS_MS, slow_passes));
+                        }
+                    }
+                    last_pass = now_pass;
                     if !gw_known || !tcpst.have_clock() { break ctx.recv(); }
                     // ---- THE POLL IS A PERIODIC OBLIGATION, NOT AN IDLE-TIME FILLER ----
                     //

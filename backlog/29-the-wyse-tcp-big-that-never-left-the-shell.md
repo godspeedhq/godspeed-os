@@ -170,6 +170,70 @@ dispatch and the loss is in the closure - and the second instrument should name 
 DOES print, the request arrived and the fault is downstream of it, which is a different and much
 smaller search.
 
+## RESOLVED: `big` was never the problem. net-stack is slow to PICK UP a request (2026-09-16)
+
+The arrival receipt settled it in one run:
+
+```
+12:36:08.8    shell sends the request       (inferred from the 2 s hint at :10.770)
+12:36:10.770    (q to quit)
+              ... 18 seconds of silence, from every service ...
+12:36:28.798  net-stack: op 21 reached dispatch (from the queue)
+12:36:29.077  net-stack: tcp 192.168.4.40:7777 ok - 2884 byte(s)
+```
+
+**The transaction takes 279 ms and returns all 2884 bytes correctly, multi-segment (`SADAAF`).** The
+protocol is fine. The request sat in the endpoint queue for 20 seconds before net-stack dequeued it.
+
+`hello` has the same disease, milder: Enter at `12:36:00.335`, dispatch at `12:36:05.142` - 4.8 s for a
+command that then completes in 142 ms. So it is not about `big`; `big` is the one whose delay crossed
+a person's patience. Enter-to-dispatch on one boot:
+
+| when | delay | context |
+|---|---|---|
+| `12:36:00.335` (`hello`) | 4.8 s | 5 s after the SNTP exchange |
+| `12:36:08.8` (`big`) | ~20 s | 8 s after the previous transaction |
+| `12:40:38.792` (`big`) | 0.49 s | after 4 minutes idle |
+
+**It is not a warm-up.** A later command was the slowest and a much later one the fastest. What
+correlates is RECENT NETWORK ACTIVITY.
+
+Two earlier "hangs" are explained too: `q` was pressed 19.4 s and 17.1 s after the send, both just
+short of the delay. They would have returned.
+
+## And it is `backlog/28`, reproduced in QEMU
+
+The slow-pass detector added here fires **9 times in one `osdev test shell` run**, so this is not
+Wyse-specific and needs no board to chase. Every one of them follows a long in-loop operation:
+
+```
+gsh> ping count 3 10.0.2.2        <- a ping sequence, ~900 ms per window
+net-stack: DHCP - ACK ...          <- the dance
+net-stack: SNTP - querying ...     <- the SNTP exchange
+```
+
+net-stack is single-threaded and runs the dance, SNTP and a ping sequence INSIDE its serve loop. While
+one runs it does not ask for client requests, so a request arriving during it waits for the whole
+thing. That is exactly the limitation `backlog/28` records and `docs/tcp-design.md` already states
+about this service - **the fix is making the dance incremental, a state-machine rework rather than a
+constant.** This entry adds the measurement that makes the cost visible per occurrence; it does not
+change the fix.
+
+**Confirmed by chaos on hardware.** After `chaos 100 rounds` the operator reported `big` slow again -
+as predicted here before the run: chaos restarts net-stack repeatedly, every restart re-runs the
+DHCP + ARP + SNTP dance, and the dance is precisely what blocks the loop.
+
+## The instrument that settled it, and the one added after
+
+1. **Arrival receipt at dispatch**, ops 21 and 22 only: `net-stack: op 21 reached dispatch (from the
+   queue|stash)`. Separated "never reached dispatch" from "reached dispatch and the work went wrong".
+   Answer: it reaches dispatch, very late, from the QUEUE (so it was not stashed, and the shell never
+   retried - there is no `discarded` line, so the whole wait was one tag).
+2. **Slow-pass report**: a serve pass over `SLOW_PASS_MS` (1 s) says how long it took. A healthy pass
+   is `POLL_MS` + `POLL_BUDGET_MS` = 350 ms, so the threshold is four times the worst legitimate pass
+   and a compile-time assertion keeps it that way. This is what makes the starvation self-reporting on
+   any board instead of a mystery per platform.
+
 ## Also still open
 
 - **The console echo corrupts characters on this box** - duplicated runs, inserted commas - while the
