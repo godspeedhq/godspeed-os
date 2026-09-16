@@ -182,11 +182,17 @@ not. Re-run on the two x86 boards after the fix:
 | Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | n/a, no disk |
 | HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
 | StarFive VisionFive 2 Lite | 204 / 78 / 174 / 205 ms (4 runs) | under 20 ms | **ran 461, failed 0** |
+| Raspberry Pi 4 | **31 / 47 / 32 ms** (3 runs) | under 40 ms | **ran 461, failed 0** |
 
-The two boards with a real disk report **the same 461 checks and the same 0 failures on two different
-instruction sets** - x86-64 on AMD, and riscv64 - with `drives check` and `drives scrub` both green on
-each. That is the portability claim in its strongest available form: not "it builds everywhere" but
-one suite, one count, one result, across ISAs that share no arch code.
+The three boards with a real disk report **the same 461 checks and the same 0 failures on three
+different instruction sets** - x86-64 on AMD, riscv64, and AArch64 - with `drives check` and `drives
+scrub` green on each. That is the portability claim in its strongest available form: not "it builds
+everywhere" but one suite, one count, one result, across ISAs that share no arch code.
+
+The Pi 4 is the fastest in the fleet by a wide margin - a 2884-byte transfer in 31 ms against 159 ms
+on the T630 and 78 to 205 ms on the VisionFive - which is the GENET MAC being on-SoC rather than
+behind USB or PCIe. Its slow passes (1584 to 4001 ms) sit in the same band as every other configured
+board, which is the point: the blocking dance is architecture-neutral because `net-stack` is.
 
 The T630 is the useful one here, for three reasons: it is AMD, so every timing bound in this service
 calibrates through a different path; it has a real AHCI disk, so `check` and `scrub` run for real (461
