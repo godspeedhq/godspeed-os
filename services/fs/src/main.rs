@@ -425,6 +425,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // block-driver requests carry a correlation tag at byte 0 (`treq[0] = tag`), opcode at byte 1.
     ctx.trace_op_at("block-driver", 1);
     ctx.log("fs: starting");
+    guard_selftest(&ctx);
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
     // None only while block-driver is not answering yet - still registering, or our cached cap went
@@ -3403,6 +3404,28 @@ impl Fs {
     fn move_path(&mut self, ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, src).ok_or("source not found")?;
         if e.loc.is_none() { return Err("cannot move root"); }
+        // ---- THE TREE MUST STAY A TREE, AND THIS SERVICE IS WHAT ENFORCES THAT ----
+        //
+        // Moving a directory INTO ITSELF or into its own descendant would write an entry inside the
+        // subtree pointing at the subtree, then unlink the subtree from its parent: a cycle, no
+        // longer reachable from the root.
+        //
+        // The damage that does is not a tidy error. `drives check` rebuilds the free bitmap BY
+        // WALKING THE TREE (docs/persistence.md 6.11, Phase G), so blocks that are still occupied
+        // but no longer reachable are marked FREE and handed to the next allocation, which
+        // overwrites live data. `MAX_TREE_DEPTH` keeps a walk from hanging on such a cycle, so it
+        // would present as a leak that becomes corruption rather than as a wedge.
+        //
+        // **The shell already refuses this, and that is not a substitute.** `cmd_move` guards both
+        // cases before it ever sends the request, and it stays - catching it at the prompt gives a
+        // better message than a service error. But a check in the CALLER is a convention and a check
+        // in the OWNER is an enforcement: this service owns the tree, and owns the bitmap rebuild
+        // that depends on the tree being acyclic. Leaving the invariant to a client means the next
+        // client - a script, another service, a refactor of this one - inherits an obligation it was
+        // never told about, which is authority and enforcement in different places (invariant 1).
+        if path_is_ancestor(src, dst) {
+            return Err("cannot move a directory into itself or its own subtree");
+        }
         let (mut dparent, dname) = self.walk_parent(ctx, dst).ok_or("dest path not found")?;
         if dparent.itype != ITYPE_DIR { return Err("dest not a directory"); }
         if !valid_name(dname) { return Err("bad dest name"); }
@@ -3425,6 +3448,72 @@ impl Fs {
 // ── helpers ──────────────────────────────────────────────────────────────────
 fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty())
+}
+
+/// Prove the path guards on EVERY boot, on every board, before a disk is touched.
+///
+/// Both functions are pure and the whole suite is a few dozen byte comparisons, so this costs
+/// nothing and runs unconditionally rather than behind `--features selftest`. That is the point:
+/// `path_is_ancestor` is what keeps the directory tree a TREE, and a guard nobody has watched run
+/// is not evidence that it works. The same argument `tcp::selftest` is built on.
+///
+/// `#[inline(never)]`: its arrays are a frame this service does not otherwise carry.
+#[inline(never)]
+fn guard_selftest(ctx: &ServiceContext) {
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    let mut check = |ok: bool, what: &str, p: &mut u32, f: &mut u32| {
+        if ok { *p += 1; } else { *f += 1; ctx.log_fmt(format_args!("fs selftest: FAIL - {}", what)); }
+    };
+
+    // ---- path_is_ancestor: the cases that must be REFUSED ----
+    check(path_is_ancestor(b"/a", b"/a"), "a path is its own ancestor (move onto itself)", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/a", b"/a/b"), "a child is beneath its parent", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/a", b"/a/b/c/d"), "a deep descendant is still beneath it", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/", b"/anything"), "everything is beneath the root", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/", b"/"), "the root is its own ancestor", &mut pass, &mut fail);
+
+    // ---- and the cases that must be ALLOWED, which is where a sloppy prefix test fails ----
+    check(!path_is_ancestor(b"/a", b"/ab"), "a SIBLING sharing a prefix is not a descendant (/ab under /a)",
+          &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/a", b"/abc/d"), "nor is a deeper path under that sibling", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/a/b", b"/a"), "a parent is not beneath its own child", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/a/b", b"/a/c"), "two siblings are unrelated", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/abc", b"/ab"), "a shorter path is never beneath a longer one", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/x", b"/y/x"), "sharing a LAST component is not being beneath it", &mut pass, &mut fail);
+
+    // ---- valid_name: the limits, at both edges ----
+    check(valid_name(b"a"), "a one-character name is valid", &mut pass, &mut fail);
+    check(!valid_name(b""), "an empty name is refused", &mut pass, &mut fail);
+    check(!valid_name(b"a/b"), "a name containing a separator is refused", &mut pass, &mut fail);
+    let at_max = [b'n'; NAME_MAX];
+    let over_max = [b'n'; NAME_MAX + 1];
+    check(valid_name(&at_max), "a name of exactly NAME_MAX is valid", &mut pass, &mut fail);
+    check(!valid_name(&over_max), "a name one byte over NAME_MAX is refused", &mut pass, &mut fail);
+
+    if fail == 0 {
+        ctx.log_fmt(format_args!("fs: path guard selftest PASS - {} checks", pass));
+    } else {
+        ctx.log_fmt(format_args!("fs: path guard selftest FAILED - {} of {} checks", fail, pass + fail));
+    }
+}
+
+/// Does `dst` name `src` itself, or something beneath it?
+///
+/// Pure, so it is exhaustively testable without a disk - which is why the guard is expressed this
+/// way rather than as a walk up the tree. Both paths arrive already absolute and normalised by the
+/// caller; this compares them as byte strings.
+///
+/// The `/` test is what stops `/ab` reading as a child of `/a`: a descendant's path is the
+/// ancestor's path followed by a SEPARATOR, never by more name.
+fn path_is_ancestor(src: &[u8], dst: &[u8]) -> bool {
+    if dst.len() < src.len() { return false; }
+    if dst[..src.len()] != *src { return false; }
+    // Same path: moving a thing onto itself.
+    if dst.len() == src.len() { return true; }
+    // `src` is the root ("/"), so everything is beneath it and the separator is already counted.
+    if src == b"/" { return true; }
+    dst[src.len()] == b'/'
 }
 
 fn valid_name(name: &[u8]) -> bool {

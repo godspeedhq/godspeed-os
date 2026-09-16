@@ -813,6 +813,26 @@ rename /sc/d1 dd1
 assert ok read /sc/dd1/f.txt
 assert fails read /sc/d1/f.txt
 
+# A directory may not be moved INTO ITSELF or into its own subtree. Either would unlink the
+# subtree from its parent while an entry inside it still points at it - a cycle, unreachable
+# from the root. `drives check` rebuilds the free bitmap by WALKING the tree, so those blocks
+# would be marked free and handed to the next allocation: a leak that becomes data loss.
+#
+# Guarded twice on purpose, and both are asserted here because they fail differently. The shell
+# refuses it before sending (a better message, at the prompt). `fs` refuses it too, because a
+# check in the caller is a convention and only a check in the OWNER is an enforcement - the tree
+# and the bitmap rebuild that depends on it both belong to `fs`.
+assert fails move /sc/dd1 /sc/dd1
+assert fails move /sc/dd1 /sc/dd1/inner
+assert fails move /sc/dd1 /sc/dd1/a/b/c
+# ...while a SIBLING that merely shares a prefix is a perfectly good destination, which is the
+# case a sloppy prefix test gets wrong.
+mkdir /sc/dd1x
+move /sc/dd1x /sc/dd1y
+assert ok ls /sc/dd1y
+assert fails ls /sc/dd1x
+delete /sc/dd1y recursive
+
 # ===== byte pipes: producers + filters (each line spawns a service; kept lean) =====
 echo ''
 echo '===== byte pipes: producers + filters (each line spawns a service; kept lean) ====='
