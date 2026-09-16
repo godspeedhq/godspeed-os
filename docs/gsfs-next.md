@@ -69,21 +69,36 @@ ABI (§18.1); this rides them rather than adding a second mechanism.
 
 ### Already found, before the suite exists
 
-**`move_path` has no ancestor guard, and the consequence is data loss.** `move /a /a/b`:
+**`fs` does not enforce its own tree-acyclicity invariant. The only guard is in a client.**
 
-- `walk_parent("/a/b")` gives `dparent = /a`;
-- `dir_add` writes an entry inside `/a` whose `first_block` is `/a`'s own;
-- `dir_remove` then detaches `/a` from the root.
+`move_path` walks the source, walks the destination's parent, checks the destination does not
+already exist, then `dir_add`s and `dir_remove`s. Nothing checks whether the destination lies UNDER
+the source. Moving `/a` to `/a/b` would therefore write an entry inside `/a` whose `first_block` is
+`/a`'s own, then detach `/a` from the root: a cycle, unreachable from the tree.
 
-`/a` and its whole subtree are now a cycle unreachable from the root. **`drives check` rebuilds the
-free bitmap by walking the tree** (§6.11 Phase G), so those still-occupied blocks are marked FREE and
-handed to the next allocation, which overwrites live data. One shell command, silent corruption.
+The damage that would do is worth stating, because it is not a tidy error. **`drives check` rebuilds
+the free bitmap by walking the tree** (§6.11 Phase G). Blocks that are still occupied but no longer
+reachable are marked FREE and handed to the next allocation, which overwrites live data.
+`MAX_TREE_DEPTH` (64) keeps a walk from hanging, so it presents as a leak that becomes corruption
+rather than as a wedge.
 
-`MAX_TREE_DEPTH` (64) stops a walk hanging on a reachable cycle, which is why this presents as a leak
-rather than a wedge. The fix is an ancestor check in `move_path` before `dir_add`: walk from `dparent`
-to the root and refuse if `src` is met. Bounded by `MAX_TREE_DEPTH`, like every other walk.
+**It is not reachable from the prompt today, and the first version of this document wrongly said it
+was.** `cmd_move` in the shell refuses both `dst == src` and `dst` beneath `src`
+(`services/shell/src/main.rs`, "cannot move into itself"). That guard is real and it works.
 
----
+**It is in the wrong place.** A check in the caller is a convention; only a check in the owner is an
+enforcement. `fs` owns the tree and every invariant the tree has - the bitmap rebuild above depends
+on acyclicity, and `fs` is what depends on it. Today that invariant holds because one client happens
+to be careful, and nothing tells the next client - a script, another service, a refactor of this one -
+that it is carrying an obligation it never agreed to. That is the shape invariant 1 exists to refuse:
+authority and enforcement in different places.
+
+So the fix is the same either way - an ancestor check in `move_path`, bounded by `MAX_TREE_DEPTH`
+like every other walk - and the shell's guard stays, because catching it early gives a better message
+than a service error. What changes is that `fs` stops depending on being asked nicely.
+
+**How it gets tested.** Not from the shell, which correctly refuses to issue it. This is what §1c is
+for: the protocol path, where a client can send exactly the request the shell declines to.
 
 ## 2. Phase N - append-only and sealed file capabilities
 
