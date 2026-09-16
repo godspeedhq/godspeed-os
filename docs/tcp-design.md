@@ -181,11 +181,27 @@ not. Re-run on the two x86 boards after the fix:
 |---|---|---|---|
 | Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | n/a, no disk |
 | HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
+| StarFive VisionFive 2 Lite | 204 / 78 / 174 / 205 ms (4 runs) | under 20 ms | |
 
 The T630 is the useful one here, for three reasons: it is AMD, so every timing bound in this service
 calibrates through a different path; it has a real AHCI disk, so `check` and `scrub` run for real (461
 checks against 349-354 on the diskless boards); and it had never run this branch at all - both earlier
 x86 sessions booted the Wyse in its place. It needed no change.
+
+**The VisionFive shows the fix ABSORBING the condition that used to break it**, which is better
+evidence than a fast run. One of its `hello` commands arrived while net-stack was inside a 2006 ms
+block:
+
+```
+19:46:18.115  op 21 reached dispatch (from the queue)
+19:46:19.788    (q to quit)                              <- the wait lingers past 2 s, so it says so
+19:46:20.008  net-stack: tcp 192.168.4.40:7777 ok - 10 byte(s)
+19:46:20.034  net-stack: a serve pass took 2006 ms (over 1000)
+```
+
+Held, then served, 1.9 s end to end. **That is precisely the case that was dropped at 1.5 s and cost
+twenty seconds before `backlog/29`.** Its three slow passes (3406, 1875, 2006 ms) are the same
+configured-stack scale as the x86 boards, with zero drops and zero timeouts beside them.
 
 **What it shows that a green run usually cannot.** Its log carries three genuinely slow serve passes -
 1981 ms, 1557 ms and 4001 ms - and **zero dropped requests and zero timeouts beside them.** The
