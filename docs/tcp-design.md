@@ -179,11 +179,17 @@ not. Re-run on the two x86 boards after the fix:
 
 | board | `tcp ... big`, dispatch to reply | queue wait before dispatch | selfcheck |
 |---|---|---|---|
-| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | n/a, no disk |
+| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | not run |
 | HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
 | StarFive VisionFive 2 Lite | 204 / 78 / 174 / 205 ms (4 runs) | under 20 ms | **ran 461, failed 0** |
 | Raspberry Pi 4 | **31 / 47 / 32 ms** (3 runs) | under 40 ms | **ran 461, failed 0** |
 | Raspberry Pi 2 | 47 to 236 ms, median ~95 ms (8 runs) | under 20 ms | **ran 452, failed 0** |
+
+The Wyse cell says **not run**, not "no disk", and the distinction is a correction rather than a
+nicety. Its `xhci: alive` line reports `disk no`, and that was read here as the machine having no
+storage - but `xhci` only knows about USB, and the Wyse's disk is AHCI on `block-driver`, which its own
+log shows working (`block-driver: op 5 spent 108630 us`, `fs: op 10 took 227238 us, 17 block ops`).
+A driver reporting the absence of what IT can see is not the machine reporting an absence.
 
 The three boards with a real disk report **the same 461 checks and the same 0 failures on three
 different instruction sets** - x86-64 on AMD, riscv64, and AArch64 - with `drives check` and `drives
