@@ -234,6 +234,39 @@ DHCP + ARP + SNTP dance, and the dance is precisely what blocks the loop.
    and a compile-time assertion keeps it that way. This is what makes the starvation self-reporting on
    any board instead of a mystery per platform.
 
+## THE ACTUAL BUG: the wait slept on work it already had (2026-09-16)
+
+Making the drop report a sentence found it in one run:
+
+```
+13:22:02.842  net-stack: dropped a held client request (op 21) after its client's own 20000 ms of patience
+13:22:02.864  net-stack: a serve pass took 2060 ms (over 1000)
+13:22:28.977  net-stack: op 21 reached dispatch (from the stash)
+```
+
+The request was held for its client's FULL twenty seconds and never served, while the loop was running
+normally - only 2 s of slow pass in the whole window. And every successful "from the stash" dispatch
+landed immediately after an unrelated dispatch had woken the loop.
+
+**The stash is drained only by `pending.take()` at the top of the serve loop, and the wait below it
+only exits when a NEW message arrives.** So a request displaced into the stash by the poll step sat
+there until something unrelated happened along. For a shell blocked on that very request, nothing ever
+did: it aged out its entire patience, was dropped, the client re-sent, and the re-send was answered in
+milliseconds. That is why every served copy arrived "from the queue" - it was the retry.
+
+The fix is three words at the bottom of the wait: `if pending.has_work() { continue 'serve; }`. Going
+back to the top of the serve loop reaches `take`, which is the only thing that drains the stash.
+
+**This was the real defect all along.** The two earlier fixes were both necessary and neither was it:
+the 20 s bound stopped an unbounded hang, and the per-client patience byte stopped net-stack
+discarding a 20 s client's request after 1.5 s - but a request that is never taken is dropped whatever
+its deadline says. The instruments are what made each layer visible: the arrival receipt showed the
+served copy was the retry, the slow-pass report killed the starvation theory, and the unlatched drop
+line named the victim and its patience.
+
+Measured effect in `osdev test shell`: patience-expiry drops **2 -> 0**. The one remaining drop is a
+full stash during a burst, which is a different and bounded case.
+
 ## Also still open
 
 - **The console echo corrupts characters on this box** - duplicated runs, inserted commas - while the

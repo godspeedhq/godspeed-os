@@ -485,6 +485,11 @@ impl Displaced {
         self.live += 1;
     }
 
+    /// Is a displaced client request waiting to be served?
+    ///
+    /// The wait loop asks this so it does not SLEEP on work it already has - see its call site.
+    fn has_work(&self) -> bool { self.live > 0 }
+
     /// Take the oldest request still worth answering, for the serve loop.
     ///
     /// Entries are expired from the FRONT only, which is sound because they were kept in arrival
@@ -2681,7 +2686,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut last_gw_arp_at: i64 = -RESYNC_SECS;
     /// Latched once the wall clock is known. A clock never becomes unset, so this is asked at most once.
     let mut clock_known = false;
-    loop {
+    // Labelled so the wait below can hand control back here when the poll step displaces a client
+    // request into the stash - `pending.take()` at the top of this loop is the only thing that
+    // drains it. See the `has_work` call site.
+    'serve: loop {
         // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
         //
         // The tick called `link_is_up()` every second to announce a cable, and that goes through
@@ -2792,6 +2800,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         poll_step(&ctx, pending, &st, &mut tcpst, &net);
                     }
                     if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) { break m; }
+                    // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
+                    //
+                    // The poll step just ran, and `nic_req`'s sifting displaces any client request
+                    // that arrives during it INTO THE STASH. The stash is only ever drained by
+                    // `pending.take()` at the top of the serve loop - and this wait only exits when a
+                    // NEW message arrives. So a displaced request sat here unserved until some
+                    // unrelated message happened along, which for a shell blocked on that very
+                    // request means nothing ever came: it aged out its client's whole patience and
+                    // was dropped, the client re-sent, and the re-send was answered at once.
+                    //
+                    // That is precisely what the board showed - `dropped a held client request (op
+                    // 21) after its client's own 20000 ms of patience`, with only a 2 s slow pass in
+                    // the window, and every successful "from the stash" dispatch landing immediately
+                    // after an unrelated one had woken the loop (`backlog/29`).
+                    //
+                    // Going back to the top of the serve loop is the whole fix: `take` is there, and
+                    // it is the only thing that drains the stash.
+                    if pending.has_work() { continue 'serve; }
                 };
                 // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
                 // name-addressed request (status / DNS / open-socket) carries no badge.
