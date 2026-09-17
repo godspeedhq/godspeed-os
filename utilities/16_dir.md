@@ -49,6 +49,32 @@ abstraction to leak into the name.
 So the three short names kept are `dir`, `cd` and `mkdir`, and each is kept for the same reason
 rather than for brevity: it says what it does.
 
+### Four columns, and why there is no fifth
+
+`dir` shows **name, type, size and when it changed**. There are no words to turn any of it on; that
+is the listing.
+
+**This is not `ls -l` made default.** `ls -l` is opt-in on Unix because it adds mode bits, link
+count, owner and group - four columns of POSIX bookkeeping. None of them exist here, so removing
+them is not a choice this made: there is nothing to remove. What is left is four columns, and four
+columns is not a wall.
+
+**There is no permissions column because permissions are not a property of a file.** Authority here
+is a capability, and a capability is held by a HOLDER - so "who can read this?" has no per-file
+answer to put in a column. The question does not live on the file; it lives on whoever holds a cap
+to it, and `caps` is what answers it. This is the one place the capability model visibly changes
+what a familiar command can even mean.
+
+**Sealing is the exception that proves it**, and why `seal` sits in the TYPE column rather than in a
+column of its own: a seal genuinely IS a property of the file, recorded on disk, constraining what
+anyone may do to it regardless of what they hold. It also costs no width, because sealing is
+file-only (`fs` refuses "only a file can be sealed"), so TYPE stays single-valued.
+
+A **directory** shows `-` for size. A directory occupies blocks, but reporting those answers a
+question nobody asked and would not equal the sum of what is inside it.
+
+`unknown` in MODIFIED is a real answer, not a missing one - see below.
+
 ## 2. Usage
 
 ```
@@ -57,8 +83,7 @@ dir 0.4.0 - list a directory (records when piped)
 usage:
   dir                       list the current directory
   dir <path>                list the directory at <path>
-  dir long                  one entry per line with type, size and MODIFIED time
-  dir human                 sizes as KiB/MiB/GiB rather than raw bytes
+  dir bytes                 sizes as an exact byte count, not KiB/MiB/GiB
   dir [path] | <verb>       piped: emits records (name/type/size)
   dir | select … / sort …   project / order the listing
   dir version               print the version
@@ -67,29 +92,49 @@ usage:
 <path> = [index:]label/path | /abs | rel   (see docs/drives.md §4.1)
 ```
 
-The words combine, in any order, and mix with a path: `dir long human /projects` and
-`dir /projects human long` are the same command. **Words, not flags** (`0_conventions.md` rule 4) -
+The word mixes with a path in either order: `dir bytes /projects` and `dir /projects bytes` are the
+same command. **Words, not flags** (`0_conventions.md` rule 4) -
 there is no `-lh`, because a flag is a thing you have to have been told.
 
 Example:
 
 ```
-gsh> dir /projects
-  NAME            TYPE   SIZE
-  notes.txt       file   18 B
-  drafts          dir    -
+gsh> dir /
+/  (5 entries)
+  NAME                  TYPE       SIZE  MODIFIED
+  canary.txt            file       41 B  unknown
+  a.[2Jb.txt            file       49 B  unknown
+  .gsh_history          file      664 B  2026-09-17 14:09
+  fz                    dir           -  unknown
+  clock.last            file       10 B  unknown
 
-gsh> dir long human /projects
-  NAME                  TYPE        SIZE  MODIFIED
-  notes.txt             file       18 B  2026-09-17 05:21
-  drafts                dir            -  unknown
+gsh> dir bytes /
+/  (5 entries)
+  NAME                  TYPE       SIZE  MODIFIED
+  canary.txt            file         41  unknown
+  a.[2Jb.txt            file         49  unknown
+  .gsh_history          file        651  2026-09-17 14:09
+  fz                    dir           -  unknown
+  clock.last            file         10  unknown
 ```
 
-### Why the terse form is still the default
+Both captured from one boot of `osdev test fs-fuzz`, not written by hand. Two things in them are
+worth pointing at:
 
-`dir` is read far more often than it is studied. The common use is "what is in here", and a wall of
-columns answers a question that was not asked. The long form is there when the question IS when or
-how big, and it is one word away.
+`a.[2Jb.txt` is a filename holding a raw `ESC [ 2J` - a clear-screen sequence - baked onto the disk
+by that suite. It renders with `.` where the control bytes are, so listing it cannot scroll itself
+off the screen. That sanitising is why the name column can be trusted, and it is a reason not to
+decorate names with markers.
+
+`.gsh_history` differs between the two listings because the shell appended the command in between.
+That is the file honestly changing, not the two renderings disagreeing.
+
+### The size column is right-aligned INCLUDING its unit
+
+`8 B` and `1.4 MiB` end at the same column. Aligning the digits and letting the units straggle still
+reads as ragged, which is the subtler half of the problem; the blunter half is that a Rust `Display`
+implementation **silently ignores the width it is given** unless it calls `f.pad()`, so `{:>9}` did
+nothing at all until the renderer was changed to render into a buffer and pad it.
 
 ### `unknown` is a real answer, not a missing one
 
@@ -141,11 +186,12 @@ it before the text producers are consulted).
 
 ## 5. Later (separate doc so it can grow)
 
-- A long/short form toggle (a *word*, e.g. `ls long`, never `-l` - `0_conventions.md` §4):
-  show generation, block extent, file-capability state once file-as-capability lands
-  (`docs/persistence.md` §7).
-- A recursive `ls tree`. (Sorting and filtering by name/size are **done** - they are the
-  record pipe's job now, §2a, not flags on `dir`.)
+- **`dir extents`** (a *word*, never `-x` - `0_conventions.md` §4): the on-disk placement - first
+  block, block count, and whether the file is fragmented (`ITYPE_FILE_FRAG`). Deliberately NOT called
+  `dir raw`, which fails the same test `ls` failed: raw *what*? Not built - nothing has asked for it
+  outside a test harness, and §26.2 says a feature is pulled into existence rather than anticipated.
+- A recursive form is already `tree`, which exists.
+  (Sorting and filtering by name/size are **done** - the record pipe's job, §2a, not words on `dir`.)
 
 ## 6. Conformance
 

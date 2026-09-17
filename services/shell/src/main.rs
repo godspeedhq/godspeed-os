@@ -828,7 +828,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
-    ("dir",      &["long", "human"]),
+    ("dir",      &["bytes"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
@@ -858,7 +858,7 @@ const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
     ("mkdir",  &["parents"]),
     ("copy",   &["recursive"]),
     ("delete", &["recursive"]),
-    ("dir",     &["long", "human"]),
+    ("dir",     &["bytes"]),
 ];
 
 /// Complete the current token (`tok_start..end`) as a subcommand keyword of its segment's command.
@@ -4551,8 +4551,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "dir" => help_block(ctx, "dir", "list a directory (records when piped)", &[
             ("dir", "list the current directory", "dir"),
             ("dir <path>", "list the directory at <path>", "dir /docs"),
-            ("dir long", "one per line with type, size and MODIFIED time", "dir long /docs"),
-            ("dir human", "sizes as KiB/MiB/GiB, not raw bytes", "dir long human"),
+            ("dir bytes", "sizes as an exact byte count, not KiB/MiB/GiB", "dir bytes /docs"),
             ("dir [path] | <verb>", "piped: emits records name/type/size", "dir | where size>0"),
             ("dir | select … / sort …", "project / order the listing", "dir | sort reverse size"),
         ], true),
@@ -12053,31 +12052,28 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
     }
 }
 
-/// `ls [path]` - list a directory.
-/// A byte count rendered either raw or in KiB/MiB, for the terse `dir` column.
+/// `dir [path]` - list a directory.
+/// A size for the `dir` column: readable by default, exact when the caller asked for `bytes`.
 ///
-/// A type rather than a formatting branch at each call site, so the two `dir` layouts cannot drift
-/// into showing sizes differently from one another.
-struct HumanSize(u64, bool);
-/// The same, right-aligned into the `ls long` column - digits that do not line up are not a column.
-struct HumanSizeR(u64, bool);
+/// **One type, one layout.** There used to be two renderings and two column sets, which is how the
+/// terse view ended up printing `204800 B` (with a unit) while the detailed one printed a bare
+/// `204800` - the friendlier rendering in the LESS detailed view, which is backwards. There is now
+/// a single layout, so they cannot drift again.
+struct SizeCol(u64, bool);
 
-impl core::fmt::Display for HumanSize {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if !self.1 { return write!(f, "{} B", self.0); }
-        human_bytes(f, self.0)
-    }
-}
-
-impl core::fmt::Display for HumanSizeR {
+impl core::fmt::Display for SizeCol {
     /// **Renders into a small buffer and then `pad`s.** A `Display` impl that writes straight to the
     /// formatter SILENTLY IGNORES a width - `{:>10}` does nothing unless the impl asks for it - so
     /// the column came out ragged and a column of ragged numbers is not a column. `f.pad` is what
     /// applies the caller's width and alignment.
+    ///
+    /// `self.1` is "the caller asked for exact bytes". Note the unit travels WITH the number and the
+    /// whole string is right-aligned, so `8 B` and `1.4 MiB` end at the same column - aligning the
+    /// digits and letting the units straggle is what made this look ragged even once it was padded.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::fmt::Write as _;
         let mut b = FixedStr::<16>::new();
-        if self.1 { let _ = human_bytes(&mut b, self.0); } else { let _ = write!(&mut b, "{}", self.0); }
+        if self.1 { let _ = write!(&mut b, "{}", self.0); } else { let _ = human_bytes(&mut b, self.0); }
         f.pad(b.as_str())
     }
 }
@@ -12146,16 +12142,20 @@ fn u32_le(b: &[u8]) -> u32 {
 }
 
 fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
-    // WORDS, NOT FLAGS (`utilities/0_conventions.md` rule 4): `ls long human`, never `ls -lh`. Any
+    // WORDS, NOT FLAGS (`utilities/0_conventions.md` rule 4): `dir bytes /docs`, never `dir -b`. Any
     // order, and mixable with a path, because an order a person has to remember is one they will
     // guess wrong.
-    let mut long = false;
-    let mut human = false;
+    //
+    // **`long` and `human` are gone; what they showed is now the default.** They were `ls -l` and
+    // `ls -h` wearing house clothes, and the reason `ls -l` is opt-in on Unix does not apply here:
+    // it hides mode bits, link count, owner and group, none of which exist in this system. Strip
+    // those and what is left - name, type, size, when - is four columns, not nine, and is what
+    // somebody wants. The one thing left to ask for is the EXACT byte count, and `bytes` says so.
+    let mut exact = false;
     let mut path_arg = "";
     for tok in args.iter() {
         match *tok {
-            "long" => long = true,
-            "human" => human = true,
+            "bytes" => exact = true,
             t => if path_arg.is_empty() { path_arg = t; },
         }
     }
@@ -12183,10 +12183,7 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     }
     let count = p[1] as usize;
     out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
-    if count > 0 {
-        if long { out.line(ctx, "  NAME                  TYPE        SIZE  MODIFIED"); }
-        else    { out.line(ctx, "  NAME                  TYPE   SIZE"); }
-    }
+    if count > 0 { out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED"); }
     let mut i = 2usize;
     for _ in 0..count {
         if i >= p.len() { break; }
@@ -12213,32 +12210,25 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
         let mtime = u32_le(&p[i + nl + 9..i + nl + 13]);
         let sealed = p[i + nl + 13] & 1 != 0;
         i += nl + 1 + 8 + 4 + 1;
-        if !long {
-            // The terse default is unchanged, deliberately: `dir` is read far more often than it is
-            // studied, and a wall of columns is worse for the common case (conventions rule 7).
-            if is_dir {
-                out.line_fmt(ctx, format_args!("  {:<20}  dir    -", name));
-            } else {
-                out.line_fmt(ctx, format_args!("  {:<20}  file   {}", name, HumanSize(size, human)));
-            }
-            continue;
-        }
-        // `ls long`: type, size and WHEN. A time this volume does not record prints as "unknown"
-        // rather than as 1970 - an absent date is honest and a wrong one is not (Phase O).
+        // A time this volume does not record prints as "unknown" rather than as 1970 - an absent
+        // date is honest and a wrong one is not (Phase O).
         let when = if mtime == 0 {
             TimeCol::Unknown
         } else {
             TimeCol::At(Datetime::from_epoch_secs(mtime as i64))
         };
-        // A sealed file says so IN THE TYPE COLUMN. It is not an attribute of a file so much as a
-        // different kind of thing to have on a disk - one you cannot change - and burying that in a
-        // trailing marker would make it easy to miss precisely when it matters.
+        // A sealed file says so IN THE TYPE COLUMN, and costs no extra column to do it. It is not an
+        // attribute of a file so much as a different kind of thing to have on a disk - one whose
+        // bytes can never change - and a trailing marker is missable precisely when it matters.
+        //
+        // This works because sealing is FILE-ONLY: `fs` refuses "only a file can be sealed", so TYPE
+        // stays single-valued and there is no `dir+sealed` case needing a flag of its own.
+        let kind = if is_dir { "dir" } else if sealed { "seal" } else { "file" };
         if is_dir {
-            out.line_fmt(ctx, format_args!("  {:<20}  dir   {:>10}  {}", name, "-", when));
+            out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>9}  {}", name, kind, "-", when));
         } else {
-            out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>10}  {}",
-                                           name, if sealed { "seal" } else { "file" },
-                                           HumanSizeR(size, human), when));
+            out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>9}  {}",
+                                           name, kind, SizeCol(size, exact), when));
         }
     }
     if count == 0 { out.line(ctx, "  (empty)"); }

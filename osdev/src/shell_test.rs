@@ -5605,10 +5605,10 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     //
     // `canary.txt` was baked host-side into a 0008 image, so no time was ever recorded for it.
     // `/fz/real.txt` was written by this machine moments ago. Both are in the same tree, and
-    // `dir long` must tell the truth about each: a real date for the one that has one, and the word
+    // `dir` must tell the truth about each: a real date for the one that has one, and the word
     // `unknown` for the one that does not - never 1970, because a wrong date is worse than no date.
-    let listing = answered!("dir long /", "dir long on a tree holding both timed and untimed entries");
-    check!(listing.contains("MODIFIED"), "`dir long` prints a MODIFIED column");
+    let listing = answered!("dir /", "dir on a tree holding both timed and untimed entries");
+    check!(listing.contains("MODIFIED"), "`dir` prints a MODIFIED column by default");
     check!(listing.contains("unknown"),
            "an entry from a 0008 volume reads as `unknown`, not as an epoch date");
     // A file written AFTER the clock arrived. `fs` learns the time from a push by `time`, so a file
@@ -5617,11 +5617,16 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(String::from_utf8_lossy(&buf.lock().unwrap()).contains("wall clock received"),
            "fs received the wall clock from `time`");
     answered!("write /fz/dated.txt now", "a file written after the clock arrived");
-    let fzl = answered!("dir long /fz", "dir long on files this machine created");
+    let fzl = answered!("dir /fz", "dir on files this machine created");
     check!(fzl.contains("20") && !fzl.contains("1970"),
            "a file written after the clock arrived carries a REAL date, not 1970");
-    let human = answered!("dir long human /", "dir long human");
-    check!(human.contains("KiB") || human.contains(" B"), "`dir human` renders sizes in units");
+    // Readable sizes are the DEFAULT now, and `bytes` is what asks for the exact count - the
+    // reverse of the old `human` word. Both halves are asserted, because "the default changed" is
+    // exactly the kind of claim that rots into being true of neither.
+    let units = answered!("dir /", "dir renders sizes with units by default");
+    check!(units.contains("KiB") || units.contains(" B"), "`dir` renders sizes in units unasked");
+    let exact = answered!("dir bytes /", "dir bytes");
+    check!(!exact.contains("KiB"), "`dir bytes` renders an exact count, not KiB/MiB");
 
     // ---- The filesystem must still be intact. That is the whole point of the suite. ----
     let chk = answered!("drives check", "fsck after the assault");
@@ -5988,16 +5993,29 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
         (outs, whole)
     };
 
-    // Pull the MODIFIED column for one name out of an `dir long` listing.
+    // Pull the MODIFIED column for one name out of a `dir` listing.
+    // Read the date from the END of the row, not by field index.
+    //
+    // It used to be `nth(3)` - name, type, size, date - which broke the moment sizes grew a unit,
+    // because `8 B` is TWO whitespace-separated fields and `8` is one. The date is either
+    // `YYYY-MM-DD HH:MM` (two trailing fields) or the single word `unknown`, and counting from the
+    // right is stable against anything the columns before it do.
     let date_of = |listing: &str, name: &str| -> String {
         listing.lines()
             .find(|l| l.trim_start().starts_with(name))
-            .and_then(|l| l.split_whitespace().nth(3).map(|d| d.to_string()))
+            .map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                match f.last() {
+                    Some(&"unknown") => "unknown".to_string(),
+                    Some(t) if f.len() >= 2 => format!("{} {}", f[f.len() - 2], t),
+                    _ => String::new(),
+                }
+            })
             .unwrap_or_default()
     };
 
     println!("fs-time: boot 1 - write a file, read its date");
-    let (o1, w1) = boot(&["write /stamped.txt hello", "dir long /"]);
+    let (o1, w1) = boot(&["write /stamped.txt hello", "dir /"]);
     check!(w1.contains("wall clock received"), "boot 1: fs was told the wall clock by `time`");
     let l1 = o1.get(1).cloned().unwrap_or_default();
     let d1 = date_of(&l1, "stamped.txt");
@@ -6009,16 +6027,16 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     // `seal` asks [y/N], so the confirmation is its own line - the harness sends one command
     // per entry and waits for a prompt between them.
     let (os, ws) = boot(&["write /frozen.txt original", "seal /frozen.txt yes",
-                          "write /frozen.txt tampered", "read /frozen.txt", "dir long /"]);
+                          "write /frozen.txt tampered", "read /frozen.txt", "dir /"]);
     check!(os.get(1).map_or(false, |r| r.contains("sealed /frozen.txt")), "boot 1: the file was sealed");
     check!(os.get(2).map_or(false, |r| !r.contains("wrote")), "boot 1: writing a SEALED file was refused");
     check!(os.get(3).map_or(false, |r| r.contains("original") && !r.contains("tampered")),
            "boot 1: the sealed content is untouched");
-    check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `dir long` marks it sealed");
+    check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `dir` marks it sealed");
     check!(ws.contains("sealed a file"), "boot 1: fs logged the seal");
 
     println!("fs-time: boot 2 - SAME disk, the date must survive the mount");
-    let (o2, w2) = boot(&["dir long /", "read /stamped.txt",
+    let (o2, w2) = boot(&["dir /", "read /stamped.txt",
                           "write /frozen.txt tampered-after-reboot", "read /frozen.txt"]);
     check!(o2.get(2).map_or(false, |r| !r.contains("wrote")),
            "boot 2: the SEAL survived the reboot - the write is still refused");
@@ -6097,7 +6115,7 @@ pub fn run_fs_hostile_case(image_path: &Path, persist_path: &str, what: &str, sm
     // Poke the crafted tree from every direction a person would. Each must ANSWER; a `None` here is
     // a hang, which is the one outcome that is never acceptable.
     let mut hung = None;
-    for c in ["dir /", "dir long /", "read /victim.txt", "dir /loop", "tree /",
+    for c in ["dir /", "dir bytes /", "read /victim.txt", "dir /loop", "tree /",
               "read /bystander.txt", "drives check", "read /bystander.txt"] {
         let line = format!("{c}\r");
         send(&mut write_half, line.as_bytes());

@@ -266,7 +266,7 @@ answer than a plain refusal, and §7.3 says a right that cannot be honoured shou
 
 ### Surfaces
 
-`dir long` shows `seal` in the TYPE column - a different kind of thing to have on a disk, not a
+`dir` shows `seal` in the TYPE column - a different kind of thing to have on a disk, not a
 footnote beside `file`. In a PIPE, `dir` emits records, so it is a separate **`sealed` column** rather
 than a new `type` value: making a sealed file's type read `seal` would silently drop it out of every
 `where type=file` query anyone has already written.
@@ -285,11 +285,10 @@ how big on request.
 | command | what it shows |
 | --- | --- |
 | `dir` | names, type, size - unchanged, and still the default |
-| `dir long` | one entry per line with type, size and a MODIFIED column |
-| `dir human` | sizes as KiB/MiB/GiB rather than raw bytes |
+| `dir bytes` | sizes as an exact byte count rather than KiB/MiB/GiB |
 
 **Words, not flags** (`utilities/0_conventions.md` rule 4), in any order, mixable with a path:
-`dir long human /projects` and `ls /projects human long` are the same command. Both orders complete
+`dir bytes /projects` and `dir /projects bytes` are the same command. Both orders complete
 on Tab, which is why `dir` is in BOTH the leading and trailing subcommand tables - and a first-position
 token matching no keyword falls through to path completion, so `ls /do<tab>` still works.
 
