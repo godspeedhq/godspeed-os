@@ -548,6 +548,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.trace_op_at("block-driver", 1);
     ctx.log("fs: starting");
     guard_selftest(&ctx);
+    protocol_selftest(&ctx);
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
     // None only while block-driver is not answering yet - still registering, or our cached cap went
@@ -3753,6 +3754,102 @@ impl Fs {
 // ── helpers ──────────────────────────────────────────────────────────────────
 fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty())
+}
+
+/// Phase M §1c - run MALFORMED REQUESTS through the real request parser, on every boot.
+///
+/// The shell cannot send these. It builds well-formed requests by construction, and where it can
+/// express something dangerous it refuses first - `move /a /a/b` never leaves it. So the hostile
+/// shapes that a non-shell client could send had no coverage at all.
+///
+/// This needs no second client and no new authority, because **`serve_once` writes its reply into a
+/// BUFFER rather than sending it**. The crafted payload goes through the same dispatch, the same tag
+/// strip and the same length arithmetic a real request does, and the answer is inspected in memory.
+/// No IPC, no test-only command in a shipping shell, no way for this to become a back door.
+///
+/// It runs BEFORE the volume is mounted, deliberately. With no filesystem every path-addressed op
+/// short-circuits to a one-byte "no filesystem", so a thousand crafted requests cannot touch a disk -
+/// and what is being tested here is the PARSER, not the operations. The operations are covered by
+/// `fs-fuzz` and `fs-hostile`, against real disks.
+///
+/// **The assertion is that every request produces a non-empty answer.** Not the right answer - a
+/// malformed request has no right answer - but SOME answer. A zero-length reply is undeliverable
+/// (the kernel refuses a zero-length send), so a request that produces one leaves its caller waiting
+/// out a deadline for a reply that can never arrive. This project has shipped that bug before, on a
+/// different service, and it cost a day.
+///
+/// `#[inline(never)]`: the buffers below are a frame this service does not otherwise carry.
+#[inline(never)]
+fn protocol_selftest(ctx: &ServiceContext) {
+    let mut vol: Option<Fs> = None;
+    let mut out = [0u8; 4096];
+    let mut checked = 0u32;
+    let mut empty = 0u32;
+    let mut worst = 0u8;
+
+    let mut run = |vol: &mut Option<Fs>, p: &[u8], out: &mut [u8; 4096], checked: &mut u32,
+                   empty: &mut u32, worst: &mut u8| {
+        let mut len = 0usize;
+        // A capability handle that names nothing. Safe because no arm can reach a mint or a send
+        // without a mounted volume, and every one of those is behind the `None => no filesystem`
+        // guard this runs under.
+        serve_once(ctx, vol, 0, false, p, 0, CapHandle(0), &mut out[..], &mut len);
+        *checked += 1;
+        if len == 0 {
+            *empty += 1;
+            *worst = p.first().copied().unwrap_or(0);
+        }
+    };
+
+    // 1. Nothing at all, and a lone opcode - the shapes with no arguments where one is expected.
+    run(&mut vol, &[], &mut out, &mut checked, &mut empty, &mut worst);
+    for op in 0u8..=255 {
+        run(&mut vol, &[op], &mut out, &mut checked, &mut empty, &mut worst);
+    }
+
+    // 2. A `plen` that overruns the message. Every path-addressed op reads `[op, plen, path…]`, so a
+    //    length byte claiming far more than arrived is the classic way to walk off the end of a
+    //    buffer - and the classic way a service is made to read somebody else's memory.
+    for op in 0u8..=40 {
+        run(&mut vol, &[op, 255], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &[op, 255, b'x'], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &[op, 0], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &[op, 1], &mut out, &mut checked, &mut empty, &mut worst);
+    }
+
+    // 3. A plausible path followed by a TRUNCATED argument: the ops that read a u64 or u32 after the
+    //    path (`read_at`, `write_at`, `write_new`) must not read past what arrived.
+    let mut buf = [0u8; 64];
+    for op in 0u8..=40 {
+        for extra in [0usize, 1, 3, 7] {
+            buf[0] = op;
+            buf[1] = 4;
+            buf[2..6].copy_from_slice(b"/abc");
+            let n = 6 + extra;
+            run(&mut vol, &buf[..n], &mut out, &mut checked, &mut empty, &mut worst);
+        }
+    }
+
+    // 4. A path length that is exactly the whole message, and one byte beyond it - the off-by-one
+    //    either side of the boundary, which is where a bounds check is right or wrong.
+    for plen in [0u8, 1, 2, 3, 250, 254, 255] {
+        buf[0] = OP_READ_FILE;
+        buf[1] = plen;
+        run(&mut vol, &buf[..2], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &buf[..3], &mut out, &mut checked, &mut empty, &mut worst);
+    }
+
+    if empty == 0 {
+        ctx.log_fmt(format_args!(
+            "fs: protocol selftest PASS - {} malformed requests, every one answered", checked));
+    } else {
+        // LOUD, because the failure is invisible from the other end: the caller does not see a bad
+        // reply, it sees NO reply, and waits out its whole deadline for one that cannot arrive.
+        ctx.log_fmt(format_args!(
+            "fs: protocol selftest FAILED - {} of {} malformed requests produced a ZERO-LENGTH reply \
+             (undeliverable; the caller would wait out its deadline). Last opcode: {}",
+            empty, checked, worst));
+    }
 }
 
 /// Prove the path guards on EVERY boot, on every board, before a disk is touched.

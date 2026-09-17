@@ -60,12 +60,42 @@ directory block, an extent block, the bitmap, the journal, a record's `first_blo
 `block_count`. **The bar is not that the filesystem survives with the data intact - it is that it
 REFUSES LOUDLY and never panics, never hangs, and never serves a wrong answer as a right one.**
 
-### 1c. Protocol fuzz
+### 1c. Protocol fuzz  (BUILT, and not the way this planned)
 
-Malformed IPC directly at the `fs` endpoint: truncated payloads, an op byte no arm claims, a `plen`
-that overruns the message, a badged file-cap invocation naming a resource `fs` never minted. The
-existing `probe` service and `sdk/rust/src/adversarial.rs` are the sanctioned way to reach the raw
-ABI (§18.1); this rides them rather than adding a second mechanism.
+Malformed requests straight at the request parser: truncated payloads, an op byte no arm claims, a
+`plen` that overruns the message, an argument cut short after a plausible path.
+
+**The plan said to ride the `probe` service and `sdk/rust/src/adversarial.rs`. That turned out to be the wrong
+tool.** Those exist to reach the raw SYSCALL ABI with fuzzed syscall numbers - genuinely unsafe work
+that needs a sanctioned home. Nothing here needs unsafe: these are ordinary messages with hostile
+CONTENTS. And pointing a probe at `fs` would have meant giving a probe `fs` as a send peer, which is
+a change to the spawn-authority path - a large, security-relevant edit to make a test possible.
+
+**`serve_once` writes its reply into a BUFFER rather than sending it**, so the crafted payload goes
+through the same dispatch, the same tag strip and the same length arithmetic a real request does, and
+the answer is inspected in memory. No IPC, no second client, no test-only command in a shipping
+shell, and no way for this to become a back door. It runs as a startup selftest, like the path
+guards, so it is proved on every boot of every board rather than in one suite on one architecture.
+
+**The assertion is that every request produces a NON-EMPTY answer.** Not the right answer - a
+malformed request has none - but some answer. A zero-length reply is undeliverable (the kernel
+refuses a zero-length send), so a request that produces one leaves its caller waiting out a full
+deadline for a reply that can never arrive. This project has shipped exactly that bug on another
+service and it cost a day.
+
+    fs: protocol selftest PASS - 599 malformed requests, every one answered
+
+**What it deliberately does NOT cover**, so the claim is not read too widely: it runs BEFORE the
+volume is mounted, so every path-addressed op short-circuits to "no filesystem" and the operations
+themselves are not exercised here. That is the point - this tests the PARSER, and a thousand crafted
+requests cannot touch a disk. The operations are covered against real disks by `fs-fuzz` (hostile
+arguments) and `fs-hostile` (crafted metadata).
+
+**Still not covered by anything: a request the shell refuses to send.** `move /a /a/b` is the
+standing example - `fs` now guards it (`path_is_ancestor`, proved exhaustively by the boot selftest)
+but no test drives that guard end to end, because no client will emit the request. Closing it needs a
+second client of `fs` with its own send peer, which is the spawn-authority change this section
+declined to make for a test.
 
 ### Already found, before the suite exists
 
