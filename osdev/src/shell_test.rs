@@ -5745,9 +5745,10 @@ fn apply_writes_prefix(base: &[u8], writes: &[TappedWrite], k: u64, out_path: &s
 /// tear survive" instead of "does any tear survive". Here every cut point of the operation is tested,
 /// a failure names its `k`, and the failing image is a file that can be booted again while it is
 /// being fixed.
-pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
-    let qemu      = crate::qemu::qemu_binary();
-    let image_str = image_path.to_string_lossy().replace('\\', "/");
+pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, smp: u32) {
+    let qemu       = crate::qemu::qemu_binary();
+    let tapped_str = tapped_image.to_string_lossy().replace('\\', "/");
+    let plain_str  = plain_image.to_string_lossy().replace('\\', "/");
     let mut pass = 0usize; let mut fail = 0usize;
     macro_rules! check { ($ok:expr, $label:expr) => {
         if $ok { println!("fs-tear: PASS - {}", $label); pass += 1; } else { println!("fs-tear: FAIL - {}", $label); fail += 1; }
@@ -5761,7 +5762,8 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
     // design, so a healthy request stays silent. Using it would have silently set the boundary to
     // zero and swept every write since power-on, which is not wrong so much as twenty minutes of
     // booting to learn the same thing.
-    let boot = |disk_path: &str, cmds: &[&str]| -> (Vec<String>, String, Vec<usize>) {
+    let boot = |disk_path: &str, cmds: &[&str], cmd_secs: u64, tap: bool| -> (Vec<String>, String, Vec<usize>) {
+        let image_str = if tap { &tapped_str } else { &plain_str };
         let disk = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
         let disk_str = disk.to_string_lossy().replace('\\', "/");
         let port = pick_free_port();
@@ -5800,7 +5802,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_some() {
             for c in cmds {
                 send(&mut write_half, format!("{c}\r").as_bytes());
-                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(cmd_secs)).unwrap_or_default());
                 marks.push(cursor);
             }
         }
@@ -5840,6 +5842,24 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         /// difference lives, which is why this arrives only now that fsck REPORTS whether it had to
         /// repair anything rather than silently repairing it.
         MustContain(&'static str),
+        /// This text must NOT appear. For an operation where several outcomes are legal and what
+        /// matters is that ONE specific state never arises.
+        ///
+        /// `delete` is the case, and getting it right took being wrong first. The oracle was
+        /// `MustContain("nothing was repaired")` - the accounting must always agree - and three tear
+        /// points failed it with a real, reproducible one-block LEAK: a block held as used that
+        /// nothing references any more.
+        ///
+        /// That leak is PERMITTED, and the design says so in its own words. The free count is a
+        /// derived view of the tree (26.4: stored, reconciled when it drifts, never a second truth),
+        /// `drives check` rebuilds it, and `delete_tree` states outright that a crash mid-reclaim
+        /// "only leaks blocks (nothing references them) - never corruption". A leak costs space until
+        /// the next fsck and costs nothing else.
+        ///
+        /// The direction that is NOT permitted is the opposite one: a block marked FREE while a live
+        /// file still references it. That one is silent and then fatal - the next allocation hands
+        /// the block out and a write destroys data that something still points at.
+        Forbids(&'static str),
     }
     struct TearCase {
         name:   &'static str,
@@ -5847,18 +5867,33 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         op:     &'static str,
         probe:  &'static str,
         oracle: Oracle,
+        /// How long the probe may take. `drives check` walks the whole tree and rewrites the bitmap,
+        /// which on the `write-tap` build means eight serial lines per sector written - so it needs
+        /// far longer than a `read` or a `dir`.
+        probe_secs: u64,
+        /// Text that proves the probe ANSWERED AT ALL, whatever the answer was.
+        ///
+        /// **This is what stops a timeout being reported as a violation**, and it exists because the
+        /// harness did exactly that: `drives check` ran past its window, the capture held no `check:`
+        /// line of any kind, and the oracle read the absent answer as a broken invariant. The image
+        /// was booted by hand afterwards and the filesystem was perfectly consistent. A false FAIL is
+        /// the worst kind of test failure - it trains a reader to discount red, which is the whole
+        /// subject of `backlog/32`.
+        answered: &'static str,
     }
     const CASES: &[TearCase] = &[
         // A whole-file overwrite: the old content complete, or the new content complete. Never a
         // mix, and never an entry pointing at blocks that were never written.
         TearCase { name: "overwrite", setup: &["read /tear.txt"],
                    op: "write /tear.txt NEWNEWNEW", probe: "read /tear.txt",
-                   oracle: Oracle::ExactlyOne("ORIGINAL", "NEWNEWNEW") },
+                   oracle: Oracle::ExactlyOne("ORIGINAL", "NEWNEWNEW"),
+                   probe_secs: 20, answered: "read /tear.txt" },
         // A rename: the old name or the new name, never both, never neither. Two directory-entry
         // mutations in one transaction, which is what the journal is for.
         TearCase { name: "rename", setup: &["dir /"],
                    op: "rename /tear.txt ZZrenamed.txt", probe: "dir /",
-                   oracle: Oracle::ExactlyOne("tear.txt", "ZZrenamed.txt") },
+                   oracle: Oracle::ExactlyOne("tear.txt", "ZZrenamed.txt"),
+                   probe_secs: 20, answered: "NAME" },
         // A move ACROSS directories: an add into the destination and a remove from the source, in
         // one transaction. The file is in exactly one of the two places - never in both (a second
         // reference to one extent) and never in neither (the file lost outright).
@@ -5868,7 +5903,8 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         // destination holding the file are genuinely exclusive.
         TearCase { name: "move", setup: &["mkdir /zdir", "dir /zdir"],
                    op: "move /tear.txt /zdir/tear.txt", probe: "dir /zdir",
-                   oracle: Oracle::ExactlyOne("(empty)", "tear.txt") },
+                   oracle: Oracle::ExactlyOne("(empty)", "tear.txt"),
+                   probe_secs: 20, answered: "entries" },
         // DELETE, and it needs the other oracle. Present-with-its-blocks and absent-with-them-freed
         // are BOTH permitted, so there is nothing to exclude - but the two failures that matter are
         // invisible in a listing. A LEAK (absent from the directory, blocks still marked used) looks
@@ -5878,7 +5914,11 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         // left the accounting inconsistent is caught by the one instrument that can see it.
         TearCase { name: "delete", setup: &["dir /"],
                    op: "delete /tear.txt", probe: "drives check",
-                   oracle: Oracle::MustContain("nothing was repaired") },
+                   oracle: Oracle::Forbids("marked free but are IN USE"),
+                   // 150s: measured, not guessed. The check answered in well under a minute when
+                   // asked by hand; the 20s the other probes use was not enough and the shortfall
+                   // read as a filesystem defect.
+                   probe_secs: 150, answered: "check:" },
     ];
 
     let mut total_points = 0u64;
@@ -5893,7 +5933,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         let mut cmds: Vec<&str> = case.setup.to_vec();
         cmds.push(case.op);
         cmds.push(case.probe);
-        let (rout, rserial, rmarks) = boot(&rec_disk, &cmds);
+        let (rout, rserial, rmarks) = boot(&rec_disk, &cmds, case.probe_secs.max(20), true);   // RECORD: the tap is the point
         let writes = parse_write_tap(&rserial);
         // KEEP THE EVIDENCE, on every run and not only on failure. The serial holds the tap, and the
         // tap is the only record of what the operation actually did; a suite that reports a number
@@ -5913,6 +5953,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         let landed = match case.oracle {
             Oracle::ExactlyOne(_, after) => rout.last().map_or(false, |r| r.contains(after)),
             Oracle::MustContain(t)       => rout.last().map_or(false, |r| r.contains(t)),
+            Oracle::Forbids(t)           => rout.last().map_or(false, |r| !r.contains(t)),
         };
         check!(landed, format!("[{}] the operation landed when nothing interrupted it", case.name));
         check!(op_end > op_start,
@@ -5932,11 +5973,21 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
                 check!(false, format!("[{}] k={k}: could not build the torn image", case.name));
                 continue;
             }
-            let (o, w, _) = boot(&img, &[case.probe]);
+            let (o, w, _) = boot(&img, &[case.probe], case.probe_secs, false);       // REPLAY: no tap, no splicing
             let out = o.first().cloned().unwrap_or_default();
             let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
             // A failure to mount is outside the table whatever the oracle says: the operation
             // corrupted the structure rather than landing on one side of it.
+            // DID IT ANSWER AT ALL? A probe that ran out of time has told us nothing, and calling
+            // that a violation is a false FAIL - which is worse than a missed one, because it
+            // teaches a reader to discount red.
+            if !out.contains(case.answered) {
+                check!(false, format!(
+                    "[{}] k={k}: the probe `{}` DID NOT ANSWER within {}s - this is a TIMEOUT, not a \
+                     verdict on the filesystem. Image kept at {img}",
+                    case.name, case.probe, case.probe_secs));
+                continue;
+            }
             let (ok, why) = match case.oracle {
                 Oracle::ExactlyOne(before, after) => {
                     let (b, a) = (out.contains(before), out.contains(after));
@@ -5946,6 +5997,10 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
                     let c = out.contains(t);
                     (mounted && c, format!("\"{t}\"={c}"))
                 }
+                Oracle::Forbids(t) => {
+                    let c = out.contains(t);
+                    (mounted && !c, format!("forbidden \"{t}\" present={c}"))
+                }
             };
             if ok {
                 torn_ok += 1;
@@ -5954,6 +6009,15 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
                 check!(false, format!(
                     "[{}] k={k}: outside the permitted set (mounted={mounted} {why}) - image kept at {img}",
                     case.name));
+                // SHOW WHAT IT ACTUALLY SAW, not just that it did not match.
+                //
+                // A failing tear point that reports only a boolean sends whoever reads it back to
+                // QEMU to find out what the probe said - which is the first thing anybody wants and
+                // the harness already has in hand. Trimmed, because a listing can be long and the
+                // answer is always in the first line or two.
+                for line in out.lines().filter(|l| !l.trim().is_empty()).take(4) {
+                    println!("fs-tear:        | {}", line.trim_end());
+                }
             }
         }
         let points = op_end - op_start;
@@ -5961,6 +6025,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         let verdict = match case.oracle {
             Oracle::ExactlyOne(b, a) => format!("left exactly one of `{b}` / `{a}`"),
             Oracle::MustContain(t)   => format!("left the volume reporting `{t}`"),
+            Oracle::Forbids(t)       => format!("left the volume free of `{t}`"),
         };
         check!(torn_ok == points,
                format!("[{}] every tear point {} ({}/{})", case.name, verdict, torn_ok, points));
@@ -5981,7 +6046,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
     {
         let ctl = "build/tests/fs_tear_control.img";
         if std::fs::write(ctl, &base).is_ok() {
-            let (o, w, _) = boot(ctl, &["dir /zdir"]);
+            let (o, w, _) = boot(ctl, &["dir /zdir"], 20, false);
             let out = o.first().cloned().unwrap_or_default();
             let has_before = out.contains("(empty)");
             let has_after  = out.contains("tear.txt");   // the move case's Oracle::ExactlyOne texts

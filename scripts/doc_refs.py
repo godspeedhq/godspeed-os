@@ -47,6 +47,65 @@ EXEMPT_PREFIXES = ("audits/", "website/book/", "build/", "target/")
 
 PATHISH = re.compile(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+\.(?:rs|md|toml|py|json|gsh))`")
 
+# A BACKLOG CITATION BY NUMBER: `backlog/33`, which is how every one of them is referenced.
+#
+# Two reasons this needs its own pattern and its own scan. It has NO EXTENSION, so `PATHISH` cannot
+# see it - that regex requires one. And it is cited from CODE COMMENTS at least as often as from
+# documents, which nothing scanned at all.
+#
+# Both halves mattered: `services/fs/src/main.rs` cited `backlog/33` for a filesystem limitation, the
+# file did not exist, and the citation read as though the limitation had been recorded. That is the
+# exact failure 26.7 names - a recorded limitation is one the next person can plan around, an
+# unrecorded one is discovered by whoever trusted the document - and it was invisible to every gate
+# this project has.
+BACKLOG_REF = re.compile(r"`?backlog/(\d+)`?")
+
+# Source trees whose COMMENTS cite backlog entries. Only the backlog check runs over these: scanning
+# source for `PATHISH` would match path-shaped string literals and produce noise, and a wrong finding
+# costs a reader their trust in the whole list.
+SOURCE_PATTERNS = [
+    "services/*/src/*.rs",
+    "services/*/src/*/*.rs",
+    "kernel/src/*.rs",
+    "kernel/src/*/*.rs",
+    "kernel/src/*/*/*.rs",
+    "sdk/rust/src/*.rs",
+    "osdev/src/*.rs",
+    "scripts/*.py",
+]
+
+
+def backlog_entries():
+    """The numbers that actually exist: `backlog/29-some-title.md` -> "29"."""
+    found = set()
+    for f in os.listdir(os.path.join(ROOT, "backlog")):
+        m = re.match(r"^(\d+)-.*\.md$", f)
+        if m:
+            found.add(m.group(1))
+    return found
+
+
+def check_backlog_refs():
+    """Every `backlog/NN` cited anywhere must name an entry that exists. Returns a list of misses."""
+    have = backlog_entries()
+    misses = []
+    files = []
+    for pat in PATTERNS + SOURCE_PATTERNS:
+        files += glob.glob(os.path.join(ROOT, pat), recursive=True)
+    files.append(os.path.join(ROOT, "backlog/README.md"))
+    for path in sorted(set(files)):
+        rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
+        if rel.startswith(EXEMPT_PREFIXES):
+            continue
+        try:
+            text = io.open(path, encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for n in set(BACKLOG_REF.findall(text)):
+            if n not in have:
+                misses.append((rel, n))
+    return misses
+
 # Paths named by prose that is ABOUT their removal. Listed one by one rather than matched by a
 # heuristic on the surrounding words, so admitting one is a deliberate act that shows up in a diff -
 # the same reason PLANNED is a list. Each entry is a file that was deleted and whose absence is the
@@ -117,10 +176,27 @@ def main() -> int:
             if not resolves(ref, doc_dir):
                 dead.setdefault(rel, set()).add(ref)
 
-    if not dead:
+    bad_backlog = check_backlog_refs()
+
+    if not dead and not bad_backlog:
         n = len(set(docs))
-        print(f"doc refs: every referenced path resolves ({n} docs scanned)")
+        print(f"doc refs: every referenced path resolves ({n} docs scanned), "
+              f"and every backlog citation names an entry that exists")
         return 0
+
+    if bad_backlog:
+        print(f"doc refs: {len(bad_backlog)} backlog citation(s) name an entry that does not exist\n")
+        for where, n in sorted(bad_backlog):
+            print(f"  {where}")
+            print(f"      -> backlog/{n}  (no backlog/{n}-*.md)")
+        print(
+            "\nA citation of a backlog entry that was never written reads as though the limitation\n"
+            "HAS been recorded, which is worse than not citing it: 26.7's whole point is that a\n"
+            "recorded limitation can be planned around and an unrecorded one is discovered by\n"
+            "whoever trusted the document. Write the entry, or drop the citation.\n"
+        )
+        if not dead:
+            return 1
 
     total = sum(len(v) for v in dead.values())
     print(f"doc refs: {total} reference(s) point at files that do not exist\n")

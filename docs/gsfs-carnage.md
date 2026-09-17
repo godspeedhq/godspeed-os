@@ -63,7 +63,7 @@ outside it unless the caller explicitly asks for the journaled variant.
 | `mkdir` / `mkdir -p` | yes | none of the directories exist, or all of them do |
 | `rename` | yes | the old name, or the new name. Never both, never neither |
 | `move` | yes | in the source directory, or in the destination. Never both, never neither |
-| `delete` | yes | present with its blocks allocated, or absent with its blocks free. Never absent-and-allocated (a leak) or present-and-free (corruption) |
+| `delete` | yes | present with its blocks allocated, absent with them free, or **absent with them still marked used (a LEAK)**. Never present-and-free |
 | `delete-tree` | **per entry** | **a PREFIX of the tree may be gone.** Each entry's removal is atomic; the walk across them is not. The one operation whose partial outcome is a visible, intended state |
 | `seal` | yes | sealed, or not sealed. The `ro_compat` bit and the flag commit together |
 | `label` | yes | old label or new |
@@ -153,6 +153,68 @@ outcome is a prefix rather than an exclusive pair, so the oracle shape changes),
 
 Also the sub-sector variant (`A_k` plus write `k+1` applied to only its first half), which should be
 DETECTED by the CRC - the lower-value half, because `fs-corrupt` already probes that mechanism.
+
+### The delete case: three wrong conclusions, then a real finding
+
+Worth recording in full, because the answer was not visible from any amount of reasoning and each
+wrong turn was corrected by going and looking.
+
+Adding `delete` produced three consecutive FAILs - three reproducible tear points out of 21, in the
+one operation whose failure mode is invisible in a listing. About as much as a result can do to look
+like a real defect.
+
+**Wrong conclusion 1: a timeout.** The capture held no `check:` line of any kind, neither the good
+form nor the bad, which is the signature of no answer rather than a wrong one. So the oracle gained a
+declared ANSWER marker - text that proves the probe replied at all, independent of what it replied -
+and reports a TIMEOUT plainly instead of a verdict on the filesystem. That fix was right and is kept.
+It did not change the result.
+
+**Wrong conclusion 2: the filesystem is fine.** Booting the kept image by hand printed `nothing was
+repaired` and `filesystem is consistent`. Two observations of the same disk disagreeing means one of
+them is not seeing what it thinks, so the next step was the raw bytes rather than the summary:
+
+```
+check: the free count already agreed with the tree - nothing was repairedbtap 21 74 0 31373839...
+```
+
+The phrase is there with a `btap` line spliced into it and no newline between. **The write tap's own
+serial volume - eight lines per sector - was triggering the kernel's known log splice, and the
+oracle's phrase match broke wherever the splice landed inside the phrase.** The instrument was
+corrupting the evidence it was gathering. `services/fs` states the rule that was broken, about its own
+metrics: *"an observer that changes the thing it observes is not an observer."*
+
+The fix is structural rather than a looser match: **two images.** A tapped one to RECORD with, where
+the log volume is the entire point, and a plain one to REPLAY on, where it is pure noise. The replays
+are considerably faster for it as well, and that is most of the suite's wall clock.
+
+**And with the noise gone, a real finding underneath it:**
+
+```
+fs: check - free count DISAGREED with the tree: superblock said 32283 free, the tree says 32284
+    (1 block(s) were held as used but are unreachable - a leak). Repaired.
+```
+
+**Wrong conclusion 3, and this one was mine from the start: that the leak is a defect.** It is not,
+and the permitted-outcome table above was wrong to forbid it. The free count is a DERIVED VIEW of the
+tree - §26.4's "stored, but not a second truth", reconciled when it drifts - `drives check` rebuilds
+it from the tree, and `delete_tree` says outright that a crash mid-reclaim "only leaks blocks (nothing
+references them) - never corruption". A leak costs space until the next fsck and costs nothing else.
+
+The direction that is genuinely forbidden is the opposite: a block marked FREE while a live file still
+references it. That one is silent and then fatal, because the next allocation hands the block out and
+a write destroys data something still points at. So the oracle is now `Forbids("marked free but are IN
+USE")`, which encodes the dangerous state directly rather than demanding perfect accounting.
+
+**What this cost and what it bought.** It cost four runs of a twelve-minute suite and a hand-boot. It
+bought: a harness that can tell a timeout from a verdict, an instrument that no longer perturbs its
+own measurement, a corrected row in the outcome table, and the knowledge that a one-block leak is
+reachable after a torn delete - which is now a documented property rather than a surprise waiting for
+somebody with a power cut.
+
+**And it is only knowable because fsck reports its repairs.** That change was made earlier the same
+day for an unrelated reason - a silent repair is a §26.7 violation - and it is what made this visible
+at all. Before it, `drives check` would have corrected the leak and said nothing, and this test could
+not have been written.
 
 **And not a SIGKILL of QEMU.** It is the more realistic power cut and the worse oracle: not
 reproducible, so a failure cannot be bisected, and a pass proves only that one timing was survivable.
