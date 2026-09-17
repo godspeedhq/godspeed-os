@@ -169,6 +169,10 @@ const FS_OK: u8 = 0;
 ///
 /// Distinct from 0 on purpose: 0 is what a caller sends who has not thought about tags, and it is also
 /// `FS_OK`, a collision that has already hidden one bug in this file.
+/// Telling `fs` the wall clock: `[FS_CLOCK_PUSH, epoch:i64]`, one way, no reply capability.
+/// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
+const FS_CLOCK_PUSH: u8 = 0xC1;
+
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 /// How often to retry loading the floor while it has not been loaded yet.
@@ -413,6 +417,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // now that it maintains something. The moment a sync succeeded every condition went false, the
         // loop blocked on `recv`, and the next re-sync could only happen if somebody happened to ask
         // the time - which on an idle machine is never. A clock that maintains itself has to wake up.
+        // ---- TELL `fs` THE TIME, so a file can carry a date ----
+        //
+        // A PUSH, not an answer to a question, and the direction is the whole design. `fs` serves
+        // clients on the endpoint it would have to await a reply on, so a request/reply the other
+        // way could dequeue a client's request and mistake it for the answer (`backlog/31`, one
+        // service over, days of debugging). And this service already sends to `fs`, so a call back
+        // from `fs` would be the mutual-send shape §8.9 forbids.
+        //
+        // `try_send` with no reply capability: nothing is awaited, an `fs` that is busy or absent
+        // costs nothing, and the message is recognisable to `fs` precisely BECAUSE it carries no cap
+        // (its `FS_CLOCK_PUSH`). Sent on the ordinary loop tick - a stamp a few seconds stale is
+        // exactly as useful, and `fs` stops believing a reading it has carried too long anyway.
+        // NOT gated on being network-synced. A machine that has never seen the network still knows
+        // something: the floor adopted from `/clock.last`, which only ever moves forward. A file
+        // stamped from the floor carries an approximate but HONEST date, and that is strictly better
+        // than "unknown" - which is reserved for a machine that genuinely has no idea.
+        {
+            let now = clock.now(&ctx);
+            if now > 0 {
+                let mut push = [0u8; 9];
+                push[0] = FS_CLOCK_PUSH;
+                push[1..9].copy_from_slice(&now.to_le_bytes());
+                if ctx.try_send("fs", &Message::from_bytes(&push)).is_err() {
+                    // A stale cap after an `fs` restart presents as a failed send, not as silence
+                    // (§14.3). Reacquire and let the next tick carry it - never retry in a loop here.
+                    let _ = ctx.reacquire_by_name("fs");
+                }
+            }
+        }
         let wake_ms = if unsynced || !floor_settled || store_left > 0 {
             FLOOR_RETRY_MS
         } else {

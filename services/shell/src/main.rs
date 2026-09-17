@@ -1090,12 +1090,12 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     for _ in 0..count {
         if i >= rn { break; }
         let nl = rbuf[i] as usize; i += 1;
-        if i + nl + 9 > rn { break; }                 // entry = name_len, name, is_dir, size:u64
+        if i + nl + 13 > rn { break; }                // entry = name_len, name, is_dir, size:u64, mtime:u32
         let is_dir = rbuf[i + nl] != 0;
         if rbuf[i..i + nl].starts_with(leaf) && n < hits.len() {
             hits[n] = PathHit { off: i, len: nl, is_dir }; n += 1;
         }
-        i += nl + 9;
+        i += nl + 13;
     }
     if n == 0 { return; }
     let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
@@ -1681,7 +1681,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
         "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
-        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, out),
+        "ls"      => cmd_ls(ctx, cwd, &args[1..argc.min(args.len())], out),
         "edit"    => cmd_edit(ctx, cwd, s["edit".len()..].trim()),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "fmt"     => cmd_fmt(ctx, cwd, s["fmt".len()..].trim()),
@@ -6762,11 +6762,14 @@ fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
         i += 1;
-        if i + nl + 1 + 8 > p.len() { break; }
+        // GSFS0009: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
+        // four bytes wider than the 0008 layout. Every consumer of this reply must step by the same
+        // stride or it reads the NEXT entry's name out of this one's timestamp.
+        if i + nl + 1 + 8 + 4 > p.len() { break; }
         let name = t.intern(&p[i..i + nl]);
         let is_dir = p[i + nl] != 0;
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        i += nl + 1 + 8;
+        i += nl + 1 + 8 + 4;
         let kind = t.intern(if is_dir { b"dir" } else { b"file" });
         let sz = if is_dir { Value::Empty } else { Value::Int(size) };
         t.add_row(&[name, kind, sz]);
@@ -6942,11 +6945,11 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
             let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout ls reads
-            i += nl + 1 + 8;
+            i += nl + 1 + 8 + 4;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(tb, name) } else { contains(name, tb) };
@@ -11953,9 +11956,113 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 }
 
 /// `ls [path]` - list a directory.
-fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+/// A byte count rendered either raw or in KiB/MiB, for the terse `ls` column.
+///
+/// A type rather than a formatting branch at each call site, so the two `ls` layouts cannot drift
+/// into showing sizes differently from one another.
+struct HumanSize(u64, bool);
+/// The same, right-aligned into the `ls long` column - digits that do not line up are not a column.
+struct HumanSizeR(u64, bool);
+
+impl core::fmt::Display for HumanSize {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !self.1 { return write!(f, "{} B", self.0); }
+        human_bytes(f, self.0)
+    }
+}
+
+impl core::fmt::Display for HumanSizeR {
+    /// **Renders into a small buffer and then `pad`s.** A `Display` impl that writes straight to the
+    /// formatter SILENTLY IGNORES a width - `{:>10}` does nothing unless the impl asks for it - so
+    /// the column came out ragged and a column of ragged numbers is not a column. `f.pad` is what
+    /// applies the caller's width and alignment.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write as _;
+        let mut b = FixedStr::<16>::new();
+        if self.1 { let _ = human_bytes(&mut b, self.0); } else { let _ = write!(&mut b, "{}", self.0); }
+        f.pad(b.as_str())
+    }
+}
+
+/// A tiny stack string, so a `Display` impl can render itself before padding. No heap (§26.6.1);
+/// anything that does not fit is simply not written, which for a byte count cannot happen.
+struct FixedStr<const N: usize> { buf: [u8; N], len: usize }
+
+impl<const N: usize> FixedStr<N> {
+    fn new() -> Self { FixedStr { buf: [0u8; N], len: 0 } }
+    fn as_str(&self) -> &str { core::str::from_utf8(&self.buf[..self.len]).unwrap_or("?") }
+}
+
+impl<const N: usize> core::fmt::Write for FixedStr<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = N.saturating_sub(self.len);
+        let take = s.len().min(room);
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// KiB/MiB/GiB with one decimal, or plain bytes under 1 KiB.
+///
+/// Integer arithmetic only: this is a `no_std` service and there is no float formatting to reach for
+/// even if floats were wanted here (§26.6.1 - the bounded shape is also the simpler one).
+fn human_bytes<W: core::fmt::Write>(f: &mut W, n: u64) -> core::fmt::Result {
+    const K: u64 = 1024;
+    if n < K { return write!(f, "{} B", n); }
+    let (unit, div) = if n < K * K { ("KiB", K) }
+                      else if n < K * K * K { ("MiB", K * K) }
+                      else { ("GiB", K * K * K) };
+    let whole = n / div;
+    let tenth = (n % div) * 10 / div;
+    write!(f, "{}.{} {}", whole, tenth, unit)
+}
+
+/// A modification time, or the honest absence of one.
+enum TimeCol {
+    At(Datetime),
+    /// This volume records no time for the entry - a GSFS0008 file, or one written while no clock
+    /// was known. Printed as `unknown`, never as an epoch date: a wrong date is worse than none.
+    Unknown,
+}
+
+impl core::fmt::Display for TimeCol {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TimeCol::Unknown => f.pad("unknown"),
+            TimeCol::At(d) => {
+                use core::fmt::Write as _;
+                let mut b = FixedStr::<24>::new();
+                let _ = write!(&mut b, "{:04}-{:02}-{:02} {:02}:{:02}",
+                               d.year, d.month, d.day, d.hour, d.minute);
+                f.pad(b.as_str())
+            }
+        }
+    }
+}
+
+/// Read a little-endian u32 from a slice, mirroring `u64_le`.
+fn u32_le(b: &[u8]) -> u32 {
+    if b.len() < 4 { return 0; }
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
+    // WORDS, NOT FLAGS (`utilities/0_conventions.md` rule 4): `ls long human`, never `ls -lh`. Any
+    // order, and mixable with a path, because an order a person has to remember is one they will
+    // guess wrong.
+    let mut long = false;
+    let mut human = false;
+    let mut path_arg = "";
+    for tok in args.iter() {
+        match *tok {
+            "long" => long = true,
+            "human" => human = true,
+            t => if path_arg.is_empty() { path_arg = t; },
+        }
+    }
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    let path = match resolve_or_err(ctx, cwd, path_arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
         ReqOutcome::Reply(r) => r,
         ReqOutcome::Aborted => return Ok(()),
@@ -11978,13 +12085,16 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), She
     }
     let count = p[1] as usize;
     out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
-    if count > 0 { out.line(ctx, "  NAME                  TYPE   SIZE"); }
+    if count > 0 {
+        if long { out.line(ctx, "  NAME                  TYPE        SIZE  MODIFIED"); }
+        else    { out.line(ctx, "  NAME                  TYPE   SIZE"); }
+    }
     let mut i = 2usize;
     for _ in 0..count {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
         i += 1;
-        if i + nl + 1 + 8 > p.len() { break; }
+        if i + nl + 1 + 8 + 4 > p.len() { break; }
         // A NAME IS UNTRUSTED INPUT, AND THIS IS WHERE IT MEETS A TERMINAL.
         //
         // `fs` refuses to CREATE a name carrying control bytes, but a disk prepared elsewhere
@@ -12002,11 +12112,30 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), She
         let name = core::str::from_utf8(&safe[..shown]).unwrap_or("?");
         let is_dir = p[i + nl] != 0;
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        i += nl + 1 + 8;
-        if is_dir {
-            out.line_fmt(ctx, format_args!("  {:<20}  dir    -", name));
+        let mtime = u32_le(&p[i + nl + 9..i + nl + 13]);
+        i += nl + 1 + 8 + 4;
+        if !long {
+            // The terse default is unchanged, deliberately: `ls` is read far more often than it is
+            // studied, and a wall of columns is worse for the common case (conventions rule 7).
+            if is_dir {
+                out.line_fmt(ctx, format_args!("  {:<20}  dir    -", name));
+            } else {
+                out.line_fmt(ctx, format_args!("  {:<20}  file   {}", name, HumanSize(size, human)));
+            }
+            continue;
+        }
+        // `ls long`: type, size and WHEN. A time this volume does not record prints as "unknown"
+        // rather than as 1970 - an absent date is honest and a wrong one is not (GSFS0009).
+        let when = if mtime == 0 {
+            TimeCol::Unknown
         } else {
-            out.line_fmt(ctx, format_args!("  {:<20}  file   {} B", name, size));
+            TimeCol::At(Datetime::from_epoch_secs(mtime as i64))
+        };
+        if is_dir {
+            out.line_fmt(ctx, format_args!("  {:<20}  dir   {:>10}  {}", name, "-", when));
+        } else {
+            out.line_fmt(ctx, format_args!("  {:<20}  file  {:>10}  {}",
+                                           name, HumanSizeR(size, human), when));
         }
     }
     if count == 0 { out.line(ctx, "  (empty)"); }
@@ -13196,10 +13325,10 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
+            i += nl + 1 + 8 + 4; // name_len + name + is_dir + size:u64 + mtime:u32
             let mut schild = [0u8; PATH_MAX];
             let clen = match join_path(&sbuf[..slen], name, &mut schild) { Some(c) => c, None => continue };
             let mut dchild = [0u8; PATH_MAX];
@@ -13396,10 +13525,10 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
+            i += nl + 1 + 8 + 4; // name_len + name + is_dir + size:u64 + mtime:u32
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
@@ -13493,7 +13622,7 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
             if i + 1 + nl + 1 + 8 > p.len() { break; }
             offs[nc] = i;
             nc += 1;
-            i += 1 + nl + 1 + 8;
+            i += 1 + nl + 1 + 8 + 4;
         }
         for k in (0..nc).rev() {
             let off = offs[k];

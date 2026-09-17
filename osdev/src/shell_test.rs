@@ -5584,6 +5584,28 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!listing.contains("[2J"),
            "`ls` did not emit a raw ESC sequence that came from a FILENAME");
 
+    // ---- TIMESTAMPS (GSFS0009) and the migration story, in one listing ----
+    //
+    // `canary.txt` was baked host-side into a 0008 image, so no time was ever recorded for it.
+    // `/fz/real.txt` was written by this machine moments ago. Both are in the same tree, and
+    // `ls long` must tell the truth about each: a real date for the one that has one, and the word
+    // `unknown` for the one that does not - never 1970, because a wrong date is worse than no date.
+    let listing = answered!("ls long /", "ls long on a tree holding both timed and untimed entries");
+    check!(listing.contains("MODIFIED"), "`ls long` prints a MODIFIED column");
+    check!(listing.contains("unknown"),
+           "an entry from a 0008 volume reads as `unknown`, not as an epoch date");
+    // A file written AFTER the clock arrived. `fs` learns the time from a push by `time`, so a file
+    // created before that push legitimately carries no date - which is the correct behaviour and not
+    // something to assert against. The clock link announces itself, so wait for it rather than race.
+    check!(String::from_utf8_lossy(&buf.lock().unwrap()).contains("wall clock received"),
+           "fs received the wall clock from `time`");
+    answered!("write /fz/dated.txt now", "a file written after the clock arrived");
+    let fzl = answered!("ls long /fz", "ls long on files this machine created");
+    check!(fzl.contains("20") && !fzl.contains("1970"),
+           "a file written after the clock arrived carries a REAL date, not 1970");
+    let human = answered!("ls long human /", "ls long human");
+    check!(human.contains("KiB") || human.contains(" B"), "`ls human` renders sizes in units");
+
     // ---- The filesystem must still be intact. That is the whole point of the suite. ----
     let chk = answered!("drives check", "fsck after the assault");
     check!(chk.contains("consistent") || chk.contains("ok"), "the filesystem is CONSISTENT after every hostile request");

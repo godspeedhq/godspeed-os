@@ -94,6 +94,57 @@ const REC_SIZE: usize = 64;
 const RECS_PER_BLOCK: usize = 7; // 7×64 = 448 bytes of records + a 64-byte CRC trailer
 const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 - CRC covers [0..448)
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 - u32 CRC32 of the record region
+
+// ---- TIMESTAMPS (GSFS0009), in the 60 bytes every directory block already wasted ----
+//
+// A 64-byte record is FULL: type @0, name_len @1, name[38] @2, size @40, first @48, count @56.
+// There is not one spare byte in it, so times could not go there without shrinking `NAME_MAX` or
+// doubling the record and halving how many entries a directory block holds.
+//
+// They did not have to. Seven 64-byte records are 448 bytes and the CRC is a u32 at 448, so a
+// 512-byte directory block has carried **60 unused bytes at 452 since the format was written**.
+// Two u32 times for each of seven records is 56 of them.
+//
+// **The placement is what makes this a `compat` feature rather than a reformat.** The record CRC
+// still covers exactly `[0..448)` and still lives at 448, so a GSFS0008 build reads a 0009
+// directory perfectly and never looks past the CRC it knows about. The times get their OWN CRC, so
+// a 0009 build reading a 0008 volume sees the mismatch and reports the times as UNKNOWN rather than
+// inventing 1970 - a wrong date being worse than an absent one.
+//
+// u32 epoch seconds: good to 2106, four bytes instead of eight, and the difference is what let both
+// times fit beside a CRC. Recorded rather than left to be discovered.
+const DIR_TIMES_OFF: usize = 452;      // 7 x (mtime:u32, ctime:u32)
+const DIR_TIME_PAIR: usize = 8;
+const DIR_TIMES_REGION: usize = RECS_PER_BLOCK * DIR_TIME_PAIR; // 56
+const DIR_TIMES_CRC_OFF: usize = DIR_TIMES_OFF + DIR_TIMES_REGION; // 508
+const _: () = assert!(DIR_TIMES_CRC_OFF + 4 <= BLOCK,
+    "the times region and its CRC must fit inside one block");
+const _: () = assert!(DIR_TIMES_OFF >= DIR_CRC_OFF + 4,
+    "the times region must start after the record CRC, or it would corrupt what 0008 reads");
+
+/// `time` telling `fs` what the wall clock says: `[FS_CLOCK_PUSH, epoch:i64]`, ONE WAY.
+///
+/// **`fs` must never ASK for the clock, and this is why it is a push.** Two independent reasons, and
+/// either alone would settle it:
+///
+/// 1. `time` already sends to `fs` (it persists `/clock.last`). A synchronous call the other way is
+///    the mutual-send shape §8.9 forbids, which the kernel will neither detect nor recover.
+/// 2. `fs` serves its clients on the very endpoint it would have to await the reply on, so a
+///    request/reply wait here could DEQUEUE A CLIENT'S REQUEST and mistake it for the answer. That
+///    is not hypothetical - it is `backlog/31`, one service over, and it cost days.
+///
+/// A push has neither problem: nothing is awaited, so nothing can be eaten and nothing can block.
+/// It arrives with no reply capability, which is what distinguishes it from every real request and
+/// is the same shape `net-stack` already uses for `time`'s sync nudge.
+const FS_CLOCK_PUSH: u8 = 0xC1;
+
+/// How long a pushed clock reading is carried forward on the monotonic counter before `fs` stops
+/// trusting it. `time` pushes far more often than this; the bound exists so that a `time` which has
+/// died cannot leave `fs` stamping files from an ever-staler reading forever.
+const CLOCK_MAX_AGE_S: i64 = 300;
+
+/// A time this volume does not record. Displayed as "unknown", never as an epoch date.
+const TIME_UNKNOWN: u32 = 0;
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
 // Crash-consistency journal region (GSFS0008 geometry). Fixed size, bounded (§26.6): a
@@ -355,6 +406,10 @@ struct Fs {
     /// RATIO of the two is what matters, and a ratio needs no cycles-per-second - which is why it is
     /// measured this way on a board whose TSC calibration is not trustworthy.
     blk_cycles: core::cell::Cell<u64>,
+    /// The cached wall clock: `(epoch_seconds, the monotonic second it was read)`. `Cell` because
+    /// stamping happens on `&self` paths, and owned by `Fs` rather than a static (invariant 9).
+    /// See `now_epoch` and `CLOCK_REFRESH_S`.
+    clock: core::cell::Cell<(u32, i64)>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
     /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
@@ -638,6 +693,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (Commandment VIII). The mount above already self-reconciled on block-driver's truth, so we
     // come up either mounted or on a genuinely raw/unreadable disk; if block-driver restarts at run
     // time, `serve` reacquires it by name and the client retries (§14.3).
+    let mut clock_push_seen = false;
     ctx.log("fs: serving file API");
     // PUBLISHED EVERY 32 REQUESTS, not every one. A metric that costs an IPC send per request would
     // double this service's traffic to measure it, and an observer that changes the thing it observes
@@ -741,7 +797,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         let reply = match ctx.take_pending_cap() {
             Some(c) => c,
-            None => continue,
+            None => {
+                // NO REPLY CAPABILITY. A real request always carries one, so this is either the
+                // clock `time` pushes (see `FS_CLOCK_PUSH`) or something that cannot be answered.
+                let pl = msg.payload_bytes();
+                if pl.len() >= 9 && pl[0] == FS_CLOCK_PUSH {
+                    // SAY IT ONCE. Before this line there was no way to tell "the clock link works"
+                    // from "every file is stamped unknown and nobody knows why" - and a file written
+                    // before the first push legitimately HAS no date, so an operator needs to know
+                    // when the link came up to read a listing correctly.
+                    if !clock_push_seen {
+                        clock_push_seen = true;
+                        ctx.log("fs: wall clock received from `time` - entries written from now on carry a date");
+                    }
+                    if let Some(f) = fs.as_ref() {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&pl[1..9]);
+                        f.clock_push(&ctx, i64::from_le_bytes(b));
+                    }
+                }
+                continue;
+            }
         };
         match badge {
             Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable,
@@ -1772,6 +1848,7 @@ impl Fs {
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
+            clock: core::cell::Cell::new((0, 0)),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -1929,10 +2006,11 @@ impl Fs {
         Some(blk)
     }
 
-    /// Directory-block write: stamp the CRC trailer, then stage/through via `tb_write`.
+    /// Directory-block write: stamp both CRC trailers, then stage/through via `tb_write`.
     fn td_write(&mut self, ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
         let c = crc32(&blk[..DIR_REC_REGION]);
         blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+        dir_times_stamp(blk);
         self.tb_write(ctx, lba, blk)
     }
 
@@ -2326,6 +2404,7 @@ impl Fs {
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
+            clock: core::cell::Cell::new((0, 0)),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -2701,6 +2780,11 @@ impl Fs {
             for slot in 0..RECS_PER_BLOCK {
                 if blk[slot * REC_SIZE] == ITYPE_FREE {
                     encode_rec(&mut blk, slot, itype, name, size, first, count);
+                    // A new entry is modified and created at the same instant, so both times are
+                    // the same now. A clock that cannot be reached yields TIME_UNKNOWN and the
+                    // entry simply carries no date - never an invented one.
+                    let now = self.now_epoch(ctx);
+                    dir_times_set(&mut blk, slot, now, now);
                     if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
@@ -2711,6 +2795,8 @@ impl Fs {
         let block = dir.first_block + dir.block_count - 1;
         let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
         encode_rec(&mut blk, 0, itype, name, size, first, count);
+        let now = self.now_epoch(ctx);
+        dir_times_set(&mut blk, 0, now, now);
         if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
         Ok(())
     }
@@ -2745,6 +2831,17 @@ impl Fs {
             Some(loc) => {
                 let mut blk = self.td_read(ctx, loc.block).ok_or("record read failed")?;
                 let o = loc.slot * REC_SIZE;
+                // THE OLD SIZE IS ALREADY IN HAND, so the two times can be told apart precisely
+                // rather than coarsely. A changed size is a change to the CONTENT (mtime and ctime);
+                // a changed extent alone - a directory growing, a file relocating - is a change to
+                // the RECORD (ctime only). That distinction is the whole reason `ctime` is recorded
+                // separately: it answers "was this file edited, or just moved about?", which a backup
+                // and `drives check` both care about and a single timestamp cannot express.
+                let old_size = u64_at(&blk, o + 40);
+                let (old_m, _) = dir_times_get(&blk, loc.slot);
+                let now = self.now_epoch(ctx);
+                let mtime = if e.size != old_size { now } else { old_m };
+                dir_times_set(&mut blk, loc.slot, mtime, now);
                 blk[o + 40..o + 48].copy_from_slice(&e.size.to_le_bytes());
                 blk[o + 48..o + 56].copy_from_slice(&e.first_block.to_le_bytes());
                 blk[o + 56..o + 64].copy_from_slice(&e.block_count.to_le_bytes());
@@ -2994,7 +3091,13 @@ impl Fs {
         Some(n)
     }
 
-    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64}…]`, one block.
+    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64, mtime:u32}…]`, one block.
+    ///
+    /// The `mtime` is GSFS0009's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
+    /// client renders that as "unknown" rather than as a date. Four bytes per entry is the cost, out
+    /// of a one-block reply: a listing that used to fit ~30 entries fits ~26, and a directory with
+    /// more than that was already being truncated by this bound. `backlog/33` records that ceiling,
+    /// which predates this change and is not made materially worse by it.
     fn list_dir(&self, ctx: &ServiceContext, path: &[u8]) -> Option<[u8; BLOCK]> {
         let d = self.walk(ctx, path)?;
         if d.itype != ITYPE_DIR { return None; }
@@ -3010,12 +3113,14 @@ impl Fs {
                 if t == ITYPE_FREE { continue; }
                 let nl = blk[o + 1] as usize;
                 if nl == 0 || nl > NAME_MAX { continue; }
-                if w + 1 + nl + 1 + 8 > BLOCK { break; }
+                if w + 1 + nl + 1 + 8 + 4 > BLOCK { break; }
                 out[w] = nl as u8;
                 out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 2..o + 2 + nl]);
                 out[w + 1 + nl] = (t == ITYPE_DIR) as u8;
                 out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&blk[o + 40..o + 48]); // size:u64
-                w += 1 + nl + 1 + 8;
+                let (mtime, _) = dir_times_get(&blk, slot);
+                out[w + 10 + nl..w + 14 + nl].copy_from_slice(&mtime.to_le_bytes());
+                w += 1 + nl + 1 + 8 + 4;
                 count += 1;
             }
         }
@@ -3111,6 +3216,26 @@ impl Fs {
     }
 
     /// Resolve a delegated resource id → its file path (copied out so `self` can be reborrowed).
+    /// The wall clock NOW, as epoch seconds, for stamping a record. See `CLOCK_REFRESH_S`.
+    ///
+    /// Never blocks and never fails: a clock that cannot be reached yields `TIME_UNKNOWN`, and a
+    /// record stamped with it reads back as "unknown" rather than as 1970.
+    fn now_epoch(&self, ctx: &ServiceContext) -> u32 {
+        let (epoch, at) = self.clock.get();
+        if epoch == 0 { return TIME_UNKNOWN; }          // nobody has told us the time yet
+        let age = ctx.epoch_secs_monotonic().saturating_sub(at);
+        if age < 0 || age > CLOCK_MAX_AGE_S { return TIME_UNKNOWN; }
+        epoch.saturating_add(age as u32)
+    }
+
+    /// Accept a clock reading pushed by `time`. See `FS_CLOCK_PUSH`.
+    fn clock_push(&self, ctx: &ServiceContext, epoch: i64) {
+        // Refuse a value that cannot be a date. A clock this service cannot believe leaves the cache
+        // alone, so files keep reading "unknown" rather than acquiring a nonsense stamp.
+        if epoch <= 0 || epoch >= u32::MAX as i64 { return; }
+        self.clock.set((epoch as u32, ctx.epoch_secs_monotonic()));
+    }
+
     /// Was this resource opened APPEND-ONLY? See `OPEN_APPEND_ONLY`.
     fn open_is_append_only(&self, rid: u64) -> bool {
         self.open_files.iter().any(|o| o.rid != 0 && o.rid == rid && o.append_only)
@@ -3596,6 +3721,38 @@ fn guard_selftest(ctx: &ServiceContext) {
     } else {
         ctx.log_fmt(format_args!("fs: path guard selftest FAILED - {} of {} checks", fail, pass + fail));
     }
+}
+
+/// Stamp the times region's own CRC. Called by every directory-block write.
+///
+/// **A GSFS0008 volume is upgraded in place by this, and harmlessly.** Its times region is all
+/// zeros, so the first write stamps a valid CRC over zeros - and zero IS `TIME_UNKNOWN`, so every
+/// pre-existing entry keeps reading back as "unknown" while entries written from now on carry real
+/// times. No migration pass, no reformat, and no date invented for a file whose date nobody knows.
+fn dir_times_stamp(blk: &mut [u8; BLOCK]) {
+    let c = crc32(&blk[DIR_TIMES_OFF..DIR_TIMES_CRC_OFF]);
+    blk[DIR_TIMES_CRC_OFF..DIR_TIMES_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+}
+
+/// A slot's `(mtime, ctime)`, or `TIME_UNKNOWN` for a volume that does not record them.
+///
+/// The times carry their own CRC precisely so this question has an honest answer: a region that
+/// fails it is not believed, and "unknown" is reported instead of a date read out of noise.
+fn dir_times_get(blk: &[u8; BLOCK], slot: usize) -> (u32, u32) {
+    if slot >= RECS_PER_BLOCK { return (TIME_UNKNOWN, TIME_UNKNOWN); }
+    if u32_at(blk, DIR_TIMES_CRC_OFF) != crc32(&blk[DIR_TIMES_OFF..DIR_TIMES_CRC_OFF]) {
+        return (TIME_UNKNOWN, TIME_UNKNOWN);
+    }
+    let o = DIR_TIMES_OFF + slot * DIR_TIME_PAIR;
+    (u32_at(blk, o), u32_at(blk, o + 4))
+}
+
+/// Set a slot's times. The CRC is stamped by the write path, not here, so a caller cannot forget it.
+fn dir_times_set(blk: &mut [u8; BLOCK], slot: usize, mtime: u32, ctime: u32) {
+    if slot >= RECS_PER_BLOCK { return; }
+    let o = DIR_TIMES_OFF + slot * DIR_TIME_PAIR;
+    blk[o..o + 4].copy_from_slice(&mtime.to_le_bytes());
+    blk[o + 4..o + 8].copy_from_slice(&ctime.to_le_bytes());
 }
 
 /// Does `dst` name `src` itself, or something beneath it?
@@ -4084,6 +4241,7 @@ fn block_flush(ctx: &ServiceContext) -> bool {
 fn dir_write(ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
     let c = crc32(&blk[..DIR_REC_REGION]);
     blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+    dir_times_stamp(blk);
     block_write(ctx, lba, blk)
 }
 
