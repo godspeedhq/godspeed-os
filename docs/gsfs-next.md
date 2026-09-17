@@ -342,3 +342,8 @@ Recorded so it is not rediscovered as an omission (§26.7):
 
 A hardware pass on the five boards confirms at the end. It is not needed along the way, and this plan
 is deliberately arranged so that it is not.
+
+**The checklist for it is `docs/gsfs-hardware-pass.md`**, written while this work was fresh. Two of
+its items are NOT confirmations: the cross-ISA handoff and the Pi 2's durability warning cannot be
+answered in QEMU at all (`backlog/34`), so for those the boards are the only instrument rather than a
+second opinion.
