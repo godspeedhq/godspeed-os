@@ -1,0 +1,65 @@
+name: storage
+
+# The fourteen `fs` suites, in one run (`backlog/32`).
+#
+# WHY THIS EXISTS: two of them were RED on `main` at the commit released as v0.18.0, and nothing
+# noticed. Not one `fs` suite runs in any other gate - `identity.yml` runs the identity suite and
+# `fuzz.yml` the fuzz suites, and that is the whole of `osdev test` in CI. So the subsystem whose
+# failure mode is losing the user's data had the deepest test coverage in the project and the least
+# reporting. Neither red suite was a filesystem bug; both were assertions that had gone stale, and
+# they would have stayed red indefinitely.
+#
+# `workflow_dispatch` ONLY, matching `identity.yml`, and that is deliberate rather than an oversight:
+# the push trigger there is paused with the note "re-add push/branches: [main] when CI minutes are
+# available", and this run is ~12 minutes. Adding it to every push would spend exactly what that note
+# is conserving. When the minutes are there, add `push: branches: [main]` here at the same time.
+
+on:
+  workflow_dispatch:  # paused like identity.yml: re-add push/branches: [main] with it
+
+jobs:
+  storage:
+    name: Every fs suite (osdev test fs-all)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45     # the run is ~12 min; the margin is for a cold cache and a slow runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install QEMU and build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y qemu-system-x86 gcc
+
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Download and set up Limine
+        run: |
+          mkdir -p tools/limine
+          curl -fsSL \
+            https://github.com/limine-bootloader/limine/releases/download/v12.2.0/limine-binary.tar.gz \
+            | tar -xz --strip-components=1 -C tools/limine
+          make -C tools/limine limine
+          chmod +x tools/limine/limine
+
+      - name: Run every fs suite
+        run: cargo run -p osdev --release -- test fs-all
+
+      # ON FAILURE, KEEP EVERYTHING. `fs-all` writes each suite's full output to
+      # build/tests/fs_all_<name>.log and the suites write their own serial captures beside it. A
+      # storage failure is usually diagnosed from the serial log rather than from the tally, and a
+      # QEMU run that is gone cannot be re-read.
+      - name: Upload every suite's output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-logs-${{ github.sha }}
+          path: build/tests/

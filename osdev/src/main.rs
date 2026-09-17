@@ -1391,6 +1391,7 @@ fn cmd_test(suite: &str) {
         "fs-fuzz"      => run_fs_fuzz_test(),
         "fs-time"      => run_fs_time_test(),
         "fs-hostile"   => run_fs_hostile_test(),
+        "fs-all"       => run_fs_all_tests(),
         "fs-compat"    => run_fs_compat_test(),
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
@@ -2725,6 +2726,84 @@ fn run_fs_check_test() {
 /// already gone, somebody wrote over it. It is that **`fs` never panics, never hangs, and never
 /// serves a wrong answer as a right one.** A machine that refuses a corrupt tree is working; a
 /// machine that walks a crafted cycle forever, or reads a block outside the disk, is not.
+/// Every `fs` suite, one command, one tally - `backlog/32`.
+///
+/// **This exists because two of them were RED on `main` and nobody noticed.** The storage stack is
+/// the one subsystem whose failure mode is losing the user's data, it has the deepest test coverage
+/// in the project, and none of it runs in any gate before a merge. The suites were run by hand when
+/// somebody was working on storage, and rotted quietly in between: `fs-check` had been pinning a
+/// free-block count that two later features invalidated, and `fs-corrupt` had been matching one of
+/// two correct log sentences. Neither was a filesystem bug. Both were red for months.
+///
+/// A meta-suite does not make anything automatic, and that is the honest limit of it - the gate
+/// question is still open in `backlog/32`. What it does is remove the excuse: running all fourteen
+/// is now one command rather than fourteen, and a person or a workflow has a single thing to call.
+///
+/// **Each suite runs as a SUBPROCESS, deliberately.** They call `std::process::exit` on failure, so
+/// calling them in-process would let the first failure kill the run and hide every suite after it -
+/// which is the exact shape of problem this is meant to end. Isolated, one failure costs one line
+/// and the rest still report.
+fn run_fs_all_tests() {
+    // Ordered cheapest-first so a broken build or a broken mount is reported in a minute rather than
+    // at the end of a long run.
+    const SUITES: &[&str] = &[
+        "fs-restart", "fs-check", "fs-scrub", "fs-corrupt", "fs-compat",
+        "fs-journal", "fs-djournal", "fs-ioretry", "fs-frag", "fs-large",
+        "file-cap", "fs-fuzz", "fs-hostile", "fs-time",
+    ];
+    println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
+    println!("fs-all: {} suites, each in its own process\n", SUITES.len());
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => { eprintln!("fs-all: cannot find my own binary: {e}"); std::process::exit(1); }
+    };
+    let started = std::time::Instant::now();
+    let mut failed: Vec<&str> = Vec::new();
+
+    for (i, name) in SUITES.iter().enumerate() {
+        print!("fs-all: [{:>2}/{}] {:<12} ", i + 1, SUITES.len(), name);
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let t0 = std::time::Instant::now();
+        let log = format!("build/tests/fs_all_{name}.log");
+        let out = std::process::Command::new(&exe).args(["test", name]).output();
+        let secs = t0.elapsed().as_secs();
+        match out {
+            Ok(o) => {
+                // The full output goes to a file either way: a PASS nobody reads still carries the
+                // numbers somebody will want when the next one fails.
+                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+                let _ = std::fs::write(&log, &text);
+                // Report the suite's OWN tally where it has one, rather than just "ok" - the number
+                // is what tells you a suite silently stopped asserting.
+                let tally = text.lines().rev()
+                    .find(|l| l.contains(" passed, ") || l.contains(" passed "))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
+                if o.status.success() {
+                    println!("PASS  {:>3}s   {}", secs, tally);
+                } else {
+                    println!("FAIL  {:>3}s   {}  -> {}", secs, tally, log);
+                    failed.push(name);
+                }
+            }
+            Err(e) => { println!("FAIL  {:>3}s   could not run: {e}", secs); failed.push(name); }
+        }
+    }
+
+    let mins = started.elapsed().as_secs() / 60;
+    println!("\nfs-all: {} of {} suites passed in ~{} min",
+             SUITES.len() - failed.len(), SUITES.len(), mins);
+    if !failed.is_empty() {
+        println!("fs-all: FAILED - {}", failed.join(", "));
+        println!("fs-all: each failing suite's full output is in build/tests/fs_all_<name>.log");
+        std::process::exit(1);
+    }
+    println!("fs-all: the storage stack is green");
+}
+
 fn run_fs_hostile_test() {
     println!("\n=== fs: a CRC-VALID but hostile disk - crafted metadata, not bit-rot (Phase M 1b) ===");
     cmd_build_bare_metal();
