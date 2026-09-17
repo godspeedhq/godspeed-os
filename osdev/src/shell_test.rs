@@ -5639,6 +5639,217 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
 /// It also proves the compatibility claim from the other direction: a file baked host-side by
 /// `osdev mkfs` - which writes no times region at all - reads as `unknown` on both boots, and is NOT
 /// given an invented one by having been mounted by a build that does record times.
+/// A sector this driver wrote, as the `write-tap` build reported it: its order, where, and what.
+struct TappedWrite { seq: u64, lba: u64, data: Vec<u8> }
+
+/// Reassemble the `btap` lines of a serial capture into an ordered list of writes.
+///
+/// One line per 64-byte chunk (`btap <seq> <lba> <chunk> <128 hex>`), eight per sector, because a
+/// log line renders through a fixed 256-byte buffer. A sector is kept only if all eight of its
+/// chunks arrived and parsed: the serial stream is shared with every other service's logging and
+/// can splice one line into another under load (a known hazard - see the serial-splice note), and a
+/// HALF-DECODED sector would hand the replay a disk state the machine never produced. Dropping it
+/// costs one tear point; believing it would invent a failure.
+fn parse_write_tap(serial: &str) -> Vec<TappedWrite> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<u64, (u64, [Option<[u8; 64]>; 8])> = BTreeMap::new();
+    for line in serial.lines() {
+        let Some(rest) = line.split("btap ").nth(1) else { continue };
+        let mut it = rest.split_whitespace();
+        let (Some(seq), Some(lba), Some(chunk), Some(hex)) = (it.next(), it.next(), it.next(), it.next())
+            else { continue };
+        let (Ok(seq), Ok(lba), Ok(chunk)) = (seq.parse::<u64>(), lba.parse::<u64>(), chunk.parse::<usize>())
+            else { continue };
+        if chunk >= 8 || hex.len() != 128 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) { continue; }
+        let mut bytes = [0u8; 64];
+        for i in 0..64 {
+            match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) { Ok(b) => bytes[i] = b, Err(_) => continue }
+        }
+        let e = acc.entry(seq).or_insert((lba, [None; 8]));
+        e.0 = lba;
+        e.1[chunk] = Some(bytes);
+    }
+    acc.into_iter().filter_map(|(seq, (lba, chunks))| {
+        let mut data = Vec::with_capacity(512);
+        for c in chunks.iter() { data.extend_from_slice(c.as_ref()?); }
+        Some(TappedWrite { seq, lba, data })
+    }).collect()
+}
+
+/// Build the disk state a power cut after the first `k` writes would leave: the pristine image with
+/// writes 1..=k applied in the order the driver issued them.
+///
+/// **This is not a model of a power cut, it is one.** Each write in the list completed on the medium;
+/// stopping after any of them is a state the machine genuinely passed through.
+fn apply_writes_prefix(base: &[u8], writes: &[TappedWrite], k: u64, out_path: &str) -> std::io::Result<()> {
+    let mut img = base.to_vec();
+    for w in writes.iter().filter(|w| w.seq <= k) {
+        let off = (w.lba as usize) * 512;
+        if off + 512 <= img.len() { img[off..off + 512].copy_from_slice(&w.data); }
+    }
+    std::fs::write(out_path, img)
+}
+
+/// TORN WRITES: boot the disk state left by a power cut after EVERY prefix of one operation's
+/// writes, and check the result against the outcomes `docs/gsfs-carnage.md` 2 permits.
+///
+/// Record, then replay. The `write-tap` build of `block-driver` logs every sector it writes - order,
+/// LBA and content - and changes nothing else. So the harness can run one operation, learn exactly
+/// which sectors it wrote and in what order, and then construct and boot the disk as it stood after
+/// each of them. No fault is injected and the I/O path under test is the shipping one.
+///
+/// Why this rather than an injector: an injector tears where somebody CHOSE, which answers "did this
+/// tear survive" instead of "does any tear survive". Here every cut point of the operation is tested,
+/// a failure names its `k`, and the failing image is a file that can be booted again while it is
+/// being fixed.
+pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-tear: PASS - {}", $label); pass += 1; } else { println!("fs-tear: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // Boot `disk`, run `cmds`, and hand back each command's output, the whole serial capture, and
+    // the serial LENGTH at which each command finished.
+    //
+    // That last one is what bounds the sweep. The obvious marker - a log line naming the op - does
+    // not exist on the success path: `fs` logs "request op N answered" only when it FAILS, by
+    // design, so a healthy request stays silent. Using it would have silently set the boundary to
+    // zero and swept every write since power-on, which is not wrong so much as twenty minutes of
+    // booting to learn the same thing.
+    let boot = |disk_path: &str, cmds: &[&str]| -> (Vec<String>, String, Vec<usize>) {
+        let disk = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("fs-tear: QEMU launch failed: {e}"); return (Vec::new(), String::new(), Vec::new()); }
+        };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return (Vec::new(), String::new(), Vec::new()); }
+        };
+        let mut read_half = stream.try_clone().expect("clone tcp stream");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        let mut marks = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default());
+                marks.push(cursor);
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole, marks)
+    };
+
+    // The pristine disk, kept byte-for-byte: every replayed image is built from THIS, never from a
+    // previous replay, so one bad boot cannot contaminate the rest of the sweep.
+    let base = match std::fs::read(persist_path) { Ok(b) => b, Err(e) => { eprintln!("fs-tear: cannot read {persist_path}: {e}"); std::process::exit(1); } };
+
+    // ---- 1. RECORD ----------------------------------------------------------------------------
+    //
+    // The operation under test is a whole-file overwrite of a file that already exists with known,
+    // different content. Its permitted outcomes are the crispest in the table: the OLD content
+    // complete, or the NEW content complete. Never a mix, and never an entry pointing at blocks that
+    // were never written.
+    println!("fs-tear: recording - one overwrite, with every sector it writes");
+    let rec_disk = "build/tests/fs_tear_record.img";
+    if std::fs::write(rec_disk, &base).is_err() { eprintln!("fs-tear: cannot stage the record disk"); std::process::exit(1); }
+    // A marker command first: the writes before it are boot and mount, and the sweep starts after
+    // them. `read` writes nothing, so the tap's high-water mark at this point is exactly the
+    // boundary between "the machine came up" and "the operation ran".
+    let (rout, rserial, rmarks) = boot(rec_disk, &["read /tear.txt", "write /tear.txt NEWNEWNEW", "read /tear.txt"]);
+    let writes = parse_write_tap(&rserial);
+    // KEEP THE EVIDENCE. A tear suite that reports a number and discards the recording cannot be
+    // argued with: the serial holds the tap, and the tap is the only record of what the operation
+    // actually did. Written unconditionally, not only on failure, because the interesting question
+    // is often about a run that PASSED.
+    let _ = std::fs::write("build/tests/fs_tear_serial.log", &rserial);
+    check!(!writes.is_empty(), format!("the write tap recorded sectors ({} of them)", writes.len()));
+    check!(rout.first().map_or(false, |r| r.contains("ORIGINAL")),
+           "the file held its ORIGINAL content before the overwrite");
+    check!(rout.get(2).map_or(false, |r| r.contains("NEWNEWNEW")),
+           "the overwrite landed when nothing interrupted it");
+
+    // Where the operation's writes begin: the tap high-water mark at the moment the preceding `read`
+    // finished. `read` writes nothing, so that mark is exactly the boundary between "the machine came
+    // up and mounted" and "the operation ran" - and it is measured, not assumed, because the number
+    // of boot writes is not a constant.
+    //
+    // It ENDS at the mark after the write rather than at the last tap line in the capture, so a
+    // later flush or a `time` service clock write cannot stretch the sweep past the operation.
+    let op_start = rmarks.first().map_or(0, |m| parse_write_tap(&rserial[..(*m).min(rserial.len())]).last().map_or(0, |w| w.seq));
+    let op_end = rmarks.get(1).map_or(0, |m| parse_write_tap(&rserial[..(*m).min(rserial.len())]).last().map_or(0, |w| w.seq));
+    check!(op_end > op_start,
+           format!("the overwrite wrote {} sector(s) (tap {}..{})", op_end - op_start, op_start + 1, op_end));
+    if op_end <= op_start || writes.is_empty() {
+        println!("\nfs-tear: {pass} passed, {fail} failed  (nothing to replay)");
+        if fail > 0 { std::process::exit(1); }
+        return;
+    }
+
+    // ---- 2. REPLAY ----------------------------------------------------------------------------
+    //
+    // Every cut point, not a sample. A tear point that is not in the permitted set is a real defect
+    // and its image is left on disk to be booted again.
+    println!("fs-tear: replaying {} tear point(s)", op_end - op_start);
+    let mut torn_ok = 0usize;
+    for k in (op_start + 1)..=op_end {
+        let img = format!("build/tests/fs_tear_k{k}.img");
+        if apply_writes_prefix(&base, &writes, k, &img).is_err() {
+            check!(false, format!("k={k}: could not build the torn image"));
+            continue;
+        }
+        let (o, w, _) = boot(&img, &["read /tear.txt"]);
+        let out = o.first().cloned().unwrap_or_default();
+        let old_intact = out.contains("ORIGINAL");
+        let new_intact = out.contains("NEWNEWNEW");
+        let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+        // The oracle. Exactly one of the two contents, on a volume that mounted. Anything else -
+        // a mix, an empty file, a refusal to mount, a panic - is outside what section 2 permits.
+        let ok = mounted && (old_intact ^ new_intact);
+        if ok {
+            torn_ok += 1;
+            let _ = std::fs::remove_file(&img);
+        } else {
+            check!(false, format!(
+                "k={k}: outcome outside the permitted set (mounted={mounted} old={old_intact} new={new_intact}) - image kept at {img}"));
+        }
+    }
+    check!(torn_ok as u64 == op_end - op_start,
+           format!("every tear point left the file wholly OLD or wholly NEW ({}/{})",
+                   torn_ok, op_end - op_start));
+
+    let _ = std::fs::remove_file(rec_disk);
+    println!("fs-tear: recording kept at build/tests/fs_tear_serial.log ({} sectors written in all, {} of them by the operation)", writes.len(), op_end - op_start);
+    println!("\nfs-tear: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -5709,7 +5920,7 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     let d1 = date_of(&l1, "stamped.txt");
     check!(d1.starts_with("20"), format!("boot 1: the new file carries a real date ({d1})"));
     check!(date_of(&l1, "canary.txt") == "unknown",
-           "boot 1: a file baked into the 0008 image reads as `unknown`");
+           "boot 1: a file baked in by a tool that records no times reads as `unknown`");
 
     println!("fs-time: boot 1 - seal a file (the seal must outlive the machine)");
     // `seal` asks [y/N], so the confirmation is its own line - the harness sends one command

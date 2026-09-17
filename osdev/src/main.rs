@@ -1395,6 +1395,7 @@ fn cmd_test(suite: &str) {
         "fs-compat"    => run_fs_compat_test(),
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
+        "fs-tear"      => run_fs_tear_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -2934,6 +2935,28 @@ fn run_fs_time_test() {
     gsfs_add_file(persist, "canary.txt", b"a file that predates timestamps");
 
     crate::shell_test::run_fs_time(&image_path, persist, 4);
+}
+
+fn run_fs_tear_test() {
+    println!("\n=== fs: TORN WRITES - every prefix of one operation's writes, booted (carnage 3.1) ===");
+    // `write-tap` on the block driver: it logs every sector it writes - order, LBA and content - and
+    // changes nothing else. A tap, not a valve; the I/O path under test is the shipping one.
+    build_blockdev_fs("selftest", "write-tap");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_tear.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // The file the operation overwrites. Baked host-side so its OLD content is known exactly, which
+    // is what makes "wholly old or wholly new" a decidable question rather than a judgement.
+    gsfs_add_file(persist, "tear.txt", b"ORIGINAL");
+
+    crate::shell_test::run_fs_tear(&image_path, persist, 4);
 }
 
 fn run_fs_fuzz_test() {

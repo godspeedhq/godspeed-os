@@ -92,6 +92,10 @@ struct Ahci<'a> {
     /// Test-only (`io-error-test` build): force the next N read/write commands to fail, to
     /// exercise the retry + recovery path. Always 0 in production.
     forced_fails: Cell<u32>,
+    /// Test-only (`write-tap` build): how many sectors have been written so far, so the host can
+    /// order them. Present unconditionally because a `cfg` field would fork every construction
+    /// site; it costs 8 bytes and is never read in a production build.
+    tap_seq: Cell<u64>,
 }
 
 impl<'a> Ahci<'a> {
@@ -381,6 +385,44 @@ impl<'a> Ahci<'a> {
         Ok(())
     }
 
+    /// Record a sector this driver just wrote: its ORDER, its LBA and its bytes
+    /// (`write-tap` build only; compiled to nothing otherwise).
+    ///
+    /// **A tap, not a valve.** It runs AFTER the write has succeeded and changes nothing about what
+    /// was written or when, which is the whole reason this exists rather than a fault injector: an
+    /// injector can only tear where somebody chose, and it perturbs the very path under test. With
+    /// the order and the content in hand, the host can build the disk state after ANY prefix of an
+    /// operation's writes - which is not an approximation of a power cut, it is exactly what one
+    /// produces - and boot each of them. `docs/gsfs-carnage.md` 3.1.
+    ///
+    /// Emitted as 8 lines of 64 bytes because the SDK renders a log line through a fixed 256-byte
+    /// stack buffer (26.6.1); 512 bytes of hex is 1024 characters and would be truncated in silence.
+    /// One self-describing line shape, so the host parses one regex:
+    ///
+    /// ```text
+    /// btap <seq> <lba> <chunk 0-7> <128 hex chars>
+    /// ```
+    #[cfg(feature = "write-tap")]
+    fn write_tap(&self, ctx: &ServiceContext, lba: u64, data: &[u8; 512]) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let seq = self.tap_seq.get().wrapping_add(1);
+        self.tap_seq.set(seq);
+        for chunk in 0..8usize {
+            let mut line = [0u8; 128];
+            for i in 0..64usize {
+                let b = data[chunk * 64 + i];
+                line[i * 2] = HEX[(b >> 4) as usize];
+                line[i * 2 + 1] = HEX[(b & 0xf) as usize];
+            }
+            // Every byte written above is one of HEX, so this cannot fail; `unwrap_or` keeps the
+            // no-panic rule rather than asserting it (Commandment V).
+            let hex = core::str::from_utf8(&line).unwrap_or("?");
+            ctx.log_fmt(format_args!("btap {} {} {} {}", seq, lba, chunk, hex));
+        }
+    }
+    #[cfg(not(feature = "write-tap"))]
+    fn write_tap(&self, _ctx: &ServiceContext, _lba: u64, _data: &[u8; 512]) {}
+
     /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT + FLUSH), with bounded retry.
     fn write_block(&self, ctx: &ServiceContext, lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
         for i in 0..128 {
@@ -391,6 +433,9 @@ impl<'a> Ahci<'a> {
             self.arena.write32(DATA_OFF + i * 4, w);
         }
         self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
+        // Only on the success path: a write that failed did not reach the medium, so recording it
+        // would hand the host a disk state that never existed.
+        self.write_tap(ctx, lba, data);
         // NO FLUSH HERE. Ordering is the CALLER's to declare, and `fs` already declares it.
         //
         // This issued a full FLUSH CACHE EXT after every 512-byte sector. A journal transaction is
@@ -681,7 +726,8 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // `io-error-test` build: arm a few forced read/write failures so the boot self-test +
     // mount exercise the retry/recovery path. Always 0 (no injection) in production.
     let forced = if cfg!(feature = "io-error-test") { 2 } else { 0 };
-    let ahci = Ahci { hba, arena, port, sectors: Cell::new(0), forced_fails: Cell::new(forced) };
+    let ahci = Ahci { hba, arena, port, sectors: Cell::new(0), forced_fails: Cell::new(forced),
+                      tap_seq: Cell::new(0) };
     ahci.init_port(ctx);
 
     match ahci.identify() {

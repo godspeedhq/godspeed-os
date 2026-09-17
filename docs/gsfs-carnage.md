@@ -1,31 +1,35 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
-**Status: scoped, not built. Section 2 (the outcome table) is the deliverable everything else
-depends on, and it is built from the code as it stands, not from intent.**
+**Status: one gate PASSES in QEMU (torn writes, `osdev test fs-tear`), the rest are NOT RUN. This
+is QEMU-validated only; no hardware result is claimed anywhere in this file.**
 
-The invariant this whole programme serves, stated first because every test below is an instance
-of it:
+The mission, and every gate below is an instance of it:
 
+> **Try to falsify GSFS's correctness, persistence, recovery and isolation guarantees. Do not treat a
+> successful command, a passing unit test, or a surviving service as proof that data is correct.**
+>
 > **A failed operation must never be reported as successful, and recovery must never silently turn
 > known corruption into apparently valid data. Not every interrupted operation must be atomic, but
 > its guarantees must be explicit and testable.**
 
-That second sentence is the useful half. GSFS does not make every operation atomic and should not
-pretend to: a streaming write of a 4 MB file is not one transaction and cannot be. What it must do
-is say exactly which outcomes are permitted after an interruption, so that an outcome outside that
-set is a bug rather than a debate.
+That last sentence is the load-bearing one. GSFS does not make every operation atomic and should not
+pretend to: a streaming write of a 4 MB file is not one transaction and cannot be. What it must do is
+say exactly which outcomes are permitted after an interruption, so that an outcome outside that set
+is a bug rather than a debate. Section 2 is that statement, and it did not exist until this file.
 
 ## 1. What is already covered, so it is not rebuilt
 
-Fourteen suites, ~11 minutes, all green (`osdev test fs-all`, `backlog/32`):
+Fifteen suites, all green in QEMU (`osdev test fs-all` covers fourteen of them in ~11 minutes;
+`fs-tear` is new and separate):
 
 | suite | what it actually attacks |
 |---|---|
+| `fs-tear` | **NEW.** Every prefix of one operation's writes, recorded from the real driver and booted. Section 3.1 |
 | `fs-corrupt` | metadata damaged host-side: bad superblock CRC, bad directory CRC, bad magic. 14 checks |
 | `fs-hostile` | genuinely malicious disks: a directory that contains itself, a name carrying `ESC [ 2J`, a `name_len` past the record |
 | `fs-journal` | a committed-but-unfinished transaction is replayed; an invalid commit record is rejected |
 | `fs-djournal` | the data-journal variant: a chunk commits atomically or not at all |
-| `fs-ioretry` | block commands forced to FAIL through a real injection hook in the AHCI driver (`io-error-test`) |
+| `fs-ioretry` | block commands forced to FAIL through a real injection hook in the AHCI driver |
 | `fs-restart` | `fs` killed and respawned; the volume re-mounts and the data is there |
 | `fs-time` | a full machine REBOOT, then the bytes and the dates are re-read from disk |
 | `fs-fuzz` | 599 malformed protocol requests, every one answered rather than crashed |
@@ -33,121 +37,266 @@ Fourteen suites, ~11 minutes, all green (`osdev test fs-all`, `backlog/32`):
 | `fs-compat` | unknown `compat` / `ro_compat` / `incompat` bits drive mount, mount-read-only, refuse |
 | `fs-frag` / `fs-large` / `file-cap` | extent lists, multi-megabyte streaming, the capability surface |
 
-**What none of them do is leave the disk in a state the running system did not intend.** Killing
-`fs` leaves the image byte-identical to the instant before; the journal suites CONSTRUCT a
-post-crash image host-side rather than interrupting a live write; the I/O injection fails a command
-cleanly rather than half-performing it. So every crash tested so far is a crash we authored. That is
-the gap.
+**Until `fs-tear`, none of them left the disk in a state the running system did not intend.** Killing
+`fs` leaves the image byte-identical to the instant before; the journal suites CONSTRUCT a post-crash
+image host-side; the I/O injection fails a command cleanly rather than half-performing it. Every
+crash tested was a crash we authored. That is the gap `fs-tear` closes for one operation and leaves
+open for the rest.
 
 ## 2. The permitted-outcome table
 
-This is what a reference model has to be told, and it has never been written down. Built by reading
-the dispatch in `services/fs`, not by reading the design notes.
+This is what a reference model has to be told. Built by reading the dispatch in `services/fs`, not
+the design notes.
 
 **The journal is a METADATA redo journal.** Structural blocks are staged into a 32 KiB region, a
 commit record naming them is made durable, and only then does any home block move. So the unit of
-atomicity is *the set of directory/bitmap/superblock blocks one operation touches* - and file DATA
-is outside it unless the caller explicitly asks for the journaled variant.
+atomicity is *the set of directory/bitmap/superblock blocks one operation touches* - and file DATA is
+outside it unless the caller explicitly asks for the journaled variant.
 
 | operation | journaled | permitted outcomes after an interruption |
 |---|---|---|
 | `write` (whole file) | yes | the old file complete, or the new file complete. Never a mix of the two extents, never an entry pointing at blocks that were never written |
 | `write-new` (pre-allocate) | yes | the file does not exist, or it exists at its full declared size with undefined content |
-| `write-at` (streaming chunk) | **no** | **any prefix of the chunks may have landed.** The metadata does not change, so the file's size and extent are unaffected; the CONTENT is a mix of old and new at block granularity |
+| `write-at` (streaming chunk) | **no** | **any prefix of the chunks may have landed.** The metadata does not change, so size and extent are unaffected; the CONTENT is a mix of old and new at block granularity |
 | `write-at` journaled variant | yes | that one chunk landed entirely or not at all |
 | `mkdir` / `mkdir -p` | yes | none of the directories exist, or all of them do |
 | `rename` | yes | the old name, or the new name. Never both, never neither |
 | `move` | yes | in the source directory, or in the destination. Never both, never neither |
 | `delete` | yes | present with its blocks allocated, or absent with its blocks free. Never absent-and-allocated (a leak) or present-and-free (corruption) |
-| `delete-tree` | **per entry** | **a PREFIX of the tree may be gone.** Each entry's own removal is atomic; the walk across them is not. This is the one operation whose partial outcome is a visible, intended state |
+| `delete-tree` | **per entry** | **a PREFIX of the tree may be gone.** Each entry's removal is atomic; the walk across them is not. The one operation whose partial outcome is a visible, intended state |
 | `seal` | yes | sealed, or not sealed. The `ro_compat` bit and the flag commit together |
 | `label` | yes | old label or new |
 
-**And the detection boundary, which is the subtle one.** Every block carries a CRC, so:
+**The detection boundary**, which is the subtle part and the thing that makes "accepted / completed /
+durable" three different words:
 
 - **A torn block** - the device wrote part of a 512-byte sector - **is DETECTED.** The CRC sits at
-  the end of the block (@448 for a directory record region, @508 for data and for the times region),
-  so a partial write fails it and the block is refused loudly on read.
-- **A torn SEQUENCE - block 3 of a write landed and block 4 did not - is NOT detected, and cannot
-  be.** Both blocks are individually valid; nothing records that they were meant to arrive together.
-  For metadata that is what the journal is for. For file data it is the permitted outcome in the
-  table above, and it is the honest statement of what a power cut costs.
+  the end of the block (@448 for a directory's record region, @508 for data and for the times
+  region), so a partial write fails it and the block is refused loudly on read.
+- **A torn SEQUENCE - block 3 landed and block 4 did not - is NOT detected, and cannot be.** Both
+  blocks are individually valid; nothing records that they were meant to arrive together. For
+  metadata that is what the journal is for. For file data it is the permitted outcome above, and it
+  is the honest cost of a power cut.
+- **Acknowledged is not durable.** A write the driver acknowledged has reached the device, not
+  necessarily the medium. `CLAUDE.md` 6.1 already records that this guarantee is backend-conditional
+  and that one shipping backend (the Pi 2's USB stick) refuses `SYNCHRONIZE CACHE` outright.
 
-This is consistent with what `CLAUDE.md` 6.1 already says about backend-conditional durability, and
-it is the first time it has been said per operation.
+## 3. The gates
 
-## 3. The workstreams, in the order they should be done
+Ordered so the unknown comes first rather than the easy.
 
-### 3.1 Torn writes (the real gap)
+### 3.1 Torn writes - BUILT, PASSES in QEMU (`osdev test fs-tear`)
 
-The injection hook already exists and is already gated by a build feature: `services/block-driver`
-can force the next N read/write commands to fail. What it cannot do is write the first N bytes and
-then report failure, which is what a power cut looks like from above.
+**The first design here was an injector, and it was the wrong instrument.** The reasoning that
+replaced it is the useful part. Extending the existing `io-error-test` hook to write part of a
+transfer and then fail would work, but it tears where somebody CHOSE, it perturbs the path under
+test, and it answers "did this tear survive" rather than "does any tear survive".
 
-Two flavours, and they are not the same test:
+**Record and replay is strictly better and changes nothing about the I/O path.**
 
-- **Sub-sector tear** - write 256 of 512 bytes. Expect DETECTION on the next read: the block's CRC
-  fails and the failure is loud. This is a test of the checksums, and it should pass today.
-- **Inter-block tear** - write blocks 1 and 2 of a five-block sequence, then fail. Expect the
-  operation's row in the table above, and nothing else. For a journaled op this is a test of the
-  journal; for `write-at` it is a test that the *metadata* is untouched while the content is mixed.
+1. A `write-tap` build of `block-driver` logs every sector it writes - order, LBA, content - after
+   the write has already succeeded. **A tap, not a valve.**
+2. The harness boots a known image, runs ONE operation, and captures the log. It now holds the exact
+   ordered sequence of writes, with content - which a before/after byte diff cannot give, because a
+   block may be written twice in one operation (staged into the journal, then again at home).
+3. For each `k`, it builds `A_k` = the pristine image with writes 1..=k applied in order. **`A_k` is
+   not a model of a power cut. It is exactly the disk state one produces.**
+4. Boot each `A_k`, mount, and check the outcome is in the permitted set - and nothing else.
 
-**Do the injected version, not a SIGKILL of QEMU.** A SIGKILL is a more realistic power cut and a
-worse oracle: it is not reproducible, so a failure cannot be bisected and a pass proves only that
-this particular timing was survivable. The injected version is deterministic, can be swept across
-every block index of an operation, and can be replayed exactly when it finds something. Keep the
-SIGKILL form as a second opinion, run rarely, never as a gate.
+**First result: a whole-file overwrite writes 22 sectors, and all 22 tear points left the file wholly
+OLD or wholly NEW, on a volume that mounted.** Evidence: `build/tests/fs_tear_serial.log` holds the
+recording; a tear point outside the permitted set keeps its image at `build/tests/fs_tear_k<N>.img`
+so it can be booted again while it is being fixed.
 
-### 3.2 Kill `fs` mid-operation
+The recording holds 522 sectors in all and the operation accounts for 22 of them, which looks wrong
+until you know why: the suite builds `fs` with its `selftest` feature, and that self-test writes a
+set of files at every boot. Those writes are real, they are in the replay, and a tear point inside
+them is a legitimate state - they are simply not the operation under test. Named here so the ratio is
+not mistaken for a boot that writes 400 sectors.
 
-`fs-restart` kills at a quiescent point. The interesting kills are between the staged blocks and the
-commit record, and between the commit record and the home-block writes - precisely the two windows
-the journal exists for. Needs a way to ask `fs` to die at a named point; a build feature in the same
-shape as `io-error-test` is the obvious route, since it keeps the hook out of the shipping binary.
+Where the boundary of the operation comes from is worth recording, because the obvious answer is
+wrong: `fs` logs "request op N answered" only when a request FAILS, by design, so there is no log
+line marking a successful write. The sweep is bounded instead by the tap high-water mark at the
+moment the preceding (read-only) command finished - measured, not assumed, since the number of boot
+writes is not a constant.
 
-Note what this does NOT test that 3.1 does: killing the service leaves the disk consistent with
-every write that was issued. Only 3.1 can produce a disk that no sequence of completed writes could
-have produced.
+**Still to do here:** the other ten rows of section 2, and the sub-sector variant (`A_k` plus write
+`k+1` applied to only its first half), which should be DETECTED by the CRC and is the lower-value
+half because `fs-corrupt` already probes that mechanism.
 
-### 3.3 Cross-ISA interchange
+**And not a SIGKILL of QEMU.** It is the more realistic power cut and the worse oracle: not
+reproducible, so a failure cannot be bisected, and a pass proves only that one timing was survivable.
+Worth an occasional second opinion; never the gate.
 
-Write an image under x86-64, then read AND MODIFY it under riscv64 and aarch64 in QEMU, and bring it
-back. Every field is little-endian by construction, so the expectation is that it passes - and an
-expectation is not a result. Cheap, completely untested, and the kind of thing that is discovered by
-a user rather than by us if it is wrong.
+### 3.2 An independent oracle - NOT RUN
 
-### 3.4 The reference model
+A small abstract model of files, directories, names and contents, host-side in `osdev` where the
+suites already live and where a `HashMap` is allowed (26.6.1 governs what runs on the machine).
 
-A few hundred lines HOST-side in `osdev`, where the suites already live: a plain Rust model of the
-tree (names, sizes, bytes), a generator of random operation sequences, and a differential run that
-applies each sequence to both and compares the whole tree afterwards. Host-side matters - the model
-wants a `HashMap` and a `Vec`, and 26.6.1's no-heap rule is about what runs on the machine.
+**It must not reuse GSFS allocation, traversal, rename or recovery logic.** A model that shares the
+implementation reproduces its bugs and agrees with them, which is worse than no model because it
+produces a green tick. This is the single most important constraint on this gate.
 
-Then the same thing with failures injected, where the comparison is not equality but membership: the
-result must be one of the outcomes section 2 permits for the operation that was interrupted. **This
-is why section 2 is first.** Without it the model has no oracle and every difference is an argument.
+Reproducible sequences, recorded seeds, and comparison of return values, trees, metadata and file
+bytes. Under injected interruption the comparison is not equality but MEMBERSHIP of the permitted set
+in section 2 - which is why that table had to exist first.
 
-### 3.5 Persistence by bytes, not by cache
+### 3.3 Crash at every persistence boundary - PARTIAL
 
-Partly covered - `fs-time` already reboots the machine and re-reads - but not systematically, and
-never with a flush boundary under test. Write, flush, shut down, remount, compare actual bytes. The
-interesting variant is the one where the flush is REFUSED, which is a real backend (the Pi 2's stick
-refuses `SYNCHRONIZE CACHE` outright; `CLAUDE.md` 6.1 records it): the guarantee narrows and `fs`
-must say so rather than imply the wider one.
+3.1 does this for one operation, exhaustively. The remaining work is the other operations, the
+reordered/delayed/failed variants, and the volatile-write-cache model: an acknowledged write is not
+durable without the declared barrier, and the test must be able to express the difference.
 
-## 4. What QEMU can and cannot do here
+**Killing `fs` is a service-restart test, not a power-loss simulation.** Recorded here because it is
+the mistake this whole programme exists to stop repeating: `fs-restart` is a good test of a different
+thing.
 
-It can do almost all of this, which is the point of doing it now. The injection is in our own driver,
-the model is host-side, the reboots are real reboots, and the cross-ISA work is three QEMU targets we
-already build for.
+### 3.4 Resource exhaustion - NOT RUN
 
-What it cannot do is a real power cut on a real device with a real write cache, and that is exactly
-where the guarantee is backend-conditional anyway. The hardware pass answers a different question -
-does THIS device honour the barrier - and it needs the five boards, not a test suite.
+Fill data space to near capacity and exercise every operation; exhaust metadata while data remains
+and the reverse; inject allocation failure at each allocation point. Then verify what matters, which
+is not the error message: no leaked blocks, no double allocation, no orphaned-but-reachable data, no
+damage to unrelated files, and a filesystem that still accepts valid work afterwards.
 
-## 5. Not in scope
+`drives check` rebuilds the free bitmap by walking the tree, so it is the natural oracle for the leak
+and double-allocation half.
+
+### 3.5 Concurrency, ordering and retries - NOT RUN, and NARROWER than it looks
+
+Stated honestly rather than adopted wholesale: **`fs` is single-threaded and serves one request to
+completion before dequeuing the next.** There is no intra-operation interleaving to find, so "two
+operations racing inside the filesystem" is not a reachable state and testing for it would be
+theatre.
+
+What IS reachable and worth attacking is the CLIENT side, and one item in it is a genuine open
+weakness:
+
+- **A duplicate request can repeat a destructive operation, and nothing stops it today.** The fs
+  protocol carries a correlation tag at byte 0 that is ECHOED, never interpreted - it exists to match
+  a reply to a request, not to deduplicate. A client that times out and retries a `delete` or a
+  `move` sends it twice, and the second one executes. For `delete` that is harmless; for a
+  `move` whose first attempt succeeded, the retry operates on a path that no longer means what the
+  client thought. This is the clearest thing on this list that is a design gap rather than a missing
+  test.
+- Client timeouts injected immediately before and after a commit, then retried, with the outcome
+  inspected.
+- Two clients issuing conflicting sequences (create, rename, delete, recreate) against the same
+  paths, checking the observable ordering matches what is documented - which currently is nothing,
+  so documenting it is part of the gate.
+
+### 3.6 Stale identity and authority - PARTIALLY COVERED
+
+The core of this is already enforced by the capability model rather than by convention: a file
+capability is a delegated resource cap (7.10), revoked by a generation bump on delete, close and
+rename, and `file-cap` (13 checks) pins unforgeable, non-escalating and revocable end to end. The
+`move` doc records that open capabilities to a moved path are revoked including for every descendant.
+
+What is NOT covered is the reuse case the checklist names: open A, restart `fs`, delete A, let B take
+its storage, then use A's old handle. The generation mechanism should make this impossible, and
+"should" is exactly the word this programme exists to remove.
+
+### 3.7 Attack the block layer - NOT RUN
+
+Kill and restart `block-driver` with requests outstanding; simulate hot-unplug, delayed return, I/O
+error and device disappearance mid-write; inject late, duplicate, missing and out-of-order
+completions.
+
+**And there is already evidence this one matters.** `backlog/31` records a confirmed case of a reply
+stream running behind - a service reading replies that belonged to earlier requests - in the network
+stack, where a correlation tag proved the fault and was then REVERTED because rejecting a stale reply
+is not the same as recovering from one. The fs/block channel has the same shape and the same tag
+design. A completion from an old driver instance acknowledging a newer request is not hypothetical
+here; it is the thing that already happened one layer over.
+
+### 3.8 Crash recovery itself - NOT RUN
+
+Interrupt recovery, at each mutation point, repeatedly, on the same image. Verify it is restartable
+and does not progressively worsen the damage, and that when it cannot determine a safe outcome it
+REFUSES a read-write mount rather than guessing. The existing `read_only` mount path is the right
+mechanism for that refusal and is already exercised by `fs-compat` for a different reason.
+
+This is where 3.1's machinery pays off twice: recovery is itself a sequence of writes, so the same
+record-and-replay applies to it directly.
+
+### 3.9 Corruption and format validation - LARGELY COVERED
+
+`fs-corrupt` (14), `fs-hostile` (6), `fs-fuzz` (43) and `fs-compat` (12) cover mutated headers,
+damaged directory entries, cycles, impossible lengths, malformed names, and version/compat handling.
+`fs-scrub` is read-only by construction and a suite asserts it repairs nothing.
+
+Gaps: overlapping extents specifically, truncated images, and an explicit statement of on-disk field
+widths and byte order - which matters for 3.10 and has never been written down as a contract.
+
+### 3.10 Observability-unavailable - NOT APPLICABLE, with reason
+
+The checklist asks that filesystem correctness not depend on events, logging or diagnostics being
+available. **It structurally cannot.** `ctx.log()` is syscall 5 writing the kernel ring and serial
+directly; no log line has ever been sent to the `events` service, whose contract declares only
+`ipc_receive` (`CLAUDE.md` 11.4). Killing `events` loses no `fs` output and cannot block it.
+
+Recorded as NOT APPLICABLE rather than PASS, because the honest claim is "the dependency does not
+exist", not "we tested its absence". If logs are ever re-pointed at a service, this becomes a live
+gate immediately - which is precisely why 11.4 forbids it.
+
+### 3.11 Cross-ISA - NOT RUN
+
+Create and modify the same image across x86-64, riscv64 and aarch64 in QEMU, comparing bytes, trees
+and metadata after each handoff. Every field is little-endian by construction, so the expectation is
+a pass - and an expectation is not a result. Cheap, and the kind of thing a user finds if we do not.
+
+### 3.12 Physical hardware - NOT RUN, and cannot be claimed from any of the above
+
+Real controllers, hotplug, restart, and the flush/durability assumptions that QEMU does not model.
+Five boards. **A QEMU pass is never recorded as a hardware pass.**
+
+## 4. Merge evidence
+
+Filled in from what has actually been run. NOT RUN means not run.
+
+| Gate | Result | Evidence / notes |
+|---|---|---|
+| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` 14/14, ~11 min; `files` 222/0; `shell` 174/0 |
+| Independent reference-model tests | NOT RUN | 3.2. Blocked on nothing but effort; the outcome table it needs now exists |
+| Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 5/0 - one operation, 22/22 tear points. Ten rows of section 2 remain |
+| Data/metadata exhaustion | NOT RUN | 3.4 |
+| Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
+| Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
+| Block-driver restart and hot-unplug | NOT RUN | 3.7. See `backlog/31` for the same failure shape one layer over |
+| Interrupted recovery | NOT RUN | 3.8 |
+| Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
+| Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
+| Cross-ISA QEMU image tests | NOT RUN | 3.11 |
+| Physical-hardware validation | NOT RUN | 3.12. No hardware result is claimed anywhere in this file |
+| Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
+
+**Merge rule adopted:** do not merge until the required gates pass, genuinely inapplicable gates are
+justified in writing, and the remaining limitations are documented. Where hardware validation is
+deferred, the result is labelled **QEMU-validated only** and hardware readiness is not claimed.
+
+## 5. Turning surprises into permanent tests
+
+For every bug this finds: preserve the seed, the operation sequence, the fault point and the failing
+image; reduce to the smallest deterministic reproduction; name the violated invariant and the layer
+responsible; fix the smallest component without weakening a boundary; add the reproduction to a
+suite; rerun the focused test and the full sweep.
+
+**Chaos discovers surprises; deterministic regressions keep them fixed.** `fs-tear` is built this way
+already - it keeps its recording on every run, not only on failure, and keeps the failing image
+whenever a tear point falls outside the permitted set.
+
+## 6. Not in scope
 
 - Making `write-at` atomic by default. The journaled variant exists for callers that need it; making
-  it the default would put every streaming byte through the journal region, which is 32 KiB.
+  it the default would put every streaming byte through a 32 KiB journal region.
 - Repairing a torn sequence automatically. Detection is the guarantee; silent repair of data whose
-  correct value is unknown is the second half of the invariant at the top of this file.
+  correct value is unknown is the second half of the mission statement at the top of this file.
+- Expanding the kernel to make any of this testable. Filesystem semantics stay in userspace (4.4);
+  a test that needs a kernel change needs a different test.
+
+## 7. One term not adopted, because it was not understood
+
+The source checklist twice refers to **MISCIS** ("do not expand MISCIS merely to make a test pass";
+"Kernel changes / MISCIS boundary review"). The term appears nowhere in this project and was not
+guessed at. Both instances have been read as the KERNEL SCOPE boundary - `CLAUDE.md` 4.4's anti-scope
+and 26.10's mechanism-not-policy rule - which is what the surrounding sentences are about. If it
+means something else, this section is where to correct it.

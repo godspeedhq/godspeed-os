@@ -13,5 +13,11 @@ path = "src/main.rs"
 # ONLY; production never injects faults. Enabled by `osdev test fs-ioretry`.
 io-error-test = []
 
+# Log every sector this driver writes - LBA, order and content - to the serial log, so the host
+# can reconstruct the exact disk state after any prefix of an operation's writes and boot it.
+# It is a TAP, NOT A VALVE: it changes nothing about what is written or when. See
+# docs/gsfs-carnage.md 3.1. TEST BUILDS ONLY; it would drown a real machine's log.
+write-tap = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
