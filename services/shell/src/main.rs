@@ -90,6 +90,7 @@ const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a forei
 const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
                          // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
+const OP_SEAL: u8 = 31;  // [op, plen, path] - freeze a file's content, permanently
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
 const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]  (needs WRITE)
@@ -1095,12 +1096,12 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     for _ in 0..count {
         if i >= rn { break; }
         let nl = rbuf[i] as usize; i += 1;
-        if i + nl + 13 > rn { break; }                // entry = name_len, name, is_dir, size:u64, mtime:u32
+        if i + nl + 14 > rn { break; }                // entry = name_len, name, is_dir, size:u64, mtime:u32
         let is_dir = rbuf[i + nl] != 0;
         if rbuf[i..i + nl].starts_with(leaf) && n < hits.len() {
             hits[n] = PathHit { off: i, len: nl, is_dir }; n += 1;
         }
-        i += nl + 13;
+        i += nl + 14;
     }
     if n == 0 { return; }
     let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
@@ -1699,6 +1700,10 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             if argc < 3 { ctx.console_writeln("usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
+        }
+        "seal"    => {
+            if argc < 2 { ctx.console_writeln("usage: seal <path> [yes]"); Err(ShellError::Unknown) }
+            else { cmd_seal(ctx, cwd, args[1], argc >= 3 && args[2] == "yes") }
         }
         "rename"  => {
             if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); Err(ShellError::Unknown) }
@@ -6763,7 +6768,11 @@ fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
         return None;
     }
     let count = p[1] as usize;
-    let mut t = Table::new(&["name", "type", "size"]);
+    // A `sealed` COLUMN rather than a new `type` value, deliberately. Making a sealed file's type
+    // read `seal` would quietly drop it out of every existing `where type=file` query - a silent
+    // change of meaning in queries people have already written. A separate column adds an answer
+    // without moving an existing one.
+    let mut t = Table::new(&["name", "type", "size", "sealed"]);
     let mut i = 2usize;
     for _ in 0..count {
         if i >= p.len() { break; }
@@ -6772,14 +6781,16 @@ fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
         // GSFS0009: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
         // four bytes wider than the 0008 layout. Every consumer of this reply must step by the same
         // stride or it reads the NEXT entry's name out of this one's timestamp.
-        if i + nl + 1 + 8 + 4 > p.len() { break; }
+        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
         let name = t.intern(&p[i..i + nl]);
         let is_dir = p[i + nl] != 0;
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        i += nl + 1 + 8 + 4;
+        let sealed = p[i + nl + 13] & 1 != 0;      // flags bit 0
+        i += nl + 1 + 8 + 4 + 1;
         let kind = t.intern(if is_dir { b"dir" } else { b"file" });
         let sz = if is_dir { Value::Empty } else { Value::Int(size) };
-        t.add_row(&[name, kind, sz]);
+        let sl = t.intern(if sealed { b"true" } else { b"false" });
+        t.add_row(&[name, kind, sz, sl]);
     }
     Some(t)
 }
@@ -6952,11 +6963,11 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 + 4 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
             let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout ls reads
-            i += nl + 1 + 8 + 4;
+            i += nl + 1 + 8 + 4 + 1;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(tb, name) } else { contains(name, tb) };
@@ -12101,7 +12112,7 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
         if i >= p.len() { break; }
         let nl = p[i] as usize;
         i += 1;
-        if i + nl + 1 + 8 + 4 > p.len() { break; }
+        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
         // A NAME IS UNTRUSTED INPUT, AND THIS IS WHERE IT MEETS A TERMINAL.
         //
         // `fs` refuses to CREATE a name carrying control bytes, but a disk prepared elsewhere
@@ -12120,7 +12131,8 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
         let is_dir = p[i + nl] != 0;
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
         let mtime = u32_le(&p[i + nl + 9..i + nl + 13]);
-        i += nl + 1 + 8 + 4;
+        let sealed = p[i + nl + 13] & 1 != 0;
+        i += nl + 1 + 8 + 4 + 1;
         if !long {
             // The terse default is unchanged, deliberately: `ls` is read far more often than it is
             // studied, and a wall of columns is worse for the common case (conventions rule 7).
@@ -12138,15 +12150,58 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
         } else {
             TimeCol::At(Datetime::from_epoch_secs(mtime as i64))
         };
+        // A sealed file says so IN THE TYPE COLUMN. It is not an attribute of a file so much as a
+        // different kind of thing to have on a disk - one you cannot change - and burying that in a
+        // trailing marker would make it easy to miss precisely when it matters.
         if is_dir {
             out.line_fmt(ctx, format_args!("  {:<20}  dir   {:>10}  {}", name, "-", when));
         } else {
-            out.line_fmt(ctx, format_args!("  {:<20}  file  {:>10}  {}",
-                                           name, HumanSizeR(size, human), when));
+            out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>10}  {}",
+                                           name, if sealed { "seal" } else { "file" },
+                                           HumanSizeR(size, human), when));
         }
     }
     if count == 0 { out.line(ctx, "  (empty)"); }
     Ok(())
+}
+
+/// `seal <path>` - freeze a file's content, permanently.
+///
+/// **Asks once, because there is no undo.** Every other destructive-ish command here can be
+/// reversed by doing the opposite; this one cannot, by design - a seal a holder can lift is a
+/// request rather than a guarantee. The prompt is the only chance to have meant something else.
+fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), ShellError> {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    ctx.console_writeln_fmt(format_args!(
+        "seal {} - its content can NEVER be changed again, and there is no unseal.", str_of(path)));
+    // `yes` as a fourth word skips the prompt, the same escape `chaos max-carnage` offers and for
+    // the same reason: a confirm reads the CONSOLE, so a script cannot answer one. The warning above
+    // still prints either way - what `yes` buys is not silence, it is the ability to be automated.
+    if !yes {
+        ctx.console_write(" Seal it? [y/N]: ");
+        // `read_confirm`, the same line-edited prompt `drives flash` and `max-carnage` use: the
+        // operator can backspace a typo, and the decision is the FINAL line - a mistyped `y`
+        // corrected to `n` cancels rather than proceeds.
+        if !read_confirm(ctx) {
+            ctx.console_writeln("seal: cancelled");
+            return Ok(());
+        }
+    }
+    match fs_request(ctx, OP_SEAL, path, &[]).as_ref().map(|r| r.payload_bytes().first().copied()) {
+        Some(Some(FS_OK)) => {
+            ctx.console_writeln_fmt(format_args!("sealed {}", str_of(path)));
+            Ok(())
+        }
+        Some(Some(FS_NOTFOUND)) => {
+            ctx.console_writeln_fmt(format_args!("seal: not found: {}", str_of(path)));
+            Err(ShellError::FileNotFound)
+        }
+        _ => {
+            ctx.console_writeln("seal: failed (a directory, or storage unavailable) - see fs's log");
+            Err(ShellError::Unknown)
+        }
+    }
 }
 
 /// `read <path>` - print a file's contents. The first command on the Ok/Err `Result` model:
@@ -13332,10 +13387,10 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 + 4 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8 + 4; // name_len + name + is_dir + size:u64 + mtime:u32
+            i += nl + 1 + 8 + 4 + 1; // name_len + name + is_dir + size:u64 + mtime:u32
             let mut schild = [0u8; PATH_MAX];
             let clen = match join_path(&sbuf[..slen], name, &mut schild) { Some(c) => c, None => continue };
             let mut dchild = [0u8; PATH_MAX];
@@ -13532,10 +13587,10 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 + 4 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8 + 4; // name_len + name + is_dir + size:u64 + mtime:u32
+            i += nl + 1 + 8 + 4 + 1; // name_len + name + is_dir + size:u64 + mtime:u32
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
@@ -13629,7 +13684,7 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
             if i + 1 + nl + 1 + 8 > p.len() { break; }
             offs[nc] = i;
             nc += 1;
-            i += 1 + nl + 1 + 8 + 4;
+            i += 1 + nl + 1 + 8 + 4 + 1;
         }
         for k in (0..nc).rev() {
             let off = offs[k];

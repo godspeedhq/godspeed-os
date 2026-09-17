@@ -833,6 +833,28 @@ assert ok ls /sc/dd1y
 assert fails ls /sc/dd1x
 delete /sc/dd1y recursive
 
+# ===== seal: content frozen, permanently =====
+echo ''
+echo '===== seal: a sealed file cannot be rewritten ====='
+write /sc/frozen.txt original
+# `yes` skips the [y/N] prompt: a confirm reads the console, which a script cannot answer.
+seal /sc/frozen.txt yes
+read /sc/frozen.txt | assert contains original
+# Every write route must refuse it, and the content must be untouched afterwards.
+assert fails write /sc/frozen.txt tampered
+read /sc/frozen.txt | assert contains original
+read /sc/frozen.txt | assert lacks tampered
+# In a PIPE `ls` emits records, so the seal is a COLUMN rather than text: a separate `sealed`
+# column, not a new `type` value, so existing `where type=file` queries keep their meaning.
+ls /sc | where sealed=true | assert contains frozen.txt
+ls /sc | where sealed=false | assert lacks frozen.txt
+# A seal freezes CONTENT, not existence: renaming and deleting still work, and that is deliberate
+# (see utilities/50_seal.md - an unremovable file is a denial of service, not a guarantee).
+rename /sc/frozen.txt frozen2.txt
+assert ok read /sc/frozen2.txt
+delete /sc/frozen2.txt
+assert fails read /sc/frozen2.txt
+
 # ===== byte pipes: producers + filters (each line spawns a service; kept lean) =====
 echo ''
 echo '===== byte pipes: producers + filters (each line spawns a service; kept lean) ====='

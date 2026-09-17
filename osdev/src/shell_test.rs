@@ -5706,8 +5706,25 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     check!(date_of(&l1, "canary.txt") == "unknown",
            "boot 1: a file baked into the 0008 image reads as `unknown`");
 
+    println!("fs-time: boot 1 - seal a file (the seal must outlive the machine)");
+    // `seal` asks [y/N], so the confirmation is its own line - the harness sends one command
+    // per entry and waits for a prompt between them.
+    let (os, ws) = boot(&["write /frozen.txt original", "seal /frozen.txt yes",
+                          "write /frozen.txt tampered", "read /frozen.txt", "ls long /"]);
+    check!(os.get(1).map_or(false, |r| r.contains("sealed /frozen.txt")), "boot 1: the file was sealed");
+    check!(os.get(2).map_or(false, |r| !r.contains("wrote")), "boot 1: writing a SEALED file was refused");
+    check!(os.get(3).map_or(false, |r| r.contains("original") && !r.contains("tampered")),
+           "boot 1: the sealed content is untouched");
+    check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `ls long` marks it sealed");
+    check!(ws.contains("sealed a file"), "boot 1: fs logged the seal");
+
     println!("fs-time: boot 2 - SAME disk, the date must survive the mount");
-    let (o2, w2) = boot(&["ls long /", "read /stamped.txt"]);
+    let (o2, w2) = boot(&["ls long /", "read /stamped.txt",
+                          "write /frozen.txt tampered-after-reboot", "read /frozen.txt"]);
+    check!(o2.get(2).map_or(false, |r| !r.contains("wrote")),
+           "boot 2: the SEAL survived the reboot - the write is still refused");
+    check!(o2.get(3).map_or(false, |r| r.contains("original")),
+           "boot 2: the sealed content is still the original");
     let l2 = o2.first().cloned().unwrap_or_default();
     let d2 = date_of(&l2, "stamped.txt");
     check!(d2 == d1, format!("boot 2: the date SURVIVED the reboot ({d1} -> {d2})"));

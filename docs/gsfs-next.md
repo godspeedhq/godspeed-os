@@ -146,11 +146,11 @@ Verified by `osdev test file-cap` (13/0): a forward write is accepted, going bac
 is DENIED, and a later forward write still works afterwards, which proves the refusal did not rewind
 the mark.
 
-### SEALED moved to Phase O
+### SEALED moved to Phase O  (BUILT there)
 
 A file that can never be written again is a property of the FILE, not of a capability, so it has to
-survive a reboot - which means on-disk state, which means the format bump. It belongs with Phase O
-and this section should not have claimed it needed no format change.
+survive a reboot - which means on-disk state, which means the format work. It belongs with Phase O
+and this section should not have claimed it needed no format change. See §3a.
 
 ## 3. Phase O - timestamps (GSFS0008 -> 0009)  (BUILT, except SEALED)
 
@@ -177,6 +177,62 @@ the epoch, because a wrong date is worse than an absent one. `drives check` stam
 the floor. Format bump is reformat-only, in the house pattern of 0005 -> 0008.
 
 ---
+
+## 3a. SEALED - content frozen, permanently  (BUILT)
+
+`seal <path>` freezes a file's bytes. It can still be read, listed, renamed, moved and deleted; it
+can never be written again, and **there is no unseal** - a seal a holder can lift is a request
+rather than a guarantee.
+
+### Where the bit lives, and why every obvious place was wrong
+
+The 64-byte record is full. Each candidate was examined and rejected on its failure mode, not on
+taste:
+
+| candidate | why not |
+| --- | --- |
+| a high bit of `name_len` | readers skip entries where `nl > NAME_MAX`, so a sealed file would VANISH from its own listing |
+| a high bit of `itype` | `ITYPE_FILE \| 0x80` matches neither file nor directory - the entry becomes unclassifiable |
+| growing the record to 128 bytes | halves how many entries a directory block holds, for one bit |
+
+It rides **the top bit of the 64-bit `size`**, which is room no file can reach (2^63 bytes is eight
+exabytes). Every size read goes through `rec_size`, which masks it off - and that is not tidiness:
+`write_at` bounds a fragmented file's extent by its size, so the flag leaking into that arithmetic
+would let a write run past the file's own blocks.
+
+The cost is that a build which does not know this feature would display a nonsense size. So the
+volume records **`FEAT_RO_COMPAT_SEALED`** the first time anything is sealed, and Phase L's policy
+then makes such a build mount READ-ONLY: it can neither act on the wrong number nor change anything.
+`ro_compat` rather than `incompat`, because refusing to mount a whole volume over one frozen file is
+a punishment out of proportion, and read-only is the honest middle that policy exists to express.
+
+### Enforced where it cannot be forgotten
+
+The seal is carried on the `Entry`, and **every write path walks to an Entry**, so a write route
+added later cannot forget to ask. `fs` also refuses to MINT a writable capability to a sealed file -
+at `open`, not at each write, because a capability that looks writable and fails on use is a worse
+answer than a plain refusal, and §7.3 says a right that cannot be honoured should not be granted.
+
+### What it deliberately does not promise
+
+- **Deletion still works.** A seal freezes content, not existence; deleting needs authority over the
+  parent directory. An unremovable file is a way to fill a disk with rubbish nobody may clear - a
+  denial of service bought with a guarantee nobody asked for.
+- **Renaming and moving still work.** Archiving a sealed log is reasonable and changes no bytes.
+- **It is not encryption.** A sealed file is as readable as any other.
+
+### Surfaces
+
+`ls long` shows `seal` in the TYPE column - a different kind of thing to have on a disk, not a
+footnote beside `file`. In a PIPE, `ls` emits records, so it is a separate **`sealed` column** rather
+than a new `type` value: making a sealed file's type read `seal` would silently drop it out of every
+`where type=file` query anyone has already written.
+
+`seal <path> yes` skips the `[y/N]` prompt, because a confirm reads the console and a script cannot
+answer one. The warning still prints; `yes` buys automation, not silence.
+
+Verified by `osdev test fs-time` (15/0): seal, refuse the write, **reboot**, refuse it again, and the
+content is still the original.
 
 ## 4. Phase P - `ls`, made fully featured  (BUILT)
 

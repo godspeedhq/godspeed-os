@@ -65,7 +65,17 @@ const SB_CRC_OFF: usize = 136;         // u32 CRC32 over [0..136) - moved from @
 const FEAT_COMPAT_BACKUP_SB: u32 = 0x1; // a backup superblock sits at the last LBA (Phase F)
 const FEAT_INCOMPAT_EXTENTS: u32 = 0x1; // some file is fragmented (extent list, Phase I) - needed to read it
 const KNOWN_COMPAT: u32 = FEAT_COMPAT_BACKUP_SB;
-const KNOWN_RO_COMPAT: u32 = 0;
+/// Some file on this volume is SEALED (Phase O). `ro_compat`, deliberately: a build that does not
+/// know this bit mounts READ-ONLY (§6.15, Phase L), so it cannot write to a sealed file, cannot
+/// unseal one, and cannot allocate over the bit's storage. The one thing it would get wrong is
+/// cosmetic - it would report a nonsense SIZE for a sealed entry, because the flag rides the size
+/// field's top bit - and it would do that on a mount that cannot change anything.
+///
+/// Not `incompat`: refusing to mount a whole volume because one file is read-only forever is a
+/// punishment out of all proportion to the risk, and read-only is the honest middle the feature-flag
+/// policy was built to express.
+const FEAT_RO_COMPAT_SEALED: u32 = 0x1;
+const KNOWN_RO_COMPAT: u32 = FEAT_RO_COMPAT_SEALED;
 const KNOWN_INCOMPAT: u32 = FEAT_INCOMPAT_EXTENTS;
 
 // Extent lists (GSFS0008). A file is normally a single contiguous extent (`ITYPE_FILE`:
@@ -142,6 +152,23 @@ const FS_CLOCK_PUSH: u8 = 0xC1;
 /// trusting it. `time` pushes far more often than this; the bound exists so that a `time` which has
 /// died cannot leave `fs` stamping files from an ever-staler reading forever.
 const CLOCK_MAX_AGE_S: i64 = 300;
+
+/// SEALED rides the top bit of a record's 64-bit `size`.
+///
+/// **The record is full - there was no spare byte, and each obvious candidate was worse.** A high bit
+/// in `name_len` makes readers skip the entry (`nl > NAME_MAX`), so a sealed file would VANISH from
+/// its own listing. A high bit in `itype` matches neither `ITYPE_FILE` nor `ITYPE_DIR`, so the entry
+/// becomes unclassifiable. Growing the record to 128 bytes would halve how many entries a directory
+/// block holds, for one bit.
+///
+/// The size field has room that no file can ever reach: 2^63 bytes is eight exabytes. The cost is
+/// that a build which does not know this feature would display a nonsense size - which is why the
+/// volume also carries `FEAT_RO_COMPAT_SEALED`, so such a build mounts READ-ONLY and can neither act
+/// on that wrong number nor change anything.
+///
+/// Every read of a size goes through `rec_size`, which masks it off, so the flag cannot leak into
+/// arithmetic. That is the whole reason these are functions rather than an inline `& !BIT`.
+const REC_SEALED_BIT: u64 = 1 << 63;
 
 /// A time this volume does not record. Displayed as "unknown", never as an epoch date.
 const TIME_UNKNOWN: u32 = 0;
@@ -221,6 +248,8 @@ const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] - like W
 const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep - walk the tree, verify
                              // every block's CRC, report → [FS_OK, files:u32, dirs:u32, bad:u32,
                              // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
+/// Seal a file: `[op, plen, path]`. Content frozen permanently - see `Fs::seal`.
+const OP_SEAL: u8 = 31;
 const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
                              // delegated resource for the file, reply [FS_OK] + the embedded FILE CAP.
                              // The client then operates the file by INVOKING that cap (no fs name in
@@ -466,6 +495,10 @@ const _: () = assert!(
 #[derive(Clone, Copy)]
 struct Entry {
     itype: u8,
+    /// Content frozen permanently (`REC_SEALED_BIT`). Carried on the Entry so that EVERY path which
+    /// walks to a file - and every write path does - has the answer already, and no write route can
+    /// be added later that forgets to ask.
+    sealed: bool,
     size: u64,
     first_block: u64,
     block_count: u64,
@@ -1590,6 +1623,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             }
             send(&out);
         }
+        OP_SEAL => txn!(fs.seal(ctx, path)),
         OP_MKDIR => txn!(fs.mkdir(ctx, path)),
         OP_MKDIR_P => txn!(fs.mkdir_parents(ctx, path)),
         OP_LIST_DIR => match fs.list_dir(ctx, path) {
@@ -1606,7 +1640,18 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // [FS_OK] with the FILE CAP embedded; the client then operates the file by invoking
             // that cap (§7.10). `open_file` sends its own reply (it must embed the cap), so we
             // only send FS_ERR if it failed before replying.
-            let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE | OPEN_APPEND_ONLY) };
+            let mut want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE | OPEN_APPEND_ONLY) };
+            // A SEALED file yields no writable capability. Refused HERE rather than at each write,
+            // because handing out a cap that looks writable and fails on use is a worse answer than
+            // refusing plainly - and because §7.3 says rights narrow, so a capability that cannot be
+            // honoured should never be minted in the first place.
+            if want & (RIGHT_WRITE | OPEN_APPEND_ONLY) != 0
+                && fs.walk(ctx, path).map_or(false, |e| e.sealed)
+            {
+                ctx.log("fs: refusing a writable capability to a SEALED file (read-only is available)");
+                want &= RIGHT_READ;
+                if want == 0 { send(&[FS_DENIED]); return; }
+            }
             if fs.open_file(ctx, path, want, tag, reply).is_err() { send(&[FS_ERR]); }
             else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
         }
@@ -2721,7 +2766,7 @@ impl Fs {
 
     // ── directory tree (self-describing entries) ──────────────────────────────
     fn root_entry(&self) -> Entry {
-        Entry { itype: ITYPE_DIR, size: 0, first_block: self.root_first_block, block_count: self.root_block_count, loc: None }
+        Entry { itype: ITYPE_DIR, sealed: false, size: 0, first_block: self.root_first_block, block_count: self.root_block_count, loc: None }
     }
 
     /// Find `name` among a directory's entries; returns the child (with its on-disk loc).
@@ -2737,7 +2782,8 @@ impl Fs {
                 if &blk[o + 2..o + 2 + nl] == name {
                     return Some(Entry {
                         itype: blk[o],
-                        size: u64_at(&blk, o + 40),
+                        size: rec_size(&blk, o),
+                        sealed: rec_is_sealed(&blk, o),
                         first_block: u64_at(&blk, o + 48),
                         block_count: u64_at(&blk, o + 56),
                         loc: Some(Loc { block, slot }),
@@ -2837,12 +2883,12 @@ impl Fs {
                 // the RECORD (ctime only). That distinction is the whole reason `ctime` is recorded
                 // separately: it answers "was this file edited, or just moved about?", which a backup
                 // and `drives check` both care about and a single timestamp cannot express.
-                let old_size = u64_at(&blk, o + 40);
+                let old_size = rec_size(&blk, o);
                 let (old_m, _) = dir_times_get(&blk, loc.slot);
                 let now = self.now_epoch(ctx);
                 let mtime = if e.size != old_size { now } else { old_m };
                 dir_times_set(&mut blk, loc.slot, mtime, now);
-                blk[o + 40..o + 48].copy_from_slice(&e.size.to_le_bytes());
+                rec_set_size(&mut blk, o, e.size);   // preserves the seal
                 blk[o + 48..o + 56].copy_from_slice(&e.first_block.to_le_bytes());
                 blk[o + 56..o + 64].copy_from_slice(&e.block_count.to_le_bytes());
                 if !self.td_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
@@ -2920,6 +2966,10 @@ impl Fs {
         if parent.itype != ITYPE_DIR { return Err("parent is not a directory"); }
         if !valid_name(name) { return Err("bad name"); }
         let existing = self.dir_find(ctx, &parent, name);
+        // A sealed file is frozen: overwriting it here would be a new extent under the same name,
+        // which is exactly the rewrite the seal exists to refuse.
+        if existing.as_ref().map_or(false, |e| e.sealed) { return Err("file is sealed - its content cannot be changed"); }
+        if existing.as_ref().map_or(false, |e| e.sealed) { return Err("file is sealed - its content cannot be changed"); }
         if let Some(ref e) = existing {
             if !is_file(e.itype) { return Err("path is a directory"); }
         }
@@ -2938,7 +2988,7 @@ impl Fs {
                 if !data_write(ctx, first + i as u64, payload) { return Err("block write failed"); }
             }
         } else {
-            let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+            let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
             let (exts, ne) = self.ext_of(ctx, &frag_e).ok_or("extent block read failed")?;
             let mut produced = 0usize;
             'fill: for ei in 0..ne {
@@ -2955,7 +3005,7 @@ impl Fs {
         }
         match existing {
             Some(e) => {
-                let ne = Entry { itype, size: data.len() as u64, first_block: first, block_count: count, loc: e.loc };
+                let ne = Entry { itype, sealed: false, size: data.len() as u64, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)?;
             }
@@ -3006,7 +3056,7 @@ impl Fs {
         let (itype, first, count) = self.alloc_file(ctx, blocks)?;
         match existing {
             Some(e) => {
-                let ne = Entry { itype, size: total, first_block: first, block_count: count, loc: e.loc };
+                let ne = Entry { itype, sealed: false, size: total, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)
             }
@@ -3027,6 +3077,7 @@ impl Fs {
     fn write_at(&mut self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8], journal: bool) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if !is_file(e.itype) { return Err("not a file"); }
+        if e.sealed { return Err("file is sealed - its content cannot be changed"); }
         if offset % DATA_PAYLOAD as u64 != 0 { return Err("unaligned offset"); }
         // The file's data-block count: a contiguous file's `block_count`, else the extents'
         // total (a fragmented file's `block_count` counts only the extent block).
@@ -3091,7 +3142,12 @@ impl Fs {
         Some(n)
     }
 
-    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64, mtime:u32}…]`, one block.
+    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64, mtime:u32, flags:u8}…]`.
+    ///
+    /// `flags` bit 0 is SEALED. A SEPARATE byte rather than a spare bit of `is_dir`, deliberately: a
+    /// consumer that missed the change would then read a sealed FILE as a DIRECTORY, which is a
+    /// silent wrong answer. Getting the stride wrong instead produces visible garbage, and a loud
+    /// failure is the one to choose when a mistake is possible (§26.7).
     ///
     /// The `mtime` is GSFS0009's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
     /// client renders that as "unknown" rather than as a date. Four bytes per entry is the cost, out
@@ -3113,14 +3169,15 @@ impl Fs {
                 if t == ITYPE_FREE { continue; }
                 let nl = blk[o + 1] as usize;
                 if nl == 0 || nl > NAME_MAX { continue; }
-                if w + 1 + nl + 1 + 8 + 4 > BLOCK { break; }
+                if w + 1 + nl + 1 + 8 + 4 + 1 > BLOCK { break; }
                 out[w] = nl as u8;
                 out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 2..o + 2 + nl]);
                 out[w + 1 + nl] = (t == ITYPE_DIR) as u8;
-                out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&blk[o + 40..o + 48]); // size:u64
+                out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&rec_size(&blk, o).to_le_bytes()); // size:u64
                 let (mtime, _) = dir_times_get(&blk, slot);
                 out[w + 10 + nl..w + 14 + nl].copy_from_slice(&mtime.to_le_bytes());
-                w += 1 + nl + 1 + 8 + 4;
+                out[w + 14 + nl] = u8::from(rec_is_sealed(&blk, o));   // flags bit 0 = SEALED
+                w += 1 + nl + 1 + 8 + 4 + 1;
                 count += 1;
             }
         }
@@ -3234,6 +3291,36 @@ impl Fs {
         // alone, so files keep reading "unknown" rather than acquiring a nonsense stamp.
         if epoch <= 0 || epoch >= u32::MAX as i64 { return; }
         self.clock.set((epoch as u32, ctx.epoch_secs_monotonic()));
+    }
+
+    /// Seal a file: its content can never change again.
+    ///
+    /// **There is no unseal, and that is the feature.** A seal a holder can lift is a request; the
+    /// value here is that nothing short of deleting the file undoes it.
+    ///
+    /// **What it does NOT claim.** The file can still be renamed, moved and DELETED - a seal freezes
+    /// CONTENT, not existence, and deleting needs authority over the parent directory rather than
+    /// over the file. Refusing deletion would make a sealed file unremovable, so a filesystem could
+    /// be filled with rubbish nobody is permitted to clear: a denial of service bought with a
+    /// guarantee nobody asked for. Overclaiming here would be worse than the narrower promise.
+    fn seal(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
+        let e = self.walk(ctx, path).ok_or("not found")?;
+        if !is_file(e.itype) { return Err("only a file can be sealed"); }
+        let loc = e.loc.ok_or("cannot seal the root")?;
+        if e.sealed { return Ok(()); }                       // idempotent: already frozen
+        // Record the FEATURE before the seal. A volume carrying a sealed file must announce it, so a
+        // build that does not know the bit mounts read-only (§6.15) instead of writing through a
+        // flag it cannot see. Doing it in this order means a crash between the two leaves a volume
+        // that is merely cautious, never one with an invisible seal.
+        if self.feat_ro_compat & FEAT_RO_COMPAT_SEALED == 0 {
+            self.feat_ro_compat |= FEAT_RO_COMPAT_SEALED;
+            self.persist_super(ctx)?;
+        }
+        let mut blk = self.td_read(ctx, loc.block).ok_or("record read failed")?;
+        rec_seal(&mut blk, loc.slot * REC_SIZE);
+        if !self.td_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
+        ctx.log_fmt(format_args!("fs: sealed a file ({} bytes) - its content can no longer change", e.size));
+        Ok(())
     }
 
     /// Was this resource opened APPEND-ONLY? See `OPEN_APPEND_ONLY`.
@@ -3389,7 +3476,7 @@ impl Fs {
             }
         } else if itype == ITYPE_FILE_FRAG {
             // Free the scattered data runs (each its own bounded txn) before the extent block.
-            let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+            let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
             if let Some((exts, ne)) = self.ext_of(ctx, &frag_e) {
                 for i in 0..ne { let (s, l) = exts[i]; self.free_run_txn(ctx, s, l)?; }
             }
@@ -3462,7 +3549,7 @@ impl Fs {
             // marked used regardless - the entry references them; freeing would risk reuse.
             if itype == ITYPE_FILE_FRAG {
                 // `first` (already marked above) is the extent block; its runs hold the data.
-                let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+                let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
                 match self.ext_of(ctx, &frag_e) {
                     Some((exts, ne)) => {
                         let mut ok = true;
@@ -3586,7 +3673,7 @@ impl Fs {
             st.0 += 1;
             if itype == ITYPE_FILE_FRAG {
                 st.3 += count; // the extent block (count == 1), read + CRC-verified by ext_of
-                let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+                let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
                 match self.ext_of(ctx, &frag_e) {
                     Some((exts, ne)) => {
                         let mut ok = true;
@@ -3723,6 +3810,33 @@ fn guard_selftest(ctx: &ServiceContext) {
     }
 }
 
+/// A record's true size, with the SEALED flag masked off.
+///
+/// Every size read goes through here. An unmasked read would be a file eight exabytes long, and the
+/// damage is not cosmetic: `write_at` bounds a fragmented file's extent by `size`, so the flag
+/// leaking into that arithmetic would let a write run past the file's blocks.
+fn rec_size(blk: &[u8; BLOCK], o: usize) -> u64 {
+    u64_at(blk, o + 40) & !REC_SEALED_BIT
+}
+
+/// Is this record sealed - content frozen, permanently?
+fn rec_is_sealed(blk: &[u8; BLOCK], o: usize) -> bool {
+    u64_at(blk, o + 40) & REC_SEALED_BIT != 0
+}
+
+/// Write a size back, preserving the seal.
+fn rec_set_size(blk: &mut [u8; BLOCK], o: usize, size: u64) {
+    let sealed = u64_at(blk, o + 40) & REC_SEALED_BIT;
+    blk[o + 40..o + 48].copy_from_slice(&((size & !REC_SEALED_BIT) | sealed).to_le_bytes());
+}
+
+/// Seal a record. There is deliberately no unseal: a seal a holder can lift is a request, not a
+/// guarantee, and the whole value of this flag is that nothing short of deleting the file undoes it.
+fn rec_seal(blk: &mut [u8; BLOCK], o: usize) {
+    let v = u64_at(blk, o + 40) | REC_SEALED_BIT;
+    blk[o + 40..o + 48].copy_from_slice(&v.to_le_bytes());
+}
+
 /// Stamp the times region's own CRC. Called by every directory-block write.
 ///
 /// **A GSFS0008 volume is upgraded in place by this, and harmlessly.** Its times region is all
@@ -3829,7 +3943,7 @@ fn encode_rec(blk: &mut [u8], slot: usize, itype: u8, name: &[u8], size: u64, fi
     let nl = name.len().min(NAME_MAX);
     blk[o + 1] = nl as u8;
     blk[o + 2..o + 2 + nl].copy_from_slice(&name[..nl]);
-    blk[o + 40..o + 48].copy_from_slice(&size.to_le_bytes());
+    blk[o + 40..o + 48].copy_from_slice(&(size & !REC_SEALED_BIT).to_le_bytes());
     blk[o + 48..o + 56].copy_from_slice(&first.to_le_bytes());
     blk[o + 56..o + 64].copy_from_slice(&count.to_le_bytes());
 }

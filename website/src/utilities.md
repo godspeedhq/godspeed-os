@@ -46,6 +46,7 @@ fails.
 | [`move`](utilities/move.md) | relocate a file |
 | [`rename`](utilities/rename.md) | rename a file or directory in place |
 | [`delete`](utilities/delete.md) | remove a file, directory, or whole subtree |
+| [`seal`](utilities/seal.md) | freeze a file's content, permanently (no unseal) |
 | [`find`](utilities/find.md) | search the tree for a name |
 | [`tree`](utilities/tree.md) | print the directory hierarchy |
 | [`edit`](utilities/edit.md) | the full-screen editor (a bounded piece table - any file size) |
