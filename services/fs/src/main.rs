@@ -1522,14 +1522,18 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                     send(&[FS_ERR]);
                 }
                 Some(f) => match f.check(ctx) {
-                    Ok((files, dirs, bad, used)) => {
-                        let mut out = [0u8; 29];
+                    Ok((files, dirs, bad, used, stored_before)) => {
+                        // 37 bytes now, not 29: the trailing u64 is what the SUPERBLOCK said before
+                        // the rebuild, so a client can report that a repair was needed rather than
+                        // only its result. Appended, so a client reading the first 29 is unaffected.
+                        let mut out = [0u8; 37];
                         out[0] = FS_OK;
                         out[1..5].copy_from_slice(&files.to_le_bytes());
                         out[5..9].copy_from_slice(&dirs.to_le_bytes());
                         out[9..13].copy_from_slice(&bad.to_le_bytes());
                         out[13..21].copy_from_slice(&used.to_le_bytes());
                         out[21..29].copy_from_slice(&f.free_blocks.to_le_bytes());
+                        out[29..37].copy_from_slice(&stored_before.to_le_bytes());
                         send(&out);
                     }
                     Err(_) => send(&[FS_ERR]),
@@ -3527,7 +3531,19 @@ impl Fs {
 
     /// Walk the filesystem from root, rebuild the bitmap + free count, verify CRCs. Returns
     /// `(files, dirs, bad, used)`.
-    fn check(&mut self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64), &'static str> {
+    /// fsck: rebuild the free bitmap and the free count from the tree, which is the truth (26.4).
+    ///
+    /// Returns `(files, dirs, bad, used, stored_free_before)`. **That last one is the point, and it
+    /// used to be thrown away.** This overwrote `self.free_blocks` with the recomputed value and
+    /// persisted it, so a volume whose stored free count had DRIFTED was silently corrected and
+    /// nobody ever learned it had been wrong. A repair that reports nothing is the same shape as a
+    /// silent fallback: the operator cannot tell a healthy disk from one that just had an
+    /// inconsistency repaired underneath them, and an inconsistency is evidence about something else
+    /// (an interrupted write, a leaked extent) that is then lost (26.7).
+    ///
+    /// The repair itself is unchanged and still happens. What is added is that the disagreement is
+    /// REPORTED, loudly in the log and back to the caller.
+    fn check(&mut self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64, u64), &'static str> {
         // Start from an all-free bitmap (fast batched zero), then mark what is actually used.
         // The bitmap region is [bitmap_start, journal_start).
         let bitmap_blocks = self.journal_start - self.bitmap_start;
@@ -3540,9 +3556,21 @@ impl Fs {
         self.check_subtree(ctx, root.itype, root.first_block, root.block_count, 0, &mut st)?;
         // Recompute the free count from what the tree actually uses, and persist BOTH superblock
         // copies (heals a drifted free count + refreshes the backup).
+        let stored_before = self.free_blocks;
         self.free_blocks = self.total_blocks - st.3;
+        if stored_before != self.free_blocks {
+            // SAY IT. The numbers disagreeing means the superblock's accounting did not match the
+            // tree, and the tree is the truth - so the repair is right, and the fact that a repair
+            // was NEEDED is a finding about this volume that the operator must not have to infer.
+            ctx.log_fmt(format_args!(
+                "fs: check - free count DISAGREED with the tree: superblock said {} free, the tree says {} ({} block(s) {}). Repaired.",
+                stored_before, self.free_blocks,
+                stored_before.abs_diff(self.free_blocks),
+                if stored_before > self.free_blocks { "were marked free but are in use" }
+                else { "were held as used but are unreachable - a leak" }));
+        }
         self.persist_super(ctx)?;
-        Ok((st.0, st.1, st.2, st.3))
+        Ok((st.0, st.1, st.2, st.3, stored_before))
     }
 
     /// Mark a node's extent used, recurse into directories, verify file/dir CRCs. `st` is

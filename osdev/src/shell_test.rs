@@ -4271,6 +4271,18 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
                    "free count rebuilt from the tree to within a few blocks of the truth");
             check!(r.contains("0 bad"), "no corrupt blocks reported");
             check!(r.contains("ok") || r.contains("consistent"), "reports consistent");
+            // fsck must SAY a repair was needed, not merely perform one.
+            //
+            // This disk's free count was drifted on purpose, so the repaired case is the one under
+            // test here - and until this assertion existed, a healthy volume and one that had just
+            // had its accounting corrected printed identical lines. A silent repair is the same
+            // shape as a silent fallback: the drift is evidence about something else (an
+            // interrupted write, a leaked extent) and repairing it away unseen destroys that
+            // evidence (26.7). The assertion is also what proves the new reporting FIRES rather
+            // than merely compiling.
+            check!(r.contains("REPAIRED"), "fsck reports that a repair was NEEDED, not just its result");
+            check!(r.contains("marked free but are IN USE"),
+                   "fsck names the DIRECTION of the disagreement (free-but-used, not a leak)");
         }
         None => { println!("fs-check: FAIL - drives check timeout"); fail += 1; }
     }

@@ -1747,6 +1747,13 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             write_bytes(&mut buf, &mut pos, b"unknown: ");
             write_bytes(&mut buf, &mut pos, other.as_bytes());
             ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
+            // If they reached for a POSIX or DOS name, name the word we use - once, and without
+            // running anything. See `FOREIGN_HINTS`: a hint, never an alias, and it states no rule
+            // about the vocabulary because every such rule here has exceptions.
+            if let Some(ours) = foreign_hint(other) {
+                ctx.console_writeln_fmt(format_args!(
+                    "  try `{}` - see `help` for every command.", ours));
+            }
             Err(ShellError::Unknown) // an unknown command is a failure (so `assert fails …` holds)
         }
     };
@@ -4176,6 +4183,64 @@ fn cmd_assert(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<()
 // ---------------------------------------------------------------------------
 
 const UTIL_VERSION: &str = "0.4.0";
+
+/// What someone typed when they meant one of ours, and what to point them at.
+///
+/// **Teaching the vocabulary at the moment somebody reaches for the wrong word.** Somebody arriving
+/// with POSIX or DOS fingers gets `unknown: cat` and no idea that `read` is the word here, which
+/// costs them a trip to `help` to learn one substitution.
+///
+/// **The hint names the word and claims nothing about the vocabulary**, because any rule stated here
+/// would be false. This is not "GodspeedOS uses whole words": `cd` is kept precisely because it
+/// reads well, and `find`, `kill`, `echo` and `clear` are shared with POSIX outright. The vocabulary
+/// is chosen command by command on whether the name says what the thing does - sometimes that
+/// coincides with POSIX and sometimes it does not. A hint that lectures about a pattern will be
+/// wrong for whichever command is the next exception.
+///
+/// **A hint, never an alias.** The command does NOT run. An alias would reward the reflex and keep
+/// the borrowed vocabulary in front of the user, which is the opposite of the point: these tools are
+/// not their POSIX namesakes and do not take their flags (there are no flags - conventions rule 4),
+/// there are no mode bits, no owner, no inodes and no symlinks. Being told the right word once is
+/// how the reflex retrains; being silently served is how it never does.
+///
+/// Kept deliberately short. It covers the commands whose absence is genuinely surprising, not every
+/// binary on a Linux box - a hint for something we do not do and never will is noise, and pretending
+/// to recognise `awk` implies a plan to have one.
+const FOREIGN_HINTS: &[(&str, &str)] = &[
+    // POSIX
+    ("dir",   "ls"),        // the DOS reflex for the listing command
+    ("cat",   "read"),
+    ("more",  "read"),
+    ("less",  "read"),
+    ("mv",    "move"),      // ... or `rename`; POSIX conflates them and we deliberately do not
+    ("rm",    "delete"),
+    ("cp",    "copy"),
+    ("grep",  "match"),
+    ("wc",    "count"),
+    ("head",  "first"),
+    ("tail",  "last"),
+    ("touch", "write"),
+    ("pwd",   "cd"),        // `cd` with no argument prints where you are
+    ("ps",    "status"),
+    ("top",   "observe"),
+    ("htop",  "observe"),
+    ("df",    "drives"),
+    ("du",    "drives"),
+    ("fsck",  "drives check"),
+    ("chmod", "seal"),      // the nearest thing: there are no mode bits, only a capability
+    ("chown", "caps"),      // ... and no ownership either; authority is what a holder was granted
+    ("shutdown", "reboot"),
+    ("halt",  "reboot"),
+    ("poweroff", "reboot"),
+    ("uname", "about"),
+    ("man",   "help"),
+    ("which", "whatis"),
+];
+
+/// The hint for a word we do not have, if there is one worth giving.
+fn foreign_hint(cmd: &str) -> Option<&'static str> {
+    FOREIGN_HINTS.iter().find(|(foreign, _)| *foreign == cmd).map(|(_, ours)| *ours)
+}
 
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
@@ -14437,7 +14502,9 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
 /// `drives check` - fsck: walk the tree (the source of truth), rebuild the free bitmap + free
 /// count from it, and verify every block's CRC. Repairs allocation drift non-destructively;
 /// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
-/// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
+/// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64,
+/// stored_free_before:u64] - the last field is what the SUPERBLOCK claimed before the rebuild, so a
+/// repair that was NEEDED can be reported rather than only its result.
 fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
@@ -14456,6 +14523,27 @@ fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
                 ctx.console_writeln_fmt(format_args!(
                     "check: {} files, {} dirs, {} bad; {} blocks used, {} free (bitmap + free count rebuilt from the tree)",
                     files, dirs, bad, used, free));
+                // SAY WHETHER A REPAIR WAS NEEDED, not just that one ran.
+                //
+                // fsck rebuilt the free count from the tree either way, so this line used to look
+                // identical on a healthy volume and on one whose accounting had drifted - and drift
+                // is evidence about something else (an interrupted write, a leaked extent) that was
+                // being repaired away unseen (26.7). The older reply has no such field, so a short
+                // one still prints the line above and simply says nothing more.
+                if p.len() >= 37 {
+                    let before = u64a(29);
+                    if before == free {
+                        ctx.console_writeln("check: the free count already agreed with the tree - nothing was repaired");
+                    } else if before > free {
+                        ctx.console_writeln_fmt(format_args!(
+                            "check: REPAIRED - the superblock claimed {} free, the tree says {}; {} block(s) were marked free but are IN USE",
+                            before, free, before - free));
+                    } else {
+                        ctx.console_writeln_fmt(format_args!(
+                            "check: REPAIRED - the superblock claimed {} free, the tree says {}; {} block(s) were held as used but are unreachable (a LEAK)",
+                            before, free, free - before));
+                    }
+                }
                 if bad > 0 {
                     ctx.console_writeln_fmt(format_args!(
                         "check: WARNING - {} file(s)/dir(s) had unreadable (CRC-failed) blocks; see the log", bad));
