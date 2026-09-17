@@ -1,7 +1,8 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
-**Status: one gate PASSES in QEMU (torn writes, `osdev test fs-tear`), the rest are NOT RUN. This
-is QEMU-validated only; no hardware result is claimed anywhere in this file.**
+**Status: the torn-write gate PASSES in QEMU across three operations (`osdev test fs-tear`, 14/0,
+54 tear points), the rest are NOT RUN. This is QEMU-validated only; no hardware result is claimed
+anywhere in this file.**
 
 The mission, and every gate below is an instance of it:
 
@@ -19,12 +20,12 @@ is a bug rather than a debate. Section 2 is that statement, and it did not exist
 
 ## 1. What is already covered, so it is not rebuilt
 
-Fifteen suites, all green in QEMU (`osdev test fs-all` covers fourteen of them in ~11 minutes;
-`fs-tear` is new and separate):
+Fifteen suites, all green in QEMU. `osdev test fs-all` runs every one of them; it was ~11 minutes
+before `fs-tear` joined and roughly doubles with it, because `fs-tear` boots QEMU once per tear point:
 
 | suite | what it actually attacks |
 |---|---|
-| `fs-tear` | **NEW.** Every prefix of one operation's writes, recorded from the real driver and booted. Section 3.1 |
+| `fs-tear` | **NEW.** Every prefix of an operation's writes, recorded from the real driver and booted. 3 operations, 54 tear points, plus a control proving the oracle can reject. Section 3.1 |
 | `fs-corrupt` | metadata damaged host-side: bad superblock CRC, bad directory CRC, bad magic. 14 checks |
 | `fs-hostile` | genuinely malicious disks: a directory that contains itself, a name carrying `ESC [ 2J`, a `name_len` past the record |
 | `fs-journal` | a committed-but-unfinished transaction is replayed; an invalid commit record is rejected |
@@ -103,10 +104,31 @@ test, and it answers "did this tear survive" rather than "does any tear survive"
    not a model of a power cut. It is exactly the disk state one produces.**
 4. Boot each `A_k`, mount, and check the outcome is in the permitted set - and nothing else.
 
-**First result: a whole-file overwrite writes 22 sectors, and all 22 tear points left the file wholly
-OLD or wholly NEW, on a volume that mounted.** Evidence: `build/tests/fs_tear_serial.log` holds the
-recording; a tear point outside the permitted set keeps its image at `build/tests/fs_tear_k<N>.img`
-so it can be booted again while it is being fixed.
+**Results so far - three operations, 54 tear points, every one inside the permitted set:**
+
+| operation | sectors written | tear points | outcome |
+|---|---|---|---|
+| overwrite a whole file | 22 | 22 | wholly `ORIGINAL` or wholly `NEWNEWNEW`, never a mix |
+| rename | 15 | 15 | the old name or the new name, never both, never neither |
+| move across directories | 17 | 17 | in the source or in the destination, never both, never neither |
+
+Each case is a row in a table rather than a copy of the harness: a setup whose last command writes
+nothing (that is the boundary marker), the one operation to tear, a probe, and the two mutually
+exclusive outcomes the permitted-outcome table allows. Evidence:
+`build/tests/fs_tear_serial_<case>.log` holds each recording, written on every run and not only on
+failure; a tear point outside the permitted set keeps its image at
+`build/tests/fs_tear_<case>_k<N>.img` so it can be booted again while it is being fixed.
+
+**And the oracle is proved able to REJECT**, because 54 passes are worth nothing until the thing
+doing the judging has been seen to fail. A control boots the pristine disk and probes for the move
+case, where neither permitted outcome can hold (there is no destination directory at all); the oracle
+must reject it, and the suite fails if it does not. Getting the `move` oracle right took two attempts
+for exactly this reason: the first version looked for the destination directory, which exists both
+before and after the move, so it could never have distinguished them.
+
+One trap recorded, because the obvious answer is wrong. An oracle marker must not be a substring of
+its own opposite, nor present in both states. `zdir` failed the second test; probing INSIDE the
+destination for `(empty)` versus the file name passes both.
 
 The recording holds 522 sectors in all and the operation accounts for 22 of them, which looks wrong
 until you know why: the suite builds `fs` with its `selftest` feature, and that self-test writes a
@@ -120,9 +142,17 @@ line marking a successful write. The sweep is bounded instead by the tap high-wa
 moment the preceding (read-only) command finished - measured, not assumed, since the number of boot
 writes is not a constant.
 
-**Still to do here:** the other ten rows of section 2, and the sub-sector variant (`A_k` plus write
-`k+1` applied to only its first half), which should be DETECTED by the CRC and is the lower-value
-half because `fs-corrupt` already probes that mechanism.
+**Still to do here:** the remaining rows of section 2. `delete` is the next one worth having and
+needs a different oracle from the three above - present-and-allocated versus absent-and-free is not a
+question `ls` can answer, because a LEAK (absent but still allocated) looks identical to a clean
+delete from the directory side. The check is the free accounting: `drives list` reports the
+superblock's stored free count and `drives check` recomputes it by walking the tree, so a
+disagreement between them within one boot is exactly the leak. Then `write-at` (whose permitted
+outcome is a prefix rather than an exclusive pair, so the oracle shape changes), `mkdir -p`,
+`delete-tree` and `seal`.
+
+Also the sub-sector variant (`A_k` plus write `k+1` applied to only its first half), which should be
+DETECTED by the CRC - the lower-value half, because `fs-corrupt` already probes that mechanism.
 
 **And not a SIGKILL of QEMU.** It is the more realistic power cut and the worse oracle: not
 reproducible, so a failure cannot be bisected, and a pass proves only that one timing was survivable.
@@ -143,7 +173,7 @@ in section 2 - which is why that table had to exist first.
 
 ### 3.3 Crash at every persistence boundary - PARTIAL
 
-3.1 does this for one operation, exhaustively. The remaining work is the other operations, the
+3.1 does this for three operations, exhaustively. The remaining work is the other operations, the
 reordered/delayed/failed variants, and the volatile-write-cache model: an acknowledged write is not
 durable without the declared barrier, and the test must be able to express the difference.
 
@@ -255,9 +285,9 @@ Filled in from what has actually been run. NOT RUN means not run.
 
 | Gate | Result | Evidence / notes |
 |---|---|---|
-| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` 14/14, ~11 min; `files` 222/0; `shell` 174/0 |
+| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (now 15 suites including `fs-tear`); `files` 222/0; `shell` 174/0 |
 | Independent reference-model tests | NOT RUN | 3.2. Blocked on nothing but effort; the outcome table it needs now exists |
-| Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 5/0 - one operation, 22/22 tear points. Ten rows of section 2 remain |
+| Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 14/0 - three operations, 54/54 tear points, oracle proved able to reject. Eight rows of section 2 remain |
 | Data/metadata exhaustion | NOT RUN | 3.4 |
 | Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |

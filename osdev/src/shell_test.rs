@@ -5770,82 +5770,153 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
     // previous replay, so one bad boot cannot contaminate the rest of the sweep.
     let base = match std::fs::read(persist_path) { Ok(b) => b, Err(e) => { eprintln!("fs-tear: cannot read {persist_path}: {e}"); std::process::exit(1); } };
 
-    // ---- 1. RECORD ----------------------------------------------------------------------------
+    // ---- THE CASES ----------------------------------------------------------------------------
     //
-    // The operation under test is a whole-file overwrite of a file that already exists with known,
-    // different content. Its permitted outcomes are the crispest in the table: the OLD content
-    // complete, or the NEW content complete. Never a mix, and never an entry pointing at blocks that
-    // were never written.
-    println!("fs-tear: recording - one overwrite, with every sector it writes");
-    let rec_disk = "build/tests/fs_tear_record.img";
-    if std::fs::write(rec_disk, &base).is_err() { eprintln!("fs-tear: cannot stage the record disk"); std::process::exit(1); }
-    // A marker command first: the writes before it are boot and mount, and the sweep starts after
-    // them. `read` writes nothing, so the tap's high-water mark at this point is exactly the
-    // boundary between "the machine came up" and "the operation ran".
-    let (rout, rserial, rmarks) = boot(rec_disk, &["read /tear.txt", "write /tear.txt NEWNEWNEW", "read /tear.txt"]);
-    let writes = parse_write_tap(&rserial);
-    // KEEP THE EVIDENCE. A tear suite that reports a number and discards the recording cannot be
-    // argued with: the serial holds the tap, and the tap is the only record of what the operation
-    // actually did. Written unconditionally, not only on failure, because the interesting question
-    // is often about a run that PASSED.
-    let _ = std::fs::write("build/tests/fs_tear_serial.log", &rserial);
-    check!(!writes.is_empty(), format!("the write tap recorded sectors ({} of them)", writes.len()));
-    check!(rout.first().map_or(false, |r| r.contains("ORIGINAL")),
-           "the file held its ORIGINAL content before the overwrite");
-    check!(rout.get(2).map_or(false, |r| r.contains("NEWNEWNEW")),
-           "the overwrite landed when nothing interrupted it");
-
-    // Where the operation's writes begin: the tap high-water mark at the moment the preceding `read`
-    // finished. `read` writes nothing, so that mark is exactly the boundary between "the machine came
-    // up and mounted" and "the operation ran" - and it is measured, not assumed, because the number
-    // of boot writes is not a constant.
+    // One row per operation of the permitted-outcome table (`docs/gsfs-carnage.md` 2). Each names
+    // the setup that establishes a known starting state, the ONE operation to tear, and the two
+    // mutually exclusive outcomes the table permits: after any interruption, EXACTLY ONE of them
+    // must be observed. Never both (the operation half-applied), never neither (it destroyed both).
     //
-    // It ENDS at the mark after the write rather than at the last tap line in the capture, so a
-    // later flush or a `time` service clock write cannot stretch the sweep past the operation.
-    let op_start = rmarks.first().map_or(0, |m| parse_write_tap(&rserial[..(*m).min(rserial.len())]).last().map_or(0, |w| w.seq));
-    let op_end = rmarks.get(1).map_or(0, |m| parse_write_tap(&rserial[..(*m).min(rserial.len())]).last().map_or(0, |w| w.seq));
-    check!(op_end > op_start,
-           format!("the overwrite wrote {} sector(s) (tap {}..{})", op_end - op_start, op_start + 1, op_end));
-    if op_end <= op_start || writes.is_empty() {
-        println!("\nfs-tear: {pass} passed, {fail} failed  (nothing to replay)");
-        if fail > 0 { std::process::exit(1); }
-        return;
+    // The last setup command must write nothing. It is what marks the boundary between "the machine
+    // came up and mounted" and "the operation ran" - measured from the write tap, not assumed,
+    // because the number of boot writes is not a constant.
+    struct TearCase {
+        name:   &'static str,
+        setup:  &'static [&'static str],
+        op:     &'static str,
+        probe:  &'static str,
+        /// The two permitted outcomes, as text that must appear in the probe's output.
+        before: &'static str,
+        after:  &'static str,
     }
+    const CASES: &[TearCase] = &[
+        // A whole-file overwrite: the old content complete, or the new content complete. Never a
+        // mix, and never an entry pointing at blocks that were never written.
+        TearCase { name: "overwrite", setup: &["read /tear.txt"],
+                   op: "write /tear.txt NEWNEWNEW", probe: "read /tear.txt",
+                   before: "ORIGINAL", after: "NEWNEWNEW" },
+        // A rename: the old name or the new name, never both, never neither. Two directory-entry
+        // mutations in one transaction, which is what the journal is for.
+        TearCase { name: "rename", setup: &["ls /"],
+                   op: "rename /tear.txt ZZrenamed.txt", probe: "ls /",
+                   before: "tear.txt", after: "ZZrenamed.txt" },
+        // A move ACROSS directories: an add into the destination and a remove from the source, in
+        // one transaction. The file is in exactly one of the two places - never in both (a second
+        // reference to one extent) and never in neither (the file lost outright).
+        // The probe looks INTO the destination rather than at the whole tree, because `zdir` exists
+        // before the move as well as after - a marker present in both outcomes cannot distinguish
+        // them, and an oracle that cannot fail is not an oracle. An empty destination and a
+        // destination holding the file are genuinely exclusive.
+        TearCase { name: "move", setup: &["mkdir /zdir", "ls /zdir"],
+                   op: "move /tear.txt /zdir/tear.txt", probe: "ls /zdir",
+                   before: "(empty)", after: "tear.txt" },
+    ];
 
-    // ---- 2. REPLAY ----------------------------------------------------------------------------
-    //
-    // Every cut point, not a sample. A tear point that is not in the permitted set is a real defect
-    // and its image is left on disk to be booted again.
-    println!("fs-tear: replaying {} tear point(s)", op_end - op_start);
-    let mut torn_ok = 0usize;
-    for k in (op_start + 1)..=op_end {
-        let img = format!("build/tests/fs_tear_k{k}.img");
-        if apply_writes_prefix(&base, &writes, k, &img).is_err() {
-            check!(false, format!("k={k}: could not build the torn image"));
+    let mut total_points = 0u64;
+    for case in CASES {
+        // ---- 1. RECORD -------------------------------------------------------------------------
+        println!("fs-tear: [{}] recording - the operation and every sector it writes", case.name);
+        let rec_disk = format!("build/tests/fs_tear_record_{}.img", case.name);
+        if std::fs::write(&rec_disk, &base).is_err() {
+            check!(false, format!("[{}] could not stage the record disk", case.name));
             continue;
         }
-        let (o, w, _) = boot(&img, &["read /tear.txt"]);
-        let out = o.first().cloned().unwrap_or_default();
-        let old_intact = out.contains("ORIGINAL");
-        let new_intact = out.contains("NEWNEWNEW");
-        let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
-        // The oracle. Exactly one of the two contents, on a volume that mounted. Anything else -
-        // a mix, an empty file, a refusal to mount, a panic - is outside what section 2 permits.
-        let ok = mounted && (old_intact ^ new_intact);
-        if ok {
-            torn_ok += 1;
-            let _ = std::fs::remove_file(&img);
+        let mut cmds: Vec<&str> = case.setup.to_vec();
+        cmds.push(case.op);
+        cmds.push(case.probe);
+        let (rout, rserial, rmarks) = boot(&rec_disk, &cmds);
+        let writes = parse_write_tap(&rserial);
+        // KEEP THE EVIDENCE, on every run and not only on failure. The serial holds the tap, and the
+        // tap is the only record of what the operation actually did; a suite that reports a number
+        // and discards its recording cannot be argued with.
+        let _ = std::fs::write(format!("build/tests/fs_tear_serial_{}.log", case.name), &rserial);
+        let _ = std::fs::remove_file(&rec_disk);
+
+        let n_setup = case.setup.len();
+        let mark_at = |i: usize| -> u64 {
+            rmarks.get(i).map_or(0, |m| parse_write_tap(&rserial[..(*m).min(rserial.len())])
+                                            .last().map_or(0, |w| w.seq))
+        };
+        let op_start = mark_at(n_setup - 1);
+        let op_end   = mark_at(n_setup);
+
+        check!(!writes.is_empty(), format!("[{}] the write tap recorded sectors", case.name));
+        check!(rout.last().map_or(false, |r| r.contains(case.after)),
+               format!("[{}] the operation landed when nothing interrupted it", case.name));
+        check!(op_end > op_start,
+               format!("[{}] the operation wrote {} sector(s) (tap {}..{})",
+                       case.name, op_end.saturating_sub(op_start), op_start + 1, op_end));
+        if op_end <= op_start || writes.is_empty() { continue; }
+
+        // ---- 2. REPLAY -------------------------------------------------------------------------
+        //
+        // Every cut point, not a sample. A tear point whose outcome is not in the permitted set is a
+        // real defect, and its image stays on disk so it can be booted again while it is fixed.
+        println!("fs-tear: [{}] replaying {} tear point(s)", case.name, op_end - op_start);
+        let mut torn_ok = 0u64;
+        for k in (op_start + 1)..=op_end {
+            let img = format!("build/tests/fs_tear_{}_k{}.img", case.name, k);
+            if apply_writes_prefix(&base, &writes, k, &img).is_err() {
+                check!(false, format!("[{}] k={k}: could not build the torn image", case.name));
+                continue;
+            }
+            let (o, w, _) = boot(&img, &[case.probe]);
+            let out = o.first().cloned().unwrap_or_default();
+            let has_before = out.contains(case.before);
+            let has_after  = out.contains(case.after);
+            let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+            // The oracle: the volume mounted, and EXACTLY ONE of the two permitted outcomes holds.
+            // Both means the operation half-applied; neither means it destroyed what it touched; a
+            // failure to mount means it corrupted the structure. All three are outside the table.
+            let ok = mounted && (has_before ^ has_after);
+            if ok {
+                torn_ok += 1;
+                let _ = std::fs::remove_file(&img);
+            } else {
+                check!(false, format!(
+                    "[{}] k={k}: outside the permitted set (mounted={mounted} {}={has_before} {}={has_after}) - image kept at {img}",
+                    case.name, case.before, case.after));
+            }
+        }
+        let points = op_end - op_start;
+        total_points += points;
+        check!(torn_ok == points,
+               format!("[{}] every tear point left exactly one of `{}` / `{}` ({}/{})",
+                       case.name, case.before, case.after, torn_ok, points));
+    }
+
+    // ---- 3. PROVE THE ORACLE CAN FAIL ----------------------------------------------------------
+    //
+    // 54 tear points passed, which is worth exactly nothing until the thing doing the judging has
+    // been seen to REJECT something. An oracle that cannot fail reports PASS over whatever it is
+    // pointed at, and this project has been caught by that five times over (`commandments_redteam`
+    // exists for the same reason).
+    //
+    // The control is a state genuinely outside the permitted set, reached with one boot of an image
+    // we already have: the PRISTINE disk, probed for the move case. There is no `/zdir` on it at all,
+    // so neither `(empty)` nor `tear.txt` can appear - neither permitted outcome holds - and the
+    // oracle must say so. If this ever passes, the sweep above is meaningless and the suite says so
+    // rather than reporting a green tick it did not earn.
+    {
+        let ctl = "build/tests/fs_tear_control.img";
+        if std::fs::write(ctl, &base).is_ok() {
+            let (o, w, _) = boot(ctl, &["ls /zdir"]);
+            let out = o.first().cloned().unwrap_or_default();
+            let has_before = out.contains("(empty)");
+            let has_after  = out.contains("tear.txt");
+            let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+            let oracle_says_ok = mounted && (has_before ^ has_after);
+            check!(mounted, "control: the pristine disk mounts (so a rejection is the ORACLE, not a dead boot)");
+            check!(!oracle_says_ok,
+                   "control: the oracle REJECTS a state outside the permitted set (neither outcome present)");
+            let _ = std::fs::remove_file(ctl);
         } else {
-            check!(false, format!(
-                "k={k}: outcome outside the permitted set (mounted={mounted} old={old_intact} new={new_intact}) - image kept at {img}"));
+            check!(false, "control: could not stage the pristine disk");
         }
     }
-    check!(torn_ok as u64 == op_end - op_start,
-           format!("every tear point left the file wholly OLD or wholly NEW ({}/{})",
-                   torn_ok, op_end - op_start));
 
-    let _ = std::fs::remove_file(rec_disk);
-    println!("fs-tear: recording kept at build/tests/fs_tear_serial.log ({} sectors written in all, {} of them by the operation)", writes.len(), op_end - op_start);
+    println!("fs-tear: {} tear point(s) across {} operation(s); recordings kept in build/tests/",
+             total_points, CASES.len());
     println!("\nfs-tear: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }
 }

@@ -54,10 +54,15 @@ existed and the reporting did not, which is the whole of this entry.
 
 ## Step one is DONE: `osdev test fs-all`
 
-There are **fourteen** suites now, not eleven - `feat/gsfs` added `fs-fuzz`, `fs-hostile` and
-`fs-time`, which made the problem worse before it made it better. `osdev test fs-all` runs all
-fourteen and reports one tally, with each suite's full output kept in
+There are **fifteen** suites now, not eleven - `feat/gsfs` added `fs-fuzz`, `fs-hostile`, `fs-time`
+and `fs-tear`, which made the problem worse before it made it better. `osdev test fs-all` runs all
+fifteen and reports one tally, with each suite's full output kept in
 `build/tests/fs_all_<name>.log`.
+
+**`fs-tear` roughly doubles the run** (it boots QEMU once per tear point, ~55 of them plus a
+recording boot per operation and a control), which sharpens the trigger question below rather than
+changing it. It is in the list anyway: a suite sitting outside "every fs suite" is exactly how the
+two red ones went unnoticed.
 
 Each runs as a **subprocess**, deliberately: the suites call `std::process::exit` on failure, so
 running them in-process would let the first failure kill the run and hide every suite after it -

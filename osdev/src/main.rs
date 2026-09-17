@@ -2751,6 +2751,12 @@ fn run_fs_all_tests() {
         "fs-restart", "fs-check", "fs-scrub", "fs-corrupt", "fs-compat",
         "fs-journal", "fs-djournal", "fs-ioretry", "fs-frag", "fs-large",
         "file-cap", "fs-fuzz", "fs-hostile", "fs-time",
+        // LAST, and by far the longest: `fs-tear` boots QEMU once per tear point, ~55 of them plus a
+        // recording boot per operation and a negative control. It roughly doubles this run. It is in
+        // the list anyway, because a suite that exists outside "every fs suite" is precisely the rot
+        // `backlog/32` is about - the two suites that sat RED on `main` did so because nothing swept
+        // them. Cheapest-first ordering means a broken build still reports in a minute.
+        "fs-tear",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
