@@ -311,8 +311,8 @@ the common question is "what is in here", and a wall of columns answers one nobo
 ### `unknown` is an answer
 
 `MODIFIED` reads `unknown` when the filesystem records no time for that entry - a file written
-before the volume carried times, or one written before the machine knew the time. **Never 1970.** A date you can see is a date you will act
-on, so a wrong one is worse than an absent one.
+before the volume carried times, or one written before the machine knew the time. **Never 1970.** A
+date you can see is a date you will act on, so a wrong one is worse than an absent one.
 
 ## 5. What this does NOT do
 

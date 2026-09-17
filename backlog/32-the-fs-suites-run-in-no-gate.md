@@ -93,7 +93,7 @@ otherwise would be the same optimism that let the suites rot.
 
 The trigger above. And, if the minutes stay scarce, which shape to spend them on:
 
-**Measured, not estimated: the full run is ~12 minutes**, 14 of 14 green:
+**Measured, not estimated: the full run is 11 to 12 minutes**, 14 of 14 green:
 
 ```
 fs-all: [ 1/14] fs-restart   PASS   32s    ...   [ 4/14] fs-corrupt   PASS  118s
@@ -116,5 +116,3 @@ four minutes.
 3. **A subset gate**: the four or five suites that cover the paths most likely to break, in the
    pre-merge gate, with the full run in CI. Needs somebody to choose the subset honestly rather than
    by what is fastest.
-
-Whether the existing workflows would have caught any of this has still not been checked.
