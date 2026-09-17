@@ -5745,6 +5745,127 @@ fn apply_writes_prefix(base: &[u8], writes: &[TappedWrite], k: u64, out_path: &s
 /// tear survive" instead of "does any tear survive". Here every cut point of the operation is tested,
 /// a failure names its `k`, and the failing image is a file that can be booted again while it is
 /// being fixed.
+/// EXHAUSTION: fill the volume, then check what a REFUSED allocation leaves behind.
+///
+/// The interesting question is not whether a write fails when the disk is full - of course it does.
+/// It is what the failure costs: whether the refusal is reported accurately, whether the blocks it
+/// half-claimed are handed back, whether a file that had nothing to do with it is still intact, and
+/// whether the filesystem accepts valid work again afterwards. A allocator that strands a few blocks
+/// on every refusal turns a full disk into a shrinking one.
+///
+/// The disk is baked nearly full HOST-SIDE rather than filled from the prompt. Filling 16 MiB a file
+/// at a time is thousands of commands, and copying megabytes inside QEMU spends the whole runtime on
+/// the least interesting part. Three large files and a canary get the volume to the edge in one step,
+/// and every command the test then sends is aimed at the actual question.
+pub fn run_fs_full(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("fs-full: booting (smp={smp}) with a volume baked to the edge of capacity");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let disk      = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str  = disk.to_string_lossy().replace('\\', "/");
+    let port      = pick_free_port();
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-full: PASS - {}", $label); pass += 1; } else { println!("fs-full: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-full: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-full: could not connect to serial {port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        println!("fs-full: FAIL - no prompt"); child.kill().ok(); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, format!("{}\r", $c).as_bytes());
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    // The canary is the file that has nothing to do with any of this. Everything below asks, in one
+    // way or another, whether a failure somewhere else reached it.
+    let canary0 = run!("read /canary.txt", 20);
+    check!(canary0.contains("do-not-disturb"), "the canary reads correctly before the disk is stressed");
+
+    let before = run!("drives check", 150);
+    check!(before.contains("0 bad"), "the baked volume starts consistent (0 bad)");
+    check!(before.contains("nothing was repaired"),
+           "the baked volume's accounting starts consistent (fsck had nothing to repair)");
+
+    // ---- the refusal -------------------------------------------------------------------------
+    //
+    // COPY A WHOLE FILL FILE, not a one-line write. The first version of this asked for a single
+    // block and the write SUCCEEDED, because leaving "a few hundred blocks free" left eight hundred
+    // - plenty for one block. Sizing a test so that it only fails if the arithmetic is exactly right
+    // is a test that reports on the arithmetic. This asks for 10,600 blocks against a volume with a
+    // few hundred: no rounding error can accommodate it, and the large claim also makes a leak
+    // obvious if the refusal strands what it reserved.
+    let refused = run!("copy /fill1.bin /toobig.bin", 120);
+    check!(!refused.contains("copied"), "copying a large file into a full volume is REFUSED");
+    // And it says WHY. `copy` used to answer "write failed (parent missing?)" here - the same
+    // misleading guess `write` and `move` were corrected for - which would send somebody hunting for
+    // a typo when the real answer is that the disk is full.
+    check!(refused.contains("no space") || refused.contains("full"),
+           format!("the refusal NAMES the reason rather than guessing (got: {})",
+                   refused.lines().find(|l| l.contains("copy:")).unwrap_or("nothing").trim()));
+
+    // ---- what the refusal cost --------------------------------------------------------------
+    let canary1 = run!("read /canary.txt", 20);
+    check!(canary1.contains("do-not-disturb"), "an unrelated file is untouched by the failed allocation");
+
+    let after = run!("drives check", 150);
+    check!(after.contains("0 bad"), "no corrupt blocks after the refusal");
+    // THE ONE THAT MATTERS. A refused allocation that keeps the blocks it claimed turns every
+    // out-of-space error into permanent lost capacity - invisible, because the directory never
+    // referenced them. fsck walks the tree and would report exactly that as a leak.
+    check!(after.contains("nothing was repaired"),
+           "the refused allocation LEAKED NOTHING (fsck still has nothing to repair)");
+
+    // ---- and the volume still works ----------------------------------------------------------
+    let del = run!("delete /fill3.bin", 120);
+    check!(!del.contains("failed"), "space can be reclaimed from a full volume");
+    let ok = run!("write /extra.txt now-there-is-room", 30);
+    check!(ok.contains("wrote /extra.txt"), "a valid write SUCCEEDS once there is room again");
+    let back = run!("read /extra.txt", 20);
+    check!(back.contains("now-there-is-room"), "and the file reads back correctly");
+    // The big one too: the space a refused copy could not have is usable once it genuinely exists.
+    let big = run!("copy /fill1.bin /toobig.bin", 240);
+    check!(big.contains("copied"), "and the large copy that was refused now SUCCEEDS");
+
+    let end = run!("drives check", 150);
+    check!(end.contains("0 bad") && end.contains("nothing was repaired"),
+           "the volume is still consistent after the whole sequence");
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+    let _ = std::fs::write("build/tests/fs_full_serial.log", &whole);
+    child.kill().ok(); child.wait().ok();
+    println!("\nfs-full: {pass} passed, {fail} failed  (serial -> build/tests/fs_full_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, smp: u32) {
     let qemu       = crate::qemu::qemu_binary();
     let tapped_str = tapped_image.to_string_lossy().replace('\\', "/");

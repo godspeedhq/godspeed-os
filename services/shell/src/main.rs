@@ -316,6 +316,10 @@ pub struct ShellCtx {
     /// `static`, which is the anonymous singleton Invariant 9 forbids - the same mistake that had to be
     /// undone in `xhci` an hour ago, and one this file already avoids for `fs_tag`.
     pipe_stack_hwm: core::cell::Cell<usize>,
+    /// The reason `fs` gave for the most recent failed write - see `LastWriteErr`. Owned here for
+    /// the reason `pipe_stack_hwm` is: a module-level `static` is the anonymous singleton invariant
+    /// 9 forbids.
+    last_write_err: core::cell::RefCell<LastWriteErr>,
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -343,6 +347,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         fs_tag: core::cell::Cell::new(0),
         net_tag: core::cell::Cell::new(0),
         pipe_stack_hwm: core::cell::Cell::new(0),
+        last_write_err: core::cell::RefCell::new(LastWriteErr::new()),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -12020,9 +12025,43 @@ fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], 
 
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
 /// `fs_write_at` to stream a large file.
+/// The reason `fs` gave for the most recent failed write, kept so a helper that returns `bool` can
+/// still hand the WHY to whoever prints the message.
+///
+/// **Why a stashed reason and not a richer return type.** `copy` runs through `fs_write_new` and a
+/// loop of `fs_write_at`, both of which answer yes-or-no, and `copy_file_streaming` returns an
+/// `Option<u64>`. Threading a reason through all three changes four signatures and every caller to
+/// carry a string that only one of them ever prints. The alternative was leaving `copy` saying
+/// "write failed (parent missing?)" on a FULL DISK, which is the same misleading guess `write` and
+/// `move` were corrected for earlier - and a full disk is precisely when a person meets it.
+///
+/// Owned by the shell, single-threaded, written immediately before the failure it describes is
+/// reported. Not a cache and never read except on the failure path.
+struct LastWriteErr {
+    buf: [u8; 64],
+    len: usize,
+}
+impl LastWriteErr {
+    const fn new() -> Self { Self { buf: [0u8; 64], len: 0 } }
+    fn set(&mut self, m: Option<&Message>) {
+        self.len = 0;
+        if let Some(why) = m.and_then(fs_err_reason) {
+            let n = why.len().min(self.buf.len());
+            self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
+            self.len = n;
+        }
+    }
+    fn get(&self) -> Option<&str> {
+        if self.len == 0 { return None; }
+        core::str::from_utf8(&self.buf[..self.len]).ok()
+    }
+}
+
 fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
-    matches!(fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes()),
-             Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+    let r = fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes());
+    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
+    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    ok
 }
 
 /// Write `chunk` into `path` at block-aligned byte `offset`.
@@ -12031,8 +12070,10 @@ fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     let n = chunk.len().min(IO_CHUNK);
     tail[8..8 + n].copy_from_slice(&chunk[..n]);
-    matches!(fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]),
-             Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+    let r = fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]);
+    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
+    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    ok
 }
 
 /// True if `fs` replied "no filesystem" - print the standard hint and consume it.
@@ -13413,7 +13454,13 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
             ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), bytes));
             Ok(())
         }
-        None => { ctx.console_writeln("copy: write failed (parent missing?)"); Err(ShellError::Unknown) }
+        None => {
+            match ctx.last_write_err.borrow().get() {
+                Some(why) => ctx.console_writeln_fmt(format_args!("copy: failed - {}", why)),
+                None      => ctx.console_writeln("copy: write failed (parent missing?)"),
+            }
+            Err(ShellError::Unknown)
+        }
     }
 }
 

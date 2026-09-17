@@ -244,15 +244,42 @@ durable without the declared barrier, and the test must be able to express the d
 the mistake this whole programme exists to stop repeating: `fs-restart` is a good test of a different
 thing.
 
-### 3.4 Resource exhaustion - NOT RUN
+### 3.4 Resource exhaustion - BUILT, PASSES in QEMU (`osdev test fs-full`, 14/0)
 
-Fill data space to near capacity and exercise every operation; exhaust metadata while data remains
-and the reverse; inject allocation failure at each allocation point. Then verify what matters, which
-is not the error message: no leaked blocks, no double allocation, no orphaned-but-reachable data, no
-damage to unrelated files, and a filesystem that still accepts valid work afterwards.
+The interesting question is not whether a write fails when the disk is full. It is what the failure
+COSTS: whether the refusal is reported accurately, whether the blocks it half-claimed are handed
+back, whether a file with nothing to do with it is still intact, and whether the filesystem accepts
+valid work again afterwards. An allocator that strands a few blocks on every refusal turns a full
+disk into a shrinking one, and nothing in a listing would ever show it.
 
-`drives check` rebuilds the free bitmap by walking the tree, so it is the natural oracle for the leak
-and double-allocation half.
+The volume is baked to the edge HOST-SIDE - a canary plus three 10,600-block files on a 16 MiB disk -
+rather than filled from the prompt, because filling 16 MiB a file at a time is thousands of commands
+and copying megabytes inside QEMU spends the whole runtime on the least interesting part.
+
+What it establishes, in order:
+
+| | |
+|---|---|
+| the refusal happens | copying a 10,600-block file into a volume with a few hundred free is refused |
+| **and names its reason** | `copy: failed - no space`, not a guess |
+| a bystander is untouched | the canary still reads correctly after the failed allocation |
+| **nothing leaked** | fsck still has nothing to repair - the refused claim was handed back in full |
+| no corruption | 0 bad blocks throughout |
+| the volume still works | delete a fill file, and both a small write and the large copy that was just refused succeed |
+
+**The leak check is the one that matters**, and it only became possible because fsck reports its
+repairs. A refused allocation that keeps what it reserved is invisible from every other angle: the
+directory never referenced those blocks, so no listing, no read and no walk would show them. Only the
+free accounting knows, and until this branch it corrected itself in silence.
+
+**A note on how the test was sized, because the first version was wrong.** It originally asked for a
+ONE-BLOCK write and the write succeeded - "a few hundred blocks free" turned out to be eight hundred,
+which is ample for one block. A test that only fails when the arithmetic is exactly right is a test
+of the arithmetic. Asking for 10,600 blocks against a few hundred cannot be rescued by a rounding
+error, and the large claim also makes a leak obvious if the refusal strands what it reserved.
+
+**Not yet covered:** exhausting METADATA while data space remains (and the reverse), and injecting
+allocation failure at each individual allocation point rather than only at the natural boundary.
 
 ### 3.5 Concurrency, ordering and retries - NOT RUN, and NARROWER than it looks
 
@@ -403,7 +430,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (now 15 suites including `fs-tear`); `files` 222/0; `shell` 174/0 |
 | Independent reference-model tests | NOT RUN | 3.2. Blocked on nothing but effort; the outcome table it needs now exists |
 | Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
-| Data/metadata exhaustion | NOT RUN | 3.4 |
+| Data/metadata exhaustion | PARTIAL (QEMU) | `osdev test fs-full` 14/0 - a refused allocation names its reason, damages no bystander and leaks nothing. Metadata-vs-data exhaustion not covered |
 | Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
 | Block-driver restart and hot-unplug | NOT RUN | 3.7. See `backlog/31` for the same failure shape one layer over |

@@ -1396,6 +1396,7 @@ fn cmd_test(suite: &str) {
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
         "fs-tear"      => run_fs_tear_test(),
+        "fs-full"      => run_fs_full_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -2757,6 +2758,7 @@ fn run_fs_all_tests() {
         // `backlog/32` is about - the two suites that sat RED on `main` did so because nothing swept
         // them. Cheapest-first ordering means a broken build still reports in a minute.
         "fs-tear",
+        "fs-full",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
@@ -2941,6 +2943,34 @@ fn run_fs_time_test() {
     gsfs_add_file(persist, "canary.txt", b"a file that predates timestamps");
 
     crate::shell_test::run_fs_time(&image_path, persist, 4);
+}
+
+fn run_fs_full_test() {
+    println!("\n=== fs: EXHAUSTION - what a refused allocation leaves behind (carnage 3.4) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_full.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // The canary goes in FIRST, so it sits low in the data region and the big files are allocated
+    // around it. A file written after everything else would be a weaker control: what is being asked
+    // is whether a failure reaches a bystander, and a bystander in the middle is a better test.
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    // Three large files take the volume to the edge. 16 MiB is 32768 blocks; ~138 are the superblock,
+    // bitmap, journal and root, so about 32630 remain. Three files of 10,600 blocks each leave a few
+    // hundred blocks free - enough that the volume is healthy and mountable, too few for another file.
+    let filler = vec![0xA5u8; 10_600 * 508];
+    for name in ["fill1.bin", "fill2.bin", "fill3.bin"] {
+        gsfs_add_file(persist, name, &filler);
+    }
+
+    crate::shell_test::run_fs_full(&image_path, persist, 4);
 }
 
 fn run_fs_tear_test() {
