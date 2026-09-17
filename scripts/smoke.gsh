@@ -10,7 +10,7 @@ echo hello world | assert contains world
 mkdir /sm
 write /sm/f.txt data
 read /sm/f.txt | assert contains data
-ls /sm | where type=file | assert contains f.txt
+dir /sm | where type=file | assert contains f.txt
 # guard (Tier 2): a function must NOT shadow a piped producer - defining `fn greet` must not
 # hijack `greet | ...`, which still runs the greet SERVICE (a function is not a pipe source).
 fn greet { echo FN-GREET-BUG }
@@ -23,4 +23,4 @@ roster | where role=core | assert contains Matthew
 assert fails read /sm/nope
 assert fails-with FileNotFound read /sm/nope
 delete /sm recursive
-assert fails ls /sm
+assert fails dir /sm

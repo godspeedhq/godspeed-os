@@ -35,10 +35,10 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   `docs/console-service.md` §9.
 - **Interactive shell:** a supervisor-spawned `gsh>` prompt over serial. Verified utilities in QEMU:
   `help`, `version` (`GodspeedOS 0.10.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
-  (`status | count` -> `3`), and graceful degradation (`ls` -> `ls: storage unavailable`).
+  (`status | count` -> `3`), and graceful degradation (`dir` -> `ls: storage unavailable`).
 - **Persistence (USB stick -> fs):** `block-driver` reaches a **USB mass-storage stick** through the
   `dwc2` SERVICE over the block IPC protocol, and `fs` mounts on top. `drives flash` formats GSFS, files
-  write + read and **survive a reboot**, which unblocks the file utilities (`ls`, `read`, `write`, `edit`,
+  write + read and **survive a reboot**, which unblocks the file utilities (`dir`, `read`, `write`, `edit`,
   `drives`, ...). Needs `--release` (see below).
 
   > **The SD/EMMC card is the boot medium and is NEVER written.** An earlier version of this document

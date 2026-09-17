@@ -23,7 +23,7 @@ So the gaps are not "more storage features". They are:
 2. **A file capability carries READ/WRITE and nothing else.** There is no way to hand out a right to
    APPEND without also handing out the right to rewrite history.
 3. **There are no timestamps.** A directory entry is `{itype, size, first_block, block_count}`.
-   Nothing records when a file changed, so `ls` cannot say.
+   Nothing records when a file changed, so `dir` cannot say.
 
 The fuzz suite goes first because it can only find things, never break what works - and because a
 feature built on an unproven parser inherits its bugs.
@@ -266,8 +266,8 @@ answer than a plain refusal, and §7.3 says a right that cannot be honoured shou
 
 ### Surfaces
 
-`ls long` shows `seal` in the TYPE column - a different kind of thing to have on a disk, not a
-footnote beside `file`. In a PIPE, `ls` emits records, so it is a separate **`sealed` column** rather
+`dir long` shows `seal` in the TYPE column - a different kind of thing to have on a disk, not a
+footnote beside `file`. In a PIPE, `dir` emits records, so it is a separate **`sealed` column** rather
 than a new `type` value: making a sealed file's type read `seal` would silently drop it out of every
 `where type=file` query anyone has already written.
 
@@ -277,23 +277,23 @@ answer one. The warning still prints; `yes` buys automation, not silence.
 Verified by `osdev test fs-time` (15/0): seal, refuse the write, **reboot**, refuse it again, and the
 content is still the original.
 
-## 4. Phase P - `ls`, made fully featured  (BUILT)
+## 4. Phase P - `dir`, made fully featured  (BUILT)
 
-Timestamps exist to be seen. `ls` lists names by default, as it always did, and answers when and
+Timestamps exist to be seen. `dir` lists names by default, as it always did, and answers when and
 how big on request.
 
 | command | what it shows |
 | --- | --- |
-| `ls` | names, type, size - unchanged, and still the default |
-| `ls long` | one entry per line with type, size and a MODIFIED column |
-| `ls human` | sizes as KiB/MiB/GiB rather than raw bytes |
+| `dir` | names, type, size - unchanged, and still the default |
+| `dir long` | one entry per line with type, size and a MODIFIED column |
+| `dir human` | sizes as KiB/MiB/GiB rather than raw bytes |
 
 **Words, not flags** (`utilities/0_conventions.md` rule 4), in any order, mixable with a path:
-`ls long human /projects` and `ls /projects human long` are the same command. Both orders complete
-on Tab, which is why `ls` is in BOTH the leading and trailing subcommand tables - and a first-position
+`dir long human /projects` and `ls /projects human long` are the same command. Both orders complete
+on Tab, which is why `dir` is in BOTH the leading and trailing subcommand tables - and a first-position
 token matching no keyword falls through to path completion, so `ls /do<tab>` still works.
 
-**The terse form stays the default, deliberately.** `ls` is read far more often than it is studied;
+**The terse form stays the default, deliberately.** `dir` is read far more often than it is studied;
 the common question is "what is in here", and a wall of columns answers one nobody asked.
 
 ### Two things this phase cost more than expected
@@ -339,7 +339,7 @@ Recorded so it is not rediscovered as an omission (§26.7):
 | M - adversarial | `osdev test fs-fuzz` (new), plus no regression across the eleven existing fs suites |
 | N - rights | `osdev test file-cap` extended |
 | O - timestamps | `osdev test fs-time` (new): stamp, survive a reboot, survive a restart, read a volume with no times region as `unknown` |
-| P - `ls` | `osdev test shell` (the file section) and `selfcheck.gsh` |
+| P - `dir` | `osdev test shell` (the file section) and `selfcheck.gsh` |
 
 A hardware pass on the five boards confirms at the end. It is not needed along the way, and this plan
 is deliberately arranged so that it is not.

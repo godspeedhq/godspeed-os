@@ -564,11 +564,11 @@ pub fn run(image_path: &Path, smp: u32) {
     //     rows appearing here is that local-write path working.
     // (2) `fs` publishes over IPC like any other service, which is the path a new service would use.
     //
-    // The `ls` runs first because `fs` publishes every 32 requests rather than on every one (an
+    // The `dir` runs first because `fs` publishes every 32 requests rather than on every one (an
     // observer that doubles the traffic it measures is not an observer), so the row only exists once
     // real work has happened. That is the design, not a wait for a timer.
     for _ in 0..12 {
-        send(&mut write_half, b"ls /\r");
+        send(&mut write_half, b"dir /\r");
         let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
     }
     send(&mut write_half, b"events metrics\r");
@@ -1163,10 +1163,10 @@ pub fn run(image_path: &Path, smp: u32) {
         }
         None => { println!("shell-test: FAIL - timed out after `write help`  [×2]"); fail += 2; }
     }
-    send(&mut write_half, b"ls version\r");
+    send(&mut write_half, b"dir version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains(&format!("ls {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "ls version: number + creator credit"),
-        None    => { println!("shell-test: FAIL - timed out after `ls version`"); fail += 1; }
+        Some(r) => check!(r.contains(&format!("dir {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "dir version: number + creator credit"),
+        None    => { println!("shell-test: FAIL - timed out after `dir version`"); fail += 1; }
     }
     send(&mut write_half, b"drives flash help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
@@ -1670,7 +1670,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
-/// Step 4: drive the file commands (ls / read / write / mkdir / cd) end to end. Boots
+/// Step 4: drive the file commands (dir / read / write / mkdir / cd) end to end. Boots
 /// bare-metal with a RAW AHCI disk, flashes it, then exercises the commands including
 /// relative paths and `..` (the shell's current-directory + path resolution).
 /// Boot QEMU with a SATA data disk and return (child, serial buffer, write half).
@@ -1915,7 +1915,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
     } else { println!("files-test: FAIL - no flash confirm"); fail += 1; }
 
-    // mkdir + write + ls + read (absolute paths).
+    // mkdir + write + dir + read (absolute paths).
     match run!(b"mkdir /docs\r", 10) {
         Some(r) => check!(r.contains("created /docs"), "mkdir /docs"),
         None    => { println!("files-test: FAIL - mkdir timeout"); fail += 1; }
@@ -1924,9 +1924,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("wrote /docs/note.txt"), "write /docs/note.txt"),
         None    => { println!("files-test: FAIL - write timeout"); fail += 1; }
     }
-    match run!(b"ls /docs\r", 10) {
-        Some(r) => check!(r.contains("note.txt") && r.contains("file"), "ls /docs shows note.txt"),
-        None    => { println!("files-test: FAIL - ls timeout"); fail += 1; }
+    match run!(b"dir /docs\r", 10) {
+        Some(r) => check!(r.contains("note.txt") && r.contains("file"), "dir /docs shows note.txt"),
+        None    => { println!("files-test: FAIL - dir timeout"); fail += 1; }
     }
     match run!(b"read /docs/note.txt\r", 10) {
         Some(r) => check!(r.contains("hello world"), "read /docs/note.txt"),
@@ -1942,9 +1942,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("wrote /docs/inside.txt"), "write relative → /docs/inside.txt"),
         None    => { println!("files-test: FAIL - relative write timeout"); fail += 1; }
     }
-    match run!(b"ls\r", 10) {
-        Some(r) => check!(r.contains("note.txt") && r.contains("inside.txt"), "ls (cwd) shows both files"),
-        None    => { println!("files-test: FAIL - ls cwd timeout"); fail += 1; }
+    match run!(b"dir\r", 10) {
+        Some(r) => check!(r.contains("note.txt") && r.contains("inside.txt"), "dir (cwd) shows both files"),
+        None    => { println!("files-test: FAIL - dir cwd timeout"); fail += 1; }
     }
     // Tab-completion of a FILE PATH: a unique prefix fills in the rest, and the completed command
     // runs. /docs has note.txt + inside.txt, so 'i' and 'n' are unique. \t = Tab, then \r runs it.
@@ -1984,9 +1984,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("renamed"), "rename note-copy.txt → renamed.txt"),
         None    => { println!("files-test: FAIL - rename timeout"); fail += 1; }
     }
-    match run!(b"ls /docs\r", 10) {
-        Some(r) => check!(r.contains("renamed.txt") && !r.contains("note-copy.txt"), "ls shows renamed, not old name"),
-        None    => { println!("files-test: FAIL - ls after rename timeout"); fail += 1; }
+    match run!(b"dir /docs\r", 10) {
+        Some(r) => check!(r.contains("renamed.txt") && !r.contains("note-copy.txt"), "dir shows renamed, not old name"),
+        None    => { println!("files-test: FAIL - dir after rename timeout"); fail += 1; }
     }
 
     // delete (GSFS0003: frees blocks, reclaims) - file then re-list shows it gone.
@@ -1994,9 +1994,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("deleted"), "delete /docs/renamed.txt"),
         None    => { println!("files-test: FAIL - delete timeout"); fail += 1; }
     }
-    match run!(b"ls /docs\r", 10) {
+    match run!(b"dir /docs\r", 10) {
         Some(r) => check!(!r.contains("renamed.txt"), "ls: deleted file is gone"),
-        None    => { println!("files-test: FAIL - ls after delete timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir after delete timeout"); fail += 1; }
     }
 
     // move (relink) - into the /docs/sub directory created earlier.
@@ -2004,9 +2004,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("moved"), "move /docs/note.txt → /docs/sub/note.txt"),
         None    => { println!("files-test: FAIL - move timeout"); fail += 1; }
     }
-    match run!(b"ls /docs/sub\r", 10) {
-        Some(r) => check!(r.contains("note.txt"), "ls /docs/sub shows moved file"),
-        None    => { println!("files-test: FAIL - ls sub timeout"); fail += 1; }
+    match run!(b"dir /docs/sub\r", 10) {
+        Some(r) => check!(r.contains("note.txt"), "dir /docs/sub shows moved file"),
+        None    => { println!("files-test: FAIL - dir sub timeout"); fail += 1; }
     }
     match run!(b"read /docs/sub/note.txt\r", 10) {
         Some(r) => check!(r.contains("hello world"), "moved file keeps its content"),
@@ -2020,12 +2020,12 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         let cmd = format!("write /big/f{} x\r", i);
         let _ = run!(cmd.as_bytes(), 10);
     }
-    match run!(b"ls /big\r", 10) {
+    match run!(b"dir /big\r", 10) {
         Some(r) => {
             let n = (1..=10).filter(|i| r.contains(&format!("f{}", i))).count();
             check!(n == 10, "directory grew past 8 entries (no per-dir cap) - 10 files listed");
         }
-        None => { println!("files-test: FAIL - ls /big timeout"); fail += 1; }
+        None => { println!("files-test: FAIL - dir /big timeout"); fail += 1; }
     }
 
     // find - whole-filesystem tree walk from root. Tree now: /docs/{inside.txt, sub/note.txt},
@@ -2069,10 +2069,10 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - find glob inside.* timeout"); fail += 1; }
     }
 
-    // ls shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
-    match run!(b"ls /docs\r", 10) {
+    // dir shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
+    match run!(b"dir /docs\r", 10) {
         Some(r) => check!(r.contains("inside.txt") && r.contains("14 B"), "ls: shows file size (inside.txt 14 B)"),
-        None    => { println!("files-test: FAIL - ls size timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir size timeout"); fail += 1; }
     }
 
     // mkdir parents: create a 3-deep chain in one call (none of /x, /x/y exist yet).
@@ -2080,9 +2080,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("created /x/y/z"), "mkdir parents: created /x/y/z chain"),
         None    => { println!("files-test: FAIL - mkdir parents timeout"); fail += 1; }
     }
-    match run!(b"ls /x/y\r", 10) {
+    match run!(b"dir /x/y\r", 10) {
         Some(r) => check!(r.contains("z") && r.contains("dir"), "mkdir parents: /x/y/z exists as a dir"),
-        None    => { println!("files-test: FAIL - ls /x/y timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir /x/y timeout"); fail += 1; }
     }
     // plain mkdir into a missing parent still fails (parents is opt-in).
     match run!(b"mkdir /no/such/dir\r", 10) {
@@ -2145,10 +2145,10 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("deleted (recursive)"), "delete recursive: /grove subtree removed"),
         None    => { println!("files-test: FAIL - delete recursive timeout"); fail += 1; }
     }
-    match run!(b"ls /\r", 10) {
+    match run!(b"dir /\r", 10) {
         Some(r) => check!(!r.contains("grove") && r.contains("orchard"),
                           "delete recursive: /grove gone, /orchard (the copy) survives"),
-        None    => { println!("files-test: FAIL - ls after recursive delete timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir after recursive delete timeout"); fail += 1; }
     }
     // The copy is independent - its nested file is intact after the source was deleted.
     match run!(b"read /orchard/branch/leaf2.txt\r", 10) {
@@ -2426,50 +2426,50 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - bare roster timeout"); fail += 1; }
     }
 
-    // ── ls as a record producer: directory entries become typed rows (name/type/size) ──
+    // ── dir as a record producer: directory entries become typed rows (name/type/size) ──
     // A dedicated dir with known contents: two files of different size + one subdir.
     let _ = run!(b"mkdir /lsr\r", 10);
     let _ = run!(b"write /lsr/big.txt hello world\r", 10);  // 11 bytes
     let _ = run!(b"write /lsr/tiny.txt x\r", 10);           // 1 byte
     let _ = run!(b"mkdir /lsr/kids\r", 10);                 // a subdirectory
-    // bare ls is still the plain text listing (record path is pipe-only).
-    match run!(b"ls /lsr\r", 10) {
+    // bare dir is still the plain text listing (record path is pipe-only).
+    match run!(b"dir /lsr\r", 10) {
         Some(r) => check!(r.contains("big.txt") && r.contains("TYPE") && r.contains("dir"),
-                          "ls record: bare ls is still the text listing"),
-        None    => { println!("files-test: FAIL - ls /lsr timeout"); fail += 1; }
+                          "dir record: bare dir is still the text listing"),
+        None    => { println!("files-test: FAIL - dir /lsr timeout"); fail += 1; }
     }
     // where on the `type` column keeps only directories.
-    match run!(b"ls /lsr | where type=dir\r", 12) {
+    match run!(b"dir /lsr | where type=dir\r", 12) {
         Some(r) => check!(r.contains("kids") && !r.contains("big.txt"),
-                          "ls record: where type=dir keeps the subdir, drops files"),
-        None    => { println!("files-test: FAIL - ls|where type=dir timeout"); fail += 1; }
+                          "dir record: where type=dir keeps the subdir, drops files"),
+        None    => { println!("files-test: FAIL - dir|where type=dir timeout"); fail += 1; }
     }
     // select projects just the name column (no type/size keys).
-    match run!(b"ls /lsr | select name | to json\r", 12) {
+    match run!(b"dir /lsr | select name | to json\r", 12) {
         Some(r) => check!(r.contains("\"name\": \"big.txt\"") && !r.contains("\"type\"") && !r.contains("\"size\""),
-                          "ls record: select name projects one column"),
-        None    => { println!("files-test: FAIL - ls|select timeout"); fail += 1; }
+                          "dir record: select name projects one column"),
+        None    => { println!("files-test: FAIL - dir|select timeout"); fail += 1; }
     }
     // where type=file | to json renders file rows with a numeric size, no subdir.
-    match run!(b"ls /lsr | where type=file | to json\r", 12) {
+    match run!(b"dir /lsr | where type=file | to json\r", 12) {
         Some(r) => check!(r.contains("\"type\": \"file\"") && r.contains("\"size\":") && !r.contains("kids"),
-                          "ls record: where type=file | to json renders file rows"),
-        None    => { println!("files-test: FAIL - ls|where|to json timeout"); fail += 1; }
+                          "dir record: where type=file | to json renders file rows"),
+        None    => { println!("files-test: FAIL - dir|where|to json timeout"); fail += 1; }
     }
     // column sort works on the listing: reverse size puts big.txt (11) before tiny.txt (1).
-    match run!(b"ls /lsr | where type=file | sort reverse size | to json\r", 12) {
+    match run!(b"dir /lsr | where type=file | sort reverse size | to json\r", 12) {
         Some(r) => {
             let (big, tiny) = (r.find("big.txt"), r.find("tiny.txt"));
             check!(big.is_some() && tiny.is_some() && big < tiny,
-                   "ls record: sort reverse size orders files by byte size");
+                   "dir record: sort reverse size orders files by byte size");
         }
-        None => { println!("files-test: FAIL - ls|sort size timeout"); fail += 1; }
+        None => { println!("files-test: FAIL - dir|sort size timeout"); fail += 1; }
     }
     // a text filter on a record stream is a loud, guided error (not silent, not wrong output).
-    match run!(b"ls /lsr | match big\r", 12) {
+    match run!(b"dir /lsr | match big\r", 12) {
         Some(r) => check!(r.contains("record stream") && r.contains("where"),
-                          "ls record: text filter (match) on records errors with guidance"),
-        None    => { println!("files-test: FAIL - ls|match guard timeout"); fail += 1; }
+                          "dir record: text filter (match) on records errors with guidance"),
+        None    => { println!("files-test: FAIL - dir|match guard timeout"); fail += 1; }
     }
 
     // ── drives as a record producer: the attached disk as a row (index/label/status/size) ──
@@ -3152,7 +3152,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - assert fails delete timeout"); fail += 1; }
     }
     // and `result` reflects a converted command directly.
-    let _ = run!(b"ls /nowhere\r", 10);
+    let _ = run!(b"dir /nowhere\r", 10);
     match run!(b"result\r", 10) {
         Some(r) => check!(r.contains("Err(FileNotFound)"), "result: ls of a missing dir → Err(FileNotFound)"),
         None    => { println!("files-test: FAIL - ls result timeout"); fail += 1; }
@@ -3219,7 +3219,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 
     // Regression: storm `fs` and the catch-22-safe save must settle + reacquire fs THROUGH THE
-    // KERNEL DIRECTORY to land the report. Then `ls /` must reacquire fs the same way (not "storage
+    // KERNEL DIRECTORY to land the report. Then `dir /` must reacquire fs the same way (not "storage
     // unavailable"). This pins client-resolution-after-restart via the directory, the property §22
     // Test 11 covers. Generous timeout (settle + bounded save-retry on TCG).
     match run!(b"chaos kill-storm fs 2 save /fsr.txt\r", 60) {
@@ -3232,10 +3232,10 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "chaos: fs-target report file persisted (catch-22-safe save landed)"),
         None    => { println!("files-test: FAIL - read fs chaos report timeout"); fail += 1; }
     }
-    match run!(b"ls /\r", 10) {
+    match run!(b"dir /\r", 10) {
         Some(r) => check!(!r.contains("storage unavailable"),
                           "directory: shell reacquires fs after its own restart"),
-        None    => { println!("files-test: FAIL - ls after fs-storm timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir after fs-storm timeout"); fail += 1; }
     }
 
     // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the
@@ -3338,9 +3338,9 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
     // The disk is pre-formatted host-side with a large baked file (`/big.txt`, ~400 lines / several
     // IO_CHUNK windows). Confirm fs mounted it - proves the editor has a filesystem to save to and
     // gives the large-file tests their fixture.
-    match read_back!(b"ls /\r") {
+    match read_back!(b"dir /\r") {
         Some(r) => check!(r.contains("big.txt"), "setup: pre-baked /big.txt present"),
-        None    => { println!("edit-test: FAIL - ls / timeout"); fail += 1; }
+        None    => { println!("edit-test: FAIL - dir / timeout"); fail += 1; }
     }
 
     // 1. no-arg usage.
@@ -5560,7 +5560,7 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!over_created, "a 39-byte name (NAME_MAX + 1) is REFUSED");
     // TRUNCATION IS THE DANGEROUS OUTCOME. A 39-byte name silently becoming the 38-byte one means
     // two distinct names collide and one file shadows another, so listing must show ONE entry.
-    let r = answered!("ls /fz", "listing after both name-length attempts");
+    let r = answered!("dir /fz", "listing after both name-length attempts");
     let n38_count = r.matches(n38.as_str()).count();
     check!(n38_count <= 1, "the over-length name did not truncate into the valid one (no collision)");
 
@@ -5578,11 +5578,11 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     // ---- Depth: MAX_TREE_DEPTH is 64, so 70 levels must be refused rather than walked forever. ----
     let very_deep: String = (0..70).map(|_| "/x").collect::<Vec<_>>().join("");
     answered!(format!("mkdir {very_deep} parents"), "70 nested levels (MAX_TREE_DEPTH is 64)");
-    answered!(format!("ls {very_deep}"), "listing at 70 levels deep");
+    answered!(format!("dir {very_deep}"), "listing at 70 levels deep");
 
     // ---- Structural oddities that must each get a DEFINED answer rather than a surprise. ----
     answered!("read /", "reading a DIRECTORY as a file");
-    answered!("ls /nonexistent-path-entirely", "listing a path that does not exist");
+    answered!("dir /nonexistent-path-entirely", "listing a path that does not exist");
     answered!("delete /fz", "deleting a NON-EMPTY directory without `recursive`");
     answered!("mkdir /fz", "creating a directory that already exists");
     answered!("write /fz/real.txt/child x", "writing THROUGH a file as if it were a directory");
@@ -5594,21 +5594,21 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     //
     // The disk carries a file whose NAME contains `ESC [ 2J` (clear screen). It was baked host-side
     // because the shell's line editor accepts only printable ASCII, so it cannot be typed - which is
-    // the point: this is what a disk prepared by somebody else looks like. If `ls` emits the name
+    // the point: this is what a disk prepared by somebody else looks like. If `dir` emits the name
     // unfiltered, the listing that is supposed to REVEAL what is on the disk becomes something the
     // disk controls, and a file can scroll itself out of its own listing.
-    let listing = answered!("ls /", "listing a directory holding a hostile filename");
+    let listing = answered!("dir /", "listing a directory holding a hostile filename");
     check!(!listing.contains("[2J"),
-           "`ls` did not emit a raw ESC sequence that came from a FILENAME");
+           "`dir` did not emit a raw ESC sequence that came from a FILENAME");
 
     // ---- TIMESTAMPS (Phase O) and the migration story, in one listing ----
     //
     // `canary.txt` was baked host-side into a 0008 image, so no time was ever recorded for it.
     // `/fz/real.txt` was written by this machine moments ago. Both are in the same tree, and
-    // `ls long` must tell the truth about each: a real date for the one that has one, and the word
+    // `dir long` must tell the truth about each: a real date for the one that has one, and the word
     // `unknown` for the one that does not - never 1970, because a wrong date is worse than no date.
-    let listing = answered!("ls long /", "ls long on a tree holding both timed and untimed entries");
-    check!(listing.contains("MODIFIED"), "`ls long` prints a MODIFIED column");
+    let listing = answered!("dir long /", "dir long on a tree holding both timed and untimed entries");
+    check!(listing.contains("MODIFIED"), "`dir long` prints a MODIFIED column");
     check!(listing.contains("unknown"),
            "an entry from a 0008 volume reads as `unknown`, not as an epoch date");
     // A file written AFTER the clock arrived. `fs` learns the time from a push by `time`, so a file
@@ -5617,11 +5617,11 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(String::from_utf8_lossy(&buf.lock().unwrap()).contains("wall clock received"),
            "fs received the wall clock from `time`");
     answered!("write /fz/dated.txt now", "a file written after the clock arrived");
-    let fzl = answered!("ls long /fz", "ls long on files this machine created");
+    let fzl = answered!("dir long /fz", "dir long on files this machine created");
     check!(fzl.contains("20") && !fzl.contains("1970"),
            "a file written after the clock arrived carries a REAL date, not 1970");
-    let human = answered!("ls long human /", "ls long human");
-    check!(human.contains("KiB") || human.contains(" B"), "`ls human` renders sizes in units");
+    let human = answered!("dir long human /", "dir long human");
+    check!(human.contains("KiB") || human.contains(" B"), "`dir human` renders sizes in units");
 
     // ---- The filesystem must still be intact. That is the whole point of the suite. ----
     let chk = answered!("drives check", "fsck after the assault");
@@ -5809,8 +5809,8 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
                    before: "ORIGINAL", after: "NEWNEWNEW" },
         // A rename: the old name or the new name, never both, never neither. Two directory-entry
         // mutations in one transaction, which is what the journal is for.
-        TearCase { name: "rename", setup: &["ls /"],
-                   op: "rename /tear.txt ZZrenamed.txt", probe: "ls /",
+        TearCase { name: "rename", setup: &["dir /"],
+                   op: "rename /tear.txt ZZrenamed.txt", probe: "dir /",
                    before: "tear.txt", after: "ZZrenamed.txt" },
         // A move ACROSS directories: an add into the destination and a remove from the source, in
         // one transaction. The file is in exactly one of the two places - never in both (a second
@@ -5819,8 +5819,8 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         // before the move as well as after - a marker present in both outcomes cannot distinguish
         // them, and an oracle that cannot fail is not an oracle. An empty destination and a
         // destination holding the file are genuinely exclusive.
-        TearCase { name: "move", setup: &["mkdir /zdir", "ls /zdir"],
-                   op: "move /tear.txt /zdir/tear.txt", probe: "ls /zdir",
+        TearCase { name: "move", setup: &["mkdir /zdir", "dir /zdir"],
+                   op: "move /tear.txt /zdir/tear.txt", probe: "dir /zdir",
                    before: "(empty)", after: "tear.txt" },
     ];
 
@@ -5912,7 +5912,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
     {
         let ctl = "build/tests/fs_tear_control.img";
         if std::fs::write(ctl, &base).is_ok() {
-            let (o, w, _) = boot(ctl, &["ls /zdir"]);
+            let (o, w, _) = boot(ctl, &["dir /zdir"]);
             let out = o.first().cloned().unwrap_or_default();
             let has_before = out.contains("(empty)");
             let has_after  = out.contains("tear.txt");
@@ -5988,7 +5988,7 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
         (outs, whole)
     };
 
-    // Pull the MODIFIED column for one name out of an `ls long` listing.
+    // Pull the MODIFIED column for one name out of an `dir long` listing.
     let date_of = |listing: &str, name: &str| -> String {
         listing.lines()
             .find(|l| l.trim_start().starts_with(name))
@@ -5997,7 +5997,7 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     };
 
     println!("fs-time: boot 1 - write a file, read its date");
-    let (o1, w1) = boot(&["write /stamped.txt hello", "ls long /"]);
+    let (o1, w1) = boot(&["write /stamped.txt hello", "dir long /"]);
     check!(w1.contains("wall clock received"), "boot 1: fs was told the wall clock by `time`");
     let l1 = o1.get(1).cloned().unwrap_or_default();
     let d1 = date_of(&l1, "stamped.txt");
@@ -6009,16 +6009,16 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     // `seal` asks [y/N], so the confirmation is its own line - the harness sends one command
     // per entry and waits for a prompt between them.
     let (os, ws) = boot(&["write /frozen.txt original", "seal /frozen.txt yes",
-                          "write /frozen.txt tampered", "read /frozen.txt", "ls long /"]);
+                          "write /frozen.txt tampered", "read /frozen.txt", "dir long /"]);
     check!(os.get(1).map_or(false, |r| r.contains("sealed /frozen.txt")), "boot 1: the file was sealed");
     check!(os.get(2).map_or(false, |r| !r.contains("wrote")), "boot 1: writing a SEALED file was refused");
     check!(os.get(3).map_or(false, |r| r.contains("original") && !r.contains("tampered")),
            "boot 1: the sealed content is untouched");
-    check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `ls long` marks it sealed");
+    check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `dir long` marks it sealed");
     check!(ws.contains("sealed a file"), "boot 1: fs logged the seal");
 
     println!("fs-time: boot 2 - SAME disk, the date must survive the mount");
-    let (o2, w2) = boot(&["ls long /", "read /stamped.txt",
+    let (o2, w2) = boot(&["dir long /", "read /stamped.txt",
                           "write /frozen.txt tampered-after-reboot", "read /frozen.txt"]);
     check!(o2.get(2).map_or(false, |r| !r.contains("wrote")),
            "boot 2: the SEAL survived the reboot - the write is still refused");
@@ -6097,7 +6097,7 @@ pub fn run_fs_hostile_case(image_path: &Path, persist_path: &str, what: &str, sm
     // Poke the crafted tree from every direction a person would. Each must ANSWER; a `None` here is
     // a hang, which is the one outcome that is never acceptable.
     let mut hung = None;
-    for c in ["ls /", "ls long /", "read /victim.txt", "ls /loop", "tree /",
+    for c in ["dir /", "dir long /", "read /victim.txt", "dir /loop", "tree /",
               "read /bystander.txt", "drives check", "read /bystander.txt"] {
         let line = format!("{c}\r");
         send(&mut write_half, line.as_bytes());

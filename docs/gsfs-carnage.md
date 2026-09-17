@@ -144,7 +144,7 @@ writes is not a constant.
 
 **Still to do here:** the remaining rows of section 2. `delete` is the next one worth having and
 needs a different oracle from the three above - present-and-allocated versus absent-and-free is not a
-question `ls` can answer, because a LEAK (absent but still allocated) looks identical to a clean
+question `dir` can answer, because a LEAK (absent but still allocated) looks identical to a clean
 delete from the directory side. The check is the free accounting: `drives list` reports the
 superblock's stored free count and `drives check` recomputes it by walking the tree, so a
 disagreement between them within one boot is exactly the leak. Then `write-at` (whose permitted

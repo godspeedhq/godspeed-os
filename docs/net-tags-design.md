@@ -42,7 +42,7 @@ window open once a second, forever. The tick was reverted; the window still exis
 talks to the driver while a client is active.
 
 **Precedent:** `fs` had exactly this and fixed it exactly this way. Its replies were matched by arrival
-order, which produced the "run `ls` twice and it is out of step" desync; the fix was a correlation byte
+order, which produced the "run `dir` twice and it is out of step" desync; the fix was a correlation byte
 at offset 0 of both request and reply (see `project_fs_reply_correlation`, and the `tag` handling in
 `services/fs/src/main.rs`). This spec is that pattern applied one layer down.
 

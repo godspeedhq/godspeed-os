@@ -619,7 +619,7 @@ fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
 /// request sat unanswered in our queue forever. `fs`'s mount reads block on `request_with_reply`,
 /// which wakes on peer *death* but not on an alive-but-silent peer, so fs blocked on the first mount
 /// read, never reached its "storage-unavailable" degraded path, and every fs-dependent shell command
-/// (`ls`, `cd`, history) hung. Answering loudly here fixes that at the root: we reply to `OP_CAPACITY`
+/// (`dir`, `cd`, history) hung. Answering loudly here fixes that at the root: we reply to `OP_CAPACITY`
 /// with a true 0 sectors (fs reads `Some(0)` = genuinely no disk, its designed degraded trigger) and
 /// to every read/write with `STATUS_ERR`. fs then mounts *degraded* and serves clients `FS_NOFS` - a
 /// loud failure that returns to the prompt, never a hang. If a disk later appears, block-driver is

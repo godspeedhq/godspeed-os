@@ -56,7 +56,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    positions does *nothing* instead of offering unrelated files. (The bug this prevents:
    `chaos max-carnage all-services <tab>`, landing on the rounds argument, listed the root
    directory and offered `/.gsh_history`.) The default is path completion; **opting out is
-   explicit and per-command** - a path-taking utility (`ls`, `read`, `write`, `mkdir`, `find`,
+   explicit and per-command** - a path-taking utility (`dir`, `read`, `write`, `mkdir`, `find`,
    `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
    when you add a utility: if its args are paths, do nothing; if they are not, add it to
    `NO_PATH_CMDS`.
@@ -77,7 +77,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer
-    that can be slow. The **fs-backed** interactive commands (`ls`/`cd`/`read`/`find`/`tree` and the
+    that can be slow. The **fs-backed** interactive commands (`dir`/`cd`/`read`/`find`/`tree` and the
     file-reading filters `match`/`count`/`sort`) use the delayed-hint variant `fs_request_q` (SDK
     `request_with_reply_qhint`): silent on a fast reply, it advertises `(q to quit)` only once the wait
     lingers past ~2s - the just-in-time form of the advertisement above, so a snappy op stays quiet.

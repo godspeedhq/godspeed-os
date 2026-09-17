@@ -691,7 +691,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Establish durability AT MOUNT, so the warning (if any) sits in the boot log
                     // beside the mount line. It was previously emitted by the first transaction to
                     // ask, which on a fresh prompt is the shell recording its history - so an
-                    // operator's first `ls` answered with two lines about journal ordering before it
+                    // operator's first `dir` answered with two lines about journal ordering before it
                     // answered with the directory. The fact is about the medium, not the command.
                     let _ = f.durable_or_warn(&ctx);
                     break;
@@ -1183,8 +1183,8 @@ fn op_is_read_only(op: u8) -> bool {
 ///
 /// `fs` already re-mounts when it has seen an I/O error - but it did so at the TOP of the serve loop,
 /// which means the request that DISCOVERS the error is always the one that fails, and only the next one
-/// benefits. That is exactly the "I have to run `ls` twice" the operator hit after replugging the USB
-/// stick: the first `ls` finds the stale mount, dies, and repairs it for the second. §26.7 says a
+/// benefits. That is exactly the "I have to run `dir` twice" the operator hit after replugging the USB
+/// stick: the first `dir` finds the stale mount, dies, and repairs it for the second. §26.7 says a
 /// recovery that leaves the triggering operation failed is only half a recovery, so the repair now
 /// happens INSIDE the request: attempt, and if the device errored and a re-mount succeeds, attempt again
 /// before replying. The caller sees one answer, and for a read-only op that answer is the right one.
@@ -1277,7 +1277,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         }
     }
     if len != REPLY_SENT_DIRECTLY {
-        // A FAILING reply must be able to say why. `ls` came back as "storage error" after a stick
+        // A FAILING reply must be able to say why. `dir` came back as "storage error" after a stick
         // replug with nothing anywhere explaining it - no block-read failure, no re-mount, no I/O error
         // at all - which left the operator (and me) guessing from the outside for several rounds. That is
         // precisely the unexplained failure §26.7 exists to prevent, and the fix is not another sweep of
@@ -2012,7 +2012,7 @@ impl Fs {
     /// **A CRC mismatch is re-read ONCE before it is believed.** On the Pi's USB backend the first
     /// tree read after a device revival was observed returning garbage that the transport accepted as
     /// a complete transfer - the root block "failed its CRC", the operator was told the tree was
-    /// unreadable and to reformat, and the very next read of the same block was clean (an `ls` through
+    /// unreadable and to reformat, and the very next read of the same block was clean (an `dir` through
     /// the root PASSED seconds later). The medium was fine; the READ lied once. Declaring permanent
     /// corruption - whose stated remedy is `drives flash`, i.e. destroying the tree - on a single
     /// read's evidence turns a transient into data loss by prescription. One bounded re-read separates
@@ -4047,7 +4047,7 @@ fn path_is_ancestor(src: &[u8], dst: &[u8]) -> bool {
 /// May a new entry be called this?
 ///
 /// **Control bytes are refused, and that is a security rule rather than a tidiness one.** A name is
-/// DISPLAYED - by `ls`, by `tree`, by `find` - and a terminal acts on the bytes it is handed. A name
+/// DISPLAYED - by `dir`, by `tree`, by `find` - and a terminal acts on the bytes it is handed. A name
 /// carrying `ESC [ 2J` clears the screen when it is listed, so a file can scroll itself, and
 /// everything after it, out of the very listing meant to reveal it. Found by `osdev test fs-fuzz`
 /// against a disk baked with exactly that name (`docs/gsfs-next.md` §1a).

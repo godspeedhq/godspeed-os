@@ -218,7 +218,7 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
     //
     // In single-TT mode there is exactly one translator and it is addressed as port 1, so every
     // Clear_TT_Buffer went to a TT that does not exist. Hardware counted the result: 650 clears in
-    // ninety seconds, the wedge never lifting, and a keyboard that stopped after the first `ls`.
+    // ninety seconds, the wedge never lifting, and a keyboard that stopped after the first `dir`.
     // Reading a capability as a configuration is how a repair gets aimed at nothing - the same
     // mistake, one layer up, as re-enumerating a device to fix a hub.
     //

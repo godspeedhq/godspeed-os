@@ -1292,7 +1292,7 @@ impl ServiceContext {
         }
         // NO CLOCK READ HERE. `epoch_secs_monotonic` is a full CMOS RTC read: `wait_update_clear`
         // spins until the update-in-progress flag clears (up to ~1 ms), then seven port-I/O reads,
-        // repeated until two agree. Two of those per request/reply turned `ls`, `move`, `find` and tab
+        // repeated until two agree. Two of those per request/reply turned `dir`, `move`, `find` and tab
         // completion into TIMEOUTS, and cost the shell so much time inside the kernel that it stopped
         // draining the console and lost Enter keystrokes. Measured, not guessed: `osdev test files`
         // was 222/0 before, 213/9 with the clock read, 222/0 again without it.

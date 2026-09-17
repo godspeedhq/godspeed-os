@@ -290,7 +290,7 @@ format's birth, and never revisit the ceiling.
   finding `a` → its inode, reading that directory, finding `b`, … Each component is
   one directory lookup. Bounded path depth + entries-per-directory (§26.6).
 - **Operations:** `mkdir` (allocate a dir inode + add an entry to the parent),
-  create/`write` (allocate a file inode + entry), `ls` (read a directory's entries),
+  create/`write` (allocate a file inode + entry), `dir` (read a directory's entries),
   `read` (walk to the file inode, read its extent), `cd` (resolve a directory,
   update the session's current-directory inode).
 - **Still bounded & loud:** fixed inode count, fixed name length, contiguous extents
@@ -374,7 +374,7 @@ remain the historical record.
   drops the half that didn't - *node*.)
 
 **Why it's deferred.** The three GSFS0003 structures already serve every *current*
-operation: mount (superblock + bitmap), path lookup (walk the path), `ls` (one directory),
+operation: mount (superblock + bitmap), path lookup (walk the path), `dir` (one directory),
 free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration -
 a `find`, a global search, an "every file" view - which GodspeedOS does not have yet. So by
 §26.2 it is built the day such a command pulls it into existence, not before.

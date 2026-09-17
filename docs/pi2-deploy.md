@@ -110,7 +110,7 @@ add `force`:
 drives flash 0 data force     <- overrides the foreign-disk guard; ERASES whatever is there
 ```
 
-After formatting, the stick is mounted and ready - `write`, `read`, `ls`, `selfcheck`, etc. all work,
+After formatting, the stick is mounted and ready - `write`, `read`, `dir`, `selfcheck`, etc. all work,
 no reboot.
 
 ### Durability caveat (this hardware)

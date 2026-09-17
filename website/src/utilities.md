@@ -37,7 +37,7 @@ fails.
 
 | | |
 |---|---|
-| [`ls`](utilities/ls.md) | list a directory |
+| [`dir`](utilities/dir.md) | list a directory |
 | [`cd`](utilities/cd.md) | change current location |
 | [`read`](utilities/read.md) | print a file's contents |
 | [`write`](utilities/write.md) | create, overwrite, append, or prepend a file |

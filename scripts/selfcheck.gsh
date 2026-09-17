@@ -18,7 +18,7 @@
 #     (a line with '|' is a pipeline; the trailing `assert` is its sink instead).
 #   - `<producer> | … | assert contains|lacks|empty <text>` is the CONTENT form.
 #   - match/count/first/last are byte filters; where/select/sort/to/from work on records.
-#   - exhaustive operator coverage runs on FREE producers (status, ls, json) to avoid
+#   - exhaustive operator coverage runs on FREE producers (status, dir, json) to avoid
 #     spawning a service per line; roster/greet/upper lines are kept lean.
 
 # ##########################################################################
@@ -40,7 +40,7 @@
 version
 echo ''
 echo '#################### gsh LANGUAGE TOUR ####################'
-if ls /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
+if dir /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
 mkdir /tour                              # a scratch directory for the tour's files
 
 echo ''
@@ -169,7 +169,7 @@ fn build_thing {
     read /tour/work/out | assert contains done
 }                                        # <-- the deferred delete fires HERE, on return
 build_thing
-ls /tour | assert lacks work             # proof the defer ran: /tour/work is gone
+dir /tour | assert lacks work             # proof the defer ran: /tour/work is gone
 
 echo ''
 echo '===== 10. RECORD AGGREGATORS - count / sum / min / max / avg ====='
@@ -191,7 +191,7 @@ echo '  import /lib/math.gsh                             (all of a libs function
 echo ''
 echo '===== tour cleanup - leave nothing behind ====='
 delete /tour recursive
-assert fails ls /tour                    # the tour dir is gone
+assert fails dir /tour                    # the tour dir is gone
 
 echo ''
 echo '#################### gsh LANGUAGE TOUR complete ####################'
@@ -217,7 +217,7 @@ assert ok status help
 assert ok read help
 assert ok assert help
 assert ok mem help
-assert ok ls help
+assert ok dir help
 assert ok run help
 assert ok roster help
 assert ok find version
@@ -243,8 +243,8 @@ assert fails wait 99999
 assert ok wait help
 assert ok wait version
 # whatis: a name's kind + origin (the honest which - no $PATH here, so kind IS the answer)
-assert ok whatis ls
-whatis ls | assert contains built-in
+assert ok whatis dir
+whatis dir | assert contains built-in
 whatis fs | assert contains service
 whatis where | assert contains pipe
 assert fails whatis banana
@@ -545,7 +545,7 @@ events log | to yaml | assert contains owner
 # there on hardware and a bare `mkdir` fails - which is the single failure this suite reported on an
 # otherwise clean Pi 4 run. QEMU never showed it, because its test disk is formatted fresh every time:
 # a suite that is only ever run against a new disk cannot see the state a real machine keeps.
-if ls /sc { delete /sc recursive }
+if dir /sc { delete /sc recursive }
 mkdir /sc
 events log | write /sc/evt.log
 read /sc/evt.log | assert contains owner
@@ -589,7 +589,7 @@ events persist status | assert contains kib_day
 # token without a unit is unambiguously a service name.
 assert fails events persist start /sc/bad.log 64MB
 events persist status | to json | assert contains capacity
-ls /sc | assert contains cap.log
+dir /sc | assert contains cap.log
 # STICKY: recorded in a plain-text marker the shell reads at the next boot. Plain text on purpose -
 # `read /persist.conf` shows exactly what will happen, which is the difference between a setting and a
 # surprise. A capture that resumed silently forever because someone forgot is the hazard here.
@@ -674,9 +674,9 @@ echo '===== files: create / read / overwrite / append / empty / quoted ====='
 # make the suite re-runnable was itself the one failure in every otherwise-perfect run: 350/1 four
 # times over, caused by the cleanup rather than anything under test. A condition is evaluated for its
 # truth and never tallied, which is exactly the semantics wanted here: delete it IF it is there.
-if ls /sc { delete /sc recursive }
+if dir /sc { delete /sc recursive }
 mkdir /sc
-assert ok ls /sc
+assert ok dir /sc
 assert fails mkdir /sc
 write /sc/a.txt hello
 read /sc/a.txt | assert contains hello
@@ -746,9 +746,9 @@ echo ''
 echo '===== directories: mkdir (parents) + delete guard ====='
 assert fails mkdir /sc/x/y/z
 mkdir /sc/x/y/z parents
-assert ok ls /sc/x/y/z
+assert ok dir /sc/x/y/z
 mkdir /sc/x/y2 parents
-assert ok ls /sc/x/y2
+assert ok dir /sc/x/y2
 mkdir /sc/d1
 write /sc/d1/f.txt data
 assert fails delete /sc/d1
@@ -777,23 +777,23 @@ echo ''
 echo '===== cd: absolute / relative / parent / negative ====='
 cd /sc
 assert ok read a.txt
-ls | assert contains a.txt
+dir | assert contains a.txt
 cd /sc/d1
 cd ..
-ls | assert contains a.txt
+dir | assert contains a.txt
 cd -
 assert ok read /sc/a.txt
 assert fails cd /sc/a.txt
 cd /
 
-# ===== ls / find / tree as record producers (still referencing d1/d2) =====
+# ===== dir / find / tree as record producers (still referencing d1/d2) =====
 echo ''
-echo '===== ls / find / tree as record producers (still referencing d1/d2) ====='
-ls /sc | where type=file | assert contains a.txt
-ls /sc | where type=dir | assert contains d1
-ls /sc | where type=file | assert lacks d1
-ls /sc | select name | assert contains a.txt
-ls / | where type=dir | assert contains sc
+echo '===== dir / find / tree as record producers (still referencing d1/d2) ====='
+dir /sc | where type=file | assert contains a.txt
+dir /sc | where type=dir | assert contains d1
+dir /sc | where type=file | assert lacks d1
+dir /sc | select name | assert contains a.txt
+dir / | where type=dir | assert contains sc
 find a.txt /sc | assert contains /sc/a.txt
 find f.txt /sc | where type=file | assert contains /sc/d1/f.txt
 find fresh.txt | assert contains /sc/fresh.txt
@@ -829,8 +829,8 @@ assert fails move /sc/dd1 /sc/dd1/a/b/c
 # case a sloppy prefix test gets wrong.
 mkdir /sc/dd1x
 move /sc/dd1x /sc/dd1y
-assert ok ls /sc/dd1y
-assert fails ls /sc/dd1x
+assert ok dir /sc/dd1y
+assert fails dir /sc/dd1x
 delete /sc/dd1y recursive
 
 # ===== seal: content frozen, permanently =====
@@ -844,10 +844,10 @@ read /sc/frozen.txt | assert contains original
 assert fails write /sc/frozen.txt tampered
 read /sc/frozen.txt | assert contains original
 read /sc/frozen.txt | assert lacks tampered
-# In a PIPE `ls` emits records, so the seal is a COLUMN rather than text: a separate `sealed`
+# In a PIPE `dir` emits records, so the seal is a COLUMN rather than text: a separate `sealed`
 # column, not a new `type` value, so existing `where type=file` queries keep their meaning.
-ls /sc | where sealed=true | assert contains frozen.txt
-ls /sc | where sealed=false | assert lacks frozen.txt
+dir /sc | where sealed=true | assert contains frozen.txt
+dir /sc | where sealed=false | assert lacks frozen.txt
 # A seal freezes CONTENT, not existence: renaming and deleting still work, and that is deliberate
 # (see utilities/50_seal.md - an unremovable file is a denial of service, not a guarantee).
 rename /sc/frozen.txt frozen2.txt
@@ -930,7 +930,7 @@ echo '===== cleanup: proves delete + delete recursive ====='
 delete /sc/a.txt
 assert fails read /sc/a.txt
 delete /sc recursive
-assert fails ls /sc
+assert fails dir /sc
 
 # ---- network: RECEIVE must work, checked without sending anything ----------------------------
 #

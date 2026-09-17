@@ -801,7 +801,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// Commands whose arguments are service names, numbers, or fixed keywords - NEVER file paths. Tab at
 /// an argument position for these must not list the filesystem (which surfaced /.gsh_history). Their
 /// keyword/target arguments are completed in `complete_keyword`; anything past that has no completion,
-/// rather than falling through to path completion. (Path-taking commands - ls/read/write/mkdir/... -
+/// rather than falling through to path completion. (Path-taking commands - dir/read/write/mkdir/... -
 /// are absent, so they still path-complete.)
 ///
 /// CONVENTION (`utilities/0_conventions.md` rule 9): a new non-path utility must be added here in the
@@ -825,10 +825,10 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    // `ls` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
+    // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
-    ("ls",      &["long", "human"]),
+    ("dir",      &["long", "human"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
@@ -858,7 +858,7 @@ const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
     ("mkdir",  &["parents"]),
     ("copy",   &["recursive"]),
     ("delete", &["recursive"]),
-    ("ls",     &["long", "human"]),
+    ("dir",     &["long", "human"]),
 ];
 
 /// Complete the current token (`tok_start..end`) as a subcommand keyword of its segment's command.
@@ -1058,7 +1058,7 @@ struct PathHit { off: usize, len: usize, is_dir: bool }
 /// resolved dir and match entries whose name starts with the leaf. One match → fill it (+ `/` for a
 /// dir, ` ` for a file); several → fill the common prefix, print a numbered menu, then **digit**
 /// selects or **Tab** cycles to the next candidate (any other key keeps the line). No new authority
-/// - the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
+/// - the shell already holds the `fs` LIST_DIR cap (the same `dir` uses).
 fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let bytes = line.bytes();
     let token = &bytes[tok_start..];
@@ -1687,7 +1687,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
         "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
-        "ls"      => cmd_ls(ctx, cwd, &args[1..argc.min(args.len())], out),
+        "dir"      => cmd_dir(ctx, cwd, &args[1..argc.min(args.len())], out),
         "edit"    => cmd_edit(ctx, cwd, s["edit".len()..].trim()),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "fmt"     => cmd_fmt(ctx, cwd, s["fmt".len()..].trim()),
@@ -4208,7 +4208,7 @@ const UTIL_VERSION: &str = "0.4.0";
 /// to recognise `awk` implies a plan to have one.
 const FOREIGN_HINTS: &[(&str, &str)] = &[
     // POSIX
-    ("dir",   "ls"),        // the DOS reflex for the listing command
+    ("ls",    "dir"),       // the Unix reflex; here it is `dir` - what `mkdir` makes
     ("cat",   "read"),
     ("more",  "read"),
     ("less",  "read"),
@@ -4246,7 +4246,7 @@ fn foreign_hint(cmd: &str) -> Option<&'static str> {
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
+    "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
     "mkdir", "copy", "move", "rename", "delete", "seal", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -4435,7 +4435,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("assert fails <command>", "the command must fail (negative test)", "assert fails read /nope"),
             ("assert fails-with <V> <command>", "must fail with the named Err variant", "assert fails-with FileNotFound read /nope"),
             ("<producer> | assert contains <text>", "piped output must contain <text>", "roster | where role=core | assert contains Matthew"),
-            ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "ls / | assert lacks secret"),
+            ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "dir / | assert lacks secret"),
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
@@ -4457,7 +4457,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
         ], true),
         "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
-            ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis ls"),
+            ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis dir"),
             // The one collision in the vocabulary: whatis's argument domain CONTAINS the words
             // `help` and `version`, and the universal `<util> help|version` rule answers first -
             // so this help text itself carries the answer you were asking for.
@@ -4548,13 +4548,13 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("drives check [drive]", "verify (fsck): rebuild bitmap/free, report CRC failures", "drives check"),
             ("drives scrub [drive]", "read-only integrity sweep: verify every block's CRC, report (changes nothing)", "drives scrub"),
         ], true),
-        "ls" => help_block(ctx, "ls", "list a directory (records when piped)", &[
-            ("ls", "list the current directory", "ls"),
-            ("ls <path>", "list the directory at <path>", "ls /docs"),
-            ("ls long", "one per line with type, size and MODIFIED time", "ls long /docs"),
-            ("ls human", "sizes as KiB/MiB/GiB, not raw bytes", "ls long human"),
-            ("ls [path] | <verb>", "piped: emits records name/type/size", "ls | where size>0"),
-            ("ls | select … / sort …", "project / order the listing", "ls | sort reverse size"),
+        "dir" => help_block(ctx, "dir", "list a directory (records when piped)", &[
+            ("dir", "list the current directory", "dir"),
+            ("dir <path>", "list the directory at <path>", "dir /docs"),
+            ("dir long", "one per line with type, size and MODIFIED time", "dir long /docs"),
+            ("dir human", "sizes as KiB/MiB/GiB, not raw bytes", "dir long human"),
+            ("dir [path] | <verb>", "piped: emits records name/type/size", "dir | where size>0"),
+            ("dir | select … / sort …", "project / order the listing", "dir | sort reverse size"),
         ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
@@ -4770,7 +4770,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
-    Row("ls [path]", "list a directory"),
+    Row("dir [path]", "list a directory"),
     Row("cd [path|-]", "change directory (- = previous)"),
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
@@ -5174,7 +5174,7 @@ const KNOWN_SERVICES: &[&str] = &[
 /// cannot be asked: the universal `<util> version|help` intercept answers for whatis itself.)
 fn cmd_whatis(ctx: &ServiceContext, name: &str, out: &mut Out) -> Result<(), ShellError> {
     if name.is_empty() {
-        ctx.console_writeln("usage: whatis <name>   e.g. whatis ls");
+        ctx.console_writeln("usage: whatis <name>   e.g. whatis dir");
         return Err(ShellError::Unknown);
     }
     if PIPE_ONLY_VERBS.contains(&name) {
@@ -6806,14 +6806,14 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// Producers that emit a structured TABLE rather than text. These are inherently tabular
 /// (uniform rows), so in a pipe they emit records - composed with `where`/`select`/`sort <col>`,
 /// not the text filters. Bare (un-piped) each still prints its normal text. `status` (task
-/// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
+/// roster), `dir` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace")
 }
 
-/// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
-/// `cmd_ls`'s fs parse but emits rows instead of formatted text; `size` is `Int` for files and
+/// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
+/// `cmd_dir`'s fs parse but emits rows instead of formatted text; `size` is `Int` for files and
 /// `Empty` for directories (a dir has no byte size). Errors print and return `None` (abort pipe).
 ///
 /// `#[inline(never)]` (and on all the sibling builders): each holds a multi-KB `Table` (and
@@ -6822,18 +6822,18 @@ fn is_record_producer(name: &str) -> bool {
 /// build a record - and overflow the bounded user stack. Out-of-line, the big frame exists only
 /// while the builder actually runs.
 #[inline(never)]
-fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
+fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
         ReqOutcome::Reply(r) => r,
         ReqOutcome::Aborted => return None,
-        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return None; }
+        ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return None; }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return None; }
     if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
-        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
+        ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
         return None;
     }
     let count = p[1] as usize;
@@ -7035,7 +7035,7 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
             if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout ls reads
+            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout `dir` reads
             i += nl + 1 + 8 + 4 + 1;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
@@ -7045,7 +7045,7 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
                     let tv = t.intern(if is_dir { b"dir" } else { b"file" });
                     let pv = t.intern(&child[..clen]);
                     // Files carry their byte size (`find * | where size>1000`, the library's `size`
-                    // sum); a dir's row leaves it Empty, exactly as ls's records do.
+                    // sum); a dir's row leaves it Empty, exactly as `dir`'s records do.
                     let sz = if is_dir { Value::Empty } else { Value::Int(size) };
                     t.add_row(&[nv, tv, pv, sz]);
                 }
@@ -7116,7 +7116,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
     let mut s = if is_record_producer(c0) {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
-            "ls"      => match build_ls_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return Err(ShellError::Unknown) },
             "drives"  => match build_drives_table(ctx)          { Some(t) => t, None => return Err(ShellError::Unknown) },
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -7658,7 +7658,7 @@ fn cmd_trace(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// hang (Commandment VIII: a missing dependency RETURNS, loudly).
 /// Build the trace ring's events as a `Table`.
 ///
-/// A TABLE and not printed text, so `events ipc` is a record source like `status` or `ls`: it renders
+/// A TABLE and not printed text, so `events ipc` is a record source like `status` or `dir`: it renders
 /// as a grid on the console, pages when it is taller than the screen, and pipes into the record verbs
 /// (`events ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
 /// the alternative was a printer plus a separate serialiser that would drift apart.
@@ -9837,7 +9837,7 @@ fn split_first(s: &str) -> (&str, &str) {
 }
 
 /// Built-ins that emit text and can be the producer side of a pipe.
-// `ls` and `find` are intentionally absent: they are record producers (`is_record_producer`),
+// `dir` and `find` are intentionally absent: they are record producers (`is_record_producer`),
 // handled on the record path in `pipe_run` before this is consulted, so listing them here would
 // be dead. `tree` stays text - a hierarchy is not a flat table.
 fn is_producer_builtin(name: &str) -> bool {
@@ -9875,7 +9875,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
         "read"         => { let _ = cmd_read(ctx, cwd, arg, out); }
-        // "ls" and "find" are record producers (handled on the record path), not text here.
+        // "dir" and "find" are record producers (handled on the record path), not text here.
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
         // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
@@ -11174,7 +11174,7 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 
 
 // ---------------------------------------------------------------------------
-// File commands - ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins
+// File commands - dir / read / write / mkdir / cd (utilities/16..20). Shell built-ins
 // that send the fs file API to `fs` over IPC; `fs` holds + enforces all disk authority.
 // The shell tracks the current location (a drive+directory pointer) and resolves
 // relative / `.` / `..` paths to an absolute path before sending - fs only walks
@@ -11270,10 +11270,10 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 ///
 /// Replies were matched to requests by ARRIVAL ORDER alone, which holds only while nothing is ever
 /// overtaken. After a USB stick replug the device is slow, a `.gsh_history` write is still in flight when
-/// the next command's request goes out, and the replies come back one behind - so `ls` read the write's
+/// the next command's request goes out, and the replies come back one behind - so `dir` read the write's
 /// one-byte `[FS_OK]`, saw a reply too short to be a listing, and reported a storage error about a
 /// filesystem that was perfectly fine. The channel then stayed one behind indefinitely, which is why the
-/// SECOND `ls` always worked and why every storage-layer fix left the symptom untouched.
+/// SECOND `dir` always worked and why every storage-layer fix left the symptom untouched.
 ///
 /// A tag makes the match structural instead of circumstantial: the client stamps each request, fs echoes
 /// it, and an answer to a different question is recognisable as one. Cycles 1..=255 and never uses 0, so
@@ -11876,7 +11876,7 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
     }
 }
 
-/// `fs_request` for INTERACTIVE commands (`ls`, `cd`, `read`, `find`, ...): q-abortable, and after a
+/// `fs_request` for INTERACTIVE commands (`dir`, `cd`, `read`, `find`, ...): q-abortable, and after a
 /// short lingering threshold it prints a "(q to quit)" hint so the user can bail on a slow op instead
 /// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
 /// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
@@ -12054,9 +12054,9 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 }
 
 /// `ls [path]` - list a directory.
-/// A byte count rendered either raw or in KiB/MiB, for the terse `ls` column.
+/// A byte count rendered either raw or in KiB/MiB, for the terse `dir` column.
 ///
-/// A type rather than a formatting branch at each call site, so the two `ls` layouts cannot drift
+/// A type rather than a formatting branch at each call site, so the two `dir` layouts cannot drift
 /// into showing sizes differently from one another.
 struct HumanSize(u64, bool);
 /// The same, right-aligned into the `ls long` column - digits that do not line up are not a column.
@@ -12145,7 +12145,7 @@ fn u32_le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
-fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
+fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     // WORDS, NOT FLAGS (`utilities/0_conventions.md` rule 4): `ls long human`, never `ls -lh`. Any
     // order, and mixable with a path, because an order a person has to remember is one they will
     // guess wrong.
@@ -12164,12 +12164,12 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
         ReqOutcome::Reply(r) => r,
         ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
+        ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_NOTFOUND) {
-        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
+        ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
         return Err(ShellError::FileNotFound);
     }
     // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
@@ -12177,7 +12177,7 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
     // to look at `/` when the problem was the device. Name what actually happened (§26.7).
     if p.first() == Some(&FS_ERR) || p.len() < 2 {
         ctx.console_writeln_fmt(format_args!(
-            "ls: could not read {} - storage error (the device may still be settling after a replug; try again)",
+            "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
             str_of(path)));
         return Err(ShellError::Unknown);
     }
@@ -12214,7 +12214,7 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
         let sealed = p[i + nl + 13] & 1 != 0;
         i += nl + 1 + 8 + 4 + 1;
         if !long {
-            // The terse default is unchanged, deliberately: `ls` is read far more often than it is
+            // The terse default is unchanged, deliberately: `dir` is read far more often than it is
             // studied, and a wall of columns is worse for the common case (conventions rule 7).
             if is_dir {
                 out.line_fmt(ctx, format_args!("  {:<20}  dir    -", name));

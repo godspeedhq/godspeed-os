@@ -2230,7 +2230,7 @@ fn run_sticky_test() {
 }
 
 fn run_files_test() {
-    println!("\n=== files 4: ls / read / write / mkdir / cd (RAW AHCI disk) ===");
+    println!("\n=== files 4: dir / read / write / mkdir / cd (RAW AHCI disk) ===");
     cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -2984,7 +2984,7 @@ fn run_fs_fuzz_test() {
     gsfs_add_file(persist, "canary.txt", b"canary-must-survive-every-hostile-request");
     // A HOSTILE FILENAME, baked host-side because the shell's line editor accepts only printable
     // ASCII (`main.rs` input loop) so this cannot be typed. That is exactly the threat: the name
-    // arrives on a disk somebody else prepared. `ESC [ 2J` is "clear the screen" - if `ls` prints a
+    // arrives on a disk somebody else prepared. `ESC [ 2J` is "clear the screen" - if `dir` prints a
     // name unfiltered, listing a directory lets the DISK drive the terminal, and a file can hide
     // itself (or anything after it) from the listing that is supposed to reveal it.
     gsfs_add_file(persist, "a[2Jb.txt", b"a filename must not be able to drive the terminal");

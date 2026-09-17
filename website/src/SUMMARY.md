@@ -29,7 +29,7 @@
   - [`reboot`](utilities/reboot.md)
   - [`poweroff`](utilities/poweroff.md)
   - [`drives`](utilities/drives.md)
-  - [`ls`](utilities/ls.md)
+  - [`dir`](utilities/dir.md)
   - [`cd`](utilities/cd.md)
   - [`read`](utilities/read.md)
   - [`write`](utilities/write.md)
