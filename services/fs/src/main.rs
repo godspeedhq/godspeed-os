@@ -3179,7 +3179,18 @@ impl Fs {
         Some(n)
     }
 
-    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64, mtime:u32, flags:u8}…]`.
+    /// Reply: `[FS_OK, count:u8, more:u8, {name_len:u8, name, is_dir:u8, size:u64, mtime:u32, flags:u8}…]`.
+    ///
+    /// **`more` is 1 when entries did not fit, and it exists because this used to LIE.** The reply is
+    /// one 512-byte block, so roughly 20 entries fit; a directory with more than that was listed
+    /// incompletely and `count` reported only what fit. `dir` on a directory of thirty files printed
+    /// twenty and said `(20 entries)` as though that were the whole truth, with nothing in the reply
+    /// a client could have used to tell the difference. That is not a ceiling, it is a WRONG ANSWER,
+    /// and it reached `find`, `tree`, `delete recursive` and tab completion alike (`backlog/33`).
+    ///
+    /// The flag does not remove the ceiling - a continuation cursor is what does that, and it is
+    /// recorded rather than done. It converts a silent wrong answer into a loud partial one, which
+    /// is the difference between a limitation and a defect (invariant 12, §26.7).
     ///
     /// `flags` bit 0 is SEALED. A SEPARATE byte rather than a spare bit of `is_dir`, deliberately: a
     /// consumer that missed the change would then read a sealed FILE as a DIRECTORY, which is a
@@ -3197,8 +3208,9 @@ impl Fs {
         let mut out = [0u8; BLOCK];
         out[0] = FS_OK;
         let mut count = 0u8;
-        let mut w = 2usize;
-        for bi in 0..d.block_count {
+        let mut more = false;
+        let mut w = 3usize;   // [FS_OK, count, more] - entries start at 3
+        'blocks: for bi in 0..d.block_count {
             let blk = self.td_read(ctx, d.first_block + bi)?;
             for slot in 0..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
@@ -3206,7 +3218,13 @@ impl Fs {
                 if t == ITYPE_FREE { continue; }
                 let nl = blk[o + 1] as usize;
                 if nl == 0 || nl > NAME_MAX { continue; }
-                if w + 1 + nl + 1 + 8 + 4 + 1 > BLOCK { break; }
+                // Out of room. Say so and STOP - labelled, because the old `break` left only the
+                // slot loop and the walk carried on reading every remaining directory block to
+                // re-discover it had no room, once per entry.
+                if w + 1 + nl + 1 + 8 + 4 + 1 > BLOCK || count == u8::MAX {
+                    more = true;
+                    break 'blocks;
+                }
                 out[w] = nl as u8;
                 out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 2..o + 2 + nl]);
                 out[w + 1 + nl] = (t == ITYPE_DIR) as u8;
@@ -3219,6 +3237,12 @@ impl Fs {
             }
         }
         out[1] = count;
+        out[2] = u8::from(more);
+        if more {
+            ctx.log_fmt(format_args!(
+                "fs: LIST_DIR truncated - {} entries returned, the directory holds more than one reply block can carry (backlog/33)",
+                count));
+        }
         Some(out)
     }
 

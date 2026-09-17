@@ -1092,7 +1092,7 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let count = rbuf[1] as usize;
     let mut hits = [PathHit { off: 0, len: 0, is_dir: false }; 32];
     let mut n = 0usize;
-    let mut i = 2usize;
+    let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
     for _ in 0..count {
         if i >= rn { break; }
         let nl = rbuf[i] as usize; i += 1;
@@ -6841,7 +6841,7 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     // change of meaning in queries people have already written. A separate column adds an answer
     // without moving an existing one.
     let mut t = Table::new(&["name", "type", "size", "sealed"]);
-    let mut i = 2usize;
+    let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
     for _ in 0..count {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
@@ -7026,7 +7026,7 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
         if no_fs(ctx, p) { return None; }
         if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
         let count = p[1] as usize;
-        let mut i = 2usize;
+        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
@@ -12182,9 +12182,19 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
         return Err(ShellError::Unknown);
     }
     let count = p[1] as usize;
-    out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
+    // SAY WHEN THE LISTING IS NOT THE WHOLE DIRECTORY. The reply is one block, so past roughly
+    // twenty entries the rest are simply absent - and this line used to report the truncated count
+    // as though it were the total. A wrong answer, not a limit (`backlog/33`).
+    let truncated = p.get(2).copied().unwrap_or(0) != 0;
+    if truncated {
+        out.line_fmt(ctx, format_args!(
+            "{}  ({} entries, TRUNCATED - the directory holds more than one listing can carry)",
+            str_of(path), count));
+    } else {
+        out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
+    }
     if count > 0 { out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED"); }
-    let mut i = 2usize;
+    let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
     for _ in 0..count {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
@@ -13455,7 +13465,7 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
         if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
         let count = p[1] as usize;
-        let mut i = 2usize;
+        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
@@ -13661,7 +13671,7 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
         if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
         let count = p[1] as usize;
-        let mut i = 2usize;
+        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
@@ -13758,7 +13768,7 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         let count = p[1] as usize;
         let mut offs = [0usize; TREE_FANOUT];
         let mut nc = 0usize;
-        let mut i = 2usize;
+        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
         for _ in 0..count {
             if i >= p.len() || nc >= TREE_FANOUT { break; }
             let nl = p[i] as usize;

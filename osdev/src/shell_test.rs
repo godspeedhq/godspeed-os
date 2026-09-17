@@ -5601,6 +5601,32 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!listing.contains("[2J"),
            "`dir` did not emit a raw ESC sequence that came from a FILENAME");
 
+    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK MUST SAY SO (backlog/33) ----
+    //
+    // `list_dir` builds its answer into a single 512-byte block, so roughly twenty entries fit and
+    // the rest are simply absent. Until this was fixed the count reported only what fit, so `dir` on
+    // a directory of thirty files printed twenty and said `(20 entries)` as though that were the
+    // whole truth - a WRONG ANSWER rather than a limit, and one that reached `find`, `tree`,
+    // `delete recursive` and tab completion alike.
+    //
+    // PROVING THE GUARD FIRES is the whole point of this case. A truncation warning that has never
+    // been observed firing is not evidence, and the ceiling is not a constant anybody should be
+    // hard-coding an expectation about - so this builds a directory that is definitely too big,
+    // rather than one that is exactly one over some number read off the source.
+    answered!("mkdir /many", "a directory to overfill");
+    for i in 0..30 {
+        answered!(format!("write /many/file{i:02}.txt x"), "one of thirty entries");
+    }
+    let big = answered!("dir /many", "listing a directory that cannot fit in one reply");
+    check!(big.contains("TRUNCATED"),
+           "`dir` SAYS the listing is truncated rather than reporting a short count as the total");
+    // And the other half, which is what makes the first half meaningful: an ordinary directory must
+    // NOT carry the warning. A flag that is always set says nothing.
+    let small = answered!("dir /fz", "listing a directory that fits");
+    check!(!small.contains("TRUNCATED"),
+           "a directory that FITS is not labelled truncated (the warning discriminates)");
+    answered!("delete /many recursive", "clean up the overfilled directory");
+
     // ---- TIMESTAMPS (Phase O) and the migration story, in one listing ----
     //
     // `canary.txt` was baked host-side into a 0008 image, so no time was ever recorded for it.
@@ -5797,26 +5823,42 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
     // The last setup command must write nothing. It is what marks the boundary between "the machine
     // came up and mounted" and "the operation ran" - measured from the write tap, not assumed,
     // because the number of boot writes is not a constant.
+    /// What "inside the permitted set" means for one operation. Two shapes, because the table in
+    /// `docs/gsfs-carnage.md` 2 genuinely has two.
+    enum Oracle {
+        /// EXACTLY ONE of these two texts appears. The operation's two permitted outcomes are
+        /// mutually exclusive and both visible: old name or new name, source or destination, old
+        /// content or new content. Both means it half-applied; neither means it destroyed what it
+        /// touched.
+        ExactlyOne(&'static str, &'static str),
+        /// This text MUST appear. Used where BOTH presence and absence are permitted outcomes and
+        /// so there is nothing to exclude - what must hold is an INVARIANT instead.
+        ///
+        /// `delete` is the case: gone or still there are equally legal, and the thing that must
+        /// never happen is invisible from the directory side. A leak (absent but blocks still
+        /// allocated) and a clean delete look identical in a listing. The accounting is where the
+        /// difference lives, which is why this arrives only now that fsck REPORTS whether it had to
+        /// repair anything rather than silently repairing it.
+        MustContain(&'static str),
+    }
     struct TearCase {
         name:   &'static str,
         setup:  &'static [&'static str],
         op:     &'static str,
         probe:  &'static str,
-        /// The two permitted outcomes, as text that must appear in the probe's output.
-        before: &'static str,
-        after:  &'static str,
+        oracle: Oracle,
     }
     const CASES: &[TearCase] = &[
         // A whole-file overwrite: the old content complete, or the new content complete. Never a
         // mix, and never an entry pointing at blocks that were never written.
         TearCase { name: "overwrite", setup: &["read /tear.txt"],
                    op: "write /tear.txt NEWNEWNEW", probe: "read /tear.txt",
-                   before: "ORIGINAL", after: "NEWNEWNEW" },
+                   oracle: Oracle::ExactlyOne("ORIGINAL", "NEWNEWNEW") },
         // A rename: the old name or the new name, never both, never neither. Two directory-entry
         // mutations in one transaction, which is what the journal is for.
         TearCase { name: "rename", setup: &["dir /"],
                    op: "rename /tear.txt ZZrenamed.txt", probe: "dir /",
-                   before: "tear.txt", after: "ZZrenamed.txt" },
+                   oracle: Oracle::ExactlyOne("tear.txt", "ZZrenamed.txt") },
         // A move ACROSS directories: an add into the destination and a remove from the source, in
         // one transaction. The file is in exactly one of the two places - never in both (a second
         // reference to one extent) and never in neither (the file lost outright).
@@ -5826,7 +5868,17 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         // destination holding the file are genuinely exclusive.
         TearCase { name: "move", setup: &["mkdir /zdir", "dir /zdir"],
                    op: "move /tear.txt /zdir/tear.txt", probe: "dir /zdir",
-                   before: "(empty)", after: "tear.txt" },
+                   oracle: Oracle::ExactlyOne("(empty)", "tear.txt") },
+        // DELETE, and it needs the other oracle. Present-with-its-blocks and absent-with-them-freed
+        // are BOTH permitted, so there is nothing to exclude - but the two failures that matter are
+        // invisible in a listing. A LEAK (absent from the directory, blocks still marked used) looks
+        // exactly like a clean delete; the reverse (present, blocks marked free) looks fine until
+        // the next allocation writes over live data. `drives check` walks the tree and compares its
+        // count against the superblock's, and now SAYS whether they disagreed, so a torn delete that
+        // left the accounting inconsistent is caught by the one instrument that can see it.
+        TearCase { name: "delete", setup: &["dir /"],
+                   op: "delete /tear.txt", probe: "drives check",
+                   oracle: Oracle::MustContain("nothing was repaired") },
     ];
 
     let mut total_points = 0u64;
@@ -5858,8 +5910,11 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
         let op_end   = mark_at(n_setup);
 
         check!(!writes.is_empty(), format!("[{}] the write tap recorded sectors", case.name));
-        check!(rout.last().map_or(false, |r| r.contains(case.after)),
-               format!("[{}] the operation landed when nothing interrupted it", case.name));
+        let landed = match case.oracle {
+            Oracle::ExactlyOne(_, after) => rout.last().map_or(false, |r| r.contains(after)),
+            Oracle::MustContain(t)       => rout.last().map_or(false, |r| r.contains(t)),
+        };
+        check!(landed, format!("[{}] the operation landed when nothing interrupted it", case.name));
         check!(op_end > op_start,
                format!("[{}] the operation wrote {} sector(s) (tap {}..{})",
                        case.name, op_end.saturating_sub(op_start), op_start + 1, op_end));
@@ -5879,27 +5934,36 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
             }
             let (o, w, _) = boot(&img, &[case.probe]);
             let out = o.first().cloned().unwrap_or_default();
-            let has_before = out.contains(case.before);
-            let has_after  = out.contains(case.after);
-            let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
-            // The oracle: the volume mounted, and EXACTLY ONE of the two permitted outcomes holds.
-            // Both means the operation half-applied; neither means it destroyed what it touched; a
-            // failure to mount means it corrupted the structure. All three are outside the table.
-            let ok = mounted && (has_before ^ has_after);
+            let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+            // A failure to mount is outside the table whatever the oracle says: the operation
+            // corrupted the structure rather than landing on one side of it.
+            let (ok, why) = match case.oracle {
+                Oracle::ExactlyOne(before, after) => {
+                    let (b, a) = (out.contains(before), out.contains(after));
+                    (mounted && (b ^ a), format!("{before}={b} {after}={a}"))
+                }
+                Oracle::MustContain(t) => {
+                    let c = out.contains(t);
+                    (mounted && c, format!("\"{t}\"={c}"))
+                }
+            };
             if ok {
                 torn_ok += 1;
                 let _ = std::fs::remove_file(&img);
             } else {
                 check!(false, format!(
-                    "[{}] k={k}: outside the permitted set (mounted={mounted} {}={has_before} {}={has_after}) - image kept at {img}",
-                    case.name, case.before, case.after));
+                    "[{}] k={k}: outside the permitted set (mounted={mounted} {why}) - image kept at {img}",
+                    case.name));
             }
         }
         let points = op_end - op_start;
         total_points += points;
+        let verdict = match case.oracle {
+            Oracle::ExactlyOne(b, a) => format!("left exactly one of `{b}` / `{a}`"),
+            Oracle::MustContain(t)   => format!("left the volume reporting `{t}`"),
+        };
         check!(torn_ok == points,
-               format!("[{}] every tear point left exactly one of `{}` / `{}` ({}/{})",
-                       case.name, case.before, case.after, torn_ok, points));
+               format!("[{}] every tear point {} ({}/{})", case.name, verdict, torn_ok, points));
     }
 
     // ---- 3. PROVE THE ORACLE CAN FAIL ----------------------------------------------------------
@@ -5920,7 +5984,7 @@ pub fn run_fs_tear(image_path: &Path, persist_path: &str, smp: u32) {
             let (o, w, _) = boot(ctl, &["dir /zdir"]);
             let out = o.first().cloned().unwrap_or_default();
             let has_before = out.contains("(empty)");
-            let has_after  = out.contains("tear.txt");
+            let has_after  = out.contains("tear.txt");   // the move case's Oracle::ExactlyOne texts
             let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
             let oracle_says_ok = mounted && (has_before ^ has_after);
             check!(mounted, "control: the pristine disk mounts (so a rejection is the ORACLE, not a dead boot)");
