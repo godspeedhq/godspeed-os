@@ -182,7 +182,7 @@ A file that can never be written again is a property of the FILE, not of a capab
 survive a reboot - which means on-disk state, which means the format work. It belongs with Phase O
 and this section should not have claimed it needed no format change. See §3a.
 
-## 3. Phase O - timestamps (GSFS0008 -> 0009)  (BUILT, except SEALED)
+## 3. Phase O - timestamps  (BUILT, except SEALED)
 
 A directory entry has 64 bytes, of which the layout in use is: type @0, name_len @1, name @2..40,
 size @40, first_block @48, block_count @56. **Bytes 40..48 hold the size and 56..64 the count, so the
@@ -202,9 +202,22 @@ every read into a transaction. The cost is real and the value is low; it is refu
 sets it from SNTP, and persists a floor across reboots (`/clock.last`). A file stamped on a machine
 that has never seen the network gets the floor, not zero, and the floor only moves forward.
 
-**Migration.** A 0008 volume mounts read-write with its timestamps reading as "unknown" rather than as
-the epoch, because a wrong date is worse than an absent one. `drives check` stamps missing times with
-the floor. Format bump is reformat-only, in the house pattern of 0005 -> 0008.
+**Migration, and the version number this section used to claim.** A volume written before times
+existed mounts read-write with its timestamps reading as "unknown" rather than as the epoch, because
+a wrong date is worse than an absent one. **No migration pass runs, and nothing stamps a missing time
+with the clock floor** - this section said `drives check` would, which was scoping written before the
+design settled and is the opposite of what shipped: inventing a date for a file whose date nobody
+knows is exactly what the `unknown` rule exists to refuse.
+
+**There is no format bump.** This section was headed "GSFS0008 -> 0009" and called the change
+"reformat-only, in the house pattern of 0005 -> 0008", both of which contradict the project's own
+versioning law: `docs/persistence.md` §6.15 froze the magic at `GSFS0008` in Phase L and states that
+every future feature is additive under the three feature masks - *"GSFS00014 never happens"*. Nothing
+in this branch mints a new magic; `SB_MAGIC` is still `b"GSFS0008"`. The times region is additive
+with no feature bit at all (it sits past the record CRC and carries its own), and SEALED is a
+`ro_compat` bit, which is precisely the mechanism §6.15 prescribes. The naming was the error, not the
+implementation - but a doc inventing a version that exists on no disk is the kind of claim a reader
+would build against, so it is corrected here rather than quietly dropped.
 
 ---
 
@@ -297,8 +310,8 @@ the common question is "what is in here", and a wall of columns answers one nobo
 
 ### `unknown` is an answer
 
-`MODIFIED` reads `unknown` when the filesystem records no time for that entry - a 0008 file, or one
-written before the machine knew the time. **Never 1970.** A date you can see is a date you will act
+`MODIFIED` reads `unknown` when the filesystem records no time for that entry - a file written
+before the volume carried times, or one written before the machine knew the time. **Never 1970.** A date you can see is a date you will act
 on, so a wrong one is worse than an absent one.
 
 ## 5. What this does NOT do
@@ -325,7 +338,7 @@ Recorded so it is not rediscovered as an omission (§26.7):
 | --- | --- |
 | M - adversarial | `osdev test fs-fuzz` (new), plus no regression across the eleven existing fs suites |
 | N - rights | `osdev test file-cap` extended |
-| O - timestamps | `osdev test fs-time` (new): stamp, survive a reboot, survive a restart, migrate a 0008 volume |
+| O - timestamps | `osdev test fs-time` (new): stamp, survive a reboot, survive a restart, read a volume with no times region as `unknown` |
 | P - `ls` | `osdev test shell` (the file section) and `selfcheck.gsh` |
 
 A hardware pass on the five boards confirms at the end. It is not needed along the way, and this plan

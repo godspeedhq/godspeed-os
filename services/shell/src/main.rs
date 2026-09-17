@@ -4182,7 +4182,7 @@ const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
-    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
+    "mkdir", "copy", "move", "rename", "delete", "seal", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
     "where", "select", "to", "from", "sum", "min", "max", "avg",
@@ -4527,6 +4527,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
             ("delete <a>,<b>,...", "remove several (comma-separated; recursive applies to all)", "delete /a.txt,/b.txt"),
+        ], true),
+        "seal" => help_block(ctx, "seal", "freeze a file's content, permanently - there is NO unseal", &[
+            ("seal <path>", "freeze <path>'s bytes after asking [y/N]", "seal /audit.log"),
+            ("seal <path> yes", "freeze it without asking (for a script; the warning still prints)", "seal /audit.log yes"),
         ], true),
         "find" => help_block(ctx, "find", "search the tree by name (substring/glob; records when piped)", &[
             ("find <name>", "matches names containing <name>", "find report"),
@@ -6778,8 +6782,8 @@ fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
         i += 1;
-        // GSFS0009: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
-        // four bytes wider than the 0008 layout. Every consumer of this reply must step by the same
+        // Phase O: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
+        // four bytes wider than the layout before it. Every consumer of this reply must step by the same
         // stride or it reads the NEXT entry's name out of this one's timestamp.
         if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
         let name = t.intern(&p[i..i + nl]);
@@ -11435,6 +11439,17 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
+/// The REASON `fs` gave for a failure, when it gave one.
+///
+/// An `FS_ERR` reply carries `[FS_ERR, reason bytes...]`. The trailing bytes are optional - older
+/// paths and the ops that have no reason to give still send the single byte - so this returns
+/// `None` rather than an empty string, and a caller falls back to its own wording.
+fn fs_err_reason(m: &Message) -> Option<&str> {
+    let p = m.payload_bytes();
+    if p.first().copied() != Some(FS_ERR) || p.len() < 2 { return None; }
+    core::str::from_utf8(&p[1..]).ok().filter(|r| !r.is_empty())
+}
+
 fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
@@ -12144,7 +12159,7 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(),
             continue;
         }
         // `ls long`: type, size and WHEN. A time this volume does not record prints as "unknown"
-        // rather than as 1970 - an absent date is honest and a wrong one is not (GSFS0009).
+        // rather than as 1970 - an absent date is honest and a wrong one is not (Phase O).
         let when = if mtime == 0 {
             TimeCol::Unknown
         } else {
@@ -13076,7 +13091,10 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
         Ok(())
     } else {
-        ctx.console_writeln("write: failed (bad path, or parent missing?)");
+        match fs_err_reason(&reply) {
+            Some(why) => ctx.console_writeln_fmt(format_args!("write: failed - {}", why)),
+            None      => ctx.console_writeln("write: failed (bad path, or parent missing?)"),
+        }
         Err(ShellError::Unknown)
     }
 }
@@ -13547,7 +13565,13 @@ fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
             Ok(())
         }
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) => { ctx.console_writeln("move: failed (not found, or dest exists?)"); Err(ShellError::Unknown) }
+        Some(ref m) => {
+            match fs_err_reason(m) {
+                Some(why) => ctx.console_writeln_fmt(format_args!("move: failed - {}", why)),
+                None      => ctx.console_writeln("move: failed (not found, or dest exists?)"),
+            }
+            Err(ShellError::Unknown)
+        }
         None    => { ctx.console_writeln("move: storage unavailable"); Err(ShellError::Unknown) }
     }
 }

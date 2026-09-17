@@ -45,12 +45,19 @@ seal /audit.log - its content can NEVER be changed again, and there is no unseal
 sealed /audit.log
 
 gsh> write /audit.log tampered
-write: failed
+write: failed - file is sealed - its content cannot be changed
 
 gsh> ls long /
+/  (1 entries)
   NAME                  TYPE        SIZE  MODIFIED
-  audit.log             seal        812  2026-09-17 07:33
+  audit.log             seal         812  2026-09-17 07:33
 ```
+
+**The refusal says WHY, and did not always.** It read `write: failed (bad path, or parent missing?)`
+until the audit that followed this utility shipping: `fs` knew the reason, logged it, and dropped it
+at the reply, so sealing a file and then writing to it sent the operator hunting for a typo in a path
+that was perfectly correct. A failure that misdirects is worse than one that says nothing
+(`CLAUDE.md` §26.7). The reason now rides back after the unchanged error byte.
 
 A sealed file shows as **`seal`** in the TYPE column of `ls long`, not as a marker beside `file`. It
 is less an attribute of a file than a different kind of thing to have on a disk - one you cannot

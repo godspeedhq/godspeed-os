@@ -1,9 +1,9 @@
 # Utility: `move` - relocate a file
 
-**Status:** **Built + QEMU-verified** (`osdev test files` 21/21) on GSFS0003. Same-drive move
-is a **relink** - only the directory entries change, no data copied and (so) no reclamation
-needed; `fs` treats a same-directory move as a rename. (Cross-drive move = copy + delete is
-later, with multi-drive.) Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files`, 222/0). Same-drive move is a
+**relink** - only the directory entries change, no data copied and (so) no reclamation needed; `fs`
+treats a same-directory move as a rename. (Cross-drive move = copy + delete is later, with
+multi-drive.) Trails `CLAUDE.md`; does not amend it.
 
 ---
 
@@ -64,12 +64,22 @@ sloppy prefix test gets wrong: `/ab` is **not** inside `/a`, and moving it there
 
 ## 4. Failure
 
+`fs` now sends the REASON back with the failure rather than only logging it, so these are its
+words, not a guess made at the prompt:
+
 | what happened | what you see |
 |---|---|
-| the source does not exist | `move: failed (not found, or dest exists?)` |
-| the destination already exists | the same line - `fs` distinguishes them in its log |
-| moving a directory into itself or its subtree | `move: cannot move into itself` |
+| the source does not exist | `move: failed - path not found` |
+| the destination already exists | `move: failed - dest exists` |
+| the destination's parent is a file | `move: failed - dest not a directory` |
+| moving a directory into itself or its subtree | `move: cannot move into itself` (the shell's own check, before the round trip) |
 | storage is not available | `move: storage unavailable` |
+
+**This table used to say the first two were indistinguishable** - "the same line; `fs` distinguishes
+them in its log". That was true and it was the wrong place to leave it: the reason was already in
+hand at the moment of failure and was being thrown away at the reply. See `docs/persistence.md`
+§6.17 and `send_res!` in `services/fs`. A client that has not been taught to read the reason still
+gets the old wording, because the reason is appended after an unchanged `FS_ERR` byte.
 
 ## 5. Later (separate doc so it can grow)
 

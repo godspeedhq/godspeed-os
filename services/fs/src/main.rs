@@ -105,7 +105,7 @@ const RECS_PER_BLOCK: usize = 7; // 7×64 = 448 bytes of records + a 64-byte CRC
 const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 - CRC covers [0..448)
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 - u32 CRC32 of the record region
 
-// ---- TIMESTAMPS (GSFS0009), in the 60 bytes every directory block already wasted ----
+// ---- TIMESTAMPS (Phase O), in the 60 bytes every directory block already wasted ----
 //
 // A 64-byte record is FULL: type @0, name_len @1, name[38] @2, size @40, first @48, count @56.
 // There is not one spare byte in it, so times could not go there without shrinking `NAME_MAX` or
@@ -115,11 +115,13 @@ const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 - u32 CRC32 of the record regi
 // 512-byte directory block has carried **60 unused bytes at 452 since the format was written**.
 // Two u32 times for each of seven records is 56 of them.
 //
-// **The placement is what makes this a `compat` feature rather than a reformat.** The record CRC
-// still covers exactly `[0..448)` and still lives at 448, so a GSFS0008 build reads a 0009
-// directory perfectly and never looks past the CRC it knows about. The times get their OWN CRC, so
-// a 0009 build reading a 0008 volume sees the mismatch and reports the times as UNKNOWN rather than
-// inventing 1970 - a wrong date being worse than an absent one.
+// **The placement is what makes this additive rather than a reformat, and it needs no feature bit
+// at all.** The record CRC still covers exactly `[0..448)` and still lives at 448, so a build that
+// predates times reads the directory perfectly and never looks past the CRC it knows about. The
+// times get their OWN CRC, so a build that DOES know them, reading a volume that has none, sees the
+// mismatch and reports the times as UNKNOWN rather than inventing 1970 - a wrong date being worse
+// than an absent one. The magic stays `GSFS0008` (§6.15): this is not a version, and there is no
+// `GSFS0009` on any disk.
 //
 // u32 epoch seconds: good to 2106, four bytes instead of eight, and the difference is what let both
 // times fit beside a CRC. Recorded rather than left to be discovered.
@@ -256,6 +258,36 @@ const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, pat
                              // hand), the kernel badges the request with the resource id + right.
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
+/// How much of a failure's REASON rides back with `FS_ERR` (see `send_res!`). Bounded (§26.6):
+/// every reason is a `&'static str` in this file, and the longest is well under this.
+const FS_ERR_REASON_MAX: usize = 64;
+
+/// Reply `FS_OK`, or `FS_ERR` **with the reason**: `send_res!(send, expr)`.
+///
+/// `fs` has always known why a mutating op failed - "file is sealed", "no space", "path is a
+/// directory" - and has always thrown it away at the reply, sending a bare `FS_ERR`. The client then
+/// guessed, and the guess was often wrong in the way that costs the most time: writing to a file you
+/// had just sealed answered `write: failed (bad path, or parent missing?)`, sending the operator
+/// hunting for a typo in a path that was perfectly correct. A failure that MISDIRECTS is worse than
+/// one that says nothing (§26.7, invariant 12), and the reason was already in hand.
+///
+/// `[FS_ERR, reason bytes...]`, so this is purely additive: byte 0 is unchanged and every existing
+/// consumer reads the same answer it always did. The reply closure is passed in because each serve
+/// function owns its own.
+macro_rules! send_res {
+    ($send:expr, $r:expr) => {{
+        match $r {
+            Ok(()) => $send(&[FS_OK]),
+            Err(e) => {
+                let mut eb = [0u8; 1 + FS_ERR_REASON_MAX];
+                eb[0] = FS_ERR;
+                let n = e.len().min(FS_ERR_REASON_MAX);
+                eb[1..1 + n].copy_from_slice(&e.as_bytes()[..n]);
+                $send(&eb[..1 + n]);
+            }
+        }
+    }};
+}
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact),
@@ -320,21 +352,22 @@ const RIGHT_WRITE: u8 = 1 << 1;
 /// writes through it may only EXTEND. A holder cannot escape the restriction by any route, because
 /// the capability only ever reaches the file through `fs`, and `fs` is what is enforcing it.
 ///
+/// **What the restriction actually is: a HIGH-WATER MARK, not `offset == size`.** The obvious rule -
+/// only write at the end of the file - cannot be expressed here, because `write_at` demands
+/// block-aligned offsets and `write_new` pre-allocates the whole extent, so a streamed file is its
+/// final size from the first moment. `fs` therefore records the furthest offset written through the
+/// resource and refuses anything at or below it: writes may only move FORWARD.
+///
+/// **`recorder` is the shape this is for**, though it does not yet ask for it. It streams a capture
+/// file holding full `WRITE` - the authority to go back over and rewrite the very history it is
+/// recording - so a capture's integrity rests on `recorder` being well-behaved rather than on what
+/// it can do. A capability that cannot write backwards makes the log unrewritable by construction
+/// (§7.3: rights narrow and never widen). Exercised today by the shell's `fcap` self-check, which
+/// streams exactly as `recorder` does.
+///
 /// This bit never reaches the kernel: it is masked off before the mint.
 const OPEN_APPEND_ONLY: u8 = 1 << 6;
 
-/// EXTEND a file, without being able to change what is already in it.
-///
-/// A holder with `APPEND` and not `WRITE` may only write at `offset == size`: the file grows, and
-/// every byte already committed is beyond reach. That is the difference between a log and a file
-/// that happens to be written sequentially, and it is enforced here rather than promised.
-///
-/// **`recorder` is why this exists.** It streams a capture file and until now had to hold full
-/// `WRITE`, which is the authority to rewrite or truncate the very history it is recording - so the
-/// integrity of a capture rested on `recorder` being well-behaved rather than on what it could do.
-/// A capability that cannot rewrite makes the log tamper-evident by construction (§7.3: rights
-/// narrow on transfer and never widen).
-const _RIGHT_APPEND_RETIRED: u8 = 0; // see OPEN_APPEND_ONLY above
 const RIGHT_GRANT: u8 = 1 << 4;
 
 // Open-file table (file-as-capability): maps a delegated `ResourceId` → the file path it names, so
@@ -1447,7 +1480,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 Some(f) => {
                     f.begin_txn();
                     let r = f.relabel(ctx, label);
-                    send(&[match f.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+                    send_res!(send, f.end_txn(ctx, r));
                 }
                 None => send(&[nofs]),
             }
@@ -1540,7 +1573,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     // than silently dropping the write. Reads (STAT/READ/READ_AT/LIST) pass through.
     if fs.read_only && op_is_mutating(op) {
         ctx.log("fs: write refused - filesystem mounted READ-ONLY (unsupported ro_compat feature)");
-        send(&[FS_ERR]);
+        send_res!(send, Err::<(), &str>("filesystem is mounted READ-ONLY (unsupported feature)"));
         return;
     }
     let plen = p[1] as usize;
@@ -1555,7 +1588,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
         ($e:expr) => {{
             fs.begin_txn();
             let r = $e;
-            send(&[match fs.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, fs.end_txn(ctx, r));
         }};
     }
     match op {
@@ -1583,7 +1616,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             let offset = u64_at(tail, 0);
             let chunk = &tail[8..];
             // Direct (not journaled): no transaction - the fast streaming path (§6.8 data model).
-            send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, fs.write_at(ctx, path, offset, chunk, false));
         }
         OP_WRITE_AT_J => {
             if tail.len() < 8 { send(&[FS_ERR]); return; }
@@ -1593,7 +1626,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // atomically (crash → replayed or discarded, never torn). Bounded to one chunk.
             fs.begin_txn();
             let r = fs.write_at(ctx, path, offset, chunk, true);
-            send(&[match fs.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, fs.end_txn(ctx, r));
         }
         OP_READ_AT => {
             if tail.len() < 12 { send(&[FS_ERR]); return; }
@@ -1634,7 +1667,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
         OP_RENAME => txn!(fs.rename(ctx, path, tail)),
         OP_DELETE => txn!(fs.delete(ctx, path)),
         // delete_tree manages its own transactions (unlink + batched frees) - not wrapped.
-        OP_DELETE_TREE => send(&[match fs.delete_tree(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_DELETE_TREE => send_res!(send, fs.delete_tree(ctx, path)),
         OP_MOVE => txn!(fs.move_path(ctx, path, tail)),
         OP_OPEN => {
             // [op, plen, path, rights:u8] → mint a delegated resource for the file and reply
@@ -1749,7 +1782,7 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
             // Advance the mark only on a write that actually landed, so a refused or failed write
             // cannot move it and lock the holder out of ground it never covered.
             if r.is_ok() { fs.open_bump_hwm(rid, offset + chunk.len() as u64); }
-            send(&[match r { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, r);
         }
         FOP_STAT => {
             if right & RIGHT_READ == 0 { send(&[FS_DENIED]); return; }
@@ -2970,7 +3003,6 @@ impl Fs {
         // A sealed file is frozen: overwriting it here would be a new extent under the same name,
         // which is exactly the rewrite the seal exists to refuse.
         if existing.as_ref().map_or(false, |e| e.sealed) { return Err("file is sealed - its content cannot be changed"); }
-        if existing.as_ref().map_or(false, |e| e.sealed) { return Err("file is sealed - its content cannot be changed"); }
         if let Some(ref e) = existing {
             if !is_file(e.itype) { return Err("path is a directory"); }
         }
@@ -3150,7 +3182,7 @@ impl Fs {
     /// silent wrong answer. Getting the stride wrong instead produces visible garbage, and a loud
     /// failure is the one to choose when a mistake is possible (§26.7).
     ///
-    /// The `mtime` is GSFS0009's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
+    /// The `mtime` is Phase O's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
     /// client renders that as "unknown" rather than as a date. Four bytes per entry is the cost, out
     /// of a one-block reply: a listing that used to fit ~30 entries fits ~26, and a directory with
     /// more than that was already being truncated by this bound. `backlog/33` records that ceiling,

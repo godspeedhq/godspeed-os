@@ -436,6 +436,8 @@ that snaps on when search arrives.
    directory read (`dir_read`) and stamped on every write (`dir_write`), so corruption in
    the metadata that *defines the tree* surfaces loudly instead of returning garbage
    records. The `file_record` layout is otherwise unchanged - **names stay 38 bytes**.
+   *(The other 60 trailer bytes, 452..512, went unused until Phase O put timestamps there -
+   past this CRC and under one of their own, so nothing above is invalidated. See §6.17.)*
 3. **Reserved journal region** - `journal_start`/`journal_blocks` (u64 @108/@116) carve a
    fixed 64-block (32 KiB) region between the bitmap and the data region. **Empty and
    unused in Phase A**; it is where Phase C's crash-consistency redo-journal lives. Baking
@@ -863,6 +865,10 @@ This is *more* honest than the old scheme, not less: an old build meeting a newe
 precise reason (refuse / read-only / fine) instead of a version mismatch indistinguishable from a
 foreign disk.
 
+**The bits defined so far.** `compat` bit 0 = a backup superblock exists (Phase F). `incompat`
+bit 0 = some file is fragmented, so an extent list must be read to find its blocks (Phase I).
+`ro_compat` bit 0 = some file on this volume is SEALED (Phase O, §6.17).
+
 **Features earn forward-compatibility by being lazy.** The bit is set only when the feature is
 exercised. Extent lists (Phase I) are an `incompat` feature, but the `FEAT_INCOMPAT_EXTENTS` bit is
 set **the first time a file actually fragments** - a freshly-formatted disk that never fragments
@@ -926,6 +932,82 @@ timed out; see the loop's own note) - but only on the truth of *success*. Teachi
 a truth is what closes the wedge. Verified: `osdev test identity` 24/0 (Test 13 fs-restart and the whole
 file suite stay green); the live CI-stuck self-heal is T630-only (QEMU's emulated AHCI never raises the
 CI-stuck condition).
+
+### 6.17 Timestamps and SEALED - the first two features added under the frozen magic (Phase O)
+
+> **Built 2026-09-17.** The first change to the on-disk format since §6.15 froze the magic, and
+> therefore the first test of whether that policy actually works. It does: **`SB_MAGIC` is still
+> `b"GSFS0008"`**, no volume needs reformatting, and the two features arrive by the two routes §6.15
+> prescribes - one additive and invisible to an older build, one behind a `ro_compat` bit.
+
+**Timestamps, in the 60 bytes every directory block already wasted.** A 64-byte record is FULL -
+type @0, name_len @1, name[38] @2, size @40, first_block @48, block_count @56 - so times could not go
+inside it without shrinking `NAME_MAX` or halving how many entries a directory block holds. They did
+not have to: seven 64-byte records are 448 bytes and the record CRC is a u32 at 448, so bytes
+**452..512 have been unused since the format was written**. Two `u32` epoch times for each of seven
+records is 56 of them, and their own CRC32 is the four at 508.
+
+```
+Directory block (512 B):  records [0..448)  |  record CRC32 @448  |  7 x (mtime:u32, ctime:u32) @452  |  times CRC32 @508
+```
+
+- **`mtime`** - when the content last changed. **`ctime`** - when the record last changed (rename,
+  move, size), which is what distinguishes "the file changed" from "the file was moved".
+- **No `atime`**: recording a read turns every read into a write, and on a journaled filesystem into
+  a transaction. The cost is real, the value is low, and it is refused on purpose.
+- **`u32` epoch seconds**, good to 2106. Four bytes rather than eight is what let both times fit
+  beside a CRC in 60 bytes.
+
+**Why this needs no feature bit at all.** The record CRC still covers exactly `[0..448)` and still
+lives at 448, so a build that predates times reads the directory perfectly and never looks past the
+CRC it knows about - it will also overwrite the times region without stamping its CRC, which is
+precisely why the times carry their own. A build that knows times, reading a volume that has none,
+finds the mismatch and reports **`unknown`** rather than inventing 1970: a wrong date is worse than an
+absent one, because a date you can see is a date you will act on. **No migration pass runs and nothing
+back-fills a missing time** - the first write to an old directory block stamps a valid CRC over zeros,
+and zero *is* `TIME_UNKNOWN`, so old entries keep reading as unknown while new ones carry real times.
+
+The clock behind it is the `time` service, which owns the wall clock, sets it from SNTP and persists a
+floor across reboots (`/clock.last`); a file stamped on a machine that has never seen the network gets
+the floor rather than zero, and the floor only moves forward.
+
+**SEALED - content frozen, permanently.** A sealed file can be read, listed, renamed, moved and
+deleted; its bytes can never change again, and **there is no unseal** (a seal a holder can lift is a
+request, not a guarantee). It freezes CONTENT, not existence: refusing deletion would make a sealed
+file unremovable, so a disk could be filled with rubbish nobody is permitted to clear - a denial of
+service bought with a guarantee nobody asked for.
+
+The record had no spare bit either, so the flag rides **the top bit of the 64-bit size** - room no
+file can reach, since 2^63 bytes is eight exabytes. Every size read goes through an accessor that
+masks it off, which is correctness rather than tidiness: `write_at` bounds a fragmented file's extent
+by its size, so the flag leaking into that arithmetic would let a write run past the file's own blocks.
+
+Three refusals enforce it, and the first is the one that matters:
+
+1. **`fs` will not mint a writable capability to a sealed file** - refused at `open`, not per write,
+   because a capability that looks writable and fails on use is a worse answer than a plain refusal,
+   and §7.3 says rights narrow, so a capability that cannot be honoured should never exist.
+2. Every write path (`write`, the streaming `write_at`, the journaled variant) refuses, because the
+   seal is carried on the `Entry` each of them already walks. A write route added later cannot forget
+   to ask.
+3. The volume sets **`ro_compat` bit 0** the first time anything is sealed, so a build that does not
+   know the bit mounts the whole volume **READ-ONLY** (§6.15) instead of writing through a flag it
+   cannot see. Not `incompat`: refusing to mount a volume because one file is read-only forever is a
+   punishment out of proportion to the risk, and read-only is exactly the honest middle the mask
+   policy exists to express. The one thing such a build gets wrong is cosmetic - a nonsense SIZE for
+   a sealed entry - on a mount that can change nothing.
+
+**The version number this work does NOT have.** During the build these two features were repeatedly
+called "GSFS0009", in this branch's scope note, in code comments and in commit messages. That was
+wrong and is corrected: §6.15 froze the magic and states that every later feature is additive under
+the masks - *"GSFS00014 never happens"*. Nothing here mints a new magic, and there is no `GSFS0009` on
+any disk. Recorded rather than quietly renamed, because a version a reader could build against is
+exactly the kind of claim §26.7 says to write down instead of papering over.
+
+Verified by `osdev test fs-time` (15/0), which stamps a file, **reboots the machine**, and proves the
+date survived, that a file with no time is still `unknown` afterwards rather than given an invented
+one, that the write to the times region did not break the record CRC every build reads, and that a
+seal survives the reboot with the write still refused and the content still original.
 
 ## 7. File = capability (the north star)
 

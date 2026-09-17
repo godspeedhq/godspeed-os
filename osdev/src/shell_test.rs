@@ -5589,7 +5589,7 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!listing.contains("[2J"),
            "`ls` did not emit a raw ESC sequence that came from a FILENAME");
 
-    // ---- TIMESTAMPS (GSFS0009) and the migration story, in one listing ----
+    // ---- TIMESTAMPS (Phase O) and the migration story, in one listing ----
     //
     // `canary.txt` was baked host-side into a 0008 image, so no time was ever recorded for it.
     // `/fz/real.txt` was written by this machine moments ago. Both are in the same tree, and
@@ -5630,15 +5630,15 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
 
 /// Phase O - timestamps must survive a REBOOT, which is the half no single-boot test can reach.
 ///
-/// Everything about GSFS0009 that matters is on the disk: a times region at byte 452 of each
+/// Everything about Phase O that matters is on the disk: a times region at byte 452 of each
 /// directory block, its own CRC, and the rule that a region failing that CRC reads as `unknown`
 /// rather than as a date. A test inside one boot proves only that `fs` remembers what it just wrote.
 ///
 /// So this boots the SAME disk twice. The first boot writes a file and reads its date; the second
 /// reads the date again, from blocks that have been through a mount, and must get the same answer.
-/// It also proves the `compat` claim from the other direction: a file baked host-side into a 0008
-/// image has no time, reads as `unknown` on both boots, and is NOT given an invented one by having
-/// been mounted by a 0009 build.
+/// It also proves the compatibility claim from the other direction: a file baked host-side by
+/// `osdev mkfs` - which writes no times region at all - reads as `unknown` on both boots, and is NOT
+/// given an invented one by having been mounted by a build that does record times.
 pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -5734,10 +5734,10 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     let d2 = date_of(&l2, "stamped.txt");
     check!(d2 == d1, format!("boot 2: the date SURVIVED the reboot ({d1} -> {d2})"));
     check!(date_of(&l2, "canary.txt") == "unknown",
-           "boot 2: mounting with a 0009 build did NOT invent a date for the 0008 file");
+           "boot 2: a build that records times did NOT invent one for a file that has none");
     check!(o2.get(1).map_or(false, |r| r.contains("hello")), "boot 2: the file's CONTENT survived too");
     check!(!w2.contains("CRC mismatch on directory block"),
-           "boot 2: writing the times region did not break the record CRC a 0008 build reads");
+           "boot 2: writing the times region did not break the record CRC every build reads");
     check!(!w1.contains("KERNEL PANIC") && !w2.contains("KERNEL PANIC"), "no kernel panic across either boot");
     let _ = std::fs::write("build/tests/fs_time_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
 
