@@ -358,11 +358,36 @@ Recorded as NOT APPLICABLE rather than PASS, because the honest claim is "the de
 exist", not "we tested its absence". If logs are ever re-pointed at a service, this becomes a live
 gate immediately - which is precisely why 11.4 forbids it.
 
-### 3.11 Cross-ISA - NOT RUN
+### 3.11 Cross-ISA - NOT RUN, and NOT REACHABLE IN QEMU (`backlog/34`)
 
-Create and modify the same image across x86-64, riscv64 and aarch64 in QEMU, comparing bytes, trees
-and metadata after each handoff. Every field is little-endian by construction, so the expectation is
-a pass - and an expectation is not a result. Cheap, and the kind of thing a user finds if we do not.
+Attempted, and the attempt is the result. **No non-x86 port can reach a disk in QEMU**, each for its
+own concrete reason, measured rather than assumed:
+
+| port | disk in QEMU | what happens |
+|---|---|---|
+| x86-64 | yes, AHCI | works - a volume was flashed, written and read back |
+| riscv64 | none attached | `riscv_run.py` has no drive option at all |
+| aarch64 | attached, invisible | no VL805 emulation, so the controller idles with no MMIO and the OS never sees it |
+| arm32 | attached, never settles | the stick enumerates, binds, reports 16 MiB - **126 times in two minutes**, re-addressed each cycle. `block-driver` asks for capacity before the first enumeration completes, latches 0, and `fs` never mounts |
+
+The control rules out the port and the day's changes: the same arm32 kernel with no stick attached
+boots clean, `supervisor: ready`, prompt working, **zero** connect events. Real Pi 2 hardware runs the
+storage stack fine - that is how `selfcheck` reaches 349/0 on the board - so this is QEMU's dwc2
+emulation rather than the driver on silicon.
+
+**The half that IS done:** a GSFS volume was flashed and written on x86-64 and is sitting on disk,
+holding `/from-x86.txt` and `/shared/note.txt`. When a board is available, that image goes on a stick
+and the second half runs unchanged.
+
+**Why this matters more than one gate.** Every storage guarantee in this file is verified on ONE
+architecture - fifteen suites, 75 tear points, the recovery measurements, all x86-64 and all AHCI. It
+also hides a whole category of bug: anything where the BLOCK TRANSPORT changes the picture. AHCI
+hands `fs` a sector; USB mass storage hands it one through BOT/SCSI over a split transaction. The
+filesystem should not care, and "should not" is the phrase this programme exists to remove.
+
+So this gate is recorded as **not reachable in QEMU** rather than merely not done, which is a
+different fact: it changes what the hardware pass is FOR. For everything else in this file hardware
+is a confirmation at the end. For this, it is the only way to get an answer at all.
 
 ### 3.12 Physical hardware - NOT RUN, and cannot be claimed from any of the above
 
@@ -385,7 +410,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Crashing DURING recovery is not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
-| Cross-ISA QEMU image tests | NOT RUN | 3.11 |
+| Cross-ISA QEMU image tests | NOT RUN - NOT REACHABLE | 3.11 / `backlog/34`. No non-x86 port can attach a usable disk in QEMU: riscv64 has no drive option, aarch64 has no VL805 emulation, arm32's stick re-enumerates 126 times and never settles. The x86 half is written and waiting |
 | Physical-hardware validation | NOT RUN | 3.12. No hardware result is claimed anywhere in this file |
 | Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
 
