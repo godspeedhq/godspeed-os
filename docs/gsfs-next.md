@@ -100,30 +100,57 @@ than a service error. What changes is that `fs` stops depending on being asked n
 **How it gets tested.** Not from the shell, which correctly refuses to issue it. This is what §1c is
 for: the protocol path, where a client can send exactly the request the shell declines to.
 
-## 2. Phase N - append-only and sealed file capabilities
+## 2. Phase N - append-only capabilities  (BUILT)
 
-**No on-disk format change** - this is a rights question, and rights live in the capability, not on
-the disk.
+**No on-disk format change, and no kernel change.** Append-only is a property of the RESOURCE, which
+is where §7.10 puts the meaning of a delegated capability: `fs` mints an ordinary WRITE capability,
+the kernel validates it exactly as it validates any other, and `fs` records against that
+`ResourceId` that writes may only move forward.
 
-A file capability today carries `READ` and `WRITE`. Two additions:
+### Two things this section originally got wrong
 
-- **`APPEND`** - a holder may extend a file and may not modify or truncate what is already there. A
-  write is admitted only at `offset == size`.
-- **`SEALED`** - a file whose content can never change again, enforced by refusing to mint any
-  writable capability to it.
+Both were found by building it, and both are worth keeping because the reasoning that produced them
+looked sound.
 
-Both are exactly the shape §7.3 and §7.4 already describe: rights narrow on transfer and never widen,
-and `fs` enforces `op <= right` under the badge the kernel validated. Nothing new is asked of the
-kernel: it already routes a badged invocation carrying `(resource_id, right)`.
+**1. There is no spare kernel right, and taking one is worse than having none.** The plan said "add
+an `APPEND` right", in the shape of §7.4. The kernel's rights are fixed - bits 0 to 5 are READ,
+WRITE, SEND, RECV, GRANT, REVOKE (`kernel/src/capability/rights.rs`) - so `1 << 2` is SEND. Minting
+with it asks the kernel for something else entirely, and measured, every invoke failed including the
+one that should have succeeded. The bit `OPEN_APPEND_ONLY` uses is masked off before the mint and
+never reaches the kernel.
 
-**`recorder` is the waiting consumer.** It streams a capture file and today must hold full `WRITE`,
-so a compromised or confused recorder can rewrite history it should only be able to extend. With
-`APPEND` it cannot, and a log becomes tamper-evident by construction rather than by trust.
+**2. "A write is admitted only at `offset == size`" cannot work, for two independent reasons.**
+`write_at` demands BLOCK-ALIGNED offsets, so "exactly at the end" is usually not even expressible.
+And a log is written into an extent allocated up front by `write_new`, so `size` is the FINAL size
+from the first moment - an end-of-file test would refuse every write a log ever makes.
 
-Verified by extending `osdev test file-cap`, which already exercises non-escalation at both the kernel
-and `fs` layers.
+### What it actually is: a high-water mark
 
----
+Each open resource remembers one byte past the furthest write made through it. An append-only holder
+may not write below that mark, and the mark only ever moves forward - a refused or failed write does
+not move it, so a rejection cannot lock a holder out of ground it never covered.
+
+**What this guarantees, exactly:** within the life of one capability, a holder can never write below
+anything it has already written. A log cannot be gone back over and edited.
+
+**What it does NOT guarantee**, recorded so it is not over-read: the first write may land anywhere,
+so it does not protect content that existed before the capability was minted; and closing and
+re-opening starts a fresh mark. Both are bounded by who may call OPEN at all, which is a separate
+authority.
+
+**`recorder` is the waiting consumer.** It streams a capture file and today must hold full `WRITE` -
+the authority to rewrite or truncate the very history it is recording - so a log's integrity rests
+on the writer being well-behaved rather than on what it is able to do.
+
+Verified by `osdev test file-cap` (13/0): a forward write is accepted, going back over written bytes
+is DENIED, and a later forward write still works afterwards, which proves the refusal did not rewind
+the mark.
+
+### SEALED moved to Phase O
+
+A file that can never be written again is a property of the FILE, not of a capability, so it has to
+survive a reboot - which means on-disk state, which means the format bump. It belongs with Phase O
+and this section should not have claimed it needed no format change.
 
 ## 3. Phase O - timestamps (GSFS0008 -> 0009)
 

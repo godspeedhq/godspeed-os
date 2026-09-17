@@ -226,6 +226,35 @@ const FOP_CLOSE: u8 = 4; // [FOP_CLOSE]  → [FS_OK]; revoke the resource + free
 // Capability right bits - MUST match the kernel `Rights` bitfield (§7.4) and the SDK `RIGHT_*`.
 const RIGHT_READ: u8 = 1 << 0;
 const RIGHT_WRITE: u8 = 1 << 1;
+/// Ask for an APPEND-ONLY capability. **A flag in the `fs` OPEN protocol, not a kernel right.**
+///
+/// The kernel's rights are fixed (`capability/rights.rs`): bits 0-5 are READ, WRITE, SEND, RECV,
+/// GRANT and REVOKE. There is no spare bit meaning "append", and taking one would be worse than
+/// useless - bit 2 is SEND, so a capability minted with it asks the kernel for something else
+/// entirely. (Measured: minting APPEND as `1 << 2` made every invoke fail, including the one that
+/// should have succeeded.)
+///
+/// So append-only is expressed where it belongs: as a property of the RESOURCE, which §7.10 puts in
+/// the hands of the service that owns it. `fs` mints an ordinary WRITE capability - the kernel
+/// validates it exactly as it validates any other - and records against that `ResourceId` that
+/// writes through it may only EXTEND. A holder cannot escape the restriction by any route, because
+/// the capability only ever reaches the file through `fs`, and `fs` is what is enforcing it.
+///
+/// This bit never reaches the kernel: it is masked off before the mint.
+const OPEN_APPEND_ONLY: u8 = 1 << 6;
+
+/// EXTEND a file, without being able to change what is already in it.
+///
+/// A holder with `APPEND` and not `WRITE` may only write at `offset == size`: the file grows, and
+/// every byte already committed is beyond reach. That is the difference between a log and a file
+/// that happens to be written sequentially, and it is enforced here rather than promised.
+///
+/// **`recorder` is why this exists.** It streams a capture file and until now had to hold full
+/// `WRITE`, which is the authority to rewrite or truncate the very history it is recording - so the
+/// integrity of a capture rested on `recorder` being well-behaved rather than on what it could do.
+/// A capability that cannot rewrite makes the log tamper-evident by construction (§7.3: rights
+/// narrow on transfer and never widen).
+const _RIGHT_APPEND_RETIRED: u8 = 0; // see OPEN_APPEND_ONLY above
 const RIGHT_GRANT: u8 = 1 << 4;
 
 // Open-file table (file-as-capability): maps a delegated `ResourceId` → the file path it names, so
@@ -243,6 +272,11 @@ const OPEN_PATH_MAX: usize = 96;
 struct OpenFile {
     rid: u64, // 0 = free slot
     plen: u8,
+    /// Writes through this resource may only move FORWARD - see `OPEN_APPEND_ONLY`.
+    append_only: bool,
+    /// The high-water mark: one byte past the furthest write made through this resource. An
+    /// append-only holder may not write below it, which is what makes the log unrewritable.
+    write_hwm: u64,
     path: [u8; OPEN_PATH_MAX],
 }
 
@@ -1496,7 +1530,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // [FS_OK] with the FILE CAP embedded; the client then operates the file by invoking
             // that cap (§7.10). `open_file` sends its own reply (it must embed the cap), so we
             // only send FS_ERR if it failed before replying.
-            let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE) };
+            let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE | OPEN_APPEND_ONLY) };
             if fs.open_file(ctx, path, want, tag, reply).is_err() { send(&[FS_ERR]); }
             else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
         }
@@ -1554,12 +1588,46 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
             }
         }
         FOP_WRITE => {
-            if right & RIGHT_WRITE == 0 { send(&[FS_DENIED]); return; } // ← non-escalation: a READ cap can't write
+            // WRITE may put bytes anywhere. APPEND may only ADD them.
+            //
+            // Checked against the file's CURRENT size at the moment of the write, which is what makes
+            // it an enforcement rather than an honour system: a holder cannot read the size, decide
+            // to overwrite, and send the old offset, because the offset is compared here and now.
+            // A short write elsewhere in the file is refused identically to a write by a READ-only
+            // cap - `FS_DENIED`, the same non-escalation answer (§7.3).
+            if right & RIGHT_WRITE == 0 { send(&[FS_DENIED]); return; } // non-escalation: a READ cap can't write
             if fs.read_only { send(&[FS_ERR]); return; }
             if p.len() < 9 { send(&[FS_ERR]); return; }
             let offset = u64_at(p, 1);
+            if fs.open_is_append_only(rid) {
+                // FORWARD ONLY. The rule is against this resource's own HIGH-WATER MARK, not against
+                // the file's size, and that is what makes it fit how a log is actually written:
+                // `write_new` allocates the whole extent up front, so `size` is the FINAL size from
+                // the first moment and an end-of-file test would refuse every write. `write_at` also
+                // demands block-aligned offsets, so "exactly at the end" is not expressible anyway.
+                //
+                // What this guarantees, stated exactly: **within the life of this capability, a
+                // holder can never write below anything it has already written.** A log cannot be
+                // gone back over and edited, which is the property `recorder` needs.
+                //
+                // What it does NOT guarantee, recorded so it is not over-read: the first write may
+                // land anywhere, so this does not protect content that existed BEFORE the capability
+                // was minted, and closing and re-opening starts a fresh mark. Both are bounded by who
+                // can call OPEN at all, which is a separate authority.
+                let hwm = fs.open_hwm(rid);
+                if offset < hwm {
+                    ctx.log_fmt(format_args!(
+                        "fs: APPEND-only capability refused a write at offset {} - it has already                          written up to {}, and may not go back over it", offset, hwm));
+                    send(&[FS_DENIED]);
+                    return;
+                }
+            }
             let chunk = &p[9..];
-            send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            let r = fs.write_at(ctx, path, offset, chunk, false);
+            // Advance the mark only on a write that actually landed, so a refused or failed write
+            // cannot move it and lock the holder out of ground it never covered.
+            if r.is_ok() { fs.open_bump_hwm(rid, offset + chunk.len() as u64); }
+            send(&[match r { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
         }
         FOP_STAT => {
             if right & RIGHT_READ == 0 { send(&[FS_DENIED]); return; }
@@ -1714,7 +1782,7 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
-            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
+            open_files: [OpenFile { rid: 0, plen: 0, append_only: false, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         });
         Ok(())
     }
@@ -2268,7 +2336,7 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
-            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
+            open_files: [OpenFile { rid: 0, plen: 0, append_only: false, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         });
         Ok(())
     }
@@ -2997,8 +3065,15 @@ impl Fs {
         if !is_file(e.itype) { return Err("not a file"); }
         if path.len() > OPEN_PATH_MAX { return Err("path too long"); }
         let slot = self.open_files.iter().position(|o| o.rid == 0).ok_or("too many open files")?;
-        let (rid, cap) = ctx.resource_mint(want | RIGHT_GRANT).ok_or("mint failed")?;
-        let mut of = OpenFile { rid, plen: path.len() as u8, path: [0u8; OPEN_PATH_MAX] };
+        // APPEND-ONLY is a property of the RESOURCE, recorded here, and the bit never reaches the
+        // kernel - see `OPEN_APPEND_ONLY`. The minted capability carries ordinary WRITE so the
+        // kernel validates a write invoke exactly as it does any other; what narrows it is this
+        // service, which is the only thing that can act on the resource at all (§7.10).
+        let append_only = want & OPEN_APPEND_ONLY != 0;
+        let kernel_rights = (want & (RIGHT_READ | RIGHT_WRITE))
+            | if append_only { RIGHT_WRITE } else { 0 };
+        let (rid, cap) = ctx.resource_mint(kernel_rights | RIGHT_GRANT).ok_or("mint failed")?;
+        let mut of = OpenFile { rid, plen: path.len() as u8, append_only, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] };
         of.path[..path.len()].copy_from_slice(path);
         self.open_files[slot] = of;
         // Hand a derived copy to the client; drop fs's original either way.
@@ -3036,6 +3111,24 @@ impl Fs {
     }
 
     /// Resolve a delegated resource id → its file path (copied out so `self` can be reborrowed).
+    /// Was this resource opened APPEND-ONLY? See `OPEN_APPEND_ONLY`.
+    fn open_is_append_only(&self, rid: u64) -> bool {
+        self.open_files.iter().any(|o| o.rid != 0 && o.rid == rid && o.append_only)
+    }
+
+    /// How far this resource has already written. See `OpenFile::write_hwm`.
+    fn open_hwm(&self, rid: u64) -> u64 {
+        self.open_files.iter().find(|o| o.rid != 0 && o.rid == rid).map_or(0, |o| o.write_hwm)
+    }
+
+    /// Move the high-water mark forward. Never backward: `max`, not assignment, so an out-of-order
+    /// write by a holder that is ALLOWED to seek cannot rewind the mark for one that is not.
+    fn open_bump_hwm(&mut self, rid: u64, to: u64) {
+        if let Some(o) = self.open_files.iter_mut().find(|o| o.rid != 0 && o.rid == rid) {
+            if to > o.write_hwm { o.write_hwm = to; }
+        }
+    }
+
     fn open_path(&self, rid: u64) -> Option<([u8; OPEN_PATH_MAX], usize)> {
         self.open_files.iter()
             .find(|o| o.rid != 0 && o.rid == rid)

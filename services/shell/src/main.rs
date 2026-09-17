@@ -96,6 +96,10 @@ const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]  (needs WRITE)
 const FOP_CLOSE: u8 = 4; // [FOP_CLOSE] → revoke the resource
 const RIGHT_READ: u8 = 1 << 0;
 const RIGHT_WRITE: u8 = 1 << 1;
+/// Ask `fs` to open a file APPEND-ONLY. A flag in the fs OPEN protocol, NOT a kernel right - the
+/// kernel's bit 2 is SEND, so this could never have been one. `fs` mints an ordinary WRITE cap and
+/// records against the resource that writes may only extend it (`OPEN_APPEND_ONLY` there).
+const OPEN_APPEND_ONLY: u8 = 1 << 6;
 const LABEL_MAX: usize = 31;
 const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 
@@ -12164,6 +12168,62 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         None    => ctx.console_writeln("fcap: cap revoked after rename"),
         Some(_) => { fail(ctx, "fcap: FAIL cap usable after rename"); ok = false; }
     }
+
+    // ---- APPEND-ONLY: a capability whose writes may only move FORWARD ----
+    //
+    // This is the right `recorder` needs and could not have. Streaming a capture used to require
+    // full WRITE - the authority to go back over and rewrite the very history being recorded - so a
+    // log's integrity rested on the writer being well-behaved. A capability that cannot write
+    // backwards makes it unrewritable by construction instead (§7.3).
+    //
+    // Shaped like a real log, because that is what it is for: `WRITE_NEW` allocates the whole extent
+    // up front and chunks go in at block-aligned offsets, exactly as `recorder` does it. So the rule
+    // is against the resource's own HIGH-WATER MARK, not against end-of-file - the file is its final
+    // size from the first moment.
+    const APPEND_PATH: &[u8] = b"/.fcap_append";
+    const BLK: u64 = 508;   // DATA_PAYLOAD - `write_at` demands block-aligned offsets
+    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
+    let mut newreq = [0u8; 8];
+    newreq[..8].copy_from_slice(&(3 * BLK).to_le_bytes());
+    if !matches!(fs_request(ctx, OP_WRITE_NEW, APPEND_PATH, &newreq).as_ref().map(|r| r.payload_bytes().first().copied()),
+                 Some(Some(FS_OK))) {
+        fail(ctx, "fcap: FAIL pre-allocate append test file");
+        ok = false;
+    } else if let Some(ap) = fc_open(ctx, APPEND_PATH, RIGHT_READ | OPEN_APPEND_ONLY) {
+        ctx.console_writeln("fcap: opened append-only (file cap)");
+        let mut wr = |off: u64, tag: &[u8; 4]| -> Option<u8> {
+            let mut w = [0u8; 13];
+            w[0] = FOP_WRITE;
+            w[1..9].copy_from_slice(&off.to_le_bytes());
+            w[9..13].copy_from_slice(tag);
+            fc_invoke(ctx, ap, RIGHT_WRITE, &w).and_then(|r| r.payload_bytes().first().copied())
+        };
+        // Writing forward is the whole point and must succeed: two chunks, ascending.
+        let first  = wr(0, b"AAAA");
+        let second = wr(BLK, b"BBBB");
+        if first == Some(FS_OK) && second == Some(FS_OK) {
+            ctx.console_writeln("fcap: append-only writes moving FORWARD accepted");
+        } else {
+            fail(ctx, "fcap: FAIL append-only refused a forward write");
+            ok = false;
+        }
+        // Going BACK over what it already wrote must be refused. This is the assertion the whole
+        // right exists for; a pass here would mean the right is decorative.
+        match wr(0, b"XXXX") {
+            Some(FS_DENIED) => ctx.console_writeln("fcap: rewriting earlier bytes through an append-only cap DENIED"),
+            _ => { fail(ctx, "fcap: FAIL append-only cap could REWRITE what it had already written"); ok = false; }
+        }
+        // And the mark did not move backwards: a forward write still works afterwards.
+        match wr(2 * BLK, b"CCCC") {
+            Some(FS_OK) => ctx.console_writeln("fcap: a later forward write still accepted after the refusal"),
+            _ => { fail(ctx, "fcap: FAIL a refused write broke the high-water mark"); ok = false; }
+        }
+        ctx.remove_cap(ap);
+    } else {
+        fail(ctx, "fcap: FAIL open append-only");
+        ok = false;
+    }
+    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
 
     // Cleanup so `fcap` is leak-free and re-runnable (e.g. in selfcheck): drop both shell handles
     // (rw revoked at close, ro revoked at rename) and delete the throwaway file (now at the renamed

@@ -4177,12 +4177,21 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
             check!(r.contains("forged handle rejected"), "a fabricated handle is not a capability (unforgeable)");
             check!(r.contains("revoked after close"),  "the cap is revoked on close (revocable)");
             check!(r.contains("revoked after rename"),  "rename revokes the cap (no confused-deputy via path reuse)");
+            // APPEND-only: extend yes, rewrite no. The right `recorder` needs and could not have.
+            check!(r.contains("writes moving FORWARD accepted"), "an append-only cap CAN write forward");
+            check!(r.contains("rewriting earlier bytes through an append-only cap DENIED"),
+                   "an append-only cap CANNOT go back over what it already wrote");
+            check!(r.contains("still accepted after the refusal"),
+                   "a refused write did not rewind the high-water mark");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }
     }
     let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+    // SAVE THE SERIAL. Without it a failure here says only that some property did not hold, and the
+    // one line that says WHICH is inside the guest.
+    let _ = std::fs::write("build/tests/file_cap_serial.log", &whole);
 
     child.kill().ok(); child.wait().ok();
     println!("\nfile-cap: {pass} passed, {fail} failed");
