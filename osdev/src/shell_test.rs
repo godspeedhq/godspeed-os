@@ -5739,3 +5739,92 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
     println!("\nfs-time: {pass} passed, {fail} failed  (serial -> build/tests/fs_time_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }
+
+/// One hostile-disk case (Phase M §1b): boot it, poke the crafted tree, and report whether `fs`
+/// behaved. Returns `(ok, note)` so the caller can name the case it set up.
+///
+/// **What "ok" means here is worth being exact about, because it is not "the data survived".** The
+/// disk was crafted; the victim's data is already gone. What must hold is that `fs` stays a working
+/// service: it answers every command (no hang), the kernel does not panic, an untouched BYSTANDER
+/// file still reads back correctly, and the machine is still usable afterwards. Whether the crafted
+/// entry is refused, skipped or listed as nonsense is `fs`'s business - serving a WRONG answer as a
+/// right one is the only outcome that fails.
+pub fn run_fs_hostile_case(image_path: &Path, persist_path: &str, what: &str, smp: u32) -> (bool, String) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("QEMU launch failed: {e}")),
+    };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { child.kill().ok(); return (false, "could not attach to the serial port".into()); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        let _ = std::fs::write(format!("build/tests/fs_hostile_{}.log", what.replace(' ', "_")), &whole);
+        return (false, "never reached a prompt - fs did not come up on this disk".into());
+    }
+
+    // Poke the crafted tree from every direction a person would. Each must ANSWER; a `None` here is
+    // a hang, which is the one outcome that is never acceptable.
+    let mut hung = None;
+    for c in ["ls /", "ls long /", "read /victim.txt", "ls /loop", "tree /",
+              "read /bystander.txt", "drives check", "read /bystander.txt"] {
+        let line = format!("{c}\r");
+        send(&mut write_half, line.as_bytes());
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(25)).is_none() {
+            hung = Some(c);
+            break;
+        }
+    }
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write(format!("build/tests/fs_hostile_{}.log", what.replace(' ', "_")), &whole);
+
+    if let Some(c) = hung { return (false, format!("`{c}` never returned - fs HUNG on the crafted tree")); }
+    if whole.contains("KERNEL PANIC") { return (false, "KERNEL PANIC".into()); }
+    if whole.contains("LIVENESS WEDGE") { return (false, "liveness wedge".into()); }
+    // The bystander is the control: an untouched file in the same directory must still read back
+    // byte-exact, which is what distinguishes "refused the bad record" from "gave up on the tree".
+    if !whole.contains("this file is untouched and must still be readable") {
+        return (false, "the untouched BYSTANDER file no longer reads - fs gave up on the whole tree".into());
+    }
+    // A CRAFTED CYCLE MUST BE REPORTED, not merely survived. `tree` was already bounded, so it could
+    // not hang - but it printed twenty-odd levels of a structure that does not exist and then simply
+    // stopped, which reads as a complete tree. Surviving quietly is the failure mode this whole
+    // suite is about.
+    if whole.contains("loop/") && !whole.contains("a LIMIT was reached") {
+        return (false, "`tree` walked the crafted cycle and stopped SILENTLY - a wrong answer served as a right one".into());
+    }
+    (true, "answered every command, no panic, bystander intact".into())
+}

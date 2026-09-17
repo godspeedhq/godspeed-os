@@ -1390,6 +1390,7 @@ fn cmd_test(suite: &str) {
         "fs-scrub"     => run_fs_scrub_test(),
         "fs-fuzz"      => run_fs_fuzz_test(),
         "fs-time"      => run_fs_time_test(),
+        "fs-hostile"   => run_fs_hostile_test(),
         "fs-compat"    => run_fs_compat_test(),
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
@@ -2712,6 +2713,130 @@ fn run_fs_check_test() {
 /// disk twice: the first boot writes a file and reads its date, the second reads it again from
 /// blocks that have been through a mount. Also proves the `compat` claim from the other side - a
 /// file baked into a 0008 image reads `unknown` on BOTH boots and is never given an invented date.
+/// Phase M §1b - a disk that is WRONG BUT CRC-VALID, which is what a hostile disk actually is.
+///
+/// `fs-corrupt` already covers bit-rot: flip a byte, the CRC fails, `fs` refuses loudly. That is the
+/// accident case, and it is well handled. **This is the deliberate case, and it is the harder one:**
+/// somebody who crafts a disk re-stamps the CRC, so every check `fs` currently performs passes and
+/// the metadata is still nonsense. A record can name a first block past the end of the device, a
+/// block count of 2^64, a name longer than any name may be, or a directory that contains ITSELF.
+///
+/// The bar is the same as the rest of the suite and it is not "the data survives" - the data is
+/// already gone, somebody wrote over it. It is that **`fs` never panics, never hangs, and never
+/// serves a wrong answer as a right one.** A machine that refuses a corrupt tree is working; a
+/// machine that walks a crafted cycle forever, or reads a block outside the disk, is not.
+fn run_fs_hostile_test() {
+    println!("\n=== fs: a CRC-VALID but hostile disk - crafted metadata, not bit-rot (Phase M 1b) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    // Find a named record in the root block and hand it to `edit`, then RE-STAMP the CRC so the
+    // block still validates. That re-stamp is the whole point: without it this would just be
+    // `fs-corrupt` again.
+    let craft = |path: &str, name: &[u8], edit: &dyn Fn(&mut [u8])| {
+        let mut d = std::fs::read(path).unwrap();
+        let root = u64::from_le_bytes(d[48..56].try_into().unwrap()) as usize;
+        let base = root * 512;
+        let mut found = false;
+        for slot in 0..FS_RECS_PER_BLOCK {
+            let r = base + slot * 64;
+            let nl = d[r + 1] as usize;
+            if d[r] != 0 && nl <= 38 && &d[r + 2..r + 2 + nl] == name {
+                edit(&mut d[r..r + 64]);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not find the record to craft");
+        let mut blk = [0u8; 512];
+        blk.copy_from_slice(&d[base..base + 512]);
+        fs_dir_stamp_crc(&mut blk);
+        d[base..base + 512].copy_from_slice(&blk);
+        std::fs::write(path, &d).unwrap();
+    };
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+
+    // Each case gets its OWN disk, because the point is what `fs` does with one crafted record - not
+    // what it does with four at once, where the first refusal would mask the rest.
+    let cases: &[(&str, &dyn Fn(&mut [u8]), &str)] = &[
+        ("first_block past the end of the device",
+         &|r: &mut [u8]| r[48..56].copy_from_slice(&0xFFFF_FFFFu64.to_le_bytes()),
+         "reading it must be refused, not attempted"),
+        ("block_count of 2^64 - 1",
+         &|r: &mut [u8]| r[56..64].copy_from_slice(&u64::MAX.to_le_bytes()),
+         "no loop may be bounded by this number"),
+        ("size larger than the whole disk",
+         &|r: &mut [u8]| r[40..48].copy_from_slice(&(1u64 << 40).to_le_bytes()),
+         "a read must not trust it"),
+        ("an itype no build defines",
+         &|r: &mut [u8]| r[0] = 0x5A,
+         "an unknown kind is neither a file nor a directory"),
+        ("name_len claiming 255 in a 38-byte field",
+         &|r: &mut [u8]| r[1] = 0xFF,
+         "the name must not be read past its field"),
+    ];
+
+    for (what, edit, why) in cases {
+        let disk = format!("build/tests/persist_fs_hostile_{}.img",
+                           what.split_whitespace().next().unwrap_or("x"));
+        std::fs::write(&disk, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+        format_superblock(&disk);
+        gsfs_add_file(&disk, "victim.txt", b"the record naming this file is about to be crafted");
+        gsfs_add_file(&disk, "bystander.txt", b"this file is untouched and must still be readable");
+        craft(&disk, b"victim.txt", *edit);
+        println!("\nfs-hostile: {what} - {why}");
+        let (ok, note) = crate::shell_test::run_fs_hostile_case(&image_path, &disk, what, 4);
+        if ok { println!("fs-hostile: PASS - {what}: {note}"); pass += 1; }
+        else   { println!("fs-hostile: FAIL - {what}: {note}"); fail += 1; }
+    }
+
+    // A DIRECTORY THAT CONTAINS ITSELF. Crafted separately because it needs a directory rather than
+    // a file: the record for `loop` is pointed at the ROOT's own first block, so walking into it
+    // arrives back where it started. `MAX_TREE_DEPTH` is what must stop this, and a tree walk that
+    // trusted the disk instead would run until something else broke.
+    {
+        let disk = "build/tests/persist_fs_hostile_cycle.img";
+        std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+        format_superblock(disk);
+        gsfs_add_file(disk, "bystander.txt", b"this file is untouched and must still be readable");
+        let mut d = std::fs::read(disk).unwrap();
+        let root = u64::from_le_bytes(d[48..56].try_into().unwrap());
+        let base = root as usize * 512;
+        // Take the first free slot and make it a directory pointing at the root itself.
+        for slot in 0..FS_RECS_PER_BLOCK {
+            let r = base + slot * 64;
+            if d[r] == 0 {
+                d[r] = 2;                                   // ITYPE_DIR
+                d[r + 1] = 4;
+                d[r + 2..r + 6].copy_from_slice(b"loop");
+                d[r + 40..r + 48].copy_from_slice(&0u64.to_le_bytes());
+                d[r + 48..r + 56].copy_from_slice(&root.to_le_bytes());   // <- itself
+                d[r + 56..r + 64].copy_from_slice(&1u64.to_le_bytes());
+                break;
+            }
+        }
+        let mut blk = [0u8; 512];
+        blk.copy_from_slice(&d[base..base + 512]);
+        fs_dir_stamp_crc(&mut blk);
+        d[base..base + 512].copy_from_slice(&blk);
+        std::fs::write(disk, &d).unwrap();
+        println!("\nfs-hostile: a directory that CONTAINS ITSELF - the walk must be bounded");
+        let (ok, note) = crate::shell_test::run_fs_hostile_case(&image_path, disk, "self-referential directory", 4);
+        if ok { println!("fs-hostile: PASS - self-referential directory: {note}"); pass += 1; }
+        else   { println!("fs-hostile: FAIL - self-referential directory: {note}"); fail += 1; }
+    }
+
+    println!("\nfs-hostile: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 fn run_fs_time_test() {
     println!("
 === fs: timestamps survive a reboot, and a 0008 file is never given a date (Phase O) ===");

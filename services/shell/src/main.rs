@@ -13643,6 +13643,8 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
     // a non-last ancestor draws a `│` continuation, a last one draws blank). The DFS finishes a
     // subtree before its siblings, so this stays valid for every descendant.
     let mut level_last = [false; TREE_MAX_DEPTH];
+    // Did the walk stop at its depth bound rather than at the end of the tree? See the push site.
+    let mut deep = false;
     let mut pre = [0u8; TREE_PREFIX_MAX];
     while let Some((plen, is_dir, depth, is_last)) = stack.pop(&mut buf) {
         let d = depth as usize;
@@ -13693,10 +13695,37 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
             let cdir = p[off + 1 + nl] != 0;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&buf[..plen], cname, &mut child) {
+                // STOPPING SILENTLY AT THE DEPTH BOUND IS A WRONG ANSWER SERVED AS A RIGHT ONE.
+                //
+                // The walk was already bounded, so a crafted directory that contains itself could
+                // not hang it (`osdev test fs-hostile`). But it printed twenty-odd levels of a
+                // structure that does not exist and then simply stopped, with nothing to say it had
+                // given up - so the output read as a complete tree. A bound that is not reported is
+                // indistinguishable from having reached the end (§26.7).
+                if depth as usize + 1 >= TREE_MAX_DEPTH {
+                    deep = true;
+                    continue;
+                }
                 // The last child read (forward order) is its parent's last → draws `└──`.
                 stack.push(&child[..clen], cdir, depth + 1, k == nc - 1);
+            } else {
+                // THE PATH GOT TOO LONG, AND THIS IS THE BOUND THAT ACTUALLY FIRES FIRST.
+                //
+                // `join_path` returns None when a child's full path will not fit `PATH_MAX`, and
+                // this arm used to be absent - the child was silently skipped. On an ordinary tree
+                // that is nearly invisible; on a directory that CONTAINS ITSELF it is what stops the
+                // walk, at about two dozen levels, saying nothing - so the output reads as a
+                // complete tree of a structure that does not exist.
+                //
+                // Measured rather than guessed: `osdev test fs-hostile` crafts exactly that disk,
+                // and the depth guard above never fired because this limit was reached first.
+                deep = true;
             }
         }
+    }
+    if deep {
+        ctx.console_writeln_fmt(format_args!(
+            "tree: stopped early - a LIMIT was reached (path length, or {} levels of depth), not the end of the tree. Something is nested very deeply, or a directory contains itself.", TREE_MAX_DEPTH));
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
