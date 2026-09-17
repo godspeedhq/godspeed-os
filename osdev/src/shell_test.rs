@@ -5622,3 +5622,103 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     println!("\nfs-fuzz: {pass} passed, {fail} failed  (serial -> build/tests/fs_fuzz_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }
+
+/// Phase O - timestamps must survive a REBOOT, which is the half no single-boot test can reach.
+///
+/// Everything about GSFS0009 that matters is on the disk: a times region at byte 452 of each
+/// directory block, its own CRC, and the rule that a region failing that CRC reads as `unknown`
+/// rather than as a date. A test inside one boot proves only that `fs` remembers what it just wrote.
+///
+/// So this boots the SAME disk twice. The first boot writes a file and reads its date; the second
+/// reads the date again, from blocks that have been through a mount, and must get the same answer.
+/// It also proves the `compat` claim from the other direction: a file baked host-side into a 0008
+/// image has no time, reads as `unknown` on both boots, and is NOT given an invented one by having
+/// been mounted by a 0009 build.
+pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-time: PASS - {}", $label); pass += 1; } else { println!("fs-time: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |cmds: &[&str]| -> (Vec<String>, String) {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-time: QEMU launch failed: {e}"); std::process::exit(1); });
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { eprintln!("fs-time: could not connect to serial {port}"); child.kill().ok(); std::process::exit(1); }
+        };
+        let mut read_half = stream.try_clone().expect("clone tcp stream");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 256];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_some() {
+            // The clock reaches `fs` by a PUSH from `time`, so a file written before that push
+            // legitimately has no date. Wait for the push to be announced rather than racing it.
+            let _ = collect_until(&buf, &mut cursor, b"wall clock received", Duration::from_secs(45));
+            for c in cmds {
+                let line = format!("{c}\r");
+                send(&mut write_half, line.as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default());
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole)
+    };
+
+    // Pull the MODIFIED column for one name out of an `ls long` listing.
+    let date_of = |listing: &str, name: &str| -> String {
+        listing.lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(3).map(|d| d.to_string()))
+            .unwrap_or_default()
+    };
+
+    println!("fs-time: boot 1 - write a file, read its date");
+    let (o1, w1) = boot(&["write /stamped.txt hello", "ls long /"]);
+    check!(w1.contains("wall clock received"), "boot 1: fs was told the wall clock by `time`");
+    let l1 = o1.get(1).cloned().unwrap_or_default();
+    let d1 = date_of(&l1, "stamped.txt");
+    check!(d1.starts_with("20"), format!("boot 1: the new file carries a real date ({d1})"));
+    check!(date_of(&l1, "canary.txt") == "unknown",
+           "boot 1: a file baked into the 0008 image reads as `unknown`");
+
+    println!("fs-time: boot 2 - SAME disk, the date must survive the mount");
+    let (o2, w2) = boot(&["ls long /", "read /stamped.txt"]);
+    let l2 = o2.first().cloned().unwrap_or_default();
+    let d2 = date_of(&l2, "stamped.txt");
+    check!(d2 == d1, format!("boot 2: the date SURVIVED the reboot ({d1} -> {d2})"));
+    check!(date_of(&l2, "canary.txt") == "unknown",
+           "boot 2: mounting with a 0009 build did NOT invent a date for the 0008 file");
+    check!(o2.get(1).map_or(false, |r| r.contains("hello")), "boot 2: the file's CONTENT survived too");
+    check!(!w2.contains("CRC mismatch on directory block"),
+           "boot 2: writing the times region did not break the record CRC a 0008 build reads");
+    check!(!w1.contains("KERNEL PANIC") && !w2.contains("KERNEL PANIC"), "no kernel panic across either boot");
+    let _ = std::fs::write("build/tests/fs_time_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+
+    println!("\nfs-time: {pass} passed, {fail} failed  (serial -> build/tests/fs_time_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}

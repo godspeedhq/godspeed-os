@@ -1389,6 +1389,7 @@ fn cmd_test(suite: &str) {
         "fs-check"     => run_fs_check_test(),
         "fs-scrub"     => run_fs_scrub_test(),
         "fs-fuzz"      => run_fs_fuzz_test(),
+        "fs-time"      => run_fs_time_test(),
         "fs-compat"    => run_fs_compat_test(),
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
@@ -2707,6 +2708,30 @@ fn run_fs_check_test() {
 /// the path a real client travels. Cases the shell legitimately refuses to send (a move into a
 /// directory's own subtree) are not reachable here by design; those need the protocol path
 /// (`docs/gsfs-next.md` §1c).
+/// Phase O - timestamps must survive a REBOOT, which no single-boot test can prove. Boots the SAME
+/// disk twice: the first boot writes a file and reads its date, the second reads it again from
+/// blocks that have been through a mount. Also proves the `compat` claim from the other side - a
+/// file baked into a 0008 image reads `unknown` on BOTH boots and is never given an invented date.
+fn run_fs_time_test() {
+    println!("
+=== fs: timestamps survive a reboot, and a 0008 file is never given a date (Phase O) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_time.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // Baked host-side, so it carries no time at all - the 0008 case, which must stay `unknown`.
+    gsfs_add_file(persist, "canary.txt", b"a file that predates timestamps");
+
+    crate::shell_test::run_fs_time(&image_path, persist, 4);
+}
+
 fn run_fs_fuzz_test() {
     println!("
 === fs: adversarial - hostile paths, names, and limits (Phase M) ===");

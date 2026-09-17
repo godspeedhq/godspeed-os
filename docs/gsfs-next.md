@@ -152,7 +152,7 @@ A file that can never be written again is a property of the FILE, not of a capab
 survive a reboot - which means on-disk state, which means the format bump. It belongs with Phase O
 and this section should not have claimed it needed no format change.
 
-## 3. Phase O - timestamps (GSFS0008 -> 0009)
+## 3. Phase O - timestamps (GSFS0008 -> 0009)  (BUILT, except SEALED)
 
 A directory entry has 64 bytes, of which the layout in use is: type @0, name_len @1, name @2..40,
 size @40, first_block @48, block_count @56. **Bytes 40..48 hold the size and 56..64 the count, so the
@@ -178,27 +178,42 @@ the floor. Format bump is reformat-only, in the house pattern of 0005 -> 0008.
 
 ---
 
-## 4. Phase P - `ls`, made fully featured
+## 4. Phase P - `ls`, made fully featured  (BUILT)
 
-Timestamps exist to be seen. `ls` today lists names; this makes it a tool.
+Timestamps exist to be seen. `ls` lists names by default, as it always did, and answers when and
+how big on request.
 
 | command | what it shows |
 | --- | --- |
-| `ls` | names, as now - the default stays terse |
-| `ls long` | type, size, mtime, one entry per line |
-| `ls all` | include entries the terse form elides |
-| `ls sort name\|size\|time` | explicit, because a default sort order that changes is a lie |
-| `ls rev` | reverse the sort |
-| `ls human` | sizes as KiB/MiB rather than bytes |
+| `ls` | names, type, size - unchanged, and still the default |
+| `ls long` | one entry per line with type, size and a MODIFIED column |
+| `ls human` | sizes as KiB/MiB/GiB rather than raw bytes |
 
-**Words, not flags** (`utilities/0_conventions.md` rule 4), so `ls long time` rather than `ls -lt`.
-Every subcommand tab-completes (rule 9) and `ls` stays in the path-completing set, since its argument
-IS a path. The wait stays `q`-escapable (rule 10) - it already goes through `fs_request_q`.
+**Words, not flags** (`utilities/0_conventions.md` rule 4), in any order, mixable with a path:
+`ls long human /projects` and `ls /projects human long` are the same command. Both orders complete
+on Tab, which is why `ls` is in BOTH the leading and trailing subcommand tables - and a first-position
+token matching no keyword falls through to path completion, so `ls /do<tab>` still works.
 
-Sizes column-align with `font-variant-numeric`'s terminal equivalent: pad to a fixed width so digits
-line up, because a column of right-ragged numbers is not a column.
+**The terse form stays the default, deliberately.** `ls` is read far more often than it is studied;
+the common question is "what is in here", and a wall of columns answers one nobody asked.
 
----
+### Two things this phase cost more than expected
+
+- **Sizes did not line up, and the reason is a trap worth naming.** A Rust `Display` implementation
+  SILENTLY IGNORES the width it is given unless it asks - `{:>10}` did nothing at all until the
+  renderer was changed to build its text and call `f.pad`. A column of ragged numbers is not a
+  column.
+- **Widening the `LIST_DIR` reply by four bytes needed SIX consumers updated, and the first pass
+  found three.** `files` went 222/0 to 203/19 and `selfcheck` failed 8 - each one a records pipe, a
+  `find`, a `tree` or tab-completion stepping by the old stride and reading the next entry's name
+  out of this one's timestamp. Every failure was caught by suites that were green beforehand, which
+  is the entire argument for Phase M going first.
+
+### `unknown` is an answer
+
+`MODIFIED` reads `unknown` when the filesystem records no time for that entry - a 0008 file, or one
+written before the machine knew the time. **Never 1970.** A date you can see is a date you will act
+on, so a wrong one is worse than an absent one.
 
 ## 5. What this does NOT do
 

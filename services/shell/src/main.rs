@@ -824,6 +824,10 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
+    // `ls` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
+    // `ls /d long` are the same command, and documented as such). A first-position token that
+    // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
+    ("ls",      &["long", "human"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
@@ -853,6 +857,7 @@ const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
     ("mkdir",  &["parents"]),
     ("copy",   &["recursive"]),
     ("delete", &["recursive"]),
+    ("ls",     &["long", "human"]),
 ];
 
 /// Complete the current token (`tok_start..end`) as a subcommand keyword of its segment's command.
@@ -4476,6 +4481,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "ls" => help_block(ctx, "ls", "list a directory (records when piped)", &[
             ("ls", "list the current directory", "ls"),
             ("ls <path>", "list the directory at <path>", "ls /docs"),
+            ("ls long", "one per line with type, size and MODIFIED time", "ls long /docs"),
+            ("ls human", "sizes as KiB/MiB/GiB, not raw bytes", "ls long human"),
             ("ls [path] | <verb>", "piped: emits records name/type/size", "ls | where size>0"),
             ("ls | select … / sort …", "project / order the listing", "ls | sort reverse size"),
         ], true),
