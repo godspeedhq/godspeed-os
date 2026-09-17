@@ -5897,7 +5897,7 @@ fn net_dns(ctx: &ShellCtx, host: &str, out: &mut Out) -> Result<(), ShellError> 
     // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
     // silent hang.
     ctx.console_writeln("net: resolving ...");
-    let reply = match ns_query(ctx, &req[..1 + hb.len()], 8) {
+    let reply = match ns_query(ctx, &req[..1 + hb.len()], NET_RESOLVE_SECS) {
         NetQ::Reply(r)   => r,
         // A q-aborted resolve did NOT succeed, so it is Err (not Ok): a probe's Result is its verdict,
         // and `online`'s `if net dns ...` must not print a false "dns ok" for an aborted probe (audit U4).
@@ -11746,6 +11746,21 @@ const NET_TXN_SECS: i64 = 20;
 /// How long the wait must linger before the `(q to quit)` hint is printed. A fast transaction prints
 /// nothing, so a snappy `tcp` is not nagged.
 const NET_HINT_SECS: i64 = 2;
+
+/// How long `net resolve` waits for net-stack to answer a DNS lookup.
+///
+/// **This is the SHORTEST deadline any client gives net-stack, and that makes it load-bearing on the
+/// other side of the wire.** net-stack must finish a DNS resolve - even to report that it failed -
+/// inside this window. If it takes longer, this command gives up first and net-stack's answer lands
+/// afterwards as a stale reply, which does not merely waste the work: the next request receives the
+/// previous one's answer, the correlation tag rejects it, and the stream never catches up.
+///
+/// That is exactly what a Dell Wyse showed (2026-09-17): net-stack's DNS path was bounded by a COUNT
+/// (twelve polls of two seconds), so it could spend 24 seconds on a request this command waited 8 for.
+///
+/// It was a bare `8` at the call site until then. `scripts/facts_check.py` now checks this against
+/// net-stack's own budget, which it cannot do to a literal.
+const NET_RESOLVE_SECS: i64 = 8;
 
 /// Discard anything already queued on our endpoint BEFORE sending a net-stack request, reclaiming any
 /// capability a discarded reply carried.

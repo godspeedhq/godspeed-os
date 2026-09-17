@@ -133,6 +133,48 @@ def porting_tree_problems():
     return problems
 
 
+def budget_ordering_problems():
+    """net-stack must answer a request BEFORE its client stops waiting.
+
+    Not a doc-versus-code check like the rest of this file - a CODE-versus-CODE one, across a crate
+    boundary, which is why it lives in a function rather than the facts table.
+
+    THE RULE. When a service can spend longer on a request than its caller will wait, the caller
+    always gives up first and the answer lands afterwards as a STALE reply. That does not merely waste
+    the work: the next request receives the previous one's answer, the correlation tag rejects it, and
+    the reply stream never catches up. One slow lookup desyncs the channel indefinitely.
+
+    WHY IT IS CHECKED RATHER THAN COMMENTED. It was a comment. net-stack bounded DNS by a COUNT
+    (`DNS_RX_TRIES` polls of `DANCE_SECS` each = 24 s) while the shell waited 8 - and nothing compared
+    them, because they are in different crates and neither number looks wrong on its own. A Dell Wyse
+    found it (2026-09-17): every `net resolve` timed out, and the log showed the shell discarding a
+    reply for tag 4 while awaiting tag 6.
+
+    The same ordering `backlog/28` established for the stash budgets, extended across the wire.
+    """
+    problems = []
+    client = const("services/shell/src/main.rs", "NET_RESOLVE_SECS")
+    floor  = const("services/net-stack/src/main.rs", "CLIENT_MIN_DEADLINE_SECS")
+    budget = const("services/net-stack/src/main.rs", "DNS_BUDGET_SECS")
+    if client is None or floor is None or budget is None:
+        problems.append("budget ordering: a constant is missing - shell NET_RESOLVE_SECS=%s, "
+                        "net-stack CLIENT_MIN_DEADLINE_SECS=%s DNS_BUDGET_SECS=%s "
+                        "(renamed or deleted? this check cannot pass vacuously)"
+                        % (client, floor, budget))
+        return problems
+    if floor != client:
+        problems.append(
+            "budget ordering: net-stack believes its shortest client deadline is %ds, but the shell's "
+            "`net resolve` waits %ds. net-stack sizes its DNS budget against that belief, so the two "
+            "must agree." % (floor, client))
+    if budget >= client:
+        problems.append(
+            "budget ordering: net-stack may spend %ds on a DNS resolve while its client waits only "
+            "%ds. The client will give up first and the late answer will desync the reply stream - "
+            "see backlog/28 and the Wyse capture of 2026-09-17." % (budget, client))
+    return problems
+
+
 def facts():
     out = []
 
@@ -255,7 +297,7 @@ def main():
     checked = 0
     bad = []
 
-    tree = porting_tree_problems()
+    tree = porting_tree_problems() + budget_ordering_problems()
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))
