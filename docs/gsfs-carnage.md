@@ -1,7 +1,7 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
-**Status: the torn-write gate PASSES in QEMU across three operations (`osdev test fs-tear`, 14/0,
-54 tear points), the rest are NOT RUN. This is QEMU-validated only; no hardware result is claimed
+**Status: the torn-write gate PASSES in QEMU across four operations (`osdev test fs-tear`, 18/0,
+75 tear points, 35 of them exercising journal recovery), the rest are NOT RUN. This is QEMU-validated only; no hardware result is claimed
 anywhere in this file.**
 
 The mission, and every gate below is an instance of it:
@@ -106,11 +106,12 @@ test, and it answers "did this tear survive" rather than "does any tear survive"
 
 **Results so far - three operations, 54 tear points, every one inside the permitted set:**
 
-| operation | sectors written | tear points | outcome |
-|---|---|---|---|
-| overwrite a whole file | 22 | 22 | wholly `ORIGINAL` or wholly `NEWNEWNEW`, never a mix |
-| rename | 15 | 15 | the old name or the new name, never both, never neither |
-| move across directories | 17 | 17 | in the source or in the destination, never both, never neither |
+| operation | sectors written | tear points | of which replay | outcome |
+|---|---|---|---|---|
+| overwrite a whole file | 22 | 22 | 10 | wholly `ORIGINAL` or wholly `NEWNEWNEW`, never a mix |
+| rename | 15 | 15 | 7 | the old name or the new name, never both, never neither |
+| move across directories | 17 | 17 | 8 | in the source or in the destination, never both, never neither |
+| delete | 21 | 21 | 10 | gone, or still there, or gone-with-a-leak. Never a block marked free while a live file uses it |
 
 Each case is a row in a table rather than a copy of the harness: a setup whose last command writes
 nothing (that is the boundary marker), the one operation to tear, a probe, and the two mutually
@@ -300,15 +301,42 @@ is not the same as recovering from one. The fs/block channel has the same shape 
 design. A completion from an old driver instance acknowledging a newer request is not hypothetical
 here; it is the thing that already happened one layer over.
 
-### 3.8 Crash recovery itself - NOT RUN
+### 3.8 Crash recovery itself - PARTIAL, and the covered half is MEASURED
 
-Interrupt recovery, at each mutation point, repeatedly, on the same image. Verify it is restartable
-and does not progressively worsen the damage, and that when it cannot determine a safe outcome it
-REFUSES a read-write mount rather than guessing. The existing `read_only` mount path is the right
-mechanism for that refusal and is already exercised by `fs-compat` for a different reason.
+**35 of the 75 tear points make the journal replay on mount.** Counted rather than assumed, and free:
+every replay boot's serial is already captured and `fs` announces a recovery
+(`journal recovered N block(s) from an interrupted write`).
 
-This is where 3.1's machinery pays off twice: recovery is itself a sequence of writes, so the same
-record-and-replay applies to it directly.
+| case | tear points | of which replay |
+|---|---|---|
+| overwrite | 22 | 10 |
+| rename | 15 | 7 |
+| move | 17 | 8 |
+| delete | 21 | 10 |
+
+That ratio is the size of the window between the commit record landing and the last home block being
+written, which is the only window in which the journal does any work at all. So roughly half of every
+sweep is a recovery running to completion and then being checked against the permitted-outcome table.
+The count is reported per case precisely so a green tally cannot imply coverage it does not have: a
+case where it came out ZERO would not have tested recovery at all, however many points it passed.
+
+**What is covered:** recovery RUNS, on 35 genuinely distinct interrupted states, and the result is
+inside the permitted set every time.
+
+**What is NOT covered, and is the rest of this gate:** crashing DURING the recovery. Replay is itself
+a sequence of writes, so the same record-and-replay nests - boot an `A_k` that replays, record the
+writes the RECOVERY makes, then build and boot `A_k` plus each prefix of those. The properties it
+would pin are the ones this section was written for: recovery is restartable, repeating it does not
+progressively worsen the damage, and where it cannot determine a safe outcome it REFUSES a read-write
+mount rather than guessing.
+
+The code is already explicit that these are the stakes - `recover` leaves the journal INTACT on a read
+failure so the next mount retries, refuses to apply blocks whose checksum changed between verify and
+apply, and never clears a half-applied commit. Those are exactly the claims a nested sweep would
+test, and they are currently argued rather than exercised.
+
+The `read_only` mount path is the right mechanism for the refusal case and is already exercised by
+`fs-compat` for a different reason.
 
 ### 3.9 Corruption and format validation - LARGELY COVERED
 
@@ -349,12 +377,12 @@ Filled in from what has actually been run. NOT RUN means not run.
 |---|---|---|
 | Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (now 15 suites including `fs-tear`); `files` 222/0; `shell` 174/0 |
 | Independent reference-model tests | NOT RUN | 3.2. Blocked on nothing but effort; the outcome table it needs now exists |
-| Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 14/0 - three operations, 54/54 tear points, oracle proved able to reject. Eight rows of section 2 remain |
+| Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
 | Data/metadata exhaustion | NOT RUN | 3.4 |
 | Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
 | Block-driver restart and hot-unplug | NOT RUN | 3.7. See `backlog/31` for the same failure shape one layer over |
-| Interrupted recovery | NOT RUN | 3.8 |
+| Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Crashing DURING recovery is not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | NOT RUN | 3.11 |

@@ -5967,6 +5967,15 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         // real defect, and its image stays on disk so it can be booted again while it is fixed.
         println!("fs-tear: [{}] replaying {} tear point(s)", case.name, op_end - op_start);
         let mut torn_ok = 0u64;
+        // HOW MANY TEAR POINTS ACTUALLY EXERCISE RECOVERY, counted rather than assumed.
+        //
+        // Free: every replay boot's serial is already captured, and `fs` announces a replay
+        // (`journal recovered N block(s) from an interrupted write`). The number matters because it
+        // is the size of the window between the commit record landing and the last home block being
+        // written - the only window in which the journal does any work. A case where it is ZERO has
+        // not tested recovery at all, however many tear points it passed, and saying so stops a
+        // green tally implying coverage it does not have.
+        let mut replayed = 0u64;
         for k in (op_start + 1)..=op_end {
             let img = format!("build/tests/fs_tear_{}_k{}.img", case.name, k);
             if apply_writes_prefix(&base, &writes, k, &img).is_err() {
@@ -5976,6 +5985,7 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
             let (o, w, _) = boot(&img, &[case.probe], case.probe_secs, false);       // REPLAY: no tap, no splicing
             let out = o.first().cloned().unwrap_or_default();
             let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+            if w.contains("journal recovered") { replayed += 1; }
             // A failure to mount is outside the table whatever the oracle says: the operation
             // corrupted the structure rather than landing on one side of it.
             // DID IT ANSWER AT ALL? A probe that ran out of time has told us nothing, and calling
@@ -6029,6 +6039,9 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         };
         check!(torn_ok == points,
                format!("[{}] every tear point {} ({}/{})", case.name, verdict, torn_ok, points));
+        println!("fs-tear: [{}] {} of {} tear point(s) made the journal REPLAY on mount{}",
+                 case.name, replayed, points,
+                 if replayed == 0 { "  <- recovery was never exercised by this case" } else { "" });
     }
 
     // ---- 3. PROVE THE ORACLE CAN FAIL ----------------------------------------------------------
