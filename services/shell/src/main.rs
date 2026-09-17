@@ -11981,7 +11981,21 @@ fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), She
         let nl = p[i] as usize;
         i += 1;
         if i + nl + 1 + 8 > p.len() { break; }
-        let name = core::str::from_utf8(&p[i..i + nl]).unwrap_or("?");
+        // A NAME IS UNTRUSTED INPUT, AND THIS IS WHERE IT MEETS A TERMINAL.
+        //
+        // `fs` refuses to CREATE a name carrying control bytes, but a disk prepared elsewhere
+        // already holds whatever names it likes - and this shell must still be able to list and
+        // delete them, so the name cannot simply be rejected here. It is RENDERED SAFELY instead:
+        // a terminal acts on the bytes it is handed, and a name containing `ESC [ 2J` clears the
+        // screen when listed, scrolling itself and everything after it out of the listing that was
+        // supposed to reveal it. Found by `osdev test fs-fuzz` against a disk baked with that name.
+        let mut safe = [b'?'; 64];
+        let shown = nl.min(safe.len());
+        for k in 0..shown {
+            let b = p[i + k];
+            safe[k] = if b >= 0x20 && b < 0x7f { b } else { b'.' };
+        }
+        let name = core::str::from_utf8(&safe[..shown]).unwrap_or("?");
         let is_dir = p[i + nl] != 0;
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
         i += nl + 1 + 8;

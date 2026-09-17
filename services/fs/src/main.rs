@@ -3486,6 +3486,13 @@ fn guard_selftest(ctx: &ServiceContext) {
     check(valid_name(b"a"), "a one-character name is valid", &mut pass, &mut fail);
     check(!valid_name(b""), "an empty name is refused", &mut pass, &mut fail);
     check(!valid_name(b"a/b"), "a name containing a separator is refused", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x1b, b'b']),
+          "a name containing ESC is refused (it would drive the terminal)", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x00, b'b']), "a name containing NUL is refused", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x0a, b'b']), "a name containing a newline is refused", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x7f, b'b']), "a name containing DEL is refused", &mut pass, &mut fail);
+    check(valid_name(&[b'c', b'a', b'f', 0xc3, 0xa9]),
+          "a UTF-8 name is still valid (only C0 and DEL are barred)", &mut pass, &mut fail);
     let at_max = [b'n'; NAME_MAX];
     let over_max = [b'n'; NAME_MAX + 1];
     check(valid_name(&at_max), "a name of exactly NAME_MAX is valid", &mut pass, &mut fail);
@@ -3516,8 +3523,26 @@ fn path_is_ancestor(src: &[u8], dst: &[u8]) -> bool {
     dst[src.len()] == b'/'
 }
 
+/// May a new entry be called this?
+///
+/// **Control bytes are refused, and that is a security rule rather than a tidiness one.** A name is
+/// DISPLAYED - by `ls`, by `tree`, by `find` - and a terminal acts on the bytes it is handed. A name
+/// carrying `ESC [ 2J` clears the screen when it is listed, so a file can scroll itself, and
+/// everything after it, out of the very listing meant to reveal it. Found by `osdev test fs-fuzz`
+/// against a disk baked with exactly that name (`docs/gsfs-next.md` §1a).
+///
+/// This is only half the fix and is the half that stops it SPREADING. A disk prepared elsewhere
+/// already carries whatever names it likes, and this service must still let you list and delete
+/// them - so `valid_name` guards CREATE and RENAME only (`mkdir`, `write_path`, `write_new`,
+/// `rename`, and the destination of a move), never lookup. The other half is the shell rendering any
+/// name safely whatever it says, because a name that already exists has to be survivable.
+///
+/// Bytes at or above 0x80 are allowed: they are UTF-8 continuation bytes, and refusing them would
+/// bar every non-ASCII filename to defend against a class of attack that C0 controls already cover.
 fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= NAME_MAX && !name.iter().any(|&b| b == b'/')
+    !name.is_empty()
+        && name.len() <= NAME_MAX
+        && !name.iter().any(|&b| b == b'/' || b < 0x20 || b == 0x7f)
 }
 
 /// A regular file, contiguous (`ITYPE_FILE`) or fragmented (`ITYPE_FILE_FRAG`). Both store

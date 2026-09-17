@@ -1388,6 +1388,7 @@ fn cmd_test(suite: &str) {
         "resource-server" => run_resource_server_test(),
         "fs-check"     => run_fs_check_test(),
         "fs-scrub"     => run_fs_scrub_test(),
+        "fs-fuzz"      => run_fs_fuzz_test(),
         "fs-compat"    => run_fs_compat_test(),
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
@@ -1823,7 +1824,18 @@ fn run_fs_corruption_test() {
     println!("fs: case 2 - corrupt root directory block, boot (~25s) …");
     let log2 = boot_ahci_qemu(&img_str, &dir_disk, "build/tests/fs_corrupt_dir.log", 25);
     let dir_mounted = log2.contains("fs: mounted GSFS");                 // superblock OK
-    let dir_caught = log2.contains("directory block CRC mismatch");      // loud
+    // MATCH THE BEHAVIOUR, NOT ONE SENTENCE. This asked for the literal phrase "directory block CRC
+    // mismatch", which is the wording of the NON-ROOT path (`fs: directory block CRC mismatch at lba
+    // N - refusing`). This case corrupts the ROOT block, which takes its own path and says something
+    // else entirely: "CRC mismatch on directory block lba N ..." followed by a ROOT-specific refusal
+    // explaining that no redundancy exists for it. `fs` was loud and correct the whole time and the
+    // assertion was looking for the wrong string, so the suite sat red on `main` (see `backlog/32`).
+    //
+    // Both wordings are accepted now, because what is being asserted is that the mismatch was
+    // REPORTED - not which of two correct sentences reported it.
+    let dir_caught = log2.contains("CRC mismatch on directory block")
+        || log2.contains("directory block CRC mismatch")
+        || log2.contains("failed its CRC");                              // loud
     let dir_no_garbage = !log2.contains("round-trip OK (greeting)");     // never silently succeeded
     let dir_no_panic = !log2.contains("KERNEL PANIC");
 
@@ -2683,6 +2695,45 @@ fn run_fs_check_test() {
 /// bad block (`1 bad`) without panicking, leave the disk UNCHANGED (a second scrub still reports
 /// `1 bad` - read-only, no repair), and the clean file must still read back. Proves a routine,
 /// non-destructive integrity sweep that detects bit-rot.
+/// Phase M - the adversarial suite. `fs` takes client-supplied paths, offsets, sizes and names over
+/// IPC and had no red-team coverage, while every other subsystem has some (§22 F1-F8, A1-A15).
+///
+/// **The bar is not that a hostile request succeeds or fails in some particular way. It is that
+/// `fs` NEVER panics, NEVER hangs, and never serves a wrong answer as a right one** - and that
+/// afterwards the filesystem is still consistent, which the run proves by ending with `drives check`
+/// and a read of a file that was there before the assault started.
+///
+/// This boots ONE machine and drives the hostile cases through the shell, so every request travels
+/// the path a real client travels. Cases the shell legitimately refuses to send (a move into a
+/// directory's own subtree) are not reachable here by design; those need the protocol path
+/// (`docs/gsfs-next.md` §1c).
+fn run_fs_fuzz_test() {
+    println!("
+=== fs: adversarial - hostile paths, names, and limits (Phase M) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_fuzz.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // A CANARY that predates the assault. Every hostile case runs after this, and the run ends by
+    // reading it back: if the filesystem were damaged along the way, this is what notices.
+    gsfs_add_file(persist, "canary.txt", b"canary-must-survive-every-hostile-request");
+    // A HOSTILE FILENAME, baked host-side because the shell's line editor accepts only printable
+    // ASCII (`main.rs` input loop) so this cannot be typed. That is exactly the threat: the name
+    // arrives on a disk somebody else prepared. `ESC [ 2J` is "clear the screen" - if `ls` prints a
+    // name unfiltered, listing a directory lets the DISK drive the terminal, and a file can hide
+    // itself (or anything after it) from the listing that is supposed to reveal it.
+    gsfs_add_file(persist, "a[2Jb.txt", b"a filename must not be able to drive the terminal");
+
+    crate::shell_test::run_fs_fuzz(&image_path, persist, 4);
+}
+
 fn run_fs_scrub_test() {
     println!("\n=== fs: drives scrub (read-only integrity sweep) - detect bit-rot, change nothing (Phase K) ===");
     cmd_build_bare_metal();

@@ -4244,10 +4244,22 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     }
 
     // The disk is already formatted (drifted free count); fs auto-mounted it. Run the fsck.
-    let expect = format!("{} free", expect_free);
+    // **NOT an exact match, and the exactness is what made this test wrong.** `expect_free` is read
+    // from the superblock BEFORE boot, but the running system creates files of its own on the way up
+    // - `/clock.last` (the `time` service's persisted floor) and `.gsh_history` - each taking a
+    // block. Both arrived after this test was written, so the pinned figure silently went stale and
+    // the suite had been failing 4/1 on `main` with nobody looking: no gate that runs before a merge
+    // includes the eleven fs suites. See `backlog/32`.
+    //
+    // What the test is FOR is preserved exactly - that fsck rebuilds the count from the tree instead
+    // of believing the superblock. The value must no longer be the bogus one, and must land within a
+    // few blocks of the truth: a window boot-time writes fit in and a 123,456-block lie does not.
+    let bogus_free = format!("{} free", expect_free.wrapping_add(123_456));
     match run!(b"drives check\r", 15) {
         Some(r) => {
-            check!(r.contains(&expect), "free count rebuilt from the tree to the correct value");
+            check!(!r.contains(&bogus_free), "fsck stopped believing the drifted superblock count");
+            check!((0..=8).any(|d: u64| r.contains(&format!("{} free", expect_free.saturating_sub(d)))),
+                   "free count rebuilt from the tree to within a few blocks of the truth");
             check!(r.contains("0 bad"), "no corrupt blocks reported");
             check!(r.contains("ok") || r.contains("consistent"), "reports consistent");
         }
@@ -5430,5 +5442,152 @@ pub fn run_adopt_storm(image_path: &Path, persist_path: &str, smp: u32) {
 
     child.kill().ok(); child.wait().ok();
     println!("\nadopt-storm: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Phase M - the adversarial suite (`osdev test fs-fuzz`).
+///
+/// Boots one machine and throws hostile requests at `fs` through the shell, which is the path a real
+/// client travels. **The bar is that `fs` never panics, never hangs, and never serves a wrong answer
+/// as a right one** - not that any particular case succeeds or fails, because for several of them
+/// either outcome is defensible as long as it is the SAME one every time and the filesystem is intact
+/// afterwards.
+///
+/// The run opens and closes with the same canary file. Everything in between is the assault; if the
+/// canary still reads back at the end and `drives check` is clean, the filesystem survived it.
+///
+/// Cases the shell legitimately refuses to send - a move into a directory's own subtree - are not
+/// reachable from here by design. Those need the protocol path (`docs/gsfs-next.md` §1c).
+pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("fs-fuzz: booting (smp={smp}) with a canary file already on the disk");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-fuzz: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-fuzz: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) }
+            }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-fuzz: PASS - {}", $label); pass += 1; } else { println!("fs-fuzz: FAIL - {}", $label); fail += 1; }
+    }; }
+    // Every hostile command must come back to a prompt. A case that never returns is the worst
+    // outcome of all, so the timeout IS an assertion: `None` means `fs` stopped answering.
+    macro_rules! answered { ($cmd:expr, $label:expr) => {{
+        let c = format!("{}\r", $cmd);
+        send(&mut write_half, c.as_bytes());
+        let r = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20));
+        check!(r.is_some(), format!("answered: {}", $label));
+        r.unwrap_or_default()
+    }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fs-fuzz: FAIL - timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // The guard selftest runs at every fs start, and nothing below is trustworthy if it did not pass.
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        check!(whole.contains("path guard selftest PASS"), "fs proved its path guards at startup");
+    }
+    let base = answered!("read /canary.txt", "the canary reads before the assault");
+    check!(base.contains("canary-must-survive"), "the canary is intact before the assault");
+    answered!("mkdir /fz", "a working directory for the assault");
+
+    // ---- NAME_MAX (38) at both edges. Four separate call sites check this; they must agree. ----
+    let n38: String = "n".repeat(38);
+    let n39: String = "n".repeat(39);
+    let r = answered!(format!("mkdir /fz/{n38}"), "a name of exactly NAME_MAX");
+    check!(!r.contains("failed"), "a 38-byte name (exactly NAME_MAX) is ACCEPTED");
+    let r = answered!(format!("mkdir /fz/{n39}"), "a name one byte over NAME_MAX");
+    let over_created = r.contains("created");
+    check!(!over_created, "a 39-byte name (NAME_MAX + 1) is REFUSED");
+    // TRUNCATION IS THE DANGEROUS OUTCOME. A 39-byte name silently becoming the 38-byte one means
+    // two distinct names collide and one file shadows another, so listing must show ONE entry.
+    let r = answered!("ls /fz", "listing after both name-length attempts");
+    let n38_count = r.matches(n38.as_str()).count();
+    check!(n38_count <= 1, "the over-length name did not truncate into the valid one (no collision)");
+
+    // ---- `.` and `..`: nothing in `fs` handles either, so this RECORDS what actually happens. ----
+    answered!("write /fz/real.txt here-i-am", "a file to reach via a relative path");
+    let dot = answered!("read /fz/./real.txt", "a path containing a `.` component");
+    let dotdot = answered!("read /fz/sub/../real.txt", "a path containing a `..` component");
+    println!("fs-fuzz: NOTE - `.` resolved to the file: {}", if dot.contains("here-i-am") { "YES" } else { "no" });
+    println!("fs-fuzz: NOTE - `..` resolved to the file: {}", if dotdot.contains("here-i-am") { "YES" } else { "no" });
+
+    // ---- A path far longer than the `plen` byte can describe (255). ----
+    let long_path: String = (0..40).map(|i| format!("/d{i}")).collect::<Vec<_>>().join("");
+    answered!(format!("mkdir {long_path} parents"), "a path longer than 255 bytes");
+
+    // ---- Depth: MAX_TREE_DEPTH is 64, so 70 levels must be refused rather than walked forever. ----
+    let very_deep: String = (0..70).map(|_| "/x").collect::<Vec<_>>().join("");
+    answered!(format!("mkdir {very_deep} parents"), "70 nested levels (MAX_TREE_DEPTH is 64)");
+    answered!(format!("ls {very_deep}"), "listing at 70 levels deep");
+
+    // ---- Structural oddities that must each get a DEFINED answer rather than a surprise. ----
+    answered!("read /", "reading a DIRECTORY as a file");
+    answered!("ls /nonexistent-path-entirely", "listing a path that does not exist");
+    answered!("delete /fz", "deleting a NON-EMPTY directory without `recursive`");
+    answered!("mkdir /fz", "creating a directory that already exists");
+    answered!("write /fz/real.txt/child x", "writing THROUGH a file as if it were a directory");
+    answered!("rename / newroot", "renaming the ROOT");
+    answered!("delete /", "deleting the ROOT");
+    answered!("read /fz/real.txt", "the tree still answers an ordinary read afterwards");
+
+    // ---- A FILENAME MUST NOT BE ABLE TO DRIVE THE TERMINAL ----
+    //
+    // The disk carries a file whose NAME contains `ESC [ 2J` (clear screen). It was baked host-side
+    // because the shell's line editor accepts only printable ASCII, so it cannot be typed - which is
+    // the point: this is what a disk prepared by somebody else looks like. If `ls` emits the name
+    // unfiltered, the listing that is supposed to REVEAL what is on the disk becomes something the
+    // disk controls, and a file can scroll itself out of its own listing.
+    let listing = answered!("ls /", "listing a directory holding a hostile filename");
+    check!(!listing.contains("[2J"),
+           "`ls` did not emit a raw ESC sequence that came from a FILENAME");
+
+    // ---- The filesystem must still be intact. That is the whole point of the suite. ----
+    let chk = answered!("drives check", "fsck after the assault");
+    check!(chk.contains("consistent") || chk.contains("ok"), "the filesystem is CONSISTENT after every hostile request");
+    let after = answered!("read /canary.txt", "the canary reads after the assault");
+    check!(after.contains("canary-must-survive"), "the canary is byte-intact after the assault");
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic across the whole assault");
+    check!(!whole.contains("LIVENESS WEDGE"), "no liveness wedge across the whole assault");
+    check!(!whole.contains("path guard selftest FAILED"), "fs never reported a failed guard selftest");
+    let _ = std::fs::write("build/tests/fs_fuzz_serial.log", &whole);
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nfs-fuzz: {pass} passed, {fail} failed  (serial -> build/tests/fs_fuzz_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }

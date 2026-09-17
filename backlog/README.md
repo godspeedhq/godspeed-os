@@ -74,6 +74,7 @@ direction.
 | [29](29-the-wyse-tcp-big-that-never-left-the-shell.md) | A `tcp` that took ~20 s to start: three defects, each hiding the one behind it - **CLOSED**, hardware-verified on five boards | Closed | - |
 | [30](30-chaos-flood-storm-xhci-flakes-under-host-load.md) | `chaos: flood-storm xhci` fails intermittently in `osdev test shell` and passes on a re-run - dismissed as host load twice, so recorded | Open / not diagnosed | - |
 | [31](31-net-stack-blocked-48s-on-a-live-nic-driver.md) | `net-stack` blocked 48 s on a `nic-driver` that was ALIVE - **cause CONFIRMED**: the reply stream runs ~28 requests behind. A correlation tag proved it and was reverted (refusing is not recovering) | Open / cause known | `backlog/28` |
+| [32](32-the-fs-suites-run-in-no-gate.md) | The eleven `fs` suites run in NO pre-merge gate, and two were red on the v0.18.0 commit - both stale assertions, both now fixed; the gap that let them rot is open | Open / process | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
