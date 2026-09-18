@@ -1919,7 +1919,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     // Dispatch - every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => cmd_help(ctx, depth),
+        "help"    => cmd_help(ctx),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
@@ -4587,23 +4587,12 @@ fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], foote
     //
     // Same standing as `cmd_help`'s pager: the "framebuffer has no scrollback" that justified this
     // is no longer true, and both go together once scrollback is hardware-proven.
+    // NO PAGER, for the same reason `cmd_help` no longer has one: the console keeps scrollback
+    // now, and `<command> help | paginate` is there when you want to page deliberately. `trace`'s
+    // help is the tall one - six views and eight columns - and on a 32-row console it is what
+    // PgUp exists for.
     let lines = help_block_lines(rows, footer);
-    let (rows_avail, _) = ctx.console_dims();
-    // Unknown geometry is not "no terminal": a failed lookup returns 0, and `edit` and `trace` both
-    // assume 24 rather than dropping the feature.
-    let rows_avail = if rows_avail == 0 { 24 } else { rows_avail as usize };
-    if lines + 3 <= rows_avail {
-        help_block_render(ctx, title, desc, rows, footer, 0, lines);
-        return;
-    }
-    line_pager(ctx, lines, rows_avail,
-        &|c| {
-            c.console_write_fmt(format_args!("{} {} - {}\x1b[K\n", title, UTIL_VERSION, desc));
-            c.console_write("\x1b[K\n");
-            c.console_write("usage:\x1b[K\n");
-            3
-        },
-        &|c, i| help_block_line(c, rows, footer, i), &|_| {});
+    help_block_render(ctx, title, desc, rows, footer, 0, lines);
 }
 
 /// How many scrolling lines a help block has (the header is pinned, so it does not count).
@@ -4612,55 +4601,6 @@ fn help_block_lines(rows: &[Row], footer: bool) -> usize {
     for (_, _, ex) in rows { n += if ex.is_empty() { 1 } else { 2 }; }
     if footer { n += 2; }
     n
-}
-
-/// Render scrolling line `i` of a help block, erasing its tail for the pager's in-place repaint.
-///
-/// CLAMPED TO THE CONSOLE WIDTH, and that is load-bearing rather than cosmetic. The pager counts
-/// LOGICAL lines and paints one per screen row; a line longer than the terminal wraps onto a second
-/// row, so every wrapped row pushes the frame down, scrolls the pinned header off the top and makes
-/// the whole thing look like it started in the middle. That is exactly what `events help` did on a
-/// 102-column display while looking perfect on serial, which has no width at all.
-///
-/// The rows are short now, but content should not be able to break the frame - so an over-long line
-/// is cut and marked with a `>` rather than silently wrapped. Visible truncation is a bug report; a
-/// broken pager is a mystery.
-fn help_block_line(ctx: &ServiceContext, rows: &[Row], footer: bool, i: usize) {
-    let mut n = 0usize;
-    for (sig, d, ex) in rows {
-        if n == i {
-            help_write_clamped(ctx, format_args!("  {:<28}  {}", sig, d));
-            return;
-        }
-        n += 1;
-        if !ex.is_empty() {
-            if n == i {
-                help_write_clamped(ctx, format_args!("      e.g. {}", ex));
-                return;
-            }
-            n += 1;
-        }
-    }
-    if footer {
-        if n == i     { ctx.console_write("  version\x1b[K\n"); return; }
-        if n + 1 == i { ctx.console_write("  help\x1b[K\n"); }
-    }
-}
-
-/// Write one pager line, cut to the console width so it occupies exactly one screen row.
-fn help_write_clamped(ctx: &ServiceContext, args: core::fmt::Arguments) {
-    let (_, cols) = ctx.console_dims();
-    let cols = if cols == 0 { 80 } else { cols as usize };
-    let mut buf = [0u8; 256];
-    let mut w = ClampWriter { buf: &mut buf, n: 0 };
-    let _ = core::fmt::write(&mut w, args);
-    let n = w.n;
-    let keep = n.min(cols.saturating_sub(1)).min(256);
-    if let Ok(text) = core::str::from_utf8(&buf[..keep]) {
-        ctx.console_write(text);
-        if keep < n { ctx.console_write(">"); }
-    }
-    ctx.console_write("\x1b[K\n");
 }
 
 /// A fixed-buffer `fmt::Write` sink. Bounded, no heap (26.6.1).
@@ -5144,8 +5084,12 @@ static HELP: &[HelpRow] = &[
 /// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`). When `clear_eol`
 /// the line ends with `ESC[K` (erase to end of line) before the newline - the pager repaints
 /// each row in place over the old frame, so a shorter line must wipe the longer one's tail.
-fn help_render_line(ctx: &ServiceContext, idx: usize, clear_eol: bool) {
-    let eol = if clear_eol { "\x1b[K" } else { "" };
+/// `clear_eol` is GONE with the pager it served. It emitted `ESC[K` so an in-place repaint could
+/// wipe the tail of a longer previous frame; nothing repaints in place any more, and every caller
+/// was passing `false`. A parameter whose other branch is unreachable is a lie about what the
+/// function can do.
+fn help_render_line(ctx: &ServiceContext, idx: usize) {
+    let eol = "";
     if idx == 0 {
         // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
         ctx.console_write_fmt(format_args!("help {} - GodspeedOS shell commands", UTIL_VERSION));
@@ -5162,38 +5106,23 @@ fn help_render_line(ctx: &ServiceContext, idx: usize, clear_eol: bool) {
     ctx.console_write("\n");
 }
 
-fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
-    let total = HELP.len() + 1; // +1 for the header line
-    // Page only for a direct interactive `help` (depth 0). When help is run from a
-    // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys -
-    // the pager would block the run - so just dump it. rows==0 means geometry is
-    // unknown → just print it.
-    //
-    // **THIS PAGER IS ON BORROWED TIME, AND THE REASON IT EXISTS HAS GONE.** It said "the
-    // framebuffer console has no scrollback, so an interactive help longer than the screen
-    // scrolls its top off forever". The console service KEEPS that history now and PgUp walks
-    // it (`docs/console-service.md` §10), so the justification no longer holds: `help | paginate`
-    // covers the deliberate case and scrollback covers the accidental one.
-    //
-    // It stays until scrollback is proven on a BOARD. Removing a workaround before its
-    // replacement is verified would leave the Pi-wired-to-a-TV case - the only machine either
-    // ever existed for - with no way to read `help` at all. Delete this, and `help_block`'s
-    // twin, in one commit once that passes.
-    let (rows, _cols) = ctx.console_dims();
-    let rows = rows as usize;
-    // UNKNOWN GEOMETRY IS NOT "NO TERMINAL". A failed `console_dims` returns 0, and this treated that
-    // as a reason to dump sixty lines past the top of the screen - the pager silently disappearing
-    // because a lookup missed. `edit` handles the same zero by assuming 24 rows and carrying on; this
-    // now does the same, so a future failure degrades instead of removing a feature.
-    //
-    // `depth > 0` stays a real reason to skip: nested help is being rendered into someone else's
-    // output (a pipe, `help | write`), where a pager would be wrong rather than merely unhelpful.
-    let rows = if rows == 0 { 24 } else { rows };
-    if depth > 0 || total <= rows {
-        for i in 0..total { help_render_line(ctx, i, false); }
-        return Ok(());
-    }
-    help_pager(ctx, total, rows);
+/// `help` - print the command reference. **It does not page, and that is the change.**
+///
+/// It paged for a long time, for a reason that was true when it was written and is not now: the
+/// framebuffer console had no scrollback, so an interactive `help` taller than the screen scrolled
+/// its own top off permanently. The console service RETAINS that history (`docs/console-service.md`
+/// §10) and PgUp walks it - hardware-verified on a Dell Wyse, 2026-09-18, which is the condition
+/// this removal was held against.
+///
+/// So there are two ways to read a long `help` now, and neither is a mode this command enters on
+/// your behalf: **scroll back** to what went past, or ask for `help | paginate` before it does. A
+/// command that pages itself has to GUESS whether a human is watching, and the guess is wrong
+/// exactly when it matters - which is why `paginate` is a stage you ask for.
+///
+/// `depth` is gone with the pager. It existed to answer "is anybody there to press a key", and
+/// nothing here waits for a key any more.
+fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
+    for i in 0..HELP.len() + 1 { help_render_line(ctx, i); }  // +1 for the header line
     Ok(())
 }
 
@@ -5209,20 +5138,6 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
             Row(cmd, desc) => out.line_fmt(ctx, format_args!("  {:<21}  {}", cmd, desc)),
         }
     }
-}
-
-/// `less`-style pager for `help`: render a screenful from `top`, a status line, then
-/// read a key and scroll. Arrows move a line; PgUp/PgDn and space move a page; Home/End jump to
-/// the ends; q, Esc and Ctrl+C quit. (Enter moves a line, like a terminal's own.)
-///
-/// Repaint is done **in place** to avoid the flicker and cost of a full clear: the cursor
-/// is hidden for the session (`ESC[?25l`) so the bulk redraw skips the per-character cursor
-/// toggle, each frame homes (`ESC[H`) instead of clearing to black, every row erases its own
-/// tail (`ESC[K`), and `ESC[J` wipes anything below the status line on a short last page.
-/// This is the same write-only repaint the fast boot-time scroll uses, so scrolling is smooth
-/// rather than a black flash + full reprint. Bounded: at most `total` lines, clamped each step.
-fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
-    line_pager(ctx, total, rows, &|_| 0, &|c, i| help_render_line(c, i, true), &|_| {});
 }
 
 /// The pager, over ANY indexable set of lines.
@@ -8784,7 +8699,8 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     // reason this one survives is the PINNED REGION below: scrolled back through a grid in a
     // scrollback buffer, the column names are off the top and you are reading unlabelled columns.
     // Scrollback structurally cannot pin a header; a pager can. That is the whole difference
-    // between the two, and it is why `help`'s goes and this one does not.
+    // between the two, and it is why `help`'s was DELETED once scrollback was hardware-verified
+    // (Dell Wyse, 2026-09-18) and this one was not.
     // PINNED: the legend and the column header are repainted at the top of every frame. They used to
     // be printed BEFORE the pager started, which put them exactly where its first `ESC[H` repaint
     // lands - so on a framebuffer console the legend flashed and vanished, and the column header met
@@ -12801,7 +12717,7 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     let mut listed = 0usize;
     let mut header_done = false;
     let mut cur = DirCursor::new();
-    'pages: while let Some(from) = cur.next() {
+    while let Some(from) = cur.next() {
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
         ReqOutcome::Reply(r) => r,
         ReqOutcome::Aborted => return Ok(()),

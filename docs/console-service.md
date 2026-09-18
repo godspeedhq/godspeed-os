@@ -242,7 +242,8 @@ console with foreground-app support*, not a terminal emulator.
 > a framebuffer console **loses output permanently**: reaching the bottom of the screen
 > scrolls the top away and there is nowhere for it to have gone. That is not a missing
 > convenience, it is the display discarding information the operator asked for - and it is
-> the stated reason `help` and `trace` each grew a pager of their own (§10).
+> the stated reason `help` and `trace` each grew a pager of their own - and `help`'s has since
+> been deleted because this replaced it (§10).
 >
 > The rest of the list stands.
 
@@ -598,11 +599,17 @@ nothing measured them:
 
 ### 10.8 What it does NOT do yet
 
-The `help` and `trace` pagers are **still in place**. Removing a workaround before its
-replacement is verified on hardware would leave the Pi-on-a-TV case - the only reason either
-exists - with no way to read `help` at all. `help`'s pager goes once scrollback is proven on a
-board; `trace`'s stays regardless, because it pins a **column header** while you scroll, which
-scrollback structurally cannot do.
+**`help`'s pager is GONE, and `trace`'s is permanent.**
+
+The condition this was held against is met: scrollback was verified on a Dell Wyse 5070 on
+2026-09-18 - PgUp entered history, End returned, typing returned on its own, and the serial log
+carries all three transitions. `help` prints its table and returns; a long one is recovered with
+PgUp, or asked for with `help | paginate`.
+
+`trace`'s pager stays for a reason that has nothing to do with scrollback: it PINS A COLUMN
+HEADER while you scroll. Scrolled back through a grid in a scrollback buffer the column names are
+off the top and you are reading unlabelled columns, and no scrollback can fix that. That is the
+whole difference between the two pagers.
 
 Verified in QEMU (`osdev test shell`): PgUp enters history, output returns the view to live by
 itself, End returns to live while scrolled, Home is taken as a scroll while scrolled **and

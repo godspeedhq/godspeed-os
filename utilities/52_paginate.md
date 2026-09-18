@@ -83,7 +83,7 @@ name        type  size  sealed
 f0.txt      file     1  false
 f1.txt      file     1  false
 ...
-[ lines 1-22 of 45 ]  [up/down] scroll  [PgUp/PgDn] page  [Home/End] top/bottom  [q] quit
+[ lines 1-22 of 45 ] [arrows] scroll [PgUp/PgDn] page [Home/End] ends [q] quit
 ```
 
 ## 5. What it does to the content, and why
@@ -116,6 +116,9 @@ They are complements, not alternatives.
 
 Scrollback is the safety net for output you did not expect to be long. `paginate` is what you
 reach for when you already know it will be.
+
+Between them they retired `help`'s built-in pager (2026-09-18, once scrollback was verified on a
+board). `trace` keeps its own, and the pinned column header in the row above is exactly why.
 
 ## 7. Implementation
 

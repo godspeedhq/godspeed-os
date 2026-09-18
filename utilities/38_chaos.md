@@ -166,7 +166,7 @@ verdict: PASS (kernel survived)
 ```
 
 All output is **ASCII** (the framebuffer font has no em-dash/ellipsis - they render as `?` on the
-panel) and `q to quit` matches the rest of the shell (`observe`, the help pager).
+panel) and `[q] quit` matches the rest of the shell (`observe`, `paginate`).
 
 > **The whole tree regrows from the kernel.** Only the *directly*-restarted services (supervisor by
 > the kernel; block-driver/fs by the supervisor) recover on their own death. The rest (`events`,

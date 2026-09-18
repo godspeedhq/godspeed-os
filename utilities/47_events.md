@@ -581,7 +581,9 @@ A service that never declares itself reads `?`, which is the honest answer rathe
 than a printer plus a serialiser that drift apart:
 
 - **Console**: a grid, with a two-line legend above it.
-- **Taller than the screen**: it pages, with `help`'s keys (up/down, space, `g`/`G`, `q`). The pager
+- **Taller than the screen**: it pages, with the shared pager's keys (arrows, space, PgUp/PgDn,
+  Home/End, `q`). `g`/`G` and `j`/`k` are gone, and so is `b` - `[b] background` claims that letter.
+  The pager
   was `help`-shaped - it called `help_render_line` directly - and is now given a render closure, so
   the one screenful-at-a-time reader in the system is shared instead of copied.
 - **Piped**: `events ipc | to json`, `| to yaml`, `| where caller=fs`, `| where outcome=TIMEOUT`,

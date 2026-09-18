@@ -450,29 +450,28 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
-    // `help` is paged. (It was paged BECAUSE the framebuffer console had no scrollback; the console
-    // keeps history now, so that reason is gone and the pager is scheduled for removal once
-    // scrollback is hardware-proven - see `cmd_help`. This case goes with it.) Drive the pager:
-    // page down through every screen (extra page-downs clamp at the bottom, harmless),
-    // then `q` to quit. The accumulated byte stream still contains every section, and
-    // reaching `gsh>` proves the pager exited cleanly back to the prompt.
-    send(&mut write_half, b"help\r          q");
+    // `help` DOES NOT PAGE ANY MORE, and that is what this case now pins.
+    //
+    // It paged because the framebuffer console had no scrollback, so a long `help` scrolled its own
+    // top off permanently. The console retains that history now and PgUp walks it - verified on a
+    // Dell Wyse, 2026-09-18, which is the condition the removal was held against. Two ways to read a
+    // long `help` remain and neither is a mode the command enters for you: scroll back to what went
+    // past, or ask for `help | paginate` before it does.
+    //
+    // NO PAGER KEYS ARE SENT. Sending them to a command that no longer reads them would type spaces
+    // and a `q` into the NEXT prompt, which is exactly the desync this case would otherwise hide.
+    send(&mut write_half, b"help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => {
             check!(r.contains("GodspeedOS shell commands"), "help: header");
-            check!(r.contains("spawn"),   "help: spawn listed (paged)");
-            check!(r.contains("restart"), "help: restart listed (paged)");
-            check!(r.contains("status"),  "help: status listed (paged)");
-            // THE STATUS LINE NAMES EVERY KEY THAT WORKS, AND ONLY THOSE. It used to advertise
-            // `j/k`, `b`, `f`, `g` and `G` as well; `b` had to go because `[b] background` claims
-            // that letter in the job-control design, and the rest went with it rather than leave a
-            // legend that is part house convention and part `less` habit. If a key is added back,
-            // this check fails until the line says so - which is the point.
-            check!(r.contains("[arrows] scroll") && r.contains("[PgUp/PgDn] page")
-                   && r.contains("[Home/End] ends") && r.contains("[q] quit"),
-                   "help: pager status line names every key");
-            check!(!r.contains("j/k") && !r.contains("b: page up") && !r.contains("g/G"),
-                   "help: pager no longer advertises the keys it dropped");
+            check!(r.contains("spawn"),   "help: spawn listed");
+            check!(r.contains("restart"), "help: restart listed");
+            check!(r.contains("status"),  "help: status listed");
+            // The WHOLE table arrives in one go - the last section as well as the first. A pager
+            // would have stopped at a screenful and waited.
+            check!(r.contains("Records"), "help: the last section arrives without a keypress");
+            check!(!r.contains("lines 1-") && !r.contains("[q] quit"),
+                   "help: no pager status line - it prints and returns");
         }
         None => {
             println!("shell-test: FAIL - timed out after `help`  [×5]");
