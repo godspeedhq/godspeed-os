@@ -73,7 +73,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    (`INFO_CMDS`). Pick one; `version`/`help` come along in every case.
 10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
-    to the prompt, and a wait of more than a moment advertises `(press q to abort)`. A command
+    to the prompt, and a wait of more than a moment advertises `(press q to quit)`. A command
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer

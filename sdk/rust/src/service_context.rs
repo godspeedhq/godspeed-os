@@ -2305,7 +2305,7 @@ impl ServiceContext {
         let mut on_linger = Some(on_linger);   // FnOnce, fired at most once when the wait lingers
         loop {
             // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
-            // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
+            // actually use (the "press q to quit" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
             if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
                 // DO NOT remove the reply cap on a REPLY. The send already removed it.

@@ -4608,7 +4608,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("churn <seconds>", "write/rename/delete continuously, then stop", "churn 30"),
             ("churn verify", "after a cut: is any file a MIX of two writes? (content, not structure)", "churn verify"),
             ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
-            ("churn <seconds>", "q stops it early; run BOTH `churn verify` and `drives check` after", "churn 120"),
+            ("churn <seconds>", "q quits early; run BOTH `churn verify` and `drives check` after", "churn 120"),
         ], true),
         "seal" => help_block(ctx, "seal", "freeze a file's content, permanently - there is NO unseal", &[
             ("seal <path>", "freeze <path>'s bytes after asking [y/N]", "seal /audit.log"),
@@ -5810,7 +5810,7 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
 fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to abort)"));
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to quit)"));
     let outcome = ns_abortable(ctx, &[8u8], 30);
     match outcome {
         ReqOutcome::Reply(r) => {
@@ -5838,7 +5838,7 @@ fn net_arp(ctx: &ShellCtx, ip_str: &str, out: &mut Out) -> Result<(), ShellError
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to abort)", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to quit)", ip[0], ip[1], ip[2], ip[3]));
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
     let outcome = ns_abortable(ctx, &[6, ip[0], ip[1], ip[2], ip[3]], 8);
     match outcome {
@@ -5870,7 +5870,7 @@ fn net_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
         ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to abort):", our[0], our[1], our[2]));
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to quit):", our[0], our[1], our[2]));
     // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
     // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
     // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
@@ -5906,7 +5906,7 @@ fn net_dns(ctx: &ShellCtx, host: &str, out: &mut Out) -> Result<(), ShellError> 
     req[0] = 1;
     req[1..1 + hb.len()].copy_from_slice(hb);
     // A DNS resolve waits on the server, which can take a moment. Route it through net_query (not a
-    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to abort"
+    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to quit"
     // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
     // silent hang.
     ctx.console_writeln("net: resolving ...");
@@ -5990,7 +5990,7 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64, tag
         }
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
-        if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
+        if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to quit"); }
         let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
@@ -6574,9 +6574,9 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
                 last_note = waited;
                 match limit {
                     Some(n) => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s of {}s, {} served (q stops)", waited, n, served)),
+                        "still listening - {}s of {}s, {} served (q to quit)", waited, n, served)),
                     None => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s, {} served (q stops)", waited, served)),
+                        "still listening - {}s, {} served (q to quit)", waited, served)),
                 }
             }
             // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four
@@ -6639,7 +6639,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
         ctx.sleep(ctx.duration_cycles(200));
         ctx.remove_cap(conn_h);
-        out.line(ctx, "closed - waiting for the next connection (q stops)");
+        out.line(ctx, "closed - waiting for the next connection (q to quit)");
         // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
         // connections and is released once, on the way out, by every exit path below.
     }
@@ -10514,7 +10514,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
         ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
         ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
         ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
-        ctx.console_writeln("  (press q to abort; an abort clears the override)");
+        ctx.console_writeln("  (press q to quit; quitting clears the override)");
         return Ok(());
     }
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
@@ -10531,7 +10531,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     let clr  = Message::from_bytes(&[8]);
     for cycle in 1..=cycles {
         ctx.console_writeln_fmt(format_args!(
-            "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
+            "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to quit)", cycle, cycles));
         match net_query(ctx, "nic-driver", &down, 3, None) {
             NetQ::Aborted => {
                 let _ = net_query(ctx, "nic-driver", &clr, 2, None);
@@ -12334,8 +12334,14 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
 /// **Bounded** (26.6): a fixed rotation of files in one directory, each rewritten in place, so the
 /// volume never fills however long it runs. Fixed stack buffers, no heap (26.6.1).
 ///
-/// **Abortable** (conventions rule 9): `q` stops it, and it stops on its own at the deadline. A
+/// **Abortable** (conventions rule 9): `q` quits it, and it ends on its own at the deadline. A
 /// command that runs for a minute and cannot be interrupted is one the operator has to reboot out of.
+///
+/// The wording is `(q to quit)`, and that is now the ONLY form. One key, one word - because the
+/// LETTER is the mnemonic, which is the whole reason the key is `q`. "abort" would have earned the
+/// letter `a` and never had it, yet the shell advertised `(press q to abort)` in six places and
+/// `0_conventions.md` rule 9 mandated it. Both corrected. Unix makes the same association from the
+/// other direction: ctrl+C says "cancel".
 fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let secs: i64 = match arg.parse::<i64>() {
         Ok(n) if n > 0 && n <= 3600 => n,
@@ -12349,7 +12355,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
 
     let _ = fs_request(ctx, OP_MKDIR, DIR, &[]);
     out.line_fmt(ctx, format_args!(
-        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT (q to stop)", secs));
+        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT (q to quit)", secs));
 
     let mut buf = [0u8; 3000];
     let mut path = [0u8; 32];
@@ -12365,7 +12371,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         if now.saturating_sub(start) >= secs { break; }
         if let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b {
-                out.line(ctx, "churn: stopped");
+                out.line(ctx, "churn: quit");
                 break;
             }
         }
