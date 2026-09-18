@@ -1397,6 +1397,8 @@ fn cmd_test(suite: &str) {
         "fs-ioretry"   => run_fs_ioretry_test(),
         "fs-tear"      => run_fs_tear_test(),
         "fs-full"      => run_fs_full_test(),
+        "fs-window"    => run_fs_window_test(),
+        "fs-churn"     => run_fs_churn_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -2759,6 +2761,11 @@ fn run_fs_all_tests() {
         // them. Cheapest-first ordering means a broken build still reports in a minute.
         "fs-tear",
         "fs-full",
+        // The two power-cut suites. `fs-window` aims at ONE known window and proves recovery runs;
+        // `fs-churn` cuts at a moment nobody chose and checks the permitted-outcome table holds
+        // whatever the cut hit. A proof and a search - they answer different questions.
+        "fs-window",
+        "fs-churn",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
@@ -2943,6 +2950,48 @@ fn run_fs_time_test() {
     gsfs_add_file(persist, "canary.txt", b"a file that predates timestamps");
 
     crate::shell_test::run_fs_time(&image_path, persist, 4);
+}
+
+fn run_fs_churn_test() {
+    println!("\n=== fs: CHURN then CUT - a power cut at a moment nobody chose ===");
+    // NO test feature on `fs`. `churn` is an ordinary shell command on a shipping build, and that is
+    // the point of it: a fault that only appears in a build nobody ships is a fault about that build.
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_churn.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
+
+    crate::shell_test::run_fs_churn(&image_path, persist, 4);
+}
+
+fn run_fs_window_test() {
+    println!("\n=== fs: the CRASH WINDOW - kill inside it, and the journal must recover ===");
+    // The `crash-window` build holds the commit-to-checkpoint window open for ten seconds when a
+    // path begins `/cutme`. It exists so an operator with a power cable can aim at a window that is
+    // normally sub-millisecond - three real cuts on a Dell Wyse produced three clean mounts and not
+    // one recovery. This proves the mechanism works before anybody carries it to a board.
+    build_blockdev_fs("selftest,crash-window", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_window.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
+
+    crate::shell_test::run_fs_window(&image_path, persist, 4);
 }
 
 fn run_fs_full_test() {

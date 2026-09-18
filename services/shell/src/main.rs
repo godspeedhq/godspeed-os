@@ -1706,6 +1706,10 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
         }
+        "churn"   => {
+            if argc < 2 { ctx.console_writeln("usage: churn <seconds>   e.g. churn 30"); Err(ShellError::Unknown) }
+            else { cmd_churn(ctx, args[1], out) }
+        }
         "seal"    => {
             if argc < 2 { ctx.console_writeln("usage: seal <path> [yes]"); Err(ShellError::Unknown) }
             else { cmd_seal(ctx, cwd, args[1], argc >= 3 && args[2] == "yes") }
@@ -4252,7 +4256,7 @@ const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
-    "mkdir", "copy", "move", "rename", "delete", "seal", "find", "tree", "match", "count", "sort",
+    "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
     "where", "select", "to", "from", "sum", "min", "max", "avg",
@@ -4596,6 +4600,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
             ("delete <a>,<b>,...", "remove several (comma-separated; recursive applies to all)", "delete /a.txt,/b.txt"),
+        ], true),
+        "churn" => help_block(ctx, "churn", "hammer the filesystem for N seconds so a power cut lands somewhere", &[
+            ("churn <seconds>", "write/rename/delete continuously, then stop", "churn 30"),
+            ("churn <seconds>", "q stops it early; `drives check` afterwards is the verdict", "churn 120"),
         ], true),
         "seal" => help_block(ctx, "seal", "freeze a file's content, permanently - there is NO unseal", &[
             ("seal <path>", "freeze <path>'s bytes after asking [y/N]", "seal /audit.log"),
@@ -12298,6 +12306,111 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
         }
     }
     if count == 0 { out.line(ctx, "  (empty)"); }
+    Ok(())
+}
+
+/// `churn <seconds>` - keep the filesystem in constant motion so a power cut lands SOMEWHERE.
+///
+/// **Why this exists.** Three real power cuts on a Dell Wyse produced three clean mounts and not one
+/// `journal recovered` line, because the commit-to-checkpoint window is sub-millisecond and a human
+/// with a plug samples a fraction of a percent of a run. There are two ways to fix that and they
+/// answer different questions:
+///
+/// - `write /cutme.txt ...` (the `crash-window` build) holds ONE known window open for ten seconds.
+///   Deterministic. It PROVES the recovery path works.
+/// - `churn` runs thousands of transactions of every shape - create, overwrite, rename, delete, and
+///   the directory and bitmap and superblock writes that hang off them - for as long as you ask.
+///   Probabilistic. It SEARCHES for the windows nobody thought to aim at.
+///
+/// A proof and a search. Maximum carnage wants both, and this is the one that runs on a shipping
+/// build with no test feature compiled in - which matters, because a fault that only appears in a
+/// build nobody ships is a fault about that build.
+///
+/// **Bounded** (26.6): a fixed rotation of files in one directory, each rewritten in place, so the
+/// volume never fills however long it runs. Fixed stack buffers, no heap (26.6.1).
+///
+/// **Abortable** (conventions rule 9): `q` stops it, and it stops on its own at the deadline. A
+/// command that runs for a minute and cannot be interrupted is one the operator has to reboot out of.
+fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let secs: i64 = match arg.parse::<i64>() {
+        Ok(n) if n > 0 && n <= 3600 => n,
+        _ => { ctx.console_writeln("usage: churn <seconds>   e.g. churn 30   (1 to 3600)"); return Err(ShellError::Unknown); }
+    };
+    const DIR: &[u8] = b"/churn";
+    const SLOTS: usize = 8;
+    // Four sizes, so the mix spans a single data block, a partial extent and several blocks - the
+    // allocator takes different paths for each, and a one-size churn would only ever exercise one.
+    const SIZES: [usize; 4] = [64, 500, 1200, 3000];
+
+    let _ = fs_request(ctx, OP_MKDIR, DIR, &[]);
+    out.line_fmt(ctx, format_args!(
+        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT (q to stop)", secs));
+
+    let mut buf = [0u8; 3000];
+    let mut path = [0u8; 32];
+    let (mut writes, mut renames, mut deletes, mut bytes, mut failures) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let start = ctx.epoch_secs_monotonic();
+    let mut last_beat = start;
+    let mut i = 0u64;
+
+    loop {
+        // Deadline and abort checked EVERY iteration, not every N: a count would mean a different
+        // duration on every machine, which is the trap this project keeps re-learning.
+        let now = ctx.epoch_secs_monotonic();
+        if now.saturating_sub(start) >= secs { break; }
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b {
+                out.line(ctx, "churn: stopped");
+                break;
+            }
+        }
+        if now != last_beat {
+            last_beat = now;
+            out.line_fmt(ctx, format_args!("churn: {}s elapsed, {} writes", now.saturating_sub(start), writes));
+        }
+
+        let slot = (i % SLOTS as u64) as usize;
+        let n = SIZES[(i as usize / SLOTS) % SIZES.len()];
+        // A recognisable, varying payload: if a torn write ever surfaces, the bytes say which
+        // iteration wrote them rather than being an anonymous block of one repeated character.
+        for k in 0..n { buf[k] = b'0' + ((i as u8).wrapping_add(k as u8) % 10); }
+        let mut pl = 0usize;
+        for &b in DIR { path[pl] = b; pl += 1; }
+        path[pl] = b'/'; pl += 1;
+        path[pl] = b'f'; pl += 1;
+        path[pl] = b'0' + slot as u8; pl += 1;
+        path[pl..pl + 4].copy_from_slice(b".bin"); pl += 4;
+
+        match fs_request(ctx, OP_WRITE_FILE, &path[..pl], &buf[..n]).as_ref()
+                 .map(|r| r.payload_bytes().first().copied()) {
+            Some(Some(FS_OK)) => { writes += 1; bytes += n as u64; }
+            _ => failures += 1,
+        }
+
+        // Every few iterations, a DIFFERENT transaction shape. An overwrite alone exercises one
+        // journal path; rename and delete move directory entries and free extents, which are where
+        // the interesting interrupted states live (the tear sweep found its only real finding in a
+        // delete).
+        if i % 5 == 4 {
+            let mut np = [0u8; 32];
+            np[..pl].copy_from_slice(&path[..pl]);
+            np[pl - 4..pl].copy_from_slice(b".ren");
+            if matches!(fs_request(ctx, OP_RENAME, &path[..pl], &np[pl - 9..pl]).as_ref()
+                          .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+                renames += 1;
+                if matches!(fs_request(ctx, OP_DELETE, &np[..pl], &[]).as_ref()
+                              .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+                    deletes += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    out.line_fmt(ctx, format_args!(
+        "churn: done - {} writes, {} renames, {} deletes, {} bytes, {} refused",
+        writes, renames, deletes, bytes, failures));
+    out.line(ctx, "churn: run `drives check` after a cut - a LEAK is permitted, `marked free but are IN USE` is not");
     Ok(())
 }
 

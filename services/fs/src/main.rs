@@ -188,6 +188,11 @@ const COMMIT_CRC_OFF: usize = 508; // commit record: CRC32 of [0..8+n*8] lives a
 // `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
 // limit - a too-deep tree is refused loudly rather than risking the service stack.
 const MAX_TREE_DEPTH: u32 = 64;
+
+/// How long the `crash-window` build holds the commit-to-checkpoint window open, in seconds.
+/// Long enough to reach for a plug and short enough that an accidental arm is not a wedge.
+#[cfg(feature = "crash-window")]
+const CRASH_WINDOW_SECS: u64 = 10;
 const LABEL_MAX: usize = 31; // superblock: label_len u8 @76, label[31] @77
 
 const ITYPE_FREE: u8 = 0;
@@ -497,6 +502,9 @@ struct Fs {
     // `commit_txn` right after the commit record is durable but before the checkpoint, to
     // simulate a power loss at the worst moment. Always false in production.
     crash_after_commit: bool,
+    /// `crash-window` build: this transaction touches a `/cutme…` path, so hold the
+    /// commit-to-checkpoint window open. Set by the op dispatch, cleared when the window closes.
+    crash_window_armed: bool,
     // Open-file table (file-as-capability, §7.10): delegated ResourceId → file path. `rid == 0`
     // is a free slot. Reset on mount (an fs restart invalidates all outstanding file caps).
     open_files: [OpenFile; MAX_OPEN],
@@ -1588,6 +1596,12 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     // commit them through the journal (`end_txn`). A crash before the commit record leaves the
     // fs unchanged; after it, the op is replayed on the next mount. (delete_tree manages its
     // own transactions; write_at writes only data, so neither is wrapped here.)
+    // ARM THE CRASH WINDOW when the path says so (`crash-window` build only; compiled out
+    // otherwise). `/cutme...` is the operator saying "hold the journal open on this one" without a
+    // protocol op or a shell verb existing to say it.
+    #[cfg(feature = "crash-window")]
+    { fs.crash_window_armed = path.starts_with(b"/cutme"); }
+
     macro_rules! txn {
         ($e:expr) => {{
             fs.begin_txn();
@@ -1942,6 +1956,7 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
+            crash_window_armed: false,
             open_files: [OpenFile { rid: 0, plen: 0, append_only: false, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         });
         Ok(())
@@ -2156,6 +2171,28 @@ impl Fs {
         }
     }
 
+    /// Hold the commit-to-checkpoint window open for `CRASH_WINDOW_SECS` (test builds only).
+    ///
+    /// Compiled to nothing without the feature, and even then it does nothing unless this
+    /// transaction was armed by a `/cutme…` path. Announced loudly and counted down, because a
+    /// window nobody can see is no more aimable than one that lasts a microsecond.
+    #[cfg(feature = "crash-window")]
+    fn crash_window(&mut self, ctx: &ServiceContext) {
+        if !self.crash_window_armed { return; }
+        self.crash_window_armed = false;
+        ctx.log_fmt(format_args!(
+            "fs: [crash-window] THE JOURNAL IS COMMITTED AND UNAPPLIED - CUT THE POWER NOW ({}s)",
+            CRASH_WINDOW_SECS));
+        for left in (1..=CRASH_WINDOW_SECS).rev() {
+            ctx.log_fmt(format_args!("fs: [crash-window] {}...", left));
+            ctx.sleep(ctx.duration_cycles(1000));
+        }
+        ctx.log("fs: [crash-window] window closed - applying the checkpoint normally. \
+                 A boot after a cut inside it must say `journal recovered`.");
+    }
+    #[cfg(not(feature = "crash-window"))]
+    fn crash_window(&mut self, _ctx: &ServiceContext) {}
+
     fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
         if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
         let n = self.txn_n;
@@ -2217,6 +2254,19 @@ impl Fs {
         let _ = self.durable_or_warn(ctx); // advisory: see BARRIER 3
         // Test-only: simulate a power loss right here - commit record durable, home not yet
         // updated. The next mount must replay this transaction. (Never set in production.)
+        // HOLD THE WINDOW OPEN so a human can aim at it (`crash-window` build only).
+        //
+        // The commit record is durable and NO home block has moved yet. That is precisely the state
+        // the journal exists to recover from, and it normally lasts under a millisecond - which is
+        // why three real power cuts on a Dell Wyse produced three clean mounts and not one
+        // `journal recovered` line. The recovery path is exercised 35 times in every QEMU tear
+        // sweep and has never once run on silicon.
+        //
+        // Armed by the PATH rather than by a command: any write whose path begins `/cutme` opens the
+        // window. That keeps the whole feature out of the protocol and out of the shell's
+        // vocabulary - the trigger is data, not surface - and makes it obvious at the prompt what
+        // is about to happen.
+        self.crash_window(ctx);
         if self.crash_after_commit {
             ctx.log("fs: [journal-crash-test] commit record durable - halting before checkpoint (simulated crash)");
             loop { ctx.yield_cpu(); }
@@ -2498,6 +2548,7 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
+            crash_window_armed: false,
             open_files: [OpenFile { rid: 0, plen: 0, append_only: false, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         });
         Ok(())

@@ -61,6 +61,7 @@
   - [`whatis`](utilities/whatis.md)
   - [`trace`](utilities/trace.md)
   - [`events`](utilities/events.md)
+  - [`churn`](utilities/churn.md)
 
 # The gsh Language
 

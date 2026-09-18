@@ -8,6 +8,12 @@ name = "fs"
 path = "src/main.rs"
 
 [features]
+# Hold the commit-to-checkpoint window OPEN for a few seconds, on demand, so an operator with a
+# power cable can aim at it. The journal's recovery path is the one thing three real power cuts on
+# a Dell Wyse never reached: that window is sub-millisecond, so a hand-timed cut samples a fraction
+# of a percent of a run. Armed by writing to a path beginning `/cutme`, so it costs no protocol op
+# and no shell vocabulary. TEST BUILDS ONLY - see docs/gsfs-hardware-pass.md.
+crash-window = []
 # A feature rather than a promise to remove it, because §7.10 means real file I/O will eventually run
 # through `serve_filecap`, and this would then be per-request logging on every read and write.
 

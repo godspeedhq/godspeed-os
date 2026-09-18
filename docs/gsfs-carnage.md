@@ -328,6 +328,39 @@ is not the same as recovering from one. The fs/block channel has the same shape 
 design. A completion from an old driver instance acknowledging a newer request is not hypothetical
 here; it is the thing that already happened one layer over.
 
+### 3.8a Power cuts, deliberately and at random - BUILT (`fs-window` 8/0, `fs-churn` 8/0)
+
+Added after the Dell Wyse produced three clean power cuts and **not one `journal recovered` line**.
+Nothing was wrong: the commit-to-checkpoint window is sub-millisecond, and a human with a plug samples
+a fraction of a percent of a run. The recovery path had never run on silicon, and could not be made to.
+
+Two instruments, because they answer different questions:
+
+| | how | answers |
+|---|---|---|
+| **`fs-window`** | a `crash-window` build holds ONE known window open for ten seconds, armed by writing to a `/cutme...` path | **proves** recovery works - the next boot must say `journal recovered N block(s)` |
+| **`fs-churn`** | the `churn <seconds>` utility runs thousands of transactions of every shape; the machine is cut at a moment nobody chose | **searches** for the windows nobody thought to aim at |
+
+A proof and a search. Both carry to hardware unchanged, which is the point of building them here.
+
+**`churn` is an ordinary shell command on a SHIPPING build** - no test feature compiled in. That
+matters more than it looks: a fault that appears only in a build nobody ships is a fault about that
+build. `crash-window` is necessarily a test feature, since holding a journal open is not a thing a
+shipping filesystem should do.
+
+**What `fs-churn` asserts is deliberately NOT "the journal recovered."** It usually will not; one cut
+samples a narrow window once, and the run that verified this reported *"this cut fell outside the
+commit window - no replay, which is the common case"*. What must hold every time, whatever the cut
+hit, is the permitted-outcome table: the volume mounts, `0 bad`, and the accounting either consistent
+or drifted in the SAFE direction. The assertion carrying the weight is the negative one -
+`marked free but are IN USE` must never appear, because those blocks belong to a live file and the
+next allocation would overwrite them.
+
+One harness detail that decides whether either test is worth anything: **both kill on a MARKER, not a
+timer.** `fs-window` cuts when `fs` announces the window is open; `fs-churn` cuts once churn's
+per-second heartbeat proves it is writing. A fixed delay would sometimes cut before the first write
+reached the disk, or after the checkpoint, and either way the test would pass having proved nothing.
+
 ### 3.8 Crash recovery itself - PARTIAL, and the covered half is MEASURED
 
 **35 of the 75 tear points make the journal replay on mount.** Counted rather than assumed, and free:
@@ -434,7 +467,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
 | Block-driver restart and hot-unplug | NOT RUN | 3.7. See `backlog/31` for the same failure shape one layer over |
-| Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Crashing DURING recovery is not covered |
+| Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | NOT RUN - NOT REACHABLE | 3.11 / `backlog/34`. No non-x86 port can attach a usable disk in QEMU: riscv64 has no drive option, aarch64 has no VL805 emulation, arm32's stick re-enumerates 126 times and never settles. The x86 half is written and waiting |

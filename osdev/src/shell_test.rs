@@ -5757,6 +5757,209 @@ fn apply_writes_prefix(base: &[u8], writes: &[TappedWrite], k: u64, out_path: &s
 /// at a time is thousands of commands, and copying megabytes inside QEMU spends the whole runtime on
 /// the least interesting part. Three large files and a canary get the volume to the edge in one step,
 /// and every command the test then sends is aimed at the actual question.
+/// THE CRASH WINDOW: kill the machine while the journal is committed and unapplied.
+///
+/// Every other crash test here either constructs the post-crash disk host-side or replays a recorded
+/// write prefix. This one lets the SYSTEM reach the dangerous state on its own and then stops it
+/// there - which is the only version of the test that can be carried to real hardware, where nobody
+/// gets to choose the cut point.
+///
+/// Two boots. The first writes through a `/cutme` path, which makes `fs` hold the window open and
+/// announce it; QEMU is killed inside that window, leaving a durable commit record and NO home block
+/// moved. The second boots the same disk and must REPLAY it.
+/// CHURN then CUT: kill the machine while the filesystem is under continuous load.
+///
+/// The complement to `fs-window`. That one holds ONE known window open and proves recovery works;
+/// this one runs thousands of transactions of every shape and kills the machine at an arbitrary
+/// moment, which is what a real power cut is. The cut point is not chosen and cannot be - that is
+/// the point.
+///
+/// **What it asserts is deliberately not "the journal recovered".** It usually will not: the window
+/// is narrow and one cut samples it once. What must hold EVERY time, whatever the cut hit, is the
+/// permitted-outcome table - the volume mounts, no block is corrupt, and the free accounting is
+/// either consistent or drifted in the SAFE direction (a leak). `marked free but are IN USE` is the
+/// one that must never appear, because those blocks belong to a live file and the next allocation
+/// would overwrite them.
+pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-churn: PASS - {}", $label); pass += 1; } else { println!("fs-churn: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |cmds: &[&str], kill_after: Option<&str>, secs: u64| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                match kill_after {
+                    // Wait for churn to be demonstrably RUNNING (its per-second heartbeat), then cut.
+                    // Killing on a fixed delay from the command being sent would sometimes cut before
+                    // the first write ever reached the disk, which tests nothing.
+                    Some(marker) => {
+                        if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(40)).is_some() {
+                            thread::sleep(Duration::from_millis(1500));
+                            child.kill().ok();
+                            break;
+                        }
+                    }
+                    None => { let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(secs)); }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-churn: boot 1 - churn, then cut the machine mid-transaction");
+    let w1 = boot(&["churn 30"], Some("churn: 2s elapsed"), 60);
+    check!(w1.contains("churn: writing continuously"), "churn started");
+    check!(w1.contains("s elapsed"), "churn was demonstrably WRITING when the machine was cut");
+    check!(!w1.contains("churn: done"), "the machine was cut mid-churn (churn never finished)");
+
+    println!("fs-churn: boot 2 - the volume must come back inside the permitted set");
+    let w2 = boot(&["read /canary.txt", "drives check"], None, 200);
+    check!(w2.contains("mounted GSFS0008") || w2.contains("storage recovered"), "the volume MOUNTS after the cut");
+    check!(w2.contains("untouched-by-any-of-this"), "a file written before the churn is intact");
+    check!(w2.contains("0 bad"), "no corrupt blocks - nothing was torn at the sector level");
+    // THE ONE THAT MATTERS. A leak is permitted (26.4: the free count is a derived view, reconciled
+    // from the tree). Blocks marked FREE while a live file still references them are not: the next
+    // allocation hands them out and a write destroys data something still points at.
+    check!(!w2.contains("marked free but are IN USE"),
+           "the accounting did not drift in the DANGEROUS direction (free-but-in-use)");
+    check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
+    if w2.contains("journal recovered") {
+        println!("fs-churn: (this cut landed IN the commit window - the journal replayed)");
+    } else {
+        println!("fs-churn: (this cut fell outside the commit window - no replay, which is the common case)");
+    }
+
+    let _ = std::fs::write("build/tests/fs_churn_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\nfs-churn: {pass} passed, {fail} failed  (serial -> build/tests/fs_churn_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_window(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-window: PASS - {}", $label); pass += 1; } else { println!("fs-window: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // Boot, run `cmds`, and - if `kill_on` is given - kill QEMU the moment that text appears, rather
+    // than after a fixed wait. Waiting a fixed time would be a race with a ten-second window.
+    let boot = |cmds: &[&str], kill_on: Option<&str>| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                match kill_on {
+                    // KILL ON THE MARKER, NOT ON A TIMER. The window is ten seconds; a fixed sleep
+                    // would either cut before the commit record is durable (proving nothing) or
+                    // after the checkpoint (proving nothing else).
+                    Some(marker) => {
+                        if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(40)).is_some() {
+                            // Inside the window now. Cut immediately - this is the power cut.
+                            child.kill().ok();
+                            break;
+                        }
+                    }
+                    None => { let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)); }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-window: boot 1 - write through /cutme, and cut inside the open window");
+    let w1 = boot(&["write /cutme.txt committed-but-unapplied"],
+                  Some("THE JOURNAL IS COMMITTED AND UNAPPLIED"));
+    check!(w1.contains("THE JOURNAL IS COMMITTED AND UNAPPLIED"),
+           "the crash window OPENED and announced itself");
+    check!(!w1.contains("window closed"),
+           "the machine was cut INSIDE the window (it never reached the checkpoint)");
+
+    println!("fs-window: boot 2 - the same disk must RECOVER");
+    let w2 = boot(&["read /cutme.txt", "read /canary.txt", "drives check"], None);
+    // THE POINT OF THE WHOLE TEST. A commit record that survived with no home block applied is
+    // exactly what the journal is for, and this is the line that says it did its job.
+    check!(w2.contains("journal recovered"),
+           "the next mount REPLAYED the committed transaction (`journal recovered`)");
+    check!(w2.contains("mounted GSFS0008"), "and the volume mounted");
+    check!(w2.contains("committed-but-unapplied"),
+           "the interrupted write is PRESENT and correct after recovery");
+    check!(w2.contains("untouched-by-any-of-this"), "an unrelated file is intact");
+    check!(w2.contains("0 bad"), "no corrupt blocks after the recovery");
+    check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
+
+    let _ = std::fs::write("build/tests/fs_window_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\nfs-window: {pass} passed, {fail} failed  (serial -> build/tests/fs_window_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_full(image_path: &Path, persist_path: &str, smp: u32) {
     println!("fs-full: booting (smp={smp}) with a volume baked to the edge of capacity");
     let qemu      = crate::qemu::qemu_binary();
