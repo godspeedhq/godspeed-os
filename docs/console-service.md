@@ -232,10 +232,19 @@ ANSI subset, and (5) routing by API stand.
 
 ## 6. Out of scope (far-future, not this work)
 
-Multiple virtual terminals, a real VT100/xterm emulator, scrollback paging, copy/
-paste, resize, colour themes beyond the current green-on-black. The goal here is a
-*clean, stable interactive console with foreground-app support*, not a terminal
-emulator.
+Multiple virtual terminals, a real VT100/xterm emulator, copy/paste, resize, colour
+themes beyond the current green-on-black. The goal here is a *clean, stable interactive
+console with foreground-app support*, not a terminal emulator.
+
+> **Amendment 2026-09-18: scrollback is IN, and it is the one item on this list that was
+> not a nicety.** This section listed "scrollback paging" alongside copy/paste and colour
+> themes, as though the three were the same kind of want. They are not. Without scrollback
+> a framebuffer console **loses output permanently**: reaching the bottom of the screen
+> scrolls the top away and there is nowhere for it to have gone. That is not a missing
+> convenience, it is the display discarding information the operator asked for - and it is
+> the stated reason `help` and `trace` each grew a pager of their own (§10).
+>
+> The rest of the list stands.
 
 ---
 
@@ -471,3 +480,130 @@ KIND of miss:
    covered, so nobody looks.** There is no test for it (§22 explains why - it is a negative property on
    a machine that cannot be failed on demand in QEMU), which is exactly why it needed reading rather
    than assuming.
+
+---
+
+## 10. Scrollback (2026-09-18)
+
+The console retains lines that scroll off the top, and PgUp/PgDn walk them.
+
+### 10.1 Why it belongs to the service and not the kernel
+
+§11.4's boot/panic floor deliberately keeps **no** history: reaching the bottom of the
+screen clears it and starts again, because a panic must not depend on a data structure
+that could itself be corrupt, and serial holds the full transcript either way. This is the
+`console` **service**, which owns the terminal model (§9.2), and history is exactly that.
+
+The kernel is not touched by this work.
+
+### 10.2 The ring
+
+32 KiB of bytes and 512 line slots, evicting oldest-first on whichever bound binds first.
+Both bounds are real: a screen of blank lines must not be able to evict a screen of real
+ones, so there is a ceiling on count as well as on bytes. Measured on the first boot, the
+ring filled at 512 lines / 26,008 bytes - about 51 bytes a line, so the two ceilings are
+well matched rather than one being decorative.
+
+**The bound is the STACK, not the memory limit**, and that is worth knowing before anyone
+raises it. The service may use 8 MiB, but `Term` is a local of `service_main` and the user
+stack is 256 KiB. The first cut (64 KiB + 1024 lines) put `Term::new` at 180 KiB and
+`service_main` at 118 KiB - 299 KiB together, which faults on the first store of its own
+prologue. See §10.6.
+
+Addressing is **monotonic**: `wpos` counts every byte ever written and never wraps, and the
+storage index is `wpos % SB_BYTES`. That turns "has this line been overwritten?" into one
+comparison rather than an interval-overlap test against a wrapped region, which is where a
+ring like this usually goes wrong. A line may straddle the end of the buffer; readers copy
+it in two pieces.
+
+Trailing blanks are stripped on the way in. The shadow grid is space-filled to its full
+width, so storing a line verbatim would spend 208 bytes on it regardless of content and cut
+what fits by an order of magnitude.
+
+**Attributes are not retained**, stated here rather than left to be discovered. The shadow
+grid carries one reverse-video bit per cell; scrollback keeps characters only, halving the
+memory. A reverse-video line scrolled back to shows as plain text. Reverse video lives in
+full-screen apps, which own the screen and whose output is not scrollback material.
+
+### 10.3 One capture point
+
+`scroll()`, where row 0 is about to be overwritten by row 1. That is the exact and only
+moment a line leaves the screen - every other path either stays on screen or clears it
+deliberately. Retaining it there means scrollback cannot miss output, whatever produced it,
+and no producer needs to know scrollback exists.
+
+### 10.4 Scrolling is a REQUEST, never an escape sequence
+
+Console output is untrusted content: a file being `read` can contain any bytes at all, so a
+scroll expressed as a CSI sequence would let a file scroll the view of the terminal
+displaying it. This is the argument `dir` already makes about filenames, one layer out.
+
+Requests carry a reply cap and output does not, which is what separates the two channels in
+this service - by construction, not by inspecting the payload. `REQ_SCROLL` joins `REQ_DIMS`
+on that channel, and the SDK's `console_scroll(action)` is how a holder of the keyboard asks.
+
+**The console does the arithmetic**, because only it knows how many lines it holds and how
+tall the screen is. A copy of either number in the shell would be a second thing to drift.
+
+### 10.5 What the keys are, and the one conflict
+
+- **PgUp / PgDn** scroll a page, always. They were genuinely free: the shell's CSI handler
+  listed them as ignored.
+- **Home / End** are claimed **only while the view is already scrolled** - "oldest kept" and
+  "live". At an ordinary prompt they still mean start-of-line and end-of-line, because they
+  have edited the command line since there was one and that is not negotiable. While scrolled
+  there is nothing to edit, and the indicator on screen is advertising them.
+- **Anything else** returns the view to live and is then handled normally. This needs no code:
+  a keystroke at the prompt is echoed, an echo is console output, and **output snaps the view**.
+
+The pinned bottom row says `[PgUp/PgDn] page  [Home] oldest kept  [End] live`, in reverse
+video so it cannot be mistaken for content.
+
+**"Oldest kept", never "start".** Once the ring has wrapped, the top of the view is not the
+beginning of the session - it is the oldest line that survived. Presenting it as the beginning
+would be claiming to show history that was discarded, which is the same shape of wrong answer
+as a truncated directory listing reported as a total (§26.7). The ring counts what it has aged
+out so the view can say which case it is in.
+
+### 10.6 Output snaps the view back to live - the deliberate simplification
+
+A desktop terminal holds your position and lets the backlog grow behind you. That needs the
+glyph path to update the shadow grid **without** touching the framebuffer - a suppression flag
+threaded through every draw - and it is worth much less here than it looks: service logs go to
+the kernel ring and serial (§11.4), not to this service, so on a framebuffer the only writer is
+whoever the operator just ran. **Output arrives because you asked for it.**
+
+Recorded as the simplification it is, rather than left to be inferred from the behaviour.
+
+### 10.7 What adding it uncovered
+
+Three defects, each older and worse than the feature, all of which had survived because
+nothing measured them:
+
+1. **`osdev build` had been shipping a stale `console`.** Its crate list omitted `console`,
+   `control`, `time` and `hw-enumerator`, so it relinked the supervisor around whatever copies
+   were lying in the target directory. Sixteen copies of that list; there is one now. Same
+   shape `services/supervisor/build.rs` already records for its USB list: a **missing** binary
+   trips a guard and a **stale** one does not, because a stale file is not missing.
+2. **`scripts/stack_fit_check.py` was blind on x86**, and was called only from two hand-written
+   board scripts - so the gate existed on two boards and nowhere else, including every QEMU
+   suite. It now knows the x86 prologue *and its probe loop* (teaching it only the first was an
+   18x undercount, precisely on the large frames it exists to catch), has a command line, and
+   runs from `osdev build`.
+3. **`Term::new` materialised the terminal twice** - 180 KiB, from a 118 KiB `service_main`.
+   Its own doc comment warned about exactly this while the code did it; it was survivable only
+   because `Fb` was small. `blank()` is a `const fn` returning a literal now, built directly
+   into the caller's local, with `attach(fb)` doing the init through `&mut self` - which is what
+   the comment said all along.
+
+### 10.8 What it does NOT do yet
+
+The `help` and `trace` pagers are **still in place**. Removing a workaround before its
+replacement is verified on hardware would leave the Pi-on-a-TV case - the only reason either
+exists - with no way to read `help` at all. `help`'s pager goes once scrollback is proven on a
+board; `trace`'s stays regardless, because it pins a **column header** while you scroll, which
+scrollback structurally cannot do.
+
+Verified in QEMU (`osdev test shell`): PgUp enters history, output returns the view to live by
+itself, End returns to live while scrolled, Home is taken as a scroll while scrolled **and
+still edits the line when it is not**.

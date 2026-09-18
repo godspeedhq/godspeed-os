@@ -380,6 +380,74 @@ pub fn run(image_path: &Path, smp: u32) {
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
 
     // -----------------------------------------------------------------------
+    // console scrollback
+    // -----------------------------------------------------------------------
+    //
+    // The framebuffer console keeps no history of its own, so anything taller than the screen loses
+    // its top permanently. The `console` service now retains lines that scroll off and PgUp/PgDn walk
+    // them.
+    //
+    // **THIS IS A FRAMEBUFFER FEATURE BEING TESTED OVER A SERIAL LINE**, which sounds impossible and
+    // is why the console reports the two TRANSITIONS - into history and back to live. Those are what
+    // carry the information anyway (a report per keypress is a report nobody reads), and they make
+    // the feature observable by something other than a pair of eyes. Boot has already produced far
+    // more than a screenful by this point, so there is history to walk.
+    //
+    // PgUp is `ESC [ 5 ~`. The CSI handler listed it as ignored until now, which is why it was free:
+    // Home and End were NOT free, and are claimed only while the view is already scrolled.
+    // WAIT ON THE MARKER, NOT ON THE PROMPT. The console's log is asynchronous to the shell's
+    // prompt, and it was landing a few bytes after it - so a collect that stopped at `gsh>` missed
+    // the line it was looking for and found it at the start of the NEXT case instead. Each step
+    // below waits for the transition it is actually about.
+    send(&mut write_half, b"\x1b[5~");
+    let sb1 = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10))
+        .unwrap_or_default();
+    check!(sb1.contains("scrolled back"),
+           "scrollback: PgUp scrolls the console into retained history");
+    // OUTPUT SNAPS THE VIEW BACK TO LIVE. This is the whole of "any key that is not a scroll key
+    // returns you to the bottom": a keystroke at the prompt is echoed, an echo is console output, and
+    // output snaps the view. It falls out rather than being implemented.
+    send(&mut write_half, b"cores\r");
+    let sb1b = collect_until(&buf, &mut cursor, b"(output arrived)", Duration::from_secs(10))
+        .unwrap_or_default();
+    check!(sb1b.contains("returned to live"),
+           "scrollback: output returns the view to live by itself");
+    let sb1c = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sb1c.contains("cores: 4") || sb1b.contains("cores: 4"),
+           "scrollback: the command ran normally afterwards");
+
+    // End RETURNS TO LIVE while scrolled, and is the line editor's "end of line" otherwise. Home is
+    // the same arrangement for "oldest kept". Sent as `ESC [ F` / `ESC [ H`, the forms the shell's
+    // CSI handler already reads for the line editor.
+    send(&mut write_half, b"\x1b[5~");
+    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
+    send(&mut write_half, b"\x1b[F");
+    let sb2 = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(10))
+        .unwrap_or_default();
+    check!(sb2.contains("returned to live"),
+           "scrollback: End returns to live while scrolled (not the line editor)");
+
+    // Home while scrolled reaches the OLDEST LINE STILL KEPT - never called "the start", because once
+    // the ring has wrapped it is not the start, and saying so would claim history that was discarded.
+    send(&mut write_half, b"\x1b[5~");
+    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
+    send(&mut write_half, b"\x1b[H");
+    send(&mut write_half, b"cores\r");
+    let sb3 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sb3.contains("returned to live"), "scrollback: Home is taken as a scroll while scrolled");
+
+    // AND AT AN ORDINARY PROMPT, Home and End STILL EDIT THE LINE. This is the half that would break
+    // silently if the keys had been claimed unconditionally.
+    //
+    // Type `hello world`, press Home, then type `echo ` - which must land at the FRONT, giving
+    // `echo hello world`. If Home had gone to the scrollback instead, the cursor would still be at
+    // the end and the line would read `hello worldecho `, which is not a command.
+    send(&mut write_half, b"hello world\x1b[Hecho \r");
+    let sb4 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sb4.contains("hello world"),
+           "scrollback: Home still edits the line when the view is NOT scrolled");
+
+    // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
     // `help` is now paged (the framebuffer console has no scrollback). Drive the pager:

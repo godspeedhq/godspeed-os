@@ -2804,6 +2804,40 @@ impl ServiceContext {
         }
     }
 
+    /// Move the console's scrolled-back view, returning `(lines back, most it can go back)`.
+    ///
+    /// `action` is one of the `SCROLL_*` values in `services/console/src/term.rs`: 0 live, 1 line
+    /// up, 2 line down, 3 page up, 4 page down, 5 oldest kept.
+    ///
+    /// The framebuffer console has no scrollback of its own - reaching the bottom of the screen used
+    /// to mean the top was gone permanently - and this is how a holder of the keyboard asks to look
+    /// back. The console does the arithmetic, because only it knows how many lines it is holding and
+    /// how tall the screen is; a second copy of either number here would be a second thing to drift.
+    ///
+    /// **THE SCROLL IS A REQUEST, NOT AN ESCAPE SEQUENCE.** Console output is untrusted content: a
+    /// file being `read` can hold any bytes, so a scroll expressed in the byte stream would let a
+    /// file scroll the view of the terminal showing it. A request carries a reply cap and output
+    /// does not, so the two channels are separated by construction.
+    ///
+    /// `(0, 0)` if the console cannot be reached - the same degraded answer `console_dims` gives,
+    /// and for the same reason: a caller must be able to carry on without a display service.
+    pub fn console_scroll(&self, action: u8) -> (u16, u16) {
+        let mut buf = [0u8; 8];
+        // Opcode 2 = REQ_SCROLL (`services/console/src/main.rs`).
+        let req = [2u8, action];
+        let mut n = self.request_with_reply_deadline_into("console", &req, &mut buf, 2);
+        if n.is_none() && self.reacquire_by_name("console") {
+            n = self.request_with_reply_deadline_into("console", &req, &mut buf, 2);
+        }
+        match n {
+            Some(k) if k >= 4 => (
+                u16::from_le_bytes([buf[0], buf[1]]),
+                u16::from_le_bytes([buf[2], buf[3]]),
+            ),
+            _ => (0, 0),
+        }
+    }
+
     /// Whether the input driver has reported setup complete (syscall 13, query 10).
     /// The deterministic end-of-boot signal: the shell watches it to auto-clear the
     /// boot screen the moment the keyboard subsystem is up. Ambient.

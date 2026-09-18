@@ -65,6 +65,21 @@ use crate::render::{CELL_H, CELL_W};
 /// `service_main` at 118 KiB - 299 KiB together, against a 256 KiB stack, which faults on the first
 /// store of its own prologue. `scripts/stack_fit_check.py` measures it; it could not, on x86, until
 /// this change taught it the prologue, which is how a 45%-of-stack frame had gone unnoticed.
+/// What a scroll request asks for. The shell sends one of these; the console does the arithmetic,
+/// because only it knows how many lines it is holding and how tall the screen is.
+pub const SCROLL_LIVE: u8 = 0;      // End - back to the live screen
+pub const SCROLL_UP: u8 = 1;        // one line further into history
+pub const SCROLL_DOWN: u8 = 2;      // one line back toward live
+pub const SCROLL_PAGE_UP: u8 = 3;   // PgUp
+pub const SCROLL_PAGE_DOWN: u8 = 4; // PgDn
+pub const SCROLL_TOP: u8 = 5;       // Home - the OLDEST LINE STILL KEPT, which is not the start
+/// Ask where the view is WITHOUT moving it or repainting.
+///
+/// The shell needs this because Home and End are shared with the line editor: it must know whether
+/// the view is already scrolled before deciding which of the two meanings a keypress has. A query
+/// that repainted would flicker the screen on every Home at an ordinary prompt.
+pub const SCROLL_QUERY: u8 = 6;
+
 pub(crate) const SB_BYTES: usize = 32 * 1024;
 
 /// Most lines retained, whatever their length. A screen of blank lines must not be able to evict a
@@ -276,6 +291,25 @@ pub(crate) struct Fb {
     // pagers, and why they can stop needing them.
     pub(crate) sb: Scrollback,
 
+    /// Set when OUTPUT snapped the view back to live, cleared when that is reported.
+    ///
+    /// Needed because the console reports the two view transitions, and "returned to live" happens
+    /// two ways: a scroll request asked for it, or output arrived. The first is reported by the
+    /// request handler; without this flag the pass-level check reported the same transition a second
+    /// time, so a single `End` produced both lines and the log claimed two events where there was
+    /// one. An instrument that double-counts is worse than one that says less.
+    pub(crate) snapped_by_output: bool,
+
+    /// Lines the view is scrolled back from live. 0 means the screen shows the live grid, which is
+    /// every moment except while somebody is reading history.
+    ///
+    /// The shadow grid is NOT disturbed while scrolled - the scrolled view is painted straight to
+    /// the framebuffer from the ring and the grid, and returning to live is an ordinary
+    /// `repaint_all` from the grid that was there all along. Keeping a second copy of the live
+    /// screen to restore from would be another 15 KiB on a stack that has already been the problem
+    /// once in this file.
+    pub(crate) view: usize,
+
     // Precomputed foreground-blend LUT: blend_lut[intensity] = the glyph-pixel colour for that
     // antialiasing intensity, composed in the device layout. Lets an antialiased glyph edge blit as a
     // table read instead of a per-pixel multiply/divide.
@@ -332,6 +366,8 @@ impl Term {
                 grid: [[b' '; MAX_COLS]; MAX_ROWS],
                 attr: [[0; ATTR_STRIDE]; MAX_ROWS],
                 sb: Scrollback::new(),
+                view: 0,
+                snapped_by_output: false,
                 blend_lut: [0; 256],
             },
         }
@@ -362,9 +398,68 @@ impl Term {
 
     /// Write a byte sequence to the terminal.
     pub fn put_bytes(&mut self, bytes: &[u8]) {
+        // OUTPUT SNAPS THE VIEW BACK TO LIVE, and this is the whole of the rule "any key that is not
+        // a scroll key returns you to the bottom" - it falls out rather than being implemented,
+        // because a keystroke at the prompt is echoed by the shell and an echo is output.
+        //
+        // The alternative - hold the reader's position and let the backlog grow behind them, as a
+        // desktop terminal does - needs the glyph path to update the shadow grid WITHOUT touching
+        // the framebuffer, which is a suppression flag threaded through every draw. It is also worth
+        // much less here than it looks: service logs go to the kernel ring and serial (§11.4), not
+        // to this service, so on a framebuffer the only writer is whoever the operator just ran.
+        // Output arrives because you asked for it. Recorded as the deliberate simplification it is.
+        if self.s.view != 0 {
+            self.s.view = 0;
+            self.s.repaint_pending = true;
+            self.s.snapped_by_output = true;
+        }
         for &b in bytes {
             process_byte(&mut self.s, b);
         }
+    }
+
+    /// Move the scrolled view, and repaint it. Returns `(lines back, most it can go back)`.
+    ///
+    /// The console owns this arithmetic rather than the shell, because the shell knows neither how
+    /// many lines are retained nor how tall the screen is - and a second copy of either number is a
+    /// second thing to drift.
+    pub fn scroll_view(&mut self, action: u8) -> (usize, usize) {
+        let s = &mut self.s;
+        if s.rows == 0 { return (0, 0); }
+        // Answered before anything moves or paints - see `SCROLL_QUERY`.
+        if action == SCROLL_QUERY { return (s.view, s.sb.len()); }
+        // A page leaves one line of overlap, so a reader can see where the last page ended.
+        let page = s.rows.saturating_sub(2).max(1);
+        let max = s.sb.len();
+        let was = s.view;
+        s.view = match action {
+            SCROLL_LIVE      => 0,
+            SCROLL_UP        => (s.view + 1).min(max),
+            SCROLL_DOWN      => s.view.saturating_sub(1),
+            SCROLL_PAGE_UP   => (s.view + page).min(max),
+            SCROLL_PAGE_DOWN => s.view.saturating_sub(page),
+            SCROLL_TOP       => max,
+            _                => s.view,
+        };
+        if s.view == 0 {
+            // Back to live: the shadow grid was never disturbed, so this is an ordinary repaint.
+            if was != 0 { repaint_all(s); render::present(); }
+        } else {
+            paint_view(s);
+            render::present();
+        }
+        (s.view, max)
+    }
+
+    /// Lines the view is scrolled back, and the most it could be.
+    pub fn view(&self) -> (usize, usize) { (self.s.view, self.s.sb.len()) }
+
+    /// Did OUTPUT just snap the view back to live? Clears the flag, so the transition is reported
+    /// exactly once and cannot be double-counted against a scroll request that did the same thing.
+    pub fn take_output_snap(&mut self) -> bool {
+        let was = self.s.snapped_by_output;
+        self.s.snapped_by_output = false;
+        was
     }
 
     /// Show everything written since the last flush.
@@ -882,6 +977,92 @@ fn scroll(s: &mut Fb) {
     // the sort of shortcut that would show up as a highlight silently vanishing after a scroll.
     // Deferred, not skipped: `flush` paints this before anything is shown. See `Fb::repaint_pending`.
     s.repaint_pending = true;
+}
+
+/// Paint the scrolled-back view: history above, an indicator on the bottom row.
+///
+/// THE HISTORY IS `scrollback ++ live grid`, one flat sequence of `sb.len() + rows` lines, and the
+/// view is a window of it ending `view` lines from the end. That framing is what makes scrolling
+/// past the top of the live screen and into the ring seamless rather than a special case: the join
+/// between the two is just an index comparison.
+///
+/// Nothing here touches the shadow grid. Returning to live is `repaint_all` from a grid that was
+/// never disturbed.
+fn paint_view(s: &mut Fb) {
+    let (rows, cols) = (s.rows, s.cols);
+    if rows == 0 { return; }
+    let body = rows - 1;                       // the bottom row carries the indicator
+    let sbn = s.sb.len();
+    let total = sbn + rows;
+    let bottom = total.saturating_sub(s.view); // history index just past the last visible line
+    let width = cols.min(MAX_COLS);
+    let mut line = [b' '; MAX_COLS];
+    for r in 0..body {
+        let j = (bottom + r).saturating_sub(body);
+        for c in 0..width { line[c] = b' '; }
+        if j < sbn {
+            s.sb.line(j, &mut line[..width]);
+        } else if j - sbn < rows {
+            let gr = j - sbn;
+            line[..width].copy_from_slice(&s.grid[gr][..width]);
+        }
+        paint_plain_row(s, r, width, &line);
+    }
+    paint_view_indicator(s, body, width);
+}
+
+/// Draw one row of plain text straight to the framebuffer - no attributes, no shadow-grid write.
+///
+/// Trailing blanks are filled as one rectangle for the reason `paint_row_content` gives: a console
+/// line is mostly blank, and painting a blank as a space GLYPH costs a font lookup and a full cell of
+/// non-cacheable stores per column.
+fn paint_plain_row(s: &mut Fb, r: usize, width: usize, line: &[u8; MAX_COLS]) {
+    let mut tail = width;
+    while tail > 0 && line[tail - 1] == b' ' { tail -= 1; }
+    let saved = s.reverse;
+    s.reverse = false;
+    for c in 0..tail {
+        render::draw_glyph(s, line[c], c, r);
+    }
+    s.reverse = saved;
+    blank_row_tail(s, r, tail, width);
+}
+
+/// The bottom row while scrolled: where you are, and how to get back.
+///
+/// **IT SAYS "OLDEST KEPT", NEVER "START".** Once the ring has wrapped, the top of the view is not
+/// the beginning of the session - it is the oldest line that survived - and presenting it as the
+/// beginning would be claiming to show history that was discarded (§26.7). `aged` is how it knows.
+fn paint_view_indicator(s: &mut Fb, r: usize, width: usize) {
+    let mut buf = [b' '; MAX_COLS];
+    let mut n = 0usize;
+    let mut put = |b: &mut [u8; MAX_COLS], n: &mut usize, t: &[u8]| {
+        for &c in t { if *n < width { b[*n] = c; *n += 1; } }
+    };
+    put(&mut buf, &mut n, b" scrollback ");
+    put_num(&mut buf, &mut n, s.view as u64, width);
+    put(&mut buf, &mut n, b" of ");
+    put_num(&mut buf, &mut n, s.sb.len() as u64, width);
+    put(&mut buf, &mut n, if s.sb.aged() > 0 { b" lines kept " } else { b" lines " });
+    put(&mut buf, &mut n, b"  [PgUp/PgDn] page  [Home] oldest kept  [End] live ");
+    // Reverse video, so the indicator cannot be mistaken for content - it is the one row on screen
+    // that is not something a program printed.
+    let saved = s.reverse;
+    s.reverse = true;
+    for c in 0..width { render::draw_glyph(s, buf[c], c, r); }
+    s.reverse = saved;
+}
+
+/// Append a decimal number to a fixed buffer. No heap, no `format_args!` - this file has no logger.
+fn put_num(b: &mut [u8; MAX_COLS], n: &mut usize, mut v: u64, width: usize) {
+    let mut d = [0u8; 20];
+    let mut k = 0usize;
+    if v == 0 { d[k] = b'0'; k = 1; }
+    while v > 0 { d[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+    while k > 0 {
+        k -= 1;
+        if *n < width { b[*n] = d[k]; *n += 1; }
+    }
 }
 
 /// Paint the whole screen from the shadow grid. The deferred half of `scroll`.

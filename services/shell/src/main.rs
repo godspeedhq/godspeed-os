@@ -800,6 +800,38 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
+/// Scroll actions, mirroring `services/console/src/term.rs`. Only the three the prompt sends.
+const SCROLL_LIVE: u8 = 0;
+const SCROLL_PAGE_UP: u8 = 3;
+const SCROLL_PAGE_DOWN: u8 = 4;
+const SCROLL_TOP: u8 = 5;
+const SCROLL_QUERY: u8 = 6;
+
+/// Home while SCROLLED BACK means "the oldest line still kept"; at the prompt it means "start of
+/// line". Returns true if it was taken as a scroll.
+///
+/// **HOME AND END ALREADY BELONG TO THE LINE EDITOR, and that is not negotiable** - they have edited
+/// the command line since there was one. PageUp and PageDown were genuinely free (the CSI handler
+/// listed them as ignored), so those are unconditional; Home and End are claimed ONLY while the view
+/// is already scrolled, which is a moment when there is nothing to edit and the indicator on screen
+/// is advertising them. Any other key snaps the view back to live and is then handled normally -
+/// which needs no code here, because a keystroke at the prompt is echoed, an echo is console output,
+/// and output snaps the view (see `Term::put_bytes`).
+fn scroll_home(ctx: &ServiceContext) -> bool {
+    let (view, _) = ctx.console_scroll(SCROLL_QUERY);
+    if view == 0 { return false; }
+    ctx.console_scroll(SCROLL_TOP);
+    true
+}
+
+/// End while scrolled back returns to live; at the prompt it means "end of line".
+fn scroll_end(ctx: &ServiceContext) -> bool {
+    let (view, _) = ctx.console_scroll(SCROLL_QUERY);
+    if view == 0 { return false; }
+    ctx.console_scroll(SCROLL_LIVE);
+    true
+}
+
 fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
@@ -848,13 +880,15 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
         }
         b'C' => line.right(ctx), // Right - move cursor within the line
         b'D' => line.left(ctx),  // Left
-        b'H' => line.home(ctx),  // Home (ESC[H)
-        b'F' => line.end(ctx),   // End  (ESC[F)
+        b'H' => if !scroll_home(ctx) { line.home(ctx) },  // Home (ESC[H)
+        b'F' => if !scroll_end(ctx)  { line.end(ctx) },   // End  (ESC[F)
         b'~' => match param {    // navigation cluster: ESC[<n>~
-            1 | 7 => line.home(ctx),   // Home
-            4 | 8 => line.end(ctx),    // End
+            1 | 7 => if !scroll_home(ctx) { line.home(ctx) },  // Home
+            4 | 8 => if !scroll_end(ctx)  { line.end(ctx) },   // End
             3     => line.delete(ctx), // Delete (forward delete)
-            // 2 = Insert, 5 = PageUp, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
+            5     => { ctx.console_scroll(SCROLL_PAGE_UP); }   // PageUp - into the scrollback
+            6     => { ctx.console_scroll(SCROLL_PAGE_DOWN); } // PageDown - back toward live
+            // 2 = Insert, 11.. = F-keys: no shell action, ignored.
             _ => { let _ = have_param; }
         },
         _ => {} // unknown final byte - already consumed, do nothing

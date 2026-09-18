@@ -59,6 +59,17 @@ use term::Term;
 /// live here - so this is the only party that can answer, and there is one source of truth for it.
 const REQ_DIMS: u8 = 1;
 
+/// Request byte: move the scrolled-back view. `[REQ_SCROLL, action]`, where the action is one of
+/// `term::SCROLL_*`. The reply is `[view_lo, view_hi, max_lo, max_hi]` - how far back the view is
+/// now, and the furthest it could go.
+///
+/// **A REQUEST, NOT AN ESCAPE SEQUENCE IN THE BYTE STREAM, and the reason is the same one that makes
+/// `dir` sanitise filenames.** Console output is untrusted content: a file being `read` can contain
+/// any bytes at all, so a scroll expressed as a CSI sequence would let a file scroll the view of the
+/// terminal displaying it. Requests carry a reply cap and output does not, which is what separates
+/// the two channels here - by construction rather than by inspecting the payload.
+const REQ_SCROLL: u8 = 2;
+
 ///
 /// Present because the first hardware boot left a question plain observation could not settle: the
 /// terminal's queue sat full at 16/16 while it reported ~0% CPU, which is the signature of BOTH "too
@@ -236,7 +247,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // for pixels it is not asking about.
                 Some(reply_cap) => {
                     term.flush();
-                    reply_dims(&ctx, reply_cap, &term, msg.payload_bytes());
+                    serve_request(&ctx, reply_cap, &mut term, msg.payload_bytes());
                 }
                 None => {
                     let body = msg.payload_bytes();
@@ -277,6 +288,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // without flooding the log through the very console that is misbehaving. A sequence
         // legitimately spanning a message boundary shows up here once and then clears; a stranded
         // one never clears.
+        // Output arrived while the view was in history, so the view snapped back. Same transition
+        // the scroll request reports, reached the other way - and asked of the TERM rather than
+        // inferred from a before/after comparison, which could not tell the two apart and reported
+        // both for a single `End`.
+        if term.take_output_snap() {
+            ctx.log("console: returned to live (output arrived)");
+        }
         // SCROLLBACK, SAID ONCE WHEN IT FIRST WRAPS. The ring is the only part of this service that
         // silently discards anything, and the moment it starts doing so is the one worth knowing:
         // before it, `Home` reaches the start of the session; after it, `Home` reaches the oldest
@@ -344,15 +362,47 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// to be non-blocking or a slow caller can wedge the terminal for everyone. A failure is reported rather
 /// than swallowed - the caller is blocked on this reply, and dropping it silently would leave it to time
 /// out with no idea why (§26.7).
-fn reply_dims(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term: &Term, req: &[u8]) {
-    if req.first() != Some(&REQ_DIMS) {
-        ctx.log("console: request with an unknown opcode - dropping it");
-        ctx.remove_cap(reply_cap);
-        return;
-    }
-    let (rows, cols) = term.dims();
-    let reply = Message::from_bytes(&[rows as u8, (rows >> 8) as u8, cols as u8, (cols >> 8) as u8]);
+fn serve_request(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term: &mut Term, req: &[u8]) {
+    let reply = match req.first() {
+        Some(&REQ_DIMS) => {
+            let (rows, cols) = term.dims();
+            [rows as u8, (rows >> 8) as u8, cols as u8, (cols >> 8) as u8]
+        }
+        Some(&REQ_SCROLL) => {
+            // An absent action byte is "back to live" rather than an error: the safe reading of a
+            // malformed scroll request is the one that puts the operator where they can see what is
+            // happening.
+            let action = req.get(1).copied().unwrap_or(term::SCROLL_LIVE);
+            let (before, _) = term.view();
+            let (view, max) = term.scroll_view(action);
+            // SAY WHEN THE VIEW CROSSES INTO OR OUT OF HISTORY, and only then.
+            //
+            // Two lines per scrollback session, not one per keypress: a report that fires on every
+            // PgUp is a report nobody reads, and the transitions are what carry the information -
+            // the display is showing the past, and then it is not. It is also the only way this
+            // feature is visible to anything but a pair of eyes, which is what makes it testable
+            // over a serial line in QEMU rather than only on a screen somebody is looking at.
+            if before == 0 && view != 0 {
+                ctx.log_fmt(format_args!(
+                    "console: scrolled back {} of {} lines - the screen is showing HISTORY", view, max));
+            } else if before != 0 && view == 0 {
+                // Worded so it is NOT a prefix of the output-snap message below. They were
+                // "back to live" and "back to live (output arrived)", and anything matching the
+                // first also matched the second - so the log could not distinguish "the operator
+                // asked to come back" from "output dragged them back", which is the only thing
+                // these two lines exist to tell apart.
+                ctx.log("console: returned to live (requested)");
+            }
+            [view as u8, (view >> 8) as u8, max as u8, (max >> 8) as u8]
+        }
+        _ => {
+            ctx.log("console: request with an unknown opcode - dropping it");
+            ctx.remove_cap(reply_cap);
+            return;
+        }
+    };
+    let reply = Message::from_bytes(&reply);
     if ctx.try_send_by_handle(reply_cap, &reply).is_err() {
-        ctx.log("console: could not reply to a dims request - the caller will see it as unavailable");
+        ctx.log("console: could not reply to a request - the caller will see it as unavailable");
     }
 }
