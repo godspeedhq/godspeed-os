@@ -37,6 +37,7 @@
 mod crc32;
 mod disk_image;
 mod qemu;
+mod fs_model;
 mod shell_test;
 mod validator;
 
@@ -1452,6 +1453,10 @@ fn cmd_test(suite: &str) {
         "fs-full"      => run_fs_full_test(),
         "fs-window"    => run_fs_window_test(),
         "fs-churn"     => run_fs_churn_test(),
+        // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
+        // because `osdev test` takes exactly one argument and widening that for one suite would be
+        // the wrong trade.
+        s if s == "fs-model" || s.starts_with("fs-model:") => run_fs_model_test(s),
         "fs-nested"    => run_fs_nested_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
@@ -2813,6 +2818,11 @@ fn run_fs_all_tests() {
         // the list anyway, because a suite that exists outside "every fs suite" is precisely the rot
         // `backlog/32` is about - the two suites that sat RED on `main` did so because nothing swept
         // them. Cheapest-first ordering means a broken build still reports in a minute.
+        // The DIFFERENTIAL gate. Cheap (one boot, ~200 shell round trips) and it attacks something
+        // no other suite here can: every one of them tests GSFS against assertions written about
+        // GSFS, so a wrong BELIEF passes all of them. A fixed seed, so a green result means the same
+        // thing every run - explore with `fs-model:<seed>:<ops>`.
+        "fs-model",
         "fs-tear",
         "fs-full",
         // The two power-cut suites. `fs-window` aims at ONE known window and proves recovery runs;
@@ -3031,6 +3041,35 @@ fn run_fs_nested_test() {
     gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
 
     crate::shell_test::run_fs_nested(&window_img, &replay_img, persist, 4);
+}
+
+/// `osdev test fs-model[:seed[:ops]]` - the independent-oracle gate (carnage §3.2).
+fn run_fs_model_test(suite: &str) {
+    println!("\n=== fs: DIFFERENTIAL - GSFS against a model that knows nothing about it ===");
+    // A SHIPPING BUILD, no test feature. The model compares what a user would see, so anything that
+    // changed `fs` for the benefit of the test would be comparing against the wrong thing.
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_model.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+
+    // A FIXED DEFAULT SEED, not a random one. A suite that picks a new sequence every run is a
+    // suite whose green result means something different each time and whose red result may not
+    // reproduce - the opposite of what a gate is for. Pass a seed to explore; the default is what
+    // CI and `fs-all` run, and a failure found by exploring becomes a second fixed entry here.
+    // `osdev test fs-model:<seed>:<ops>` - both optional.
+    let extra: Vec<&str> = suite.split(":").skip(1).collect();
+    let seed = extra.first().and_then(|a| a.parse::<u64>().ok()).unwrap_or(0x5EED_0001);
+    let ops = extra.get(1).and_then(|a| a.parse::<usize>().ok()).unwrap_or(120);
+
+    crate::shell_test::run_fs_model(&image_path, persist, 4, seed, ops);
 }
 
 fn run_fs_churn_test() {

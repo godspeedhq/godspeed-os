@@ -1,8 +1,18 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
-**Status: the torn-write gate PASSES in QEMU across four operations (`osdev test fs-tear`, 18/0,
-75 tear points, 35 of them exercising journal recovery), the rest are NOT RUN. This is QEMU-validated only; no hardware result is claimed
-anywhere in this file.**
+**Status, as of 2026-09-18.** BUILT AND PASSING in QEMU: torn writes (`fs-tear` 18/0, four
+operations, 75 tear points, 35 exercising journal recovery), resource exhaustion (`fs-full` 14/0),
+power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
+(`fs-model`, §3.2). NOT RUN: the block layer (§3.7), concurrency and retry ordering (§3.5), the
+remaining rows of §3.3, and cross-ISA (§3.11, not reachable in QEMU).
+
+**This is QEMU-validated only.** The one hardware result is recorded in §4 and claims less than it
+looks: three power cuts on a Dell Wyse survived cleanly, and none of them landed in the window that
+would have invoked the journal, so recovery on silicon remains unproven.
+
+*(This line used to read "the rest are NOT RUN", which stopped being true the moment `fs-full` and
+the two power-cut suites landed and was not updated. A status line is the first thing anybody reads
+and the last thing anybody edits.)*
 
 The mission, and every gate below is an instance of it:
 
@@ -221,18 +231,60 @@ not have been written.
 reproducible, so a failure cannot be bisected, and a pass proves only that one timing was survivable.
 Worth an occasional second opinion; never the gate.
 
-### 3.2 An independent oracle - NOT RUN
+### 3.2 An independent oracle - BUILT, PASSES in QEMU (`osdev test fs-model`)
 
 A small abstract model of files, directories, names and contents, host-side in `osdev` where the
-suites already live and where a `HashMap` is allowed (26.6.1 governs what runs on the machine).
+suites already live and where a `BTreeMap` is allowed (26.6.1 governs what runs on the machine).
+`osdev/src/fs_model.rs` is the model; `run_fs_model` drives both.
 
 **It must not reuse GSFS allocation, traversal, rename or recovery logic.** A model that shares the
 implementation reproduces its bugs and agrees with them, which is worse than no model because it
-produces a green tick. This is the single most important constraint on this gate.
+produces a green tick. This is the single most important constraint on this gate - so every rule in
+the model is read off `utilities/*.md`, the page a PERSON is given, and nothing is derived from
+`services/fs`.
 
-Reproducible sequences, recorded seeds, and comparison of return values, trees, metadata and file
-bytes. Under injected interruption the comparison is not equality but MEMBERSHIP of the permitted set
-in section 2 - which is why that table had to exist first.
+**Two comparisons, and the second is the one that matters.**
+
+1. Per operation, **Ok versus Err** - via `result`, the shell's own outcome channel, which prints
+   exactly `Ok` or `Err(<name>)`. Deliberately NOT the error variant: which of the four a refusal
+   picks is shell implementation detail, and a model that predicted it would be coupled to the thing
+   it exists to be independent of.
+2. At the end, **the whole volume**: every file's bytes read back, every directory's name set listed,
+   both compared to the model exactly - then `drives check`, because a sequence can leave every name
+   and byte correct and the free bitmap wrong.
+
+**Result: 8 seeds, roughly 1,500 operations, no disagreement** - after the one it found, below. The
+default seed is FIXED (`0x5EED0001`), because a suite that picks a new sequence every run is one
+whose green means something different each time and whose red may not reproduce. Explore with
+`osdev test fs-model:<seed>:<ops>`; a failure found by exploring becomes a second fixed entry.
+
+#### What it found on its first run: a rule that lived only in the code
+
+`seal` on an already-sealed file. The model predicted a refusal - a fair reading of "there is no
+unseal" - and GSFS returned Ok, three times in one sequence.
+
+**Neither was a bug.** `fs` carries `if e.sealed { return Ok(()); } // idempotent: already frozen`,
+a deliberate decision with a comment on it. `utilities/50_seal.md` said nothing about the case at
+all: not "already sealed", not "re-seal", not "idempotent". So the rule existed, was intentional,
+and was unreachable by anybody who had not read that function.
+
+That is precisely the class of defect this gate exists for and the reason it had to be written from
+the SPEC. A test written against the implementation would have encoded Ok without noticing it had
+never been documented. `50_seal.md` states the rule now, with the argument for it (seal asserts an
+invariant rather than performing an event; an error should mean something went wrong; and an
+interrupted seal must be able to finish rather than be refused).
+
+#### What this gate does NOT cover, stated plainly
+
+- **No interruption.** The comparison is equality. Under injected faults it must become MEMBERSHIP
+  of the permitted set in §2 - which is why that table had to exist first, and is the obvious next
+  step now that both halves exist.
+- **Seven of the twelve operations.** Covered: `mkdir`, `write`, `delete`, `rename`, `seal`, `read`,
+  `dir`. Not: `move`, streaming `write-at`, `delete-tree`, `mkdir -p`, `label`, `copy`.
+- **Small contents and a small namespace.** Nine paths over two levels, and contents short enough to
+  ride one IPC message - so the streaming path and the extent-list path are untouched here
+  (`fs-large` and `fs-frag` cover those, against assertions about GSFS).
+- **No concurrency**, which §3.5 explains is narrower than it sounds anyway.
 
 ### 3.3 Crash at every persistence boundary - PARTIAL
 
@@ -460,8 +512,8 @@ Filled in from what has actually been run. NOT RUN means not run.
 
 | Gate | Result | Evidence / notes |
 |---|---|---|
-| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (now 15 suites including `fs-tear`); `files` 222/0; `shell` 174/0 |
-| Independent reference-model tests | NOT RUN | 3.2. Blocked on nothing but effort; the outcome table it needs now exists |
+| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (19 suites, including `fs-tear` and `fs-model`); `files` 239/0; `shell` 183/0 (measured 2026-09-18) |
+| Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and 5 of the 12 operations, are named as uncovered in 3.2 |
 | Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
 | Data/metadata exhaustion | PARTIAL (QEMU) | `osdev test fs-full` 14/0 - a refused allocation names its reason, damages no bystander and leaks nothing. Metadata-vs-data exhaustion not covered |
 | Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |

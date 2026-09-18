@@ -22,6 +22,31 @@ establish who had write access in the meantime, because nobody did.
 That is also why `seal` is the only command here that asks before acting on a single file. Every
 other one can be undone by doing the opposite.
 
+## Sealing an already-sealed file SUCCEEDS
+
+`seal` on a file that is already sealed returns **Ok** and changes nothing.
+
+**This was decided in the code and never written down here, which is how it was found.** The
+differential oracle (`osdev test fs-model`, `docs/gsfs-carnage.md` §3.2) builds a model of the
+filesystem from THIS page and compares it against the real one. The model predicted a refusal - a
+reasonable reading of "there is no unseal", and wrong. `fs` has carried `if e.sealed { return
+Ok(()); } // idempotent: already frozen` all along; a reader of this page had no way to know.
+
+Idempotent is the right answer, and worth stating rather than merely recording:
+
+- **`seal` asserts an invariant, it does not perform an event.** The invariant is "this file's bytes
+  never change again". If it already holds, the caller has what they asked for.
+- **An error should mean something went wrong.** Nothing did. A script that seals defensively -
+  because it cannot know whether an earlier run got that far - would have to special-case a failure
+  that reports success-by-another-name, and that is the kind of refusal `CLAUDE.md` §26.7 is about
+  from the other direction.
+- It is also the only choice that composes with a crash. `seal` commits the `ro_compat` bit before
+  the record flag, so an interrupted seal can leave the volume announcing the feature without the
+  file being sealed; re-running must then be able to finish the job rather than refuse it.
+
+The one thing it does NOT do is re-confirm: the `[y/N]` prompt still appears, because the command
+cannot know the file is already sealed until it has asked `fs`.
+
 ## What it does NOT promise
 
 Stated plainly, because a security feature that is vague about its edges is worse than one that is

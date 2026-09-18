@@ -1931,6 +1931,200 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
+/// `osdev test fs-model` - DIFFERENTIAL testing against an independent model (carnage §3.2).
+///
+/// Drives a seeded random sequence of filesystem operations through the real shell on a real disk,
+/// and the SAME sequence through `crate::fs_model`, which knows nothing about GSFS. Two comparisons:
+///
+///   1. **Per operation, Ok versus Err.** Not the error VARIANT - that is shell implementation
+///      detail and a model that predicted it would be coupled to the thing it must be independent
+///      of. `result` is the shell's own outcome channel and prints exactly `Ok` or `Err(<name>)`.
+///   2. **At the end, the whole volume.** Every file the model holds is read back off the disk and
+///      its bytes compared; every directory's name set is listed and compared. This is the strong
+///      one: an operation can return the right answer and still leave the wrong state.
+///
+/// WHY THIS EXISTS WHEN 226 CHECKS ALREADY PASS. Every other storage suite tests GSFS against
+/// assertions written *about GSFS*. If a belief about what `rename` should do is wrong, all of them
+/// agree with the bug and report green. This one disagrees exactly where that belief is wrong,
+/// which is the single class of defect the rest of the programme structurally cannot reach.
+///
+/// The seed is printed on every run and on every failure, because "preserve the seed" is the first
+/// line of §5 of the carnage doc.
+pub fn run_fs_model(image_path: &Path, persist_path: &str, smp: u32, seed: u64, ops: usize) {
+    use crate::fs_model::{gen_op, universe, Model, Op, Rng};
+
+    println!("fs-model: differential run - seed {seed}, {ops} operations (smp={smp})");
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("fs-model: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(port, Duration::from_secs(20)) {
+        Some(s) => s,
+        None => { child.kill().ok(); child.wait().ok();
+                  eprintln!("fs-model: could not connect to serial {port}"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break,
+                                                     Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { pass += 1; } else { println!("fs-model: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        println!("fs-model: FAIL - timed out waiting for the first prompt");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    // A fresh volume, so the model's empty state and the disk's agree at operation zero.
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).is_none() {
+            println!("fs-model: FAIL - flash timed out"); fail += 1;
+        }
+    }
+
+    // Everything happens under one root, so a bug cannot be masked by, or mistaken for, the
+    // pre-existing contents of `/` (a history file, a clock stamp).
+    const ROOT: &str = "/m";
+    let mut model = Model::new();
+    send(&mut write_half, format!("mkdir {ROOT}\r").as_bytes());
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    model.apply(&Op::Mkdir(ROOT.to_string()));
+
+    let paths = universe(ROOT);
+    let mut rng = Rng::new(seed);
+    let mut divergences: Vec<String> = Vec::new();
+
+    for i in 0..ops {
+        let op = gen_op(&mut rng, &paths);
+        let line = op.line();
+        send(&mut write_half, format!("{line}\r").as_bytes());
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).is_none() {
+            println!("fs-model: FAIL - op {i} `{line}` never returned a prompt (seed {seed})");
+            fail += 1;
+            break;
+        }
+        send(&mut write_half, b"result\r");
+        let r = match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+            Some(r) => r,
+            None => { println!("fs-model: FAIL - `result` after op {i} timed out (seed {seed})");
+                      fail += 1; break; }
+        };
+        // `result` prints exactly `Ok` or `Err(<Variant>)` on its own line.
+        let actual_ok = r.lines().any(|l| l.trim() == "Ok");
+        let actual_err = r.contains("Err(");
+        let expect_ok = model.apply(&op);
+        if actual_ok == actual_err {
+            divergences.push(format!("op {i} `{line}`: `result` said neither Ok nor Err"));
+        } else if actual_ok != expect_ok {
+            divergences.push(format!(
+                "op {i} `{line}`: model says {}, GSFS says {}",
+                if expect_ok { "Ok" } else { "Err" },
+                if actual_ok { "Ok" } else { "Err" }));
+        }
+    }
+    check!(divergences.is_empty(),
+           format!("{} operation(s) disagreed with the model - seed {}", divergences.len(), seed));
+    for d in divergences.iter().take(12) { println!("    {d}"); }
+
+    // ---- THE STRONG COMPARISON: read the whole volume back and diff it against the model. ----
+    //
+    // An operation can return the right answer and still leave the wrong state, which is exactly the
+    // failure a per-call check cannot see.
+    let mut state_bad = 0usize;
+    for f in model.all_files() {
+        send(&mut write_half, format!("read {f}\r").as_bytes());
+        let out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default();
+        let want = model.content(&f).unwrap_or("");
+        if !out.contains(want) {
+            state_bad += 1;
+            if state_bad <= 8 {
+                println!("    content: {f} should hold `{want}`; read returned `{}`",
+                         out.replace('\r', " ").replace('\n', " ").trim().chars().take(90).collect::<String>());
+            }
+        }
+    }
+    // Only the workspace. `/` holds files this run never created - the shell's history, the clock
+    // stamp - and a model that never saw them would report the disk wrong when the disk is right.
+    for d in model.all_dirs().into_iter().filter(|d| d.starts_with(ROOT)) {
+        send(&mut write_half, format!("dir {d}\r").as_bytes());
+        let out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default();
+        // Entry rows are the indented lines between the column header and the trailing count.
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        // MATCH THE ROW SHAPE, not "an indented line". An entry row is `<name> <TYPE> <size> <date>`
+        // with TYPE in {file, dir, seal}; requiring that second column is what separates a listing
+        // from a SERVICE LOG LINE spliced into the same serial stream (`backlog/04`). The looser
+        // reading recorded `net-stack:` and `time:` as directory entries and reported the disk wrong
+        // when the disk was right - a differential test is only as good as its reader.
+        for l in out.lines() {
+            let mut w = l.trim().split_whitespace();
+            let (Some(name), Some(kind)) = (w.next(), w.next()) else { continue };
+            if !["file", "dir", "seal"].contains(&kind) { continue; }
+            seen.insert(name.to_string());
+        }
+        let want = model.children(&d);
+        if seen != want {
+            state_bad += 1;
+            if state_bad <= 8 {
+                println!("    listing: {d} model={want:?} disk={seen:?}");
+            }
+        }
+    }
+    check!(state_bad == 0,
+           format!("{state_bad} path(s) on disk disagree with the model after {ops} ops - seed {seed}"));
+
+    // The volume must also be STRUCTURALLY sound, not merely to agree with the model: a sequence
+    // that leaves the free bitmap wrong while every name and byte still reads correctly is exactly
+    // the accounting drift `drives check` exists to find.
+    send(&mut write_half, b"drives check\r");
+    let chk = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    check!(chk.contains("0 bad"), "the volume is structurally clean after the run (`drives check`)");
+
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let _ = std::fs::create_dir_all("build/tests");
+        let _ = std::fs::write("build/tests/fs_model_serial.log", whole.as_bytes());
+    }
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nfs-model: {pass} passed, {fail} failed  (seed {seed}, {ops} ops, serial -> build/tests/fs_model_serial.log)");
+    if fail > 0 {
+        println!("fs-model: reproduce with `osdev test fs-model:{seed}`");
+        std::process::exit(1);
+    }
+}
+
 pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     println!("files-test: booting (smp={smp}) with a RAW AHCI disk - scripted mode");
 
