@@ -6,9 +6,10 @@ power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **indepen
 (`fs-model`, §3.2). NOT RUN: the block layer (§3.7), concurrency and retry ordering (§3.5), the
 remaining rows of §3.3, and cross-ISA (§3.11, not reachable in QEMU).
 
-**This is QEMU-validated only.** The one hardware result is recorded in §4 and claims less than it
-looks: three power cuts on a Dell Wyse survived cleanly, and none of them landed in the window that
-would have invoked the journal, so recovery on silicon remains unproven.
+**Mostly QEMU-validated.** The hardware results are recorded in §4 and §3.12. The one that matters
+landed on 2026-09-18: a power cut during `churn` fell INSIDE the commit-to-checkpoint window on a
+Dell Wyse, the next mount replayed four blocks, and content verification found no torn file - so
+**journal recovery is proven on silicon**, on one board, on a backend that attests durability.
 
 *(This line used to read "the rest are NOT RUN", which stopped being true the moment `fs-full` and
 the two power-cut suites landed and was not updated. A status line is the first thing anybody reads
@@ -501,10 +502,41 @@ So this gate is recorded as **not reachable in QEMU** rather than merely not don
 different fact: it changes what the hardware pass is FOR. For everything else in this file hardware
 is a confirmation at the end. For this, it is the only way to get an answer at all.
 
-### 3.12 Physical hardware - NOT RUN, and cannot be claimed from any of the above
+### 3.12 Physical hardware - PARTIAL (1 of 5 boards), and the journal half is now CLOSED
 
 Real controllers, hotplug, restart, and the flush/durability assumptions that QEMU does not model.
 Five boards. **A QEMU pass is never recorded as a hardware pass.**
+
+#### Journal recovery on silicon - PROVEN, 2026-09-18, Dell Wyse 5070
+
+This was the standing hole and it is worth stating exactly what closed it, because three earlier
+power cuts on this same board did NOT close it: they survived cleanly, and the journal was never
+invoked in any of them. A cut that lands outside the commit-to-checkpoint window proves the
+filesystem was consistent, not that recovery works. The window is sub-millisecond, which is why
+`churn` exists - to run thousands of transactions so a human with a plug can land in one.
+
+It landed. 30 GB SSD, GSFS0008 over 62,533,296 blocks:
+
+```
+16:37:20  gsh> churn 100
+16:37:23  churn: 4s elapsed, 125 writes          <- the log ends here: power cut, mid-write
+16:38:08  fs: journal recovered 4 block(s) from an interrupted write
+16:38:08  fs: mounted GSFS0008 (62533296 blocks, bitmap 1..15332, root@15342, 62517885 free)
+16:38:52  churn verify: 6 file(s) checked, 0 empty, NONE torn - every file holds one generation
+```
+
+Four blocks were durable in the journal and not yet checkpointed home when the power went. The
+next mount replayed them, and content verification then found no file holding a mix of two writes.
+That is the whole claim of §6.8 of `docs/persistence.md`, on real silicon, end to end.
+
+**What this does NOT yet say.** `drives check` was not run after the recovery, so the STRUCTURAL
+half - tree, bitmap, free count - is unverified for this particular cut. `churn verify` answers
+content and `drives check` answers structure; `51_churn.md` is explicit that both are needed and
+they are not the same question. The `check: ... 0 bad` in this log predates the cut.
+
+**And it remains one board.** The backend-conditional caveat in `CLAUDE.md` §6.1 is untouched: this
+is a SATA SSD behind AHCI, which attests durability at the journal barriers. The Pi 2's USB stick
+refuses `SYNCHRONIZE CACHE` outright, so nothing here transfers to it.
 
 ## 4. Merge evidence
 
@@ -523,7 +555,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | NOT RUN - NOT REACHABLE | 3.11 / `backlog/34`. No non-x86 port can attach a usable disk in QEMU: riscv64 has no drive option, aarch64 has no VL805 emulation, arm32's stick re-enumerates 126 times and never settles. The x86 half is written and waiting |
-| Physical-hardware validation | PARTIAL (1 of 5 boards) | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD, and a real POWER CUT during heavy fs activity survived cleanly three times out of three (`0 bad`, accounting already consistent). The journal was never invoked in any of them - no cut landed in the commit-to-checkpoint window - so recovery on silicon remains unproven. `docs/gsfs-hardware-pass.md` |
+| Physical-hardware validation | PARTIAL (1 of 5 boards), journal half CLOSED | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD. A power cut during `churn` landed INSIDE the commit-to-checkpoint window: the next mount reported `journal recovered 4 block(s) from an interrupted write`, and `churn verify` then found 6 files, NONE torn. Recovery on silicon is proven (§3.12). Three earlier cuts had survived cleanly without ever invoking the journal, which proved consistency and not recovery. Still open: `drives check` after a recovered cut (structure), and four boards |
 | Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
 
 **Merge rule adopted:** do not merge until the required gates pass, genuinely inapplicable gates are
