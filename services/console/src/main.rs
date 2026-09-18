@@ -95,7 +95,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Build the terminal and clear the screen. From here the kernel's boot floor stops writing - it
     // releases the framebuffer the first time it successfully delivers console output to us, which is
     // strictly after this point, so there is never a window with two writers or with none.
-    let mut term = Term::new(fb);
+    // Built in the caller's own storage and then attached, NEVER returned by value: `Term` carries
+    // the shadow grid, its attribute plane and the scrollback ring, and a by-value return
+    // materialises all of it twice during the move. See `Term::blank`.
+    let mut term = Term::blank();
+    term.attach(fb);
     let (rows, cols) = term.dims();
     ctx.log_fmt(format_args!("console: terminal {} cols x {} rows", cols, rows));
     ctx.log("console: serving the display");
@@ -103,6 +107,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Passes completed, for context in the diagnostics below.
     let mut passes: u64 = 0;
+    // Said once, the first time the scrollback ring evicts anything. See the report in the loop.
+    let mut sb_wrapped = false;
     // PAINT CADENCE. A pass drains for at most this long before painting and returning to a blocking
     // `recv`. 16 ms is about one frame; a display that repaints that often reads as smooth.
     //
@@ -271,6 +277,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // without flooding the log through the very console that is misbehaving. A sequence
         // legitimately spanning a message boundary shows up here once and then clears; a stranded
         // one never clears.
+        // SCROLLBACK, SAID ONCE WHEN IT FIRST WRAPS. The ring is the only part of this service that
+        // silently discards anything, and the moment it starts doing so is the one worth knowing:
+        // before it, `Home` reaches the start of the session; after it, `Home` reaches the oldest
+        // line KEPT, which is a different claim. One line, not a counter - a report that repeats is
+        // a report nobody reads, and this one cannot recur because the condition cannot un-happen.
+        if !sb_wrapped {
+            let (kept, aged, bytes) = term.scrollback();
+            if aged > 0 {
+                sb_wrapped = true;
+                ctx.log_fmt(format_args!(
+                    "console: scrollback full at {} lines / {} bytes - older lines now age out",
+                    kept, bytes));
+            }
+        }
         let esc = term.esc_state();
         if esc != 0 {
             stranded += 1;

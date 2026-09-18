@@ -445,11 +445,13 @@ pub fn cmd_build() {
     // anything failing.
     //
     // `cmd_build_bare_metal` had this right already (a `non_supervisor` list, supervisor built after).
-    let service_crates = [
-        "events", "recorder", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder",
-        "supervisor",   // LAST: it embeds every name above it
-    ];
-    for crate_name in &service_crates {
+    // `SERVICE_CRATES` plus the supervisor LAST, because it embeds every name before it.
+    //
+    // This used to be its own literal, and it had silently lost `console`, `control`, `time` and
+    // `hw-enumerator` - so `osdev build` relinked the supervisor around whatever stale copies of
+    // those were lying in the target directory. An edit to the console never reached the image, and
+    // nothing said so: a stale binary is not a missing one, so the embed guard stayed quiet.
+    for crate_name in SERVICE_CRATES.iter().chain(core::iter::once(&"supervisor")) {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -461,6 +463,7 @@ pub fn cmd_build() {
         }
         println!("build: {} OK", crate_name);
     }
+    stack_fit_check(SERVICE_CRATES);
 
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
@@ -515,12 +518,57 @@ fn identity_kernel_feature_args() -> Vec<String> {
     a
 }
 
+/// Refuse to finish a build whose service frames cannot fit the 256 KiB user stack.
+///
+/// Called AFTER the services are compiled, because it reads their ELFs. `arm_build.py` and
+/// `pi4_build.py` have done this for their boards since a debug `fs` crash-looped on a 503 KiB
+/// frame; x86 had no such gate at all, which is the same "enforced on one path, therefore on none"
+/// shape those scripts already record - and it let `console::Term::new` reach a 180 KiB frame
+/// unnoticed, because the checker was additionally BLIND to x86 prologues until it was taught them.
+///
+/// 256 KiB = `USER_STACK_PAGES` in `kernel/src/task/mod.rs`. A checker that cannot RUN is not a
+/// checker that passed, so a missing python fails the build, exactly as `commandment_check` does.
+fn stack_fit_check(services: &[&str]) {
+    let mut cmd = std::process::Command::new("python");
+    cmd.args(["scripts/stack_fit_check.py", "x86_64-unknown-none", "release", "262144"]);
+    cmd.args(services);
+    match cmd.status() {
+        Ok(st) if st.success() => {}
+        Ok(_) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("osdev: cannot run scripts/stack_fit_check.py ({e}). Refusing to build - a checker that cannot run is not a checker that passed.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Every service crate `supervisor` embeds, in build order. **The supervisor is NOT here** - it is
+/// built last, separately, because `services/supervisor/build.rs` reads these binaries off disk and
+/// embeds them, so one that is newer than the supervisor is one the supervisor does not carry.
+///
+/// **ONE LIST, because five copies of it had already drifted.** `cmd_build` - plain `osdev build` -
+/// was missing `console`, `control`, `time` and `hw-enumerator`, so it relinked the supervisor around
+/// whatever stale binaries happened to be in the target directory. Editing the console and running
+/// `osdev build` produced an image with the OLD console in it, silently, and the only tell was a
+/// timestamp nobody looks at. The four image/test builders had the right list; the one command a
+/// person types by hand did not.
+///
+/// That is the same failure the arch-conditional USB list in `services/supervisor/build.rs` already
+/// records: a MISSING binary is caught by a guard, and a STALE one is not, because a stale file is
+/// not missing. `scripts/embed_order_check.py` catches the ordering; nothing caught the omission.
+const SERVICE_CRATES: &[&str] = &[
+    "events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
+    "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
+    "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
+    "resource-server", "holder",
+];
+
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -564,8 +612,8 @@ pub fn cmd_build_bare_metal() {
 /// (plain `bare-metal`) so its per-tick disk writes are test-only.
 pub fn cmd_build_counter() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -609,8 +657,8 @@ pub fn cmd_build_counter() {
 /// round-trip. Kept out of the daily-driver image (plain `bare-metal`) so the per-tick RPC is test-only.
 pub fn cmd_build_reply() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -655,8 +703,8 @@ pub fn cmd_build_reply() {
 /// Kept out of the daily-driver image (plain `bare-metal`) so the per-boot mint/grant is test-only.
 pub fn cmd_build_resource() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -699,8 +747,8 @@ pub fn cmd_build_resource() {
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -743,8 +791,8 @@ pub fn cmd_build_idle() {
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -791,8 +839,8 @@ pub fn cmd_build_identity() {
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -834,8 +882,8 @@ pub fn cmd_build_perf() {
 /// internally - no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -880,8 +928,8 @@ pub fn cmd_build_stress() {
 /// "fuzz: F* pass" line and never "KERNEL PANIC".
 pub fn cmd_build_fuzz() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -922,8 +970,8 @@ pub fn cmd_build_fuzz() {
 /// hardware chaos run (C2-C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -965,8 +1013,8 @@ pub fn cmd_build_chaos() {
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1010,8 +1058,8 @@ pub fn cmd_build_b2_only() {
 /// probes - for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1052,8 +1100,8 @@ pub fn cmd_build_perf_iso(feature: &str) {
 
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1095,8 +1143,8 @@ pub fn cmd_build_bp2_only() {
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1137,8 +1185,8 @@ pub fn cmd_build_adv() {
 /// benchmark suite (BP1-BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1439,8 +1487,8 @@ fn cmd_shell(smp: u32) {
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
             .status()
