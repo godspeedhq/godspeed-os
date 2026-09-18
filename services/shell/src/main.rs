@@ -907,7 +907,18 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
     "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve",
+    // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
+    // directory listing for a position that accepts neither a path nor a keyword.
+    "paginate",
 ];
+
+/// The command-name completion list is a fixed 96-slot array filled from `UTILS` + `LIBRARY`, and
+/// entries past it were silently dropped - a command that quietly stops completing because a list
+/// grew, which is the shape of failure this shell keeps removing elsewhere. Now it does not build.
+const _: () = assert!(
+    UTILS.len() + LIBRARY.len() <= 96,
+    "the command-name completion array in `complete_command` is too small for UTILS + LIBRARY -      grow it, do not let names fall off the end"
+);
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
 /// fixed keyword - completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
@@ -1819,7 +1830,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
         // Returns the pipeline's Result - an `… | assert` sink sets it (else Ok / a stage error).
-        return pipe_run(ctx, cwd, s, out);
+        return pipe_run(ctx, cwd, s, out, depth);
     }
 
     let mut args = [""; MAX_ARGS];
@@ -4515,6 +4526,10 @@ const UTILS: &[&str] = &[
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
     "where", "select", "to", "from", "sum", "min", "max", "avg",
+    // A pipe-only stage like the record verbs above, and in this list for the same reason: rule 1
+    // says every utility answers `<util> version` and `<util> help`, including the ones that can
+    // only appear after a `|`.
+    "paginate",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -4904,6 +4919,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
             ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps events | where rights contains send"),
         ], true),
+        "paginate" => help_block(ctx, "paginate", "read long output a screenful at a time (pipe stage)", &[
+            ("<producer> | paginate", "page any long output - text or records", "read /long.txt | paginate"),
+            ("dir /big | paginate", "a record stream keeps its column header pinned while you scroll", "dir /big | paginate"),
+            ("", "arrows scroll a line; PgUp/PgDn and space move a page; Home/End jump; q quits", ""),
+            ("", "in a script or a capture it just prints - there is nobody to press a key", "run /s.gsh"),
+        ], true),
         "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
             ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
         ], true),
@@ -5061,6 +5082,7 @@ static HELP: &[HelpRow] = &[
     Row("  e.g. read /f | upper", "filter a file through a service"),
     Row("  e.g. tree / | write /out", "capture output to a file"),
     Row("  e.g. greet | upper | write /g", "producer | filter | sink"),
+    Row("  e.g. read /long | paginate", "read long output a screenful at a time"),
     Gap,
     Sec("Records (typed pipes - docs/records.md)"),
     Row("status | where mem>0", "filter the task table by field (=,!=,>,<,~)"),
@@ -5144,8 +5166,8 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
 }
 
 /// `less`-style pager for `help`: render a screenful from `top`, a status line, then
-/// read a key and scroll. Space / PageDown page; Up/Down (or j/k) move a line; b /
-/// PageUp page back; g/G jump to top/bottom; q / Esc / Enter quit.
+/// read a key and scroll. Arrows move a line; PgUp/PgDn and space move a page; Home/End jump to
+/// the ends; q, Esc and Ctrl+C quit. (Enter moves a line, like a terminal's own.)
 ///
 /// Repaint is done **in place** to avoid the flicker and cost of a full clear: the cursor
 /// is hidden for the session (`ESC[?25l`) so the bulk redraw skips the per-character cursor
@@ -5195,10 +5217,25 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
         // on screen as well as last in the code.
         end_frame(ctx);
         ctx.console_write_fmt(format_args!(
-            // SAY WHAT ACTUALLY WORKS. `j`/`k`, `b` and Enter were all handled and none of them were
-            // mentioned - a reader who tries `j` because it is muscle memory finds it works, which
-            // means the line was under-reporting the tool rather than describing it.
-            "[ lines {}-{} of {} ]  up/down or j/k: scroll  space: page down  b: page up  g/G: top/end  q: quit",
+            // THE ADVERTISED SET IS THE IMPLEMENTED SET, and it got there by shrinking the second
+            // one rather than lengthening the line.
+            //
+            // This used to read `up/down or j/k: scroll  space: page down  b: page up  g/G: top/end
+            // q: quit`, which was honest about a key set that had accumulated `less` habits nobody
+            // decided on. Two of them had to go regardless: **`b` is `[b] background`** in the job
+            // control design, and one letter cannot mean both "back" and "background" in the same
+            // shell - that is the rule `q` established, that the LETTER is the mnemonic. `f` was a
+            // second name for space. `g`/`G` had no mnemonic at all and leaned on an upper/lower
+            // case distinction the house style avoids; Home and End say what they do.
+            //
+            // What is left is what a reader would guess: arrows, PgUp/PgDn (and space, the one
+            // habit worth keeping - every thumb goes there), Home/End, and `q`.
+            //
+            // IT ALSO HAS TO FIT. This line is written at the bottom of a frame the pager just sized
+            // to the screen; a status line that WRAPS pushes the whole frame up by a row and makes
+            // the count it is printing wrong. 77 columns at four digits, which leaves room on the
+            // 80-column terminal that is the narrowest anybody uses.
+            "[ lines {}-{} of {} ] [arrows] scroll [PgUp/PgDn] page [Home/End] ends [q] quit",
             top + 1, end, total));
         ctx.console_write("\x1b[J");
         // Read one command key (arrows/PageUp/Down arrive as escape sequences).
@@ -5207,12 +5244,12 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
         let mut to_top = false;
         let mut to_bottom = false;
         match ctx.console_read() {
-            b' ' | b'f' => down = page as i64,
-            b'b' => down = -(page as i64),
-            b'j' | b'\r' | b'\n' => down = 1,
-            b'k' => down = -1,
-            b'g' => to_top = true,
-            b'G' => to_bottom = true,
+            // Space pages forward - the one `less` habit kept, because it collides with nothing and
+            // is what a reader's thumb does unprompted. `f`, `b`, `j`, `k`, `g` and `G` are gone:
+            // see the status line above for which of them were a naming conflict and which were
+            // merely a second name for a key that already worked.
+            b' ' => down = page as i64,
+            b'\r' | b'\n' => down = 1,
             b'q' | 0x03 => quit = true,
             0x1B => match read_escape_byte(ctx) {
                 None => quit = true, // bare ESC quits
@@ -7366,7 +7403,7 @@ enum Stream {
 /// `execute` (which would carry that 16 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
-fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
+fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> Result<(), ShellError> {
     // HIGH-WATER MARK, reported only when it moves. This file's own header says the user stack is
     // 256 KiB and that this frame already sits near it (measured at 177,297 bytes on entry, 68%), and
     // the Pi 4 twice killed the shell inside a
@@ -7500,6 +7537,25 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             if !last { ctx.console_writeln("pipe: assert must be the last stage"); return Err(ShellError::Unknown); }
             return assert_stream(ctx, &s, arg);
         }
+        if cmd == "paginate" {
+            // THE READING SINK. `dir /big | paginate`, `read /long.txt | paginate`.
+            //
+            // Pagination is an EXPLICIT STAGE rather than something a command decides on its own,
+            // and that is the whole design. A command that pages itself has to guess whether a human
+            // is watching, and the guess is wrong exactly when it matters - a `dir | write` or a
+            // `selfcheck` blocks forever on a keypress nobody is there to press. Asking for it
+            // cannot make that mistake: a pipe that captures does not contain the word.
+            //
+            // It also means every producer gets it at once - `find`, `read`, `status`, `caps`,
+            // anything added later - instead of a pager wired into each, which is six copies of one
+            // fact waiting to disagree.
+            if !last { ctx.console_writeln("pipe: paginate must be the last stage - it reads the stream, it does not pass it on"); return Err(ShellError::Unknown); }
+            if !arg.trim().is_empty() {
+                ctx.console_writeln_fmt(format_args!("paginate: takes no arguments (got '{}')", arg.trim()));
+                return Err(ShellError::Unknown);
+            }
+            return paginate_sink(ctx, &s, out, depth);
+        }
         if cmd == "result" {
             // `result` reads the outcome channel, not a stream - same mix-up as `<cmd> | result`.
             ctx.console_writeln("pipe: 'result' checks a command's outcome, not piped output. Run the command, then 'result', or use 'assert ok <command>'");
@@ -7511,6 +7567,42 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
     match &s {
         Stream::Bytes(c) => out.put_bytes(ctx, c.bytes()),
         Stream::Table(t) => t.to_grid(&mut OutSink { ctx, out }),
+    }
+    Ok(())
+}
+
+/// `… | paginate` - the reading pipe sink: show the stream a screenful at a time.
+///
+/// TWO CONDITIONS MUST BOTH HOLD before a key is ever waited for, and between them they are the
+/// reason this is safe where a built-in pager was not:
+///
+///  - **`depth == 0`** - not inside a script, `run`, `assert` or `selfcheck`. A pager with nobody at
+///    the keyboard does not degrade, it HANGS, and it hangs a run that may have been started
+///    precisely because no one was going to watch it.
+///  - **the output is the console** - not `$( )` capture, not `save <path>`, not a function-body
+///    capture. Those have a reader, but the reader is the shell itself.
+///
+/// When either fails the stream is rendered exactly as an unsinked pipe would render it, so
+/// `paginate` in a script is a no-op rather than an error. That is deliberate: a script inherited
+/// from an interactive session should not fail because of a word that only concerns a screen.
+///
+/// `#[inline(never)]`: `pipe_run`'s frame already carries a 16 KiB `Stream`.
+#[inline(never)]
+fn paginate_sink(ctx: &ServiceContext, s: &Stream, out: &mut Out, depth: u8) -> Result<(), ShellError> {
+    let interactive = depth == 0 && matches!(out, Out::Console);
+    if !interactive {
+        match s {
+            Stream::Bytes(c) => out.put_bytes(ctx, c.bytes()),
+            Stream::Table(t) => t.to_grid(&mut OutSink { ctx, out }),
+        }
+        return Ok(());
+    }
+    match s {
+        // A table pages WITH ITS COLUMN HEADER PINNED, which is the one thing the console's
+        // scrollback cannot do for you: scrolled back through a grid, the column names are off the
+        // top and the columns are unlabelled.
+        Stream::Table(t) => paginate_table(ctx, t, &|_, _| 0, 0),
+        Stream::Bytes(c) => paginate_bytes(ctx, c.bytes()),
     }
     Ok(())
 }
@@ -8068,6 +8160,170 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
 /// writes, so a frame costs about a dozen syscalls instead of sixty.
 ///
 /// Bounded and no heap: one fixed buffer, flushed when full and at the end of each frame.
+/// Line index over a flat text buffer, with a one-entry forward cache.
+///
+/// `line_pager` asks for line `i`, then `i+1`, `i+2` within a frame, and moves the top by small
+/// steps between frames - so remembering where the last line started makes the common case a short
+/// scan rather than a scan from the top.
+///
+/// NO INDEX ARRAY, deliberately. A 16 KiB buffer of one-byte lines would need 16,384 offsets, and
+/// `pipe_run`'s frame already sits at 68% of the user stack. §26.6.1 says the move is to change the
+/// representation rather than find room for a big one, and a cached cursor IS the smaller
+/// representation: two words instead of sixteen thousand.
+struct Lines<'a> {
+    b: &'a [u8],
+    /// Line number the cached offset belongs to.
+    at: core::cell::Cell<usize>,
+    /// Byte offset where that line starts.
+    off: core::cell::Cell<usize>,
+}
+
+impl<'a> Lines<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Lines { b, at: core::cell::Cell::new(0), off: core::cell::Cell::new(0) }
+    }
+
+    /// How many lines the buffer holds. A TRAILING NEWLINE TERMINATES the last line rather than
+    /// starting an empty one - which is what every text tool means by a line count, and what the
+    /// status line's "of N" has to agree with or the last page looks short by one.
+    fn count(&self) -> usize {
+        if self.b.is_empty() { return 0; }
+        let mut n = 0usize;
+        for &c in self.b { if c == b'\n' { n += 1; } }
+        if *self.b.last().unwrap_or(&b'\n') != b'\n' { n += 1; }
+        n
+    }
+
+    /// Line `i`, without its terminator. Out of range yields an empty line rather than a panic:
+    /// the pager clamps its own indices, and a rendering routine is the wrong place to discover
+    /// that it did not.
+    fn line(&self, i: usize) -> &'a [u8] {
+        let (mut n, mut o) = if i >= self.at.get() { (self.at.get(), self.off.get()) } else { (0, 0) };
+        while n < i && o < self.b.len() {
+            match self.b[o..].iter().position(|&c| c == b'\n') {
+                Some(pos) => { o += pos + 1; n += 1; }
+                None      => { o = self.b.len(); n = i; }
+            }
+        }
+        self.at.set(n);
+        self.off.set(o);
+        if o >= self.b.len() { return &self.b[0..0]; }
+        let end = self.b[o..].iter().position(|&c| c == b'\n').map(|pos| o + pos).unwrap_or(self.b.len());
+        &self.b[o..end]
+    }
+}
+
+/// Render one line into a frame, SAFELY and within the screen.
+///
+/// A pager owns the whole screen and repaints it by homing the cursor, so it cannot let its content
+/// drive the terminal: one `ESC [ 2J` inside a file would clear the frame mid-paint, and a line
+/// wider than the terminal would wrap and silently push every following row down, making the row
+/// count the pager just computed wrong. Both are the argument `dir` already makes about filenames,
+/// one layer out - the listing that is supposed to reveal the content must not be something the
+/// content controls.
+///
+/// So: printable ASCII passes, a tab becomes one space (it is whitespace, and expanding it properly
+/// needs a column model this does not have), everything else becomes `.`, and an over-long line is
+/// cut at the screen width with a trailing `>` to say it was cut. `read` on its own is unchanged -
+/// it does not own the screen, so it has no reason to filter.
+fn paginate_line(ctx: &ServiceContext, f: &mut FrameBuf, line: &[u8], cols: usize) {
+    let maxw = cols.max(2) - 1;
+    let mut w = 0usize;
+    for &c in line {
+        if c == b'\r' { continue; }   // a CRLF file must not print a stray carriage return
+        if w >= maxw { f.put(ctx, b">"); break; }
+        let ch = if c == b'\t' { b' ' }
+                 else if (0x20..0x7f).contains(&c) { c }
+                 else { b'.' };
+        f.put(ctx, &[ch]);
+        w += 1;
+    }
+    f.put(ctx, b"\x1b[K\n");
+}
+
+/// Page a flat text buffer a screenful at a time.
+///
+/// `#[inline(never)]`: called from `pipe_run`, whose frame already carries a 16 KiB `Stream`.
+#[inline(never)]
+fn paginate_bytes(ctx: &ServiceContext, b: &[u8]) {
+    let (rows, cols) = ctx.console_dims();
+    // UNKNOWN GEOMETRY IS NOT "NO TERMINAL" - the same rule `help` and `edit` follow. A failed
+    // lookup returns 0, and treating that as a reason to skip paging would make the feature vanish
+    // because a query missed rather than because a human was absent.
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let lines = Lines::new(b);
+    let total = lines.count();
+    if total == 0 { return; }
+    // It already fits. Entering a pager to show four lines is a mode the reader then has to leave,
+    // which is worse than the problem; `help` makes the same call.
+    if total + 1 <= rows {
+        let mut f = FrameBuf::new();
+        for i in 0..total { paginate_line(ctx, &mut f, lines.line(i), cols); }
+        f.flush(ctx);
+        return;
+    }
+    let frame = core::cell::RefCell::new(FrameBuf::new());
+    line_pager(ctx, total, rows,
+        &|_| 0,
+        &|c, i| { let mut f = frame.borrow_mut(); paginate_line(c, &mut f, lines.line(i), cols); },
+        &|c| frame.borrow_mut().flush(c));
+}
+
+/// Page a record `Table`, keeping its COLUMN HEADER pinned.
+///
+/// This is the capability a pager has that scrollback structurally cannot: scroll a table up in a
+/// scrollback buffer and the column names are gone, leaving unlabelled columns. Here the header is
+/// repainted at the top of every frame and never scrolls.
+///
+/// `pinned_extra` draws anything above the header that must also stay put (the `trace` legend), and
+/// returns how many lines it actually wrote, so the scrolling area sizes itself. `extra_hint` is the
+/// same number used only to decide whether paging is needed at all - the one that must be EXACT is
+/// the value the closure returns.
+///
+/// `#[inline(never)]`: same frame argument as `paginate_bytes`.
+#[inline(never)]
+fn paginate_table(ctx: &ServiceContext, t: &Table,
+                  pinned_extra: &dyn Fn(&ServiceContext, &mut FrameBuf) -> usize,
+                  extra_hint: usize) {
+    let (rows, _cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let w = t.grid_widths();
+    // Fits unpaged: the pinned block, the column header, and a line of slack.
+    if t.nrows() + extra_hint + 2 <= rows {
+        // The unpaged path batches too: it is the same screenful, drawn once.
+        let mut f = FrameBuf::new();
+        let _ = pinned_extra(ctx, &mut f);
+        let mut lb = LineBuf::new();
+        t.grid_header(&mut lb, &w);
+        lb.flush_into(ctx, &mut f);
+        for r in 0..t.nrows() { t.grid_row(&mut lb, r, &w); lb.flush_into(ctx, &mut f); }
+        f.flush(ctx);
+        return;
+    }
+    // ONE FRAME, A DOZEN SYSCALLS. Every line goes into a shared `FrameBuf` and out in 256-byte
+    // writes, flushed just before the status line. Writing each row straight to the console cost two
+    // syscalls per row - over a hundred console messages per keypress against a 16-deep queue - so
+    // holding a scroll key outran the sink and the keyboard went unresponsive.
+    let frame = core::cell::RefCell::new(FrameBuf::new());
+    line_pager(ctx, t.nrows(), rows,
+        &|c| {
+            let mut f = frame.borrow_mut();
+            let extra = pinned_extra(c, &mut f);
+            let mut lb = LineBuf::new();
+            t.grid_header(&mut lb, &w);
+            lb.flush_into(c, &mut f);
+            extra + 1 // what the pinned block ACTUALLY wrote, plus the column header
+        },
+        &|c, i| {
+            let mut f = frame.borrow_mut();
+            let mut lb = LineBuf::new();
+            t.grid_row(&mut lb, i, &w);
+            lb.flush_into(c, &mut f);
+        },
+        &|c| frame.borrow_mut().flush(c));
+}
+
 struct FrameBuf {
     buf: [u8; 256],
     n: usize,
@@ -8477,50 +8733,15 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     // screen, and the framebuffer console has no scrollback, so the top would otherwise be gone
     // forever. Unknown geometry is not "no terminal": a failed `console_dims` returns 0, and `edit`
     // already treats that as 24 rows rather than dropping the feature.
-    let (rows, _cols) = ctx.console_dims();
-    let rows = if rows == 0 { 24 } else { rows as usize };
-    let w = t.grid_widths();
-    // Does it fit unpaged? Legend block, column header, and a line of slack.
-    if t.nrows() + TRACE_LEGEND_LINES + 2 <= rows {
-        // The unpaged path batches too: it is the same screenful, drawn once.
-        let mut f = FrameBuf::new();
-        let _ = trace_legend(ctx, &mut f, t.nrows());
-        let mut lb = LineBuf::new();
-        t.grid_header(&mut lb, &w);
-        lb.flush_into(ctx, &mut f);
-        for r in 0..t.nrows() {
-            t.grid_row(&mut lb, r, &w);
-            lb.flush_into(ctx, &mut f);
-        }
-        f.flush(ctx);
-        return Ok(());
-    }
     // PINNED: the legend and the column header are repainted at the top of every frame. They used to
-    // be printed before the pager started, which put them exactly where its first `ESC[H` repaint
-    // lands - so on a framebuffer console the legend flashed and vanished. The column header had the
-    // same fate one page in, having been line 0 of the scrolling region.
+    // be printed BEFORE the pager started, which put them exactly where its first `ESC[H` repaint
+    // lands - so on a framebuffer console the legend flashed and vanished, and the column header met
+    // the same fate one page in, having been line 0 of the scrolling region.
     //
-    // ONE FRAME, A DOZEN SYSCALLS. Every line here goes into a shared `FrameBuf` and out in 256-byte
-    // writes, flushed just before the status line. Writing each line straight to the console cost two
-    // syscalls per row - over a hundred console messages per keypress against a 16-deep queue - so
-    // holding a scroll key outran the sink and the keyboard went unresponsive.
-    let frame = core::cell::RefCell::new(FrameBuf::new());
-    line_pager(ctx, t.nrows(), rows,
-        &|c| {
-            let mut f = frame.borrow_mut();
-            let legend = trace_legend(c, &mut f, t.nrows());
-            let mut lb = LineBuf::new();
-            t.grid_header(&mut lb, &w);
-            lb.flush_into(c, &mut f);
-            legend + 1 // what the legend ACTUALLY wrote, plus the column header
-        },
-        &|c, i| {
-            let mut f = frame.borrow_mut();
-            let mut lb = LineBuf::new();
-            t.grid_row(&mut lb, i, &w);
-            lb.flush_into(c, &mut f);
-        },
-        &|c| frame.borrow_mut().flush(c));
+    // This used to be an open-coded pager here. It is `paginate_table` now, which the `paginate`
+    // pipe stage also uses - one pager over tables rather than a second copy of this block, which is
+    // `backlog/35`'s disease in miniature (the same fact stated twice, and the two drifting).
+    paginate_table(ctx, &t, &|c, f| trace_legend(c, f, t.nrows()), TRACE_LEGEND_LINES);
     Ok(())
 }
 

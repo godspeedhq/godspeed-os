@@ -393,10 +393,16 @@ pub fn run(image_path: &Path, smp: u32) {
             check!(r.contains("spawn"),   "help: spawn listed (paged)");
             check!(r.contains("restart"), "help: restart listed (paged)");
             check!(r.contains("status"),  "help: status listed (paged)");
-            // The status line now names every key that works, j/k and b included - a reader who tries
-            // `j` from muscle memory finds it works, so the line was under-reporting the tool.
-            check!(r.contains("up/down or j/k: scroll") && r.contains("b: page up")
-                   && r.contains("q: quit"), "help: pager status line names every key");
+            // THE STATUS LINE NAMES EVERY KEY THAT WORKS, AND ONLY THOSE. It used to advertise
+            // `j/k`, `b`, `f`, `g` and `G` as well; `b` had to go because `[b] background` claims
+            // that letter in the job-control design, and the rest went with it rather than leave a
+            // legend that is part house convention and part `less` habit. If a key is added back,
+            // this check fails until the line says so - which is the point.
+            check!(r.contains("[arrows] scroll") && r.contains("[PgUp/PgDn] page")
+                   && r.contains("[Home/End] ends") && r.contains("[q] quit"),
+                   "help: pager status line names every key");
+            check!(!r.contains("j/k") && !r.contains("b: page up") && !r.contains("g/G"),
+                   "help: pager no longer advertises the keys it dropped");
         }
         None => {
             println!("shell-test: FAIL - timed out after `help`  [×5]");
@@ -3329,6 +3335,68 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     match run!(b"dir /many | count\r", 30) {
         Some(r) => check!(r.contains("45"), "many: the records pipe sees all 45 rows"),
         None    => { println!("files-test: FAIL - dir | count timeout"); fail += 1; }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // `paginate` - the reading pipe sink.
+    //
+    // /many has 45 entries, comfortably taller than the 24-row console, so it pages.
+    //
+    // The keys are sent WITH the command, the way the `help` pager case above does it: a space to
+    // page forward and then `q`, so the prompt is reached either way and a hang shows up as a
+    // timeout rather than as a wedged suite.
+    {
+        send(&mut write_half, b"dir /many | paginate\r q");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+            Some(r) => {
+                check!(r.contains("of 45"), "paginate: pages a 45-row record stream");
+                check!(r.contains("[q] quit"), "paginate: offers the quit key while it is polling");
+                // THE COLUMN HEADER IS PINNED. This is the capability the console's scrollback
+                // structurally cannot give: scrolled back through a grid, the column names are off
+                // the top and the columns are unlabelled.
+                check!(r.contains("name") && r.contains("sealed"),
+                       "paginate: the record column header is drawn");
+            }
+            None => { println!("files-test: FAIL - paginate timeout (did it hang?)"); fail += 1; }
+        }
+    }
+    // A SHORT STREAM IS NOT WORTH A MODE. Entering a pager to show three lines is something the
+    // reader then has to leave, which is worse than the problem it solves - `help` makes the same
+    // call. `/docs` has two entries, so this must print and return, with no status line at all.
+    match run!(b"dir /docs | paginate\r", 15) {
+        Some(r) => check!(!r.contains("[q] quit"),
+                          "paginate: output that already fits is printed, not paged"),
+        None    => { println!("files-test: FAIL - short paginate timeout"); fail += 1; }
+    }
+    // ARGUMENTS ARE REFUSED, rather than quietly ignored. `paginate 20` looks like it means
+    // something and does not.
+    match run!(b"dir /many | paginate 20\r", 15) {
+        Some(r) => check!(r.contains("takes no arguments"), "paginate: refuses an argument plainly"),
+        None    => { println!("files-test: FAIL - paginate-with-arg timeout"); fail += 1; }
+    }
+    // NOT THE LAST STAGE IS REFUSED. It reads the stream; it cannot pass one on.
+    match run!(b"dir /many | paginate | write /p.txt\r", 15) {
+        Some(r) => check!(r.contains("must be the last stage"), "paginate: refuses a non-final position"),
+        None    => { println!("files-test: FAIL - paginate-not-last timeout"); fail += 1; }
+    }
+
+    // THE NO-HUMAN GUARD - `paginate` inside a script must PRINT, never wait for a key - is proven
+    // in `scripts/smoke.gsh` and run by `osdev test script`, NOT here, and the reason is a genuine
+    // limitation worth knowing: `execute` treats any line containing `|` as a pipeline, so
+    // `write /p.gsh dir /many | paginate` pipes the WRITE into `paginate` instead of storing that
+    // text. **A script containing a pipe cannot be authored from the interactive shell at all**;
+    // the only route is a host-baked file, which is exactly what the script suite is for. The
+    // attempt that used to be here silently tested nothing, which is worse than testing elsewhere.
+    //
+    // What this suite still covers is the interactive half, above: it pages, it offers `[q] quit`,
+    // it pins the header, it prints rather than pages when the output already fits, and it refuses
+    // an argument or a non-final position.
+    //
+    // A CAPTURE cannot smuggle it into a non-final position either - the reader there is the shell.
+    match run!(b"dir /many | paginate | count\r", 15) {
+        Some(r) => check!(r.contains("must be the last stage"),
+                          "paginate: a capture cannot smuggle it into a non-final position either"),
+        None    => { println!("files-test: FAIL - paginate capture timeout"); fail += 1; }
     }
 
     // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the

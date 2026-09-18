@@ -19,6 +19,14 @@ greet | count | assert contains 3 lines
 greet | count | write /sm/c.txt
 let cnt = $(read /sm/c.txt)
 echo cnt-is:$cnt | assert contains 3 lines
+# THE `paginate` NO-HUMAN GUARD, proven where it can only be proven: inside a script.
+# A pager that waits for a key in a run nobody is watching does not degrade, it HANGS - and that
+# is the whole reason paging is an explicit stage rather than something `dir` and `help` do on
+# their own. NO KEYS ARE SENT for this line. If the guard is wrong the suite never finishes; if
+# it is right the rows print and the next assert runs. This cannot be tested from the interactive
+# shell, because a line containing `|` is a pipeline and so `write` can never store one.
+dir /sm | paginate
+assert ok echo past-paginate
 roster | where role=core | assert contains Matthew
 assert fails read /sm/nope
 assert fails-with FileNotFound read /sm/nope
