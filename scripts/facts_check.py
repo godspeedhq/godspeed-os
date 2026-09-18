@@ -245,6 +245,33 @@ def facts():
                     [r"([0-9]+) in the neutral kernel",
                      r"in the NEUTRAL KERNEL[^|]*\|[^|]*\|\s*\*\*([0-9]+)\*\*"]))
 
+    # HOW MANY FILES ARE IN A DIRECTORY, because §5's map of the repository states three such
+    # counts and all three had rotted: utilities said 48 and held 52, examples said 12 and held 14,
+    # docs said "~30" and held 41.
+    #
+    # This is the failure §4.1's own amendment names - "a hand count is right on the day it is taken
+    # and silently wrong afterwards" - committed by the document that names it, in the section right
+    # after. That amendment installed a ratchet for arch-conditional sites; the counts one paragraph
+    # further down had no gate at all, which is why they drifted for months without failing anything.
+    #
+    # A count nobody can be bothered to re-take is a count that should be derived. These are.
+    util = count_files("utilities", "*.md") - 1          # 0_conventions.md is the rules, not a utility
+    if util > 0:
+        out.append(("utility specs", util, "utilities/*.md minus 0_conventions.md",
+                    [r"one file each \(([0-9]+) \+ 0_conventions\)"]))
+    # Dot-directories are configuration, not examples: this counted `.cargo` on its first run and
+    # reported the doc wrong when the doc was right. An instrument that miscounts is worse than none,
+    # because the first thing it does is send you to "fix" something correct.
+    ex = len([d for d in os.listdir(os.path.join(ROOT, "examples"))
+              if not d.startswith(".") and os.path.isdir(os.path.join(ROOT, "examples", d))])
+    if ex > 0:
+        out.append(("worked examples", ex, "directories under examples/",
+                    [r"# ([0-9]+) worked services"]))
+    dcount = count_files("docs", "*.md")
+    if dcount > 0:
+        out.append(("design notes", dcount, "docs/*.md",
+                    [r"\(([0-9]+) files; the index lists them all\)"]))
+
     qd = const("kernel/src/ipc/queue.rs", "QUEUE_DEPTH")
     if qd:
         out.append(("IPC queue depth", qd, "kernel/src/ipc/queue.rs QUEUE_DEPTH",

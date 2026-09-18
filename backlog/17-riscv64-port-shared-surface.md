@@ -42,7 +42,7 @@ other ports gained enforcement from this work rather than losing any.
 actual EP0 dequeue pointer instead of assuming where it is, plus a root-port settle wait and clearing
 of port poison when nothing binds anywhere. It runs on every port that uses the service.
 
-It targets the bug `project_xhci_hotplug_handover` records as root-caused on the Pi 4 ("hub
+It targets the bug root-caused on the Pi 4 ("hub
 port-status probes are posted BEHIND the controller's dequeue"), so it should HELP x86 and the Pi 4.
 It has only been verified on riscv64.
 

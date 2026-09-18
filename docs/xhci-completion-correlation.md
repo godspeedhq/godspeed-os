@@ -66,7 +66,7 @@ almost always a serve segment to swallow the previous probe's answer, so probes 
 hub's EP0 ring. The next probe posts a second TD behind it, then accepts the first completion whose
 `sid` matches the hub - which is the **previous** TD, answering about a **possibly different port**,
 with `DATA_BUF_OFF` holding whatever that transfer wrote. This is a one-behind lockstep desync: the
-identical failure `fs` had ("run `ls` twice and it is out of step", `project_fs_reply_correlation`),
+identical failure `fs` had ("run `ls` twice and it is out of step" - fixed by the reply tag at byte 0),
 fixed there the same way this must be.
 
 ## 3. Why hot-plug specifically dies

@@ -391,6 +391,11 @@ const EXTRA_CHECKS: &[&str] = &[
     "scripts/arch_boundary_check.py",
     "scripts/arch_seam_check.py",
     "scripts/contract_check.py",
+    // A doc that names a FUNCTION must name one that exists. `doc_refs.py` checks the other half
+    // (paths), and a RENAME breaks this half silently because the prose still reads correctly -
+    // four had rotted when this was written, including one in CLAUDE.md pointing at a file an
+    // amendment in the same document had deleted.
+    "scripts/doc_symbols_check.py",
     // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/26). x86 does not
     // use extlinux, but this path is where an image is built on the machine that PRODUCES the CRLF,
     // and the rule above is the whole reason this list exists: a checker on one build path is a

@@ -187,6 +187,21 @@ completion (a later optimization, not a correctness need).
 
 ## 6. Filesystem - on-disk format
 
+> **READ THIS FIRST: §6 IS THE ORIGINAL DESIGN, AND THE SHIPPED FORMAT IS NOT IT.** What follows
+> describes a flat name-to-blob store with 4 KiB blocks and a fixed 256-entry table. GSFS has been
+> **GSFS0008** for a long time: **512-byte** blocks, real directories as a tree (§6.2), a free
+> **bitmap** rather than an entry table (§6.4), self-describing 64-byte records seven to a block with
+> a CRC trailer (§6.6), extent lists for fragmented files (§6.4), and a metadata redo-journal (§6.8).
+> Every one of those numbers below is superseded by the section named beside it.
+>
+> It is kept because §1's rule holds here as in the constitution - the history of how a format
+> reached its present shape is worth more than a tidy document - but it was NOT marked, and a reader
+> arriving at "§6. Filesystem - on-disk format" reasonably takes the section with that title as the
+> format. That is the §26.7 failure in its documentation form: a claim left standing because it is
+> labelled "proposed" and nearly true, relied on by whoever trusts the document. The label was doing
+> less work than it looked: "Final numbers set in Phase 1" was written before Phase 1, and Phase 1
+> finished several formats ago.
+
 A flat **name → blob** store. Proposed geometry (concrete but tunable in Phase 1):
 
 ```text
@@ -218,6 +233,11 @@ require relocation; both are acceptable Phase 1 and revisited only if a real nee
 **Proposed bounds** (in the spirit of queue-depth-16, MAX_ENDPOINTS - bounded everything,
 §26.6): `BLOCK_SIZE = 4096`, `NAME_MAX = 64`, `MAX_FILES = 256`. Final numbers set in
 Phase 1; the point is they are *fixed and stated*, not elastic.
+
+> **SUPERSEDED.** The shipped numbers are `BLOCK = 512` and `NAME_MAX = 38` (`services/fs/src/main.rs`),
+> and `MAX_FILES` does not exist at all - a directory is a tree of record blocks, so there is no
+> global file ceiling to state. Only the *principle* in that last sentence survived; all three numbers
+> did not.
 
 ### 6.1 Why bulk data is chunked and copied (a constitution consequence)
 

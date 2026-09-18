@@ -190,9 +190,16 @@ The current location is one drive+directory pointer moved by `cd` (`20_cd.md`).
 Read-only, so `dir` is a **shell built-in** that sends `ListDir` to `fs` (op 14) over a
 narrow `ipc_send=["fs"]` cap and formats the reply. `fs` enforces; the shell's authority is
 not widened beyond reading (`0_conventions.md` §2). Two code paths share that one `fs` call:
-`cmd_ls` formats the text listing (bare `dir`), and `build_ls_table` parses the same reply into
-the `name`/`type`/`size` table for the record pipe (`is_record_producer` routes a piped `dir` to
-it before the text producers are consulted).
+`cmd_dir` formats the text listing (bare `dir`), and `build_dir_table` parses the same reply into
+the `name`/`type`/`size`/`sealed` table for the record pipe (`is_record_producer` routes a piped
+`dir` to it before the text producers are consulted).
+
+Both walk the reply through a `DirCursor`, because one reply block carries only about twenty
+entries: the request says which entry to resume at and the reply says where to continue, so a
+directory of any size is listed in full (`backlog/33`). The count `dir` prints is therefore the
+number of entries it actually rendered, and it is printed LAST - the total is not known until the
+walk ends, and a header that can disagree with the rows under it is the wrong answer this whole
+mechanism exists to remove.
 
 ## 5. Later (separate doc so it can grow)
 

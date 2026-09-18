@@ -4581,9 +4581,12 @@ type Row = (&'static str, &'static str, &'static str);
 fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
     // PAGE IT WHEN IT DOES NOT FIT. `help` (the full list) has paged for a long time; a single
     // command's help never did, because no command's help was taller than a screen. `trace`'s is: it
-    // documents six views and eight columns, and on a 34-row console the top scrolled away for good
-    // on a framebuffer with no scrollback. The fix is not to write less - the column notes are the
-    // useful part - it is to reuse the pager that already exists.
+    // documents six views and eight columns, and on a 34-row console the top scrolled away for good.
+    // The fix is not to write less - the column notes are the useful part - it is to reuse the pager
+    // that already exists.
+    //
+    // Same standing as `cmd_help`'s pager: the "framebuffer has no scrollback" that justified this
+    // is no longer true, and both go together once scrollback is hardware-proven.
     let lines = help_block_lines(rows, footer);
     let (rows_avail, _) = ctx.console_dims();
     // Unknown geometry is not "no terminal": a failed lookup returns 0, and `edit` and `trace` both
@@ -5163,10 +5166,19 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     let total = HELP.len() + 1; // +1 for the header line
     // Page only for a direct interactive `help` (depth 0). When help is run from a
     // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys -
-    // the pager would block the run - so just dump it. The framebuffer console has no
-    // scrollback, so an interactive help longer than the screen scrolls its top off
-    // forever; page it then (a serial terminal has its own scrollback, but paging there
-    // is harmless and consistent). rows==0 means geometry is unknown → just print it.
+    // the pager would block the run - so just dump it. rows==0 means geometry is
+    // unknown → just print it.
+    //
+    // **THIS PAGER IS ON BORROWED TIME, AND THE REASON IT EXISTS HAS GONE.** It said "the
+    // framebuffer console has no scrollback, so an interactive help longer than the screen
+    // scrolls its top off forever". The console service KEEPS that history now and PgUp walks
+    // it (`docs/console-service.md` §10), so the justification no longer holds: `help | paginate`
+    // covers the deliberate case and scrollback covers the accidental one.
+    //
+    // It stays until scrollback is proven on a BOARD. Removing a workaround before its
+    // replacement is verified would leave the Pi-wired-to-a-TV case - the only machine either
+    // ever existed for - with no way to read `help` at all. Delete this, and `help_block`'s
+    // twin, in one commit once that passes.
     let (rows, _cols) = ctx.console_dims();
     let rows = rows as usize;
     // UNKNOWN GEOMETRY IS NOT "NO TERMINAL". A failed `console_dims` returns 0, and this treated that
@@ -8763,10 +8775,16 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
                             else { "trace: no events recorded (is any service granted ipc_send=[\"events\"]?)" });
         return Ok(());
     }
-    // PAGE when it does not fit, exactly as `help` does - a ring dump is routinely taller than the
-    // screen, and the framebuffer console has no scrollback, so the top would otherwise be gone
-    // forever. Unknown geometry is not "no terminal": a failed `console_dims` returns 0, and `edit`
-    // already treats that as 24 rows rather than dropping the feature.
+    // PAGE when it does not fit. Unknown geometry is not "no terminal": a failed `console_dims`
+    // returns 0, and `edit` already treats that as 24 rows rather than dropping the feature.
+    //
+    // **AND UNLIKE `help`'S PAGER, THIS ONE IS PERMANENT.** It used to say the same thing - "the
+    // framebuffer console has no scrollback, so the top would otherwise be gone forever" - which
+    // stopped being true when the console gained scrollback (`docs/console-service.md` §10). The
+    // reason this one survives is the PINNED REGION below: scrolled back through a grid in a
+    // scrollback buffer, the column names are off the top and you are reading unlabelled columns.
+    // Scrollback structurally cannot pin a header; a pager can. That is the whole difference
+    // between the two, and it is why `help`'s goes and this one does not.
     // PINNED: the legend and the column header are repainted at the top of every frame. They used to
     // be printed BEFORE the pager started, which put them exactly where its first `ESC[H` repaint
     // lands - so on a framebuffer console the legend flashed and vanished, and the column header met

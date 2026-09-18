@@ -143,10 +143,10 @@ pair.
 
 ## What's built vs next
 
-- **Built:** the `Table` model (owned column names + arena); `render_table` (default, full
-  string cells - no clipping), `render_json`, `render_yaml`; the compact `where`, `select`,
-  `sort [reverse] <col>`; **six shell-side record producers - `status` (task roster),
-  `dir` (`name`/`type`/`size`), `caps` (`resource`/`rights`), `drives`
+- **Built:** the `Table` model (owned column names + arena); `to_grid` (default, full
+  string cells - no clipping), `to_json`, `to_yaml`; the compact `where`, `select`,
+  `sort [reverse] <col>`; **the shell-side record producers - `status` (task roster),
+  `dir` (`name`/`type`/`size`/`sealed`), `caps` (`resource`/`rights`), `drives`
   (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`), and
   `observe now` (the roster + a `ticks` cumulative-cpu-time column - the native "top",
   `observe now | sort reverse ticks`)**; **`from json`** (text → records); and the **unified

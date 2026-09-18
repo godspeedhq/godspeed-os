@@ -53,7 +53,7 @@ both: the next run was `ran 461, failed 0` and ping worked.
 client request for all of it, doing `nic-driver` round trips that timed out.
 
 **`nic-driver` never died.** It started once at 20:47:06 and was still `Ready` at 20:51:23 with four
-minutes of uptime, so this is NOT the stale-peer-cap case (`project_stale_peer_cap_reacquire`), where
+minutes of uptime, so this is NOT the stale-peer-cap case, where
 the peer respawned and the cached cap went stale. The driver was alive and not answering.
 
 ## What is NOT established

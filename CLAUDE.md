@@ -343,7 +343,7 @@ os/
     naming-design.md     #   name resolution out of the kernel (Path C)
     persistence.md       #   block driver + filesystem, file-as-capability
     console-service.md   #   the terminal, and the kernel's boot/panic floor
-    ...                  #   (~30 files; the index lists them all)
+    ...                  #   (41 files; the index lists them all)
 
   audits/                # append-only EVIDENCE, not documentation
     unsafe-audit.md      #   every unsafe block; CI checks it matches source
@@ -382,14 +382,14 @@ os/
     test_report.py       #   collate a suite run into a report
     arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
 
-  utilities/             # the SPEC for every shell utility, one file each (48)
+  utilities/             # the SPEC for every shell utility, one file each (52 + 0_conventions)
     0_conventions.md     #   the 13 rules every utility obeys
   website/               # the published book (mdBook); pages `{{#include}}` the
                          #   sources above, so a doc and its page cannot drift
   backlog/               # open items - recorded rather than closed (§26.7)
   boot/                  # per-board boot config (pi2/, pi4/)
   contracts/schema/      # the JSON Schema a service contract is validated against
-  examples/              # 12 worked services
+  examples/              # 14 worked services
   milestones/            # what was achieved and when; ALMANAC.md is the chronicle
   bugs/                  # long-form investigations of four specific hardware bugs
   editors/               # syntax files for the gsh shell language
@@ -464,7 +464,10 @@ os/
 >   holds, `fs` recovers to a consistent state on mount, and the Phase D TCB claim stands unchanged.
 > - **A backend that cannot** does not. The Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, and
 >   FUA - which the drive does honour - costs more time per write than the driver's command budget can
->   give it (`USE_FUA`, `arch/arm/dwc2.rs`). With no barrier available, a power cut can lose the tail of
+>   give it (`USE_FUA`, then in the in-kernel `arch/arm/dwc2.rs`; that file was DELETED by the
+>   2026-08-17 amendment below and the driver is `services/dwc2` now - the DEVICE's refusal is what
+>   this paragraph turns on, and it is unchanged by where the driver lives). With no barrier
+>   available, a power cut can lose the tail of
 >   a write sequence, and `fs` says so **once per mount** rather than implying a guarantee it cannot
 >   deliver. Metadata is still CRC-verified, so the failure is DETECTED loudly on read; what is lost is
 >   automatic *recovery*, not the ability to notice.

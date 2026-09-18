@@ -318,7 +318,7 @@ font renderer and is serial-blind") is answered below.
 |---|---|---|
 | Serial | owns it, unchanged - **still the source of truth** | never touches it |
 | Framebuffer | a minimal boot/panic blit | the whole terminal |
-| Text model | none (no grid, no cursor, no scrollback) | ANSI/CSI, UTF-8, shadow grid, cursor, scroll, reverse video |
+| Text model | none (no grid, no cursor, no scrollback) | ANSI/CSI, UTF-8, shadow grid, cursor, scroll, reverse video, scrollback (§10) |
 | Geometry | private to its own blit, never published | the single source of truth for rows/cols |
 
 **Not serial-blind.** `ConsoleWrite` (syscall 23) still writes serial synchronously, exactly as today, so

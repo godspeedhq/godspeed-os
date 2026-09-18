@@ -450,7 +450,9 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
-    // `help` is now paged (the framebuffer console has no scrollback). Drive the pager:
+    // `help` is paged. (It was paged BECAUSE the framebuffer console had no scrollback; the console
+    // keeps history now, so that reason is gone and the pager is scheduled for removal once
+    // scrollback is hardware-proven - see `cmd_help`. This case goes with it.) Drive the pager:
     // page down through every screen (extra page-downs clamp at the bottom, harmless),
     // then `q` to quit. The accumulated byte stream still contains every section, and
     // reaching `gsh>` proves the pager exited cleanly back to the prompt.
