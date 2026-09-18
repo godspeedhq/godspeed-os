@@ -3088,11 +3088,26 @@ impl Fs {
         let existing = self.dir_find(ctx, &parent, name);
         if let Some(ref e) = existing {
             if !is_file(e.itype) { return Err("path is a directory"); }
+            // A SEALED FILE IS FROZEN HERE TOO, and this check was missing.
+            //
+            // `write_path` and `write_at` both refuse a sealed entry; this route did not, and it is
+            // the one that does the most damage: it truncates the file, allocates a fresh extent and
+            // writes a REPLACEMENT entry - which was constructed with `sealed: false`. So
+            // `copy <anything> <sealed file>` silently UNSEALED it. The headline guarantee of the
+            // whole feature is that there is no unseal, and there was one.
+            //
+            // The reasoning that missed it is worth recording because it sounded sufficient: the
+            // seal is carried on the `Entry` that each write route walks to, so a new route "cannot
+            // forget to ask". But this route does not READ the entry it replaces - it overwrites it -
+            // so there was nothing to forget. Carrying a flag on a record only protects the paths
+            // that consult that record.
+            if e.sealed { return Err("file is sealed - its content cannot be changed"); }
         }
         let blocks = ((total + DATA_PAYLOAD as u64 - 1) / DATA_PAYLOAD as u64).max(1);
         let (itype, first, count) = self.alloc_file(ctx, blocks)?;
         match existing {
             Some(e) => {
+                // `sealed: false` is correct ONLY because the guard above proved it was not sealed.
                 let ne = Entry { itype, sealed: false, size: total, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)

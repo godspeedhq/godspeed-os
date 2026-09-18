@@ -848,6 +848,25 @@ read /sc/frozen.txt | assert lacks tampered
 # column, not a new `type` value, so existing `where type=file` queries keep their meaning.
 dir /sc | where sealed=true | assert contains frozen.txt
 dir /sc | where sealed=false | assert lacks frozen.txt
+# EVERY WRITE ROUTE, not just `write`. `copy` goes through a DIFFERENT one (write_new + streaming
+# write_at), and on 2026-09-18 that route had no seal check at all: it truncated the file and wrote a
+# replacement entry with the flag CLEARED, so `copy` silently unsealed. Proving one route refuses does
+# not prove the others, which is the whole reason this line exists.
+write /sc/replacement.txt replacement-content
+assert fails copy /sc/replacement.txt /sc/frozen.txt
+read /sc/frozen.txt | assert contains original
+read /sc/frozen.txt | assert lacks replacement-content
+delete /sc/replacement.txt
+# A sealed file is still a FILE to a query. If sealing changed an entry's type, every `where
+# type=file` anyone has already written would silently stop matching it.
+dir /sc | where type=file | assert contains frozen.txt
+# Only a FILE can be sealed - a directory is refused, which is what keeps TYPE single-valued (there
+# is no dir+sealed state to render).
+assert fails seal /sc yes
+assert fails seal /sc/no-such-file.txt yes
+# `seal help` must answer (conventions rule 1). It did NOT until 2026-09-17 - the command was
+# dispatched from a block that registered no help block, and the vocabulary checker caught it.
+assert ok seal help
 # A seal freezes CONTENT, not existence: renaming and deleting still work, and that is deliberate
 # (see utilities/50_seal.md - an unremovable file is a denial of service, not a guarantee).
 rename /sc/frozen.txt frozen2.txt

@@ -6293,6 +6293,21 @@ pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
                           "write /frozen.txt tampered", "read /frozen.txt", "dir /"]);
     check!(os.get(1).map_or(false, |r| r.contains("sealed /frozen.txt")), "boot 1: the file was sealed");
     check!(os.get(2).map_or(false, |r| !r.contains("wrote")), "boot 1: writing a SEALED file was refused");
+    // EVERY write route, not just `write`. `copy` goes through write_new + streaming write_at, and
+    // that route had NO seal check: it truncated the file and wrote a replacement entry with the flag
+    // cleared, so `copy` silently unsealed. The feature's headline guarantee is that there is no
+    // unseal, and there was one - reachable with a command a user types every day.
+    let (ou, _) = boot(&["write /unsealer.txt overwrite-me", "copy /unsealer.txt /frozen.txt",
+                         "read /frozen.txt", "dir /"]);
+    check!(ou.get(1).map_or(false, |r| !r.contains("copied")),
+           "COPY onto a sealed file is refused (the other write route)");
+    check!(ou.get(2).map_or(false, |r| r.contains("original")),
+           "the sealed content survived the copy attempt");
+    // The frozen.txt ROW specifically, not the listing as a whole: `contains("seal")` would match
+    // anything anywhere in the output, including another file's row or an unrelated log line, and an
+    // assertion that cannot distinguish those is not evidence.
+    check!(ou.get(3).map_or(false, |r| r.lines().any(|l| l.contains("frozen.txt") && l.contains("seal"))),
+           "and the file is STILL sealed afterwards (its own row still reads `seal`)");
     check!(os.get(3).map_or(false, |r| r.contains("original") && !r.contains("tampered")),
            "boot 1: the sealed content is untouched");
     check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `dir` marks it sealed");

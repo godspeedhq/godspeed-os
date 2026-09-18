@@ -71,9 +71,20 @@ Three refusals, and the first is the one that matters:
    write, because handing out a capability that looks writable and fails on use is a worse answer
    than refusing plainly - and §7.3 says rights narrow, so a capability that cannot be honoured
    should never exist.
-2. Every write path (`write`, the streaming `write_at`, the journaled variant) refuses, because the
-   seal is carried on the `Entry` that each of them walks to. A new write route cannot be added later
-   that forgets to ask.
+2. Every write path refuses: `write`, the streaming `write_at`, the journaled variant, **and
+   `write_new`, which did not until 2026-09-18.**
+
+   That omission is worth keeping, because the reasoning that produced it sounded sufficient. This
+   said the seal is carried on the `Entry` each write route *walks to*, so a new route "cannot forget
+   to ask". But `write_new` does not READ the entry it replaces - it OVERWRITES it, constructing a
+   fresh one with the flag cleared - so there was nothing to forget. **Carrying a flag on a record
+   only protects the routes that consult that record.**
+
+   The reachable consequence was not a subtle one: `copy <anything> <sealed file>` destroyed the
+   sealed content. `copy` is `write_new` followed by streaming `write_at`, each in its own
+   transaction, so `write_new` truncated and committed before `write_at` refused - the command
+   reported failure and the file was already empty. Found by adding seal coverage to `selfcheck`, and
+   pinned by `osdev test fs-time`, which fails on exactly that check if the guard is removed.
 3. The volume records a **`ro_compat` feature bit** the first time anything is sealed, so a build
    that does not know about seals mounts the whole volume READ-ONLY (§6.15) rather than writing
    through a flag it cannot see.
