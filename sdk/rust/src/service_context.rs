@@ -2819,22 +2819,36 @@ impl ServiceContext {
     /// file scroll the view of the terminal showing it. A request carries a reply cap and output
     /// does not, so the two channels are separated by construction.
     ///
-    /// `(0, 0)` if the console cannot be reached - the same degraded answer `console_dims` gives,
-    /// and for the same reason: a caller must be able to carry on without a display service.
-    pub fn console_scroll(&self, action: u8) -> (u16, u16) {
+    /// **`None` MEANS THE CONSOLE DID NOT ANSWER, and that is not the same as `(0, 0)`.**
+    ///
+    /// It returned `(0, 0)` for both "the view is at live" and "I could not reach the console",
+    /// and the caller could not tell them apart. On a Dell Wyse, 2026-09-18, that turned a timed-out
+    /// request into a plausible success: the shell believed it had scrolled back to live, left the
+    /// scrollback view, and returned to the prompt **while the screen was still showing history** -
+    /// the two disagreeing about what was on the display, with nothing said. A failure wearing a
+    /// valid value is the exact shape invariant 12 and 26.7 exist to forbid, and it is worth the
+    /// `Option` to make it unrepresentable.
+    ///
+    /// **ONE SECOND, AND NO RETRY - because this is a KEYSTROKE.** It used to be the same two
+    /// seconds plus a reacquire-and-retry that `console_dims` uses, which is right for a
+    /// once-per-command lookup and wrong here: it let a single press of an arrow key block the
+    /// shell for four seconds, which the operator experiences as the machine locking up. Nothing
+    /// above the kernel may hang on a peer (Commandment V); a scroll that cannot be served quickly
+    /// must FAIL quickly and say so.
+    ///
+    /// Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
+    /// console that has just restarted is rebuilding the screen anyway; the next `console_dims`
+    /// reacquires for everyone.
+    pub fn console_scroll(&self, action: u8) -> Option<(u16, u16)> {
         let mut buf = [0u8; 8];
         // Opcode 2 = REQ_SCROLL (`services/console/src/main.rs`).
         let req = [2u8, action];
-        let mut n = self.request_with_reply_deadline_into("console", &req, &mut buf, 2);
-        if n.is_none() && self.reacquire_by_name("console") {
-            n = self.request_with_reply_deadline_into("console", &req, &mut buf, 2);
-        }
-        match n {
-            Some(k) if k >= 4 => (
+        match self.request_with_reply_deadline_into("console", &req, &mut buf, 1) {
+            Some(k) if k >= 4 => Some((
                 u16::from_le_bytes([buf[0], buf[1]]),
                 u16::from_le_bytes([buf[2], buf[3]]),
-            ),
-            _ => (0, 0),
+            )),
+            _ => None,
         }
     }
 

@@ -831,7 +831,10 @@ const SCROLL_TOP: u8 = 5;
 /// `q` still gets you out anyway because any printable key does.
 fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
     // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
-    let (mut view, _) = ctx.console_scroll(SCROLL_PAGE_UP);
+    let Some((mut view, _)) = ctx.console_scroll(SCROLL_PAGE_UP) else {
+        ctx.console_writeln("scrollback: the console did not answer - not scrolling");
+        return;
+    };
     if view == 0 { return; }
     loop {
         let c = ctx.console_read();
@@ -839,7 +842,7 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
             0x1B => match read_escape_byte(ctx) {
                 // A BARE Escape leaves. A real sequence's bytes are already queued, so this cannot
                 // be confused with an arrow (`read_escape_byte` is the same reader the prompt uses).
-                None => { ctx.console_scroll(SCROLL_LIVE); return; }
+                None => { let _ = ctx.console_scroll(SCROLL_LIVE); return; }
                 Some(b'[') | Some(b'O') => match scroll_csi(ctx) {
                     Some(a) => a,
                     None => continue,           // a sequence this view does not use
@@ -852,15 +855,30 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
             // out without a separate thought. Everything else (Tab, Backspace, Ctrl+C) leaves and is
             // dropped: they edit a line, and there is no line being edited up here.
             _ => {
-                ctx.console_scroll(SCROLL_LIVE);
+                let _ = ctx.console_scroll(SCROLL_LIVE);
                 if (0x20..0x7f).contains(&c) { line.insert(ctx, c); }
                 return;
             }
         };
-        let (v, _) = ctx.console_scroll(action);
-        view = v;
-        // Scrolled all the way back down to live - the bar is gone, so the mode is over.
-        if view == 0 { return; }
+        match ctx.console_scroll(action) {
+            Some((v, _)) => {
+                view = v;
+                // Scrolled all the way back down to live - the bar is gone, so the mode is over.
+                if view == 0 { return; }
+            }
+            // THE CONSOLE DID NOT ANSWER. Do NOT read that as "we are at live" - that is precisely
+            // the bug this arm exists to remove, and it left the screen showing history while the
+            // shell went back to the prompt. Say so and leave.
+            //
+            // Printing IS the repair: console output snaps the view back to live
+            // (`Term::put_bytes`), so the one action that reports the failure is also the one that
+            // puts the display right. If the console is gone entirely the message does not land
+            // either, but then the screen is frozen regardless and nothing here could help.
+            None => {
+                ctx.console_writeln("scrollback: the console stopped answering - left the view");
+                return;
+            }
+        }
     }
 }
 
