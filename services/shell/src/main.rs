@@ -800,36 +800,100 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
-/// Scroll actions, mirroring `services/console/src/term.rs`. Only the three the prompt sends.
+/// Scroll actions, mirroring `services/console/src/term.rs`.
 const SCROLL_LIVE: u8 = 0;
+const SCROLL_UP: u8 = 1;
+const SCROLL_DOWN: u8 = 2;
 const SCROLL_PAGE_UP: u8 = 3;
 const SCROLL_PAGE_DOWN: u8 = 4;
 const SCROLL_TOP: u8 = 5;
-const SCROLL_QUERY: u8 = 6;
 
-/// Home while SCROLLED BACK means "the oldest line still kept"; at the prompt it means "start of
-/// line". Returns true if it was taken as a scroll.
+/// **SCROLLBACK IS A MODE, AND THAT IS WHAT MAKES THE KEYS UNAMBIGUOUS.**
 ///
-/// **HOME AND END ALREADY BELONG TO THE LINE EDITOR, and that is not negotiable** - they have edited
-/// the command line since there was one. PageUp and PageDown were genuinely free (the CSI handler
-/// listed them as ignored), so those are unconditional; Home and End are claimed ONLY while the view
-/// is already scrolled, which is a moment when there is nothing to edit and the indicator on screen
-/// is advertising them. Any other key snaps the view back to live and is then handled normally -
-/// which needs no code here, because a keystroke at the prompt is echoed, an echo is console output,
-/// and output snaps the view (see `Term::put_bytes`).
-fn scroll_home(ctx: &ServiceContext) -> bool {
-    let (view, _) = ctx.console_scroll(SCROLL_QUERY);
-    if view == 0 { return false; }
-    ctx.console_scroll(SCROLL_TOP);
-    true
+/// PgUp enters it, Esc leaves it, and while it is up the shell reads keys HERE rather than through
+/// the line editor. So an arrow means scroll, full stop - no per-keystroke question about which
+/// meaning is live, and the reverse-video bar on screen IS the indicator that tells you which mode
+/// you are in.
+///
+/// The first design claimed Home/End conditionally: at the prompt they edited the line, and while
+/// the view happened to be scrolled they scrolled it. That worked, and it could not be extended to
+/// the ARROWS - which is what a reader reaches for - because Up/Down are command history and are
+/// pressed constantly, so every one of them would have had to ASK the console where the view was
+/// first. On this hardware the console can be 30-40 ms into a repaint when you ask.
+///
+/// A mode removes the question instead of answering it repeatedly. It also gives Home and End back
+/// to the line editor unconditionally, which is where they have always belonged: you cannot be
+/// scrolled at the prompt any more, because being scrolled means being in here.
+///
+/// The key set is `paginate`'s, deliberately - arrows a line, PgUp/PgDn a page, Home/End the ends -
+/// so the two things in this shell that show you more than a screenful work the same way. `q` is
+/// NOT bound: in `paginate` you quit something that is running, here you step back from a view, and
+/// `q` still gets you out anyway because any printable key does.
+fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
+    // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
+    let (mut view, _) = ctx.console_scroll(SCROLL_PAGE_UP);
+    if view == 0 { return; }
+    loop {
+        let c = ctx.console_read();
+        let action = match c {
+            0x1B => match read_escape_byte(ctx) {
+                // A BARE Escape leaves. A real sequence's bytes are already queued, so this cannot
+                // be confused with an arrow (`read_escape_byte` is the same reader the prompt uses).
+                None => { ctx.console_scroll(SCROLL_LIVE); return; }
+                Some(b'[') | Some(b'O') => match scroll_csi(ctx) {
+                    Some(a) => a,
+                    None => continue,           // a sequence this view does not use
+                },
+                Some(_) => continue,
+            },
+            // Enter scrolls a line, exactly as it does in `paginate` and in every terminal.
+            b'\r' | b'\n' => SCROLL_DOWN,
+            // ANY PRINTABLE KEY LEAVES AND THEN TYPES ITSELF, so starting to type a command gets you
+            // out without a separate thought. Everything else (Tab, Backspace, Ctrl+C) leaves and is
+            // dropped: they edit a line, and there is no line being edited up here.
+            _ => {
+                ctx.console_scroll(SCROLL_LIVE);
+                if (0x20..0x7f).contains(&c) { line.insert(ctx, c); }
+                return;
+            }
+        };
+        let (v, _) = ctx.console_scroll(action);
+        view = v;
+        // Scrolled all the way back down to live - the bar is gone, so the mode is over.
+        if view == 0 { return; }
+    }
 }
 
-/// End while scrolled back returns to live; at the prompt it means "end of line".
-fn scroll_end(ctx: &ServiceContext) -> bool {
-    let (view, _) = ctx.console_scroll(SCROLL_QUERY);
-    if view == 0 { return false; }
-    ctx.console_scroll(SCROLL_LIVE);
-    true
+/// The body of an escape sequence, as a scroll action. `None` for anything this view ignores.
+fn scroll_csi(ctx: &ServiceContext) -> Option<u8> {
+    const CSI_MAX: usize = 8;
+    let mut param: u16 = 0;
+    let mut final_byte = 0u8;
+    for _ in 0..CSI_MAX {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() {
+            param = param.saturating_mul(10).saturating_add((c - b'0') as u16);
+        } else if c == b';' {
+            continue;
+        } else {
+            final_byte = c;
+            break;
+        }
+    }
+    match final_byte {
+        b'A' => Some(SCROLL_UP),
+        b'B' => Some(SCROLL_DOWN),
+        b'H' => Some(SCROLL_TOP),
+        b'F' => Some(SCROLL_LIVE),
+        b'~' => match param {
+            1 | 7 => Some(SCROLL_TOP),
+            4 | 8 => Some(SCROLL_LIVE),
+            5 => Some(SCROLL_PAGE_UP),
+            6 => Some(SCROLL_PAGE_DOWN),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usize) {
@@ -880,15 +944,19 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
         }
         b'C' => line.right(ctx), // Right - move cursor within the line
         b'D' => line.left(ctx),  // Left
-        b'H' => if !scroll_home(ctx) { line.home(ctx) },  // Home (ESC[H)
-        b'F' => if !scroll_end(ctx)  { line.end(ctx) },   // End  (ESC[F)
+        // UNCONDITIONAL AGAIN. These were briefly "scroll if the view happens to be scrolled,
+        // otherwise edit the line"; with scrollback as a mode you cannot be scrolled at the prompt,
+        // so they are line editing and nothing else - which is what they have always been.
+        b'H' => line.home(ctx),  // Home (ESC[H)
+        b'F' => line.end(ctx),   // End  (ESC[F)
         b'~' => match param {    // navigation cluster: ESC[<n>~
-            1 | 7 => if !scroll_home(ctx) { line.home(ctx) },  // Home
-            4 | 8 => if !scroll_end(ctx)  { line.end(ctx) },   // End
+            1 | 7 => line.home(ctx),   // Home
+            4 | 8 => line.end(ctx),    // End
             3     => line.delete(ctx), // Delete (forward delete)
-            5     => { ctx.console_scroll(SCROLL_PAGE_UP); }   // PageUp - into the scrollback
-            6     => { ctx.console_scroll(SCROLL_PAGE_DOWN); } // PageDown - back toward live
-            // 2 = Insert, 11.. = F-keys: no shell action, ignored.
+            // PageUp ENTERS the scrollback view and does not return until Esc, a printable key, or
+            // scrolling back down to live. PageDown from live has nowhere to go, so it is ignored.
+            5     => scrollback_mode(ctx, line),
+            // 2 = Insert, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
             _ => { let _ = have_param; }
         },
         _ => {} // unknown final byte - already consumed, do nothing

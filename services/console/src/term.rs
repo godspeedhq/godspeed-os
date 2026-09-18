@@ -1044,7 +1044,10 @@ fn paint_view_indicator(s: &mut Fb, r: usize, width: usize) {
     put(&mut buf, &mut n, b" of ");
     put_num(&mut buf, &mut n, s.sb.len() as u64, width);
     put(&mut buf, &mut n, if s.sb.aged() > 0 { b" lines kept " } else { b" lines " });
-    put(&mut buf, &mut n, b"  [PgUp/PgDn] page  [Home] oldest kept  [End] live ");
+    // THE BAR IS THE ONLY THING THAT SAYS WHICH KEYS WORK, so it names all of them. It listed
+    // PgUp/PgDn/Home/End when those were the whole set; the view is a MODE now (see the shell's
+    // `scrollback_mode`) and the arrows and Esc belong to it too.
+    put(&mut buf, &mut n, b"  [arrows] line  [PgUp/PgDn] page  [Home/End] ends  [Esc] live ");
     // Reverse video, so the indicator cannot be mistaken for content - it is the one row on screen
     // that is not something a program printed.
     let saved = s.reverse;

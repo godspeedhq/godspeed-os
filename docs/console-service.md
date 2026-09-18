@@ -546,25 +546,56 @@ on that channel, and the SDK's `console_scroll(action)` is how a holder of the k
 **The console does the arithmetic**, because only it knows how many lines it holds and how
 tall the screen is. A copy of either number in the shell would be a second thing to drift.
 
-### 10.5 What the keys are, and the one conflict
+### 10.5 Scrollback is a MODE, which is what makes the keys unambiguous
 
-- **PgUp / PgDn** scroll a page, always. They were genuinely free: the shell's CSI handler
-  listed them as ignored.
-- **Home / End** are claimed **only while the view is already scrolled** - "oldest kept" and
-  "live". At an ordinary prompt they still mean start-of-line and end-of-line, because they
-  have edited the command line since there was one and that is not negotiable. While scrolled
-  there is nothing to edit, and the indicator on screen is advertising them.
-- **Anything else** returns the view to live and is then handled normally. This needs no code:
-  a keystroke at the prompt is echoed, an echo is console output, and **output snaps the view**.
+**PgUp enters it. Esc leaves it.** While the bar is up, the shell reads keys in a loop of its
+own (`scrollback_mode`) rather than through the line editor:
 
-The pinned bottom row says `[PgUp/PgDn] page  [Home] oldest kept  [End] live`, in reverse
-video so it cannot be mistaken for content.
+| key | in the view |
+|---|---|
+| arrows | scroll a line |
+| PgUp / PgDn, Enter | a page / a line |
+| Home / End | the oldest kept line / live |
+| Esc | back to live |
+| any printable key | back to live, **and it types itself** |
+
+The pinned bottom row says `[arrows] line  [PgUp/PgDn] page  [Home/End] ends  [Esc] live`, in
+reverse video so it cannot be mistaken for content. It is the mode indicator as well as the
+legend: no bar, no mode.
+
+**Why a mode rather than conditional keys.** The first design claimed Home and End *only while
+the view happened to be scrolled* - at the prompt they edited the line, and scrolled they
+scrolled. That worked, and it could not be extended to the **arrows**, which are what a reader
+actually reaches for. Up and Down are command history and are pressed constantly, so each one
+would have had to **ask the console where the view was** before deciding what it meant; on the
+Dell Wyse the console can be 30-40 ms into a repaint when you ask.
+
+A mode removes the question instead of answering it over and over. It also gives Home and End
+back to the line editor **unconditionally**, which is where they have always belonged - you
+cannot be scrolled at the prompt any more, because being scrolled means being in here.
+
+The key set is `paginate`'s on purpose, so the two things in this shell that show you more than
+a screenful behave the same way. `q` is deliberately not bound: in `paginate` you are quitting
+something that is *running*, here you are stepping back from a view - and `q` gets you out
+regardless, because every printable key does.
 
 **"Oldest kept", never "start".** Once the ring has wrapped, the top of the view is not the
 beginning of the session - it is the oldest line that survived. Presenting it as the beginning
 would be claiming to show history that was discarded, which is the same shape of wrong answer
 as a truncated directory listing reported as a total (§26.7). The ring counts what it has aged
 out so the view can say which case it is in.
+
+### 10.6 Output snaps the view back to live - the safety net, no longer the mechanism
+
+> **Amendment: with scrollback as a mode (§10.5), typing no longer *relies* on this.** A
+> printable key leaves the view by asking for `SCROLL_LIVE` explicitly, so the exit is a
+> decision rather than a side effect - which is why the log now reads `returned to live
+> (requested)` where it used to read `(output arrived)`.
+>
+> The snap stays as the defensive case it always was: if anything else writes to the console
+> while a reader is scrolled, the screen returns to live rather than silently showing stale
+> content with new output hidden behind it. The reasoning below is unchanged and is why that
+> case is rare here.
 
 ### 10.6 Output snaps the view back to live - the deliberate simplification
 

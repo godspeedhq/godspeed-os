@@ -399,53 +399,62 @@ pub fn run(image_path: &Path, smp: u32) {
     // prompt, and it was landing a few bytes after it - so a collect that stopped at `gsh>` missed
     // the line it was looking for and found it at the start of the NEXT case instead. Each step
     // below waits for the transition it is actually about.
+    //
+    // SCROLLBACK IS A MODE: PgUp enters it, Esc leaves it, and while it is up the shell reads keys
+    // itself rather than through the line editor. That is what makes the arrows unambiguous, and it
+    // is what these cases pin.
     send(&mut write_half, b"\x1b[5~");
     let sb1 = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10))
         .unwrap_or_default();
     check!(sb1.contains("scrolled back"),
-           "scrollback: PgUp scrolls the console into retained history");
-    // OUTPUT SNAPS THE VIEW BACK TO LIVE. This is the whole of "any key that is not a scroll key
-    // returns you to the bottom": a keystroke at the prompt is echoed, an echo is console output, and
-    // output snaps the view. It falls out rather than being implemented.
-    send(&mut write_half, b"cores\r");
-    let sb1b = collect_until(&buf, &mut cursor, b"(output arrived)", Duration::from_secs(10))
-        .unwrap_or_default();
-    check!(sb1b.contains("returned to live"),
-           "scrollback: output returns the view to live by itself");
-    let sb1c = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
-    check!(sb1c.contains("cores: 4") || sb1b.contains("cores: 4"),
-           "scrollback: the command ran normally afterwards");
+           "scrollback: PgUp enters the view");
 
-    // End RETURNS TO LIVE while scrolled, and is the line editor's "end of line" otherwise. Home is
-    // the same arrangement for "oldest kept". Sent as `ESC [ F` / `ESC [ H`, the forms the shell's
-    // CSI handler already reads for the line editor.
-    send(&mut write_half, b"\x1b[5~");
-    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
-    send(&mut write_half, b"\x1b[F");
+    // THE ARROWS DO NOT LEAK. Three Up arrows inside the view scroll it; if they had reached the
+    // line editor they would have recalled history and echoed a command onto the prompt. Then Esc
+    // leaves. Exactly ONE transition each way is the proof: a leak would have ended the mode early
+    // and produced a second `scrolled back` when the next key re-entered it.
+    send(&mut write_half, b"\x1b[A\x1b[A\x1b[A\x1b");
     let sb2 = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(10))
         .unwrap_or_default();
     check!(sb2.contains("returned to live"),
-           "scrollback: End returns to live while scrolled (not the line editor)");
+           "scrollback: Esc leaves the view");
+    check!(!sb2.contains("scrolled back"),
+           "scrollback: arrows scroll INSIDE the view - they do not leak to history and re-enter");
 
-    // Home while scrolled reaches the OLDEST LINE STILL KEPT - never called "the start", because once
-    // the ring has wrapped it is not the start, and saying so would claim history that was discarded.
+    // A PRINTABLE KEY LEAVES AND THEN TYPES ITSELF, so starting to type a command gets you out
+    // without a separate thought. `cores` is typed with its first letter delivered from inside the
+    // view; the command must still run correctly.
     send(&mut write_half, b"\x1b[5~");
     let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
-    send(&mut write_half, b"\x1b[H");
     send(&mut write_half, b"cores\r");
-    let sb3 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
-    check!(sb3.contains("returned to live"), "scrollback: Home is taken as a scroll while scrolled");
+    let sb3 = collect_until(&buf, &mut cursor, b"cores: 4", Duration::from_secs(10))
+        .unwrap_or_default();
+    check!(sb3.contains("returned to live"),
+           "scrollback: a printable key leaves the view");
+    check!(sb3.contains("cores: 4"),
+           "scrollback: ...and types itself, so the command still runs");
 
-    // AND AT AN ORDINARY PROMPT, Home and End STILL EDIT THE LINE. This is the half that would break
-    // silently if the keys had been claimed unconditionally.
+    // Home inside the view is "oldest kept"; End is "live". Both are the view's keys here, and
+    // neither touches the line.
+    send(&mut write_half, b"\x1b[5~");
+    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
+    send(&mut write_half, b"\x1b[H\x1b[F");
+    let sb5 = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(10))
+        .unwrap_or_default();
+    check!(sb5.contains("returned to live"),
+           "scrollback: Home then End inside the view jumps to the oldest kept line and back to live");
+
+    // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR AGAIN - unconditionally, which is the
+    // simplification the mode bought. They were briefly "scroll if the view happens to be scrolled",
+    // and that could never have been extended to the arrows: Up/Down are command history and are
+    // pressed constantly, so every one would have had to ask the console where the view was first.
     //
-    // Type `hello world`, press Home, then type `echo ` - which must land at the FRONT, giving
-    // `echo hello world`. If Home had gone to the scrollback instead, the cursor would still be at
-    // the end and the line would read `hello worldecho `, which is not a command.
+    // Type `hello world`, Home, then `echo ` - which must land at the FRONT, giving `echo hello
+    // world`. If Home had gone anywhere near the scrollback the line would read `hello worldecho `.
     send(&mut write_half, b"hello world\x1b[Hecho \r");
     let sb4 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
     check!(sb4.contains("hello world"),
-           "scrollback: Home still edits the line when the view is NOT scrolled");
+           "scrollback: Home is the line editor at the prompt, unconditionally");
 
     // -----------------------------------------------------------------------
     // help
