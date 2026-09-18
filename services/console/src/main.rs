@@ -120,6 +120,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut passes: u64 = 0;
     // Said once, the first time the scrollback ring evicts anything. See the report in the loop.
     let mut sb_wrapped = false;
+    // Passes that ran long enough to starve a request. See the report in the loop.
+    let mut long_passes: u64 = 0;
     // PAINT CADENCE. A pass drains for at most this long before painting and returning to a blocking
     // `recv`. 16 ms is about one frame; a display that repaints that often reads as smooth.
     //
@@ -307,6 +309,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log_fmt(format_args!(
                     "console: scrollback full at {} lines / {} bytes - older lines now age out",
                     kept, bytes));
+            }
+        }
+        // HOW LONG A WHOLE PASS TOOK, reported only when it is long enough to be the reason a client
+        // gave up. `backlog/37`: on a Dell Wyse a scroll request timed out against a 1 s deadline
+        // while this service reported no slow paint at all - so either the request waited in the
+        // queue behind work, or a pass ran long for a reason nothing here measures. A pass is
+        // drain + paint, which is everything between two blocking `recv`s, so a pass over the
+        // deadline IS a window in which no request could be answered.
+        //
+        // Quiet by construction: only over 250 ms, and only the first few plus every 32nd, so a
+        // healthy display prints nothing and a sick one cannot flood the log it is struggling with.
+        if per_us > 1 {
+            let pass_us = ctx.read_tsc().wrapping_sub(t_pass0) / per_us;
+            if pass_us > 250_000 {
+                long_passes += 1;
+                if long_passes <= 3 || long_passes % 32 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "console: pass {} took {} ms ({} messages) - no client could be answered during it, {} so far",
+                        passes, pass_us / 1000, drained, long_passes));
+                }
             }
         }
         let esc = term.esc_state();

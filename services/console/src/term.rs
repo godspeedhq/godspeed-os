@@ -79,6 +79,13 @@ pub const SCROLL_TOP: u8 = 5;       // Home - the OLDEST LINE STILL KEPT, which 
 /// the view is already scrolled before deciding which of the two meanings a keypress has. A query
 /// that repainted would flicker the screen on every Home at an ordinary prompt.
 pub const SCROLL_QUERY: u8 = 6;
+/// End - jump to the NEWEST line and STAY in the view. Distinct from `SCROLL_LIVE`, which leaves.
+///
+/// They were the same action, and that was wrong: `End` took you to the bottom and dropped you out,
+/// so the only way to reach the newest line and keep looking was to not press the key named "End".
+/// Leaving is `Esc`'s job. "The view is at offset 0" and "there is no view" are different states and
+/// now have different actions.
+pub const SCROLL_BOTTOM: u8 = 7;
 
 pub(crate) const SB_BYTES: usize = 32 * 1024;
 
@@ -300,6 +307,14 @@ pub(crate) struct Fb {
     /// one. An instrument that double-counts is worse than one that says less.
     pub(crate) snapped_by_output: bool,
 
+    /// Whether the scrollback VIEW is open at all, independent of how far back it is scrolled.
+    ///
+    /// Offset 0 used to mean "no view", which collapsed two different states: being at the newest
+    /// line WITH the view open, and not being in the view. `End` therefore had to exit in order to
+    /// reach the bottom. The bar is drawn whenever this is set, so it is also what tells the reader
+    /// they are still in a mode when the content behind it happens to be the live screen.
+    pub(crate) in_view: bool,
+
     /// Lines the view is scrolled back from live. 0 means the screen shows the live grid, which is
     /// every moment except while somebody is reading history.
     ///
@@ -367,6 +382,7 @@ impl Term {
                 attr: [[0; ATTR_STRIDE]; MAX_ROWS],
                 sb: Scrollback::new(),
                 view: 0,
+                in_view: false,
                 snapped_by_output: false,
                 blend_lut: [0; 256],
             },
@@ -408,8 +424,10 @@ impl Term {
         // much less here than it looks: service logs go to the kernel ring and serial (§11.4), not
         // to this service, so on a framebuffer the only writer is whoever the operator just ran.
         // Output arrives because you asked for it. Recorded as the deliberate simplification it is.
-        if self.s.view != 0 {
+        // Output ends the VIEW, not merely its offset: the reader is doing something else now.
+        if self.s.in_view || self.s.view != 0 {
             self.s.view = 0;
+            self.s.in_view = false;
             self.s.repaint_pending = true;
             self.s.snapped_by_output = true;
         }
@@ -431,9 +449,17 @@ impl Term {
         // A page leaves one line of overlap, so a reader can see where the last page ended.
         let page = s.rows.saturating_sub(2).max(1);
         let max = s.sb.len();
-        let was = s.view;
+        let was_open = s.in_view;
+        // LEAVING is its own action, and the only one that closes the view.
+        if action == SCROLL_LIVE {
+            s.view = 0;
+            s.in_view = false;
+            if was_open { repaint_all(s); render::present(); }
+            return (0, max);
+        }
+        s.in_view = true;
         s.view = match action {
-            SCROLL_LIVE      => 0,
+            SCROLL_BOTTOM    => 0,
             SCROLL_UP        => (s.view + 1).min(max),
             SCROLL_DOWN      => s.view.saturating_sub(1),
             SCROLL_PAGE_UP   => (s.view + page).min(max),
@@ -441,13 +467,8 @@ impl Term {
             SCROLL_TOP       => max,
             _                => s.view,
         };
-        if s.view == 0 {
-            // Back to live: the shadow grid was never disturbed, so this is an ordinary repaint.
-            if was != 0 { repaint_all(s); render::present(); }
-        } else {
-            paint_view(s);
-            render::present();
-        }
+        paint_view(s);
+        render::present();
         (s.view, max)
     }
 
@@ -1044,6 +1065,7 @@ fn paint_view_indicator(s: &mut Fb, r: usize, width: usize) {
     put(&mut buf, &mut n, b" of ");
     put_num(&mut buf, &mut n, s.sb.len() as u64, width);
     put(&mut buf, &mut n, if s.sb.aged() > 0 { b" lines kept " } else { b" lines " });
+    if s.view == 0 { put(&mut buf, &mut n, b" (newest) "); }
     // THE BAR IS THE ONLY THING THAT SAYS WHICH KEYS WORK, so it names all of them. It listed
     // PgUp/PgDn/Home/End when those were the whole set; the view is a MODE now (see the shell's
     // `scrollback_mode`) and the arrows and Esc belong to it too.

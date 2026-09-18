@@ -807,6 +807,7 @@ const SCROLL_DOWN: u8 = 2;
 const SCROLL_PAGE_UP: u8 = 3;
 const SCROLL_PAGE_DOWN: u8 = 4;
 const SCROLL_TOP: u8 = 5;
+const SCROLL_BOTTOM: u8 = 7;
 
 /// **SCROLLBACK IS A MODE, AND THAT IS WHAT MAKES THE KEYS UNAMBIGUOUS.**
 ///
@@ -862,9 +863,11 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
         };
         match ctx.console_scroll(action) {
             Some((v, _)) => {
+                // Offset 0 is NOT an exit. The view stays open at the newest line - the bar says
+                // `(newest)` - and only Esc or a printable key leaves. Scrolling down to the bottom
+                // and being thrown out was the surprise this removes.
                 view = v;
-                // Scrolled all the way back down to live - the bar is gone, so the mode is over.
-                if view == 0 { return; }
+                let _ = view;
             }
             // THE CONSOLE DID NOT ANSWER. Do NOT read that as "we are at live" - that is precisely
             // the bug this arm exists to remove, and it left the screen showing history while the
@@ -902,10 +905,13 @@ fn scroll_csi(ctx: &ServiceContext) -> Option<u8> {
         b'A' => Some(SCROLL_UP),
         b'B' => Some(SCROLL_DOWN),
         b'H' => Some(SCROLL_TOP),
-        b'F' => Some(SCROLL_LIVE),
+        // End goes to the NEWEST line and stays in the view. Leaving is Esc's job, and only Esc's:
+        // `End` used to exit, so the key named "end" could not take you to the end and leave you
+        // there. Two different states, two different keys.
+        b'F' => Some(SCROLL_BOTTOM),
         b'~' => match param {
             1 | 7 => Some(SCROLL_TOP),
-            4 | 8 => Some(SCROLL_LIVE),
+            4 | 8 => Some(SCROLL_BOTTOM),
             5 => Some(SCROLL_PAGE_UP),
             6 => Some(SCROLL_PAGE_DOWN),
             _ => None,

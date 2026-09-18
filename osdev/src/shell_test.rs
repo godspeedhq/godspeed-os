@@ -434,15 +434,24 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(sb3.contains("cores: 4"),
            "scrollback: ...and types itself, so the command still runs");
 
-    // Home inside the view is "oldest kept"; End is "live". Both are the view's keys here, and
-    // neither touches the line.
+    // END GOES TO THE NEWEST LINE AND STAYS IN THE VIEW. Only Esc leaves.
+    //
+    // THIS CASE PREVIOUSLY PASSED FOR THE WRONG REASON, which is worth recording. It sent Home then
+    // End and waited for `(requested)` - which End used to produce, because End and "leave the view"
+    // were the same action. When they were separated End stopped producing it, and the wait was
+    // satisfied by the NEXT case's keystroke instead. Green, testing nothing.
+    //
+    // The discriminator is a bare Esc AFTER End. If End has wrongly exited the view, the shell is
+    // back at the prompt - where Esc clears the line and never reaches the console - so no
+    // `(requested)` is logged and this times out. It can only pass if End left the view OPEN.
     send(&mut write_half, b"\x1b[5~");
     let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
     send(&mut write_half, b"\x1b[H\x1b[F");
+    send(&mut write_half, b"\x1b");
     let sb5 = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(10))
         .unwrap_or_default();
     check!(sb5.contains("returned to live"),
-           "scrollback: Home then End inside the view jumps to the oldest kept line and back to live");
+           "scrollback: End goes to the newest line and STAYS in the view - only Esc leaves");
 
     // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR AGAIN - unconditionally, which is the
     // simplification the mode bought. They were briefly "scroll if the view happens to be scrolled",
