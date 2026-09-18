@@ -1,8 +1,46 @@
 # The `feat/gsfs` hardware pass - what to run, and what would make it fail
 
-**Status: NOT RUN. Everything on this branch is QEMU-validated only.** This is the checklist for the
-five boards, written while the QEMU work was fresh so that the reasons behind each step are recorded
+**Status: the Dell Wyse 5070 is DONE (2026-09-18). Four boards remain.** This is the checklist for
+the five, written while the QEMU work was fresh so that the reasons behind each step are recorded
 rather than reconstructed later.
+
+## Result so far: Dell Wyse 5070 (x86-64, AHCI, 30 GB SSD)
+
+| step | result |
+|---|---|
+| volume mounts, shell works, `ls` hints at `dir` | PASS - `fs: mounted GSFS0008 (62533296 blocks ...)` |
+| `selfcheck` | **492 checks, 0 failed** |
+| **power cut during heavy filesystem activity** | **PASS, three times out of three** |
+| chaos storm | not run |
+
+**The power-cut test, and what it does and does not establish.** The plug was pulled at the wall
+partway through a `selfcheck` run - hundreds of creates, writes, renames, deletes and a seal, so the
+machine is certainly mid-transaction wherever the cut lands, with no timing skill required. That is
+the hardware analogue of the tear harness: QEMU chooses the cut point exactly, hardware chooses it
+for you.
+
+All three runs came back the same:
+
+```
+fs: mounted GSFS0008 (62533296 blocks, bitmap 1..15332, root@15342, 62517677 free)
+check: 7 files, 2 dirs, 0 bad; 15619 blocks used, 62517677 free
+check: the free count already agreed with the tree - nothing was repaired
+check: ok - filesystem is consistent
+```
+
+Mounted, `0 bad` (so no block was torn at the sector level), and the accounting already correct - the
+free count in the mount line matches what the tree walk computed, so neither a leak nor the dangerous
+direction.
+
+**What it does NOT establish, and this is the important half: the journal was never called upon.**
+There is no `journal recovered N block(s)` line in any of the three, which means no cut landed inside
+the window between a commit record becoming durable and the last home block being written. That is
+not surprising - QEMU measures that window at 35 of 75 tear points, and each of those is a fraction
+of a millisecond of wall time. A hand-timed cut will nearly always miss it.
+
+So three clean cuts prove the filesystem survives an interruption on real silicon. They do not prove
+the recovery path works on real silicon, because it never ran. Closing that needs either far more
+cuts, or a build that deliberately widens the window - see the note at the end of this file.
 
 `docs/gsfs-next.md` says a hardware pass "confirms at the end", and for most of this branch that is
 exactly right. **Two items on this list are different: they cannot be answered in QEMU at all**, and
@@ -155,3 +193,20 @@ Stated so nobody reads a green pass as more than it is:
   path and a way to rebuild the disk between boots; on hardware the equivalent is a real power cut,
   which is 2.2 and is a much blunter instrument.
 - **Metadata exhaustion, the block-layer attack and the reference model** are NOT RUN anywhere.
+
+## To actually exercise journal RECOVERY on hardware
+
+Three clean power cuts did not fire the journal once, and more of them probably will not either: the
+commit-to-checkpoint window is sub-millisecond, so a human with a plug is sampling a fraction of a
+percent of the run.
+
+The way to reach it is to make the window wide enough to aim at. `fs` already has the mechanism for
+the QEMU journal tests - `crash_after_commit`, which HALTS between the commit record and the
+checkpoint. The hardware version wants the same point with a DELAY instead of a halt: commit, log
+"the journal is now committed and unapplied - cut the power in the next N seconds", sleep, then
+checkpoint. The operator then cuts power into a window they can see, and the next boot must show
+`journal recovered N block(s) from an interrupted write` and a consistent volume.
+
+That is a test-only build feature, in the same shape as `io-error-test` and `write-tap`, and it
+converts "we never hit the window" into a test that hits it every time. NOT BUILT - recorded here
+because the three clean runs are what showed it was needed.

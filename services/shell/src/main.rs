@@ -12324,7 +12324,8 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             return Ok(());
         }
     }
-    match fs_request(ctx, OP_SEAL, path, &[]).as_ref().map(|r| r.payload_bytes().first().copied()) {
+    let reply = fs_request(ctx, OP_SEAL, path, &[]);
+    match reply.as_ref().map(|r| r.payload_bytes().first().copied()) {
         Some(Some(FS_OK)) => {
             ctx.console_writeln_fmt(format_args!("sealed {}", str_of(path)));
             Ok(())
@@ -12334,7 +12335,18 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             Err(ShellError::FileNotFound)
         }
         _ => {
-            ctx.console_writeln("seal: failed (a directory, or storage unavailable) - see fs's log");
+            // NAME THE REASON `fs` GAVE. This said "a directory, or storage unavailable" - two
+            // unrelated faults offered as a guess, and the operator left to open a service log to
+            // find out which. `fs` distinguishes them perfectly well ("only a file can be sealed" vs
+            // a storage failure) and now sends the reason back; it was simply not being read here.
+            //
+            // The fourth command today with this shape, after `write`, `move` and `copy`. The pattern
+            // is worth naming: a layer that knows why something failed and answers with a menu of
+            // possibilities costs the reader the one thing it could have told them (26.7).
+            match reply.as_ref().and_then(fs_err_reason) {
+                Some(why) => ctx.console_writeln_fmt(format_args!("seal: failed - {}", why)),
+                None      => ctx.console_writeln("seal: failed - see fs's log"),
+            }
             Err(ShellError::Unknown)
         }
     }

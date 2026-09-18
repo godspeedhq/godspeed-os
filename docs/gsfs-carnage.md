@@ -438,7 +438,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | NOT RUN - NOT REACHABLE | 3.11 / `backlog/34`. No non-x86 port can attach a usable disk in QEMU: riscv64 has no drive option, aarch64 has no VL805 emulation, arm32's stick re-enumerates 126 times and never settles. The x86 half is written and waiting |
-| Physical-hardware validation | NOT RUN | 3.12. No hardware result is claimed anywhere in this file |
+| Physical-hardware validation | PARTIAL (1 of 5 boards) | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD, and a real POWER CUT during heavy fs activity survived cleanly three times out of three (`0 bad`, accounting already consistent). The journal was never invoked in any of them - no cut landed in the commit-to-checkpoint window - so recovery on silicon remains unproven. `docs/gsfs-hardware-pass.md` |
 | Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
 
 **Merge rule adopted:** do not merge until the required gates pass, genuinely inapplicable gates are
