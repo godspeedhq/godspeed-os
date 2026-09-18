@@ -1,7 +1,37 @@
 # 33. A directory listing stops at one block, and says nothing
 
-**Status: the SILENCE is fixed (a truncated listing now says so, loudly). The CEILING is open - the
-fix for that is a continuation cursor, and it is real work.**
+**Status: CLOSED. The cursor is built; a directory of any size is listed in full.**
+
+The two halves of this entry closed separately, and the gap between them is the lesson:
+
+1. **The silence** closed first - a truncated listing said so, loudly. That converted a silent wrong
+   answer into a loud partial one, which is better and is still not an answer.
+2. **The ceiling** is closed now. `LIST_DIR` carries a resume position in both directions: the
+   request says which entry to start at, the reply says where to continue. A caller loops until the
+   directory is exhausted. Verified by `osdev test files` (45 files in one directory: listed,
+   searched, copied and piped in full) and `osdev test fs-fuzz` (30 files, first and last entry both
+   present, no truncation banner).
+
+**What the fix actually cost, because the headline underplays it.** The reply format gained four
+bytes and `fs` gained a resume argument - that part is small. The cost was in the EIGHT callers, each
+of which had its own hand-written copy of the reply parse opening with a bare `let mut i = 3usize`.
+They now share one `DirCursor`, and the header size is a named constant in both crates rather than a
+literal in ten places. Three of those callers - `find`, `tree`, `copy` - had `continue` statements
+that targeted the directory-walk loop; wrapping each in a page loop silently re-pointed them at the
+new inner loop, which would have re-asked the same directory forever. They are `break 'pages` now,
+labelled so the target is stated rather than inferred.
+
+**What a multi-page walk guarantees** is written down at `fs`'s `list_dir` rather than assumed: an
+entry present and unmoved for the whole walk is returned exactly once (records never move between
+slots - `delete` marks in place and does not compact); an entry deleted mid-walk appears only if its
+slot was already passed; an entry created mid-walk can be missed entirely, because it may land in a
+freed slot behind the cursor. That is what POSIX `readdir` gives, and it is the honest limit: a
+snapshot would need either a lock held across client round trips - letting a dead client wedge the
+filesystem - or a copy of the directory, which is unbounded.
+
+---
+
+*What follows is the entry as written when it was open.*
 
 Found by a code comment citing `backlog/33` when no such file existed. `scripts/doc_refs.py` checks
 documents, not code comments, so a dangling reference in a `///` block is caught by nothing.

@@ -26,7 +26,7 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev test chaos`          | Run chaos / partial-failure tests (C1-C7) ✅ 7/7 |
 | `osdev test chaos-brutal`   | Run brutal chaos tests (BC1-BC7) ✅ 7/7 |
 | `osdev test shell`          | Scripted shell smoke-test: boot, help, cores, status, unknown |
-| `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk (129 checks) |
+| `osdev test files`          | Files/records/pipes/`result`/`run`/`assert` over a RAW AHCI disk, plus a directory larger than one LIST_DIR reply block - listed, searched, copied and piped in full (232 checks) |
 | `osdev test edit`           | Full-screen `edit` text editor (bounded piece table - files of any size): small-file open/type/backspace/newline/save (^S)/quit (^Q)/`read`-back, edit-existing, quit-with-discard, no-arg usage; **large-file** (pre-baked multi-window `/big.txt`) windowed open + insert-at-start + PageDown mid-file insert + streaming save, verified by reading the saved bytes back off the disk. 15 checks |
 | `osdev test fs-corrupt`     | GSFS0008 integrity + backup superblock: corrupt the primary superblock (→ **recovers from the backup**), both copies (→ loud "no filesystem"), a root directory block (→ loud dir-CRC mismatch, no garbage), and a file **data block** (→ loud data-CRC mismatch, read refused); asserts no panic (§3.12). 14 checks |
 | `osdev test fs-check`       | fsck / `drives check` (Phase G): boot a disk whose superblock free count was drifted host-side (both copies, CRC re-stamped); `drives check` rebuilds the correct free count + bitmap from the tree, reports 0 bad, the file survives. 5 checks |

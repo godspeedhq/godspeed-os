@@ -60,6 +60,99 @@ const OP_READ_FILE: u8 = 11;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
+
+/// Bytes of header on a `LIST_DIR` reply before the first entry: `[FS_OK, count, more, next:u32]`.
+///
+/// **This is `fs`'s `DIR_HDR` and must equal it.** It used to be a bare `3` written out at nine
+/// call sites here, which is a wire format that changes in eight places and breaks in the ninth.
+/// `scripts/facts_check.py` compares the two constants across the crates.
+const DIR_HDR: usize = 7;
+
+/// Most pages one `LIST_DIR` walk will ask for, at roughly twenty entries each.
+///
+/// A bound, not a guess: the walk has to terminate even if `fs` is wrong or the reply is corrupt
+/// (§26.6), and ten thousand entries in one directory is far past anything else in this system.
+/// Reaching it is reported, never silent.
+const DIR_PAGE_MAX: u16 = 512;
+
+/// Where a `LIST_DIR` walk has reached, across the several round trips a long directory needs.
+///
+/// One reply block carries about twenty entries, so a bigger directory arrives in pages
+/// (`backlog/33`). Before this, every caller read one page and stopped: `dir` said TRUNCATED, but
+/// `find`, `tree` and `copy` just walked what they could see and reported success - a recursive
+/// copy that silently skipped files and said it had copied the directory.
+///
+/// The cursor is a POSITION carried in the request and returned in the reply, so `fs` keeps no
+/// per-client iteration state (see its `list_dir` for why that matters, and for what a multi-page
+/// walk does and does not guarantee while the directory is being changed underneath it).
+///
+/// Usage is a loop around the existing per-page body:
+///
+/// ```ignore
+/// let mut cur = DirCursor::new();
+/// while let Some(from) = cur.next() {
+///     let reply = /* LIST_DIR with `&from` as the request tail */;
+///     let count = cur.take(reply_payload);
+///     let mut i = DIR_HDR;
+///     for _ in 0..count { /* unchanged */ }
+/// }
+/// ```
+struct DirCursor {
+    /// Entry ordinal to resume at, as `fs` reported it.
+    from: u32,
+    /// `fs` says another page exists.
+    more: bool,
+    /// Pages asked for so far - the termination bound.
+    pages: u16,
+    /// The walk stopped before the end of the directory. Set when the page cap is hit, and when
+    /// `fs` claims another page but hands back a cursor that has not advanced.
+    cut: bool,
+}
+
+impl DirCursor {
+    fn new() -> Self { DirCursor { from: 0, more: false, pages: 0, cut: false } }
+
+    /// The 4-byte request tail for the next page, or `None` when the walk is over.
+    fn next(&mut self) -> Option<[u8; 4]> {
+        if self.pages > 0 && !self.more { return None; }
+        if self.pages >= DIR_PAGE_MAX {
+            if self.more { self.cut = true; self.more = false; }
+            return None;
+        }
+        self.pages += 1;
+        Some(self.from.to_le_bytes())
+    }
+
+    /// Read a reply's header: returns how many entries it carries, and records where to resume.
+    ///
+    /// A page that claims more but does NOT advance the cursor ends the walk and sets `cut`. That
+    /// is the one failure a bounded walk must not have - re-asking an identical question forever -
+    /// and it costs one comparison to make impossible rather than merely unlikely.
+    fn take(&mut self, p: &[u8]) -> usize {
+        if p.len() < DIR_HDR { self.more = false; return 0; }
+        let count = p[1] as usize;
+        let next = u32::from_le_bytes([p[3], p[4], p[5], p[6]]);
+        if p[2] != 0 && next > self.from {
+            self.from = next;
+            self.more = true;
+        } else {
+            self.cut = p[2] != 0;
+            self.more = false;
+        }
+        count
+    }
+
+    /// True if the walk ended before the directory did. Callers SAY SO - a partial answer that
+    /// reads as a complete one is the thing this whole mechanism exists to remove (§26.7).
+    fn cut(&self) -> bool { self.cut }
+
+    /// Pages requested so far. A caller uses this to tell "the FIRST request failed" - the path is
+    /// not a directory - from "a LATER page failed", which is a read error part way through a walk
+    /// that had already returned real entries. Reporting both as "no such directory" would be a
+    /// wrong answer for the second (§26.7), exactly the way a storage error once came out as a
+    /// claim about the path.
+    fn pages_asked(&self) -> u16 { self.pages }
+}
 const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
 const OP_MOVE: u8 = 17;
@@ -1229,31 +1322,38 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
             None => return,
         }
     };
-    // LIST_DIR (the reply is one ≤512-byte block); copy it so it can outlive the fs reply across
-    // the menu/cycle loop below.
+    // `rbuf` holds the MATCHED NAMES, packed - not a copy of the reply block.
+    //
+    // It used to be the raw reply, with `hits` carrying offsets into it, which meant completion
+    // could only ever see one page of a directory: a name past the twentieth entry was not offered,
+    // and nothing said so. Packing just the matches makes the offsets survive across pages AND
+    // makes the 512 bytes go much further, since only names that could be completed are kept.
     let mut rbuf = [0u8; 512];
-    let rn;
-    {
-        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &[]) { Some(r) => r, None => return };
-        let pb = reply.payload_bytes();
-        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
-        rn = pb.len().min(512);
-        rbuf[..rn].copy_from_slice(&pb[..rn]);
-    }
-    // Collect entries whose name starts with `leaf`.
-    let count = rbuf[1] as usize;
+    let mut w = 0usize;
     let mut hits = [PathHit { off: 0, len: 0, is_dir: false }; 32];
     let mut n = 0usize;
-    let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
-    for _ in 0..count {
-        if i >= rn { break; }
-        let nl = rbuf[i] as usize; i += 1;
-        if i + nl + 14 > rn { break; }                // entry = name_len, name, is_dir, size:u64, mtime:u32
-        let is_dir = rbuf[i + nl] != 0;
-        if rbuf[i..i + nl].starts_with(leaf) && n < hits.len() {
-            hits[n] = PathHit { off: i, len: nl, is_dir }; n += 1;
+    let mut cur = DirCursor::new();
+    while let Some(from) = cur.next() {
+        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &from) { Some(r) => r, None => return };
+        let pb = reply.payload_bytes();
+        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
+        let count = cur.take(pb);
+        let mut i = DIR_HDR;
+        for _ in 0..count {
+            if i >= pb.len() { break; }
+            let nl = pb[i] as usize; i += 1;
+            if i + nl + 14 > pb.len() { break; }      // entry = name_len, name, is_dir, size:u64, mtime:u32
+            let is_dir = pb[i + nl] != 0;
+            if pb[i..i + nl].starts_with(leaf) && n < hits.len() && w + nl <= rbuf.len() {
+                rbuf[w..w + nl].copy_from_slice(&pb[i..i + nl]);
+                hits[n] = PathHit { off: w, len: nl, is_dir };
+                w += nl; n += 1;
+            }
+            i += nl + 14;
         }
-        i += nl + 14;
+        // Enough candidates to fill the menu, or no room left to keep them. More pages cannot
+        // change what is offered, so stop asking.
+        if n >= hits.len() { break; }
     }
     if n == 0 { return; }
     let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
@@ -6994,41 +7094,47 @@ fn is_record_producer(name: &str) -> bool {
 fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
-    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return None,
-        ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return None; }
-    };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return None; }
-    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
-        ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
-        return None;
-    }
-    let count = p[1] as usize;
     // A `sealed` COLUMN rather than a new `type` value, deliberately. Making a sealed file's type
     // read `seal` would quietly drop it out of every existing `where type=file` query - a silent
     // change of meaning in queries people have already written. A separate column adds an answer
     // without moving an existing one.
     let mut t = Table::new(&["name", "type", "size", "sealed"]);
-    let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
-    for _ in 0..count {
-        if i >= p.len() { break; }
-        let nl = p[i] as usize;
-        i += 1;
-        // Phase O: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
-        // four bytes wider than the layout before it. Every consumer of this reply must step by the same
-        // stride or it reads the NEXT entry's name out of this one's timestamp.
-        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-        let name = t.intern(&p[i..i + nl]);
-        let is_dir = p[i + nl] != 0;
-        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        let sealed = p[i + nl + 13] & 1 != 0;      // flags bit 0
-        i += nl + 1 + 8 + 4 + 1;
-        let kind = t.intern(if is_dir { b"dir" } else { b"file" });
-        let sz = if is_dir { Value::Empty } else { Value::Int(size) };
-        let sl = t.intern(if sealed { b"true" } else { b"false" });
-        t.add_row(&[name, kind, sz, sl]);
+    let mut cur = DirCursor::new();
+    while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return None,
+            ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return None; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return None; }
+        if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
+            return None;
+        }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
+        for _ in 0..count {
+            if i >= p.len() { break; }
+            let nl = p[i] as usize;
+            i += 1;
+            // Phase O: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
+            // four bytes wider than the layout before it. Every consumer of this reply must step by the same
+            // stride or it reads the NEXT entry's name out of this one's timestamp.
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+            let name = t.intern(&p[i..i + nl]);
+            let is_dir = p[i + nl] != 0;
+            let size = u64_le(&p[i + nl + 1..i + nl + 9]);
+            let sealed = p[i + nl + 13] & 1 != 0;      // flags bit 0
+            i += nl + 1 + 8 + 4 + 1;
+            let kind = t.intern(if is_dir { b"dir" } else { b"file" });
+            let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+            let sl = t.intern(if sealed { b"true" } else { b"false" });
+            t.add_row(&[name, kind, sz, sl]);
+        }
+        // The table is full (64 rows, or the string arena). Further pages have nowhere to go, and
+        // `t.overflow()` already tells the reader the answer is short - so stop paying for them.
+        if t.overflow() { break; }
     }
     Some(t)
 }
@@ -7184,19 +7290,24 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     stack.push(start_abs);
     let tb = target.as_bytes();
     let is_glob = tb.iter().any(|&b| b == b'*' || b == b'?');
+    let mut short = false;
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
             ReqOutcome::Reply(r) => r,
             ReqOutcome::Aborted => return None,
             ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return None; }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return None; }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        let count = p[1] as usize;
-        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
+        // `break 'pages`, NOT `continue`: this loop is now the PAGE loop, and a bare `continue`
+        // would re-ask the same unreadable directory forever instead of moving to the next one.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
@@ -7221,10 +7332,17 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
                 if is_dir { stack.push(&child[..clen]); }
             }
         }
+        if t.overflow() { break 'pages; }
+        }
+        if cur.cut() { short = true; }
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
+    }
+    if short {
+        ctx.console_writeln_fmt(format_args!(
+            "find: INCOMPLETE - a directory was too large to read fully ({} pages); some entries were NOT searched", DIR_PAGE_MAX));
     }
     Some(t)
 }
@@ -12394,7 +12512,24 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     }
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, path_arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
+    // THE COUNT IS WHAT WAS PRINTED, AND IT IS PRINTED LAST.
+    //
+    // A long directory arrives in several pages, so the total is not known until the walk ends. The
+    // obvious fix - walk once to count, then walk again to print - gives two answers that can
+    // DISAGREE, because the directory may change between them, and a header that contradicts the
+    // rows under it is exactly the wrong answer this change exists to remove. Counting what was
+    // actually rendered cannot disagree with itself, and it matches `find` and `tree`, which have
+    // always summarised at the end.
+    //
+    // No pager here. Long output is handled by the console's scrollback (passive) and by
+    // `paginate` when it is asked for (explicit) - never by a command deciding on its own to hold
+    // the shell, which is what would break `dir | write`.
+    out.line_fmt(ctx, format_args!("{}", str_of(path)));
+    let mut listed = 0usize;
+    let mut header_done = false;
+    let mut cur = DirCursor::new();
+    'pages: while let Some(from) = cur.next() {
+    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
         ReqOutcome::Reply(r) => r,
         ReqOutcome::Aborted => return Ok(()),
         ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return Err(ShellError::Unknown); }
@@ -12408,26 +12543,18 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
     // error - the stick pulled and replugged - came out as a claim about the path, sending the operator
     // to look at `/` when the problem was the device. Name what actually happened (§26.7).
-    if p.first() == Some(&FS_ERR) || p.len() < 2 {
+    if p.first() == Some(&FS_ERR) || p.len() < DIR_HDR {
         ctx.console_writeln_fmt(format_args!(
             "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
             str_of(path)));
         return Err(ShellError::Unknown);
     }
-    let count = p[1] as usize;
-    // SAY WHEN THE LISTING IS NOT THE WHOLE DIRECTORY. The reply is one block, so past roughly
-    // twenty entries the rest are simply absent - and this line used to report the truncated count
-    // as though it were the total. A wrong answer, not a limit (`backlog/33`).
-    let truncated = p.get(2).copied().unwrap_or(0) != 0;
-    if truncated {
-        out.line_fmt(ctx, format_args!(
-            "{}  ({} entries, TRUNCATED - the directory holds more than one listing can carry)",
-            str_of(path), count));
-    } else {
-        out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
+    let count = cur.take(p);
+    if count > 0 && !header_done {
+        out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
+        header_done = true;
     }
-    if count > 0 { out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED"); }
-    let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
+    let mut i = DIR_HDR;
     for _ in 0..count {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
@@ -12473,8 +12600,21 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
             out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>9}  {}",
                                            name, kind, SizeCol(size, exact), when));
         }
+        listed += 1;
     }
-    if count == 0 { out.line(ctx, "  (empty)"); }
+    }
+    if listed == 0 {
+        out.line(ctx, "  (empty)");
+    } else {
+        out.line_fmt(ctx, format_args!("  {} entries", listed));
+    }
+    // The walk hit its own bound rather than the end of the directory. Say so where the count is,
+    // because the count is the number a reader will otherwise take as the whole truth (26.7).
+    if cur.cut() {
+        out.line_fmt(ctx, format_args!(
+            "  INCOMPLETE - this directory is larger than {} listing pages; the entries above are not all of it",
+            DIR_PAGE_MAX));
+    }
     Ok(())
 }
 
@@ -12652,22 +12792,28 @@ fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// its offset says which block boundary it fell on.
 fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     const DIR: &[u8] = b"/churn";
-    let reply = match fs_request(ctx, OP_LIST_DIR, DIR, &[]) {
+    let mut checked = 0u32;
+    let mut torn = 0u32;
+    let mut empty = 0u32;
+    let mut truncated = false;
+    let mut data = [0u8; 4096];
+    let mut cur = DirCursor::new();
+    'pages: while let Some(from) = cur.next() {
+    let reply = match fs_request(ctx, OP_LIST_DIR, DIR, &from) {
         Some(r) => r,
         None => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < 3 {
-        ctx.console_writeln("churn verify: no /churn directory - nothing to check");
-        return Ok(());
+    if p.first() != Some(&FS_OK) || p.len() < DIR_HDR {
+        if cur.pages_asked() == 1 {
+            ctx.console_writeln("churn verify: no /churn directory - nothing to check");
+            return Ok(());
+        }
+        // `break 'pages`, NOT `continue` - this is the page loop, and re-asking would never end.
+        break 'pages;
     }
-    let count = p[1] as usize;
-    let truncated = p.get(2).copied().unwrap_or(0) != 0;
-    let mut checked = 0u32;
-    let mut torn = 0u32;
-    let mut empty = 0u32;
-    let mut i = 3usize;
-    let mut data = [0u8; 4096];
+    let count = cur.take(p);
+    let mut i = DIR_HDR;
 
     for _ in 0..count {
         if i >= p.len() { break; }
@@ -12701,9 +12847,11 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                 str_of(&path[..pl]), k, n, k / 508, k % 508));
         }
     }
+    }
+    truncated = cur.cut();
 
     if truncated {
-        out.line(ctx, "churn verify: NOTE - the listing was truncated, so some files were not checked (backlog/33)");
+        out.line(ctx, "churn verify: NOTE - /churn is larger than the walk could read, so some files were NOT checked");
     }
     if torn == 0 {
         out.line_fmt(ctx, format_args!(
@@ -13947,16 +14095,20 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
     let mut stack = PathStack::new();
     stack.push(&sp[..sl]);
     let (mut dirs, mut files) = (1u32, 0u32);
+    let mut short = false;
     while let Some(slen) = stack.pop(&mut sbuf) {
-        let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &from) {
             Some(r) => r,
             None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        let count = p[1] as usize;
-        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
+        // `break 'pages`, NOT `continue` - see `find`. This is the page loop now.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
@@ -13976,10 +14128,20 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
                 files += 1;
             }
         }
+        }
+        if cur.cut() { short = true; }
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "copy: truncated - tree wider than {} pending directories (bounded walk)", FIND_QCAP));
+    }
+    // A COPY THAT SKIPPED FILES MUST NOT REPORT SUCCESS. Before the listing gained a cursor this
+    // was the everyday case rather than the edge one: past about twenty entries the rest of a
+    // directory was simply invisible here, and the summary below counted what it had seen and
+    // called it a copy of the tree (§26.7).
+    if short {
+        ctx.console_writeln_fmt(format_args!(
+            "copy: INCOMPLETE - a directory was too large to read fully ({} pages); some files were NOT copied", DIR_PAGE_MAX));
     }
     ctx.console_writeln_fmt(format_args!(
         "copied {} → {} ({} dirs, {} files)", str_of(&sp[..sl]), str_of(&dp[..dl]), dirs, files));
@@ -14151,18 +14313,22 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     // default is a plain substring match (so `find report` still finds `report-final.txt`).
     let is_glob = target.iter().any(|&b| b == b'*' || b == b'?');
     let mut matches = 0u32;
+    let mut short = false;
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
             ReqOutcome::Reply(r) => r,
             ReqOutcome::Aborted => return Ok(()),
             ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        let count = p[1] as usize;
-        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
+        // `break 'pages`, NOT `continue` - see the records `find`. This is the page loop now.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
@@ -14184,10 +14350,16 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
                 }
             }
         }
+        }
+        if cur.cut() { short = true; }
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
+    }
+    if short {
+        ctx.console_writeln_fmt(format_args!(
+            "find: INCOMPLETE - a directory was too large to read fully ({} pages); some files were NOT searched", DIR_PAGE_MAX));
     }
     ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
     Ok(()) // a search that finds nothing still succeeded (0 matches is not an error)
@@ -14247,19 +14419,23 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         if !is_dir { files += 1; continue; }
         if d > 0 { dirs += 1; }
 
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &from) {
             ReqOutcome::Reply(r) => r,
             ReqOutcome::Aborted => return Ok(()),
             ReqOutcome::Timeout => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        // Record each child's offset, then push in REVERSE so they pop in directory order.
-        let count = p[1] as usize;
+        // `break 'pages`, NOT `continue` - see `find`. This is the page loop now.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        // Record each child's offset, then push in REVERSE so they pop in directory order. Both
+        // halves stay INSIDE the page loop: the offsets point into THIS reply and do not outlive it.
+        let count = cur.take(p);
         let mut offs = [0usize; TREE_FANOUT];
         let mut nc = 0usize;
-        let mut i = 3usize;   // [FS_OK, count, more] - see `list_dir` (backlog/33)
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() || nc >= TREE_FANOUT { break; }
             let nl = p[i] as usize;
@@ -14302,10 +14478,14 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
                 deep = true;
             }
         }
+        }
+        // A directory too large to read fully is the same class of answer as the depth bound: the
+        // tree drawn is not the tree on disk, and saying nothing makes it read as though it were.
+        if cur.cut() { deep = true; }
     }
     if deep {
         ctx.console_writeln_fmt(format_args!(
-            "tree: stopped early - a LIMIT was reached (path length, or {} levels of depth), not the end of the tree. Something is nested very deeply, or a directory contains itself.", TREE_MAX_DEPTH));
+            "tree: stopped early - a LIMIT was reached (path length, {} levels of depth, or a directory larger than {} listing pages), not the end of the tree. Something is nested very deeply, or a directory contains itself.", TREE_MAX_DEPTH, DIR_PAGE_MAX));
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(

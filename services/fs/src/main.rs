@@ -102,6 +102,11 @@ const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 - u32 CRC32 of the 508-byte pay
 // region). The record layout itself is unchanged from GSFS0003 - names stay 38 bytes.
 const REC_SIZE: usize = 64;
 const RECS_PER_BLOCK: usize = 7; // 7×64 = 448 bytes of records + a 64-byte CRC trailer
+
+/// Bytes of header on a `LIST_DIR` reply, before the first entry: `[FS_OK, count, more, next:u32]`.
+/// Named because nine call sites in the shell used to open with a bare `let mut i = 3usize`, and a
+/// wire format whose size is a literal in ten places is a wire format that changes in nine.
+const DIR_HDR: usize = 7;
 const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 - CRC covers [0..448)
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 - u32 CRC32 of the record region
 
@@ -1678,10 +1683,17 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
         OP_SEAL => txn!(fs.seal(ctx, path)),
         OP_MKDIR => txn!(fs.mkdir(ctx, path)),
         OP_MKDIR_P => txn!(fs.mkdir_parents(ctx, path)),
-        OP_LIST_DIR => match fs.list_dir(ctx, path) {
-            Some(out) => send(&out),
-            None => send(&[FS_NOTFOUND]),
-        },
+        // [op, plen, path, from:u32 LE] - an absent or short tail means "start at the beginning",
+        // so a caller that does not page is unchanged and needs to know nothing about the cursor.
+        OP_LIST_DIR => {
+            let from = if tail.len() >= 4 {
+                u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]])
+            } else { 0 };
+            match fs.list_dir(ctx, path, from) {
+                Some(out) => send(&out),
+                None => send(&[FS_NOTFOUND]),
+            }
+        }
         OP_RENAME => txn!(fs.rename(ctx, path, tail)),
         OP_DELETE => txn!(fs.delete(ctx, path)),
         // delete_tree manages its own transactions (unlink + batched frees) - not wrapped.
@@ -3295,27 +3307,68 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// of a one-block reply: a listing that used to fit ~30 entries fits ~26, and a directory with
     /// more than that was already being truncated by this bound. `backlog/33` records that ceiling,
     /// which predates this change and is not made materially worse by it.
-    fn list_dir(&self, ctx: &ServiceContext, path: &[u8]) -> Option<[u8; BLOCK]> {
+    /// List a directory, RESUMABLY. One reply block carries roughly twenty entries; `from` says
+    /// which entry to start at, and the reply says where to ask next.
+    ///
+    /// **This used to stop at one block and set a `more` flag, which made a long directory a
+    /// question nobody could finish asking** (`backlog/33`). The flag turned a silent wrong answer
+    /// into a loud partial one; it did not make the listing obtainable. It is obtainable now: a
+    /// caller loops until `more` is 0.
+    ///
+    /// THE CURSOR IS A POSITION, NOT A HANDLE. It is an ordinal into the directory's record slots -
+    /// `block_index * RECS_PER_BLOCK + slot` - encoded in the request and returned in the reply.
+    /// `fs` therefore keeps NO per-client iteration state: nothing to allocate, nothing to evict,
+    /// nothing to invalidate when a client dies mid-walk, and no way for one client's cursor to be
+    /// disturbed by another's (§26.6 - a bound you can read off the source). A server-side iterator
+    /// handle would have needed all four, and `fs` is single-threaded, so a handle would also have
+    /// had to survive an arbitrary gap between pages.
+    ///
+    /// WHAT A MULTI-PAGE WALK ACTUALLY GUARANTEES, stated because a caller will otherwise assume
+    /// the stronger thing (§26.4 - what guarantees exist must be answerable):
+    ///
+    ///   - An entry present and unmoved for the whole walk is returned EXACTLY ONCE.
+    ///   - A record never moves between slots once written - `delete` marks its slot `ITYPE_FREE`
+    ///     in place and does not compact - so a cursor cannot skip an untouched entry, which is
+    ///     what makes the guarantee above hold at all.
+    ///   - An entry DELETED mid-walk appears if its slot was already passed, and not otherwise.
+    ///   - An entry CREATED mid-walk appears only if it lands at or after the cursor. `mkdir` and
+    ///     `write` fill the first free slot, which may be a hole BEHIND the cursor, so a file
+    ///     created during a walk can be missed entirely.
+    ///
+    /// That is the same guarantee POSIX `readdir` gives across a directory being modified, and it
+    /// is the honest one: a snapshot would need either a lock held across client round trips (which
+    /// would let a dead client wedge the filesystem) or a copy of the directory (unbounded).
+    fn list_dir(&self, ctx: &ServiceContext, path: &[u8], from: u32) -> Option<[u8; BLOCK]> {
         let d = self.walk(ctx, path)?;
         if d.itype != ITYPE_DIR { return None; }
         let mut out = [0u8; BLOCK];
         out[0] = FS_OK;
         let mut count = 0u8;
         let mut more = false;
-        let mut w = 3usize;   // [FS_OK, count, more] - entries start at 3
-        'blocks: for bi in 0..d.block_count {
+        let mut next = 0u32;
+        let mut w = DIR_HDR;   // [FS_OK, count, more, next:u32] - entries start at DIR_HDR
+        let rpb = RECS_PER_BLOCK as u64;
+        let start_bi = from as u64 / rpb;
+        let start_slot = (from as u64 % rpb) as usize;
+        'blocks: for bi in start_bi..d.block_count {
             let blk = self.td_read(ctx, d.first_block + bi)?;
-            for slot in 0..RECS_PER_BLOCK {
+            let first = if bi == start_bi { start_slot } else { 0 };
+            for slot in first..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 let t = blk[o];
                 if t == ITYPE_FREE { continue; }
                 let nl = blk[o + 1] as usize;
                 if nl == 0 || nl > NAME_MAX { continue; }
-                // Out of room. Say so and STOP - labelled, because the old `break` left only the
-                // slot loop and the walk carried on reading every remaining directory block to
-                // re-discover it had no room, once per entry.
+                // Out of room. Record WHERE WE STOPPED and stop - labelled, because the old `break`
+                // left only the slot loop and the walk carried on reading every remaining directory
+                // block to re-discover it had no room, once per entry.
+                //
+                // `next` names the entry that did NOT fit, so the following page starts exactly
+                // here. Off by one in either direction is a duplicated or a dropped entry, and a
+                // dropped one is the bug this whole change exists to remove.
                 if w + 1 + nl + 1 + 8 + 4 + 1 > BLOCK || count == u8::MAX {
                     more = true;
+                    next = (bi * rpb + slot as u64) as u32;
                     break 'blocks;
                 }
                 out[w] = nl as u8;
@@ -3331,11 +3384,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         }
         out[1] = count;
         out[2] = u8::from(more);
-        if more {
-            ctx.log_fmt(format_args!(
-                "fs: LIST_DIR truncated - {} entries returned, the directory holds more than one reply block can carry (backlog/33)",
-                count));
-        }
+        out[3..7].copy_from_slice(&next.to_le_bytes());
         Some(out)
     }
 

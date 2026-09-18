@@ -133,6 +133,40 @@ def porting_tree_problems():
     return problems
 
 
+def wire_format_problems():
+    """`fs` and the shell must agree on the LIST_DIR reply header size.
+
+    Another CODE-versus-CODE check across a crate boundary, for the same reason as the budget
+    ordering above: neither number looks wrong on its own, and nothing else compares them.
+
+    THE RULE. A `LIST_DIR` reply opens `[FS_OK, count, more, next:u32]` and the entries follow. `fs`
+    writes them at its `DIR_HDR`; the shell reads them at its own. If the two drift, every caller
+    parses a name length out of the middle of the cursor and renders garbage - or worse, a plausible
+    wrong name, since the bytes are real data.
+
+    WHY IT IS CHECKED RATHER THAN COMMENTED. This offset was a bare `3` written out at NINE call
+    sites in the shell and once in `fs`. Growing the header by four bytes meant changing it in ten
+    places, and the ninth and tenth were found by a test failing, not by a checker. Both sides name
+    the constant now, and this compares them so the next change to the wire format cannot be applied
+    to only one half of it.
+    """
+    problems = []
+    fs_hdr    = const("services/fs/src/main.rs", "DIR_HDR")
+    shell_hdr = const("services/shell/src/main.rs", "DIR_HDR")
+    if fs_hdr is None or shell_hdr is None:
+        problems.append("wire format: a constant is missing - fs DIR_HDR=%s, shell DIR_HDR=%s "
+                        "(renamed or deleted? this check cannot pass vacuously)"
+                        % (fs_hdr, shell_hdr))
+        return problems
+    if fs_hdr != shell_hdr:
+        problems.append(
+            "wire format: LIST_DIR header size disagrees across the crates - fs DIR_HDR=%d writes "
+            "entries at that offset, shell DIR_HDR=%d reads them from there. Every listing would "
+            "parse a name length out of the wrong byte. Change both, or neither."
+            % (fs_hdr, shell_hdr))
+    return problems
+
+
 def budget_ordering_problems():
     """net-stack must answer a request BEFORE its client stops waiting.
 
@@ -297,7 +331,7 @@ def main():
     checked = 0
     bad = []
 
-    tree = porting_tree_problems() + budget_ordering_problems()
+    tree = porting_tree_problems() + budget_ordering_problems() + wire_format_problems()
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))

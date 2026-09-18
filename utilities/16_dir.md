@@ -100,26 +100,36 @@ Example:
 
 ```
 gsh> dir /
-/  (5 entries)
+/
   NAME                  TYPE       SIZE  MODIFIED
   canary.txt            file       41 B  unknown
   a.[2Jb.txt            file       49 B  unknown
   .gsh_history          file      664 B  2026-09-17 14:09
   fz                    dir           -  unknown
   clock.last            file       10 B  unknown
+  5 entries
 
 gsh> dir bytes /
-/  (5 entries)
+/
   NAME                  TYPE       SIZE  MODIFIED
   canary.txt            file         41  unknown
   a.[2Jb.txt            file         49  unknown
   .gsh_history          file        651  2026-09-17 14:09
   fz                    dir           -  unknown
   clock.last            file         10  unknown
+  5 entries
 ```
 
-Both captured from one boot of `osdev test fs-fuzz`, not written by hand. Two things in them are
+Both captured from one boot of `osdev test fs-fuzz`, not written by hand. Three things in them are
 worth pointing at:
+
+**The count is LAST, and it is the number of entries actually printed.** It used to lead, next to the
+path. A directory larger than one reply block arrives in several pages, so the total is not known
+until the walk ends - and the obvious fix, walking once to count and again to print, produces two
+answers that can disagree, because the directory may change between them. A header contradicting the
+rows beneath it is precisely the wrong answer this format exists to avoid. Counting what was rendered
+cannot disagree with itself, and it puts `dir` in line with `find` and `tree`, which have always
+summarised at the end.
 
 `a.[2Jb.txt` is a filename holding a raw `ESC [ 2J` - a clear-screen sequence - baked onto the disk
 by that suite. It renders with `.` where the control bytes are, so listing it cannot scroll itself

@@ -3260,6 +3260,77 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - dir after fs-storm timeout"); fail += 1; }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // A DIRECTORY BIGGER THAN ONE LISTING PAGE.
+    //
+    // Every case above this point uses a directory of two or three files, which is why none of them
+    // ever caught the thing this block exists for: a `LIST_DIR` reply is ONE 512-byte block, holding
+    // roughly twenty entries, and until the continuation cursor landed everything past the twentieth
+    // was simply absent. `dir` at least said TRUNCATED. `find`, `tree` and `copy` did not - they
+    // walked what they could see and reported success, so a recursive copy silently skipped files
+    // and told you it had copied the directory.
+    //
+    // 45 files is deliberately just over two pages, so the walk has to resume twice rather than
+    // once: an off-by-one in the cursor that happens to work for a single resume shows up here.
+    match run!(b"mkdir /many\r", 10) {
+        Some(r) => check!(r.contains("created /many"), "many: mkdir /many"),
+        None    => { println!("files-test: FAIL - mkdir /many timeout"); fail += 1; }
+    }
+    // 45 separate `write` commands rather than a `for` loop, because `for` is a SCRIPT construct -
+    // the interactive shell answers `unknown: for`. Driving it from the harness also keeps this
+    // test independent of the script parser, which is not what is under test here.
+    {
+        let mut wrote = 0usize;
+        for k in 0..45 {
+            let line = format!("write /many/f{k}.txt x\r");
+            if let Some(r) = run!(line.as_bytes(), 10) {
+                if r.contains("wrote ") { wrote += 1; }
+            }
+        }
+        check!(wrote == 45, "many: wrote 45 files into one directory");
+    }
+    // THE HEADLINE CHECK. Before the cursor this printed about twenty entries and a TRUNCATED
+    // banner; the count is now what was actually listed, so "45 entries" is the whole directory.
+    match run!(b"dir /many\r", 30) {
+        Some(r) => {
+            check!(r.contains("45 entries"), "many: dir lists all 45 entries across pages");
+            check!(!r.contains("INCOMPLETE") && !r.contains("TRUNCATED"),
+                   "many: dir does not report a truncated listing");
+            // Entries from the FIRST page and the LAST must both be present - a resumed walk that
+            // restarts from zero would show f0 twice and f44 never, and the count alone would not
+            // distinguish that from a correct walk.
+            check!(r.contains("f0.txt") && r.contains("f44.txt"),
+                   "many: dir shows both the first and the last entry");
+        }
+        None => { println!("files-test: FAIL - dir /many timeout"); fail += 1; }
+    }
+    // `find` walked a truncated listing and said nothing. f44 lives past the first page, so finding
+    // it is proof the walk resumed rather than proof the name exists.
+    match run!(b"find f44 /many\r", 30) {
+        Some(r) => check!(r.contains("/many/f44.txt") && r.contains("1 match"),
+                          "many: find reaches an entry past the first listing page"),
+        None    => { println!("files-test: FAIL - find /many timeout"); fail += 1; }
+    }
+    // THE ONE THAT WAS SILENTLY WRONG. A recursive copy reported success having copied only what
+    // fit in one listing block. The count in its summary is now the count it actually copied.
+    match run!(b"copy /many /manycopy recursive\r", 90) {
+        Some(r) => {
+            check!(r.contains("45 files"), "many: recursive copy copies every file, not one page");
+            check!(!r.contains("INCOMPLETE"), "many: copy does not report an incomplete walk");
+        }
+        None => { println!("files-test: FAIL - copy /many timeout"); fail += 1; }
+    }
+    match run!(b"dir /manycopy\r", 30) {
+        Some(r) => check!(r.contains("45 entries"), "many: the copy has all 45 files on disk"),
+        None    => { println!("files-test: FAIL - dir /manycopy timeout"); fail += 1; }
+    }
+    // The records pipe reads the same listing. It is capped at 64 rows by `REC_MAX_ROWS`, which 45
+    // is comfortably under, so a short answer here would be the cursor and not the table bound.
+    match run!(b"dir /many | count\r", 30) {
+        Some(r) => check!(r.contains("45"), "many: the records pipe sees all 45 rows"),
+        None    => { println!("files-test: FAIL - dir | count timeout"); fail += 1; }
+    }
+
     // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the
     // harness printed a label and threw the serial away, so the first move on any failure was to
     // reproduce the whole run by hand. Same treatment `shell-test` already gives itself.
@@ -5630,25 +5701,37 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!listing.contains("[2J"),
            "`dir` did not emit a raw ESC sequence that came from a FILENAME");
 
-    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK MUST SAY SO (backlog/33) ----
+    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK IS LISTED IN FULL (backlog/33) ----
     //
-    // `list_dir` builds its answer into a single 512-byte block, so roughly twenty entries fit and
-    // the rest are simply absent. Until this was fixed the count reported only what fit, so `dir` on
-    // a directory of thirty files printed twenty and said `(20 entries)` as though that were the
-    // whole truth - a WRONG ANSWER rather than a limit, and one that reached `find`, `tree`,
-    // `delete recursive` and tab completion alike.
+    // `list_dir` builds each answer into a single 512-byte block, so roughly twenty entries fit per
+    // reply. THIS CASE USED TO ASSERT THE OPPOSITE OF WHAT IT ASSERTS NOW, and the history is worth
+    // keeping because it is two different bugs:
     //
-    // PROVING THE GUARD FIRES is the whole point of this case. A truncation warning that has never
-    // been observed firing is not evidence, and the ceiling is not a constant anybody should be
-    // hard-coding an expectation about - so this builds a directory that is definitely too big,
-    // rather than one that is exactly one over some number read off the source.
-    answered!("mkdir /many", "a directory to overfill");
+    //   1. Originally the count reported only what fit, so `dir` on a directory of thirty files
+    //      printed twenty and said `(20 entries)` as though that were the whole truth - a WRONG
+    //      ANSWER rather than a limit, reaching `find`, `tree`, `copy` and tab completion alike.
+    //   2. The first fix added a TRUNCATED banner, and this case pinned it. That converted a silent
+    //      wrong answer into a loud partial one, which is better and still not an answer.
+    //
+    // The listing now RESUMES: the reply carries the position to continue from and the caller loops
+    // until the directory is exhausted, so thirty entries take two round trips and all thirty
+    // arrive. The banner is gone because there is nothing left to warn about.
+    //
+    // Thirty is deliberately past one page and not a constant read off the source - the per-reply
+    // ceiling depends on name length and is nobody's business to hard-code an expectation about.
+    answered!("mkdir /many", "a directory bigger than one reply block");
     for i in 0..30 {
         answered!(format!("write /many/file{i:02}.txt x"), "one of thirty entries");
     }
     let big = answered!("dir /many", "listing a directory that cannot fit in one reply");
-    check!(big.contains("TRUNCATED"),
-           "`dir` SAYS the listing is truncated rather than reporting a short count as the total");
+    check!(big.contains("30 entries"),
+           "`dir` lists all thirty entries, resuming across replies rather than stopping at one");
+    check!(!big.contains("TRUNCATED") && !big.contains("INCOMPLETE"),
+           "`dir` reports no truncation, because the listing is now complete");
+    // The first and last entries specifically: a resumed walk that restarted from zero would repeat
+    // the first page and never reach the last name, and a bare count would not tell the difference.
+    check!(big.contains("file00.txt") && big.contains("file29.txt"),
+           "`dir` shows both the first entry and one well past the first reply block");
     // And the other half, which is what makes the first half meaningful: an ordinary directory must
     // NOT carry the warning. A flag that is always set says nothing.
     let small = answered!("dir /fz", "listing a directory that fits");
