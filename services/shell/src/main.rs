@@ -843,6 +843,72 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("from",    &["json"]),
 ];
 
+/// The COLUMNS each record producer emits, so a pipe stage can complete them.
+///
+/// `dir | where t<tab>` should offer `type`, and did not - the record stages (`where`, `select`,
+/// `sort`, `sum`, `min`, `max`, `avg`) all take a column name and none completed one. They are the
+/// most-typed part of the pipeline and the part where a typo is silent: `where typ=file` matches
+/// nothing and says nothing.
+///
+/// PER PRODUCER, not a union. The columns differ - `dir` has `sealed`, `drives` has `free_mib`,
+/// `events ipc` has `outcome` - and a union would offer `kib_day` while listing a directory. An
+/// offer for a column that does not exist on this row is a worse answer than no offer: it reads as
+/// confirmation that the name is right.
+///
+/// Keyed on the producer at the START of the pipeline, which is what decides the shape of every row
+/// downstream. Kept in sync with each `Table::new(&[..])` call site.
+const PRODUCER_COLS: &[(&str, &[&str])] = &[
+    ("dir",     &["name", "type", "size", "sealed"]),
+    ("find",    &["name", "type", "path", "size"]),
+    ("status",  &["slot", "name", "core", "state", "mem", "queue", "restarts"]),
+    ("caps",    &["resource", "rights"]),
+    ("drives",  &["index", "label", "status", "size_mib", "free_mib"]),
+    ("roster",  &["name", "type", "size"]),
+    ("uptime",  &["owner", "text"]),
+];
+
+/// Pipe stages whose first argument is a COLUMN of the row flowing into them.
+const COLUMN_STAGES: &[&str] = &["where", "select", "sort", "sum", "min", "max", "avg"];
+
+/// SECOND-LEVEL subcommands: the words valid at position 2, given the word at position 1.
+///
+/// `SUBCMD_FIRST` stops after one level, so `events persist s⇥` and `chaos kill-storm f⇥` offered
+/// nothing and fell through to a filesystem listing - a path menu for an argument that is a keyword
+/// or a service name. Completion that goes one level deep on a surface that goes three teaches the
+/// operator that tab does not work here, which is worse than it being absent.
+///
+/// Entries reference existing lists rather than restating them (`CHAOS_RESTARTABLE`), because a
+/// completion table that carries its own copy of the service names is one more place for them to
+/// drift - the exact complaint `CHAOS_RESTARTABLE`'s own comment makes about the other three copies.
+const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
+    ("events", "persist",      &["start", "stop", "status"]),
+    // The storms take a SERVICE, and a misspelt service name is refused with a list - so completing
+    // it is the difference between one keystroke and reading an error.
+    ("chaos",  "kill-storm",   CHAOS_RESTARTABLE),
+    ("chaos",  "flood-storm",  CHAOS_RESTARTABLE),
+    ("chaos",  "max-carnage",  CHAOS_RESTARTABLE),
+    ("trace",  "deps",         CHAOS_RESTARTABLE),
+    ("trace",  "chain",        CHAOS_RESTARTABLE),
+];
+
+/// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
+/// has one - `events persist start <path> <size> [sticky]` is the deepest thing in the shell, and
+/// `sticky` was reachable by typing it in full and no other way.
+const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
+    ("events", "persist", "start", &["sticky"]),
+];
+
+/// Commands whose FIRST argument is a command name rather than a path or a keyword.
+///
+/// `assert ok d⇥` should offer `dir`/`date`/`delete`, not the contents of the current directory.
+/// `watch` and `whatis` already had this; `assert` takes a command after its verb, which is one
+/// level deeper and so was never reached.
+const CMDNAME_AFTER: &[(&str, &str)] = &[
+    ("assert", "ok"),
+    ("assert", "fails"),
+    ("assert", "fails-with"),
+];
+
 /// Info / no-argument utilities: their only first-argument subcommands are the universal `version`
 /// and `help`. Tab at their first-arg position completes those (and NEVER falls through to a
 /// filesystem listing - they take no path). This is the info-command analogue of `NO_PATH_CMDS`:
@@ -932,6 +998,11 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
     if "restart".as_bytes() == cmd && prior == 0 {
+        // KEPT AS ITS OWN LIST for now, and this is the honest reason rather than an oversight: it
+        // differs from `CHAOS_RESTARTABLE` (no `dwc2`, no `control`) and nobody has established which
+        // difference is deliberate. Collapsing two lists that are not the same fact would be worse
+        // than leaving both - see the note on `CHAOS_RESTARTABLE`, which already counts four copies
+        // of a list nobody has reconciled. `backlog/35`.
         const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "events", "xhci",
             "ehci", "shell", "nic-driver", "net-stack", "ping", "pong", "version", "help"];
         return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
@@ -957,6 +1028,81 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     if prior == 0 && INFO_CMDS.iter().any(|c| c.as_bytes() == cmd) {
         complete_from_list(ctx, line, tok_start, &["version", "help"]);
         return true;
+    }
+
+    // ---- A COLUMN OF WHATEVER IS FLOWING DOWN THE PIPE -------------------------------------
+    //
+    // The stage's own name says nothing about its argument: `where` takes a column of the row, and
+    // which columns exist is decided by the PRODUCER at the head of the pipeline. So look back past
+    // every `|` to the first command on the line and complete from its columns.
+    //
+    // `sort` is in both this list and `SUBCMD_FIRST` (it also takes `reverse`), so its columns are
+    // offered alongside that keyword rather than instead of it.
+    if prior == 0 && COLUMN_STAGES.contains(&core::str::from_utf8(cmd).unwrap_or("")) {
+        let whole = &line.bytes()[..seg_start];
+        let producer = whole.split(|&b| b == b'|')
+            .next()
+            .and_then(|seg| seg.split(|&b| b == b' ').find(|w| !w.is_empty()));
+        if let Some(prod) = producer {
+            if let Some((_, cols)) = PRODUCER_COLS.iter().find(|(c, _)| c.as_bytes() == prod) {
+                let mut all: [&str; 16] = [""; 16];
+                let mut n = 0usize;
+                for &c in *cols { if n < all.len() { all[n] = c; n += 1; } }
+                // `sort reverse` is a keyword at the same position as a column name.
+                if cmd == b"sort" && n < all.len() { all[n] = "reverse"; n += 1; }
+                if n > 0 { return complete_from_list(ctx, line, tok_start, &all[..n]); }
+            }
+        }
+    }
+
+    // ---- DEEPER THAN ONE LEVEL -------------------------------------------------------------
+    //
+    // `SUBCMD_FIRST` stops after the first argument, so everything past it fell through to PATH
+    // completion - offering a directory listing for an argument that is a keyword or a service name.
+    // Completion that goes one level deep on a surface three deep teaches the operator that tab does
+    // not work here, which is worse than it being absent.
+    //
+    // Checked before the first-level table because a command can appear in both: `events` has
+    // first-level words AND `events persist <start|stop|status>` beneath one of them.
+    let first_arg = words.clone().next();
+
+    // Position 3: `events persist start <path> <size> [sticky]` is the deepest surface in the shell,
+    // and `sticky` was reachable only by typing it in full.
+    if prior >= 1 {
+        let second_arg = words.clone().nth(1);
+        if let (Some(a1), Some(a2)) = (first_arg, second_arg) {
+            if let Some((_, _, _, cands)) = SUBCMD_THIRD.iter().find(
+                |(c, f, sd, _)| c.as_bytes() == cmd && f.as_bytes() == a1 && sd.as_bytes() == a2) {
+                // Offer only what is not already present, like the trailing-modifier table.
+                let mut avail = [""; 8];
+                let mut a = 0usize;
+                for &k in *cands {
+                    let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
+                    if !used && a < avail.len() { avail[a] = k; a += 1; }
+                }
+                if a > 0 { return complete_from_list(ctx, line, tok_start, &avail[..a]); }
+            }
+        }
+    }
+
+    // Position 2: the word after a first-level keyword.
+    if prior == 1 {
+        if let Some(a1) = first_arg {
+            // A COMMAND NAME, where the surface takes one - `assert ok d<tab>` must offer `dir`,
+            // `date`, `delete`, not the contents of the current directory. `watch` and `whatis`
+            // already had this at position 1; nothing had it at position 2.
+            if CMDNAME_AFTER.iter().any(|(c, f)| c.as_bytes() == cmd && f.as_bytes() == a1) {
+                let mut names: [&str; 96] = [""; 96];
+                let mut n = 0usize;
+                for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
+                for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
+                return complete_from_list(ctx, line, tok_start, &names[..n]);
+            }
+            if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
+                |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
+                return complete_from_list(ctx, line, tok_start, cands);
+            }
+        }
     }
 
     if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
@@ -4259,6 +4405,12 @@ const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
+    // `events` and `trace` were absent, so they alone among the utilities answered neither
+    // `<util> version` nor `<util> help` - conventions rule 1, unmet since they shipped. Both already
+    // HAD help blocks; nothing referred a reader to them. Safe to add: the intercept fires only on
+    // exactly `<util> version` / `<util> help` / `<util> <sub> help`, so `events log 5` and
+    // `events ipc` still reach their own dispatch untouched.
+    "events", "trace",
     "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -7534,6 +7686,15 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
             ("NO LIVE OWNER", "its task died, or it is a reply-only mailbox", ""),
             ("holder / rights", "every live task holding a cap, and its rights", ""),
         ], false),
+        "persist" => help_block(ctx, "events persist", "capture the log to disk, via `recorder`", &[
+            ("start <path> <size>", "begin capturing to <path>, rotating at <size>", "events persist start /log.txt 256KiB"),
+            ("start ... sticky", "and resume after a reboot (recorded in /persist.conf)", "events persist start /log.txt 256KiB sticky"),
+            ("stop", "end the capture; the file gets its footer so it reads as complete", "events persist stop"),
+            ("status", "what is recording, how much it has taken, and whether lines were LOST", "events persist status"),
+            ("lost", "the window wrapped faster than the disk took it - the gap is real", ""),
+            ("why a separate service", "`events` is a broker, not a store: a persisting sink would", ""),
+            ("", "cycle through `fs`, and make observing a storage failure need storage", ""),
+        ], false),
         "ipc" | "failures" => help_block(ctx, "events ipc", "recent IPC exchanges, oldest first", &[
             ("seq", "the CALLER'S own count. A gap = an event that never arrived", ""),
             ("sec", "when the RING saw it, from the oldest row. Not a latency", ""),
@@ -10330,8 +10491,11 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // fourth time. It stays a literal for now because the shell cannot see the supervisor's list, but
 // the honest fix is to derive it from live tasks the way `chaos` derives its own exclusions - which
 // is exactly why chaos has no roster to drift.
-const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
-                                       "nic-driver", "net-stack", "time", "control", "dwc2"];
+/// A `&[&str]` rather than a `[&str; 11]` so TAB COMPLETION can point at the same list instead of
+/// carrying a second copy. The comment above is about this list drifting from the supervisor's; a
+/// copy inside the completion tables would have been a fifth statement of the same fact.
+const CHAOS_RESTARTABLE: &[&str] = &["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
+                                     "nic-driver", "net-stack", "time", "control", "dwc2"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A

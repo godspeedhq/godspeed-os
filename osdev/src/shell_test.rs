@@ -434,11 +434,33 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("write append"), "tab: menu digit 1 selects 'write append'"),
         None    => { println!("shell-test: FAIL - tab keyword menu selection timed out"); fail += 1; }
     }
-    // pipe-stage keyword: a verb after `|` completes its first-arg keyword. `status | sort r` → reverse.
-    send(&mut write_half, b"status | sort r\t\x03");
+    // Pipe-stage keyword AND column. `sort` takes both `reverse` and any column of the row flowing
+    // into it, so after `status |` the prefix `r` matches TWO real things - `restarts` (a column of
+    // status) and `reverse` (the keyword). A menu is the correct answer there; this used to complete
+    // straight to `reverse` only because columns were not completable at all, which made
+    // `sort restarts` - a perfectly good command - something you had to type in full.
+    //
+    // So the unambiguous prefix is what pins the keyword now, and the ambiguous one is asserted
+    // separately below. Narrowing the feature to keep the old assertion would have been the wrong
+    // way round: the assertion described a gap, not a guarantee.
+    send(&mut write_half, b"status | sort rev\t\x03");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort r' completes to 'sort reverse'"),
+        Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort rev' completes to 'sort reverse'"),
         None    => { println!("shell-test: FAIL - tab pipe-stage keyword timed out"); fail += 1; }
+    }
+    // A COLUMN of the producer at the head of the pipe. `restarts` belongs to `status`; it is not a
+    // keyword of `sort` and was not completable before.
+    send(&mut write_half, b"status | sort res\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("sort restarts"), "tab: a COLUMN of the producer completes ('status | sort res')"),
+        None    => { println!("shell-test: FAIL - tab column completion timed out"); fail += 1; }
+    }
+    // And the columns are the PRODUCER'S, not a union: `sealed` is a column of `dir` and of nothing
+    // else, so it must complete after `dir |` - and `core` (a `status` column) must not.
+    send(&mut write_half, b"dir | where se\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("where sealed"), "tab: the column set is the PRODUCER'S ('dir | where se')"),
+        None    => { println!("shell-test: FAIL - tab producer-column timed out"); fail += 1; }
     }
     // command-name completion AFTER a pipe (the segment's first word). `status | sor` → `status | sort`.
     // ("so" is now ambiguous - `sock` (the socket utility) and `sort` both start with it - so this uses
