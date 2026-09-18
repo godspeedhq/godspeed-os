@@ -52,7 +52,7 @@ its own (§26.2).
 
 ```
 gsh> serve 8080
-listening on 192.168.4.37:8080 - answering connections until you press q
+listening on 192.168.4.37:8080 - answering connections  [q] quit
 still listening - 10s (q aborts)
 accepted a connection
 received 11 byte(s): knock knock

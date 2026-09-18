@@ -247,14 +247,33 @@ These are the laws that bound every design choice. Any change that violates an i
     ▲ syscall             ▲ syscall       ▲ syscall
 ```
 
-### 4.3 Kernel Scope (Strict)
+### 4.3 Kernel Scope (Strict) - **MISCIS**
+
+The six, and the mnemonic for them - **MISCIS**, said like "misses": **M**emory isolation, **I**PC,
+**S**cheduling, **C**apabilities, **I**nterrupts, **S**MP routing.
 
 - Memory isolation (per-service address spaces, page tables)
-- Scheduling (per-core run queues, round-robin with timer preemption)
 - IPC (synchronous message passing, bounded queues, cross-core routing)
+- Scheduling (per-core run queues, round-robin with timer preemption)
 - Capability enforcement (validation on every privileged syscall, generation check)
 - Interrupt routing (delivery to userspace driver services)
 - SMP routing (EndpointId → CoreId map, IPI wakeup)
+
+> **Leave these six bullets as plain text.** `scripts/commandments.py` parses each line up to the
+> `(` as the responsibility's NAME, so bolding the mnemonic letters inside them - `**M**emory
+> isolation` - turned every name into something it did not recognise and failed six modules at once.
+> Caught in seconds by the gate that reads this list, which is the argument for deriving it from here
+> rather than copying it into config.
+
+"Do not expand MISCIS" is therefore the short form of §4.4: a seventh responsibility is a change to
+what this kernel IS, not a feature. `scripts/commandments.py` (`I-responsibilities`) derives the six
+from this very list and fails on a module that serves something outside it, so the acronym and the
+gate read the same source.
+
+> **The list is ordered to spell the word.** It previously ran memory / scheduling / IPC / ... which
+> spells MSICIS, and the order carries no meaning - the checker builds a SET from these bullets and
+> does not care. A mnemonic that does not match the list it names is a small trap, so the list moved
+> rather than the mnemonic.
 
 ### 4.4 Kernel Anti-Scope
 

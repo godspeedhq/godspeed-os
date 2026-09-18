@@ -498,10 +498,17 @@ whenever a tear point falls outside the permitted set.
 - Expanding the kernel to make any of this testable. Filesystem semantics stay in userspace (4.4);
   a test that needs a kernel change needs a different test.
 
-## 7. One term not adopted, because it was not understood
+## 7. MISCIS
 
 The source checklist twice refers to **MISCIS** ("do not expand MISCIS merely to make a test pass";
-"Kernel changes / MISCIS boundary review"). The term appears nowhere in this project and was not
-guessed at. Both instances have been read as the KERNEL SCOPE boundary - `CLAUDE.md` 4.4's anti-scope
-and 26.10's mechanism-not-policy rule - which is what the surrounding sentences are about. If it
-means something else, this section is where to correct it.
+"Kernel changes / MISCIS boundary review"). It is the mnemonic for the kernel's six responsibilities -
+**M**emory isolation, **I**PC, **S**cheduling, **C**apabilities, **I**nterrupts, **S**MP routing -
+now written into `CLAUDE.md` §4.3, which is where a reader will look for it.
+
+So the constraint is §4.4 in short form: a seventh responsibility is a change to what the kernel IS.
+Nothing in this programme needs one. The merge-evidence row reads "Kernel changes / scope boundary
+review" and is PASS because no kernel source changed on this branch at all.
+
+This section originally recorded the term as not understood, and is kept rather than deleted because
+the reading was provisional and is now confirmed - the difference between a guess and a checked fact
+is worth leaving visible.

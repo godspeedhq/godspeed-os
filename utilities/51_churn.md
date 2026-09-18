@@ -78,7 +78,7 @@ ever does surface the bytes say which iteration wrote them.
 
 ```
 gsh> churn 60
-churn: writing continuously for 60s - CUT THE POWER AT ANY POINT (q to quit)
+churn: writing continuously for 60s - CUT THE POWER AT ANY POINT [q] quit
 churn: 1s elapsed, 47 writes
 churn: 2s elapsed, 95 writes
 ...
@@ -138,7 +138,7 @@ facts without editorialising, and `q` aborts (rule 9) - a command that runs for 
 interrupted is one the operator has to reboot out of. Bounded (26.6): a fixed file rotation and fixed
 stack buffers, no heap (26.6.1).
 
-The wording is **`(q to quit)`**, matching `observe` and `ping` - the house phrasing for a CONTINUOUS
+The wording is **`[q] quit`**, matching `observe` and `ping` - the house phrasing for a CONTINUOUS
 run - and now the ONLY form. One key, one word, because the letter IS the mnemonic, which is the
 whole reason the key is `q`. "abort" would have earned the letter `a` and never had it, yet the shell
 advertised `(press q to abort)` in six places and rule 9 mandated it. Both corrected. Unix makes the

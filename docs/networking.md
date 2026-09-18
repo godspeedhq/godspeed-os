@@ -345,7 +345,7 @@ link transition as a first-class, *observable* event, never a silent error (§26
 - **`ping` rides an unplug/replug.** A running `ping` does not die when the cable is pulled - it reports
   the link down and **resumes** when the cable returns and the lease re-acquires, with an instant `q`
   abort throughout (the utility never blocks un-abortably on a dead link - Commandment VIII, and the
-  "press q to quit" utility convention).
+  "[q] quit" utility convention).
 - **`net` reflects the *live* link.** `net` reads carrier + lease state at call time, so it never shows a
   stale "up" for a cable that is out.
 - **`net renew` recovers in place.** A link that came up mis-configured, or a lease that expired, is

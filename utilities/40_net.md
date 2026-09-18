@@ -119,7 +119,7 @@ landed and the driver has not consumed it yet. (On QEMU the e1000 path prints CT
 gsh> net arp 192.168.4.1
 192.168.4.1 is at 00:ab:48:da:1b:0d
 gsh> net scan
-Scanning 192.168.4.0/24 for live hosts (press q to quit):
+Scanning 192.168.4.0/24 for live hosts [q] quit
   192.168.4.1
   192.168.4.80
   192.168.4.107

@@ -4666,7 +4666,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("status", "slot, name, core, state of every task", "status"),
         ], true),
         "observe" => help_block(ctx, "observe", "live system metrics view (records when piped)", &[
-            ("observe", "full-screen live view (q to quit)", "observe"),
+            ("observe", "full-screen live view; q quits", "observe"),
             ("observe now", "one-shot metrics frame", "observe now"),
             ("observe now | <verb>", "piped: records + a 'ticks' (cpu-time) column", "observe now | sort reverse ticks"),
         ], true),
@@ -4925,7 +4925,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
-    Row("observe [now]", "live view (q to quit) / one-shot frame"),
+    Row("observe [now]", "live view (q quits) / one-shot frame"),
     // Neither of these was ever listed here, so `help` did not mention the observability tools at all.
     // Two entries because they are two commands over two SOURCES: `trace` walks live kernel state,
     // `events` reads what the sink recorded.
@@ -5776,7 +5776,7 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     let bl = (b as u16).to_le_bytes();
     // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
     if count.is_none() {
-        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data (press q to quit):", ip[0], ip[1], ip[2], ip[3], b));
+        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:  [q] quit", ip[0], ip[1], ip[2], ip[3], b));
     } else {
         out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
     }
@@ -5962,7 +5962,7 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
 fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to quit)"));
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)  [q] quit"));
     let outcome = ns_abortable(ctx, &[8u8], 30);
     match outcome {
         ReqOutcome::Reply(r) => {
@@ -5990,7 +5990,7 @@ fn net_arp(ctx: &ShellCtx, ip_str: &str, out: &mut Out) -> Result<(), ShellError
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to quit)", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{}  [q] quit", ip[0], ip[1], ip[2], ip[3]));
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
     let outcome = ns_abortable(ctx, &[6, ip[0], ip[1], ip[2], ip[3]], 8);
     match outcome {
@@ -6022,7 +6022,7 @@ fn net_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
         ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to quit):", our[0], our[1], our[2]));
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts:  [q] quit", our[0], our[1], our[2]));
     // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
     // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
     // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
@@ -6058,7 +6058,7 @@ fn net_dns(ctx: &ShellCtx, host: &str, out: &mut Out) -> Result<(), ShellError> 
     req[0] = 1;
     req[1..1 + hb.len()].copy_from_slice(hb);
     // A DNS resolve waits on the server, which can take a moment. Route it through net_query (not a
-    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to quit"
+    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "[q] quit"
     // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
     // silent hang.
     ctx.console_writeln("net: resolving ...");
@@ -6142,7 +6142,7 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64, tag
         }
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
-        if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to quit"); }
+        if i == 0 { ctx.console_writeln("net: waiting for a reply  [q] quit"); }
         let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
@@ -6636,7 +6636,7 @@ fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
 fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     if args.len() < 2 || args[1] == "help" {
         out.line(ctx, "usage: serve <port> [for]   - accept ONE connection on <port>, echo it, close");
-        out.line(ctx, "       waits until you press q; `for` bounds it: 30s, 5m, 2h, 1d");
+        out.line(ctx, "       runs until you quit; `for` bounds it: 30s, 5m, 2h, 1d");
         out.line(ctx, "       e.g. serve 8080        serve 8080 5m");
         return Ok(());
     }
@@ -6686,14 +6686,14 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
         if st.len() >= 4 && st[..4] != [0, 0, 0, 0] {
             out.line_fmt(ctx, format_args!(
-                "listening on {}.{}.{}.{}:{} - answering connections until you press q",
+                "listening on {}.{}.{}.{}:{} - answering connections  [q] quit",
                 st[0], st[1], st[2], st[3], port));
             shown = true;
         }
     }
     if !shown {
         out.line_fmt(ctx, format_args!(
-            "listening on port {} - answering connections until you press q", port));
+            "listening on port {} - answering connections  [q] quit", port));
     }
 
     // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.
@@ -6726,9 +6726,9 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
                 last_note = waited;
                 match limit {
                     Some(n) => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s of {}s, {} served (q to quit)", waited, n, served)),
+                        "still listening - {}s of {}s, {} served  [q] quit", waited, n, served)),
                     None => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s, {} served (q to quit)", waited, served)),
+                        "still listening - {}s, {} served  [q] quit", waited, served)),
                 }
             }
             // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four
@@ -6791,7 +6791,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
         ctx.sleep(ctx.duration_cycles(200));
         ctx.remove_cap(conn_h);
-        out.line(ctx, "closed - waiting for the next connection (q to quit)");
+        out.line(ctx, "closed - waiting for the next connection  [q] quit");
         // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
         // connections and is released once, on the way out, by every exit path below.
     }
@@ -8429,7 +8429,7 @@ fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> ReqOutcome {
     const MAX_SECS:  i64 = 5;   // the ring is in memory; a healthy answer is immediate
     for _ in 0..3 {
         match ctx.request_with_reply_qhint("events", &Message::from_bytes(req), HINT_SECS, MAX_SECS,
-                                           || ctx.console_writeln("  (q to quit)")) {
+                                           || ctx.console_writeln("  [q] quit")) {
             ReqOutcome::Reply(r) => return ReqOutcome::Reply(r),
             // The user's decision, not a fault - never retried.
             ReqOutcome::Aborted  => return ReqOutcome::Aborted,
@@ -9746,7 +9746,7 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     // snapshot is the WHOLE frame - top not cut off, a faithful freeze of what you were watching. These
     // two strings are byte-for-byte the painter's (services/observe title bar); \x1b[K clears whatever
     // the partial frame left on these two rows.
-    ctx.console_write("observe - live                                      (q to quit)\x1b[K\r\n");
+    ctx.console_write("observe - live                                      [q] quit\x1b[K\r\n");
     ctx.console_write("================================================================\x1b[K\r\n");
     let r = cmd_observe_now(ctx);
     ctx.console_write("\x1b[J\x1b[?25h");
@@ -10678,7 +10678,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
         ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
         ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
         ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
-        ctx.console_writeln("  (press q to quit; quitting clears the override)");
+        ctx.console_writeln("  [q] quit  (quitting clears the override)");
         return Ok(());
     }
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
@@ -10695,7 +10695,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     let clr  = Message::from_bytes(&[8]);
     for cycle in 1..=cycles {
         ctx.console_writeln_fmt(format_args!(
-            "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to quit)", cycle, cycles));
+            "chaos link-flap: cycle {}/{} - forcing link DOWN  [q] quit", cycle, cycles));
         match net_query(ctx, "nic-driver", &down, 3, None) {
             NetQ::Aborted => {
                 let _ = net_query(ctx, "nic-driver", &clr, 2, None);
@@ -11920,7 +11920,7 @@ fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
 /// 8 + 6 is 14, so 20 leaves real slack and still returns while a person is still watching.
 const NET_TXN_SECS: i64 = 20;
 
-/// How long the wait must linger before the `(q to quit)` hint is printed. A fast transaction prints
+/// How long the wait must linger before the `[q] quit` hint is printed. A fast transaction prints
 /// nothing, so a snappy `tcp` is not nagged.
 const NET_HINT_SECS: i64 = 2;
 
@@ -11965,7 +11965,7 @@ fn drain_stale_net_replies(ctx: &ServiceContext) {
 }
 
 /// A tagged net-stack request on the transaction path (`tcp`, `sock`, `serve`'s listen): bounded by
-/// `NET_TXN_SECS`, and **`q`-abortable**, with a `(q to quit)` hint once the wait lingers.
+/// `NET_TXN_SECS`, and **`q`-abortable**, with a `[q] quit` hint once the wait lingers.
 ///
 /// **A bound alone was not enough, and the Wyse proved it.** Bounding this at 20 s stopped the shell
 /// hanging forever, but the operator still had a dead prompt for twenty seconds with no way out - they
@@ -11983,7 +11983,7 @@ fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
     let (n, tag) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
     let first = ctx.request_with_reply_qhint(
         "net-stack", &Message::from_bytes(&buf[..n]), NET_HINT_SECS, NET_TXN_SECS,
-        || ctx.console_writeln("  (q to quit)"));
+        || ctx.console_writeln("  [q] quit"));
     match ns_take_tagged(ctx, tag, first, NET_TXN_SECS) {
         // A timeout here means the send never left or the peer is silent. Reacquire by name and retry
         // once, with a FRESH tag - the first request may still be in flight, and its late reply must
@@ -11992,7 +11992,7 @@ fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
             let (n2, tag2) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
             let again = ctx.request_with_reply_qhint(
                 "net-stack", &Message::from_bytes(&buf[..n2]), NET_HINT_SECS, NET_TXN_SECS,
-                || ctx.console_writeln("  (q to quit)"));
+                || ctx.console_writeln("  [q] quit"));
             ns_take_tagged(ctx, tag2, again, NET_TXN_SECS)
         }
         other => other,
@@ -12073,14 +12073,14 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 }
 
 /// `fs_request` for INTERACTIVE commands (`dir`, `cd`, `read`, `find`, ...): q-abortable, and after a
-/// short lingering threshold it prints a "(q to quit)" hint so the user can bail on a slow op instead
+/// short lingering threshold it prints a "[q] quit" hint so the user can bail on a slow op instead
 /// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
 /// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
 /// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
 /// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
 /// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
 fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
-    const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
+    const HINT_SECS: i64 = 2;    // print "[q] quit" only if the wait lingers past this
     // How long `fs` gets to answer before the shell declares storage unavailable.
     //
     // **This was 3600, with the comment "effectively unbounded - fs replies fast now; q is the real
@@ -12109,7 +12109,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
     let dn = data.len().min(req.len() - 3 - pl);
     req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..3 + pl + dn]);
-    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
     match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
         // A fresh tag for the fresh request - see `fs_request`.
@@ -12118,7 +12118,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
             let mut req2 = req;
             req2[0] = tag2;
             let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
             fs_take_tagged(ctx, tag2, again, MAX_SECS)
         }
         other => other,
@@ -12135,17 +12135,17 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
 /// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
 /// (`fs_request_q` would append a path-length byte).
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
-    const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
+    const HINT_SECS: i64 = 2;    // print "[q] quit" only once the wait lingers
     const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE, not the volume - a real bound
     let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
-    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
     match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
             let tag2 = next_fs_tag(ctx);
             let msg2 = Message::from_bytes(&[tag2, op]);
-            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
             fs_take_tagged(ctx, tag2, again, MAX_SECS)
         }
         other => other,
@@ -12501,7 +12501,7 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
 /// **Abortable** (conventions rule 9): `q` quits it, and it ends on its own at the deadline. A
 /// command that runs for a minute and cannot be interrupted is one the operator has to reboot out of.
 ///
-/// The wording is `(q to quit)`, and that is now the ONLY form. One key, one word - because the
+/// The wording is `[q] quit`, and that is now the ONLY form. One key, one word - because the
 /// LETTER is the mnemonic, which is the whole reason the key is `q`. "abort" would have earned the
 /// letter `a` and never had it, yet the shell advertised `(press q to abort)` in six places and
 /// `0_conventions.md` rule 9 mandated it. Both corrected. Unix makes the same association from the
@@ -12519,7 +12519,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
 
     let _ = fs_request(ctx, OP_MKDIR, DIR, &[]);
     out.line_fmt(ctx, format_args!(
-        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT (q to quit)", secs));
+        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
 
     let mut buf = [0u8; 3000];
     let mut path = [0u8; 32];
