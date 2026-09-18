@@ -1967,6 +1967,122 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
 ///
 /// The seed is printed on every run and on every failure, because "preserve the seed" is the first
 /// line of §5 of the carnage doc.
+/// `osdev test fs-tear-detect` - PROVE THE CONTENT DETECTOR FIRES.
+///
+/// `churn verify` has reported `NONE torn` on every hardware run there has ever been. That is the
+/// right answer and it tells you nothing about whether the detector CAN say otherwise - and a check
+/// never observed failing is not evidence, which is the rule that has already caught a blind stack
+/// gate and a doc gate in this repo.
+///
+/// `churn tear` writes a well-formed block of a DIFFERENT generation into the middle of a churn
+/// file. The carnage doc describes exactly this case: "a file holding the first half of one write
+/// and the second half of another has perfectly valid block CRCs (each block was written whole),
+/// sits in a perfectly valid directory, and occupies correctly accounted blocks. Every check this
+/// project had would pass it."
+///
+/// So the assertion is not merely "verify says TORN". It is that **`drives check` and `drives scrub`
+/// both still say clean while `churn verify` does not** - the demonstration that structure and
+/// content are different questions, rather than the claim that they are.
+pub fn run_fs_tear_detect(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("fs-tear-detect: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(port, Duration::from_secs(20)) {
+        Some(s) => s,
+        None => { child.kill().ok(); child.wait().ok();
+                  eprintln!("fs-tear-detect: no serial on {port}"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break,
+                                                     Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-tear-detect: PASS - {}", $label); pass += 1; }
+        else { println!("fs-tear-detect: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        println!("fs-tear-detect: FAIL - no prompt"); child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    }
+
+    // Enough churn to produce files past the tear point (the 1200- and 3000-byte sizes).
+    send(&mut write_half, b"churn 8\r");
+    let churn = collect_until(&buf, &mut cursor, b"churn: done", Duration::from_secs(40)).unwrap_or_default();
+    check!(churn.contains("writes"), "churn ran and wrote files");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15));
+
+    // CLEAN FIRST. Without this the TORN result below proves nothing - it could have been torn
+    // already, which is precisely the ambiguity a positive control removes.
+    send(&mut write_half, b"churn verify\r");
+    let v0 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(v0.contains("NONE torn"), "control: every file is intact BEFORE the tear");
+
+    send(&mut write_half, b"churn tear\r");
+    let tear = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    check!(tear.contains("a MIX"), "churn tear reports which file it tore, and how");
+
+    // THE DETECTOR FIRES. This is the whole point of the suite.
+    send(&mut write_half, b"churn verify\r");
+    let v1 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(v1.contains("TORN"), "churn verify DETECTS the tear");
+    check!(v1.contains("diverges at byte 508"),
+           "churn verify names the exact tear point (byte 508, the second block)");
+
+    // AND THE STRUCTURAL CHECKS DO NOT, which is the claim being demonstrated: the blocks are
+    // well-formed, their CRCs are right, the tree is right, the accounting is right. Only the
+    // CONTENT is a lie, and only one check reads content.
+    send(&mut write_half, b"drives check\r");
+    let chk = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    check!(chk.contains("0 bad"), "drives check still reports a consistent STRUCTURE");
+    send(&mut write_half, b"drives scrub\r");
+    let scr = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    check!(scr.contains("0 bad"), "drives scrub still reports every block's CRC correct");
+
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let _ = std::fs::create_dir_all("build/tests");
+        let _ = std::fs::write("build/tests/fs_tear_detect_serial.log", whole.as_bytes());
+    }
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nfs-tear-detect: {pass} passed, {fail} failed  (serial -> build/tests/fs_tear_detect_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_model(image_path: &Path, persist_path: &str, smp: u32, seed: u64, ops: usize) {
     use crate::fs_model::{gen_op, universe, Model, Op, Rng};
 

@@ -1063,7 +1063,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
-    ("churn",    &["verify", "reset"]),
+    ("churn",    &["verify", "tear", "reset"]),
     ("dir",      &["bytes"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
@@ -2091,8 +2091,9 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
         }
         "churn"   => {
-            if argc < 2 { ctx.console_writeln("usage: churn <seconds> | churn verify | churn reset"); Err(ShellError::Unknown) }
+            if argc < 2 { ctx.console_writeln("usage: churn <seconds> | churn verify | churn tear | churn reset"); Err(ShellError::Unknown) }
             else if args[1] == "verify" { cmd_churn_verify(ctx, out) }
+            else if args[1] == "tear"   { cmd_churn_tear(ctx, out) }
             else if args[1] == "reset"  { cmd_churn_reset(ctx, out) }
             else { cmd_churn(ctx, args[1], out) }
         }
@@ -13033,6 +13034,85 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
     out.line(ctx, "churn: /churn is left in place (it is the evidence); `churn reset` removes it");
     Ok(())
+}
+
+/// `churn tear` - deliberately make one churn file a MIX of two generations, so the detector can
+/// be seen firing.
+///
+/// **A DETECTOR NEVER OBSERVED FIRING IS NOT EVIDENCE.** `churn verify` has reported `NONE torn` on
+/// every hardware run there has ever been, which is the right answer and tells you nothing about
+/// whether it *could* say otherwise. Every corruption test this project has - `fs-corrupt`,
+/// `fs-scrub`, `fs-hostile` - damages the disk HOST-SIDE before boot, which is impossible on a
+/// machine you cannot take the disk out of. This is the same proof, reachable from the shell.
+///
+/// **What it creates is precisely the case the carnage doc says nothing else catches.** From
+/// `docs/gsfs-carnage.md`: a file holding the first half of one write and the second half of
+/// another "has perfectly valid block CRCs (each block was written whole), sits in a perfectly
+/// valid directory, and occupies correctly accounted blocks. Every check this project had would
+/// pass it." So this writes a well-formed block of a DIFFERENT generation into the middle of a
+/// churn file: the structure stays immaculate and the content is a lie. `drives check` and `drives
+/// scrub` must both still report clean afterwards, and `churn verify` must not - which is the whole
+/// argument that they answer different questions, demonstrated rather than asserted.
+///
+/// **IT DOES NOT REPAIR, AND NOTHING WILL.** Detection is the guarantee (`gsfs-carnage.md` §6):
+/// silent repair of data whose correct value is unknown is the second half of the mission statement
+/// this programme exists to defend. The accounting can be rebuilt because the free bitmap is a
+/// derived view of one irreducible source (§26.4); file content has no second source, so there is
+/// nothing to rebuild it from. `churn reset` removes the evidence when you are finished with it.
+fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    const DIR: &[u8] = b"/churn";
+    // 508 bytes of payload per block - the same figure `churn verify` reports its tear point
+    // against, so the offset it names will match the offset written here.
+    const PAYLOAD: usize = 508;
+    // Tear the SECOND block, so there is intact original before it - a tear at the very start
+    // would be indistinguishable from a file simply written by another generation - and, for any
+    // file past 1016 bytes, intact original after it too.
+    //
+    // The third block would be a better demonstration and is not reachable: `churn` cycles file
+    // sizes through 64/500/1200/3000, so after a short run the largest file on disk may be 1200
+    // bytes. Requiring 1524 made this refuse on a volume that had just been churned for eight
+    // seconds, which is the commonest way anyone will reach for it.
+    const AT: u64 = PAYLOAD as u64;
+
+    let mut data = [0u8; 4096];
+    let mut path = [0u8; 32];
+    for slot in 0..8u8 {
+        let mut pl = 0usize;
+        for &b in DIR { path[pl] = b; pl += 1; }
+        path[pl] = b'/'; pl += 1;
+        path[pl] = b'f'; pl += 1;
+        path[pl] = b'0' + slot; pl += 1;
+        path[pl..pl + 4].copy_from_slice(b".bin"); pl += 4;
+
+        let n = match fs_read_file(ctx, &path[..pl], &mut data, 20) { Some(n) => n, None => continue };
+        // Needs a whole block past the tear point, or there is nothing to disagree with.
+        if n < AT as usize + PAYLOAD { continue; }
+
+        let gen = data[0];
+        // A DIFFERENT generation, and one that cannot collide: 251 is prime and 37 is not a
+        // multiple of it, so `gen + 37` is never `gen` mod 251.
+        let gen2 = (gen as usize + 37) as u8 % 251;
+        let mut chunk = [0u8; PAYLOAD];
+        for k in 0..PAYLOAD {
+            let abs = AT as usize + k;
+            chunk[k] = ((gen2 as usize + abs) % 251) as u8;
+        }
+        if !fs_write_at(ctx, &path[..pl], AT, &chunk) {
+            let why = ctx.last_write_err.borrow();
+            out.line_fmt(ctx, format_args!("churn tear: could not write {} - {}",
+                                           str_of(&path[..pl]), why.get().unwrap_or("no reason given")));
+            return Err(ShellError::Unknown);
+        }
+        out.line_fmt(ctx, format_args!(
+            "churn tear: {} now holds generation {} from byte 0 and generation {} from byte {} - a MIX",
+            str_of(&path[..pl]), gen, gen2, AT));
+        out.line(ctx, "churn tear: the blocks are well-formed and their CRCs are correct, so `drives check`");
+        out.line(ctx, "churn tear: and `drives scrub` will BOTH still report clean. Only `churn verify` sees it.");
+        out.line(ctx, "churn tear: nothing repairs this - detection is the guarantee. `churn reset` removes it.");
+        return Ok(());
+    }
+    out.line(ctx, "churn tear: no churn file is large enough - run `churn 10` first, then tear one");
+    Err(ShellError::Unknown)
 }
 
 /// `churn reset` - remove `/churn` and everything in it.

@@ -523,16 +523,27 @@ It landed. 30 GB SSD, GSFS0008 over 62,533,296 blocks:
 16:38:08  fs: journal recovered 4 block(s) from an interrupted write
 16:38:08  fs: mounted GSFS0008 (62533296 blocks, bitmap 1..15332, root@15342, 62517885 free)
 16:38:52  churn verify: 6 file(s) checked, 0 empty, NONE torn - every file holds one generation
+19:13:25  check: 51 files, 3 dirs, 0 bad; 15411 blocks used, 62517885 free
+19:13:25  check: the free count already agreed with the tree - nothing was repaired
+19:13:25  check: ok - filesystem is consistent
 ```
 
 Four blocks were durable in the journal and not yet checkpointed home when the power went. The
 next mount replayed them, and content verification then found no file holding a mix of two writes.
 That is the whole claim of §6.8 of `docs/persistence.md`, on real silicon, end to end.
 
-**What this does NOT yet say.** `drives check` was not run after the recovery, so the STRUCTURAL
-half - tree, bitmap, free count - is unverified for this particular cut. `churn verify` answers
-content and `drives check` answers structure; `51_churn.md` is explicit that both are needed and
-they are not the same question. The `check: ... 0 bad` in this log predates the cut.
+**BOTH QUESTIONS ARE ANSWERED, and they are different questions.** `churn verify` reads content -
+is any file a mix of two writes? `drives check` reads structure - tree, bitmap, free count.
+`51_churn.md` is explicit that one does not imply the other: a file holding the first half of one
+write and the second half of another has perfectly valid block CRCs, sits in a valid directory,
+and occupies correctly accounted blocks.
+
+**And the structural result is the STRONG form.** "Nothing was repaired" is not the same as "it
+was repaired successfully". The permitted-outcome table (§2) allows an interrupted `delete` to
+leave blocks marked used - a leak - which `drives check` would silently reclaim; that would still
+have been a pass. It did not happen. The free count the recovery mount reported (62,517,885) is
+the same number the check computed from the tree hours later, so recovery left the accounting
+already correct rather than merely correctable.
 
 **And it remains one board.** The backend-conditional caveat in `CLAUDE.md` §6.1 is untouched: this
 is a SATA SSD behind AHCI, which attests durability at the journal barriers. The Pi 2's USB stick
@@ -555,7 +566,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | NOT RUN - NOT REACHABLE | 3.11 / `backlog/34`. No non-x86 port can attach a usable disk in QEMU: riscv64 has no drive option, aarch64 has no VL805 emulation, arm32's stick re-enumerates 126 times and never settles. The x86 half is written and waiting |
-| Physical-hardware validation | PARTIAL (1 of 5 boards), journal half CLOSED | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD. A power cut during `churn` landed INSIDE the commit-to-checkpoint window: the next mount reported `journal recovered 4 block(s) from an interrupted write`, and `churn verify` then found 6 files, NONE torn. Recovery on silicon is proven (§3.12). Three earlier cuts had survived cleanly without ever invoking the journal, which proved consistency and not recovery. Still open: `drives check` after a recovered cut (structure), and four boards |
+| Physical-hardware validation | PARTIAL (1 of 5 boards), journal half CLOSED | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD. A power cut during `churn` landed INSIDE the commit-to-checkpoint window: the next mount reported `journal recovered 4 block(s) from an interrupted write`, and `churn verify` then found 6 files, NONE torn. `drives check` then reported `0 bad` and `nothing was repaired`, with the free count identical to the one the recovery mount computed - so both the content and the structural question are answered, and the structural one in its strong form. Recovery on silicon is proven (§3.12). Three earlier cuts had survived cleanly without ever invoking the journal, which proved consistency and not recovery. Still open: four boards |
 | Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
 
 **Merge rule adopted:** do not merge until the required gates pass, genuinely inapplicable gates are

@@ -10,7 +10,7 @@ rather than reconstructed later.
 |---|---|
 | volume mounts, shell works, `ls` hints at `dir` | PASS - `fs: mounted GSFS0008 (62533296 blocks ...)` |
 | `selfcheck` | **492 checks, 0 failed** |
-| **power cut during heavy filesystem activity** | **PASS, three times out of three** |
+| **power cut during heavy filesystem activity** | **PASS, four times out of four** - and the fourth landed INSIDE the commit window, so the journal replayed and recovery is proven on silicon |
 | chaos storm | not run |
 
 **The power-cut test, and what it does and does not establish.** The plug was pulled at the wall
@@ -32,15 +32,44 @@ Mounted, `0 bad` (so no block was torn at the sector level), and the accounting 
 free count in the mount line matches what the tree walk computed, so neither a leak nor the dangerous
 direction.
 
-**What it does NOT establish, and this is the important half: the journal was never called upon.**
-There is no `journal recovered N block(s)` line in any of the three, which means no cut landed inside
-the window between a commit record becoming durable and the last home block being written. That is
-not surprising - QEMU measures that window at 35 of 75 tear points, and each of those is a fraction
-of a millisecond of wall time. A hand-timed cut will nearly always miss it.
+**What those three did NOT establish: the journal was never called upon.** There is no
+`journal recovered N block(s)` line in any of them, which means no cut landed inside the window
+between a commit record becoming durable and the last home block being written. That is not
+surprising - QEMU measures that window at 35 of 75 tear points, and each is a fraction of a
+millisecond of wall time. A hand-timed cut will nearly always miss it.
 
-So three clean cuts prove the filesystem survives an interruption on real silicon. They do not prove
-the recovery path works on real silicon, because it never ran. Closing that needs either far more
-cuts, or a build that deliberately widens the window - see the note at the end of this file.
+So three clean cuts proved the filesystem survives an interruption on real silicon. They did not
+prove the recovery path WORKS on real silicon, because it never ran.
+
+### A FOURTH CUT LANDED IN THE WINDOW - 2026-09-18, and that closes it
+
+`churn` is the answer to "a hand-timed cut will nearly always miss it": thousands of transactions
+per run, so the operator only has to pull the plug somewhere.
+
+```
+16:37:20  gsh> churn 100
+16:37:23  churn: 4s elapsed, 125 writes      <- the log ends here: power cut, mid-write
+16:38:08  fs: journal recovered 4 block(s) from an interrupted write
+16:38:08  fs: mounted GSFS0008 (62533296 blocks, bitmap 1..15332, root@15342, 62517885 free)
+16:38:52  churn verify: 6 file(s) checked, 0 empty, NONE torn - every file holds one generation
+19:13:25  check: 51 files, 3 dirs, 0 bad; 15411 blocks used, 62517885 free
+19:13:25  check: the free count already agreed with the tree - nothing was repaired
+```
+
+Four blocks were durable in the journal and not yet checkpointed home. The next mount replayed
+them. Content verification found no file holding a mix of two writes, and the structural check
+found nothing to repair - with the free count identical to the one the recovery mount had
+computed hours earlier.
+
+**"Nothing was repaired" is the strong form and is worth separating from "repaired successfully".**
+The permitted-outcome table allows an interrupted `delete` to leave blocks marked used - a leak -
+which `drives check` would have silently reclaimed, and that would still have counted as a pass.
+It did not happen.
+
+**Scope, unchanged:** one board, and a backend that ATTESTS durability. This is a SATA SSD behind
+AHCI, which honours the flush at the journal barriers. `CLAUDE.md` §6.1's backend-conditional
+caveat stands untouched - the Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, so none of
+this transfers to it.
 
 `docs/gsfs-next.md` says a hardware pass "confirms at the end", and for most of this branch that is
 exactly right. **Two items on this list are different: they cannot be answered in QEMU at all**, and

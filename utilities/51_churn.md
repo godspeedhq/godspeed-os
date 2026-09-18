@@ -5,9 +5,61 @@ mid-churn, and checks the volume comes back consistent.
 
     churn <seconds>     write, rename and delete continuously, then stop and report
     churn verify        after a cut: is any file a MIX of two writes?
+    churn tear          deliberately make one file a mix, to prove `verify` can say so
     churn reset         remove /churn and its files
 
 Press `q` to quit a run early.
+
+## `churn tear` - proving the detector can fire
+
+`churn verify` has reported `NONE torn` on every hardware run there has ever been. That is the right
+answer, and it says nothing at all about whether the detector *could* say otherwise. **A check never
+observed failing is not evidence.**
+
+Every other corruption test in this project - `fs-corrupt`, `fs-scrub`, `fs-hostile` - damages the
+disk **host-side, before boot**, which is not available on a machine whose disk you cannot take out.
+`churn tear` is the same proof reachable from the shell:
+
+```
+gsh> churn tear
+churn tear: /churn/f0.bin now holds generation 12 from byte 0 and generation 49 from byte 508 - a MIX
+churn tear: the blocks are well-formed and their CRCs are correct, so `drives check`
+churn tear: and `drives scrub` will BOTH still report clean. Only `churn verify` sees it.
+churn tear: nothing repairs this - detection is the guarantee. `churn reset` removes it.
+```
+
+### Why it is called `tear` and not `corrupt`
+
+Because it is not corruption, and the difference is the entire point. It writes a **well-formed
+block of a different generation**: every CRC is correct, the tree is correct, the accounting is
+correct. `drives scrub` reports `0 bad` afterwards, truthfully. What the file has is a **tear** - a
+mix of two writes - which is the word this whole programme already uses (`fs-tear`, "torn write",
+and `verify`'s own `TORN`). Calling it corruption would name it after a thing it deliberately is not.
+
+### Nothing repairs it, and `drives check` least of all
+
+The obvious next sentence to write would be "run `drives check` to fix it". That would be wrong
+twice over: `drives check` **cannot** fix it, and it cannot even **see** it. It validates structure -
+tree, bitmap, free count - and the structure is immaculate.
+
+That is not a limitation, it is the design. `gsfs-carnage.md` §6 puts repair explicitly out of
+scope: *detection is the guarantee; silent repair of data whose correct value is unknown is the
+second half of the mission statement.* The accounting **can** be rebuilt because the free bitmap is
+a derived view of one irreducible source, the tree (`CLAUDE.md` §26.4). File content has no second
+source, so there is nothing to rebuild it from. A filesystem that "fixed" this would be inventing
+bytes and calling them yours.
+
+`churn reset` removes the torn file when you are finished looking at it.
+
+### It does not ask [y/N], deliberately
+
+`seal` asks because there is no unseal; `drives flash` asks because it erases a disk. `churn tear`
+can only ever write to `/churn/fN.bin` - files `churn` itself created, in a directory `churn reset`
+exists to delete. It cannot reach anything else, so a confirm would be ceremony rather than a guard.
+
+Pinned by `osdev test fs-tear-detect`, which asserts the interesting half: `churn verify` says TORN
+**while `drives check` and `drives scrub` both still say clean**. That is the demonstration that the
+two questions below are genuinely different, rather than the assertion of it.
 
 ## The two questions after a power cut, and why both are needed
 

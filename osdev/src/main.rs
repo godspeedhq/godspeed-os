@@ -1453,6 +1453,7 @@ fn cmd_test(suite: &str) {
         "fs-full"      => run_fs_full_test(),
         "fs-window"    => run_fs_window_test(),
         "fs-churn"     => run_fs_churn_test(),
+        "fs-tear-detect" => run_fs_tear_detect_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
         // because `osdev test` takes exactly one argument and widening that for one suite would be
         // the wrong trade.
@@ -2823,6 +2824,9 @@ fn run_fs_all_tests() {
         // GSFS, so a wrong BELIEF passes all of them. A fixed seed, so a green result means the same
         // thing every run - explore with `fs-model:<seed>:<ops>`.
         "fs-model",
+        // Proves the CONTENT detector can fire at all, and that it sees something the structural
+        // checks truthfully do not. One boot.
+        "fs-tear-detect",
         "fs-tear",
         "fs-full",
         // The two power-cut suites. `fs-window` aims at ONE known window and proves recovery runs;
@@ -3070,6 +3074,23 @@ fn run_fs_model_test(suite: &str) {
     let ops = extra.get(1).and_then(|a| a.parse::<usize>().ok()).unwrap_or(120);
 
     crate::shell_test::run_fs_model(&image_path, persist, 4, seed, ops);
+}
+
+/// `osdev test fs-tear-detect` - prove the CONTENT detector fires (carnage 3.9 / 5).
+fn run_fs_tear_detect_test() {
+    println!("
+=== fs: TEAR then DETECT - a file whose blocks are perfect and whose content lies ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_tear_detect.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_tear_detect(&image_path, persist, 4);
 }
 
 fn run_fs_churn_test() {
