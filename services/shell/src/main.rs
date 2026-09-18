@@ -833,6 +833,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
+    ("churn",    &["verify", "reset"]),
     ("dir",      &["bytes"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
@@ -1707,7 +1708,9 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
         }
         "churn"   => {
-            if argc < 2 { ctx.console_writeln("usage: churn <seconds>   e.g. churn 30"); Err(ShellError::Unknown) }
+            if argc < 2 { ctx.console_writeln("usage: churn <seconds> | churn verify | churn reset"); Err(ShellError::Unknown) }
+            else if args[1] == "verify" { cmd_churn_verify(ctx, out) }
+            else if args[1] == "reset"  { cmd_churn_reset(ctx, out) }
             else { cmd_churn(ctx, args[1], out) }
         }
         "seal"    => {
@@ -4603,7 +4606,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "churn" => help_block(ctx, "churn", "hammer the filesystem for N seconds so a power cut lands somewhere", &[
             ("churn <seconds>", "write/rename/delete continuously, then stop", "churn 30"),
-            ("churn <seconds>", "q stops it early; `drives check` afterwards is the verdict", "churn 120"),
+            ("churn verify", "after a cut: is any file a MIX of two writes? (content, not structure)", "churn verify"),
+            ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
+            ("churn <seconds>", "q stops it early; run BOTH `churn verify` and `drives check` after", "churn 120"),
         ], true),
         "seal" => help_block(ctx, "seal", "freeze a file's content, permanently - there is NO unseal", &[
             ("seal <path>", "freeze <path>'s bytes after asking [y/N]", "seal /audit.log"),
@@ -12371,9 +12376,24 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
 
         let slot = (i % SLOTS as u64) as usize;
         let n = SIZES[(i as usize / SLOTS) % SIZES.len()];
-        // A recognisable, varying payload: if a torn write ever surfaces, the bytes say which
-        // iteration wrote them rather than being an anonymous block of one repeated character.
-        for k in 0..n { buf[k] = b'0' + ((i as u8).wrapping_add(k as u8) % 10); }
+        // SELF-DESCRIBING CONTENT, so a torn file can be DETECTED rather than merely suspected.
+        //
+        // Every byte encodes the generation that wrote it: `byte[k] = (gen + k) mod 251`. A file
+        // written wholly in one generation therefore satisfies that relation for every k, and a file
+        // holding a MIX of two generations breaks it at exactly the byte where the tear happened.
+        // `churn verify` reads byte 0 to learn the generation and then checks the rest.
+        //
+        // This is the half that was missing. `drives check` validates STRUCTURE - the tree, the
+        // bitmap, the CRCs - and nothing validated CONTENT, so a file left holding the first half of
+        // one write and the second half of another would have passed every check this project has.
+        // The permitted-outcome table says a whole-file `write` must be old-complete or new-complete
+        // and never a mix; until now nothing on hardware could tell.
+        //
+        // 251 is the largest prime under 256: a prime stride means the pattern does not align with
+        // the 508-byte block payload, so a tear on a block boundary still lands mid-pattern and is
+        // visible rather than looking like a continuation.
+        let gen = (i % 251) as u8;
+        for k in 0..n { buf[k] = gen.wrapping_add((k % 251) as u8) % 251; }
         let mut pl = 0usize;
         for &b in DIR { path[pl] = b; pl += 1; }
         path[pl] = b'/'; pl += 1;
@@ -12395,7 +12415,16 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
             let mut np = [0u8; 32];
             np[..pl].copy_from_slice(&path[..pl]);
             np[pl - 4..pl].copy_from_slice(b".ren");
-            if matches!(fs_request(ctx, OP_RENAME, &path[..pl], &np[pl - 9..pl]).as_ref()
+            // OP_RENAME takes the NEW NAME, not a new path - so the slice must start after the
+            // final `/`. It was `pl - 9`, which began mid-directory ("rn/f0.ren"): a name containing
+            // a slash, refused by `valid_name` every time. Churn was reporting "0 renames, 0 deletes"
+            // out of 119 writes and exercising ONE transaction shape while claiming three.
+            //
+            // Caught because the report prints the counts. A load generator that says only "119
+            // writes" would have hidden this indefinitely, which is the argument for a tool
+            // reporting what it DID rather than that it ran.
+            let name_at = DIR.len() + 1;
+            if matches!(fs_request(ctx, OP_RENAME, &path[..pl], &np[name_at..pl]).as_ref()
                           .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
                 renames += 1;
                 if matches!(fs_request(ctx, OP_DELETE, &np[..pl], &[]).as_ref()
@@ -12410,8 +12439,113 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     out.line_fmt(ctx, format_args!(
         "churn: done - {} writes, {} renames, {} deletes, {} bytes, {} refused",
         writes, renames, deletes, bytes, failures));
-    out.line(ctx, "churn: run `drives check` after a cut - a LEAK is permitted, `marked free but are IN USE` is not");
+    out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
+    out.line(ctx, "churn: /churn is left in place (it is the evidence); `churn reset` removes it");
     Ok(())
+}
+
+/// `churn reset` - remove `/churn` and everything in it.
+///
+/// **Explicit, never automatic.** `churn` leaves its files behind on purpose: after a power cut they
+/// ARE the evidence, and `churn verify` reads them. A run that finishes without a cut leaves them too
+/// - deleting data because a command happened to reach its end is the kind of helpfulness this
+/// project avoids, and the operator who wandered off mid-run would come back to find the thing they
+/// meant to examine gone.
+///
+/// The set is bounded at eight files anyway, rewritten in place, so nothing accumulates however many
+/// times it runs. This is for when you want the directory gone, not for hygiene it does not need.
+fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    match fs_request(ctx, OP_DELETE_TREE, b"/churn", &[]).as_ref()
+             .map(|r| r.payload_bytes().first().copied()) {
+        Some(Some(FS_OK))       => { out.line(ctx, "churn: /churn removed"); Ok(()) }
+        Some(Some(FS_NOTFOUND)) => { out.line(ctx, "churn: nothing to remove - /churn does not exist"); Ok(()) }
+        other => {
+            match other.flatten() {
+                Some(_) => out.line(ctx, "churn: could not remove /churn - see fs's log"),
+                None    => out.line(ctx, "churn: storage unavailable"),
+            }
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `churn verify` - is any file in `/churn` a MIX of two generations?
+///
+/// The companion to the load. `drives check` answers "is the structure sound" - the tree, the
+/// bitmap, the CRCs - and until this existed NOTHING answered "is any file's content a torn mix".
+/// A file holding the first half of one write and the second half of another has perfectly valid
+/// block CRCs (each block was written whole), sits in a perfectly valid directory, and occupies
+/// perfectly accounted blocks. Every check this project had would pass it.
+///
+/// `churn` writes `byte[k] = (gen + k) mod 251`, so one read is enough: take the generation from
+/// byte 0 and every later byte is predicted. The first byte that disagrees is the tear point, and
+/// its offset says which block boundary it fell on.
+fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    const DIR: &[u8] = b"/churn";
+    let reply = match fs_request(ctx, OP_LIST_DIR, DIR, &[]) {
+        Some(r) => r,
+        None => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
+    };
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 3 {
+        ctx.console_writeln("churn verify: no /churn directory - nothing to check");
+        return Ok(());
+    }
+    let count = p[1] as usize;
+    let truncated = p.get(2).copied().unwrap_or(0) != 0;
+    let mut checked = 0u32;
+    let mut torn = 0u32;
+    let mut empty = 0u32;
+    let mut i = 3usize;
+    let mut data = [0u8; 4096];
+
+    for _ in 0..count {
+        if i >= p.len() { break; }
+        let nl = p[i] as usize;
+        i += 1;
+        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+        let is_dir = p[i + nl] != 0;
+        let mut path = [0u8; 64];
+        let mut pl = 0usize;
+        for &b in DIR { path[pl] = b; pl += 1; }
+        path[pl] = b'/'; pl += 1;
+        let take = nl.min(path.len() - pl);
+        path[pl..pl + take].copy_from_slice(&p[i..i + take]);
+        pl += take;
+        i += nl + 1 + 8 + 4 + 1;
+        if is_dir { continue; }
+
+        let n = match fs_read_file(ctx, &path[..pl], &mut data, 20) { Some(n) => n, None => continue };
+        checked += 1;
+        if n == 0 { empty += 1; continue; }
+        // The generation is byte 0 by construction; every later byte is then predicted.
+        let gen = data[0];
+        let mut bad_at: Option<usize> = None;
+        for k in 0..n {
+            if data[k] != gen.wrapping_add((k % 251) as u8) % 251 { bad_at = Some(k); break; }
+        }
+        if let Some(k) = bad_at {
+            torn += 1;
+            out.line_fmt(ctx, format_args!(
+                "churn verify: TORN - {} diverges at byte {} of {} (block {}, offset {} within it)",
+                str_of(&path[..pl]), k, n, k / 508, k % 508));
+        }
+    }
+
+    if truncated {
+        out.line(ctx, "churn verify: NOTE - the listing was truncated, so some files were not checked (backlog/33)");
+    }
+    if torn == 0 {
+        out.line_fmt(ctx, format_args!(
+            "churn verify: {} file(s) checked, {} empty, NONE torn - every file holds one generation end to end",
+            checked, empty));
+        Ok(())
+    } else {
+        out.line_fmt(ctx, format_args!(
+            "churn verify: {} of {} file(s) are TORN - each holds a mix of two writes. This is a DATA integrity failure, not a space-accounting one: report it with the serial log.",
+            torn, checked));
+        Err(ShellError::Unknown)
+    }
 }
 
 /// `seal <path>` - freeze a file's content, permanently.
@@ -14721,14 +14855,17 @@ fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
                     let before = u64a(29);
                     if before == free {
                         ctx.console_writeln("check: the free count already agreed with the tree - nothing was repaired");
-                    } else if before > free {
-                        ctx.console_writeln_fmt(format_args!(
-                            "check: REPAIRED - the superblock claimed {} free, the tree says {}; {} block(s) were marked free but are IN USE",
-                            before, free, before - free));
                     } else {
+                        // THE COUNT, and only the count. `check` rebuilds the bitmap from the tree
+                        // unconditionally, so this says nothing about whether the bitmap was wrong -
+                        // and the two matter very differently. The allocator chooses blocks from the
+                        // BITMAP and never reads this number, so a count too high overstates free
+                        // space until the next check and costs nothing else.
+                        let (word, by) = if before > free { ("too much", before - free) }
+                                         else            { ("too little", free - before) };
                         ctx.console_writeln_fmt(format_args!(
-                            "check: REPAIRED - the superblock claimed {} free, the tree says {}; {} block(s) were held as used but are unreachable (a LEAK)",
-                            before, free, free - before));
+                            "check: REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted {} free space, off by {}). The bitmap was rebuilt from the tree regardless.",
+                            before, free, word, by));
                     }
                 }
                 if bad > 0 {

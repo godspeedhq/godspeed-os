@@ -1399,6 +1399,7 @@ fn cmd_test(suite: &str) {
         "fs-full"      => run_fs_full_test(),
         "fs-window"    => run_fs_window_test(),
         "fs-churn"     => run_fs_churn_test(),
+        "fs-nested"    => run_fs_nested_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -2950,6 +2951,33 @@ fn run_fs_time_test() {
     gsfs_add_file(persist, "canary.txt", b"a file that predates timestamps");
 
     crate::shell_test::run_fs_time(&image_path, persist, 4);
+}
+
+fn run_fs_nested_test() {
+    println!("\n=== fs: INTERRUPT THE RECOVERY ITSELF - is it restartable? (carnage 3.8) ===");
+    // TWO images, because the two pauses must never fire in one boot. The `crash-window` build holds
+    // the COMMIT window open (boots 1 and 3); the `crash-window-replay` build holds a REPLAY open
+    // (boot 2). A single build carrying both would pause twice and the test could not tell which
+    // window it had cut.
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    let limine_dir = std::path::Path::new("tools/limine");
+    let _ = std::fs::create_dir_all("build/tests");
+
+    build_blockdev_fs("selftest,crash-window", "");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let window_img = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-cw.img"));
+    disk_image::install_bootloader(limine_dir, &window_img);
+
+    build_blockdev_fs("selftest,crash-window-replay", "");
+    let replay_img = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-cwr.img"));
+    disk_image::install_bootloader(limine_dir, &replay_img);
+
+    let persist = "build/tests/persist_fs_nested.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
+
+    crate::shell_test::run_fs_nested(&window_img, &replay_img, persist, 4);
 }
 
 fn run_fs_churn_test() {

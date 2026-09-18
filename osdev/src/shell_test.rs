@@ -4281,8 +4281,15 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
             // evidence (26.7). The assertion is also what proves the new reporting FIRES rather
             // than merely compiling.
             check!(r.contains("REPAIRED"), "fsck reports that a repair was NEEDED, not just its result");
-            check!(r.contains("marked free but are IN USE"),
-                   "fsck names the DIRECTION of the disagreement (free-but-used, not a leak)");
+            check!(r.contains("counted too much free space"),
+                   "fsck names the DIRECTION of the count disagreement");
+            // AND SAYS IT IS ONLY THE COUNT. The old message read "marked free but are IN USE",
+            // which describes a BITMAP fault - the kind that destroys data - while this check only
+            // ever compared two scalars. A message naming a worse fault than it measured sends its
+            // reader to the wrong place; this asserts the scope is stated.
+            check!(r.contains("bitmap was rebuilt from the tree regardless")
+                   || r.contains("The bitmap was rebuilt"),
+                   "and says the claim is about the COUNT, not the bitmap");
         }
         None => { println!("fs-check: FAIL - drives check timeout"); fail += 1; }
     }
@@ -5780,6 +5787,145 @@ fn apply_writes_prefix(base: &[u8], writes: &[TappedWrite], k: u64, out_path: &s
 /// either consistent or drifted in the SAFE direction (a leak). `marked free but are IN USE` is the
 /// one that must never appear, because those blocks belong to a live file and the next allocation
 /// would overwrite them.
+/// INTERRUPT THE RECOVERY ITSELF - the one crash state nothing had ever reached.
+///
+/// `recover` makes three claims in its own comments, and until this suite existed all three were
+/// arguments rather than results: it is RESTARTABLE, repeating it does not PROGRESSIVELY WORSEN the
+/// damage, and it never clears a half-applied commit. Everything else in this project crashes a
+/// machine doing ordinary work; this crashes one in the middle of cleaning up after the last crash.
+///
+/// Three boots, because two is not enough to show the property:
+///
+///   1. Write through `/cutme`, so `fs` holds the commit window open, and kill inside it.
+///      The disk now carries a durable commit record and NO home block applied.
+///   2. Boot that disk. Recovery starts, applies the FIRST home block, and pauses. Kill it there.
+///      The journal is still intact - it is invalidated only once every block is home - so the disk
+///      is now half-recovered, which is a state no other test produces.
+///   3. Boot again. Recovery must run AGAIN and finish, and the file must be correct.
+///
+/// Step 3 is what makes step 2 meaningful. A recovery that ran once and left the disk unusable would
+/// pass a two-boot test that only checked "it mounted".
+pub fn run_fs_nested(image_path: &Path, replay_image: &Path, persist_path: &str, smp: u32) {
+    let qemu       = crate::qemu::qemu_binary();
+    let window_img = image_path.to_string_lossy().replace('\\', "/");
+    let replay_img = replay_image.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-nested: PASS - {}", $label); pass += 1; } else { println!("fs-nested: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |image: &str, cmds: &[&str], kill_on: Option<&str>| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        // A REPLAY WINDOW OPENS BEFORE THE PROMPT, because recovery runs at mount. So watch for the
+        // marker FIRST and only wait for a prompt if no marker was asked for - waiting for `gsh>`
+        // first would sail straight past the window this test exists to catch.
+        // TWO SHAPES OF WINDOW, and conflating them cost a whole run. A COMMIT window is opened BY A
+        // COMMAND, so that boot must reach a prompt and type first. A REPLAY window opens during
+        // MOUNT, before any prompt exists, so waiting for `gsh>` there sails straight past the thing
+        // the test is trying to catch. `cmds` being empty is what distinguishes them.
+        match (kill_on, cmds.is_empty()) {
+            // Replay window: nothing to type - the marker arrives on its own during mount.
+            (Some(marker), true) => {
+                if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(60)).is_some() {
+                    child.kill().ok();
+                }
+            }
+            // Commit window: reach a prompt, issue the write, THEN watch for the marker it opens.
+            (Some(marker), false) => {
+                if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_some() {
+                    for c in cmds {
+                        send(&mut write_half, format!("{c}\r").as_bytes());
+                    }
+                    if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(60)).is_some() {
+                        child.kill().ok();
+                    }
+                }
+            }
+            (None, _) => {
+                if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_some() {
+                    for c in cmds {
+                        send(&mut write_half, format!("{c}\r").as_bytes());
+                        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+                    }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-nested: boot 1 - commit, then cut inside the commit window");
+    let w1 = boot(&window_img, &["write /cutme.txt interrupted-twice"],
+                  Some("THE JOURNAL IS COMMITTED AND UNAPPLIED"));
+    check!(w1.contains("THE JOURNAL IS COMMITTED AND UNAPPLIED"), "the commit window opened");
+    check!(!w1.contains("window closed"), "cut INSIDE it - no home block was applied");
+
+    println!("fs-nested: boot 2 - recovery starts, and is cut HALF WAY THROUGH");
+    let w2 = boot(&replay_img, &[], Some("A REPLAY IS HALF APPLIED"));
+    check!(w2.contains("journal recovered") || w2.contains("A REPLAY IS HALF APPLIED"),
+           "recovery STARTED on the second boot");
+    check!(w2.contains("A REPLAY IS HALF APPLIED"), "and it was interrupted part-way through");
+    check!(!w2.contains("replay-window] window closed"),
+           "the machine was cut before the replay finished (the disk is HALF recovered)");
+
+    println!("fs-nested: boot 3 - recovery must run AGAIN and finish");
+    let w3 = boot(&window_img, &["read /cutme.txt", "read /canary.txt", "drives check"], None);
+    // THE CLAIM UNDER TEST. `recover` invalidates the journal only once every block is home, so an
+    // interrupted replay must leave the record intact and the next mount must redo it. If this fails,
+    // an interrupted recovery is unrecoverable - strictly worse than the crash it was recovering from.
+    check!(w3.contains("journal recovered"),
+           "the interrupted replay was REDONE on the next boot (recovery is restartable)");
+    check!(w3.contains("mounted GSFS0008"), "and the volume mounted");
+    check!(w3.contains("interrupted-twice"),
+           "the twice-interrupted write is PRESENT and correct");
+    check!(w3.contains("untouched-by-any-of-this"), "an unrelated file is intact");
+    check!(w3.contains("0 bad"), "no corrupt blocks - repeating the replay did not worsen the damage");
+    check!(!w3.contains("DANGEROUS DIRECTION"),
+           "the BITMAP did not drift in the dangerous direction across three interrupted boots");
+    // The COUNT is a separate, milder question and is allowed to drift - `alloc_run` scans the
+    // bitmap and never reads it, so a stale count costs reporting accuracy until the next check.
+    // Recorded rather than asserted, because a replay currently DOES leave it one high.
+    if w3.contains("REPAIRED the FREE COUNT") {
+        println!("fs-nested: (the free count drifted after replay - known, count-only, see the note)");
+    }
+    check!(!w3.contains("KERNEL PANIC"), "no kernel panic across any of the three boots");
+
+    let _ = std::fs::write("build/tests/fs_nested_serial.log",
+                           format!("{w1}\n==== BOOT 2 ====\n{w2}\n==== BOOT 3 ====\n{w3}"));
+    println!("\nfs-nested: {pass} passed, {fail} failed  (serial -> build/tests/fs_nested_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -5849,15 +5995,24 @@ pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!w1.contains("churn: done"), "the machine was cut mid-churn (churn never finished)");
 
     println!("fs-churn: boot 2 - the volume must come back inside the permitted set");
-    let w2 = boot(&["read /canary.txt", "drives check"], None, 200);
+    // BOTH questions, because they are different ones. `drives check` validates STRUCTURE - the tree,
+    // the bitmap, the CRCs. `churn verify` validates CONTENT: a file holding the first half of one
+    // write and the second half of another has valid block CRCs, sits in a valid directory and
+    // occupies correctly accounted blocks, so every structural check passes it.
+    let w2 = boot(&["read /canary.txt", "churn verify", "drives check"], None, 200);
     check!(w2.contains("mounted GSFS0008") || w2.contains("storage recovered"), "the volume MOUNTS after the cut");
     check!(w2.contains("untouched-by-any-of-this"), "a file written before the churn is intact");
     check!(w2.contains("0 bad"), "no corrupt blocks - nothing was torn at the sector level");
     // THE ONE THAT MATTERS. A leak is permitted (26.4: the free count is a derived view, reconciled
     // from the tree). Blocks marked FREE while a live file still references them are not: the next
     // allocation hands them out and a write destroys data something still points at.
-    check!(!w2.contains("marked free but are IN USE"),
-           "the accounting did not drift in the DANGEROUS direction (free-but-in-use)");
+    // THE REAL DETECTOR, which did not exist when this was first written. `fs` now compares the old
+    // bitmap's set bits against the rebuilt one and names the direction, so this asserts on the fault
+    // itself rather than on a count that only implied it.
+    check!(!w2.contains("DANGEROUS DIRECTION"),
+           "the BITMAP did not drift in the dangerous direction (no live block was marked free)");
+    check!(w2.contains("NONE torn"),
+           "no file holds a MIX of two writes (content, not just structure)");
     check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
     if w2.contains("journal recovered") {
         println!("fs-churn: (this cut landed IN the commit window - the journal replayed)");

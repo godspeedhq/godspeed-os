@@ -3,9 +3,39 @@
 **Status:** Built. Verified in QEMU by `osdev test fs-churn`, which runs it, kills the machine
 mid-churn, and checks the volume comes back consistent.
 
-    churn <seconds>
+    churn <seconds>     write, rename and delete continuously, then stop and report
+    churn verify        after a cut: is any file a MIX of two writes?
+    churn reset         remove /churn and its files
 
-Write, rename and delete continuously for `<seconds>`, then stop and report. Press `q` to stop early.
+Press `q` to stop a run early.
+
+## The two questions after a power cut, and why both are needed
+
+`drives check` validates **structure** - the tree, the bitmap, the CRCs.
+`churn verify` validates **content**.
+
+They are not the same question, and the second had no answer until now. A file holding the first half
+of one write and the second half of another has perfectly valid block CRCs (each block was written
+whole), sits in a perfectly valid directory, and occupies correctly accounted blocks. Every check this
+project had would pass it.
+
+**How verify knows.** Every byte churn writes encodes the generation that wrote it:
+`byte[k] = (gen + k) mod 251`. So one read decides it - take the generation from byte 0, and every
+later byte is predicted. The first disagreement is the tear point:
+
+```
+gsh> churn verify
+churn verify: TORN - /churn/f7.bin diverges at byte 1216 of 3000 (block 2, offset 200 within it)
+churn verify: 1 of 8 file(s) are TORN - each holds a mix of two writes.
+```
+
+251 is the largest prime under 256, chosen so the pattern does not align with the 508-byte block
+payload. A tear on a block boundary therefore still lands mid-pattern and stays visible, rather than
+looking like a continuation.
+
+**It has been seen to fire.** A file was corrupted mid-way host-side and the block CRC re-stamped, so
+the damage was structurally invisible. `drives check` reported `0 bad, consistent` on that disk;
+verify named the exact byte. A detector nobody has watched fail is not evidence.
 
 ## Why it exists
 
@@ -80,8 +110,26 @@ journal barriers, so a bigger number is not a better disk.
 **Not a soak test for the rest of the system.** It hammers storage and nothing else. `chaos` is the
 utility for killing services; this one never kills anything.
 
-**It leaves `/churn` behind after a cut**, deliberately. Those files are the evidence, and `drives
-check` walks them. Delete the directory when you are done with it.
+**It leaves `/churn` behind, deliberately - after a cut AND after a clean finish.** `churn reset`
+removes it when you want it gone.
+
+Not automatic, and the reasoning is worth stating because the opposite looks tidier. Those files are
+the evidence: after a cut they are what `churn verify` reads. A run that ends normally is
+indistinguishable from one somebody walked away from, so auto-deleting would mean coming back to find
+the thing you meant to examine gone. And the set is bounded at eight files rewritten in place, so
+nothing accumulates however many times it runs - there is no hygiene problem to solve. Deleting data
+because a command reached its end is the kind of silent helpfulness this project avoids.
+
+## No size or path parameters
+
+Asked for, and declined for now (26.2 - a feature is pulled into existence, not anticipated).
+
+The four sizes are not arbitrary: 64, 500, 1200 and 3000 bytes span a sub-block write, a single block,
+a partial extent and a multi-block extent, because the allocator takes a different path for each. A
+size parameter would let a run NARROW that, which is the opposite of what carnage wants by default.
+
+A path parameter matters when multi-drive ships and not before. If a specific test needs either, it
+arrives then with a reason attached.
 
 ## Conventions
 

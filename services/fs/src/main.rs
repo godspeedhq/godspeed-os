@@ -2390,6 +2390,17 @@ impl Fs {
                         return;
                     }
                     if !block_write(ctx, lba, &blk) { replayed_ok = false; }
+                    // PAUSE PART-WAY THROUGH THE REPLAY (`crash-window-replay` build only).
+                    //
+                    // After the FIRST home block has landed and before the rest have: the journal is
+                    // still intact (it is invalidated only once every block is home), so a machine
+                    // killed here must recover again on the next boot and finish the job. That is the
+                    // "recovery is restartable" claim, and until this existed it was a comment.
+                    //
+                    // Deliberately after the first write rather than before any: pausing before the
+                    // loop does anything is just the `crash-window` case again, and would prove the
+                    // same thing twice.
+                    if i == 0 { Self::replay_window(ctx); }
                 }
                 None => replayed_ok = false,
             }
@@ -2407,7 +2418,23 @@ impl Fs {
         }
     }
 
-    /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
+    /// Hold a journal REPLAY open part-way through (`crash-window-replay` build only).
+///
+/// Unconditional in that build, because `recover` runs before a mount exists and so has no per-request
+/// state to arm from. That is acceptable for a test build and would not be for any other.
+#[cfg(feature = "crash-window-replay")]
+fn replay_window(ctx: &ServiceContext) {
+    ctx.log("fs: [replay-window] A REPLAY IS HALF APPLIED - CUT THE POWER NOW (8s). The journal is still intact, so the next boot must finish it.");
+    for left in (1..=8u64).rev() {
+        ctx.log_fmt(format_args!("fs: [replay-window] {}...", left));
+        ctx.sleep(ctx.duration_cycles(1000));
+    }
+    ctx.log("fs: [replay-window] window closed - finishing the replay normally.");
+}
+#[cfg(not(feature = "crash-window-replay"))]
+fn replay_window(_ctx: &ServiceContext) {}
+
+/// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     /// Format, constructing into `out` for the reason `mount_into` documents: `Fs` is 36 KiB and a
     /// by-value return costs a copy of it in every caller that stores the result.
@@ -3634,9 +3661,28 @@ impl Fs {
     /// The repair itself is unchanged and still happens. What is added is that the disagreement is
     /// REPORTED, loudly in the log and back to the caller.
     fn check(&mut self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64, u64), &'static str> {
-        // Start from an all-free bitmap (fast batched zero), then mark what is actually used.
-        // The bitmap region is [bitmap_start, journal_start).
+        // COUNT THE OLD BITMAP'S SET BITS BEFORE DESTROYING IT.
+        //
+        // Until this existed, the one filesystem fault that actually destroys data had NO DETECTOR.
+        // `check` zeroes the bitmap and rebuilds it from the tree, so a bit that was CLEAR for a
+        // block a live file uses - which is what makes the allocator hand that block out and a write
+        // overwrite the file - was gone before anything could notice it. The free-count comparison
+        // below cannot see it either: that compares two scalars, and `alloc_run` never reads the
+        // count. Proven by measuring an image offline after a journal replay: the count was off by
+        // one and the bitmap was bit-for-bit correct, which is a completely different severity from
+        // what the old message implied.
+        //
+        // One extra read pass over the bitmap region, once per `drives check`. On a 16 MiB volume
+        // that is 9 blocks; on a 30 GB disk it is 15,332, which roughly doubles the walk. That is a
+        // real cost, paid by an occasional operator-invoked command, to detect the failure whose
+        // signature is otherwise a file quietly becoming someone else's data.
         let bitmap_blocks = self.journal_start - self.bitmap_start;
+        let mut old_set: u64 = 0;
+        for b in 0..bitmap_blocks {
+            if let Some(blk) = block_read(ctx, self.bitmap_start + b) {
+                for byte in blk.iter() { old_set += byte.count_ones() as u64; }
+            }
+        }
         if !block_write_zeros(ctx, self.bitmap_start, bitmap_blocks) { return Err("bitmap zero failed"); }
         // System blocks [0, data_start): superblock + bitmap + journal. Plus the backup block.
         self.bm_set_range(ctx, 0, self.data_start, true)?;
@@ -3646,18 +3692,52 @@ impl Fs {
         self.check_subtree(ctx, root.itype, root.first_block, root.block_count, 0, &mut st)?;
         // Recompute the free count from what the tree actually uses, and persist BOTH superblock
         // copies (heals a drifted free count + refreshes the backup).
+        // What the rebuilt bitmap says, so the two can be compared. `st.3` is the block count the
+        // tree walk marked used, which is exactly the number of bits now set.
+        let new_set = st.3;
+        if old_set != new_set {
+            if old_set < new_set {
+                // THE ONE THAT DESTROYS DATA. Bits were clear for blocks the tree uses, so
+                // `alloc_run` - which chooses by scanning these bits - would have handed one out and
+                // the next write would have overwritten a live file.
+                ctx.log_fmt(format_args!(
+                    "fs: check - THE BITMAP WAS WRONG IN THE DANGEROUS DIRECTION: {} block(s) that the tree USES had their bit CLEAR, so the allocator could have handed them out and a write would have destroyed live data. Rebuilt from the tree. Anything written since the bitmap drifted should be verified.",
+                    new_set - old_set));
+            } else {
+                // Bits set for blocks nothing references: wasted space, reclaimed by this rebuild.
+                ctx.log_fmt(format_args!(
+                    "fs: check - the bitmap held {} block(s) as used that nothing references (a leak). Rebuilt from the tree; the space is back.",
+                    old_set - new_set));
+            }
+        }
         let stored_before = self.free_blocks;
         self.free_blocks = self.total_blocks - st.3;
         if stored_before != self.free_blocks {
             // SAY IT. The numbers disagreeing means the superblock's accounting did not match the
             // tree, and the tree is the truth - so the repair is right, and the fact that a repair
             // was NEEDED is a finding about this volume that the operator must not have to infer.
+            // SAY WHAT WAS MEASURED, WHICH IS THE COUNT - NOT THE BITMAP.
+            //
+            // This used to read "N block(s) were marked free but are in use", which describes a
+            // BITMAP fault: a live file's block available for reallocation, the one failure that
+            // destroys data. This check cannot see that. It compares two SCALARS - the count the
+            // superblock stored against the count the tree walk just produced - and the bitmap is
+            // zeroed and rebuilt before anything could compare its bits.
+            //
+            // The distinction is not pedantic: `alloc_run` chooses blocks by scanning the BITMAP and
+            // never reads this count, so a count that is too high costs accurate reporting and
+            // nothing else, while a stale bitmap bit costs a file. Measured offline on an image left
+            // by a journal replay: count drifted by one, bitmap bit-for-bit correct.
+            //
+            // A message that names the worse fault when it measured the milder one sends its reader
+            // to the wrong place, and cost exactly that here - a test assertion inherited the wording
+            // and reported a data-loss risk that the evidence did not support.
             ctx.log_fmt(format_args!(
-                "fs: check - free count DISAGREED with the tree: superblock said {} free, the tree says {} ({} block(s) {}). Repaired.",
+                "fs: check - the FREE COUNT disagreed with the tree: superblock said {} free, the tree says {} (off by {}, {}). The bitmap is rebuilt from the tree either way; this line is about the count only. Repaired.",
                 stored_before, self.free_blocks,
                 stored_before.abs_diff(self.free_blocks),
-                if stored_before > self.free_blocks { "were marked free but are in use" }
-                else { "were held as used but are unreachable - a leak" }));
+                if stored_before > self.free_blocks { "counted too much free space" }
+                else { "counted too little" }));
         }
         self.persist_super(ctx)?;
         Ok((st.0, st.1, st.2, st.3, stored_before))
