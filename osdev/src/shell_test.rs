@@ -453,6 +453,34 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(sb5.contains("returned to live"),
            "scrollback: End goes to the newest line and STAYS in the view - only Esc leaves");
 
+    // THE VIEW MUST SURVIVE BEING LEFT OPEN. `backlog/37`: on hardware, scrolling works repeatedly
+    // and then stops answering FOREVER, and every log shows the break beginning after the reader has
+    // sat in the view for a few seconds. The console is `BlockRecv, queue 0` throughout - idle,
+    // waiting, empty - so the request is not reaching it.
+    //
+    // This holds the view open with no keystrokes and then scrolls again. If the fault is time spent
+    // in the view, this reproduces it in QEMU where it can be iterated on in seconds instead of
+    // flash cycles.
+    // ASSERT ON THE FAULT'S SIGNATURE, not on the success message. The first version of this waited
+    // for `(requested)` after the sleep and reported a failure whose log showed `[5~` echoed as
+    // literal text - an escape-parse desync in the HARNESS (a bare `ESC` sent alone, then more bytes
+    // later), not the fault under test. A reproduction that cannot be told apart from a test bug is
+    // not a reproduction.
+    //
+    // The fault has an unambiguous fingerprint of its own: the shell prints `the console stopped
+    // answering` with the console's state. Waiting for its ABSENCE is immune to how the success path
+    // happens to be worded or timed.
+    send(&mut write_half, b"\x1b[5~");
+    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(8));
+    send(&mut write_half, b"\x1b[6~");   // PgDn: a scroll, so it must be answered
+    let soak = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6))
+        .unwrap_or_default();
+    check!(!soak.contains("stopped answering") && !soak.contains("did not answer"),
+           "scrollback: the view still answers after 8s open with no keystrokes (backlog/37)");
+    send(&mut write_half, b"\x1b");
+    let _ = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(6));
+
     // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR AGAIN - unconditionally, which is the
     // simplification the mode bought. They were briefly "scroll if the view happens to be scrolled",
     // and that could never have been extended to the arrows: Up/Down are command history and are

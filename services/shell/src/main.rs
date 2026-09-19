@@ -932,9 +932,30 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
             // puts the display right. If the console is gone entirely the message does not land
             // either, but then the screen is frozen regardless and nothing here could help.
             None => {
+                // ONE REACQUIRE-AND-RETRY, AND IT IS A MEASUREMENT AS MUCH AS A RECOVERY.
+                //
+                // `backlog/37`: on hardware the console reports `BlockRecv, queue 0` while every
+                // scroll times out - idle, waiting, and the message never even ENQUEUED on its
+                // endpoint. A send that the kernel accepts, does not error on, and never delivers is
+                // consistent with exactly one thing: it is going somewhere else. A handle that names
+                // an endpoint which exists, is alive, and nobody reads.
+                //
+                // So retry with a freshly resolved one. Whichever way it goes is informative:
+                //
+                //   it works  -> the handle was the fault, and this is also the recovery
+                //   it fails  -> the handle is fine and the fault is downstream of it
+                //
+                // Only on the failure path, so a keystroke still costs one deadline in the normal
+                // case and two only when something is already wrong.
+                let again = ctx.reacquire_by_name("console") && ctx.console_scroll(action).is_some();
+                if again {
+                    ctx.console_writeln(
+                        "scrollback: the console needed a fresh handle - reacquired, carry on");
+                    continue;
+                }
                 let (state, q) = console_state_note(ctx);
                 ctx.console_writeln_fmt(format_args!(
-                    "scrollback: the console stopped answering - left the view (console is {}, queue {})",
+                    "scrollback: the console stopped answering - left the view (console is {}, queue {}, reacquire did not help)",
                     state, q));
                 return;
             }

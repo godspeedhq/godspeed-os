@@ -76,6 +76,39 @@ fix - the reasoning that claimed it was has since been retracted. See the correc
 > the one this project keeps relearning: reason to a hypothesis, then MEASURE it, and do not let
 > the absence of evidence become evidence of absence.
 
+> **Measurement 2026-09-19, and it narrows this a lot.** The kernel-side diagnostic answered on the
+> first run:
+>
+> ```
+> scrollback: the console stopped answering - left the view (console is BlockRecv, queue 0)
+> ```
+>
+> **`BlockRecv, queue 0`.** The console is idle, waiting on `recv`, with an EMPTY queue - not busy,
+> not stuck, not slow. And `queue 0` is the strong part: the message was never even ENQUEUED on its
+> endpoint. There is no `cap::` line anywhere in the failure window either, so the kernel did not
+> reject the send.
+>
+> A send that the kernel accepts, does not error on, and never delivers, while the intended receiver
+> sits idle with an empty queue, is consistent with one thing: **it is going somewhere else** - a
+> handle naming an endpoint that exists, is alive, and nobody reads.
+>
+> **It does not reproduce in QEMU.** A soak that holds the view open for 8 seconds and then scrolls
+> passes here (`osdev test shell`), and is kept as a guard in case it ever starts failing. A first
+> attempt at that soak DID fail, and it was a harness bug - a bare `ESC` sent alone desyncing the
+> escape parser, visible as `[5~` echoed literally. A reproduction that cannot be told apart from a
+> test bug is not a reproduction, so it was rewritten to assert the fault's own signature instead.
+>
+> **Next measurement, which is also a partial recovery.** On a failed scroll the shell now
+> reacquires the console by name and retries once, then reports which happened:
+>
+> - `the console needed a fresh handle - reacquired, carry on` -> the handle WAS the fault, and this
+>   is the fix as well as the proof.
+> - `... reacquire did not help` -> the handle is fine and the fault is downstream of it, which
+>   would point at the kernel's routing or delivery rather than at either service.
+>
+> Only on the failure path, so a keystroke costs one deadline normally and two only when something
+> is already wrong.
+
 ## What happened
 
 Dell Wyse 5070, 2026-09-18, immediately after `selfcheck` finished (492 statements, `failed 0`):
