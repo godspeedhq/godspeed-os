@@ -2197,11 +2197,44 @@ pub fn run_fs_tear_detect(image_path: &Path, persist_path: &str, smp: u32) {
         let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
     }
 
-    // Enough churn to produce files past the tear point (the 1200- and 3000-byte sizes).
-    send(&mut write_half, b"churn 8\r");
-    let churn = collect_until(&buf, &mut cursor, b"churn: done", Duration::from_secs(40)).unwrap_or_default();
-    check!(churn.contains("writes"), "churn ran and wrote files");
-    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15));
+    // ESTABLISH THE PRECONDITION, DO NOT ASSUME IT.
+    //
+    // This was a single `churn 8` with a comment asserting eight seconds is "enough churn to produce
+    // files past the tear point". Under the load of `fs-all`'s 23 back-to-back suites it is not, and
+    // the run failed with
+    //     churn tear: no churn file is large enough - run `churn 10` first, then tear one
+    // taking three checks down with it. Nothing was wrong with the filesystem.
+    //
+    // The defect is a FIXED DURATION used to guarantee a COUNT - the inverse of the "a count is not
+    // a duration" lesson this repo already carries, and it makes the test's outcome a function of
+    // how busy the host is. So: churn, ASK whether the file the tear needs exists, and churn again
+    // if not. Bounded, and loud when it genuinely cannot get there.
+    let mut churned = String::new();
+    let mut big = false;
+    for round in 0..4 {
+        send(&mut write_half, b"churn 8\r");
+        churned = collect_until(&buf, &mut cursor, b"churn: done", Duration::from_secs(60)).unwrap_or_default();
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20));
+        // `churn tear` needs a file spanning more than one block (508 bytes of payload), so it tears
+        // ACROSS a block boundary - the whole point of the case. Ask the filesystem rather than the
+        // clock: a size column above 508 means such a file is there.
+        send(&mut write_half, b"dir /churn\r");
+        let listing = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+        // READ THE FORMAT `dir` ACTUALLY PRINTS. The first version parsed whitespace tokens as
+        // integers, and `dir` renders sizes with a unit - `1.1 KiB`, not `1126`. So `1.1` and `KiB`
+        // both failed to parse, the check said no multi-block file existed, and it said that while
+        // the tear it guards was succeeding two lines later. A precondition that disagrees with the
+        // thing it gates is worse than no precondition.
+        //
+        // Anything reported in KiB or above is necessarily past 508 bytes. A bare `N B` is parsed
+        // too, so a file just over the boundary still counts.
+        big = listing.contains("KiB") || listing.contains("MiB")
+            || listing.split_whitespace().collect::<Vec<_>>().windows(2).any(|w|
+                   w[1] == "B" && w[0].parse::<u64>().map(|n| n > 508).unwrap_or(false));
+        if big { if round > 0 { println!("fs-tear-detect: (needed {} churn rounds to reach a multi-block file)", round + 1); } break; }
+    }
+    check!(churned.contains("writes"), "churn ran and wrote files");
+    check!(big, "a churn file spans more than one block (the precondition `churn tear` needs)");
 
     // CLEAN FIRST. Without this the TORN result below proves nothing - it could have been torn
     // already, which is precisely the ambiguity a positive control removes.
