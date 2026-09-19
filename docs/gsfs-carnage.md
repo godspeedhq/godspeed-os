@@ -3,7 +3,8 @@
 **Status, as of 2026-09-18.** BUILT AND PASSING in QEMU: torn writes (`fs-tear` 18/0, four
 operations, 75 tear points, 35 exercising journal recovery), resource exhaustion (`fs-full` 14/0),
 power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
-(`fs-model`, §3.2). NOT RUN: the block layer (§3.7), concurrency and retry ordering (§3.5), the
+(`fs-model`, §3.2). PARTIAL: the block layer (§3.7 - the completion stream is attacked by
+`fs-blockchaos`; driver death mid-request and hot-unplug are not). NOT RUN: concurrency and retry ordering (§3.5), the
 remaining rows of §3.3, and cross-ISA (§3.11, not reachable in QEMU).
 
 **Mostly QEMU-validated.** The hardware results are recorded in §4 and §3.12. The one that matters
@@ -368,7 +369,7 @@ What is NOT covered is the reuse case the checklist names: open A, restart `fs`,
 its storage, then use A's old handle. The generation mechanism should make this impossible, and
 "should" is exactly the word this programme exists to remove.
 
-### 3.7 Attack the block layer - NOT RUN
+### 3.7 Attack the block layer - PARTIAL (`fs-blockchaos` 10/0)
 
 Kill and restart `block-driver` with requests outstanding; simulate hot-unplug, delayed return, I/O
 error and device disappearance mid-write; inject late, duplicate, missing and out-of-order
@@ -380,6 +381,43 @@ stack, where a correlation tag proved the fault and was then REVERTED because re
 is not the same as recovering from one. The fs/block channel has the same shape and the same tag
 design. A completion from an old driver instance acknowledging a newer request is not hypothetical
 here; it is the thing that already happened one layer over.
+
+**BUILT: the completion stream, which is the half `backlog/31` warned about.** `io-error-test` makes
+the DEVICE fail and `fs` answers that by retrying; `completion-chaos` corrupts the REPLY instead -
+one duplicate, one missing, one carrying somebody else's tag - injected into ordinary `churn` traffic
+after a measured 800-completion warm-up, so boot and mount are untouched.
+
+Every detection assertion is paired with a recovery one, because that is the distinction that got
+`backlog/31`'s tag reverted. A run where `fs` spots every bad completion and then cannot write a file
+has failed this gate. What the machine actually did:
+
+| injected | `fs` said | and then |
+|---|---|---|
+| DUPLICATE | `dropped 1 orphaned block reply(s) ... re-aligned` | the next write succeeded |
+| WRONG-TAG | `discarded a block reply for tag 211 while awaiting 210` | `churn verify` completed |
+| MISSING | `did not reply within 30 s - failing (NOT re-sent)` | the volume stayed mounted |
+
+**And it found something, which is what it was for.** A file came back holding a mix of two
+generations - `/churn/f2.bin diverges at byte 1 of 1200`. That is NOT corruption here, and the
+distinction is the useful part: it sat beside `churn: done - 26 writes ... 2 refused`. The write was
+refused and the caller was told. `fs-churn` requires `NONE torn` because a power cut returns no error
+at all, so a mixed file there is unexplained; this test deliberately makes writes FAIL, and a caller
+that ignores a reported failure and reads back a partial file is not a filesystem fault.
+
+So the property asserted here is the sharper one, and it is the one §3.7 is really about: **no
+completion fault may change data without somebody being told.** A tear accompanied by a refusal is a
+reported failure; a tear with no refusal anywhere would be silent corruption.
+
+**STILL NOT RUN, and named rather than implied:** killing `block-driver` *with requests outstanding*,
+hot-unplug, and device disappearance mid-write. Those need the driver to die or vanish mid-flight
+rather than to answer wrongly, which is a different injection point (the supervisor, or the emulated
+device) and a separate piece of work.
+
+Two calibration notes, because both first read as failures of the filesystem and were failures of the
+test: a MISSING completion costs the caller its full 30 s deadline **by design** (`block-driver`
+retries a busy device that long), so nine injections starved the verification phase of clock and
+`drives check` reported nothing - indistinguishable from corruption at a glance. And the warm-up is
+measured, not guessed: a boot consumes ~795 completions.
 
 ### 3.8a Power cuts, deliberately and at random - BUILT (`fs-window` 8/0, `fs-churn` 8/0)
 
@@ -561,7 +599,8 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Data/metadata exhaustion | PARTIAL (QEMU) | `osdev test fs-full` 14/0 - a refused allocation names its reason, damages no bystander and leaks nothing. Metadata-vs-data exhaustion not covered |
 | Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
-| Block-driver restart and hot-unplug | NOT RUN | 3.7. See `backlog/31` for the same failure shape one layer over |
+| Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |
+| Block-driver restart mid-request, and hot-unplug | NOT RUN | 3.7. Needs the driver to die mid-flight, not to answer wrongly - a different injection point |
 | Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |

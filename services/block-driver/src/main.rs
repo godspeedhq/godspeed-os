@@ -46,6 +46,102 @@ use godspeed_sdk::ServiceContext;
 pub struct Reply {
     pub cap: godspeed_sdk::CapHandle,
     pub tag: u8,
+    /// What to do to this completion (carnage §3.7). `Fault::None` on every shipping build.
+    ///
+    /// **Decided at CONSTRUCTION, carried here, applied at send** - and the shape is forced by
+    /// ownership. The injector's counters cannot be `static` (Commandment VI, no unowned global
+    /// mutable state in services - the build refuses it), so they live in a `Chaos` the main loop
+    /// owns. But `send` is called from sixteen places across three files and a reply is BUILT in
+    /// four, so threading `&mut Chaos` to the senders means touching all sixteen, including a
+    /// closure where it would collide with an existing borrow. Deciding once, at the four
+    /// construction sites, costs nothing and reaches every sender for free.
+    pub fault: Fault,
+}
+
+impl Reply {
+    /// A reply that will be answered faithfully - every path except the one injecting faults.
+    pub fn plain(cap: godspeed_sdk::CapHandle, tag: u8) -> Self {
+        Reply { cap, tag, fault: Fault::None }
+    }
+}
+
+/// What to do to one completion, for the `completion-chaos` build (carnage §3.7).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Fault {
+    /// Answer normally.
+    None,
+    /// Answer TWICE. The second is an orphan the caller never asked for.
+    Duplicate,
+    /// Do not answer at all. The caller's deadline must fire rather than hanging it.
+    Missing,
+    /// Answer with somebody else's tag - what an out-of-order or previous-instance completion
+    /// looks like from the caller's side, and the one shape a length check cannot catch.
+    WrongTag,
+}
+
+/// The injector's state, OWNED BY `service_main` - which is the point, not a detail.
+///
+/// The first version kept two `static` atomics and `commandments.py` refused the build:
+/// Commandment VI, no unowned global mutable state in services. It was right, and "it is only a
+/// test build" is not an exemption - the rule says an exemption must cite a constitutional
+/// amendment that accepts the violation, and none does. There is exactly one call site, so the
+/// counters are simply a local the main loop holds and passes down (Invariant 8).
+///
+/// Zero-sized on a shipping build, so the parameter costs nothing and the faults cannot exist.
+#[cfg(feature = "completion-chaos")]
+pub struct Chaos { seen: u32, hit: u32 }
+#[cfg(not(feature = "completion-chaos"))]
+pub struct Chaos;
+
+impl Chaos {
+    #[cfg(feature = "completion-chaos")]
+    pub fn new() -> Self { Chaos { seen: 0, hit: 0 } }
+    #[cfg(not(feature = "completion-chaos"))]
+    pub fn new() -> Self { Chaos }
+
+    /// Which fault, if any, this completion should suffer.
+    ///
+    /// **THIS ATTACKS THE PROTOCOL, NOT THE DEVICE, AND THAT IS THE GAP IT FILLS.** `io-error-test`
+    /// makes the disk fail, which `fs` already handles by retrying. Carnage §3.7 asks for the other
+    /// half - late, duplicate, missing and out-of-order COMPLETIONS - and names why: `backlog/31`
+    /// recorded exactly that one layer up, a service reading replies that belonged to earlier
+    /// requests. The fs/block channel has the same shape, carries the same correlation tag, and
+    /// gained a drain-before-request repair that nothing had ever exercised adversarially.
+    ///
+    /// **The bar is RECOVERY, not detection** - `backlog/31`'s tag was reverted precisely because
+    /// rejecting a stale reply is not the same as surviving one.
+    ///
+    /// One of each shape and no more: a MISSING completion costs the caller its full 30 s deadline
+    /// by design, so more injections buy no proof and starve the verification phase of clock. The
+    /// warm-up is MEASURED - a boot consumes ~795 completions - so boot and mount run untouched and
+    /// the first fault lands in ordinary filesystem work.
+    #[cfg(feature = "completion-chaos")]
+    pub fn fault(&mut self, ctx: &godspeed_sdk::ServiceContext) -> Fault {
+        const WARMUP: u32 = 800;
+        const STRIDE: u32 = 8;
+        const LIMIT:  u32 = 3;
+        let n = self.seen;
+        self.seen += 1;
+        if n < WARMUP || (n - WARMUP) % STRIDE != 0 { return Fault::None; }
+        let k = self.hit;
+        if k >= LIMIT { return Fault::None; }
+        self.hit += 1;
+        let f = match k % 3 {
+            0 => Fault::Duplicate,
+            1 => Fault::WrongTag,
+            _ => Fault::Missing,
+        };
+        ctx.log_fmt(format_args!(
+            "block-driver: [completion-chaos] injecting {} at completion {} (injection {} of {})",
+            match f { Fault::Duplicate => "DUPLICATE", Fault::WrongTag => "WRONG-TAG",
+                      Fault::Missing => "MISSING", Fault::None => "none" },
+            n, k + 1, LIMIT));
+        f
+    }
+
+    #[cfg(not(feature = "completion-chaos"))]
+    #[inline(always)]
+    pub fn fault(&mut self, _ctx: &godspeed_sdk::ServiceContext) -> Fault { Fault::None }
 }
 
 impl Reply {
@@ -78,7 +174,21 @@ impl Reply {
         // (`liveness=Dead` sits beside each one), which is ordinary. A full queue on a LIVE caller is
         // genuine backpressure and is the one worth chasing - so the line must not assert the second
         // when it is seeing the first, which the earlier wording did.
-        if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(&out[..1 + n])).is_err() {
+        let fault = self.fault;
+        if fault == Fault::Missing { return; }
+        if fault == Fault::WrongTag {
+            // Not a random byte: a tag the caller could plausibly be awaiting, which is what makes
+            // this the case a length check cannot separate. `+1` cannot collide with `self.tag`.
+            out[0] = self.tag.wrapping_add(1);
+            if out[0] == 0 { out[0] = 1; }
+        }
+        self.emit(ctx, &out[..1 + n]);
+        if fault == Fault::Duplicate { self.emit(ctx, &out[..1 + n]); }
+    }
+
+    /// One send, with the undelivered report. Split out so a fault can emit zero, one or two.
+    fn emit(&self, ctx: &godspeed_sdk::ServiceContext, msg: &[u8]) {
+        if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(msg)).is_err() {
             ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
         }
     }
@@ -245,7 +355,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         Some((t, rest)) => (*t, rest),
                         None => (0, &raw[..0]),
                     };
-                    let reply = Reply { cap: reply, tag };
+                    let reply = Reply::plain(reply, tag);
                     let mut out = [0u8; 9];
                     let n = if !p.is_empty() && p[0] == OP_CAPACITY {
                         // Capacity is [STATUS_OK, sectors u64 LE]; zero sectors is the truth here and

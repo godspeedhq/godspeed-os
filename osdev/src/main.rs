@@ -1454,6 +1454,7 @@ fn cmd_test(suite: &str) {
         "fs-window"    => run_fs_window_test(),
         "fs-churn"     => run_fs_churn_test(),
         "fs-tear-detect" => run_fs_tear_detect_test(),
+        "fs-blockchaos"  => run_fs_blockchaos_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
         // because `osdev test` takes exactly one argument and widening that for one suite would be
         // the wrong trade.
@@ -2834,6 +2835,10 @@ fn run_fs_all_tests() {
         // whatever the cut hit. A proof and a search - they answer different questions.
         "fs-window",
         "fs-churn",
+        // §3.7. The other two attack the DEVICE (a power cut, an I/O error); this one attacks the
+        // COMPLETION STREAM - duplicate, missing and out-of-order replies - which is the failure
+        // `backlog/31` recorded one layer up and which no suite reached until now.
+        "fs-blockchaos",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
@@ -3336,6 +3341,26 @@ fn run_fs_compat_test() {
 /// transient error (the boot self-test read still succeeds) - and that normal operation is
 /// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
 /// be injected.
+/// Carnage §3.7: corrupt the COMPLETION STREAM and require the filesystem to survive it.
+///
+/// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/31` warned about:
+/// duplicate, missing and out-of-order completions, injected into ordinary churn traffic. See
+/// `run_fs_blockchaos` for why every detection assertion is paired with a recovery one.
+fn run_fs_blockchaos_test() {
+    println!("\n=== fs: completion-stream chaos - duplicate / missing / out-of-order replies (§3.7) ===");
+    build_blockdev_fs("", "completion-chaos");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_blockchaos.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_blockchaos(&image_path, persist, 4);
+}
+
 fn run_fs_ioretry_test() {
     println!("\n=== fs: block I/O retry - transient failure retried + recovered (Phase H) ===");
     build_blockdev_fs("selftest", "io-error-test");

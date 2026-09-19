@@ -637,7 +637,7 @@ fn serve_no_disk(ctx: &ServiceContext) -> ! {
             Some((t, rest)) => (*t, rest),
             None => (0, &raw[..0]),
         };
-        let reply = crate::Reply { cap: reply, tag };
+        let reply = crate::Reply::plain(reply, tag);
         if !p.is_empty() && p[0] == OP_CAPACITY {
             // Capacity reply is [STATUS_OK, sectors:u64 LE]; sectors = 0 = "genuinely no disk".
             let mut out = [0u8; 9];
@@ -781,6 +781,11 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // state, owned here, not a module static (Invariant 9).
     let slow_threshold = ctx.duration_cycles(5);
     let mut slow_seen: u64 = 0;
+    // LOOP STATE, OWNED HERE, exactly as `slow_seen` above and for the same reason (Invariant 9).
+    // This is the loop that actually serves `fs`; the injector was first wired into the no-disk path
+    // in `main.rs` and fired zero times, which the gate caught by asserting the faults HAPPENED
+    // before asserting anything about them.
+    let mut chaos = crate::Chaos::new();
     loop {
         let msg = ctx.recv();
         let reply = match ctx.take_pending_cap() {
@@ -795,7 +800,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         };
         let op = body.first().copied().unwrap_or(0);
         let t_serve = ctx.read_tsc();
-        ahci.serve(ctx, body, crate::Reply { cap: reply, tag });
+        ahci.serve(ctx, body, crate::Reply { cap: reply, tag, fault: chaos.fault(ctx) });
         let spent = ctx.read_tsc().wrapping_sub(t_serve);
         if slow_threshold > 0 && spent >= slow_threshold {
             slow_seen += 1;

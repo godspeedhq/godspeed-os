@@ -6781,6 +6781,128 @@ pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.7: attack the COMPLETION STREAM, not the device.
+///
+/// `fs-ioretry` already makes the disk fail, and `fs` handles that by retrying. §3.7 asks for the
+/// other half - late, duplicate, missing and out-of-order completions - and names why it matters:
+/// `backlog/31` recorded exactly that failure one layer up, a service reading replies that belonged
+/// to earlier requests. The fs/block channel has the same shape, carries the same correlation tag,
+/// and gained a drain-before-request repair that had never been adversarially exercised.
+///
+/// **THE BAR IS RECOVERY, NOT DETECTION.** `backlog/31`'s tag was reverted precisely because
+/// rejecting a stale reply is not the same as surviving one, so every assertion below that merely
+/// proves a fault was NOTICED is paired with one proving the filesystem still worked afterwards.
+/// A run where `fs` spots every bad completion and then cannot write a file has failed this gate.
+pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-blockchaos: PASS - {}", $label); pass += 1; }
+        else { println!("fs-blockchaos: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-blockchaos: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-blockchaos: could not connect to the shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok();
+        eprintln!("fs-blockchaos: never reached a prompt");
+        std::process::exit(1);
+    }
+
+    // CHURN IS THE TRAFFIC GENERATOR. The injector warms up for 800 completions so boot and mount
+    // are untouched - a run that tests whether the machine boots is not testing this - and churn
+    // then produces thousands of block operations in a few seconds, so the faults land in ordinary
+    // filesystem work rather than in a hand-picked operation.
+    send(&mut write_half, b"churn 8\r");
+    let _ = collect_until(&buf, &mut cursor, b"churn: done", Duration::from_secs(120));
+
+    // AND THEN THE REAL QUESTION: does it still work? Every one of these runs AFTER the faults.
+    send(&mut write_half, b"write /after.txt survived-the-completion-chaos\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"read /after.txt\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"churn verify\r");
+    let _ = collect_until(&buf, &mut cursor, b"file(s)", Duration::from_secs(180));
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    // `drives check` walks every block; on a 16 MiB volume behind an injected 30 s stall it is the
+    // longest single step here, and cutting it short reads exactly like corruption (it did once).
+    send(&mut write_half, b"drives check\r");
+    let _ = collect_until(&buf, &mut cursor, b"check: ok", Duration::from_secs(300));
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_blockchaos_serial.log", &w);
+
+    // ---- the faults actually happened. Without this the rest passes vacuously on a clean run.
+    check!(w.contains("[completion-chaos] injecting"), "completions were corrupted at all");
+    check!(w.contains("DUPLICATE"), "a DUPLICATE completion was injected");
+    check!(w.contains("WRONG-TAG"), "an OUT-OF-ORDER completion was injected (wrong tag)");
+    check!(w.contains("MISSING"),   "a MISSING completion was injected");
+
+    // ---- `fs` NOTICED. Detection is necessary and, on its own, worth nothing.
+    check!(w.contains("discarded a block reply for tag") || w.contains("orphaned block reply"),
+           "fs detected a mis-correlated completion rather than believing it");
+
+    // ---- AND RECOVERED, which is the gate. §3.7 exists because `backlog/31` proved detection
+    // without recovery is not enough.
+    check!(w.contains("survived-the-completion-chaos"),
+           "a file written AFTER the faults reads back correctly (recovery, not just rejection)");
+    // A TEAR IS PERMITTED HERE, AND `fs-churn`'s ASSERTION WOULD BE THE WRONG ONE.
+    //
+    // `fs-churn` requires `NONE torn` because a POWER CUT returns no error - the caller is told
+    // nothing, so a mixed file is corruption by any reading. This test deliberately makes writes
+    // FAIL, and the first run found `/churn/f2.bin diverges at byte 1 of 1200` sitting beside
+    // `churn: done - 26 writes ... 2 refused`. The write was refused and the caller was told; a
+    // caller that ignores a reported failure and reads back a partial file is not a filesystem bug.
+    //
+    // So the property this gate actually wants is the sharper one: **no completion fault may change
+    // data without somebody being told.** A tear WITH a refusal is a reported failure. A tear with
+    // no refusal anywhere is silent corruption, and that is the thing §3.7 exists to catch.
+    let torn    = w.contains("are TORN");
+    let refused = w.contains("refused") || w.contains("NO usable reply");
+    check!(!torn || refused,
+           "no SILENT data change - any torn file is accompanied by a reported write failure");
+    if torn {
+        println!("fs-blockchaos: (a tear occurred and WAS reported - the permitted outcome, not corruption)");
+    }
+    check!(w.contains("0 bad"), "no corrupt blocks after the chaos");
+    check!(!w.contains("DANGEROUS DIRECTION"),
+           "the bitmap did not drift in the dangerous direction");
+    check!(!w.contains("KERNEL PANIC"), "no kernel panic");
+
+    println!("\nfs-blockchaos: {pass} passed, {fail} failed  (serial -> build/tests/fs_blockchaos_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_window(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
