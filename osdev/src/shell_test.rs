@@ -514,6 +514,25 @@ pub fn run(image_path: &Path, smp: u32) {
     // document you would otherwise not know which part you were reading.
     check!(h1.contains("|   Console"), "help: names the section you are in, pinned");
 
+    // EVERY BODY LINE ERASES ITS OWN TAIL, and this is a regression test for a deletion.
+    //
+    // `clear_eol` was removed on the note "nothing repaints in place any more, and every caller was
+    // passing false". True when written. Then `help` got its browser back - a pager that homes the
+    // cursor and redraws - and the erase was not restored, because the reason for removing it had
+    // been recorded as a fact about the FUNCTION rather than about its callers. On a Dell Wyse every
+    // row then showed the tail of the longer row it overwrote: `Storage` drawn over a 9-character
+    // line read `Storagert`, and a 58-character description over an 88-character one trailed
+    // `... - watch is built on it)ore)an up`. Nothing was wrong with the table; the frame was never
+    // cleared.
+    //
+    // Asserted on the BYTES rather than on the look, because a screen is what the bug is visible on
+    // and a serial line is what a test can read. An `ESC[K` per body line is the mechanism itself.
+    check!(h1.matches("\u{1b}[K").count() >= 10,
+           "help: the browser erases to end of line on every row (the `Storagert` garbage)");
+    // ...and the man-page shape: a section heading is upper-case at the margin, its commands
+    // indented under it. `CONSOLE` cannot appear by accident - the table spells it `Console`.
+    check!(h1.contains("CONSOLE"), "help: section headings read as headings, not as rows");
+
     // CONTENTS, then a digit jumps to that section. This is "go to a section with a keypress".
     send(&mut write_half, b"t");
     let h2 = collect_until(&buf, &mut cursor, b"press a digit", Duration::from_secs(8)).unwrap_or_default();

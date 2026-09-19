@@ -237,3 +237,74 @@ statements of output.
 **Written down rather than closed** (26.7) because the honest state is "the symptom is handled and
 the cause is unknown", and a backlog entry saying so is worth more than a commit message implying
 the latter was the former.
+
+---
+
+## 2026-09-19: a Wyse run that narrows it a lot, and retires one of my own instruments
+
+`selfcheck` (492 statements, 0 failed), then PgUp/PgDn at the prompt. Serial, trimmed to the window:
+
+```
+gsh> cap::get: ResourceId(102) gen mismatch cap=3 rec=29 liveness=Alive
+console: scrolled back 30 of 512 lines - the screen is showing HISTORY
+console: returned to live (requested)
+console: scrolled back 30 of 512 lines - the screen is showing HISTORY
+console: returned to live (output arrived)
+call: slot 8 waited 1000222 us across 3 blocks, 717786 core halts (slow #3)
+scrollback: the console stopped answering - left the view (console is BlockRecv, queue 0; our queue 0; reacquire did not help)
+scrollback: the console did not answer - not scrolling (console is BlockRecv, queue 0; our queue 0)
+```
+
+### What this rules OUT, including a diagnosis of mine
+
+**It is not a stale cap at entry, and the gen-mismatch line is not the trigger.** That line is at the
+prompt, and **three scrolls succeed after it**. Scrolling works, repeatedly, and then stops. Any
+explanation that starts "the shell's console cap went stale" has to account for the three that
+worked; none does. This is the fourth time a stale cap has looked like the answer here.
+
+**The `our queue 0` in those lines is not evidence, and I put it there.** It was added specifically
+to answer "did the reply arrive and sit unread". It cannot: it reads
+`task_stat(shell).queue_depth`, the task's OWN endpoint, while `request_with_reply*` waits on the
+**reply mailbox** (`reply_mailbox()`), a separate endpoint `task_stat` has no query for. So it
+reported a zero about an endpoint the reply was never going to arrive on. Relabelled in the code
+rather than deleted, because it still answers a narrower question honestly.
+
+### What the run does establish
+
+The mailbox IS measured, by something better than a depth. `drain_stale_replies` runs before every
+request and logs loudly when it finds anything. **Across the entire failing run it never fired**, so
+the mailbox was empty. Combined with the console's side:
+
+1. **The console never received the request.** `BlockRecv, queue 0` is a service idle at its recv.
+   And `serve_request` replies to `REQ_SCROLL` on every path - there is no branch where it takes one
+   and stays silent - so had it arrived, a reply would exist.
+2. **No reply was ever sent.** The mailbox was empty every time (1), and the shell's own endpoint
+   was empty too.
+3. **But the send was ACCEPTED.** `call_deadline_into` returning `Err` makes
+   `request_with_reply_deadline_into_inner` return `None` immediately; the observed wait is the full
+   `1000222 us` deadline, three times over, one second apart. A rejected send cannot produce that.
+
+**(3) against (1) is the contradiction to chase.** A send the kernel accepted, for a message that is
+not in the target's queue, to a service sitting at `recv` that never woke. That is a statement about
+delivery or wakeup, not about the console's code or the shell's.
+
+### The trigger is now specific
+
+Failure begins on the keypress immediately after `console: returned to live (output arrived)` - the
+console was scrolled back and something PRINTED, snapping the view to live on its own. The two
+preceding transitions are both `(requested)` and both fine. That wording exists precisely to tell
+those apart, which is the one instrument here that has earned its keep.
+
+So the shape to reproduce is **output arriving at the console while the view is scrolled back**, not
+scrolling as such. That is testable without a 4K framebuffer: scroll back, have another service log,
+then scroll again.
+
+### Changed in this commit
+
+- The failure line reports `reacquire ok={true|false}`. "reacquire did not help" was written as
+  though the reacquire had succeeded, but nothing checked the return - it covered "the reacquire
+  itself failed" equally well, and those are different bugs.
+- `console_state_note`'s doc says what its number can and cannot support.
+
+Still **OPEN**, and still recorded rather than closed (26.7). What is gone is three wrong answers and
+one instrument that was manufacturing a zero.

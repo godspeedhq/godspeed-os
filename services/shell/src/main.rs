@@ -854,15 +854,21 @@ fn console_state_note(ctx: &ServiceContext) -> (&'static str, u8, u8) {
         Some(slot) => { let st = ctx.task_stat(slot); (st.state_str(), st.queue_depth) }
         None => ("not-found", 0),
     };
-    // AND OUR OWN QUEUE, which the first version of this omitted and which is the half that can
-    // actually explain a missing REPLY. The console reporting `BlockRecv, queue 0` says it handled
-    // whatever it had and went back to waiting - it does NOT say the reply reached us. If this
-    // shell's own endpoint is full, the console's `try_send` of the reply has nowhere to land and
-    // the caller waits out its deadline for a message that was never deliverable.
+    // OUR OWN QUEUE - AND IT IS THE MAIN ENDPOINT'S, NOT THE ONE A REPLY ARRIVES ON.
     //
-    // It matters here because `net-stack` was measured taking 21-23 SECONDS in a single serve pass
-    // in the same window (`backlog/28`), and a stalled peer is exactly how unrelated traffic backs
-    // up into a queue that a reply then cannot enter.
+    // This was added to answer "did the reply reach us and sit unread", and it CANNOT answer that.
+    // `request_with_reply*` waits on the REPLY MAILBOX when the task has one (`reply_mailbox`), a
+    // separate endpoint from the task's own; `task_stat` reports one queue per TASK and has no
+    // query for the mailbox. So the `our queue 0` printed on a Dell Wyse was a number about an
+    // endpoint the reply was never going to arrive on - a zero it had not earned, which is the
+    // exact instrument failure this project keeps paying for.
+    //
+    // It is left in, labelled for what it is, because it still answers a real question: whether the
+    // console's reply had somewhere to land at all. What it must never again be read as is evidence
+    // about the reply itself. The mailbox IS measured, by a better instrument than a depth:
+    // `drain_stale_replies` runs before every request and logs loudly if it finds anything, and
+    // across the whole failing run it never fired - so the mailbox was empty and the reply was
+    // never sent. See `backlog/37`.
     let mine = slot_of(ctx, "shell").map(|s| ctx.task_stat(s).queue_depth).unwrap_or(0);
     (state, q, mine)
 }
@@ -891,7 +897,11 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
     // precisely the case where it was never stale to begin with. So carry on and let the scroll
     // itself decide: its failure path already reports honestly. What must not happen is treating a
     // missed reacquire as a reason to refuse, which would make a working console unusable.
-    let _fresh = ctx.reacquire_by_name("console");
+    // AND WHETHER IT WORKED. The failure line used to say "reacquire did not help", which reads as
+    // "we reacquired and the problem persisted" - but nothing checked the return, so it equally covered
+    // "the reacquire itself failed". Those are different bugs and the log could not tell them
+    // apart (`backlog/37`).
+    let fresh = ctx.reacquire_by_name("console");
 
     // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
     let Some((mut view, _)) = ctx.console_scroll(SCROLL_PAGE_UP) else {
@@ -966,7 +976,7 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
                 }
                 let (state, q, mine) = console_state_note(ctx);
                 ctx.console_writeln_fmt(format_args!(
-                    "scrollback: the console stopped answering - left the view (console is {}, queue {}; our queue {}; reacquire did not help)",
+                    "scrollback: the console stopped answering - left the view (console is {}, queue {}; our queue {}; reacquire ok={fresh})",
                     state, q, mine));
                 return;
             }
@@ -5367,29 +5377,113 @@ static HELP: &[HelpRow] = &[
 /// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`). When `clear_eol`
 /// the line ends with `ESC[K` (erase to end of line) before the newline - the pager repaints
 /// each row in place over the old frame, so a shorter line must wipe the longer one's tail.
-/// `clear_eol` is GONE with the pager it served. It emitted `ESC[K` so an in-place repaint could
-/// wipe the tail of a longer previous frame; nothing repaints in place any more, and every caller
-/// was passing `false`. A parameter whose other branch is unreachable is a lie about what the
-/// function can do.
-fn help_render_line(ctx: &ServiceContext, idx: usize) { help_render_line_of(ctx, HELP, "help", idx) }
+/// `clear_eol` WAS REMOVED ON A REASON THAT STOPPED BEING TRUE, and a Dell Wyse showed the cost.
+///
+/// It emitted `ESC[K` so an in-place repaint could wipe the tail of a longer previous frame, and it
+/// was deleted with the note "nothing repaints in place any more, and every caller was passing
+/// `false`". Both halves were true the day they were written. Then `help` got its browser back - a
+/// pager that homes the cursor and redraws - and nothing restored the erase, because the argument
+/// for removing it had been recorded as a fact about the FUNCTION rather than about its callers.
+///
+/// What that looks like on a screen: every row shows the tail of the longer row it overwrote.
+/// `Storage` drawn over a 9-character line reads `Storagert`; a 58-character description drawn over
+/// an 88-character one reads `... - watch is built on it)ore)an up`. It is not a content bug and
+/// there is nothing wrong with the table - the frame is simply never cleared.
+///
+/// So the capability is back, and this time it is not a flag: a line knows the WIDTH it must fit.
+/// `width == 0` means "no screen" - the script dump - and emits plain text. Anything else is a
+/// console of that many columns, and the line is clipped to it and erased to end of line. The two
+/// cases cannot be confused because neither is a bare `true`/`false` at a call site.
+fn help_render_line(ctx: &ServiceContext, idx: usize) {
+    help_render_line_of(ctx, HELP, "help", idx)
+}
 
-/// One line of `doc`. Line 0 is the title; the rest index the table.
+/// One line of `doc` as a PLAIN dump - a script, `run`, `assert` or `selfcheck` (`width == 0`).
 fn help_render_line_of(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, idx: usize) {
-    let eol = "";
-    if idx == 0 {
-        // Rule 6 (0_conventions.md): a utility's first line of output is `<util> <version>`.
-        ctx.console_write_fmt(format_args!("{} {} - GodspeedOS", title, UTIL_VERSION));
-    } else {
-        match &doc[idx - 1] {
-            Gap => {}
-            Sec(s) | Text(s) => ctx.console_write(s),
-            // One "  command  description" row, left-justified to a fixed width so the
-            // description columns line up (ASCII-only - renders the same on TV and serial).
-            Row(cmd, desc) => ctx.console_write_fmt(format_args!("  {:<21}  {}", cmd, desc)),
+    let mut lb = LineBuf::new();
+    help_line_text(doc, title, idx, help_term_width_at(doc, idx), &mut lb);
+    let n = lb.n.min(lb.b.len());
+    if let Ok(t) = core::str::from_utf8(&lb.b[..n]) { ctx.console_write(t); }
+    ctx.console_writeln("");
+}
+
+/// The command column is measured PER SECTION, and the numbers say it has to be.
+///
+/// The column was pinned at 21, so every command longer than that shoved its description out of
+/// alignment - that is the visible half of the mess on a 4K television. The obvious fix, one column
+/// wide enough for the whole document, does not survive being measured: fitting 90% of the 70
+/// commands needs 30 characters, and the longest description then wants 102 columns on a screen
+/// that has about 96. Every choice either clips text or leaves a lake of whitespace after `mem`.
+///
+/// Sections are the natural unit because they are HOMOGENEOUS - Storage's commands all look like
+/// `move <src> <dst>`, System's all look like `uptime`. Measuring each block separately gives every
+/// one a column just wide enough for itself, which is both tighter and tidier than any single
+/// number, and it is what a well-set reference page looks like.
+const HELP_TERM_MIN: usize = 10;
+const HELP_TERM_MAX: usize = 34;
+
+/// The command-column width for the section containing line `idx`.
+///
+/// Scans out from `idx` to the section boundaries and takes the widest command between them. O(n)
+/// per line over a 91-line document, called for the ~30 lines of one frame - a few thousand length
+/// comparisons per keypress, against a repaint that costs two orders of magnitude more. Recomputing
+/// beats caching here: there is no second copy to fall out of step with the table (26.4).
+fn help_term_width_at(doc: &'static [HelpRow], idx: usize) -> usize {
+    if idx == 0 || idx > doc.len() { return HELP_TERM_MIN; }
+    let i = idx - 1;
+    // Back to the start of this section (just past the preceding `Sec`, or the top).
+    let mut lo = i;
+    while lo > 0 && !matches!(doc[lo], Sec(_)) { lo -= 1; }
+    // Forward to the next one.
+    let mut hi = i + 1;
+    while hi < doc.len() && !matches!(doc[hi], Sec(_)) { hi += 1; }
+    let mut w = 0usize;
+    for row in &doc[lo..hi] {
+        if let Row(cmd, _) = row { if cmd.len() > w { w = cmd.len(); } }
+    }
+    w.clamp(HELP_TERM_MIN, HELP_TERM_MAX)
+}
+
+/// The TEXT of one line of `doc`, with no escapes and no newline. Line 0 is the title.
+///
+/// MAN-PAGE SHAPE, and the reason is that this is a reference you SCAN rather than read. A section
+/// heading is upper-case and sits at the left margin; everything under it is indented beneath it, so
+/// the eye finds the group first and the command second. `Gap` rows already separate the sections,
+/// which is where the breathing room comes from.
+///
+/// ONE LINE PER ROW IS AN INVARIANT, not a layout preference. The browser indexes `doc[idx - 1]` by
+/// screen line, and `total`, `help_sections`, `help_find_from` and the contents jump all count on
+/// that. A long command wrapping its description onto a second line - which is what `man` itself
+/// does - would silently break every one of them. So a long command pushes its own description
+/// right instead, and the clip at the screen edge is what keeps the row to one line.
+fn help_line_text(doc: &'static [HelpRow], title: &str, idx: usize, term_w: usize,
+                  out: &mut LineBuf) {
+    use core::fmt::Write;
+    struct W<'a>(&'a mut LineBuf);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            RecordSink::put(self.0, s.as_bytes());
+            Ok(())
         }
     }
-    ctx.console_write(eol);
-    ctx.console_write("\n");
+    let mut w = W(out);
+    if idx == 0 {
+        // Rule 6 (0_conventions.md): a utility's first line of output is `<util> <version>`.
+        let _ = write!(w, "{} {} - GodspeedOS", title, UTIL_VERSION);
+        return;
+    }
+    match &doc[idx - 1] {
+        Gap => {}
+        Sec(s) => {
+            let _ = w.write_str("  ");
+            for b in s.bytes() {
+                let up = [b.to_ascii_uppercase()];
+                let _ = w.write_str(core::str::from_utf8(&up).unwrap_or(" "));
+            }
+        }
+        Text(s) => { let _ = write!(w, "    {}", s); }
+        Row(cmd, desc) => { let _ = write!(w, "    {:<1$}  ", cmd, term_w); let _ = w.write_str(desc); }
+    }
 }
 
 /// Sections of `help`, as (line index, name). Derived from `HELP` itself, so a section added to the
@@ -5429,8 +5523,14 @@ const HELP_FIND_MAX: usize = 32;
 /// The piped form goes through `help_to_out` and never reaches here at all.
 fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, seek: &str) {
     let total = doc.len() + 1;
-    let (rows, _cols) = ctx.console_dims();
+    let (rows, cols) = ctx.console_dims();
     let rows = if rows == 0 { 24 } else { rows as usize };
+    // THE WIDTH WAS THROWN AWAY, which is why the text neither filled the screen nor stayed on it.
+    // A line longer than the console WRAPS, and a wrapped line pushes every row below it down by
+    // one - so the pager's own "lines 21-50 of 91" becomes a lie about what is on the screen. Same
+    // reason `paginate` clips (52_paginate.md 5); `help` simply never knew the number.
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let clip = cols.saturating_sub(1);
     let mut secs = [(0usize, ""); HELP_SECTIONS_MAX];
     let nsec = help_sections(doc, &mut secs);
 
@@ -5485,8 +5585,18 @@ fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, seek
         } else {
             let max_top = total.saturating_sub(body);
             if top > max_top { top = max_top; }
-            for i in top..(top + body).min(total) { help_render_line_of(ctx, doc, title, i); }
-            for _ in (top + body).min(total)..(top + body) { ctx.console_write("\x1b[K\n"); }
+            // THROUGH A FRAME, like `paginate`. Writing each row straight to the console costs two
+            // syscalls per row; a screenful is then well over a hundred messages per keypress
+            // against a 16-deep queue, and holding a scroll key outruns the sink.
+            let mut frame = FrameBuf::new();
+            for i in top..(top + body).min(total) {
+                let mut lb = LineBuf::new();
+                help_line_text(doc, title, i, help_term_width_at(doc, i), &mut lb);
+                if lb.n > clip { lb.n = clip; RecordSink::put(&mut lb, b">"); }
+                lb.flush_into(ctx, &mut frame);
+            }
+            for _ in (top + body).min(total)..(top + body) { frame.put(ctx, b"\x1b[K\n"); }
+            frame.flush(ctx);
         }
 
         if about {
