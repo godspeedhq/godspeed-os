@@ -83,7 +83,7 @@ name        type  size  sealed
 f0.txt      file     1  false
 f1.txt      file     1  false
 ...
-[ lines 1-22 of 45 ] [arrows] scroll [PgUp/PgDn] page [Home/End] ends [q] quit
+[ lines 1-22 of 45 ] [up/down] scroll [PgUp/PgDn] page [Home/End] ends [q] quit
 ```
 
 ## 5. What it does to the content, and why

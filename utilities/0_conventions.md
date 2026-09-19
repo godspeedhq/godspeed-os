@@ -91,7 +91,17 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
       saving need a modifier: `^Q` and `^S`.
 
     **NAVIGATION IS THE SAME EVERYWHERE, and that is the part that must not drift**: arrows move a
-    line, PgUp/PgDn a page, Home/End the ends. `edit` already matches `help`, `docs`, `paginate` and
+    line, PgUp/PgDn a page, Home/End the ends.
+
+    **Name the two keys that work, not the cluster.** A status line reading `[arrows]` claims all
+    four when only up and down do anything, and left/right are free to mean something else later.
+    It reads `[up/down]`.
+
+    **In WORDS, because the console cannot draw the symbols.** `render::cell_for_codepoint` passes
+    ASCII through and maps eleven box-drawing characters; everything else becomes a literal `?`
+    (deliberately - visible, never silently dropped). So `\u2191` and `\u2193` would print as `??` on a
+    framebuffer while rendering correctly over serial, which is worse than either. Words also match
+    rule 4: a word means the same thing everywhere, and symbols are what that rule exists to avoid. `edit` already matches `help`, `docs`, `paginate` and
     the scrollback view key for key on all five. Somebody "fixing" `edit` to quit on `q` would break
     the only rule that actually distinguishes them, so the rule is written down rather than left to
     be inferred from two examples that look contradictory.

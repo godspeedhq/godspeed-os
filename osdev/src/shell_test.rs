@@ -420,7 +420,7 @@ pub fn run(image_path: &Path, smp: u32) {
     let s1 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
     check!(s1.contains("scrollback") && s1.contains("scrolled off"),
            "scrollback: opens with its title");
-    check!(s1.contains("[arrows] line") && s1.contains("[PgUp/PgDn] page"),
+    check!(s1.contains("[up/down] line") && s1.contains("[PgUp/PgDn] page"),
            "scrollback: the status line names the keys that work");
     // The count comes from the ring, so it must name a real total rather than nothing.
     check!(s1.contains("] quit") && !s1.contains(" of 0 ]"),
@@ -430,12 +430,12 @@ pub fn run(image_path: &Path, smp: u32) {
     // repaints nothing. PgUp is `ESC [ 5 ~`.
     send(&mut write_half, b"\x1b[5~");
     let s2 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
-    check!(s2.contains("[arrows] line"), "scrollback: PgUp pages back inside the view");
+    check!(s2.contains("[up/down] line"), "scrollback: PgUp pages back inside the view");
 
     // ARROWS SCROLL INSIDE THE VIEW - they must not reach the command history.
     send(&mut write_half, b"\x1b[A");
     let s3 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
-    check!(s3.contains("[arrows] line"),
+    check!(s3.contains("[up/down] line"),
            "scrollback: arrows scroll INSIDE the view, they do not leak to history");
 
     // `q` LEAVES. Every other full-screen view in this shell quits on `q` (conventions rule 10a).
@@ -490,7 +490,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // rendered grid), or a string introduced AFTER the dump, which is what this does.
     send(&mut write_half, b"echo zz-sb-end\r");
     let s7 = collect_until(&buf, &mut cursor, b"zz-sb-end", Duration::from_secs(40)).unwrap_or_default();
-    check!(!s7.is_empty() && !s7.contains("[arrows] line"),
+    check!(!s7.is_empty() && !s7.contains("[up/down] line"),
            "scrollback: dumps rather than paging when nobody is watching");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
 
@@ -517,7 +517,7 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"help\r");
     let h1 = collect_until(&buf, &mut cursor, b"[q] quit", Duration::from_secs(8)).unwrap_or_default();
     check!(h1.contains("help") && h1.contains("GodspeedOS"), "help: opens with its title");
-    check!(h1.contains("[arrows] line") && h1.contains("[t] contents") && h1.contains("[/] find"),
+    check!(h1.contains("[up/down] line") && h1.contains("[t] contents") && h1.contains("[/] find"),
            "help: the status line names the keys that work");
     // The PINNED section header is the half a scrollback cannot do: scrolled into the middle of a
     // document you would otherwise not know which part you were reading.
@@ -549,10 +549,10 @@ pub fn run(image_path: &Path, smp: u32) {
            "help: `t` lists the sections, numbered");
     // WAIT ON A MARKER THE CONTENTS VIEW DOES NOT ALSO PRINT. `[q] quit` appears in BOTH status
     // lines, so collecting on it matched the contents frame that was already on screen and the
-    // check read a frame from before the keypress. `[arrows] line` belongs to the document view
+    // check read a frame from before the keypress. `[up/down] line` belongs to the document view
     // alone. Second time this exact mistake has been made in this suite.
     send(&mut write_half, b"4");
-    let h3 = collect_until(&buf, &mut cursor, b"[arrows] line", Duration::from_secs(8)).unwrap_or_default();
+    let h3 = collect_until(&buf, &mut cursor, b"[up/down] line", Duration::from_secs(8)).unwrap_or_default();
     check!(h3.contains("|   Storage"), "help: a digit jumps to that section");
 
     // SEARCH. `churn` is deep in Storage, so finding it proves the search moved the view rather

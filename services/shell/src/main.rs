@@ -5420,7 +5420,7 @@ fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, seek
                 "[ contents: {} sections ]  press a digit to jump   [t] back  [q] quit", nsec));
         } else {
             ctx.console_write_fmt(format_args!(
-                "[ {}-{} of {} ]  [arrows] line  [PgUp/PgDn] page  [t] contents  [a] about  [/] find  [q] quit",
+                "[ {}-{} of {} ]  [up/down] line  [PgUp/PgDn] page  [t] contents  [a] about  [/] find  [q] quit",
                 top + 1, (top + body).min(total), total));
         }
         ctx.console_write("\x1b[J");
@@ -5737,7 +5737,7 @@ fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<()
         frame.flush(ctx);
 
         ctx.console_write_fmt(format_args!(
-            "[ {}-{} of {}{} ]  [arrows] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit",
+            "[ {}-{} of {}{} ]  [up/down] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit",
             top + 1, top + have, total,
             if aged { ", older lines aged out" } else { "" }));
         ctx.console_write("\x1b[J");
@@ -5862,7 +5862,7 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
             // to the screen; a status line that WRAPS pushes the whole frame up by a row and makes
             // the count it is printing wrong. 77 columns at four digits, which leaves room on the
             // 80-column terminal that is the narrowest anybody uses.
-            "[ lines {}-{} of {} ] [arrows] scroll [PgUp/PgDn] page [Home/End] ends [q] quit",
+            "[ lines {}-{} of {} ] [up/down] scroll [PgUp/PgDn] page [Home/End] ends [q] quit",
             top + 1, end, total));
         ctx.console_write("\x1b[J");
         // Read one command key (arrows/PageUp/Down arrive as escape sequences).

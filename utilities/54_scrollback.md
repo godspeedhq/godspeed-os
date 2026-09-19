@@ -18,7 +18,7 @@ scrollback 0.4.0 - what has scrolled off the screen
   gsh> churn verify
   churn: 0 empty, NONE torn
 
-[ 340-372 of 512, older lines aged out ]  [arrows] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit
+[ 340-372 of 512, older lines aged out ]  [up/down] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit
 ```
 
 ## 2. How it opens

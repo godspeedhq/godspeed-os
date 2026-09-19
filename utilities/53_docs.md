@@ -18,7 +18,7 @@ docs 0.1.0 - GodspeedOS
   What you can rely on
   Seeing it work
 
-[ 1-22 of 46 ]  [arrows] line  [PgUp/PgDn] page  [t] contents  [a] about  [/] find  [q] quit
+[ 1-22 of 46 ]  [up/down] line  [PgUp/PgDn] page  [t] contents  [a] about  [/] find  [q] quit
 ```
 
 ## 2. Why it is not part of `help`
