@@ -2879,6 +2879,29 @@ impl ServiceContext {
         }
     }
 
+    /// Read a page of the console's scrollback AS DATA, starting at line `from` (0 = oldest KEPT).
+    ///
+    /// Returns `(lines, total retained, any line has aged out, bytes written)`. The payload after
+    /// the 4-byte header is `lines` records of `[len, bytes...]`; `bytes` is the whole reply so a
+    /// caller can bound its own walk.
+    ///
+    /// **The counterpart to `console_scroll`, and it exists because that one cannot be made cheap.**
+    /// Moving the terminal's own view forces a full repaint before the console can reply - on a
+    /// 3840x2160 panel the most expensive thing it does, paid inside the caller's blocking request,
+    /// from the same core (`backlog/37`). This asks for BYTES: the console copies out of its ring
+    /// and replies, and the caller paints its own screen through ordinary output, which is a send
+    /// rather than a call and carries no deadline at all.
+    ///
+    /// The history is BOUNDED (32 KiB / 512 lines). `aged` is how a view says "this is the oldest
+    /// line kept" rather than implying it is the start of the session (§26.7).
+    pub fn console_history(&self, from: u16, buf: &mut [u8]) -> Option<(usize, u16, bool, usize)> {
+        // Opcode 3 = REQ_HISTORY (`services/console/src/main.rs`).
+        let req = [3u8, from as u8, (from >> 8) as u8];
+        let k = self.request_with_reply_deadline_into("console", &req, buf, 1)?;
+        if k < 4 { return None; }
+        Some((buf[0] as usize, u16::from_le_bytes([buf[1], buf[2]]), buf[3] != 0, k))
+    }
+
     /// Whether the input driver has reported setup complete (syscall 13, query 10).
     /// The deterministic end-of-boot signal: the shell watches it to auto-clear the
     /// boot screen the moment the keyboard subsystem is up. Ambient.

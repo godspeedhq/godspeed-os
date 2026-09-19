@@ -475,6 +475,37 @@ impl Term {
     /// Lines the view is scrolled back, and the most it could be.
     pub fn view(&self) -> (usize, usize) { (self.s.view, self.s.sb.len()) }
 
+    /// Copy history lines from `from` onward into `out` as `[len, bytes...]` records.
+    ///
+    /// Returns `(lines written, bytes used, lines retained, any line has aged out)`.
+    ///
+    /// **THIS PAINTS NOTHING, AND THAT IS THE ENTIRE POINT OF IT.** `scroll_view` moves the terminal's
+    /// own view, and to do that it must `paint_view` + `present` BEFORE it can return - a full
+    /// repaint of the framebuffer, synchronously, inside the caller's blocking request. On a
+    /// 3840x2160 panel that is the most expensive thing this service ever does, and the caller was
+    /// giving it one second while sitting on the same core (`backlog/37`). Reading the ring is a
+    /// bounded memcpy: it cannot take a framebuffer's worth of time because it never touches one.
+    ///
+    /// The caller pages the result itself, so a keypress costs no repaint here at all.
+    pub fn history_into(&self, from: usize, out: &mut [u8]) -> (usize, usize, usize, bool) {
+        let total = self.s.sb.len();
+        let aged  = self.s.sb.aged() > 0;
+        let (mut n, mut used, mut i) = (0usize, 0usize, from);
+        let mut line = [0u8; MAX_COLS];
+        while i < total && n < 255 {
+            let ln = self.s.sb.line(i, &mut line);
+            // Stop on the record that would not fit whole. A truncated line is a wrong answer that
+            // looks like a right one; the caller asks again from here (§26.7).
+            if used + 1 + ln > out.len() { break; }
+            out[used] = ln as u8;
+            out[used + 1..used + 1 + ln].copy_from_slice(&line[..ln]);
+            used += 1 + ln;
+            n += 1;
+            i += 1;
+        }
+        (n, used, total, aged)
+    }
+
     /// Did OUTPUT just snap the view back to live? Clears the flag, so the transition is reported
     /// exactly once and cannot be double-counted against a scroll request that did the same thing.
     pub fn take_output_snap(&mut self) -> bool {

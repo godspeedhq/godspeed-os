@@ -383,111 +383,120 @@ pub fn run(image_path: &Path, smp: u32) {
     // console scrollback
     // -----------------------------------------------------------------------
     //
-    // The framebuffer console keeps no history of its own, so anything taller than the screen loses
-    // its top permanently. The `console` service now retains lines that scroll off and PgUp/PgDn walk
-    // them.
+    // `scrollback` IS A UTILITY NOW, NOT A MODE, and these cases had to be rewritten rather than
+    // adjusted - the mechanism underneath them is gone.
     //
-    // **THIS IS A FRAMEBUFFER FEATURE BEING TESTED OVER A SERIAL LINE**, which sounds impossible and
-    // is why the console reports the two TRANSITIONS - into history and back to live. Those are what
-    // carry the information anyway (a report per keypress is a report nobody reads), and they make
-    // the feature observable by something other than a pair of eyes. Boot has already produced far
-    // more than a screenful by this point, so there is history to walk.
+    // What they used to assert was the shell driving the CONSOLE's own view, one blocking request
+    // per keypress. Each of those made the console `paint_view` + `present` before it could reply: a
+    // full repaint of the framebuffer, inside the caller's deadline, on the core the caller was
+    // blocked on. Against a 3840x2160 panel that overran one second and the shell declared a console
+    // that was merely busy to be dead (`backlog/37`).
     //
-    // PgUp is `ESC [ 5 ~`. The CSI handler listed it as ignored until now, which is why it was free:
-    // Home and End were NOT free, and are claimed only while the view is already scrolled.
-    // WAIT ON THE MARKER, NOT ON THE PROMPT. The console's log is asynchronous to the shell's
-    // prompt, and it was landing a few bytes after it - so a collect that stopped at `gsh>` missed
-    // the line it was looking for and found it at the start of the NEXT case instead. Each step
-    // below waits for the transition it is actually about.
+    // **AND THIS SUITE RAN GREEN THROUGH ALL OF IT**, which is the part worth keeping in mind: the
+    // cost that broke it is a repaint, QEMU has no such panel, so the tests could not have caught it
+    // and did not. The new path asks the console for BYTES out of its ring and pages them here, so
+    // what is exercised below is deterministic on any framebuffer - which is why it is testable at
+    // all rather than merely passing.
     //
-    // SCROLLBACK IS A MODE: PgUp enters it, Esc leaves it, and while it is up the shell reads keys
-    // itself rather than through the line editor. That is what makes the arrows unambiguous, and it
-    // is what these cases pin.
-    send(&mut write_half, b"\x1b[5~");
-    let sb1 = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10))
-        .unwrap_or_default();
-    check!(sb1.contains("scrolled back"),
-           "scrollback: PgUp enters the view");
+    // Boot plus everything above has produced far more than a screenful, so there is history.
 
-    // THE ARROWS DO NOT LEAK. Three Up arrows inside the view scroll it; if they had reached the
-    // line editor they would have recalled history and echoed a command onto the prompt. Then Esc
-    // leaves. Exactly ONE transition each way is the proof: a leak would have ended the mode early
-    // and produced a second `scrolled back` when the next key re-entered it.
-    send(&mut write_half, b"\x1b[A\x1b[A\x1b[A\x1b");
-    let sb2 = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(10))
-        .unwrap_or_default();
-    check!(sb2.contains("returned to live"),
-           "scrollback: Esc leaves the view");
-    check!(!sb2.contains("scrolled back"),
-           "scrollback: arrows scroll INSIDE the view - they do not leak to history and re-enter");
-
-    // A PRINTABLE KEY LEAVES AND THEN TYPES ITSELF, so starting to type a command gets you out
-    // without a separate thought. `cores` is typed with its first letter delivered from inside the
-    // view; the command must still run correctly.
-    send(&mut write_half, b"\x1b[5~");
-    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
-    send(&mut write_half, b"cores\r");
-    let sb3 = collect_until(&buf, &mut cursor, b"cores: 4", Duration::from_secs(10))
-        .unwrap_or_default();
-    check!(sb3.contains("returned to live"),
-           "scrollback: a printable key leaves the view");
-    check!(sb3.contains("cores: 4"),
-           "scrollback: ...and types itself, so the command still runs");
-
-    // END GOES TO THE NEWEST LINE AND STAYS IN THE VIEW. Only Esc leaves.
+    // WAIT ON `ESC[J`, NOT ON ANYTHING THE FRAME SAYS. This is the third time this suite has been
+    // caught waiting for a marker that appears twice, and here it is not a slip - it is structural.
+    // A scrollback viewer DISPLAYS everything the terminal has ever shown, so any text a frame
+    // contains can also be sitting in the history the frame is rendering. The first run of these
+    // cases matched `[q] quit` against the line
+    //     net: waiting for a reply  [q] quit
+    // which is a row left merged by an earlier pager and then scrolled into the ring - so the
+    // collect stopped in the MIDDLE of the frame and every later case desynced, taking four passing
+    // `help` cases down with it.
     //
-    // THIS CASE PREVIOUSLY PASSED FOR THE WRONG REASON, which is worth recording. It sent Home then
-    // End and waited for `(requested)` - which End used to produce, because End and "leave the view"
-    // were the same action. When they were separated End stopped producing it, and the wait was
-    // satisfied by the NEXT case's keystroke instead. Green, testing nothing.
-    //
-    // The discriminator is a bare Esc AFTER End. If End has wrongly exited the view, the shell is
-    // back at the prompt - where Esc clears the line and never reaches the console - so no
-    // `(requested)` is logged and this times out. It can only pass if End left the view OPEN.
+    // `ESC[J` cannot suffer that. The ring stores the rendered GRID (`sb.push(&s.grid[0][..cols])`),
+    // so escape sequences are consumed by the terminal and are never history. It is also exactly the
+    // end of a frame, which is what these cases actually want to wait for.
+    const FRAME_END: &[u8] = b"\x1b[J";
+
+    // TYPED, opening at the newest line.
+    send(&mut write_half, b"scrollback\r");
+    let s1 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s1.contains("scrollback") && s1.contains("scrolled off"),
+           "scrollback: opens with its title");
+    check!(s1.contains("[arrows] line") && s1.contains("[PgUp/PgDn] page"),
+           "scrollback: the status line names the keys that work");
+    // The count comes from the ring, so it must name a real total rather than nothing.
+    check!(s1.contains("] quit") && !s1.contains(" of 0 ]"),
+           "scrollback: reports a real line count from the ring");
+
+    // PAGING IS LOCAL: every key here is served by a memcpy out of the ring, and the console
+    // repaints nothing. PgUp is `ESC [ 5 ~`.
     send(&mut write_half, b"\x1b[5~");
-    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
-    send(&mut write_half, b"\x1b[H\x1b[F");
+    let s2 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s2.contains("[arrows] line"), "scrollback: PgUp pages back inside the view");
+
+    // ARROWS SCROLL INSIDE THE VIEW - they must not reach the command history.
+    send(&mut write_half, b"\x1b[A");
+    let s3 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s3.contains("[arrows] line"),
+           "scrollback: arrows scroll INSIDE the view, they do not leak to history");
+
+    // `q` LEAVES. Every other full-screen view in this shell quits on `q` (conventions rule 10a).
+    send(&mut write_half, b"q");
+    let s4 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    check!(s4.is_some(), "scrollback: `q` returns to the prompt");
+
+    // PgUp AT THE PROMPT OPENS IT TOO, one page back - the key already meant "back a page".
+    send(&mut write_half, b"\x1b[5~");
+    let s5 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s5.contains("scrollback"), "scrollback: PgUp at the prompt opens the view");
+    // Esc leaves as well, like `help` and `docs`.
     send(&mut write_half, b"\x1b");
-    let sb5 = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(10))
-        .unwrap_or_default();
-    check!(sb5.contains("returned to live"),
-           "scrollback: End goes to the newest line and STAYS in the view - only Esc leaves");
+    let s6 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    check!(s6.is_some(), "scrollback: Esc also leaves");
 
-    // THE VIEW MUST SURVIVE BEING LEFT OPEN. `backlog/37`: on hardware, scrolling works repeatedly
-    // and then stops answering FOREVER, and every log shows the break beginning after the reader has
-    // sat in the view for a few seconds. The console is `BlockRecv, queue 0` throughout - idle,
-    // waiting, empty - so the request is not reaching it.
-    //
-    // This holds the view open with no keystrokes and then scrolls again. If the fault is time spent
-    // in the view, this reproduces it in QEMU where it can be iterated on in seconds instead of
-    // flash cycles.
-    // ASSERT ON THE FAULT'S SIGNATURE, not on the success message. The first version of this waited
-    // for `(requested)` after the sleep and reported a failure whose log showed `[5~` echoed as
-    // literal text - an escape-parse desync in the HARNESS (a bare `ESC` sent alone, then more bytes
-    // later), not the fault under test. A reproduction that cannot be told apart from a test bug is
-    // not a reproduction.
-    //
-    // The fault has an unambiguous fingerprint of its own: the shell prints `the console stopped
-    // answering` with the console's state. Waiting for its ABSENCE is immune to how the success path
-    // happens to be worded or timed.
+    // THE SOAK THAT `backlog/37` LEFT BEHIND. Open it, touch nothing for 8 seconds, then page. The
+    // old failure was the view going permanently deaf; the fingerprint was the shell printing that
+    // the console had stopped answering, so waiting for its ABSENCE is immune to how the success
+    // path happens to be worded.
     send(&mut write_half, b"\x1b[5~");
-    let _ = collect_until(&buf, &mut cursor, b"showing HISTORY", Duration::from_secs(10));
+    let _ = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10));
     thread::sleep(Duration::from_secs(8));
-    send(&mut write_half, b"\x1b[6~");   // PgDn: a scroll, so it must be answered
-    let soak = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6))
-        .unwrap_or_default();
+    send(&mut write_half, b"\x1b[6~");   // PgDn
+    let soak = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
     check!(!soak.contains("stopped answering") && !soak.contains("did not answer"),
-           "scrollback: the view still answers after 8s open with no keystrokes (backlog/37)");
-    send(&mut write_half, b"\x1b");
-    let _ = collect_until(&buf, &mut cursor, b"(requested)", Duration::from_secs(6));
+           "scrollback: still answers after 8s open with no keystrokes (backlog/37)");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
 
-    // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR AGAIN - unconditionally, which is the
-    // simplification the mode bought. They were briefly "scroll if the view happens to be scrolled",
-    // and that could never have been extended to the arrows: Up/Down are command history and are
-    // pressed constantly, so every one would have had to ask the console where the view was first.
+    // IN A SCRIPT IT DUMPS rather than waiting for a key nobody will press - the guard `help`,
+    // `docs` and `paginate` all carry.
+    send(&mut write_half, b"assert ok scrollback\r");
+    // ASSERT SOMETHING POSITIVE, because the obvious check passes on NOTHING.
     //
-    // Type `hello world`, Home, then `echo ` - which must land at the FRONT, giving `echo hello
-    // world`. If Home had gone anywhere near the scrollback the line would read `hello worldecho `.
+    // This waited 12s and then tested `!contains("[q] quit")` - and `unwrap_or_default()` hands
+    // back an EMPTY string on timeout, which contains nothing at all. The dump is up to 512
+    // lines, it overran the collect, the case passed vacuously, and its leftover output desynced
+    // the `Home` case below - so the failure that got REPORTED was downstream of a silent one.
+    //
+    // A test that cannot fail is worse than no test: it reports a guarantee nobody is checking.
+    // AND THE TERMINATOR CANNOT BE `gsh>` EITHER - THE SAME TRAP, A THIRD TIME.
+    //
+    // The dump REPLAYS the history, and the history is full of prompts. Waiting for `gsh>`
+    // therefore matched one INSIDE the dumped text while the rest was still streaming, and the
+    // keystrokes of the next case landed in the middle of it - which is why the failure that got
+    // reported was `Home is the line editor`, a case that was never broken.
+    //
+    // THE GENERAL RULE, now learned three ways in one feature: nothing this utility PRINTS can
+    // terminate a collect, because what it prints is everything the terminal has ever shown.
+    // Only two kinds of marker are safe - an escape sequence (never stored: the ring holds the
+    // rendered grid), or a string introduced AFTER the dump, which is what this does.
+    send(&mut write_half, b"echo zz-sb-end\r");
+    let s7 = collect_until(&buf, &mut cursor, b"zz-sb-end", Duration::from_secs(40)).unwrap_or_default();
+    check!(!s7.is_empty() && !s7.contains("[arrows] line"),
+           "scrollback: dumps rather than paging when nobody is watching");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+
+    // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR - unconditionally. Type `hello world`,
+    // Home, then `echo `, which must land at the FRONT giving `echo hello world`. If Home went
+    // anywhere near the scrollback the line would read `hello worldecho `.
     send(&mut write_half, b"hello world\x1b[Hecho \r");
     let sb4 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
     check!(sb4.contains("hello world"),
@@ -630,6 +639,7 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"fcap help\r");
     let fh = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
     check!(fh.contains("file-as-capability"), "fcap help: reaches its own message again");
+
 
     // -----------------------------------------------------------------------
     // tab completion of subcommand KEYWORDS (the second token). `observe n<Tab>` → `observe now`;

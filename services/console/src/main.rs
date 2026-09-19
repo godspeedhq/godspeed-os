@@ -70,6 +70,28 @@ const REQ_DIMS: u8 = 1;
 /// the two channels here - by construction rather than by inspecting the payload.
 const REQ_SCROLL: u8 = 2;
 
+/// Request byte: READ the scrollback as data. `[REQ_HISTORY, from_lo, from_hi]`, where `from` is a
+/// line index with 0 = the oldest line still KEPT. The reply is
+/// `[n, total_lo, total_hi, aged]` followed by `n` records of `[len, bytes...]`.
+///
+/// **The difference from `REQ_SCROLL` is which side does the work, and it is the whole reason this
+/// exists.** `REQ_SCROLL` moves this terminal's view, which forces a full repaint before the reply
+/// can be computed - on a 4K panel that is the most expensive operation here, and the caller waits
+/// on it with a deadline from the same core (`backlog/37`). This hands the caller BYTES and lets it
+/// paint its own screen, so the cost on this side is a bounded memcpy out of the ring.
+///
+/// `aged` is a flag rather than a count because only its truth matters to a reader: the history is
+/// BOUNDED (32 KiB / 512 lines), and a view that begins in the middle of a session while presenting
+/// itself as the beginning is the same wrong answer as a truncated directory listing (§26.7).
+const REQ_HISTORY: u8 = 3;
+
+/// Reply buffer for one `REQ_HISTORY`. Under the 4 KiB message ceiling (§8.5) with room to spare,
+/// and large enough that an ordinary screenful takes one or two requests rather than dozens.
+const HISTORY_MAX: usize = 2048;
+
+/// `[n, total_lo, total_hi, aged]`.
+const HISTORY_HDR: usize = 4;
+
 ///
 /// Present because the first hardware boot left a question plain observation could not settle: the
 /// terminal's queue sat full at 16/16 while it reported ~0% CPU, which is the signature of BOTH "too
@@ -416,6 +438,21 @@ fn serve_request(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term:
                 ctx.log("console: returned to live (requested)");
             }
             [view as u8, (view >> 8) as u8, max as u8, (max >> 8) as u8]
+        }
+        Some(&REQ_HISTORY) => {
+            let from = u16::from_le_bytes([req.get(1).copied().unwrap_or(0),
+                                           req.get(2).copied().unwrap_or(0)]) as usize;
+            let mut out = [0u8; HISTORY_MAX];
+            let (n, used, total, aged) = term.history_into(from, &mut out[HISTORY_HDR..]);
+            out[0] = n as u8;
+            out[1] = total as u8;
+            out[2] = (total >> 8) as u8;
+            out[3] = u8::from(aged);
+            let msg = Message::from_bytes(&out[..HISTORY_HDR + used]);
+            if ctx.try_send_by_handle(reply_cap, &msg).is_err() {
+                ctx.log("console: could not reply to a history request - the caller will see it as unavailable");
+            }
+            return;
         }
         _ => {
             ctx.log("console: request with an unknown opcode - dropping it");

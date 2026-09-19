@@ -64,6 +64,7 @@
   - [`churn`](utilities/churn.md)
   - [`docs`](utilities/docs.md)
   - [`paginate`](utilities/paginate.md)
+  - [`scrollback`](utilities/scrollback.md)
 
 # The gsh Language
 

@@ -61,6 +61,7 @@ fails.
 | [`echo`](utilities/echo.md) | write text |
 | [`docs`](utilities/docs.md) | the manual: what the system is, and what you can rely on |
 | [`paginate`](utilities/paginate.md) | read long output a screenful at a time (pipe stage) |
+| [`scrollback`](utilities/scrollback.md) | read back what has scrolled off the screen (also: PgUp) |
 | [`match`](utilities/match.md) | keep the lines that match (the grep-equivalent) |
 | [`count`](utilities/count.md) | how many lines, words, and bytes |
 | [`sort`](utilities/sort.md) | order the lines |

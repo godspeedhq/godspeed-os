@@ -304,7 +304,9 @@ then scroll again.
 - The failure line reports `reacquire ok={true|false}`. "reacquire did not help" was written as
   though the reacquire had succeeded, but nothing checked the return - it covered "the reacquire
   itself failed" equally well, and those are different bugs.
-- `console_state_note`'s doc says what its number can and cannot support.
+- The helper that produced that number said in its own doc what it could and could not support.
+  It has since been DELETED outright, along with the whole shell-side scroll path, when scrollback
+  became a utility - so there is no longer a function to point at here.
 
 Still **OPEN**, and still recorded rather than closed (26.7). What is gone is three wrong answers and
 one instrument that was manufacturing a zero.

@@ -800,225 +800,9 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
-/// Scroll actions, mirroring `services/console/src/term.rs`.
-const SCROLL_LIVE: u8 = 0;
-const SCROLL_UP: u8 = 1;
-const SCROLL_DOWN: u8 = 2;
-const SCROLL_PAGE_UP: u8 = 3;
-const SCROLL_PAGE_DOWN: u8 = 4;
-const SCROLL_TOP: u8 = 5;
-const SCROLL_BOTTOM: u8 = 7;
-
-/// **SCROLLBACK IS A MODE, AND THAT IS WHAT MAKES THE KEYS UNAMBIGUOUS.**
 ///
-/// PgUp enters it, Esc leaves it, and while it is up the shell reads keys HERE rather than through
-/// the line editor. So an arrow means scroll, full stop - no per-keystroke question about which
-/// meaning is live, and the reverse-video bar on screen IS the indicator that tells you which mode
-/// you are in.
-///
-/// The first design claimed Home/End conditionally: at the prompt they edited the line, and while
-/// the view happened to be scrolled they scrolled it. That worked, and it could not be extended to
-/// the ARROWS - which is what a reader reaches for - because Up/Down are command history and are
-/// pressed constantly, so every one of them would have had to ASK the console where the view was
-/// first. On this hardware the console can be 30-40 ms into a repaint when you ask.
-///
-/// A mode removes the question instead of answering it repeatedly. It also gives Home and End back
-/// to the line editor unconditionally, which is where they have always belonged: you cannot be
-/// scrolled at the prompt any more, because being scrolled means being in here.
-///
-/// The key set is `paginate`'s, deliberately - arrows a line, PgUp/PgDn a page, Home/End the ends -
-/// so the two things in this shell that show you more than a screenful work the same way. `q` is
-/// NOT bound: in `paginate` you quit something that is running, here you step back from a view, and
-/// `q` still gets you out anyway because any printable key does.
-/// Say what the CONSOLE was doing when a scroll went unanswered.
-///
-/// **THE PREVIOUS INSTRUMENT COULD NOT SEE THE INTERESTING CASE, and that is why this exists.** The
-/// console reports any PASS - drain plus paint - that runs over 250 ms, but it reports it at the END
-/// of the pass. A console stuck INSIDE one never reaches the report, so an absent line means either
-/// "nothing was slow" or "something was so slow it never finished", and those are opposite answers.
-/// Reading it from the log, I took the absence as proof the console was healthy. It was not proof of
-/// anything.
-///
-/// This asks the KERNEL instead, which is the one party that can answer while the console cannot:
-///
-///   - `Running`            -> the console is executing. It is busy or stuck, and the pass
-///                             instrument will confirm which if it ever completes.
-///   - `BlockRecv`, queue 0 -> it is idle and waiting, and OUR MESSAGE NEVER ARRIVED. That points at
-///                             the send side, not at the console at all.
-///   - `BlockRecv`, queue >0-> it holds the request and is not processing it, which should be
-///                             impossible and would be the most interesting answer of the three.
-///
-/// One `TaskStat` syscall, only on the failure path, so it costs nothing when things work.
-fn console_state_note(ctx: &ServiceContext) -> (&'static str, u8, u8) {
-    let (state, q) = match slot_of(ctx, "console") {
-        Some(slot) => { let st = ctx.task_stat(slot); (st.state_str(), st.queue_depth) }
-        None => ("not-found", 0),
-    };
-    // OUR OWN QUEUE - AND IT IS THE MAIN ENDPOINT'S, NOT THE ONE A REPLY ARRIVES ON.
-    //
-    // This was added to answer "did the reply reach us and sit unread", and it CANNOT answer that.
-    // `request_with_reply*` waits on the REPLY MAILBOX when the task has one (`reply_mailbox`), a
-    // separate endpoint from the task's own; `task_stat` reports one queue per TASK and has no
-    // query for the mailbox. So the `our queue 0` printed on a Dell Wyse was a number about an
-    // endpoint the reply was never going to arrive on - a zero it had not earned, which is the
-    // exact instrument failure this project keeps paying for.
-    //
-    // It is left in, labelled for what it is, because it still answers a real question: whether the
-    // console's reply had somewhere to land at all. What it must never again be read as is evidence
-    // about the reply itself. The mailbox IS measured, by a better instrument than a depth:
-    // `drain_stale_replies` runs before every request and logs loudly if it finds anything, and
-    // across the whole failing run it never fired - so the mailbox was empty and the reply was
-    // never sent. See `backlog/37`.
-    let mine = slot_of(ctx, "shell").map(|s| ctx.task_stat(s).queue_depth).unwrap_or(0);
-    (state, q, mine)
-}
-
-fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
-    // REACQUIRE FIRST, ONCE, BEFORE ANY KEYSTROKE CAN PAY FOR A STALE HANDLE.
-    //
-    // **This is here because removing the retry from `console_scroll` was wrong, and hardware said
-    // so in one run.** The argument for removing it was that a retry is for surviving a peer
-    // RESTART, and "the next `console_dims` reacquires for everyone". Nothing in the scroll path
-    // reacquires, so once the shell's cap went stale EVERY scroll failed, permanently - a Dell Wyse
-    // printed `scrollback: the console did not answer` once a second, indefinitely, with the kernel
-    // reporting `cap::get: ResourceId(102) gen mismatch cap=3 rec=29 liveness=Alive`. Generation 3
-    // against a record at 29: the endpoint was alive and the handle was 26 replacements out of date.
-    //
-    // A stale cap is the NORMAL state here rather than an edge case: `selfcheck` restarts services,
-    // and the shell caches its peer handles (§14.3 - reacquire by name, and it is the client's job).
-    //
-    // Doing it on ENTRY rather than per keystroke is what makes it free. `reacquire_by_name` is a
-    // kernel directory lookup, not a round trip to a service, so it costs a syscall once per PgUp
-    // and leaves every scroll inside the view at a single request. That is why there is still no
-    // retry inside `console_scroll`: a keystroke must never cost two deadlines, and if the console
-    // restarts WHILE the view is open the mode says so and the next PgUp picks up a fresh cap.
-    // A FAILED REACQUIRE IS NOT FATAL AND IS NOT IGNORED EITHER. If the directory lookup misses,
-    // the handle we already hold is untouched - it may still be perfectly good, and this is
-    // precisely the case where it was never stale to begin with. So carry on and let the scroll
-    // itself decide: its failure path already reports honestly. What must not happen is treating a
-    // missed reacquire as a reason to refuse, which would make a working console unusable.
-    // AND WHETHER IT WORKED. The failure line used to say "reacquire did not help", which reads as
-    // "we reacquired and the problem persisted" - but nothing checked the return, so it equally covered
-    // "the reacquire itself failed". Those are different bugs and the log could not tell them
-    // apart (`backlog/37`).
-    let fresh = ctx.reacquire_by_name("console");
-
-    // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
-    let Some((mut view, _)) = ctx.console_scroll(SCROLL_PAGE_UP) else {
-        let (state, q, mine) = console_state_note(ctx);
-        ctx.console_writeln_fmt(format_args!(
-            "scrollback: the console did not answer - not scrolling (console is {}, queue {}; our queue {})",
-            state, q, mine));
-        return;
-    };
-    if view == 0 { return; }
-    loop {
-        let c = ctx.console_read();
-        let action = match c {
-            0x1B => match read_escape_byte(ctx) {
-                // A BARE Escape leaves. A real sequence's bytes are already queued, so this cannot
-                // be confused with an arrow (`read_escape_byte` is the same reader the prompt uses).
-                None => { let _ = ctx.console_scroll(SCROLL_LIVE); return; }
-                Some(b'[') | Some(b'O') => match scroll_csi(ctx) {
-                    Some(a) => a,
-                    None => continue,           // a sequence this view does not use
-                },
-                Some(_) => continue,
-            },
-            // Enter scrolls a line, exactly as it does in `paginate` and in every terminal.
-            b'\r' | b'\n' => SCROLL_DOWN,
-            // ANY PRINTABLE KEY LEAVES AND THEN TYPES ITSELF, so starting to type a command gets you
-            // out without a separate thought. Everything else (Tab, Backspace, Ctrl+C) leaves and is
-            // dropped: they edit a line, and there is no line being edited up here.
-            _ => {
-                let _ = ctx.console_scroll(SCROLL_LIVE);
-                if (0x20..0x7f).contains(&c) { line.insert(ctx, c); }
-                return;
-            }
-        };
-        match ctx.console_scroll(action) {
-            Some((v, _)) => {
-                // Offset 0 is NOT an exit. The view stays open at the newest line - the bar says
-                // `(newest)` - and only Esc or a printable key leaves. Scrolling down to the bottom
-                // and being thrown out was the surprise this removes.
-                view = v;
-                let _ = view;
-            }
-            // THE CONSOLE DID NOT ANSWER. Do NOT read that as "we are at live" - that is precisely
-            // the bug this arm exists to remove, and it left the screen showing history while the
-            // shell went back to the prompt. Say so and leave.
-            //
-            // Printing IS the repair: console output snaps the view back to live
-            // (`Term::put_bytes`), so the one action that reports the failure is also the one that
-            // puts the display right. If the console is gone entirely the message does not land
-            // either, but then the screen is frozen regardless and nothing here could help.
-            None => {
-                // ONE REACQUIRE-AND-RETRY, AND IT IS A MEASUREMENT AS MUCH AS A RECOVERY.
-                //
-                // `backlog/37`: on hardware the console reports `BlockRecv, queue 0` while every
-                // scroll times out - idle, waiting, and the message never even ENQUEUED on its
-                // endpoint. A send that the kernel accepts, does not error on, and never delivers is
-                // consistent with exactly one thing: it is going somewhere else. A handle that names
-                // an endpoint which exists, is alive, and nobody reads.
-                //
-                // So retry with a freshly resolved one. Whichever way it goes is informative:
-                //
-                //   it works  -> the handle was the fault, and this is also the recovery
-                //   it fails  -> the handle is fine and the fault is downstream of it
-                //
-                // Only on the failure path, so a keystroke still costs one deadline in the normal
-                // case and two only when something is already wrong.
-                let again = ctx.reacquire_by_name("console") && ctx.console_scroll(action).is_some();
-                if again {
-                    ctx.console_writeln(
-                        "scrollback: the console needed a fresh handle - reacquired, carry on");
-                    continue;
-                }
-                let (state, q, mine) = console_state_note(ctx);
-                ctx.console_writeln_fmt(format_args!(
-                    "scrollback: the console stopped answering - left the view (console is {}, queue {}; our queue {}; reacquire ok={fresh})",
-                    state, q, mine));
-                return;
-            }
-        }
-    }
-}
-
-/// The body of an escape sequence, as a scroll action. `None` for anything this view ignores.
-fn scroll_csi(ctx: &ServiceContext) -> Option<u8> {
-    const CSI_MAX: usize = 8;
-    let mut param: u16 = 0;
-    let mut final_byte = 0u8;
-    for _ in 0..CSI_MAX {
-        let c = ctx.console_read();
-        if c.is_ascii_digit() {
-            param = param.saturating_mul(10).saturating_add((c - b'0') as u16);
-        } else if c == b';' {
-            continue;
-        } else {
-            final_byte = c;
-            break;
-        }
-    }
-    match final_byte {
-        b'A' => Some(SCROLL_UP),
-        b'B' => Some(SCROLL_DOWN),
-        b'H' => Some(SCROLL_TOP),
-        // End goes to the NEWEST line and stays in the view. Leaving is Esc's job, and only Esc's:
-        // `End` used to exit, so the key named "end" could not take you to the end and leave you
-        // there. Two different states, two different keys.
-        b'F' => Some(SCROLL_BOTTOM),
-        b'~' => match param {
-            1 | 7 => Some(SCROLL_TOP),
-            4 | 8 => Some(SCROLL_BOTTOM),
-            5 => Some(SCROLL_PAGE_UP),
-            6 => Some(SCROLL_PAGE_DOWN),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
+/// The `SCROLL_*` action bytes that used to sit here are gone with the code that sent them: the
+/// shell no longer drives the console's view, it opens `scrollback` and reads the ring as data.
 fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
@@ -1076,9 +860,10 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
             1 | 7 => line.home(ctx),   // Home
             4 | 8 => line.end(ctx),    // End
             3     => line.delete(ctx), // Delete (forward delete)
-            // PageUp ENTERS the scrollback view and does not return until Esc, a printable key, or
-            // scrolling back down to live. PageDown from live has nowhere to go, so it is ignored.
-            5     => scrollback_mode(ctx, line),
+            // PageUp OPENS `scrollback`, one page back - the key does what it was pressed for.
+            // PageDown from a live prompt stays inert: you are already at the bottom, and opening a
+            // viewer already scrolled to the end is a no-op dressed as an action.
+            5     => { let _ = cmd_scrollback(ctx, 0, true); line.reprint(ctx); }
             // 2 = Insert, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
             _ => { let _ = have_param; }
         },
@@ -1925,6 +1710,20 @@ impl Line {
 
     /// Clear to an empty line (cursor at 0), erasing what was shown.
     fn clear(&mut self, ctx: &ServiceContext) { self.set(ctx, &[]); }
+
+    /// Put the prompt and the half-typed line back after something OWNED the whole screen.
+    ///
+    /// `set` cannot do this: it starts with an absolute `CHA` to the column after the prompt, which
+    /// assumes the prompt is still on the screen. It is not - `scrollback` clears on the way out,
+    /// the same as `help` and `edit` - so the prompt has to be printed, not jumped to.
+    fn reprint(&self, ctx: &ServiceContext) {
+        ctx.console_write(PROMPT);
+        if self.len > 0 {
+            ctx.console_write(core::str::from_utf8(&self.buf[..self.len]).unwrap_or(""));
+        }
+        // Back to where the cursor actually was, not to the end of the text.
+        for _ in self.cur..self.len { ctx.console_write("\x08"); }
+    }
 }
 
 /// Wait until the input subsystem reports in - the deterministic end-of-boot
@@ -2130,6 +1929,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // asked for something specific and got the general thing with nothing said (§26.7).
         "help"    => cmd_help(ctx, depth, if argc > 1 { args[1] } else { "" }),
         "docs"    => cmd_docs(ctx, depth, if argc > 1 { args[1] } else { "" }),
+        "scrollback" => cmd_scrollback(ctx, depth, false),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
@@ -4766,7 +4566,7 @@ const UTILS: &[&str] = &[
     // HAD help blocks; nothing referred a reader to them. Safe to add: the intercept fires only on
     // exactly `<util> version` / `<util> help` / `<util> <sub> help`, so `events log 5` and
     // `events ipc` still reach their own dispatch untouched.
-    "events", "trace", "docs",
+    "events", "trace", "docs", "scrollback",
     "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -4867,6 +4667,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         // and putting it in UTILS made the intercept above shadow it, so the message `help`'s own
         // row points a reader at ("fcap help") stopped printing. Routed here rather than rewritten
         // into rows, because the four properties it lists are prose, not usage lines.
+        "scrollback" => help_block(ctx, "scrollback", "read back what has scrolled off the screen", &[
+            ("scrollback", "open at the newest line", "scrollback"),
+            ("PgUp (at the prompt)", "the same view, opened one page back", "PgUp"),
+            ("arrows / PgUp / PgDn", "a line, or a page", "PgDn"),
+            ("Home / End, q", "the ends; q or Esc leaves", "q"),
+        ], true),
         "fcap" => cmd_fcap_help(ctx),
         "events" => help_block(ctx, "events", "what the sink RECORDED: logs, IPC traces, metrics", &[
             ("events ipc", "recent IPC exchanges, oldest first", "events ipc"),
@@ -5283,6 +5089,7 @@ static HELP: &[HelpRow] = &[
     Sec("Console"),
     Row("help", "show this message"),
     Row("docs", "the manual: what this system is, and what you can rely on"),
+    Row("scrollback", "read back what has scrolled off the screen (also: PgUp)"),
     Row("<prefix> Tab", "complete a command; if several match, press the shown digit to pick"),
     Row("arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears"),
     Row("clear", "clear the screen"),
@@ -5778,6 +5585,144 @@ fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
         _ => None,
     }
 }
+
+/// One `console_history` reply. Matches `HISTORY_MAX` in `services/console`.
+const SB_FETCH: usize = 2048;
+
+/// `scrollback` - read back what has already scrolled off the screen.
+///
+/// **A UTILITY RATHER THAN A MODE, and the reason is measured rather than aesthetic.** The console
+/// used to own a view offset that the shell drove remotely, one blocking request PER KEYPRESS. Each
+/// of those made the console `paint_view` + `present` BEFORE it could reply - a full repaint of a
+/// 3840x2160 framebuffer, inside the caller's deadline, on the core the caller was blocked on. Hold
+/// PgUp and you issue one of those per key repeat; the shell then declared a console that was merely
+/// busy to be dead (`backlog/37`).
+///
+/// Here the console is only ever asked for BYTES, which is a bounded memcpy out of its ring, and this
+/// paints its own screen with ordinary output - a send, with no deadline on it. A keypress costs no
+/// repaint on the console at all.
+///
+/// It also removes the view offset from the console entirely. That was a second place holding a
+/// derived view of where the operator is looking, which is the thing §26.4 is about, and it was
+/// exactly the state that could disagree with the shell's idea of it.
+///
+/// THE HISTORY IS BOUNDED - 32 KiB or 512 lines, whichever runs out first. When anything has aged
+/// out the status line says so, because a view that starts mid-session while presenting itself as
+/// the beginning is the same wrong answer as a truncated directory listing (§26.7).
+fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<(), ShellError> {
+    let mut buf = [0u8; SB_FETCH];
+    let (_, total0, aged0, _) = match ctx.console_history(0, &mut buf) {
+        Some(v) => v,
+        None => {
+            ctx.console_writeln("scrollback: the console did not answer - no history to show");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let mut total = total0 as usize;
+    let mut aged = aged0;
+    if total == 0 {
+        ctx.console_writeln("scrollback: nothing has scrolled off the screen yet");
+        return Ok(());
+    }
+
+    // NOBODY IS THERE TO PRESS A KEY. Same guard `help`, `docs` and `paginate` carry: a full-screen
+    // view waiting on a keystroke inside a script does not degrade, it hangs the run.
+    if depth > 0 {
+        let mut i = 0usize;
+        while i < total {
+            let (n, _, _, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+            if n == 0 { break; }
+            let mut off = SB_HDR;
+            for _ in 0..n {
+                if off >= k { break; }
+                let ln = (buf[off] as usize).min(k - off - 1);
+                off += 1;
+                ctx.console_writeln(core::str::from_utf8(&buf[off..off + ln]).unwrap_or(""));
+                off += ln;
+                i += 1;
+            }
+        }
+        return Ok(());
+    }
+
+    let (rows, cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let body = rows.saturating_sub(2).max(1);
+    let clip = cols.saturating_sub(1);
+
+    // OPENED ONE PAGE BACK WHEN PgUp BROUGHT US HERE, at the newest line when the command was typed.
+    // The key already meant "go back a page", and making the operator press it twice to see one page
+    // is the interface forgetting what it was just told.
+    let mut top = if page_back { total.saturating_sub(body * 2) } else { total.saturating_sub(body) };
+
+    ctx.console_write("\x1b[?25l");
+    loop {
+        let max_top = total.saturating_sub(body);
+        if top > max_top { top = max_top; }
+        ctx.console_write("\x1b[H");
+        ctx.console_write_fmt(format_args!(
+            "scrollback {} - what has scrolled off the screen\x1b[K\n", UTIL_VERSION));
+
+        let mut frame = FrameBuf::new();
+        let mut drawn = 0usize;
+        let mut i = top;
+        while drawn < body && i < total {
+            let (n, t, a, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+            total = t as usize;
+            aged = a;
+            if n == 0 { break; }
+            let mut off = SB_HDR;
+            for _ in 0..n {
+                if drawn >= body || off >= k { break; }
+                let ln = (buf[off] as usize).min(k - off - 1);
+                off += 1;
+                let mut lb = LineBuf::new();
+                RecordSink::put(&mut lb, &buf[off..off + ln]);
+                // Clipped, never wrapped: a wrapped line pushes every row below it down and makes
+                // the count in the status line a lie about what is on the screen.
+                if lb.n > clip { lb.n = clip; RecordSink::put(&mut lb, b">"); }
+                lb.flush_into(ctx, &mut frame);
+                off += ln;
+                drawn += 1;
+                i += 1;
+            }
+        }
+        while drawn < body { frame.put(ctx, b"\x1b[K\n"); drawn += 1; }
+        frame.flush(ctx);
+
+        ctx.console_write_fmt(format_args!(
+            "[ {}-{} of {}{} ]  [arrows] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit",
+            top + 1, (top + body).min(total), total,
+            if aged { ", older lines aged out" } else { "" }));
+        ctx.console_write("\x1b[J");
+
+        let c = ctx.console_read();
+        match c {
+            b'q' | 0x03 => break,
+            b' ' => top += body,
+            0x1B => match read_escape_byte(ctx) {
+                None => break,                                   // bare Esc leaves, like `q`
+                Some(b'[') | Some(b'O') => match help_csi(ctx) {
+                    Some(HelpKey::Up) => top = top.saturating_sub(1),
+                    Some(HelpKey::Down) => top += 1,
+                    Some(HelpKey::PageUp) => top = top.saturating_sub(body),
+                    Some(HelpKey::PageDown) => top += body,
+                    Some(HelpKey::Top) => top = 0,
+                    Some(HelpKey::End) => top = total.saturating_sub(body),
+                    None => {}
+                },
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
+    Ok(())
+}
+
+/// The 4-byte `[n, total_lo, total_hi, aged]` header on a `console_history` reply.
+const SB_HDR: usize = 4;
 
 /// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
 fn cmd_help(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
