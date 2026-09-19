@@ -1932,6 +1932,33 @@ impl ServiceContext {
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {
         let target = CapHandle(self.find_send_slot(peer)?);
+        // DRAIN ABANDONED REPLIES BEFORE ISSUING, FOR EVERY CALLER.
+        //
+        // `drain_stale_replies` documents this failure precisely and had exactly one caller - `fs` -
+        // so every OTHER service was one timeout away from being permanently broken. The shell was:
+        // a single scroll request that timed out left its reply queued, and from that moment every
+        // request waited out its full deadline and failed, for the rest of the boot. Observed on a
+        // Dell Wyse as `scrollback: the console did not answer` once a second, indefinitely, with the
+        // console sitting idle at `BlockRecv, queue 0` the whole time (`backlog/37`).
+        //
+        // **It is safe here for the reason that function already gives**, and that reason is exactly
+        // why this belongs in the SDK rather than at each call site: `request_with_reply*` enforces
+        // ONE OUTSTANDING REQUEST AT A TIME, so at the instant a new request is issued nothing
+        // legitimate can be waiting in the reply mailbox. Anything present is a reply this service
+        // stopped waiting for. Leaving it to each caller to remember means a caller that forgets is
+        // not slightly worse - it is permanently broken after its first timeout, silently.
+        //
+        // Cheap: a non-blocking `try_recv` that finds nothing in the healthy case, bounded by the
+        // endpoint depth.
+        let dropped = self.drain_stale_replies();
+        if dropped > 0 {
+            // LOUD, because it means a previous request was abandoned and this one would have
+            // inherited its reply. Silent self-repair is how the fs desync stayed invisible for so
+            // long (§26.7 - a recovery that hides what it recovered from is a silent fallback).
+            self.log_fmt(format_args!(
+                "sdk: discarded {} abandoned repl(y/ies) before a request to `{}` - an earlier request timed out",
+                dropped, peer));
+        }
         // Reply mailbox when the task has one, shared endpoint when it does not. The reply cap and the
         // endpoint waited on must name the SAME endpoint, or the kernel's reply-matched dequeue waits
         // for something that will never be delivered there.

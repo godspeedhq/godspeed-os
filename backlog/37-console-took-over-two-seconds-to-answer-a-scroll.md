@@ -1,7 +1,8 @@
 # 37. The console took over two seconds to answer a scroll request, and I do not know why
 
-**Status: OPEN. A reacquire was added and is correct hygiene, but it is NOT established as the
-fix - the reasoning that claimed it was has since been retracted. See the correction below.**
+**Status: SOLVED. A stale reply left in the reply mailbox after one timeout desynced every
+subsequent request, permanently. `drain_stale_replies` existed for this and had one caller; it is
+now called for every caller inside the SDK's request helper.**
 
 > **Update 2026-09-19.** The instrument added for this answered it on the first run, and the answer
 > was not what any of the reasoning below predicted.
@@ -108,6 +109,40 @@ fix - the reasoning that claimed it was has since been retracted. See the correc
 >
 > Only on the failure path, so a keystroke costs one deadline normally and two only when something
 > is already wrong.
+
+> **SOLVED 2026-09-19: the reply mailbox, and it was a latent SDK bug the whole time.**
+>
+> `reacquire did not help`, which eliminated the handle. That left the reply path - and the SDK
+> already documents this failure, by name, with a repair function written for it:
+>
+> > *"The mismatched reply was discarded and the request failed, which leaves this service's own
+> > reply still queued for the NEXT request to find. Every subsequent request then receives its
+> > predecessor's reply, discards it, fails, and queues another: permanently one reply out of phase,
+> > alternating forever... Observed 133 times in one `osdev test peer-storm` run."*
+>
+> That is the signature exactly: works repeatedly, ONE request times out, and from that moment every
+> request fails for the rest of the boot.
+>
+> **`drain_stale_replies` had exactly one caller: `fs`.** Every other service was one timeout away
+> from being permanently broken, and the shell was the one that got there. It is called from
+> `request_with_reply_deadline_into_inner` now, so every caller is repaired rather than every caller
+> having to remember - and it is safe for the reason the function's own comment gives: these helpers
+> enforce ONE outstanding request at a time, so nothing legitimate can be in the mailbox when a new
+> request is issued. Anything there is a reply this service stopped waiting for.
+>
+> It also LOGS when it drops something, because silent self-repair is how the `fs` version of this
+> stayed invisible (§26.7).
+>
+> **Two of my own diagnostics were misleading and are worth recording as such:**
+>
+> - `console is BlockRecv, queue 0` is sampled AFTER the timeout, by which point a healthy console
+>   that received, served and replied is back at exactly that state. It cannot distinguish "never
+>   arrived" from "arrived and was handled". I read it as the former.
+> - The console's long-pass report fires at the END of a pass, so a console stuck inside one never
+>   reaches it. Absence of that line is not evidence of health.
+>
+> Both were built to answer this and both could be read two ways. The one that actually discriminated
+> was the reacquire-and-retry, because it changed something and reported which way it went.
 
 ## What happened
 
