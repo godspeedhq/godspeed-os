@@ -849,11 +849,22 @@ const SCROLL_BOTTOM: u8 = 7;
 ///                             impossible and would be the most interesting answer of the three.
 ///
 /// One `TaskStat` syscall, only on the failure path, so it costs nothing when things work.
-fn console_state_note(ctx: &ServiceContext) -> (&'static str, u8) {
-    match slot_of(ctx, "console") {
+fn console_state_note(ctx: &ServiceContext) -> (&'static str, u8, u8) {
+    let (state, q) = match slot_of(ctx, "console") {
         Some(slot) => { let st = ctx.task_stat(slot); (st.state_str(), st.queue_depth) }
         None => ("not-found", 0),
-    }
+    };
+    // AND OUR OWN QUEUE, which the first version of this omitted and which is the half that can
+    // actually explain a missing REPLY. The console reporting `BlockRecv, queue 0` says it handled
+    // whatever it had and went back to waiting - it does NOT say the reply reached us. If this
+    // shell's own endpoint is full, the console's `try_send` of the reply has nowhere to land and
+    // the caller waits out its deadline for a message that was never deliverable.
+    //
+    // It matters here because `net-stack` was measured taking 21-23 SECONDS in a single serve pass
+    // in the same window (`backlog/28`), and a stalled peer is exactly how unrelated traffic backs
+    // up into a queue that a reply then cannot enter.
+    let mine = slot_of(ctx, "shell").map(|s| ctx.task_stat(s).queue_depth).unwrap_or(0);
+    (state, q, mine)
 }
 
 fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
@@ -884,10 +895,10 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
 
     // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
     let Some((mut view, _)) = ctx.console_scroll(SCROLL_PAGE_UP) else {
-        let (state, q) = console_state_note(ctx);
+        let (state, q, mine) = console_state_note(ctx);
         ctx.console_writeln_fmt(format_args!(
-            "scrollback: the console did not answer - not scrolling (console is {}, queue {})",
-            state, q));
+            "scrollback: the console did not answer - not scrolling (console is {}, queue {}; our queue {})",
+            state, q, mine));
         return;
     };
     if view == 0 { return; }
@@ -953,10 +964,10 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
                         "scrollback: the console needed a fresh handle - reacquired, carry on");
                     continue;
                 }
-                let (state, q) = console_state_note(ctx);
+                let (state, q, mine) = console_state_note(ctx);
                 ctx.console_writeln_fmt(format_args!(
-                    "scrollback: the console stopped answering - left the view (console is {}, queue {}, reacquire did not help)",
-                    state, q));
+                    "scrollback: the console stopped answering - left the view (console is {}, queue {}; our queue {}; reacquire did not help)",
+                    state, q, mine));
                 return;
             }
         }

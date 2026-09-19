@@ -1,8 +1,34 @@
 # 37. The console took over two seconds to answer a scroll request, and I do not know why
 
-**Status: SOLVED. A stale reply left in the reply mailbox after one timeout desynced every
-subsequent request, permanently. `drain_stale_replies` existed for this and had one caller; it is
-now called for every caller inside the SDK's request helper.**
+**Status: STILL OPEN. The reply-mailbox fix below was a real latent bug and is NOT this one - the
+drain never fired on the failing hardware run. New evidence points at `backlog/28`.**
+
+> **2026-09-19, fourth measurement.** The SDK drain was added and the fault reproduced unchanged,
+> with **no `sdk: discarded ... abandoned` line anywhere in the log**. So the reply mailbox was
+> empty and that was never the mechanism here. The fix stays - `drain_stale_replies` having exactly
+> one caller was a genuine latent bug, and the SDK's own comment documents what it costs - but it is
+> not this.
+>
+> **What the same log DOES show, in the same window:**
+>
+> ```
+> net-stack: `time` asked for the clock - no route yet, will retry
+> net-stack: a serve pass took 23412 ms (over 1000) - not asking for client requests during it (#1)
+> net-stack: a serve pass took 21777 ms (over 1000) - not asking for client requests during it (#2)
+> ```
+>
+> **A service blocking for 21-23 seconds in one serve pass.** That is `backlog/28`, already measured
+> and recorded. It is the first thing in any of these logs that is on the right time scale.
+>
+> **And my diagnostic has been reporting the wrong half.** It prints the CONSOLE's queue. The console
+> saying `BlockRecv, queue 0` means it handled whatever it had and went back to waiting - it does NOT
+> say the reply reached the shell. If the SHELL's own endpoint is full, the console's `try_send` of
+> the reply has nowhere to land, the console never errors, and the caller waits out its deadline for
+> a message that was never deliverable. A stalled peer backing unrelated traffic up into that queue
+> is exactly the shape `backlog/28` would produce.
+>
+> The shell now reports `our queue N` alongside. That is the number that has been missing for four
+> rounds of this.
 
 > **Update 2026-09-19.** The instrument added for this answered it on the first run, and the answer
 > was not what any of the reasoning below predicted.
