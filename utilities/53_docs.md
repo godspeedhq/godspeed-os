@@ -50,6 +50,15 @@ went stale.
 | `/` | find; `n` for the next match |
 | `q`, Esc | leave |
 
+`docs <word>` opens with that find already run, so `docs capabilities` lands on the paragraph
+rather than at the top. `help <word>` does the same for the command list. This is **not** a second
+spelling of `<util> help`, which gives one command's detail: it is what `man` means, *find this in
+the manual*. The browser lists the commands, so reading one there and typing `help <it>` is an
+expectation the interface creates - and before this the argument was simply discarded, which made
+"you asked for something specific" and "here is the general thing" the same screen (§26.7).
+A word that matches nothing is reported as `(no match)`; without that, a miss and a hit on the
+first line look identical, because both leave you at the top.
+
 The **section you are in is pinned** at the top. That is the thing a scrollback buffer structurally
 cannot give you: scrolled into the middle of a document you would otherwise have no idea which part
 you were reading. It is the same reason `trace` keeps its own pager, which pins a column header.

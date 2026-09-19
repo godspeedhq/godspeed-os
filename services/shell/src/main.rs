@@ -2057,7 +2057,18 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     // help (`<util> <sub> help`, e.g. `drives flash help`) is intercepted just below.
     if argc == 2 && is_util(args[0]) {
         if args[1] == "version" { util_version(ctx, args[0]); return Ok(()); }
-        if args[1] == "help" { util_help(ctx, args[0]); return Ok(()); }
+        // NOT `let _ =`. A utility in UTILS with no help block used to print nothing at all and
+        // report success - the exact silent discard §26.7 forbids, and how `docs help` went out
+        // mute. Gated by `util_help_coverage_problems` now; this is the runtime half, because a
+        // gate that is added can also be skipped.
+        if args[1] == "help" {
+            if !util_help(ctx, args[0]) {
+                ctx.console_writeln_fmt(format_args!(
+                    "{}: no help block - this is a bug, not a command without help", args[0]));
+                return Err(ShellError::Unknown);
+            }
+            return Ok(());
+        }
     }
     if argc == 3 && args[2] == "help" && is_util(args[0]) {
         if sub_help(ctx, args[0], args[1]) { return Ok(()); }
@@ -2100,8 +2111,15 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     // Dispatch - every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => cmd_help(ctx, depth),
-        "docs"    => cmd_docs(ctx, depth),
+        // `help <word>` OPENS ON THAT WORD. It is not a synonym for `<util> help`, which gives one
+        // command's detail - this is what `man` actually means, "find this in the manual", and it
+        // exists because the browser LISTS the commands: reading `dir` there and typing `help dir`
+        // is an expectation this interface creates, so honouring it is not a POSIX concession.
+        //
+        // It also stops the argument being SILENTLY DISCARDED, which is what happened before: you
+        // asked for something specific and got the general thing with nothing said (§26.7).
+        "help"    => cmd_help(ctx, depth, if argc > 1 { args[1] } else { "" }),
+        "docs"    => cmd_docs(ctx, depth, if argc > 1 { args[1] } else { "" }),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
@@ -4825,7 +4843,21 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
+            ("help <word>", "open the list already scrolled to that word", "help dir"),
         ], true),
+        // `docs` was added to UTILS alongside `events` and `trace` on the note that those two
+        // "already HAD help blocks". It did not, and nothing checked - so `docs help` printed
+        // NOTHING and returned Ok: conventions rule 1 unmet, silently, by the change that was
+        // meant to meet it. `util_help_coverage_problems` is what stops the next one.
+        "docs" => help_block(ctx, "docs", "the manual: what this system is, and what you can rely on", &[
+            ("docs", "open the manual at the top", "docs"),
+            ("docs <word>", "open it already scrolled to that word", "docs capabilities"),
+        ], true),
+        // `fcap` is the opposite failure to `docs` above, and the sharper one: it HAS good help,
+        // and putting it in UTILS made the intercept above shadow it, so the message `help`'s own
+        // row points a reader at ("fcap help") stopped printing. Routed here rather than rewritten
+        // into rows, because the four properties it lists are prose, not usage lines.
+        "fcap" => cmd_fcap_help(ctx),
         "events" => help_block(ctx, "events", "what the sink RECORDED: logs, IPC traces, metrics", &[
             ("events ipc", "recent IPC exchanges, oldest first", "events ipc"),
             ("events failures", "the same, only timeouts and lost peers", "events failures"),
@@ -5395,7 +5427,7 @@ const HELP_FIND_MAX: usize = 32;
 /// It still refuses to open with nobody watching: `depth > 0` means a script, `run`, `assert` or
 /// `selfcheck` is driving, and a browser waiting for a keypress there does not degrade, it HANGS.
 /// The piped form goes through `help_to_out` and never reaches here at all.
-fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str) {
+fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, seek: &str) {
     let total = doc.len() + 1;
     let (rows, _cols) = ctx.console_dims();
     let rows = if rows == 0 { 24 } else { rows as usize };
@@ -5407,6 +5439,23 @@ fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str) {
     let mut about = false;
     let mut find = [0u8; HELP_FIND_MAX];
     let mut find_len = 0usize;
+    // OPENED WITH A TERM: `help dir` lands on `dir` instead of at the top. The search is left ARMED
+    // rather than consumed, so `n` walks the other mentions - a word usually appears in its own row
+    // and again in an example, and stopping at the first would hide the second.
+    // A SEARCH THAT MATCHED NOTHING LOOKS EXACTLY LIKE ONE THAT MATCHED THE FIRST LINE, unless it
+    // says so: both leave you at the top of the document. `help dir` finding nothing and `help dir`
+    // landing on `dir` are then the same screen, which is the silent discard this whole argument
+    // exists to stop (§26.7). The status line reports it.
+    let mut find_hit = true;
+    if !seek.is_empty() {
+        for (i, b) in seek.bytes().enumerate() {
+            if i < find.len() { find[i] = b.to_ascii_lowercase(); find_len = i + 1; }
+        }
+        match help_find_from(doc, &find[..find_len], 1) {
+            Some(hit) => top = hit,
+            None => find_hit = false,
+        }
+    }
     ctx.console_write("\x1b[?25l");                     // hide the cursor for the session
     loop {
         let body = rows.saturating_sub(2).max(1);       // one pinned header, one status line
@@ -5445,9 +5494,10 @@ fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str) {
                 "[ about: what is running HERE, read from the kernel ]   [a] back  [t] contents  [q] quit"));
         } else if find_len > 0 && !toc {
             ctx.console_write_fmt(format_args!(
-                "[ {}-{} of {} ]  find: {}   [n] next  [t] contents  [q] quit",
+                "[ {}-{} of {} ]  find: {}{}   [n] next  [t] contents  [q] quit",
                 top + 1, (top + body).min(total), total,
-                core::str::from_utf8(&find[..find_len]).unwrap_or("?")));
+                core::str::from_utf8(&find[..find_len]).unwrap_or("?"),
+                if find_hit { "" } else { " (no match)" }));
         } else if toc {
             ctx.console_write_fmt(format_args!(
                 "[ contents: {} sections ]  press a digit to jump   [t] back  [q] quit", nsec));
@@ -5470,9 +5520,19 @@ fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str) {
             b'q' | 0x03 => break,
             b't' => { toc = !toc; about = false; }
             b'a' => { about = !about; toc = false; }
-            b'/' => { find_len = help_read_find(ctx, &mut find);
-                      if find_len > 0 { if let Some(hit) = help_find_from(doc, &find[..find_len], top + 1) { top = hit; } } }
-            b'n' => { if find_len > 0 { if let Some(hit) = help_find_from(doc, &find[..find_len], top + 1) { top = hit; } } }
+            b'/' => { find_len = help_read_find(ctx, &mut find); find_hit = true;
+                      if find_len > 0 {
+                          match help_find_from(doc, &find[..find_len], top + 1) {
+                              Some(hit) => top = hit,
+                              None => find_hit = false,
+                          }
+                      } }
+            b'n' => { if find_len > 0 {
+                          match help_find_from(doc, &find[..find_len], top + 1) {
+                              Some(hit) => { top = hit; find_hit = true; }
+                              None => find_hit = false,
+                          }
+                      } }
             b' ' => top += body,
             b'\r' | b'\n' => top += 1,
             0x1B => match read_escape_byte(ctx) {
@@ -5610,7 +5670,7 @@ fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
 }
 
 /// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
-fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
+fn cmd_help(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
     // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert` or `selfcheck` is driving, and a
     // browser that waits for one does not degrade - it hangs the run. Same guard `paginate` carries,
     // and the reason paging belongs to things you ask for rather than things a command decides.
@@ -5618,17 +5678,17 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
         for i in 0..HELP.len() + 1 { help_render_line(ctx, i); }
         return Ok(());
     }
-    help_browser(ctx, HELP, "help");
+    help_browser(ctx, HELP, "help", arg.trim());
     Ok(())
 }
 
 /// `docs` - the manual. Same browser, different document (see `DOCS`).
-fn cmd_docs(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
+fn cmd_docs(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         for i in 0..DOCS.len() + 1 { help_render_line_of(ctx, DOCS, "docs", i); }
         return Ok(());
     }
-    help_browser(ctx, DOCS, "docs");
+    help_browser(ctx, DOCS, "docs", arg.trim());
     Ok(())
 }
 
@@ -13738,7 +13798,8 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
 const FCAP_TMP: &[u8] = b"/.fcap-selftest";
 const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
 fn cmd_fcap_help(ctx: &ServiceContext) {
-    ctx.console_writeln("fcap - file-as-capability self-check (a diagnostic, not a file tool)");
+    ctx.console_writeln_fmt(format_args!(
+        "fcap {} - file-as-capability self-check (a diagnostic, not a file tool)", UTIL_VERSION));
     ctx.console_writeln("");
     ctx.console_writeln("usage: fcap          run the self-check");
     ctx.console_writeln("       fcap help     this message");

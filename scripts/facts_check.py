@@ -253,6 +253,43 @@ def help_coverage_problems():
     return problems
 
 
+def util_help_coverage_problems():
+    """Every utility in UTILS must have a `util_help` BLOCK, not just a mention in `help`.
+
+    `help_coverage_problems` above asks whether a utility is FINDABLE - named somewhere in the
+    `help` list. This asks the other half of conventions rule 1: does `<util> help` actually print
+    anything. They are different failures and the second is worse, because the command answers.
+
+    `docs` shipped failing it. It was added to UTILS in the change that added `events` and `trace`,
+    on the note that those two "already HAD help blocks" - `docs` did not, so `docs help` matched
+    the intercept, fell through `util_help`'s `_ => return false`, printed NOTHING, and returned
+    Ok. A command that answers a question with a blank line and success is worse than one that
+    does not know the word.
+    """
+    import re
+    problems = []
+    src = read("services/shell/src/main.rs")
+    u = re.search(r"const UTILS: &\[&str\] = &\[(.*?)\n\];", src, re.S)
+    h = re.search(r"fn util_help\(.*?\n\}\n", src, re.S)
+    if not u or not h:
+        problems.append("util help coverage: could not find UTILS or fn util_help in "
+                        "services/shell/src/main.rs (renamed? this check cannot pass vacuously)")
+        return problems
+    utils = sorted(set(re.findall(r'"([a-z0-9_-]+)"', u.group(1))))
+    # An arm is `"name" =>` or a grouped `c @ ("sum" | "min" | ...) =>`; either way the name is a
+    # quoted word inside the match, so collecting every quoted word is enough to answer "is there
+    # an arm for this utility" without parsing Rust.
+    armed = set(re.findall(r'"([a-z0-9_-]+)"', h.group(0)))
+    missing = [x for x in utils if x not in armed]
+    if missing:
+        problems.append(
+            "util help coverage: %d utilit(y/ies) in UTILS have no `util_help` block - %s. "
+            "`<util> help` matches the intercept, finds no arm, and prints NOTHING while "
+            "reporting success (conventions rule 1)."
+            % (len(missing), ", ".join(missing)))
+    return problems
+
+
 def budget_ordering_problems():
     """net-stack must answer a request BEFORE its client stops waiting.
 
@@ -445,7 +482,8 @@ def main():
     bad = []
 
     tree = (porting_tree_problems() + budget_ordering_problems() + wire_format_problems()
-            + help_coverage_problems() + help_philosophy_problems())
+            + help_coverage_problems() + util_help_coverage_problems()
+            + help_philosophy_problems())
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))
@@ -466,7 +504,11 @@ def main():
                             bad.append((name, source, rel, line_no, "says %d, code says %d" % (got, truth)))
 
     if tree:
-        print("docs/porting.md's TREE disagrees with the ratchet it claims to reflect:")
+        # NOT a porting.md header. This list collects six unrelated code-versus-code checks, and
+        # printing one check's name over another's failure sends the reader to the wrong file -
+        # `util help coverage` arrived under "docs/porting.md's TREE disagrees", which is a checker
+        # lying about what it found.
+        print("code-versus-code checks disagree:")
         print()
         for t in tree:
             print("  %s" % t)

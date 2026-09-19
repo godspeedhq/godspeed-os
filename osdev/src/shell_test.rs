@@ -564,6 +564,54 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
 
+    // `help <word>` AND `docs <word>` OPEN ON THAT WORD.
+    //
+    // NOT a synonym for `<util> help`, which gives one command's detail - this is what `man`
+    // means, "find this in the manual", and it exists because the browser LISTS the commands:
+    // reading `dir` there and typing `help dir` is an expectation this interface creates. What it
+    // replaced was worse than either reading: the argument was SILENTLY DISCARDED and you got the
+    // general thing with nothing said.
+    //
+    // `dir`'s own row is the FIRST match in the document, so landing on it proves the term moved
+    // the view rather than being echoed at the top. Waits on `[n] next` - the find status line,
+    // which the plain document view does not print.
+    send(&mut write_half, b"help dir\r");
+    let hd = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(hd.contains("find: dir"), "help <word>: opens with the term armed");
+    check!(hd.contains("|   Storage"), "help <word>: ...and scrolled to it, not at the top");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+
+    // A TERM THAT MATCHES NOTHING SAYS SO. Both cases leave you at the top of the document, so
+    // without this the screen for "found nothing" and the screen for "found the first line" are
+    // identical - the silent discard again, one layer in.
+    send(&mut write_half, b"help zqxjv\r");
+    let hn = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(hn.contains("(no match)"), "help <word>: a term that matches nothing says so");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+
+    send(&mut write_half, b"docs capabilities\r");
+    let dd = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(dd.contains("find: capabilities"), "docs <word>: the manual takes one too");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+
+    // `<util> help` FOR THE TWO THAT PRINTED NOTHING.
+    //
+    // `docs` and `fcap` are in UTILS, so `<util> help` is intercepted for them - and neither had a
+    // `util_help` arm, so the intercept printed NOTHING and returned success. `fcap` was the worse
+    // of the two: it HAS good help, which putting it in UTILS shadowed, while `help`'s own row
+    // went on pointing a reader at `fcap help`. Gated by `util_help_coverage_problems` now; these
+    // two are the runtime half, because a gate that is added can also be skipped.
+    send(&mut write_half, b"docs help\r");
+    let dh = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(dh.contains("docs <word>"), "docs help: prints a usage block, not a blank line");
+
+    send(&mut write_half, b"fcap help\r");
+    let fh = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(fh.contains("file-as-capability"), "fcap help: reaches its own message again");
+
     // -----------------------------------------------------------------------
     // tab completion of subcommand KEYWORDS (the second token). `observe n<Tab>` → `observe now`;
     // an ambiguous prefix shows the numbered menu (a digit selects), same UX as command/path

@@ -22,6 +22,17 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    aliases. A tolerated-but-undocumented synonym would itself be a hidden, unsaid
    rule - the silent behaviour the system forbids (§26.4, §26.5). `-h` is simply
    `unknown:`, and that response *teaches* the real word.
+
+   **`help <word>` and `docs <word>` are not an exception to this**, and the
+   distinction is worth stating because it looks like one. `<util> help` gives one
+   command's detail and remains the only way to ask for that. `help dir` does
+   something else: it opens the browsable list already scrolled to `dir`, which is
+   what `man` actually means - *find this in the manual*. It exists because the
+   browser LISTS the commands, so reading `dir` there and typing `help dir` is an
+   expectation this interface creates; and because the alternative was worse than
+   either reading, since the argument used to be discarded in silence. A word that
+   matches nothing says `(no match)` rather than sitting at the top looking like a
+   hit.
 4. **Subcommands are words, never single-letter flags.** `observe now`, not
    `observe -n`. A word means the same thing across every utility; flag letters
    collide and drift (`-n` = "now" here, "number" there). This is the `ls -Sslah`
