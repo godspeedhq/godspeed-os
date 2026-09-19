@@ -83,12 +83,71 @@ const COMRESET_HOLD_CYCLES: u64 = 4_000_000;
 /// The truth is the register; the clock only bounds how long we will believe it might still arrive.
 const LINK_WAIT_CYCLES: u64 = 400_000_000;
 
+/// Blocks the cache holds. `TXN_CAP` in `fs` is 56, so 64 holds a whole journal transaction and the
+/// model does not spill in the middle of one - a cache that evicts mid-transaction would be testing
+/// the eviction, not the barrier.
+#[cfg(feature = "volatile-cache-test")]
+const VC_SLOTS: usize = 64;
+
+/// A VOLATILE WRITE CACHE: acknowledged writes that are not yet on the medium (carnage §3.3).
+///
+/// **THIS IS THE ONE FAULT QEMU CANNOT MODEL FOR US, AND IT IS THE ONE `CLAUDE.md` §6.1 SAYS THE
+/// WHOLE GUARANTEE TURNS ON.** A power-cut suite against a QEMU disk cuts a medium that already has
+/// every acknowledged write - so the tests can pass for a reason that does not hold on real
+/// hardware, where a drive may acknowledge a write into a cache it has not yet committed. §6.1 makes
+/// crash recovery explicitly BACKEND-CONDITIONAL for exactly this reason, and until now nothing
+/// exercised the conditional half.
+///
+/// The model is deliberately literal: a write is buffered and answered OK; it reaches the device
+/// only when `fs` asks for the barrier it already declares (`OP_FLUSH`). The buffer is guest RAM, so
+/// cutting the machine loses precisely what a real cache would lose, with no host-side cooperation
+/// needed.
+///
+/// **Reads are served from it**, because a real drive cache does. Without that, `fs` would read back
+/// stale blocks it had just written and any damage would be an artefact of the model rather than a
+/// property of the filesystem.
+///
+/// Eviction writes the oldest slot through and SAYS SO. A silent eviction would make the cache
+/// quietly stronger than it claims, which is the failure mode of every fault injector that flatters
+/// the system under test.
+#[cfg(feature = "volatile-cache-test")]
+struct WriteCache {
+    lba: core::cell::RefCell<[u64; VC_SLOTS]>,
+    blk: core::cell::RefCell<[[u8; 512]; VC_SLOTS]>,
+    n:   Cell<usize>,
+    spilled: Cell<u32>,
+}
+
+#[cfg(feature = "volatile-cache-test")]
+impl WriteCache {
+    fn new() -> Self {
+        WriteCache {
+            lba: core::cell::RefCell::new([u64::MAX; VC_SLOTS]),
+            blk: core::cell::RefCell::new([[0u8; 512]; VC_SLOTS]),
+            n: Cell::new(0),
+            spilled: Cell::new(0),
+        }
+    }
+    /// Index of `lba` if it is held.
+    fn find(&self, lba: u64) -> Option<usize> {
+        let l = self.lba.borrow();
+        (0..self.n.get()).find(|&i| l[i] == lba)
+    }
+}
+
 struct Ahci<'a> {
     hba: &'a Mmio,
     arena: Dma,
     port: u32,
     /// Total addressable 512-byte sectors, from IDENTIFY. Served on OP_CAPACITY.
     sectors: Cell<u64>,
+    /// Owned here, like `forced_fails` - never a static (Commandment VI). Absent entirely on a
+    /// shipping build, so a released driver cannot defer a write.
+    #[cfg(feature = "volatile-cache-test")]
+    cache: WriteCache,
+    /// One-shot, so the lie is announced once rather than per barrier.
+    #[cfg(feature = "lying-flush-test")]
+    lied: Cell<bool>,
     /// Test-only (`io-error-test` build): force the next N read/write commands to fail, to
     /// exercise the retry + recovery path. Always 0 in production.
     forced_fails: Cell<u32>,
@@ -483,6 +542,85 @@ impl<'a> Ahci<'a> {
 
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
+    /// Buffer a write instead of issuing it. `false` = not cached, do the real write.
+    ///
+    /// Evicts the oldest slot by writing it THROUGH, and says so: an injector that quietly grows
+    /// stronger than it claims is worse than none.
+    #[cfg(feature = "volatile-cache-test")]
+    fn cache_write(&self, ctx: &ServiceContext, lba: u64, data: &[u8]) -> bool {
+        if let Some(i) = self.cache.find(lba) {
+            self.cache.blk.borrow_mut()[i][..data.len().min(512)]
+                .copy_from_slice(&data[..data.len().min(512)]);
+            return true;
+        }
+        if self.cache.n.get() == VC_SLOTS {
+            // Oldest through to the medium, so the cache stays bounded (§26.6.1).
+            let (elba, eblk) = {
+                let l = self.cache.lba.borrow();
+                let b = self.cache.blk.borrow();
+                (l[0], b[0])
+            };
+            let _ = self.write_block(ctx, elba, &eblk);
+            self.cache.spilled.set(self.cache.spilled.get() + 1);
+            if self.cache.spilled.get() == 1 {
+                ctx.log("block-driver: [volatile-cache] the cache filled - oldest blocks are being written THROUGH (the model is weaker from here)");
+            }
+            let mut l = self.cache.lba.borrow_mut();
+            let mut b = self.cache.blk.borrow_mut();
+            for i in 1..VC_SLOTS { l[i - 1] = l[i]; b[i - 1] = b[i]; }
+            self.cache.n.set(VC_SLOTS - 1);
+        }
+        let i = self.cache.n.get();
+        self.cache.lba.borrow_mut()[i] = lba;
+        let n = data.len().min(512);
+        self.cache.blk.borrow_mut()[i][..n].copy_from_slice(&data[..n]);
+        self.cache.n.set(i + 1);
+        true
+    }
+
+    /// Serve a read from the cache if it holds that block - a real drive cache does.
+    #[cfg(feature = "volatile-cache-test")]
+    fn cache_read(&self, lba: u64, out: &mut [u8]) -> bool {
+        match self.cache.find(lba) {
+            Some(i) => { let b = self.cache.blk.borrow(); let n = out.len().min(512);
+                         out[..n].copy_from_slice(&b[i][..n]); true }
+            None => false,
+        }
+    }
+
+    /// Commit everything held, then let the caller issue the real device flush.
+    #[cfg(feature = "volatile-cache-test")]
+    fn cache_commit(&self, ctx: &ServiceContext) {
+        // THE DRIVE THAT ACCEPTS THE BARRIER AND DOES NOTHING - `CLAUDE.md` §6.1's unguaranteed
+        // case, and the Pi 2's USB stick exactly (it refuses `SYNCHRONIZE CACHE` outright).
+        //
+        // This is what the journal's `data_crc` was built for. With an HONEST cache the check can
+        // never fire: staged blocks and the commit record that authorises them land together at the
+        // same barrier, so a cut leaves both or neither. Only when durability happens by EVICTION,
+        // in whatever order that falls, can a commit record survive while its payload does not -
+        // and that is the state `fs` must refuse to apply rather than copy garbage over live
+        // metadata. Nothing had ever put it in that state.
+        #[cfg(feature = "lying-flush-test")]
+        {
+            if !self.lied.get() {
+                self.lied.set(true);
+                ctx.log("block-driver: [lying-flush] this drive ACCEPTS the barrier and commits NOTHING - durability is by eviction only");
+            }
+            return;
+        }
+        #[cfg(not(feature = "lying-flush-test"))]
+        {
+        let n = self.cache.n.get();
+        if n == 0 { return; }
+        for i in 0..n {
+            let (lba, blk) = { (self.cache.lba.borrow()[i], self.cache.blk.borrow()[i]) };
+            let _ = self.write_block(ctx, lba, &blk);
+        }
+        self.cache.n.set(0);
+        ctx.log_fmt(format_args!("block-driver: [volatile-cache] barrier - {} cached block(s) committed", n));
+        }
+    }
+
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
         use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
         let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
@@ -507,6 +645,10 @@ impl<'a> Ahci<'a> {
             // sent was an ASSERTED guarantee rather than an earned one, and that is the silent
             // fallback §26.7 forbids - the caller cannot tell a flush that happened from one that
             // did not. It costs three lines to answer honestly, so it answers honestly.
+            // THE BARRIER IS WHERE THE CACHE BECOMES DURABLE, which is the whole model: everything
+            // acknowledged since the last one reaches the medium here and nowhere else.
+            #[cfg(feature = "volatile-cache-test")]
+            self.cache_commit(ctx);
             let st = match self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0) {
                 Ok(()) => STATUS_OK,
                 Err(_) => STATUS_ERR,
@@ -530,6 +672,16 @@ impl<'a> Ahci<'a> {
             OP_READ_BLOCK => {
                 let mut out = [0u8; 1 + 512];
                 let mut sec = [0u8; 512];
+                // FROM THE CACHE IF IT IS THERE - a real drive cache serves reads, and without this
+                // `fs` would read back stale blocks it had just written, making any damage an
+                // artefact of the model rather than a property of the filesystem.
+                #[cfg(feature = "volatile-cache-test")]
+                if self.cache_read(lba, &mut sec) {
+                    out[0] = STATUS_OK;
+                    out[1..].copy_from_slice(&sec);
+                    reply.send(ctx, &out);
+                    return;
+                }
                 match self.read_block(ctx, lba, &mut sec) {
                     Ok(()) => {
                         out[0] = STATUS_OK;
@@ -546,6 +698,14 @@ impl<'a> Ahci<'a> {
                 }
                 let mut sec = [0u8; 512];
                 sec.copy_from_slice(&p[9..9 + 512]);
+                // ACKNOWLEDGED, NOT DURABLE. The block sits in guest RAM until `fs` asks for the
+                // barrier it already declares; cutting the machine loses exactly what a real drive
+                // cache would lose (carnage §3.3, CLAUDE.md §6.1).
+                #[cfg(feature = "volatile-cache-test")]
+                if self.cache_write(ctx, lba, &sec) {
+                    reply.send(ctx, &[STATUS_OK]);
+                    return;
+                }
                 let status = match self.write_block(ctx, lba, &sec) {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
@@ -727,6 +887,8 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // mount exercise the retry/recovery path. Always 0 (no injection) in production.
     let forced = if cfg!(feature = "io-error-test") { 2 } else { 0 };
     let ahci = Ahci { hba, arena, port, sectors: Cell::new(0), forced_fails: Cell::new(forced),
+                      #[cfg(feature = "volatile-cache-test")] cache: WriteCache::new(),
+                      #[cfg(feature = "lying-flush-test")] lied: Cell::new(false),
                       tap_seq: Cell::new(0) };
     ahci.init_port(ctx);
 

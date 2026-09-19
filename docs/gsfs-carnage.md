@@ -289,11 +289,43 @@ interrupted seal must be able to finish rather than be refused).
   (`fs-large` and `fs-frag` cover those, against assertions about GSFS).
 - **No concurrency**, which §3.5 explains is narrower than it sounds anyway.
 
-### 3.3 Crash at every persistence boundary - PARTIAL
+### 3.3 Crash at every persistence boundary - PARTIAL (`fs-cache` 8/0, `fs-lyingflush` 7/0)
 
-3.1 does this for three operations, exhaustively. The remaining work is the other operations, the
-reordered/delayed/failed variants, and the volatile-write-cache model: an acknowledged write is not
-durable without the declared barrier, and the test must be able to express the difference.
+3.1 does this for three operations, exhaustively. The remaining work is the other operations and the
+reordered/delayed/failed variants.
+
+**BUILT: the volatile-write-cache model**, which was the item on this list that mattered most.
+
+Every other power-cut suite cuts a QEMU disk that already holds every acknowledged write. That is
+not how a drive behaves, and it is not what the guarantee is conditioned on: `CLAUDE.md` §6.1 makes
+crash recovery explicitly **backend-conditional** - it holds where the device attests durability and
+does not where the device will not honour a flush. So `fs-window` and `fs-churn` test the favourable
+half only, and **could have been passing for a reason that evaporates on hardware.**
+
+Two drives are modelled, and the difference between them is the whole point:
+
+| suite | the drive | what must hold |
+|---|---|---|
+| `fs-cache` | honours the barrier: a write is acknowledged into guest RAM and reaches the medium at `OP_FLUSH` | the full guarantee - mounts, `0 bad`, no dangerous bitmap drift, barriered data intact |
+| `fs-lyingflush` | **accepts the barrier and commits nothing** - the Pi 2's USB stick exactly, which refuses `SYNCHRONIZE CACHE` | only what §6.1 still promises: damage is DETECTED and named, never silently believed, and no live block is marked free |
+
+The cache is guest RAM, so cutting the machine loses precisely what a real cache would lose with no
+host-side cooperation. Reads are served from it, because a real drive cache does - without that,
+`fs` would read back stale blocks it had just written and any damage would be an artefact of the
+model rather than a property of the filesystem. Eviction writes through and SAYS SO: an injector
+that quietly grows stronger than it claims is worse than none.
+
+**What `fs-lyingflush` must NOT assert is `0 bad`.** §6.1 withholds recovery for that medium and says
+a power loss may require a reformat; asserting the guarantee anyway would be the test contradicting
+the constitution. What it asserts instead is the part that survives - metadata stays CRC-checked, so
+damage is detected rather than believed, and the one unrecoverable drift (a live block marked free)
+never happens.
+
+**Honest limit: the `data_crc` refusal has not yet been made to fire.** `fs` recomputes a CRC over
+the staged payload and refuses to apply a transaction the device did not durably write - the defence
+added after this filesystem "has been destroyed repeatedly to prove it". Reaching it needs the cut to
+land in a specific window, and both runs so far fell outside one (reported by the suite, not
+assumed). The state is now REACHABLE, which it was not before; making it reliable is further work.
 
 **Killing `fs` is a service-restart test, not a power-loss simulation.** Recorded here because it is
 the mistake this whole programme exists to stop repeating: `fs-restart` is a good test of a different
@@ -658,6 +690,8 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Block-driver killed WITH REQUESTS OUTSTANDING | **`fs-blockdeath` 11/0** | 3.7. Noticed in 201 ms against a 30 s deadline - woken, not timed out |
 | Hot-unplug / device disappearance mid-write | NOT RUN | 3.7. Needs the DEVICE to vanish (QEMU `device_del`), not the driver |
 | A destructive op whose REPLY is lost, then retried | **`fs-dupop` 5/0** | 3.5. Found a live gap: a succeeded `move` reported as failed. Fixed at the client |
+| Power cut on a drive with a VOLATILE WRITE CACHE | **`fs-cache` 8/0** | 3.3. The first suite to cut a medium that had not yet committed what it acknowledged |
+| Power cut on a drive that IGNORES the barrier | **`fs-lyingflush` 7/0** | 3.3 / 6.1's unguaranteed case. Asserts detection, not recovery |
 | Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |

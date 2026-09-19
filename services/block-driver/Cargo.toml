@@ -14,6 +14,12 @@ path = "src/main.rs"
 io-error-test = []
 # Phase 3.7: corrupt the COMPLETION stream rather than the device. See `completion_fault`.
 completion-chaos = []
+# Carnage §3.3: model a drive with a VOLATILE WRITE CACHE - acknowledged is not durable until the
+# declared barrier. See `WriteCache` in src/ahci.rs.
+volatile-cache-test = []
+# ...and the drive that ACCEPTS the barrier and does nothing (CLAUDE.md 6.1's unguaranteed case).
+# Implies the cache; durability then happens only by eviction, in whatever order that falls.
+lying-flush-test = ["volatile-cache-test"]
 
 # Log every sector this driver writes - LBA, order and content - to the serial log, so the host
 # can reconstruct the exact disk state after any prefix of an operation's writes and boot it.

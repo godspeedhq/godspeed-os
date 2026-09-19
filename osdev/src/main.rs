@@ -1457,6 +1457,8 @@ fn cmd_test(suite: &str) {
         "fs-blockchaos"  => run_fs_blockchaos_test(),
         "fs-blockdeath"  => run_fs_blockdeath_test(),
         "fs-dupop"       => run_fs_dupop_test(),
+        "fs-cache"       => run_fs_cache_test(),
+        "fs-lyingflush"  => run_fs_lyingflush_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
         // because `osdev test` takes exactly one argument and widening that for one suite would be
         // the wrong trade.
@@ -2847,6 +2849,9 @@ fn run_fs_all_tests() {
         // §3.5. Not a device fault at all - a DESTRUCTIVE op whose reply is lost, and what the
         // client does next. It found a real gap and the fix is in the shell, not the filesystem.
         "fs-dupop",
+        // §3.3. The only suite that cuts a drive which had NOT yet committed what it acknowledged.
+        "fs-cache",
+        "fs-lyingflush",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
@@ -3349,6 +3354,42 @@ fn run_fs_compat_test() {
 /// transient error (the boot self-test read still succeeds) - and that normal operation is
 /// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
 /// be injected.
+/// Carnage §3.3: a power cut against a drive with a VOLATILE WRITE CACHE.
+fn run_fs_cache_test() {
+    println!("\n=== fs: power cut with a VOLATILE WRITE CACHE - acknowledged is not durable (§3.3) ===");
+    build_blockdev_fs("", "volatile-cache-test");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_cache.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_cache(&image_path, persist, 4, false);
+}
+
+/// Carnage §3.3: the drive that ACCEPTS the barrier and commits nothing.
+///
+/// `CLAUDE.md` §6.1 withholds the recovery guarantee for exactly this medium, so this suite asserts
+/// what still holds rather than what does not: damage is DETECTED and named, never silently
+/// believed, and no live block is marked free.
+fn run_fs_lyingflush_test() {
+    println!("\n=== fs: the drive that ACCEPTS the barrier and does nothing (§3.3, §6.1) ===");
+    build_blockdev_fs("", "lying-flush-test");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_lyingflush.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_cache(&image_path, persist, 4, true);
+}
+
 /// Carnage §3.5: a destructive op whose reply is lost, and the retry that follows.
 fn run_fs_dupop_test() {
     println!("\n=== fs: a COMPLETED move loses its reply - what does the client do? (§3.5) ===");

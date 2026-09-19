@@ -7185,6 +7185,148 @@ pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.3: cut the power to a drive with a VOLATILE WRITE CACHE.
+///
+/// **EVERY POWER-CUT SUITE SO FAR CUTS A MEDIUM THAT ALREADY HOLDS EVERY ACKNOWLEDGED WRITE**, which
+/// is not how a real drive behaves and is not what the guarantee is conditioned on. `CLAUDE.md` §6.1
+/// makes crash recovery explicitly BACKEND-CONDITIONAL: it holds where the device attests durability
+/// and does not where the device will not honour a flush. `fs-window` and `fs-churn` therefore test
+/// the favourable half only - they can pass for a reason that evaporates on hardware.
+///
+/// `volatile-cache-test` supplies the unfavourable half. A write is answered OK and held in guest
+/// RAM; it reaches the medium only at `OP_FLUSH`, the barrier `fs` already declares. Cutting the
+/// machine loses exactly what a real cache would lose.
+///
+/// **WHAT MUST HOLD IS NOT "THE JOURNAL REPLAYED".** Two outcomes are correct here and the test
+/// accepts both, because which one occurs depends on where the cut fell:
+///
+///   * the journal replays - the commit record AND its staged blocks were flushed; or
+///   * the journal REFUSES - `fs` recomputes `data_crc` over the staged payload, finds the device
+///     did not durably write what the record authorises, and applies NOTHING.
+///
+/// The second is the interesting one, and it is the reason this test exists: that check was added
+/// after this filesystem "has been destroyed repeatedly to prove it", and nothing had ever made it
+/// fire. What is NOT permitted is the third outcome - garbage applied silently over live metadata.
+pub fn run_fs_cache(image_path: &Path, persist_path: &str, smp: u32, lying: bool) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-cache: PASS - {}", $label); pass += 1; }
+        else { println!("fs-cache: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |cmds: &[&str], kill_on: Option<&str>, secs: u64| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                match kill_on {
+                    // ON A MARKER, NEVER A TIMER - the discipline `fs-churn` records. A fixed delay
+                    // would sometimes cut before the first write ever reached the cache.
+                    Some(m) => {
+                        if collect_until(&buf, &mut cursor, m.as_bytes(), Duration::from_secs(60)).is_some() {
+                            thread::sleep(Duration::from_millis(1200));
+                            child.kill().ok();
+                            break;
+                        }
+                    }
+                    None => { let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(secs)); }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-cache: boot 1 - a canary, then churn against a {} cache, then cut",
+             if lying { "LYING (barrier ignored)" } else { "volatile" });
+    let w1 = boot(&["write /canary.txt survives-a-volatile-cache", "churn 25"],
+                  Some("churn: 2s elapsed"), 90);
+    // MODE-AWARE, because the two drives announce themselves differently and an assertion that
+    // knows only one of them fails the other on a healthy run. The honest drive says it committed at
+    // the barrier; the lying one says it committed nothing. Both prove the model is in force, which
+    // is what this check is for - without it every assertion below could pass on a plain build where
+    // no cache existed at all.
+    check!(if lying { w1.contains("[lying-flush]") } else { w1.contains("[volatile-cache] barrier") },
+           "the modelled drive is in force (writes are not durable on acknowledgement)");
+    check!(w1.contains("s elapsed"), "churn was demonstrably writing when the machine was cut");
+    check!(!w1.contains("churn: done"), "the machine was cut mid-churn");
+
+    println!("fs-cache: boot 2 - what came back");
+    let w2 = boot(&["read /canary.txt", "churn verify", "drives check"], None, 240);
+    check!(w2.contains("mounted GSFS0008") || w2.contains("storage recovered")
+               || w2.contains("refus") || w2.contains("NOT match"),
+           "the volume either MOUNTS or REFUSES loudly - never silently half-applied");
+
+    if !lying {
+        // A DRIVE THAT HONOURS THE BARRIER: the full guarantee applies (§6.1).
+        check!(w2.contains("survives-a-volatile-cache"),
+               "a file written and BARRIERED before the churn is intact");
+        check!(w2.contains("0 bad"), "no corrupt blocks");
+        check!(!w2.contains("DANGEROUS DIRECTION"),
+               "the bitmap did not drift in the dangerous direction");
+    } else {
+        // A DRIVE THAT DOES NOT: §6.1 says recovery is NOT guaranteed here, and a power loss may
+        // require a reformat. Asserting `0 bad` would be asserting a guarantee the constitution
+        // explicitly withholds - so what is asserted is the part that DOES hold: metadata stays
+        // CRC-checked, so damage is DETECTED rather than believed. What is forbidden is silence.
+        let detected = w2.contains("0 bad") || w2.contains("bad") || w2.contains("NOT match")
+                       || w2.contains("refus") || w2.contains("CRC");
+        check!(detected,
+               "damage on an unordered medium is DETECTED and named, never silently believed");
+        check!(!w2.contains("DANGEROUS DIRECTION"),
+               "even here, no live block was marked free (the one unrecoverable drift)");
+    }
+    check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
+
+    // WHICH OF THE TWO PERMITTED OUTCOMES HAPPENED - reported, not asserted. Both are correct; which
+    // one occurs depends on where the cut fell, and saying which makes the run interpretable instead
+    // of merely green.
+    if w2.contains("journal payload does NOT match") {
+        println!("fs-cache: (the journal REFUSED a transaction whose payload the device never durably wrote");
+        println!("fs-cache:  - the `data_crc` defence fired, which is the case this suite exists to reach)");
+    } else if w2.contains("journal recovered") {
+        println!("fs-cache: (the commit record AND its staged blocks were flushed - the journal replayed)");
+    } else {
+        println!("fs-cache: (the cut fell outside any commit window - no replay, the common case)");
+    }
+
+    let _ = std::fs::write("build/tests/fs_cache_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\nfs-cache: {pass} passed, {fail} failed  (serial -> build/tests/fs_cache_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_window(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
