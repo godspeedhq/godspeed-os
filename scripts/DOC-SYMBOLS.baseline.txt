@@ -7,16 +7,11 @@
 # This file may SHRINK freely - the checker says so when it can. It may not grow without
 # somebody deciding the new entry is one of those two things.
 
-CONFIG_MODULE_SIG                  # docs/service-ownership.md
 CONSOLE_RENDER                     # docs/console-service.md
 FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
-LLVM_PROFILE_FILE                  # docs/verification-road-map.md
 MAX_FILES                          # docs/persistence.md
 NET_KIND                           # docs/arm32-status.md
-NO_HZ                              # docs/power.md
-SCI_EN                             # utilities/14_poweroff.md
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
-aarch64_built                      # docs/aarch64.md
 async_bulk_watchdog                # docs/arm32-usb-userspace.md
 bot_command                        # docs/arm32-status.md, docs/arm32-usb-userspace.md
 bot_recover                        # docs/arm32-usb-userspace.md
@@ -24,20 +19,14 @@ chan_dma                           # docs/arm32-usb-userspace.md
 chan_program                       # docs/arm32-usb-userspace.md
 configure_cdc_ecm                  # docs/arm32-status.md
 configure_smsc95xx                 # docs/arm32-status.md
-contract_authority_debt            # docs/x-residue.md
 ctrl_xfer                          # docs/arm32-usb-userspace.md
 decode_report                      # docs/arm32-status.md
 dims_packed                        # docs/console-service.md
 dir_read                           # docs/persistence.md
-doc_refs                           # backlog/17-riscv64-port-shared-surface.md
 dropped_log_count                  # backlog/04-serial-splice.md
 entry_table_blocks                 # docs/persistence.md
-first_byte                         # utilities/46_trace.md, utilities/47_events.md
 fs_record                          # docs/persistence.md
 gpu_mem                            # docs/aarch64.md
-hw_pci_bar                         # backlog/20-audit-followups-code-and-config.md
-hw_pci_irq                         # backlog/20-audit-followups-code-and-config.md
-introspect_queries                 # docs/observability.md
 ipc_send_remote                    # CLAUDE.md, docs/cluster-design.md
 link_poll                          # docs/arm32-usb-userspace.md
 log_did_not_receive                # CLAUDE.md
@@ -53,14 +42,9 @@ pci_cfg_write                      # backlog/25-pci-selector-layout-is-packed-ab
 reacquire_via_registry             # docs/naming-design.md
 recover_or_revive                  # docs/arm32-usb-userspace.md
 registry_lookup                    # docs/naming-design.md
-riscv64_built                      # backlog/20-audit-followups-code-and-config.md
-send_remote                        # CLAUDE.md, docs/cluster-design.md
 service_config_by_name             # docs/naming-design.md
-site_check                         # backlog/17-riscv64-port-shared-surface.md
 size_bytes                         # docs/persistence.md
 spawn_init                         # docs/naming-design.md
 spawn_pong                         # docs/service-ownership.md
-utility_vocab_debt                 # docs/x-residue.md
-workflow_dispatch                  # CLAUDE.md, backlog/32-the-fs-suites-run-in-no-gate.md
 write_file                         # docs/persistence.md
 write_hfnum                        # docs/arm32-usb-userspace.md

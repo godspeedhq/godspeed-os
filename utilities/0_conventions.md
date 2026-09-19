@@ -71,6 +71,20 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    listing. So a new utility is exactly one of: a **path** command (in neither list), a **keyword**
    command with specific subcommands (`SUBCMD_FIRST` + `NO_PATH_CMDS`), or an **info** command
    (`INFO_CMDS`). Pick one; `version`/`help` come along in every case.
+10a. **A bare letter is a control ONLY where letters are not text.** Full-screen surfaces divide
+    cleanly in two, and the apparent inconsistency between them is forced rather than an oversight:
+
+    - **Read-only views** - `help`, `docs`, `paginate`, the console's scrollback - take `q` and
+      `Esc` to leave, because nothing there is typing and a letter is free to mean something.
+    - **Typing surfaces** - `edit` - cannot. A bare `q` must insert the letter `q`, so leaving and
+      saving need a modifier: `^Q` and `^S`.
+
+    **NAVIGATION IS THE SAME EVERYWHERE, and that is the part that must not drift**: arrows move a
+    line, PgUp/PgDn a page, Home/End the ends. `edit` already matches `help`, `docs`, `paginate` and
+    the scrollback view key for key on all five. Somebody "fixing" `edit` to quit on `q` would break
+    the only rule that actually distinguishes them, so the rule is written down rather than left to
+    be inferred from two examples that look contradictory.
+
 10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
     to the prompt, and a wait of more than a moment advertises `[q] quit`. A command

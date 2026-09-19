@@ -233,16 +233,10 @@ fn banner() {
     // render as garbage on a machine with no serial port, which is exactly where a boot banner
     // matters most. 71 columns, chosen to fit an 80-column line with margin: the floor wraps rather
     // than scrolling sideways.
-    crate::kprintln!(r"
-  _____             _                                _   ____    _____
- / ____|           | |                              | | / __ \  / ____|
-| |  __   ___    __| |  ___   _ __    ___   ___   __| || |  | || (___
-| | |_ | / _ \  / _` | / __| | '_ \  / _ \ / _ \ / _` || |  | | \___ \
-| |__| || (_) || (_| | \__ \ | |_) ||  __/|  __/| (_| || |__| | ____) |
- \_____| \___/  \__,_| |___/ | .__/  \___| \___| \__,_| \____/ |_____/
-                             | |
-                             |_|
-");
+    // ONE SOURCE FOR THE ART. The shell's `help` shows the same banner, and a second copy of eight
+    // lines of ASCII is a second copy that drifts - this session has already spent a day on numbers
+    // that rotted because nobody re-took them. Both crates `include_str!` the same file.
+    crate::kprintln!("{}", include_str!("../../assets/godspeed-banner.txt"));
     crate::kprintln!("GodspeedOS {} {} ({}) - kernel", env!("CARGO_PKG_VERSION"),
                      env!("GODSPEED_TARGET_ARCH"), env!("GODSPEED_GIT_SHA"));
     // Bounded, on the stack, no heap (§26.6.1). 64 covers the x86 brand string (48 bytes) with room

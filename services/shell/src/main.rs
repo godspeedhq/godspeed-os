@@ -2100,7 +2100,8 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     // Dispatch - every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => cmd_help(ctx),
+        "help"    => cmd_help(ctx, depth),
+        "docs"    => cmd_docs(ctx, depth),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
@@ -4737,7 +4738,7 @@ const UTILS: &[&str] = &[
     // HAD help blocks; nothing referred a reader to them. Safe to add: the intercept fires only on
     // exactly `<util> version` / `<util> help` / `<util> <sub> help`, so `events log 5` and
     // `events ipc` still reach their own dispatch untouched.
-    "events", "trace",
+    "events", "trace", "docs",
     "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5177,10 +5178,69 @@ enum HelpRow {
     Row(&'static str, &'static str),
 }
 use HelpRow::*;
+/// THE MANUAL. `help` is a reference you consult mid-task; this is a document you read once.
+///
+/// **They were one thing for about an hour and that was the wrong shape.** A philosophy section
+/// inside `help` means `help` opens on prose when you wanted the word for `dir`'s byte counts, and
+/// it makes `help` the place everything explanatory accumulates - the dumping ground §4.4 and §26.2
+/// exist to prevent. Splitting them gives each one job. `help` names this one on its first screen,
+/// so a newcomer still finds it by typing the obvious thing.
+///
+/// Same browser, different document: the contents, search and keys are parameterised, not copied.
+static DOCS: &[HelpRow] = &[
+    Gap,
+    // The six responsibilities below restate `CLAUDE.md` §4.3, and a restatement rots - nine
+    // commands had just fallen out of `help` with nothing watching. So it is GATED:
+    // `scripts/facts_check.py` derives the six from the constitution, using the same slice
+    // `commandments.py` uses, and fails if this text stops naming one.
+    //
+    // The conceptual diagram stays deliberately small for the same reason. The one that CANNOT
+    // drift - drawn live from the kernel - is `[a]`.
+    Sec("What this is"),
+    Text("  A capability microkernel. Authority is never ambient: a program can do exactly what it"),
+    Text("  was handed a capability for, and nothing else - there is no root, and no way to ask."),
+    Text(""),
+    Text("      applications            replaceable, restartable"),
+    Text("      services                shell - fs - console - net-stack - drivers"),
+    Text("      supervisor              restarts anything that dies (itself included)"),
+    Text("      kernel                  MISCIS, and nothing else"),
+    Text("      arch/<isa>              the only code that knows which machine this is"),
+    Gap,
+    Sec("MISCIS - the whole of what the kernel does"),
+    Text("  Said like `misses`:"),
+    Text("      memory isolation, IPC, scheduling, capabilities, interrupts, SMP routing."),
+    Text(""),
+    Text("  A filesystem, a network stack and a display driver are NOT in that list, so they are"),
+    Text("  ordinary services out here. Killing one is a restart, not a reboot - and the only"),
+    Text("  thing that cannot be restarted is the kernel itself."),
+    Gap,
+    Sec("What you can rely on"),
+    Text("  Failures are loud, never silent. A command that could not do what you asked says so"),
+    Text("  and says why; nothing retries behind your back or quietly does something smaller."),
+    Text(""),
+    Text("  Bounded by design: fixed queues, no heap, and a limit reached is REPORTED. A listing"),
+    Text("  that cannot fit, a disk that cannot take a write, a walk too deep - each says so"),
+    Text("  rather than returning a smaller answer that looks complete."),
+    Text(""),
+    Text("  A file is a real capability, not a number the filesystem trusts you about. `fcap`"),
+    Text("  opens one and proves it: read through it, then watch a read-only one refuse to write."),
+    Gap,
+    Sec("Seeing it work"),
+    Text("  status            every service, its core, its state, its memory"),
+    Text("  trace deps        who talks to whom, live"),
+    Text("  chaos             kill things on purpose and watch them come back"),
+    Text("  selfcheck         a few hundred assertions about this machine, right now"),
+    Text("  drives check      the filesystem's structure, rebuilt from the tree and compared"),
+    Text(""),
+    Text("  Press [a] for what is running on THIS machine, read live from the kernel."),
+    Gap,
+];
+
 static HELP: &[HelpRow] = &[
     Gap,
     Sec("Console"),
     Row("help", "show this message"),
+    Row("docs", "the manual: what this system is, and what you can rely on"),
     Row("<prefix> Tab", "complete a command; if several match, press the shown digit to pick"),
     Row("arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears"),
     Row("clear", "clear the screen"),
@@ -5235,6 +5295,9 @@ static HELP: &[HelpRow] = &[
     Row("count [path]", "count lines/words/bytes (also: <prod> | count)"),
     Row("sort [reverse] [path]", "order lines (also: <prod> | sort)"),
     Row("first / last [N] [path]", "keep first/last N lines (also: <prod> |)"),
+    Row("seal <path> [yes]", "freeze a file's bytes forever - there is no unseal"),
+    Row("churn <seconds>", "hammer the filesystem so a power cut lands somewhere"),
+    Row("churn verify / tear / reset", "after a cut: torn? | make one torn, to prove it can tell | clean up"),
     Gap,
     Sec("Pipes"),
     Row("<producer> | [filter |…] <sink>", "compose stages (Appendix D)"),
@@ -5242,12 +5305,18 @@ static HELP: &[HelpRow] = &[
     Row("  e.g. tree / | write /out", "capture output to a file"),
     Row("  e.g. greet | upper | write /g", "producer | filter | sink"),
     Row("  e.g. read /long | paginate", "read long output a screenful at a time"),
+    Row("input <prompt>", "read one line from the operator, for a script"),
     Gap,
     Sec("Records (typed pipes - docs/records.md)"),
     Row("status | where mem>0", "filter the task table by field (=,!=,>,<,~)"),
     Row("status | select name state", "keep only some columns"),
     Row("status | sort [reverse] mem", "order rows by a column"),
     Row("status | to json | to yaml", "render the table (default: a grid)"),
+    Row("read /x.json | from json", "parse text INTO records - the other direction"),
+    Row("status | sum|min|max|avg mem", "reduce a numeric column; non-numeric is loud, never a silent 0"),
+    Gap,
+    Sec("Network"),
+    Row("sock", "open a UDP socket as a real capability and send through it"),
     Gap,
     Sec("Power"),
     Row("reboot", "hardware reset"),
@@ -5270,13 +5339,16 @@ static HELP: &[HelpRow] = &[
 /// wipe the tail of a longer previous frame; nothing repaints in place any more, and every caller
 /// was passing `false`. A parameter whose other branch is unreachable is a lie about what the
 /// function can do.
-fn help_render_line(ctx: &ServiceContext, idx: usize) {
+fn help_render_line(ctx: &ServiceContext, idx: usize) { help_render_line_of(ctx, HELP, "help", idx) }
+
+/// One line of `doc`. Line 0 is the title; the rest index the table.
+fn help_render_line_of(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, idx: usize) {
     let eol = "";
     if idx == 0 {
-        // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
-        ctx.console_write_fmt(format_args!("help {} - GodspeedOS shell commands", UTIL_VERSION));
+        // Rule 6 (0_conventions.md): a utility's first line of output is `<util> <version>`.
+        ctx.console_write_fmt(format_args!("{} {} - GodspeedOS", title, UTIL_VERSION));
     } else {
-        match &HELP[idx - 1] {
+        match &doc[idx - 1] {
             Gap => {}
             Sec(s) | Text(s) => ctx.console_write(s),
             // One "  command  description" row, left-justified to a fixed width so the
@@ -5288,23 +5360,275 @@ fn help_render_line(ctx: &ServiceContext, idx: usize) {
     ctx.console_write("\n");
 }
 
-/// `help` - print the command reference. **It does not page, and that is the change.**
+/// Sections of `help`, as (line index, name). Derived from `HELP` itself, so a section added to the
+/// table appears in the table of contents with nothing else to edit.
+fn help_sections(doc: &'static [HelpRow],
+                 out: &mut [(usize, &'static str); HELP_SECTIONS_MAX]) -> usize {
+    let mut n = 0usize;
+    for (i, row) in doc.iter().enumerate() {
+        if let Sec(name) = row {
+            if n < out.len() { out[n] = (i + 1, name); n += 1; }   // +1: line 0 is the title
+        }
+    }
+    n
+}
+
+/// Most sections the contents view can list. `help` has eight; the ceiling is stated rather than
+/// assumed, and a section past it is dropped from the CONTENTS only - never from the document.
+const HELP_SECTIONS_MAX: usize = 24;
+
+/// Longest search term the browser keeps. A term nobody would type past is not a limit anybody
+/// meets, and a fixed buffer is the bounded shape (§26.6.1).
+const HELP_FIND_MAX: usize = 32;
+
+/// `help` - a BROWSABLE document rather than printed output.
 ///
-/// It paged for a long time, for a reason that was true when it was written and is not now: the
-/// framebuffer console had no scrollback, so an interactive `help` taller than the screen scrolled
-/// its own top off permanently. The console service RETAINS that history (`docs/console-service.md`
-/// §10) and PgUp walks it - hardware-verified on a Dell Wyse, 2026-09-18, which is the condition
-/// this removal was held against.
+/// **Why this is a browser and `dir` is not.** `help` is not a long command output that happened to
+/// scroll past - that is what the console's scrollback is for, and why `help`'s old pager was
+/// removed. It is a DOCUMENT: you arrive wanting one section, not the top. A table of contents, a
+/// search and a pinned "where am I" line are things scrollback structurally cannot give you, which
+/// is the same reason `trace` keeps its own pager (it pins a column header).
 ///
-/// So there are two ways to read a long `help` now, and neither is a mode this command enters on
-/// your behalf: **scroll back** to what went past, or ask for `help | paginate` before it does. A
-/// command that pages itself has to GUESS whether a human is watching, and the guess is wrong
-/// exactly when it matters - which is why `paginate` is a stage you ask for.
+/// Keys: arrows scroll a line, PgUp/PgDn a page, Home/End the ends, `t` the contents (then a digit
+/// to jump), `/` search, `n` the next match, `q` or Esc to leave.
 ///
-/// `depth` is gone with the pager. It existed to answer "is anybody there to press a key", and
-/// nothing here waits for a key any more.
-fn cmd_help(ctx: &ServiceContext) -> Result<(), ShellError> {
-    for i in 0..HELP.len() + 1 { help_render_line(ctx, i); }  // +1 for the header line
+/// It still refuses to open with nobody watching: `depth > 0` means a script, `run`, `assert` or
+/// `selfcheck` is driving, and a browser waiting for a keypress there does not degrade, it HANGS.
+/// The piped form goes through `help_to_out` and never reaches here at all.
+fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str) {
+    let total = doc.len() + 1;
+    let (rows, _cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let mut secs = [(0usize, ""); HELP_SECTIONS_MAX];
+    let nsec = help_sections(doc, &mut secs);
+
+    let mut top = 0usize;
+    let mut toc = false;
+    let mut about = false;
+    let mut find = [0u8; HELP_FIND_MAX];
+    let mut find_len = 0usize;
+    ctx.console_write("\x1b[?25l");                     // hide the cursor for the session
+    loop {
+        let body = rows.saturating_sub(2).max(1);       // one pinned header, one status line
+        ctx.console_write("\x1b[H");
+        // PINNED: which section you are in. This is the half a scrollback cannot do - scrolled into
+        // the middle of a document you would otherwise have no idea which part you are reading.
+        // The section the TOP OF THE BODY is in. At line 0 no section has begun yet, but the body
+        // visibly starts inside the first one - reporting nothing there would be technically true
+        // and useless, which is the wrong trade for a line whose whole job is "where am I".
+        let mut cur = if nsec > 0 { secs[0].1 } else { "" };
+        for i in 0..nsec { if secs[i].0 <= top { cur = secs[i].1; } }
+        ctx.console_write_fmt(format_args!(
+            "{} {} - GodspeedOS{}{}\x1b[K\n",
+            title, UTIL_VERSION,
+            if cur.is_empty() { "" } else { "   |   " }, cur));
+
+        if about {
+            help_about(ctx, body);
+        } else if toc {
+            for i in 0..body {
+                if i < nsec {
+                    ctx.console_write_fmt(format_args!("  {}. {}\x1b[K\n", i + 1, secs[i].1));
+                } else {
+                    ctx.console_write("\x1b[K\n");
+                }
+            }
+        } else {
+            let max_top = total.saturating_sub(body);
+            if top > max_top { top = max_top; }
+            for i in top..(top + body).min(total) { help_render_line_of(ctx, doc, title, i); }
+            for _ in (top + body).min(total)..(top + body) { ctx.console_write("\x1b[K\n"); }
+        }
+
+        if about {
+            ctx.console_write_fmt(format_args!(
+                "[ about: what is running HERE, read from the kernel ]   [a] back  [t] contents  [q] quit"));
+        } else if find_len > 0 && !toc {
+            ctx.console_write_fmt(format_args!(
+                "[ {}-{} of {} ]  find: {}   [n] next  [t] contents  [q] quit",
+                top + 1, (top + body).min(total), total,
+                core::str::from_utf8(&find[..find_len]).unwrap_or("?")));
+        } else if toc {
+            ctx.console_write_fmt(format_args!(
+                "[ contents: {} sections ]  press a digit to jump   [t] back  [q] quit", nsec));
+        } else {
+            ctx.console_write_fmt(format_args!(
+                "[ {}-{} of {} ]  [arrows] line  [PgUp/PgDn] page  [t] contents  [a] about  [/] find  [q] quit",
+                top + 1, (top + body).min(total), total));
+        }
+        ctx.console_write("\x1b[J");
+
+        let c = ctx.console_read();
+        // A digit while the contents are open jumps to that section - the "go to a section with a
+        // keypress" this exists for.
+        if toc && c.is_ascii_digit() {
+            let k = (c - b'0') as usize;
+            if k >= 1 && k <= nsec { top = secs[k - 1].0; toc = false; }
+            continue;
+        }
+        match c {
+            b'q' | 0x03 => break,
+            b't' => { toc = !toc; about = false; }
+            b'a' => { about = !about; toc = false; }
+            b'/' => { find_len = help_read_find(ctx, &mut find);
+                      if find_len > 0 { if let Some(hit) = help_find_from(doc, &find[..find_len], top + 1) { top = hit; } } }
+            b'n' => { if find_len > 0 { if let Some(hit) = help_find_from(doc, &find[..find_len], top + 1) { top = hit; } } }
+            b' ' => top += body,
+            b'\r' | b'\n' => top += 1,
+            0x1B => match read_escape_byte(ctx) {
+                None => break,                                   // bare Esc leaves, like `q`
+                Some(b'[') | Some(b'O') => match help_csi(ctx) {
+                    Some(HelpKey::Up) => top = top.saturating_sub(1),
+                    Some(HelpKey::Down) => top += 1,
+                    Some(HelpKey::PageUp) => top = top.saturating_sub(body),
+                    Some(HelpKey::PageDown) => top += body,
+                    Some(HelpKey::Top) => top = 0,
+                    Some(HelpKey::End) => top = total.saturating_sub(body),
+                    None => {}
+                },
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
+}
+
+/// `help`'s about view: the banner, and the architecture OF THIS MACHINE.
+///
+/// **The architecture is drawn from live state, not drawn by hand, and that is the whole point.**
+/// A hand-drawn box diagram would be a second copy of `CLAUDE.md` §4.1 and would rot exactly the way
+/// nine commands rotted out of `help` itself with nothing watching. This asks the kernel what is
+/// actually running, on which core, in what state - so it cannot be wrong, it describes the machine
+/// in front of you rather than an idealised one, and it needs no gate to keep it honest.
+///
+/// The banner is `include_str!` of the same file the kernel prints at boot. One source: a second
+/// copy of eight lines of ASCII is still a second copy.
+fn help_about(ctx: &ServiceContext, body: usize) {
+    let mut drawn = 0usize;
+    for line in include_str!("../../../assets/godspeed-banner.txt").lines() {
+        if drawn < body { ctx.console_write_fmt(format_args!("{}\x1b[K\n", line)); drawn += 1; }
+    }
+    if drawn < body { ctx.console_write("\x1b[K\n"); drawn += 1; }
+    if drawn < body {
+        ctx.console_write_fmt(format_args!(
+            "  kernel   MISCIS: memory isolation, IPC, scheduling, capabilities, interrupts, SMP routing\x1b[K\n"));
+        drawn += 1;
+    }
+    if drawn < body {
+        ctx.console_write("  ---------------------------------------------------------------------------\x1b[K\n");
+        drawn += 1;
+    }
+    // One row per core, listing what the KERNEL says is there. `cores` is the live count.
+    let ncore = ctx.inspect_core_count().max(1);
+    for core in 0..ncore {
+        if drawn >= body { break; }
+        ctx.console_write_fmt(format_args!("  core {}  ", core));
+        let mut n = 0usize;
+        for slot in 0..64u32 {
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 4 /* Dead */ || st.core as u32 != core { continue; }
+            if n == 4 { ctx.console_write(" ..."); break; }          // one line per core, bounded
+            ctx.console_write_fmt(format_args!(" {}", st.name_str()));
+            n += 1;
+        }
+        ctx.console_write("\x1b[K\n");
+        drawn += 1;
+    }
+    while drawn < body { ctx.console_write("\x1b[K\n"); drawn += 1; }
+}
+
+/// Read a search term at the bottom of the screen. Backspace edits; Enter accepts; Esc cancels.
+fn help_read_find(ctx: &ServiceContext, buf: &mut [u8; HELP_FIND_MAX]) -> usize {
+    let mut n = 0usize;
+    loop {
+        ctx.console_write_fmt(format_args!(
+            "\rfind: {}\x1b[K", core::str::from_utf8(&buf[..n]).unwrap_or("")));
+        match ctx.console_read() {
+            b'\r' | b'\n' => return n,
+            0x1B => return 0,                                   // cancelled
+            0x7f | 0x08 => { n = n.saturating_sub(1); }
+            c if (0x20..0x7f).contains(&c) && n < buf.len() => { buf[n] = c.to_ascii_lowercase(); n += 1; }
+            _ => {}
+        }
+    }
+}
+
+/// First help line at or after `from` whose text contains `needle` (case-insensitive).
+fn help_find_from(doc: &'static [HelpRow], needle: &[u8], from: usize) -> Option<usize> {
+    let total = doc.len() + 1;
+    // Wraps once, so a search started near the bottom still finds an earlier match rather than
+    // reporting nothing - a find that silently refuses to wrap reads as a find that is broken.
+    for step in 0..total {
+        let i = (from + step) % total;
+        if i == 0 { continue; }
+        let hit = match &doc[i - 1] {
+            Gap => false,
+            Sec(t) | Text(t) => contains_ci(t.as_bytes(), needle),
+            Row(a, b) => contains_ci(a.as_bytes(), needle) || contains_ci(b.as_bytes(), needle),
+        };
+        if hit { return Some(i); }
+    }
+    None
+}
+
+/// Case-insensitive substring, ASCII. No allocation - `help` is static text and this runs per line.
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() { return false; }
+    for w in 0..=(hay.len() - needle.len()) {
+        if (0..needle.len()).all(|k| hay[w + k].to_ascii_lowercase() == needle[k]) { return true; }
+    }
+    false
+}
+
+enum HelpKey { Up, Down, PageUp, PageDown, Top, End }
+
+/// The body of an escape sequence, as a browser key.
+fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
+    let mut param: u16 = 0;
+    let mut fin = 0u8;
+    for _ in 0..8 {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() { param = param.saturating_mul(10).saturating_add((c - b'0') as u16); }
+        else if c == b';' { continue; }
+        else { fin = c; break; }
+    }
+    match fin {
+        b'A' => Some(HelpKey::Up),
+        b'B' => Some(HelpKey::Down),
+        b'H' => Some(HelpKey::Top),
+        b'F' => Some(HelpKey::End),
+        b'~' => match param {
+            1 | 7 => Some(HelpKey::Top),
+            4 | 8 => Some(HelpKey::End),
+            5 => Some(HelpKey::PageUp),
+            6 => Some(HelpKey::PageDown),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
+fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
+    // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert` or `selfcheck` is driving, and a
+    // browser that waits for one does not degrade - it hangs the run. Same guard `paginate` carries,
+    // and the reason paging belongs to things you ask for rather than things a command decides.
+    if depth > 0 {
+        for i in 0..HELP.len() + 1 { help_render_line(ctx, i); }
+        return Ok(());
+    }
+    help_browser(ctx, HELP, "help");
+    Ok(())
+}
+
+/// `docs` - the manual. Same browser, different document (see `DOCS`).
+fn cmd_docs(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
+    if depth > 0 {
+        for i in 0..DOCS.len() + 1 { help_render_line_of(ctx, DOCS, "docs", i); }
+        return Ok(());
+    }
+    help_browser(ctx, DOCS, "docs");
     Ok(())
 }
 

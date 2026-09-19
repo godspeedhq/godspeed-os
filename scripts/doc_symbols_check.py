@@ -31,7 +31,11 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "DOC-SYMBOLS.baseline.txt")
 
-SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "osdev/src", "examples"]
+# `scripts/` is SOURCE here too. Docs legitimately name the checkers - "gated by
+# `help_philosophy_problems`" is exactly the kind of cross-reference this gate should be validating,
+# not refusing. Scanning only Rust made a correct reference look like a stale one, which is the
+# false positive that gets a checker ignored.
+SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "osdev/src", "examples", "scripts"]
 DOC_DIRS = ["docs", "utilities", "backlog"]
 DOC_FILES = ["CLAUDE.md", "COMMANDMENTS.md", "README.md", "osdev/CLAUDE.md"]
 
@@ -54,7 +58,8 @@ def source_text():
         for dirpath, _, names in os.walk(os.path.join(ROOT, d)):
             if "target" in dirpath.split(os.sep):
                 continue
-            files.extend(os.path.join(dirpath, n) for n in names if n.endswith(".rs"))
+            files.extend(os.path.join(dirpath, n) for n in names
+                         if n.endswith(".rs") or n.endswith(".py"))
     return "\n".join(read(f) for f in files), len(files)
 
 

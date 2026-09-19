@@ -59,6 +59,7 @@ fails.
 | | |
 |---|---|
 | [`echo`](utilities/echo.md) | write text |
+| [`docs`](utilities/docs.md) | the manual: what the system is, and what you can rely on |
 | [`paginate`](utilities/paginate.md) | read long output a screenful at a time (pipe stage) |
 | [`match`](utilities/match.md) | keep the lines that match (the grep-equivalent) |
 | [`count`](utilities/count.md) | how many lines, words, and bytes |

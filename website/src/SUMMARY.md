@@ -62,6 +62,7 @@
   - [`trace`](utilities/trace.md)
   - [`events`](utilities/events.md)
   - [`churn`](utilities/churn.md)
+  - [`docs`](utilities/docs.md)
   - [`paginate`](utilities/paginate.md)
 
 # The gsh Language

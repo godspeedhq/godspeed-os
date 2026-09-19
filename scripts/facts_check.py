@@ -167,6 +167,92 @@ def wire_format_problems():
     return problems
 
 
+def help_philosophy_problems():
+    """`help`'s Philosophy section must name all six kernel responsibilities.
+
+    It restates MISCIS, which is `CLAUDE.md` §4.3 - and a restatement is a copy that rots. This
+    derives the six from the CONSTITUTION (the same list `scripts/commandments.py` parses, so there
+    is one source) and fails if the help text stops naming one.
+
+    It is what makes the copy affordable. The alternative was to leave the architecture out of
+    `help` entirely, or to draw it by hand and hope - and nine commands had just fallen out of this
+    very table with nothing watching, which is not a hope worth repeating.
+    """
+    import re
+    problems = []
+    claude = read("CLAUDE.md")
+    # SLICED EXACTLY AS `commandments.py` SLICES IT, because there must be one way to read this list.
+    # The first version here used its own regex and the `- **MISCIS**` suffix on the heading broke it
+    # immediately: two parsers for one fact is the same mistake as two copies of the fact.
+    try:
+        scope = claude[claude.index("### 4.3 Kernel Scope"):claude.index("### 4.4 Kernel Anti-Scope")]
+    except ValueError:
+        problems.append("help philosophy: cannot find CLAUDE.md 4.3 - the six responsibilities "
+                        "cannot be read from the constitution, and an unverifiable law is a "
+                        "failure, never a pass")
+        return problems
+    wanted = []
+    for ln in scope.split("\n"):
+        ln = ln.strip()
+        if ln.startswith("- "):
+            wanted.append(ln[2:].split("(")[0].strip().lower().split()[0])
+    src = read("services/shell/src/main.rs")
+    # The MANUAL, not `help` - they were split so each has one job (see `DOCS` in the shell).
+    # THE MANUAL, not `help`. They were split so each has one job: `help` is a reference consulted
+    # mid-task, `docs` is a document read once, and a philosophy section inside `help` made `help`
+    # open on prose when somebody wanted a command word.
+    ph = re.search(r"static DOCS: &\[HelpRow\] = &\[(.*?)\n\];", src, re.S)
+    if not ph:
+        problems.append("help philosophy: no DOCS document in the shell (renamed? this check "
+                        "cannot pass vacuously)")
+        return problems
+    text = ph.group(1).lower()
+    missing = [w for w in wanted if w not in text]
+    if missing:
+        problems.append(
+            "help philosophy: the section does not name %d of the six kernel responsibilities "
+            "from CLAUDE.md 4.3 - %s. MISCIS is the whole of what the kernel does; a help text "
+            "that drops one teaches a different system."
+            % (len(missing), ", ".join(missing)))
+    return problems
+
+
+def help_coverage_problems():
+    """Every utility the shell answers must appear somewhere in `help`.
+
+    A third CODE-versus-CODE check, and the one with the most obvious failure mode: `help` is the
+    front door, it is edited by hand, and nothing compared it to the command set. Nine utilities had
+    fallen out of it without a single check noticing - `avg`, `churn`, `from`, `input`, `max`,
+    `min`, `seal`, `sock`, `sum` - including two whole features with their own specs.
+
+    A command the shell accepts and `help` never mentions is not a small gap: `help` is how somebody
+    finds out the command exists at all, so an omission makes the feature effectively unshipped for
+    anyone who did not watch it being built.
+
+    Deliberately loose about WHERE: a mention anywhere in the help text counts, because several
+    utilities are documented in a piped form (`status | where mem>0`) rather than on a row of their
+    own, and demanding a particular shape would make this fight the author instead of helping them.
+    """
+    import re
+    problems = []
+    src = read("services/shell/src/main.rs")
+    m = re.search(r"static HELP:[^=]*=\s*&\[(.*?)\n\];", src, re.S)
+    u = re.search(r"const UTILS: &\[&str\] = &\[(.*?)\n\];", src, re.S)
+    if not m or not u:
+        problems.append("help coverage: could not find HELP or UTILS in services/shell/src/main.rs "
+                        "(renamed? this check cannot pass vacuously)")
+        return problems
+    help_txt, utils = m.group(1), sorted(set(re.findall(r'"([a-z0-9_-]+)"', u.group(1))))
+    missing = [x for x in utils if not re.search(r"\b" + re.escape(x) + r"\b", help_txt)]
+    if missing:
+        problems.append(
+            "help coverage: %d utilit(y/ies) the shell answers are mentioned NOWHERE in `help` - %s. "
+            "`help` is how somebody learns the command exists; an omission ships the feature to "
+            "nobody who was not watching it being built."
+            % (len(missing), ", ".join(missing)))
+    return problems
+
+
 def budget_ordering_problems():
     """net-stack must answer a request BEFORE its client stops waiting.
 
@@ -358,7 +444,8 @@ def main():
     checked = 0
     bad = []
 
-    tree = porting_tree_problems() + budget_ordering_problems() + wire_format_problems()
+    tree = (porting_tree_problems() + budget_ordering_problems() + wire_format_problems()
+            + help_coverage_problems() + help_philosophy_problems())
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))

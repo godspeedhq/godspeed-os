@@ -496,29 +496,68 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
-    // `help` DOES NOT PAGE ANY MORE, and that is what this case now pins.
+    // `help` IS A BROWSABLE DOCUMENT AGAIN, and that is what these cases pin.
     //
-    // It paged because the framebuffer console had no scrollback, so a long `help` scrolled its own
-    // top off permanently. The console retains that history now and PgUp walks it - verified on a
-    // Dell Wyse, 2026-09-18, which is the condition the removal was held against. Two ways to read a
-    // long `help` remain and neither is a mode the command enters for you: scroll back to what went
-    // past, or ask for `help | paginate` before it does.
+    // It lost its pager when the console gained scrollback, on the argument that paging output which
+    // has scrolled past is scrollback's job. That argument was right about PAGING and wrong about
+    // `help`: you arrive at it wanting one section, not the top. A contents list, a search and a
+    // pinned "where am I" line are things scrollback structurally cannot give - the same reason
+    // `trace` keeps its own pager, which pins a column header.
     //
-    // NO PAGER KEYS ARE SENT. Sending them to a command that no longer reads them would type spaces
-    // and a `q` into the NEXT prompt, which is exactly the desync this case would otherwise hide.
+    // Driven with the keys it advertises, then `q`, so reaching `gsh>` proves it exits cleanly.
     send(&mut write_half, b"help\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => {
-            check!(r.contains("GodspeedOS shell commands"), "help: header");
-            check!(r.contains("spawn"),   "help: spawn listed");
-            check!(r.contains("restart"), "help: restart listed");
-            check!(r.contains("status"),  "help: status listed");
-            // The WHOLE table arrives in one go - the last section as well as the first. A pager
-            // would have stopped at a screenful and waited.
-            check!(r.contains("Records"), "help: the last section arrives without a keypress");
-            check!(!r.contains("lines 1-") && !r.contains("[q] quit"),
-                   "help: no pager status line - it prints and returns");
-        }
+    let h1 = collect_until(&buf, &mut cursor, b"[q] quit", Duration::from_secs(8)).unwrap_or_default();
+    check!(h1.contains("help") && h1.contains("GodspeedOS"), "help: opens with its title");
+    check!(h1.contains("[arrows] line") && h1.contains("[t] contents") && h1.contains("[/] find"),
+           "help: the status line names the keys that work");
+    // The PINNED section header is the half a scrollback cannot do: scrolled into the middle of a
+    // document you would otherwise not know which part you were reading.
+    check!(h1.contains("|   Console"), "help: names the section you are in, pinned");
+
+    // CONTENTS, then a digit jumps to that section. This is "go to a section with a keypress".
+    send(&mut write_half, b"t");
+    let h2 = collect_until(&buf, &mut cursor, b"press a digit", Duration::from_secs(8)).unwrap_or_default();
+    check!(h2.contains("1. Console") && h2.contains("contents:"),
+           "help: `t` lists the sections, numbered");
+    // WAIT ON A MARKER THE CONTENTS VIEW DOES NOT ALSO PRINT. `[q] quit` appears in BOTH status
+    // lines, so collecting on it matched the contents frame that was already on screen and the
+    // check read a frame from before the keypress. `[arrows] line` belongs to the document view
+    // alone. Second time this exact mistake has been made in this suite.
+    send(&mut write_half, b"4");
+    let h3 = collect_until(&buf, &mut cursor, b"[arrows] line", Duration::from_secs(8)).unwrap_or_default();
+    check!(h3.contains("|   Storage"), "help: a digit jumps to that section");
+
+    // SEARCH. `churn` is deep in Storage, so finding it proves the search moved the view rather
+    // than merely echoing the term.
+    send(&mut write_half, b"/churn\r");
+    let h4 = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(h4.contains("find: churn"), "help: `/` searches and shows the term");
+
+    send(&mut write_half, b"q");
+    let hq = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+    check!(hq.is_some(), "help: `q` returns to the prompt");
+
+    // `docs` IS A SEPARATE DOCUMENT, SHARING THE BROWSER.
+    //
+    // They were one thing briefly and it was the wrong shape: a philosophy section inside `help`
+    // makes `help` open on prose when somebody wanted the word for `dir`'s byte counts, and makes
+    // `help` the place everything explanatory accumulates. `help` names `docs` on its first screen
+    // so it is still found by typing the obvious thing.
+    send(&mut write_half, b"docs\r");
+    let d1 = collect_until(&buf, &mut cursor, b"[q] quit", Duration::from_secs(8)).unwrap_or_default();
+    check!(d1.contains("docs") && d1.contains("What this is"),
+           "docs: opens the manual, not the command list");
+    check!(d1.contains("capability microkernel"),
+           "docs: leads with what the system IS");
+    // The ABOUT view: the boot banner, and this machine's real topology read from the kernel.
+    send(&mut write_half, b"a");
+    let d2 = collect_until(&buf, &mut cursor, b"[a] back", Duration::from_secs(8)).unwrap_or_default();
+    check!(d2.contains("core 0"), "docs: `a` draws the cores from LIVE kernel state");
+    check!(d2.contains("supervisor") || d2.contains("console"),
+           "docs: ...and names services that are actually running");
+    send(&mut write_half, b"q");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(_) => { check!(true, "docs: `q` returns to the prompt"); }
         None => {
             println!("shell-test: FAIL - timed out after `help`  [×5]");
             fail += 5;
