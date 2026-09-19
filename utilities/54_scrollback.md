@@ -69,40 +69,48 @@ It also takes the view offset **out** of the console. That was a second place ho
 of where the operator is looking, which is what §26.4 is about, and it was exactly the state that
 could disagree with the shell's idea of it.
 
-## 4a. Fetch the whole frame, THEN paint it
+## 4a. Fetched ONCE, so a keypress costs no IPC at all
 
-The first build of this utility interleaved the two, and a Dell Wyse took **two seconds a frame** for
-it before degrading to a blank body:
+Three failures on a Dell Wyse, each a different shape, all with one thing in common:
 
-```
-write the header       queued
-fetch lines 1-20       the request sits BEHIND that write: the console paints, then answers
-write those lines      queued
-fetch the rest         sits behind THOSE paints
-```
+1. a per-keypress request to move the console's view, waiting on a full 4K repaint;
+2. then a per-frame fetch, queued behind the painting the previous frame had asked for;
+3. then a reply larger than the buffer class the call had declared.
 
-Moving the repaint out of the console's request handler (§4) did not help on its own. The request
-simply moved one place down the same queue and still waited on a repaint - except now one the
-utility had asked for itself. Frames slowed until every fetch hit its one-second deadline, at which
-point the body came up empty while the status line still showed the total from the single call that
-had worked.
+**Every one of them needed a request in the hot path.** The console is both the service this reads
+FROM and the service it draws TO - one service, one 16-deep queue - so a request made mid-frame can
+always end up behind painting this very utility just caused. Fixing each instance moved the problem
+rather than removing it.
 
-So the phases are separate and the order is the point: **all the reads go out with nothing of ours
-queued ahead of them, then the frame is painted in one batch**, which finishes long before the next
-keypress needs anything. The console's reply is sized so an ordinary screenful arrives in ONE
-request, because what costs here is the number of round trips, not the size of any one of them.
+So the whole history is read **when the view opens**, and nothing is asked for afterwards. Every
+keypress is local: paint from memory, read a key, paint. There is no request left in the hot path to
+go wrong.
 
-Holding a frame needs somewhere to put it: an 8 KiB bounded arena (§26.6.1), storing lines already
-clipped to the screen. Where a console is wider than the arena can fill, **fewer rows are shown and
-the status line counts what is actually on screen**. A short frame is a visible, honest degradation;
-a status line that counts rows that are not there is not.
+### Why it fits, and why it is not allocated
 
-**The suite cannot catch this, and did not.** `osdev test shell` was green before the fix and green
-after, at the same 202 cases. The failure is a request queuing behind a repaint, and QEMU paints
-nearly for free - so the interleaving is invisible there by construction. This is the SECOND time on
-this feature that a green suite has meant less than it looked like (§6 has the first), and it is
-recorded rather than papered over: the guard against a reintroduction is this section plus the phase
-comment in `cmd_scrollback`, not a test.
+The console's ring is `SB_BYTES` = 32 KiB over `SB_LINES` = 512 lines. The shell's user stack is
+`USER_STACK_PAGES` * 4 KiB = 256 KiB. So the entire history fits in a stack arena with room to
+spare - the whole thing, never a window onto it. `stack_fit_check.py` holds that claim rather than
+this paragraph: `cmd_scrollback` does not reach the top five deepest frames in the tree, and
+`cmd_edit` is larger.
+
+Allocating was considered and rejected for a reason worth keeping. `alloc_mem` exists, but a service
+cannot use it: it returns a raw address and `services/` is `#![deny(unsafe_code)]`, so it would need
+a new safe arena wrapper in the SDK's audited layer. More decisively, **allocating creates a failure
+mode that reserving does not have.** "Insufficient memory, minimum N KiB" is a branch that can only
+exist because we chose to allocate. The bound is known when the image is built, so the space is
+reserved when the image is built, and there is nothing to be short of. That is §26.6.1's point
+exactly: a fixed footprint you can read off the source, with no allocator to fail mid-operation.
+
+A file was considered too, and is the right answer to a different question - a dump you can keep,
+search and pipe. It is not the right answer to "show me what just scrolled past", because it makes
+an everyday view depend on storage being present and healthy.
+
+### What the status line promises
+
+It counts what is actually held. If the arena ever could not take everything the ring reports it
+says `truncated` rather than naming lines that are not there (§26.7) - the same discipline as
+`older lines aged out`. Both numbers come from the same 32 KiB, so it should never fire.
 
 ## 5. In a script it prints
 

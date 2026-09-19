@@ -5598,29 +5598,33 @@ const _: () = assert!(SB_FETCH.is_power_of_two(),
                       "SB_FETCH must be a power of two - call_deadline_into rounds the declared \
                        capacity DOWN to one, so anything else silently shrinks the reply limit");
 
-/// One screenful of history, held while it is fetched.
+/// The WHOLE scrollback, held for the life of one viewing.
 ///
-/// **THE FRAME IS ASSEMBLED BEFORE ANY OF IT IS DRAWN, and that is not a tidiness preference - the
-/// first version interleaved the two and a Dell Wyse took two seconds a frame for it.** It wrote the
-/// header, fetched twenty lines, wrote them, fetched the rest. Each fetch is a blocking call, and
-/// each one was queued BEHIND the painting its own preceding writes had just asked for. Moving the
-/// repaint out of the console's request handler did not help, because the request still waited in
-/// line behind a repaint - it had simply moved one place in the queue. Frames slowed, then every
-/// fetch hit its deadline and the body came up blank while the status line still showed the total
-/// from the one call that had worked (`backlog/37`).
+/// **FETCHED ONCE WHEN THE VIEW OPENS, SO A KEYPRESS COSTS NO IPC AT ALL.** That is the property
+/// this arena exists to buy, and it is what finally ends `backlog/37` rather than mitigating it.
 ///
-/// Fetch first, paint second: the reads go out back to back with nothing of ours queued ahead of
-/// them, and the painting happens afterwards, finishing long before the next keypress asks for
-/// anything.
+/// The console is both the service this reads FROM and the service it draws TO - one service, one
+/// 16-deep queue - so any request made mid-frame can queue behind painting this very utility just
+/// asked for. That coupling produced three separate failures on a Dell Wyse: a per-keypress view
+/// request waiting on a 4K repaint, then a per-frame fetch waiting on the frame before it, then a
+/// reply larger than a declared buffer class. Every one of them needed a request in the hot path.
+/// With the history already in hand there is no request in the hot path to go wrong.
 ///
-/// 8 KiB is a bounded arena, not a guess at a maximum (§26.6.1). A line is stored already clipped to
-/// the screen, so this holds ~85 rows of 96 columns; where a console is wider than the arena can
-/// fill, FEWER rows are shown and the status line counts what is actually there rather than what was
-/// asked for. A short frame is a visible, honest degradation; a wrong count is not.
-const SB_FRAME: usize = 8192;
+/// **SIZED FROM THE RING, NOT GUESSED.** `term::SB_BYTES` is 32 KiB and `term::SB_LINES` is 512, so
+/// this holds all of it - the whole history, never a window onto it. The user stack is 256 KiB
+/// (`USER_STACK_PAGES`), and this frame is entered from the prompt, so ~34 KiB sits comfortably
+/// inside it; `stack_fit_check.py` is what actually holds that claim.
+///
+/// It is a bounded arena in the §26.6.1 sense and not a heap: the maximum is a constant, readable
+/// here. Allocating instead would have meant a new safe wrapper in the SDK (a service cannot
+/// dereference `alloc_mem`'s address - `services/` is `#![deny(unsafe_code)]`) and, worse, a failure
+/// mode: "insufficient memory" is a branch that can only exist if we chose to allocate. The bound is
+/// known when the image is built, so the space is reserved when the image is built, and there is
+/// nothing to be short of.
+const SB_FRAME: usize = 32 * 1024;
 
-/// Rows one frame can hold. `term::MAX_ROWS` in the console.
-const SB_ROWS: usize = 64;
+/// Lines one viewing can hold. `term::SB_LINES` in the console.
+const SB_ROWS: usize = 512;
 
 /// `scrollback` - read back what has already scrolled off the screen.
 ///
@@ -5687,6 +5691,44 @@ fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<()
     let mut lens = [0u16; SB_ROWS];
     let mut cut = [false; SB_ROWS];
 
+    // ---- THE ONLY FETCH. Everything after this is local: paint, read a key, paint.
+    let mut have = 0usize;
+    let mut used = 0usize;
+    let mut i = 0usize;
+    while have < SB_ROWS && i < total {
+        let (n, _, _, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+        if n == 0 { break; }
+        let mut off = SB_HDR;
+        let mut full_arena = false;
+        for _ in 0..n {
+            if have >= SB_ROWS || off >= k { break; }
+            let full = (buf[off] as usize).min(k - off - 1);
+            off += 1;
+            // Clipped, never wrapped: a wrapped line pushes every row below it down and makes the
+            // count in the status line a lie about what is on the screen.
+            let take = full.min(clip);
+            if used + take > SB_FRAME { full_arena = true; break; }
+            store[used..used + take].copy_from_slice(&buf[off..off + take]);
+            used += take;
+            lens[have] = take as u16;
+            cut[have] = full > take;
+            have += 1;
+            off += full;
+            i += 1;
+        }
+        if full_arena { break; }
+    }
+    // WHAT WE HOLD IS WHAT WE COUNT. `total` is what the ring has; `have` is what was read back. They
+    // are equal in every ordinary case, and when they are not the status line must not claim lines
+    // that are not there (§26.7) - the same reason it already reports `older lines aged out`.
+    let short = have < total;
+    let total = have;
+    if total == 0 {
+        ctx.console_write("\x1b[?25h");
+        ctx.console_writeln("scrollback: the console did not answer - no history to show");
+        return Err(ShellError::Unknown);
+    }
+
     // OPENED ONE PAGE BACK WHEN PgUp BROUGHT US HERE, at the newest line when the command was typed.
     // The key already meant "go back a page", and making the operator press it twice to see one page
     // is the interface forgetting what it was just told.
@@ -5700,41 +5742,12 @@ fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<()
         ctx.console_write_fmt(format_args!(
             "scrollback {} - what has scrolled off the screen\x1b[K\n", UTIL_VERSION));
 
-        // ---- PHASE 1: FETCH. Not one console write in here, so nothing of ours is queued ahead
-        // of a request and no reply waits on a repaint we asked for ourselves.
-        let mut have = 0usize;
-        let mut used = 0usize;
-        let mut i = top;
-        while have < body && have < SB_ROWS && i < total {
-            let (n, t, a, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
-            total = t as usize;
-            aged = a;
-            if n == 0 { break; }
-            let mut off = SB_HDR;
-            let mut stop = false;
-            for _ in 0..n {
-                if have >= body || have >= SB_ROWS || off >= k { break; }
-                let full = (buf[off] as usize).min(k - off - 1);
-                off += 1;
-                // Clipped, never wrapped: a wrapped line pushes every row below it down and makes
-                // the count in the status line a lie about what is on the screen.
-                let take = full.min(clip);
-                if used + take > SB_FRAME { stop = true; break; }
-                store[used..used + take].copy_from_slice(&buf[off..off + take]);
-                used += take;
-                lens[have] = take as u16;
-                cut[have] = full > take;
-                have += 1;
-                off += full;
-                i += 1;
-            }
-            if stop { break; }
-        }
-
-        // ---- PHASE 2: PAINT. One frame, batched, with the console free to do nothing else.
+        // PAINT ONLY. No request is made anywhere in this loop, which is the whole point.
         let mut frame = FrameBuf::new();
         let mut at = 0usize;
-        for r in 0..have {
+        for r in 0..top { at += lens[r] as usize; }
+        let shown = (top + body).min(total) - top;
+        for r in top..top + shown {
             let n = lens[r] as usize;
             let mut lb = LineBuf::new();
             RecordSink::put(&mut lb, &store[at..at + n]);
@@ -5742,13 +5755,13 @@ fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<()
             lb.flush_into(ctx, &mut frame);
             at += n;
         }
-        for _ in have..body { frame.put(ctx, b"\x1b[K\n"); }
+        for _ in shown..body { frame.put(ctx, b"\x1b[K\n"); }
         frame.flush(ctx);
 
         ctx.console_write_fmt(format_args!(
             "[ {}-{} of {}{} ]  [up/down] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit",
-            top + 1, top + have, total,
-            if aged { ", older lines aged out" } else { "" }));
+            top + 1, (top + body).min(total), total,
+            if short { ", truncated" } else if aged { ", older lines aged out" } else { "" }));
         ctx.console_write("\x1b[J");
 
         let c = ctx.console_read();
