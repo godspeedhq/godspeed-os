@@ -413,6 +413,10 @@ pub struct ShellCtx {
     /// the reason `pipe_stack_hwm` is: a module-level `static` is the anonymous singleton invariant
     /// 9 forbids.
     last_write_err: core::cell::RefCell<LastWriteErr>,
+    /// Set when a DESTRUCTIVE fs request completed with its reply lost, so the outcome is genuinely
+    /// unknown and was deliberately not retried. Read by the handlers that report failures, so they
+    /// say "unknown" rather than "failed" - the distinction carnage §3.5 is about.
+    fs_unknown: core::cell::Cell<bool>,
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -441,6 +445,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         net_tag: core::cell::Cell::new(0),
         pipe_stack_hwm: core::cell::Cell::new(0),
         last_write_err: core::cell::RefCell::new(LastWriteErr::new()),
+        fs_unknown: core::cell::Cell::new(false),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -12812,6 +12817,36 @@ fn fs_err_reason(m: &Message) -> Option<&str> {
     core::str::from_utf8(&p[1..]).ok().filter(|r| !r.is_empty())
 }
 
+/// Report a mutating command that got no answer - and say WHICH of the two things happened.
+///
+/// "storage unavailable" is true when the request never reached `fs`. It is a LIE when the request
+/// ran and its reply was lost: storage was fine, the operation may well have succeeded, and telling
+/// an operator their `move` did not happen when the file has moved is a confident wrong answer about
+/// a destructive operation (carnage §3.5, §26.7).
+///
+/// One helper rather than seven hand-written wordings, because the seven sites drifting apart is how
+/// the honest half gets left out of whichever one is touched last.
+fn fs_no_answer(ctx: &ShellCtx, verb: &str) {
+    if ctx.fs_unknown.get() {
+        let why = ctx.last_write_err.borrow();
+        ctx.console_writeln_fmt(format_args!(
+            "{}: OUTCOME UNKNOWN - {}", verb,
+            why.get().unwrap_or("the reply was lost; it MAY HAVE SUCCEEDED - check with `dir`")));
+    } else {
+        ctx.console_writeln_fmt(format_args!("{}: storage unavailable", verb));
+    }
+}
+
+/// Whether an fs op CHANGES the filesystem, and therefore must never be re-sent on a timeout.
+///
+/// Mirrors `op_is_mutating` in `services/fs`. A second copy of a list is a thing that can drift, so
+/// it is worth saying why it exists here: the shell must make this call without asking `fs`, at the
+/// moment `fs` is not answering. `facts_check.py` compares the two.
+fn op_is_mutating(op: u8) -> bool {
+    matches!(op, OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT
+                 | OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE)
+}
+
 fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
@@ -12856,6 +12891,17 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
     // diagnoses have already come from reasoning about which call blocks instead of proving it.
     // "reacquiring" without "reacquired" = this call; neither = the send never returned; both = the
     // retry below.
+    // NEVER RE-SEND A DESTRUCTIVE OP - carnage §3.5, with the argument on `op_is_mutating`.
+    //
+    // The guard is needed in BOTH request paths. It went into the bounded one first and the gate
+    // still failed with `move: failed - source not found`, because `move` comes through HERE. A fix
+    // applied to the path that was easiest to find is not a fix.
+    if op_is_mutating(op) {
+        ctx.fs_unknown.set(true);
+        ctx.last_write_err.borrow_mut().set_text(
+            "the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - a retry can repeat a destructive operation. Check with `dir`");
+        return None;
+    }
     ctx.print("  [diag] fs send failed - reacquiring by name\r\n");
     let got = ctx.reacquire_by_name("fs");
     ctx.print(if got { "  [diag] reacquired fs - retrying\r\n" } else { "  [diag] reacquire FAILED\r\n" });
@@ -13142,6 +13188,32 @@ fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs
     // solves the same problem with a drain at its own top; this path had no equivalent.
     // Timed out. Do NOT try to reclaim the late reply here - that is the race described in
     // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
+    // NEVER RE-SEND A DESTRUCTIVE OP, and this is the carnage §3.5 gap closed rather than detected.
+    //
+    // The retry below is correct for a READ: nothing happened, so asking again is free. For a
+    // `move`, `delete` or `rename` it is not, and the failure is not hypothetical - a test that
+    // completes a move and swallows its reply produced exactly this:
+    //
+    //     [diag] reacquired fs - retrying
+    //     move: failed - source not found          <- the file was already at the destination
+    //
+    // The first attempt SUCCEEDED. The retry found nothing at the source, and its error was reported
+    // as the move's outcome: a confident wrong answer about a destructive operation (§26.7).
+    //
+    // The protocol cannot deduplicate this away. The correlation tag matches a reply to a request,
+    // and the retry deliberately draws a FRESH one so a late original can be told apart - so a retry
+    // is indistinguishable from a new request BY DESIGN. Making it distinguishable means a client-
+    // supplied operation id that survives retries, plus a reply cache in `fs`; real work, and
+    // recorded as such.
+    //
+    // What needs no protocol change is the honest answer: the operation already ran, re-sending
+    // cannot help, and the outcome is UNKNOWN. Say so.
+    if op_is_mutating(op) {
+        ctx.fs_unknown.set(true);
+        ctx.last_write_err.borrow_mut().set_text(
+            "the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - a retry can repeat a destructive operation. Check with `dir`");
+        return None;
+    }
     if ctx.reacquire_by_name("fs") {
         drain_stale_fs_replies(ctx);
         let tag2 = next_fs_tag(ctx);
@@ -13346,11 +13418,21 @@ fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], 
 /// Owned by the shell, single-threaded, written immediately before the failure it describes is
 /// reported. Not a cache and never read except on the failure path.
 struct LastWriteErr {
-    buf: [u8; 64],
+    // 160, not 64: an fs error reason is short, but the "outcome unknown" sentence (§3.5) has to
+    // carry what happened AND what to do about it, and a truncated explanation of an ambiguous
+    // destructive operation is worse than none.
+    buf: [u8; 160],
     len: usize,
 }
 impl LastWriteErr {
-    const fn new() -> Self { Self { buf: [0u8; 64], len: 0 } }
+    const fn new() -> Self { Self { buf: [0u8; 160], len: 0 } }
+
+    /// Set a reason this shell composed, rather than one `fs` reported.
+    fn set_text(&mut self, why: &str) {
+        let n = why.len().min(self.buf.len());
+        self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
+        self.len = n;
+    }
     fn set(&mut self, m: Option<&Message>) {
         self.len = 0;
         if let Some(why) = m.and_then(fs_err_reason) {
@@ -14859,7 +14941,7 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     }
     let reply = match fs_request(ctx, OP_WRITE_FILE, p, content.as_bytes()) {
         Some(r) => r,
-        None => { ctx.console_writeln("write: storage unavailable"); return Err(ShellError::Unknown); }
+        None => { fs_no_answer(ctx, "write"); return Err(ShellError::Unknown); }
     };
     let rp = reply.payload_bytes();
     if no_fs(ctx, rp) { return Err(ShellError::Unknown); }
@@ -15030,7 +15112,7 @@ fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), 
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
     let reply = match fs_request(ctx, op, path, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("mkdir: storage unavailable"); return Err(ShellError::Unknown); }
+        None => { fs_no_answer(ctx, "mkdir"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -15099,7 +15181,7 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
     // Check the source exists and is a file (also surfaces the "no filesystem" hint).
     let stat = match fs_request(ctx, OP_STAT_FILE, &sp[..sl], &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
+        None => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
     };
     let stp = stat.payload_bytes();
     if no_fs(ctx, stp) { return Err(ShellError::Unknown); }
@@ -15126,6 +15208,8 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
         }
         None => {
             match ctx.last_write_err.borrow().get() {
+                Some(why) if ctx.fs_unknown.get() =>
+                    ctx.console_writeln_fmt(format_args!("copy: OUTCOME UNKNOWN - {}", why)),
                 Some(why) => ctx.console_writeln_fmt(format_args!("copy: failed - {}", why)),
                 None      => ctx.console_writeln("copy: write failed (parent missing?)"),
             }
@@ -15179,7 +15263,7 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
         'pages: while let Some(from) = cur.next() {
         let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &from) {
             Some(r) => r,
-            None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
+            None => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -15291,7 +15375,7 @@ fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<()
         }
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
         Some(_) => { ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("rename: storage unavailable"); Err(ShellError::Unknown) }
+        None    => { fs_no_answer(ctx, "rename"); Err(ShellError::Unknown) }
     }
 }
 
@@ -15334,7 +15418,7 @@ fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
         Some(_) if recursive => { ctx.console_writeln("delete: failed (not found, or tree too deep?)"); Err(ShellError::Unknown) }
         Some(_) => { ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("delete: storage unavailable"); Err(ShellError::Unknown) }
+        None    => { fs_no_answer(ctx, "delete"); Err(ShellError::Unknown) }
     }
 }
 
@@ -15363,12 +15447,14 @@ fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
         Some(ref m) => {
             match fs_err_reason(m) {
+                Some(why) if ctx.fs_unknown.get() =>
+                    ctx.console_writeln_fmt(format_args!("move: OUTCOME UNKNOWN - {}", why)),
                 Some(why) => ctx.console_writeln_fmt(format_args!("move: failed - {}", why)),
                 None      => ctx.console_writeln("move: failed (not found, or dest exists?)"),
             }
             Err(ShellError::Unknown)
         }
-        None    => { ctx.console_writeln("move: storage unavailable"); Err(ShellError::Unknown) }
+        None    => { fs_no_answer(ctx, "move"); Err(ShellError::Unknown) }
     }
 }
 

@@ -6781,6 +6781,109 @@ pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.5: a destructive op whose REPLY is lost, and the retry that follows.
+///
+/// §3.5 records this as "the clearest thing on this list that is a design gap rather than a missing
+/// test", and the shell makes it live rather than theoretical: on a timeout it reacquires `fs` and
+/// RE-SENDS. The protocol cannot deduplicate - the correlation tag matches a reply to a request, and
+/// the shell deliberately draws a FRESH one for the retry so the late original can be told apart, so
+/// a retry is indistinguishable from a new request by design.
+///
+/// **THE HARM NEEDS NO SECOND CLIENT.** A `move` that SUCCEEDS and loses its reply is retried; the
+/// second attempt finds nothing at the source and fails. The file has moved and the user is told the
+/// operation failed. A wrong outcome, reported confidently, is what §26.7 forbids.
+///
+/// So the assertions are written against the RIGHT behaviour, not the current one: an operation
+/// whose outcome is unknown must be reported as unknown. Re-sending a non-idempotent op cannot help
+/// - it already succeeded - and can only mislead.
+pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-dupop: PASS - {}", $label); pass += 1; }
+        else { println!("fs-dupop: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-dupop: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-dupop: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-dupop: never reached a prompt"); std::process::exit(1);
+    }
+
+    send(&mut write_half, b"write /dup-a.txt duplicate-op-evidence\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+
+    // THE MOVE COMPLETES AND ITS REPLY IS SWALLOWED. The shell's fs deadline is 20 s and it retries
+    // once, so this can take ~40 s before it says anything.
+    send(&mut write_half, b"move /dup-a.txt /dup-b.txt\r");
+    let injected = collect_until(&buf, &mut cursor, b"[lose-reply-test]", Duration::from_secs(30));
+    check!(injected.is_some(), "the reply to a COMPLETED move was dropped (the fault was injected)");
+    let outcome = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)).unwrap_or_default();
+
+    // ---- what actually happened on disk, asked independently of what the shell claimed.
+    send(&mut write_half, b"read /dup-b.txt\r");
+    let dst = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"read /dup-a.txt\r");
+    let src = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_dupop_serial.log", &w);
+
+    let moved = dst.contains("duplicate-op-evidence");
+    let source_gone = !src.contains("duplicate-op-evidence");
+    check!(moved && source_gone, "the move DID take effect (the first attempt succeeded)");
+
+    // ---- THE GATE. The operation succeeded; the user must not be told it failed.
+    //
+    // `not found` here is the retry's answer, not the move's: the first attempt had already moved
+    // the file, so the second found nothing at the source. Reporting that as the outcome of `move`
+    // is a confident wrong answer about a destructive operation (§26.7).
+    let claimed_failure = outcome.contains("not found") || outcome.contains("failed");
+    check!(!claimed_failure,
+           "the shell did NOT report a failure for an operation that succeeded");
+    // Matched against what the shell ACTUALLY prints. The first version looked for lowercase
+    // "unknown" while the message says `OUTCOME UNKNOWN`, so a correct fix read as a failure - and
+    // had the fix been wrong instead, this would have reported the right answer for the wrong
+    // reason. Assert the string the system emits, not a paraphrase of it.
+    check!(outcome.contains("OUTCOME UNKNOWN") && outcome.contains("MAY HAVE SUCCEEDED"),
+           "an ambiguous outcome is reported AS ambiguous, not as a failure");
+    check!(outcome.contains("Not re-sent"),
+           "...and says WHY it was not retried, so the operator knows it is theirs to verify");
+
+    println!("\nfs-dupop: {pass} passed, {fail} failed  (serial -> build/tests/fs_dupop_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Carnage §3.7, the other half: kill `block-driver` WITH REQUESTS OUTSTANDING.
 ///
 /// `fs-blockchaos` makes the driver answer WRONGLY. This makes it stop existing mid-request, which

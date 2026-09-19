@@ -4,7 +4,8 @@
 operations, 75 tear points, 35 exercising journal recovery), resource exhaustion (`fs-full` 14/0),
 power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
 (`fs-model`, §3.2), the block layer (§3.7 - `fs-blockchaos` for the completion stream,
-`fs-blockdeath` for the driver dying mid-request; hot-unplug is not). NOT RUN: concurrency and retry ordering (§3.5), the
+`fs-blockdeath` for the driver dying mid-request; hot-unplug is not), and the duplicate-destructive-op
+gap (§3.5, `fs-dupop`). NOT RUN: the rest of §3.5 (two clients on one path), the
 remaining rows of §3.3, and cross-ISA (§3.11, not reachable in QEMU).
 
 **Mostly QEMU-validated.** The hardware results are recorded in §4 and §3.12. The one that matters
@@ -335,7 +336,7 @@ error, and the large claim also makes a leak obvious if the refusal strands what
 **Not yet covered:** exhausting METADATA while data space remains (and the reverse), and injecting
 allocation failure at each individual allocation point rather than only at the natural boundary.
 
-### 3.5 Concurrency, ordering and retries - NOT RUN, and NARROWER than it looks
+### 3.5 Concurrency, ordering and retries - PARTIAL (`fs-dupop` 5/0), and NARROWER than it looks
 
 Stated honestly rather than adopted wholesale: **`fs` is single-threaded and serves one request to
 completion before dequeuing the next.** There is no intra-operation interleaving to find, so "two
@@ -345,13 +346,37 @@ theatre.
 What IS reachable and worth attacking is the CLIENT side, and one item in it is a genuine open
 weakness:
 
-- **A duplicate request can repeat a destructive operation, and nothing stops it today.** The fs
-  protocol carries a correlation tag at byte 0 that is ECHOED, never interpreted - it exists to match
-  a reply to a request, not to deduplicate. A client that times out and retries a `delete` or a
-  `move` sends it twice, and the second one executes. For `delete` that is harmless; for a
-  `move` whose first attempt succeeded, the retry operates on a path that no longer means what the
-  client thought. This is the clearest thing on this list that is a design gap rather than a missing
-  test.
+- **A duplicate request can repeat a destructive operation** - CONFIRMED, then closed at the client.
+  `fs-dupop` completes a `move`, swallows its reply (`lose-reply-test`), and watches what the shell
+  does. It did this:
+
+  ```
+    [diag] reacquired fs - retrying
+    move: failed - source not found      <- the claim
+    read /dup-b.txt
+    duplicate-op-evidence                 <- the move had worked
+  ```
+
+  The operation SUCCEEDED and the operator was confidently told it failed. Not theoretical: the shell
+  really does reacquire and re-send on a timeout, so this was live.
+
+  **The protocol cannot deduplicate it away, and that is by design rather than oversight.** The
+  correlation tag matches a reply to a request, and the retry deliberately draws a FRESH one so a
+  late original can be told apart - which makes a retry indistinguishable from a new request. Closing
+  it properly needs a client-supplied operation id that SURVIVES retries, plus a bounded reply cache
+  in `fs`. That is real work and is recorded here rather than half-done.
+
+  **What needed no protocol change was the honest answer.** Re-sending a non-idempotent op cannot
+  help - it already ran - and can only mislead, so the shell no longer retries one. It says:
+
+  ```
+    move: OUTCOME UNKNOWN - the reply was lost; it MAY HAVE SUCCEEDED.
+    Not re-sent - a retry can repeat a destructive operation. Check with `dir`
+  ```
+
+  Reads are still retried: nothing happened, so asking again is free. The mutating set is
+  `op_is_mutating`, mirrored from `fs` because the shell must make this call at the moment `fs` is
+  not answering.
 - Client timeouts injected immediately before and after a commit, then retried, with the outcome
   inspected.
 - Two clients issuing conflicting sequences (create, rename, delete, recreate) against the same
@@ -632,6 +657,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |
 | Block-driver killed WITH REQUESTS OUTSTANDING | **`fs-blockdeath` 11/0** | 3.7. Noticed in 201 ms against a 30 s deadline - woken, not timed out |
 | Hot-unplug / device disappearance mid-write | NOT RUN | 3.7. Needs the DEVICE to vanish (QEMU `device_del`), not the driver |
+| A destructive op whose REPLY is lost, then retried | **`fs-dupop` 5/0** | 3.5. Found a live gap: a succeeded `move` reported as failed. Fixed at the client |
 | Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |

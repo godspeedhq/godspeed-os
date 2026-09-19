@@ -1456,6 +1456,7 @@ fn cmd_test(suite: &str) {
         "fs-tear-detect" => run_fs_tear_detect_test(),
         "fs-blockchaos"  => run_fs_blockchaos_test(),
         "fs-blockdeath"  => run_fs_blockdeath_test(),
+        "fs-dupop"       => run_fs_dupop_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
         // because `osdev test` takes exactly one argument and widening that for one suite would be
         // the wrong trade.
@@ -2843,6 +2844,9 @@ fn run_fs_all_tests() {
         // ...and the driver dying mid-request, which is a different recovery path: `SendFailed`
         // plus a reacquire, rather than a wrong answer that has to be detected.
         "fs-blockdeath",
+        // §3.5. Not a device fault at all - a DESTRUCTIVE op whose reply is lost, and what the
+        // client does next. It found a real gap and the fix is in the shell, not the filesystem.
+        "fs-dupop",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
@@ -3345,6 +3349,22 @@ fn run_fs_compat_test() {
 /// transient error (the boot self-test read still succeeds) - and that normal operation is
 /// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
 /// be injected.
+/// Carnage §3.5: a destructive op whose reply is lost, and the retry that follows.
+fn run_fs_dupop_test() {
+    println!("\n=== fs: a COMPLETED move loses its reply - what does the client do? (§3.5) ===");
+    build_blockdev_fs("lose-reply-test", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_dupop.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_dupop(&image_path, persist, 4);
+}
+
 /// Carnage §3.7, the other half: kill `block-driver` with requests outstanding.
 ///
 /// No test feature at all - the driver is killed over the control channel on a SHIPPING build, so a

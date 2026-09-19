@@ -673,6 +673,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut storage_unreadable = false;
     // Replies that could not be delivered; owned here so no global state is needed (Commandment VI).
     let mut reply_fails = 0u32;
+    // Owned here and threaded, exactly like `reply_fails` above (Commandment VI). Zero-sized unless
+    // `lose-reply-test` is built in, so a shipping build cannot lose a reply.
+    let mut lose = LoseReply::new();
     // ONE `Fs`, DECLARED FIRST AND FILLED IN PLACE.
     //
     // This was an `if/else` EXPRESSION whose else-branch built the volume in a local called `mounted`
@@ -903,7 +906,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable,
                                                 msg.payload_bytes(), reply, &mut reply_fails),
             None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply,
-                          &mut reply_fails),
+                          &mut reply_fails, &mut lose),
         }
         ctx.remove_cap(reply);
     }
@@ -1230,6 +1233,46 @@ fn op_is_read_only(op: u8) -> bool {
 /// The drop is REPORTED, not swallowed (§26.7): without this a caller timing out looks like a slow disk
 /// rather than an answer its queue had no room for. Rate-limited on the first and every 64th, because a
 /// full queue is a burst - a dead caller would otherwise log once per request.
+/// Carnage §3.5: swallow the reply to the first destructive op, once.
+///
+/// **THIS PROVES A GAP THE CARNAGE DOC ALREADY NAMES, RATHER THAN HUNTING FOR ONE.** §3.5 records
+/// that "a duplicate request can repeat a destructive operation, and nothing stops it today", and
+/// the shell makes it live rather than theoretical: on a timeout it reacquires `fs` and RE-SENDS.
+///
+/// The protocol cannot deduplicate. The correlation tag matches a reply to a request - the shell
+/// deliberately draws a FRESH one for the retry (`next_fs_tag`) so the late original can be told
+/// apart - so a retry is indistinguishable from a new request by design, not by oversight.
+///
+/// The harm needs no second client. A `move` that SUCCEEDS and loses its reply is retried; the
+/// second attempt finds nothing at the source and fails, so the user is told an operation failed
+/// that actually worked. A wrong outcome reported confidently is exactly what §26.7 forbids.
+///
+/// State is owned by `service_main` and threaded, like `reply_fails` beside it - Commandment VI
+/// refuses a static, and it was right to (`fs-blockchaos` learned that the hard way).
+#[cfg(feature = "lose-reply-test")]
+pub struct LoseReply { armed: bool }
+#[cfg(not(feature = "lose-reply-test"))]
+pub struct LoseReply;
+
+impl LoseReply {
+    #[cfg(feature = "lose-reply-test")]
+    pub fn new() -> Self { LoseReply { armed: true } }
+    #[cfg(not(feature = "lose-reply-test"))]
+    pub fn new() -> Self { LoseReply }
+
+    /// True if this reply should be swallowed. Fires once, for one op, and never on a shipping build.
+    #[cfg(feature = "lose-reply-test")]
+    pub fn swallow(&mut self, ctx: &ServiceContext, op: u8) -> bool {
+        if !self.armed || op != OP_MOVE { return false; }
+        self.armed = false;
+        ctx.log("fs: [lose-reply-test] the MOVE completed - dropping its reply so the client retries");
+        true
+    }
+    #[cfg(not(feature = "lose-reply-test"))]
+    #[inline(always)]
+    pub fn swallow(&mut self, _ctx: &ServiceContext, _op: u8) -> bool { false }
+}
+
 fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
     if r.is_err() {
         *fails = fails.saturating_add(1);
@@ -1241,7 +1284,7 @@ fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32)
 }
 
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle,
-         reply_fails: &mut u32) {
+         reply_fails: &mut u32, lose: &mut LoseReply) {
     // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
     // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
     // from an answer to an earlier one. Everything after it is the request exactly as every opcode arm
@@ -1309,6 +1352,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         // malformed one and reports something misleading. Never send one - say ERR properly.
         if len == 0 { out[1] = FS_ERR; len = 1; }
         // +1 for the tag at out[0]
+        if lose.swallow(ctx, p.first().copied().unwrap_or(0) & 0x7F) { return; }
         reply_nonblocking(ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
     }
 
