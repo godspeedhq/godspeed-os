@@ -85,12 +85,22 @@ const REQ_SCROLL: u8 = 2;
 /// itself as the beginning is the same wrong answer as a truncated directory listing (§26.7).
 const REQ_HISTORY: u8 = 3;
 
-/// Reply buffer for one `REQ_HISTORY`. Under the 4 KiB message ceiling (§8.5) with room to spare.
+/// Reply buffer for one `REQ_HISTORY`. Under the 4 KiB message ceiling (§8.5).
 ///
-/// Sized so an ordinary screenful arrives in ONE request. Every extra round trip is a blocking call
-/// the caller has to make, and on a 4K console a call can land behind a repaint - so the number of
-/// requests per frame is the number that matters here, not the size of any one of them.
-const HISTORY_MAX: usize = 3584;
+/// **A POWER OF TWO, AND THAT IS A HARD REQUIREMENT OF THE CALL PATH, not a round number.**
+/// `call_deadline_into` cannot spare a whole length field for the caller's buffer size, so it
+/// encodes it as a 4-bit power-of-two CLASS, rounded DOWN. A caller with a 3584-byte buffer
+/// therefore declares 2048, and the kernel refuses any reply larger than that.
+///
+/// This was 3584 for one image, chosen so a screenful arrived in one request. The Dell Wyse printed
+///     call: reply of 3568 bytes exceeds the caller's 2048-byte buffer - refused (not truncated)
+/// on every keypress and `scrollback` reported no history at all. The buffer was genuinely 3584; it
+/// was the DECLARATION that rounded down. Loud and conservative, exactly as that encoding intends -
+/// a refusal rather than a smashed frame (§26.7).
+///
+/// Two requests per screen is the cost, and it is small: both go out in the fetch phase with no
+/// console writes between them, which is what actually fixed the latency (`54_scrollback.md` §4a).
+const HISTORY_MAX: usize = 2048;
 
 /// `[n, total_lo, total_hi, aged]`.
 const HISTORY_HDR: usize = 4;

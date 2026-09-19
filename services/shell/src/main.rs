@@ -5587,7 +5587,16 @@ fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
 }
 
 /// One `console_history` reply. Matches `HISTORY_MAX` in `services/console`.
-const SB_FETCH: usize = 3584;
+///
+/// **MUST BE A POWER OF TWO.** `call_deadline_into` encodes this buffer's size as a 4-bit
+/// power-of-two class rounded DOWN, so 3584 declares 2048 and the kernel refuses every reply above
+/// that - which is what a Dell Wyse did on every keypress, with `scrollback` reporting no history
+/// while the buffer was in fact large enough. The assert below is the compile-time form of the
+/// warning the SDK already carries, because a comment did not stop it happening.
+const SB_FETCH: usize = 2048;
+const _: () = assert!(SB_FETCH.is_power_of_two(),
+                      "SB_FETCH must be a power of two - call_deadline_into rounds the declared \
+                       capacity DOWN to one, so anything else silently shrinks the reply limit");
 
 /// One screenful of history, held while it is fetched.
 ///
