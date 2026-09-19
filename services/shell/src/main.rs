@@ -863,7 +863,7 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
             // PageUp OPENS `scrollback`, one page back - the key does what it was pressed for.
             // PageDown from a live prompt stays inert: you are already at the bottom, and opening a
             // viewer already scrolled to the end is a no-op dressed as an action.
-            5     => { let _ = cmd_scrollback(ctx, 0, true); line.reprint(ctx); }
+            5     => { let _ = scrollback_view(ctx, 0, true); line.reprint(ctx); }
             // 2 = Insert, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
             _ => { let _ = have_param; }
         },
@@ -1929,7 +1929,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // asked for something specific and got the general thing with nothing said (§26.7).
         "help"    => cmd_help(ctx, depth, if argc > 1 { args[1] } else { "" }),
         "docs"    => cmd_docs(ctx, depth, if argc > 1 { args[1] } else { "" }),
-        "scrollback" => cmd_scrollback(ctx, depth, false),
+        "scrollback" => cmd_scrollback(ctx, cwd, depth, s["scrollback".len()..].trim()),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
@@ -4669,6 +4669,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         // into rows, because the four properties it lists are prose, not usage lines.
         "scrollback" => help_block(ctx, "scrollback", "read back what has scrolled off the screen", &[
             ("scrollback", "open at the newest line", "scrollback"),
+            ("scrollback save <path>", "write the whole history to a file, unclipped", "scrollback save /log.txt"),
             ("PgUp (at the prompt)", "the same view, opened one page back", "PgUp"),
             ("arrows / PgUp / PgDn", "a line, or a page", "PgDn"),
             ("Home / End, q", "the ends; q or Esc leaves", "q"),
@@ -5089,7 +5090,7 @@ static HELP: &[HelpRow] = &[
     Sec("Console"),
     Row("help", "show this message"),
     Row("docs", "the manual: what this system is, and what you can rely on"),
-    Row("scrollback", "read back what has scrolled off the screen (also: PgUp)"),
+    Row("scrollback [save <path>]", "read back what has scrolled off the screen (also: PgUp)"),
     Row("<prefix> Tab", "complete a command; if several match, press the shown digit to pick"),
     Row("arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears"),
     Row("clear", "clear the screen"),
@@ -5646,7 +5647,106 @@ const SB_ROWS: usize = 512;
 /// THE HISTORY IS BOUNDED - 32 KiB or 512 lines, whichever runs out first. When anything has aged
 /// out the status line says so, because a view that starts mid-session while presenting itself as
 /// the beginning is the same wrong answer as a truncated directory listing (§26.7).
-fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<(), ShellError> {
+/// `scrollback save <path>` - the whole history, unclipped, as a file.
+///
+/// Two passes over the SAME arena rather than two fetches: the size has to be known before
+/// `OP_WRITE_NEW` can be issued, and asking the console twice would be asking it to describe a ring
+/// that moved in between. One read, then a length, then the bytes.
+fn scrollback_save(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    let mut pbuf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+
+    let mut buf = [0u8; SB_FETCH];
+    let mut store = [0u8; SB_FRAME];
+    let mut lens = [0u16; SB_ROWS];
+    let (mut have, mut used, mut i) = (0usize, 0usize, 0usize);
+    let total = match ctx.console_history(0, &mut buf) { Some((_, t, _, _)) => t as usize, None => {
+        ctx.console_writeln("scrollback: the console did not answer - nothing saved");
+        return Err(ShellError::Unknown);
+    }};
+    while have < SB_ROWS && i < total {
+        let (n, _, _, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+        if n == 0 { break; }
+        let mut off = SB_HDR;
+        let mut full_arena = false;
+        for _ in 0..n {
+            if have >= SB_ROWS || off >= k { break; }
+            let ln = (buf[off] as usize).min(k - off - 1);
+            off += 1;
+            if used + ln > SB_FRAME { full_arena = true; break; }
+            store[used..used + ln].copy_from_slice(&buf[off..off + ln]);
+            used += ln;
+            lens[have] = ln as u16;
+            have += 1;
+            off += ln;
+            i += 1;
+        }
+        if full_arena { break; }
+    }
+    if have == 0 {
+        ctx.console_writeln("scrollback: nothing has scrolled off the screen yet - nothing saved");
+        return Ok(());
+    }
+
+    // One newline per line, which the arena does not store.
+    let bytes = (used + have) as u64;
+    if !fs_write_new(ctx, path, bytes) {
+        ctx.console_writeln("scrollback: could not create the file");
+        return Err(ShellError::Unknown);
+    }
+    let mut chunk = [0u8; IO_CHUNK];
+    let (mut at, mut c, mut off) = (0usize, 0usize, 0u64);
+    for r in 0..have {
+        let n = lens[r] as usize;
+        for b in 0..=n {
+            let byte = if b == n { b'\n' } else { store[at + b] };
+            chunk[c] = byte;
+            c += 1;
+            if c == IO_CHUNK {
+                if !fs_write_at(ctx, path, off, &chunk[..c]) {
+                    ctx.console_writeln("scrollback: the write failed part-way - the file is incomplete");
+                    return Err(ShellError::Unknown);
+                }
+                off += c as u64;
+                c = 0;
+            }
+        }
+        at += n;
+    }
+    if c > 0 && !fs_write_at(ctx, path, off, &chunk[..c]) {
+        ctx.console_writeln("scrollback: the write failed part-way - the file is incomplete");
+        return Err(ShellError::Unknown);
+    }
+    ctx.console_writeln_fmt(format_args!(
+        "scrollback: saved {} line(s), {} bytes to {}", have, bytes, str_of(path)));
+    Ok(())
+}
+
+/// `scrollback` - the view, or `save <path>` to materialise it.
+///
+/// `save` is the word three other utilities already use for exactly this (`selfcheck save`,
+/// `run ... save`, `chaos kill-storm ... save`). A fourth word for one concept is what rule 4
+/// exists to prevent.
+fn cmd_scrollback(ctx: &ShellCtx, cwd: &Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
+    if let Some(rest) = arg.strip_prefix("save") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            ctx.console_writeln("usage: scrollback save <path>");
+            return Err(ShellError::Unknown);
+        }
+        return scrollback_save(ctx, cwd, rest);
+    }
+    if !arg.is_empty() {
+        ctx.console_writeln_fmt(format_args!(
+            "scrollback: unknown argument `{}` (try `scrollback help`)", arg));
+        return Err(ShellError::Unknown);
+    }
+    scrollback_view(ctx, depth, false)
+}
+
+/// The full-screen view. Takes no `cwd` because it touches no files - which is also why PgUp can
+/// reach it from the line editor, where no working directory is in scope.
+fn scrollback_view(ctx: &ShellCtx, depth: u8, page_back: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; SB_FETCH];
     let (_, total0, aged0, _) = match ctx.console_history(0, &mut buf) {
         Some(v) => v,

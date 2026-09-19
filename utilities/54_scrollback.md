@@ -1,6 +1,7 @@
 # Utility: `scrollback` - read back what has scrolled off the screen
 
-**Status:** **Built + QEMU-verified** (`osdev test shell`) for the data path; the repaint-cost
+**Status:** **Built + QEMU-verified** (`osdev test shell` for the view, `osdev test files` for
+`save`, which needs a real disk) for the data path; the repaint-cost
 behaviour is only observable on real hardware (§4a). A shell built-in, full-screen.
 Trails `CLAUDE.md`; does not amend it.
 
@@ -23,10 +24,11 @@ scrollback 0.4.0 - what has scrolled off the screen
 
 ## 2. How it opens
 
-| how | opens at |
+| how | does |
 |---|---|
-| **PgUp** at the prompt | one page back |
-| `scrollback` | the newest line |
+| **PgUp** at the prompt | opens the view, one page back |
+| `scrollback` | opens the view at the newest line |
+| `scrollback save <path>` | writes the whole history to a file |
 | **PgDn** at the prompt | nothing happens |
 
 PgUp opens it **one page back** because the key already meant "go back a page". Making you press
@@ -112,6 +114,29 @@ It counts what is actually held. If the arena ever could not take everything the
 says `truncated` rather than naming lines that are not there (§26.7) - the same discipline as
 `older lines aged out`. Both numbers come from the same 32 KiB, so it should never fire.
 
+## 4b. `save <path>` - the history as a real file
+
+`save` is the word three other utilities already use for exactly this (`selfcheck save`,
+`run ... save`, `chaos kill-storm ... save`). A fourth word for one concept is what rule 4 exists to
+prevent, which is why it is not `dump`.
+
+```
+gsh> scrollback save /docs/sb.txt
+scrollback: saved 512 line(s), 19819 bytes to /docs/sb.txt
+```
+
+**The saved copy is not clipped.** The view clips lines to the screen because a wrapped line would
+make its own row count a lie; a file has no rows and no reason to lose characters, so `save` fetches
+separately rather than writing out whatever the viewer happened to be holding.
+
+It is the answer to a different question from the view: a dump you can keep, `find` in, pipe, or
+open in `edit`. It is deliberately NOT what the everyday view depends on - that would make reading
+what just scrolled past require storage to be present and healthy.
+
+Unlike the view, it needs `fs`, and says so rather than half-writing: a failed create reports
+`could not create the file`, and a failure part-way through reports that the file is incomplete
+(§26.7 - a recovery that fails is still a failure).
+
 ## 5. In a script it prints
 
 `depth > 0` - a script, `run`, `assert` or `selfcheck` - dumps the retained lines and returns. A
@@ -131,6 +156,13 @@ contains may also be sitting in the history that frame is rendering:
 
 Each time the collect stopped mid-stream and the *following* case reported the failure, which is how
 `Home is the line editor` got blamed for a bug it had no part in.
+
+A fourth instance came from `save`, and it is the one that names the real habit. The check was
+`contains("sb.txt")` over the output of `dir / | where name=sb.txt` - and it matched **the echoed
+command line**, passing while `dir` had truncated and found nothing. Together with a check that
+passed on an empty string and one that passed on the words "storage unavailable", the pattern is:
+**asserting the ABSENCE of a failure, or a string the echo also contains, confirms nothing.** Assert
+something only the real output can say - here `read ... | count` reporting `N lines,`.
 
 Two kinds of marker are safe. An **escape sequence**, because the ring stores the rendered grid
 (`sb.push(&s.grid[0][..cols])`) and escapes are consumed by the terminal, never stored - the frame

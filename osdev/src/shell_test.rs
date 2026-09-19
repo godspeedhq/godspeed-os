@@ -494,6 +494,20 @@ pub fn run(image_path: &Path, smp: u32) {
            "scrollback: dumps rather than paging when nobody is watching");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
 
+    // `save <path>` IS TESTED IN THE FILES SUITE, NOT HERE - THIS SUITE HAS NO DISK.
+    //
+    // It was written here first and the run said so plainly: `scrollback: could not create the
+    // file`, then `storage unavailable`. Worse, the follow-up check (`!contains("FAIL")`) PASSED
+    // against that, because the words "storage unavailable" contain no "FAIL" - a check that
+    // confirmed nothing while reporting success. Third time today; see §6 of the spec.
+    //
+    // What DOES belong here is the half that needs no storage: a missing path must be a usage
+    // error rather than a file named nothing.
+    send(&mut write_half, b"scrollback save\r");
+    let sv3 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sv3.contains("usage: scrollback save"),
+           "scrollback save: a missing path is a usage error");
+
     // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR - unconditionally. Type `hello world`,
     // Home, then `echo `, which must land at the FRONT giving `echo hello world`. If Home went
     // anywhere near the scrollback the line would read `hello worldecho `.
@@ -3879,6 +3893,34 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
+    // `scrollback save <path>` - THE HISTORY AS A REAL FILE, which needs a real disk, which is why
+    // it lives here and not in the shell suite (that one has no storage and the attempt only
+    // produced `storage unavailable`).
+    //
+    // Waits for the PROMPT, not for `scrollback: saved`: `collect_until` stops AT its marker, so
+    // waiting on the start of the report line would leave the counts and the path outside the
+    // captured text - which is exactly how the first version of this case failed.
+    // WRITTEN INTO /docs, NOT ROOT. The first version saved to `/sb.txt` and tipped `dir /` over the
+    // record bound (64 rows / 4096 bytes), which broke the tab-completion cases below - they
+    // enumerate root. A test that changes the tree other tests read is a test with side effects.
+    send(&mut write_half, b"scrollback save /docs/sb.txt\r");
+    let sv = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(25)).unwrap_or_default();
+    check!(sv.contains("scrollback: saved") && sv.contains("line(s)") && sv.contains("/docs/sb.txt"),
+           "scrollback save: reports the lines and bytes it wrote");
+
+    // AND THE FILE IS REAL. ASSERT ON SOMETHING THE ECHO CANNOT CONTAIN: the first version ran
+    // `dir / | where name=sb.txt` and checked `contains("sb.txt")`, which matched THE ECHOED COMMAND
+    // - it passed while `dir` had actually truncated and found nothing. `count` reports "N lines,"
+    // and no command line here contains that.
+    send(&mut write_half, b"read /docs/sb.txt | count\r");
+    let sv2 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    check!(sv2.contains(" lines,") && !sv2.contains("0 lines,"),
+           "scrollback save: the file reads back with real content");
+
+    // AND CLEAN UP, so the tree the later cases see is the tree they expect.
+    send(&mut write_half, b"delete /docs/sb.txt\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15));
+
     // `paginate` - the reading pipe sink.
     //
     // /many has 45 entries, comfortably taller than the 24-row console, so it pages.
