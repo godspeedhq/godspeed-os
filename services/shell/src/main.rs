@@ -5691,7 +5691,22 @@ fn scrollback_save(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellErro
     // One newline per line, which the arena does not store.
     let bytes = (used + have) as u64;
     if !fs_write_new(ctx, path, bytes) {
-        ctx.console_writeln("scrollback: could not create the file");
+        // SAY WHY, AND SAY WHAT TO DO ABOUT IT. This printed "could not create the file" and stopped
+        // there, which on a Dell Wyse meant `scrollback save /docs/sb.txt` failed with no hint that
+        // `/docs` simply did not exist - the vague failure 26.7 forbids, in the one place an
+        // operator has no other way to find out. `fs_write_new` already captured the real reason;
+        // this used to throw it away. Same shape `copy` reports.
+        //
+        // It does NOT create the parent itself. `mkdir <path> parents` is opt-in everywhere else,
+        // and a save that silently builds directory trees is the kind of magic 26.5 rejects - so it
+        // names the command instead of guessing that you wanted it.
+        match ctx.last_write_err.borrow().get() {
+            Some(why) => ctx.console_writeln_fmt(format_args!(
+                "scrollback: could not create {} - {}", str_of(path), why)),
+            None => ctx.console_writeln_fmt(format_args!(
+                "scrollback: could not create {} - is the parent there? (`mkdir <dir> parents`)",
+                str_of(path))),
+        }
         return Err(ShellError::Unknown);
     }
     let mut chunk = [0u8; IO_CHUNK];
@@ -5704,7 +5719,10 @@ fn scrollback_save(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellErro
             c += 1;
             if c == IO_CHUNK {
                 if !fs_write_at(ctx, path, off, &chunk[..c]) {
-                    ctx.console_writeln("scrollback: the write failed part-way - the file is incomplete");
+                    let why = ctx.last_write_err.borrow();
+                    ctx.console_writeln_fmt(format_args!(
+                        "scrollback: the write failed part-way - {} is INCOMPLETE ({})",
+                        str_of(path), why.get().unwrap_or("no reason given")));
                     return Err(ShellError::Unknown);
                 }
                 off += c as u64;
@@ -5714,7 +5732,10 @@ fn scrollback_save(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellErro
         at += n;
     }
     if c > 0 && !fs_write_at(ctx, path, off, &chunk[..c]) {
-        ctx.console_writeln("scrollback: the write failed part-way - the file is incomplete");
+        let why = ctx.last_write_err.borrow();
+        ctx.console_writeln_fmt(format_args!(
+            "scrollback: the write failed part-way - {} is INCOMPLETE ({})",
+            str_of(path), why.get().unwrap_or("no reason given")));
         return Err(ShellError::Unknown);
     }
     ctx.console_writeln_fmt(format_args!(
