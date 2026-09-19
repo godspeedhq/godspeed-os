@@ -308,3 +308,72 @@ then scroll again.
 
 Still **OPEN**, and still recorded rather than closed (26.7). What is gone is three wrong answers and
 one instrument that was manufacturing a zero.
+
+---
+
+## 2026-09-19 (second run): not broken, SLOW - and the deadline never measured the work it bounds
+
+`reacquire ok={true|false}`, added after the previous run, answers the question that had been left
+open, and the answer removes the last cap-shaped theory:
+
+```
+console: scrolled back 30 of 512 lines - the screen is showing HISTORY
+console: returned to live (requested)
+console: scrolled back 512 of 512 lines - the screen is showing HISTORY
+console: returned to live (requested)
+console: scrolled back 512 of 512 lines - the screen is showing HISTORY
+console: returned to live (requested)
+console: returned to live (output arrived)
+call: slot 8 waited 1000209 us across 3 blocks, 718716 core halts (slow #3)
+scrollback: the console stopped answering - left the view (console is BlockRecv, queue 0; our queue 0; reacquire ok=true)
+```
+
+**`reacquire ok=true`.** The shell reacquired the console by name, successfully, and the very next
+call still ran out its deadline. A fresh cap to a live endpoint. That is the fourth stale-cap theory
+this entry has retired, and it should be the last: the mechanism is excluded, not merely unlikely.
+
+**SIX scroll operations succeed first.** Whatever this is, it is not present at entry.
+
+### The three facts that fit together
+
+- **`slot 8` is the SHELL** (`task: 'shell' spawned OK on core 0 (slot 8)`). The console is slot 2,
+  and its contract pins it to `core = 0`. **The caller and the callee share a core**, on a machine
+  that reported `smp: 4 cores ready`.
+- **The framebuffer is 3840x2160** (`spawn[fb]: 'console' 3840x2160 ... 32400 KiB`).
+- **The 1-second call begins within 9 ms of `returned to live (output arrived)`** - the snap from 512
+  lines of history back to live, which is the most expensive repaint this console ever performs.
+
+So the reading is no longer "a message was lost". It is: the console is mid-repaint, the shell gives
+it one second, and the shell is blocked on the same core the repaint is running on. 718,716 core
+halts in that second is the shape of a caller churning while the thing it waits for holds the core.
+
+**The deadline was picked without measuring what it bounds.** One second for a full 4K repaint from
+history, on a shared core, is not a conservative bound - it is a guess that happens to be wrong on
+this machine. The prior entries in this file all looked for a lost message because the number was
+assumed to be generous.
+
+### Decision: scrollback becomes a utility (operator's call, 2026-09-19)
+
+Not as a way around the bug - the shape is wrong on its own terms, and this bug is what exposed it:
+
+- **One IPC round trip PER KEYPRESS**, each with its own deadline, against a service that repaints
+  4K. Holding PgUp issues one request per key repeat. No deadline makes that robust.
+- A utility **fetches the history once and pages it locally**: zero IPC per keystroke, and it reuses
+  `line_pager` - the pager `paginate` and `help` already share - rather than adding a third.
+- It **removes the view offset from the console**. That is a second place holding a derived view of
+  where the operator is looking, which is what 26.4 is about, and it is precisely the state that can
+  desync from the shell's idea of it.
+- `q` to quit matches every other full-screen view (`0_conventions.md` rule 10a).
+
+Honest limits of that change: it still needs ONE successful request to fetch the snapshot, so it
+reduces N calls to 1 rather than proving this resolved. And it is a snapshot rather than a live view
+- which is the right semantics anyway, since the live screen keeps moving underneath.
+
+**Sequenced after the gsfs carnage gates** at the operator's direction. Until then the current
+behaviour is acceptable under 26.7: it fails loudly, says what it observed, leaves the view, and the
+session continues. It does not corrupt anything and it does not hang.
+
+Still **OPEN**. What this run cost the entry is one more wrong theory; what it bought is a mechanism
+(slow repaint on a shared core) that is measurable rather than speculative - the next step is to
+have the console REPORT its repaint cost, so the deadline is derived from a measurement instead of
+being chosen and then defended.
