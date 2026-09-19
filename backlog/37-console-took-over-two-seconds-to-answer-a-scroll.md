@@ -1,7 +1,47 @@
 # 37. The console took over two seconds to answer a scroll request, and I do not know why
 
-**Status: OPEN, and deliberately recorded UNSOLVED. The symptom it caused is fixed; the cause is
-not found.**
+**Status: the PERMANENT failure is SOLVED - a stale capability, and a regression I introduced
+while fixing the first symptom. The original two-second stall is still unexplained.**
+
+> **Update 2026-09-19.** The instrument added for this answered it on the first run, and the answer
+> was not what any of the reasoning below predicted.
+>
+> ```
+> 03:35:32.049  run: ran 492, failed 0
+> 03:35:32.049  gsh> console: scrolled back 30 of 512 lines - the screen is showing HISTORY
+> 03:35:39.456  cap::get: ResourceId(102) gen mismatch cap=3 rec=29 liveness=Alive
+> 03:36:05.231  call: slot 8 waited 1000218 us across 3 blocks (slow #3)
+> 03:36:05.231  scrollback: the console stopped answering - left the view
+> 03:36:06.253  scrollback: the console did not answer - not scrolling      (then once a second,
+> 03:36:09.575  scrollback: the console did not answer - not scrolling       indefinitely)
+> ```
+>
+> **The shell was holding a dead handle.** Generation 3 against a kernel record at 29, endpoint
+> `Alive`: the console had been replaced twenty-six times since that cap was minted, which is what
+> `selfcheck` does to services. The shell caches peer handles and it is the client's job to
+> reacquire (CLAUDE.md §14.3).
+>
+> **And it was permanent because of a change made in this very backlog entry's fix.** The retry was
+> removed from `console_scroll` on the argument that it exists to survive a peer RESTART and "the
+> next `console_dims` reacquires for everyone". Nothing in the scroll path reacquires, so once the
+> cap went stale every scroll failed forever. The reasoning was wrong and hardware falsified it in
+> one run.
+>
+> **The instrument earned its place by what it did NOT print.** There is not one
+> `console: pass N took NNN ms` line in the whole log. That was the discriminator: the console was
+> never stuck in a pass, so it was reachable and serving - the fault was entirely on the shell's
+> side. Three rounds of reasoning had pointed at the console.
+>
+> **Fixed** by reacquiring once on entry to the scrollback view, where it costs a kernel directory
+> lookup rather than a round trip, and leaves every keystroke inside the view at a single request.
+> Still no retry inside `console_scroll`: a keystroke must never cost two deadlines.
+>
+> **STILL OPEN: the original two seconds.** A stale cap should fail fast, not consume the whole
+> deadline, and both logs show the full deadline elapsing (2,000,457 us then 1,000,218 us) with
+> three blocks. Why a send on a stale handle waits out its deadline instead of returning
+> `EndpointDead` promptly is not established, and is now the only part of this entry that is
+> unexplained. It is bounded and reported, so it costs one second and says so - but the mechanism
+> is unknown.
 
 ## What happened
 
@@ -38,9 +78,14 @@ better than hanging and still not good.
 
 - **Not a slow paint.** The console reports any repaint over 250 ms and reported none. Its own
   measured cost on this display is 29-41 ms.
-- **Not a stale send cap.** `selfcheck` neither kills nor restarts `console` (checked), so the
+- ~~**Not a stale send cap.** `selfcheck` neither kills nor restarts `console` (checked), so the
   shell's cached slot was not invalidated mid-run. Scrolls had worked forty seconds earlier in the
-  same boot.
+  same boot.~~ **WRONG, and wrong in an instructive way.** It IS a stale cap: `cap=3 rec=29`. The
+  check that produced this line looked for `kill console` / `restart console` in `selfcheck.gsh`
+  and found none - but `selfcheck` drives `chaos`, which restarts services without naming them in
+  the script, and a generation 26 ahead is not subtle evidence. "Scrolls worked forty seconds
+  earlier" was consistent with the cap going stale in between, which is exactly what happened. A
+  ruled-out list is only as good as the question each entry actually asked.
 - **Not the drain loop by design.** The console drains at most a 16-deep queue, bounded by an
   adaptive paint deadline clamped to 100 ms, then paints. One cycle is ~105 ms at this display's
   cost. A request should wait at most one cycle.

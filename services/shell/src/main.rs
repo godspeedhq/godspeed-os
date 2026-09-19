@@ -831,6 +831,31 @@ const SCROLL_BOTTOM: u8 = 7;
 /// NOT bound: in `paginate` you quit something that is running, here you step back from a view, and
 /// `q` still gets you out anyway because any printable key does.
 fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
+    // REACQUIRE FIRST, ONCE, BEFORE ANY KEYSTROKE CAN PAY FOR A STALE HANDLE.
+    //
+    // **This is here because removing the retry from `console_scroll` was wrong, and hardware said
+    // so in one run.** The argument for removing it was that a retry is for surviving a peer
+    // RESTART, and "the next `console_dims` reacquires for everyone". Nothing in the scroll path
+    // reacquires, so once the shell's cap went stale EVERY scroll failed, permanently - a Dell Wyse
+    // printed `scrollback: the console did not answer` once a second, indefinitely, with the kernel
+    // reporting `cap::get: ResourceId(102) gen mismatch cap=3 rec=29 liveness=Alive`. Generation 3
+    // against a record at 29: the endpoint was alive and the handle was 26 replacements out of date.
+    //
+    // A stale cap is the NORMAL state here rather than an edge case: `selfcheck` restarts services,
+    // and the shell caches its peer handles (§14.3 - reacquire by name, and it is the client's job).
+    //
+    // Doing it on ENTRY rather than per keystroke is what makes it free. `reacquire_by_name` is a
+    // kernel directory lookup, not a round trip to a service, so it costs a syscall once per PgUp
+    // and leaves every scroll inside the view at a single request. That is why there is still no
+    // retry inside `console_scroll`: a keystroke must never cost two deadlines, and if the console
+    // restarts WHILE the view is open the mode says so and the next PgUp picks up a fresh cap.
+    // A FAILED REACQUIRE IS NOT FATAL AND IS NOT IGNORED EITHER. If the directory lookup misses,
+    // the handle we already hold is untouched - it may still be perfectly good, and this is
+    // precisely the case where it was never stale to begin with. So carry on and let the scroll
+    // itself decide: its failure path already reports honestly. What must not happen is treating a
+    // missed reacquire as a reason to refuse, which would make a working console unusable.
+    let _fresh = ctx.reacquire_by_name("console");
+
     // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
     let Some((mut view, _)) = ctx.console_scroll(SCROLL_PAGE_UP) else {
         ctx.console_writeln("scrollback: the console did not answer - not scrolling");
