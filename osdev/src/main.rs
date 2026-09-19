@@ -1455,6 +1455,7 @@ fn cmd_test(suite: &str) {
         "fs-churn"     => run_fs_churn_test(),
         "fs-tear-detect" => run_fs_tear_detect_test(),
         "fs-blockchaos"  => run_fs_blockchaos_test(),
+        "fs-blockdeath"  => run_fs_blockdeath_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
         // because `osdev test` takes exactly one argument and widening that for one suite would be
         // the wrong trade.
@@ -2839,6 +2840,9 @@ fn run_fs_all_tests() {
         // COMPLETION STREAM - duplicate, missing and out-of-order replies - which is the failure
         // `backlog/31` recorded one layer up and which no suite reached until now.
         "fs-blockchaos",
+        // ...and the driver dying mid-request, which is a different recovery path: `SendFailed`
+        // plus a reacquire, rather than a wrong answer that has to be detected.
+        "fs-blockdeath",
     ];
     println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
     println!("fs-all: {} suites, each in its own process\n", SUITES.len());
@@ -3341,6 +3345,25 @@ fn run_fs_compat_test() {
 /// transient error (the boot self-test read still succeeds) - and that normal operation is
 /// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
 /// be injected.
+/// Carnage §3.7, the other half: kill `block-driver` with requests outstanding.
+///
+/// No test feature at all - the driver is killed over the control channel on a SHIPPING build, so a
+/// fault found here is a fault about the system rather than about a build nobody runs.
+fn run_fs_blockdeath_test() {
+    println!("\n=== fs: block-driver killed WITH REQUESTS OUTSTANDING (§3.7) ===");
+    build_blockdev_fs("", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_blockdeath.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_blockdeath(&image_path, persist, 4);
+}
+
 /// Carnage §3.7: corrupt the COMPLETION STREAM and require the filesystem to survive it.
 ///
 /// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/31` warned about:

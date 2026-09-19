@@ -48,3 +48,4 @@ spawn_init                         # docs/naming-design.md
 spawn_pong                         # docs/service-ownership.md
 write_file                         # docs/persistence.md
 write_hfnum                        # docs/arm32-usb-userspace.md
+device_del                         # QEMU monitor command (hot-unplug), docs/gsfs-carnage.md 3.7 - external, not our source

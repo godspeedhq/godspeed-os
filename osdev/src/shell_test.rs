@@ -6781,6 +6781,152 @@ pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.7, the other half: kill `block-driver` WITH REQUESTS OUTSTANDING.
+///
+/// `fs-blockchaos` makes the driver answer WRONGLY. This makes it stop existing mid-request, which
+/// is a different fault with a different recovery path: `fs` sees `SendFailed` (its cap names a dead
+/// endpoint), reacquires by name, and retries - the one retry the code considers safe, because
+/// nothing is in flight when a send never left.
+///
+/// **THE SHARP ASSERTION IS THAT RECOVERY IS PROMPT, NOT MERELY EVENTUAL.** §8.6 says a caller
+/// blocked in a `Call` whose replier dies wakes with `ReplyDead` rather than hanging, and `fs` gives
+/// each block request a 30 s deadline. So "it recovered" is not enough: if the kernel's death-wake
+/// works, `fs` comes back in well under that. A recovery that takes the full deadline means the wake
+/// did NOT fire and the system merely timed out - the same outcome for very different reasons, and
+/// exactly the distinction Commandment V cares about (a dead dependency must RETURN, loudly).
+/// Whether everything captured SO FAR contains `needle`, without moving the collect cursor.
+///
+/// A plain `collect_until` would consume stream the later steps still need; this asks about the
+/// past rather than waiting on the future.
+fn w_contains(buf: &Arc<Mutex<Vec<u8>>>, needle: &str) -> bool {
+    String::from_utf8_lossy(&buf.lock().unwrap()).contains(needle)
+}
+
+pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-blockdeath: PASS - {}", $label); pass += 1; }
+        else { println!("fs-blockdeath: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-blockdeath: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-blockdeath: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-blockdeath: never reached a prompt"); std::process::exit(1);
+    }
+
+    // KILL ON A MARKER, NOT A TIMER - the discipline `fs-churn` records. `churn` prints a
+    // per-second heartbeat, so waiting for it proves requests are genuinely in flight; a fixed delay
+    // would sometimes kill before the first write ever reached the driver, and the test would pass
+    // having proved nothing.
+    send(&mut write_half, b"churn 12\r");
+    let writing = collect_until(&buf, &mut cursor, b"s elapsed", Duration::from_secs(60));
+    check!(writing.is_some(), "churn was demonstrably WRITING before the driver was killed");
+
+    let killed_at = std::time::Instant::now();
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => {
+            thread::sleep(Duration::from_millis(50));
+            send(&mut ctrl, b"\nKILL block-driver\n");
+            drop(ctrl);
+        }
+        None => { check!(false, "could not reach the control channel to kill block-driver"); }
+    }
+
+    // MEASURE THE EVENT, NOT THE PROMPT. The first version timed from the kill to the next `gsh>`
+    // and reported 23.9 s against a 30 s bound - which PASSED, and measured nothing: `churn 25` runs
+    // its full 25 seconds whatever happens to the driver, so the number was churn's duration wearing
+    // a recovery label. Waiting for the line `fs` prints when its send fails measures the thing the
+    // assertion is about.
+    //
+    // WHY THIS IS THE PROMPTNESS TEST: `fs` allows each block request 30 s (`block-driver`
+    // legitimately retries a busy device that long). If the endpoint's death is only noticed when
+    // that deadline expires, the system is merely timing out. Noticing in a second or two means the
+    // kernel told it - the §8.6 death-wake - which is what Commandment V requires of a dead
+    // dependency: RETURN, loudly, rather than hang.
+    let noticed = collect_until(&buf, &mut cursor, b"block-driver send failed", Duration::from_secs(30));
+    let notice_at = killed_at.elapsed();
+    check!(noticed.is_some(), "fs NOTICED the driver's death rather than hanging on it");
+    check!(notice_at < Duration::from_secs(10),
+           "fs noticed PROMPTLY - the death-wake fired, it did not sit out its 30 s deadline");
+    println!("fs-blockdeath: (fs noticed {notice_at:?} after the kill; its request deadline is 30 s)");
+
+    // DMA IS QUIESCED WHEN THE DRIVER DIES, which the first run surfaced and is worth pinning here
+    // rather than leaving as a line somebody once saw. An unconfined DMA-capable driver has
+    // kernel-equivalent reach (§6.4); a dead one whose bus-mastering is still enabled could have a
+    // controller writing into memory the kernel has already reclaimed - `kill_task` frees its frames
+    // in the very next line of this log.
+    check!(w_contains(&buf, "bus-master DISABLED on driver death"),
+           "the dead driver's DMA was quiesced before its frames were reclaimed");
+
+    let restarted = collect_until(&buf, &mut cursor, b"block-driver restarted", Duration::from_secs(60));
+    check!(restarted.is_some(), "supervisor observed the death and restarted block-driver");
+    let recovered = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120));
+    check!(recovered.is_some(), "the shell returned to a prompt after the driver died mid-request");
+
+    // AND IT STILL WORKS. Every one of these runs after the driver has died and been respawned.
+    send(&mut write_half, b"write /afterdeath.txt driver-died-mid-request\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"read /afterdeath.txt\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"churn verify\r");
+    let _ = collect_until(&buf, &mut cursor, b"file(s)", Duration::from_secs(180));
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    send(&mut write_half, b"drives check\r");
+    let _ = collect_until(&buf, &mut cursor, b"check: ok", Duration::from_secs(300));
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_blockdeath_serial.log", &w);
+
+    check!(w.contains("driver-died-mid-request"),
+           "a file written AFTER the driver death reads back correctly");
+    check!(w.contains("0 bad"), "no corrupt blocks after the driver died mid-request");
+    check!(!w.contains("DANGEROUS DIRECTION"),
+           "the bitmap did not drift in the dangerous direction");
+    // Same property `fs-blockchaos` asserts, and for the same reason: a tear is permitted when the
+    // caller was TOLD, and is corruption when it was not.
+    let torn    = w.contains("are TORN");
+    let refused = w.contains("refused") || w.contains("NO usable reply") || w.contains("EndpointDead");
+    check!(!torn || refused,
+           "no SILENT data change - any torn file is accompanied by a reported failure");
+    check!(!w.contains("KERNEL PANIC"), "no kernel panic");
+
+    println!("\nfs-blockdeath: {pass} passed, {fail} failed  (serial -> build/tests/fs_blockdeath_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Carnage §3.7: attack the COMPLETION STREAM, not the device.
 ///
 /// `fs-ioretry` already makes the disk fail, and `fs` handles that by retrying. §3.7 asks for the
