@@ -1,7 +1,7 @@
 # 37. The console took over two seconds to answer a scroll request, and I do not know why
 
-**Status: the PERMANENT failure is SOLVED - a stale capability, and a regression I introduced
-while fixing the first symptom. The original two-second stall is still unexplained.**
+**Status: OPEN. A reacquire was added and is correct hygiene, but it is NOT established as the
+fix - the reasoning that claimed it was has since been retracted. See the correction below.**
 
 > **Update 2026-09-19.** The instrument added for this answered it on the first run, and the answer
 > was not what any of the reasoning below predicted.
@@ -39,9 +39,42 @@ while fixing the first symptom. The original two-second stall is still unexplain
 > **STILL OPEN: the original two seconds.** A stale cap should fail fast, not consume the whole
 > deadline, and both logs show the full deadline elapsing (2,000,457 us then 1,000,218 us) with
 > three blocks. Why a send on a stale handle waits out its deadline instead of returning
-> `EndpointDead` promptly is not established, and is now the only part of this entry that is
-> unexplained. It is bounded and reported, so it costs one second and says so - but the mechanism
-> is unknown.
+> `EndpointDead` promptly is not established.
+
+> **RETRACTION, same day, before the next flash.** The update above claims the stale cap was the
+> cause. **It is not established, and two things in the same log contradict it.**
+>
+> 1. **The `gen mismatch` lines are at 03:35:24, 03:35:26 and 03:35:39 - during and just after
+>    `selfcheck`, not in the failure window.** `selfcheck` deliberately exercises stale caps; that
+>    is part of what it tests. There is **no `cap::` line at all** between 03:36:06 and 03:36:20
+>    while every scroll was failing, so the capability was VALID and the sends were accepted.
+> 2. **Every failure took almost exactly 1.000 s** (03:36:14.015, :15.025, :16.018, :17.027, ...).
+>    That is the deadline elapsing. A cap the kernel rejects fails immediately and does not consume
+>    a deadline at all - so the message was delivered and no reply came.
+>
+> **And the instrument cannot see the case that matters.** The console reports a long pass at the
+> END of the pass. A console stuck INSIDE one never reaches the report, so an absent line means
+> either "nothing was slow" or "something was so slow it never finished" - opposite answers. The
+> update above read the absence as proof the console was healthy. It proves nothing.
+>
+> So the honest position is: the console was not answering, the cap was fine, and whether it was
+> stuck or never received the message is **still unknown**. The reacquire on entry stays, because
+> a client caching a peer handle should reacquire (§14.3) and it costs a kernel lookup - but it is
+> hygiene, not a demonstrated fix.
+>
+> **The next instrument asks the KERNEL, which is the one party that can answer while the console
+> cannot.** On a failed scroll the shell now reports the console's task state and queue depth:
+>
+> - `Running` -> executing, so busy or stuck, and the pass report will confirm which if it ever
+>   completes.
+> - `BlockRecv`, queue 0 -> idle and waiting, and **our message never arrived** - which points at
+>   the send side and away from the console entirely.
+> - `BlockRecv`, queue > 0 -> holding the request and not processing it, which should be impossible
+>   and would be the most interesting of the three.
+>
+> Three rounds of reasoning have now produced three wrong answers about this bug. The pattern is
+> the one this project keeps relearning: reason to a hypothesis, then MEASURE it, and do not let
+> the absence of evidence become evidence of absence.
 
 ## What happened
 

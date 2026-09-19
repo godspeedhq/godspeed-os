@@ -830,6 +830,32 @@ const SCROLL_BOTTOM: u8 = 7;
 /// so the two things in this shell that show you more than a screenful work the same way. `q` is
 /// NOT bound: in `paginate` you quit something that is running, here you step back from a view, and
 /// `q` still gets you out anyway because any printable key does.
+/// Say what the CONSOLE was doing when a scroll went unanswered.
+///
+/// **THE PREVIOUS INSTRUMENT COULD NOT SEE THE INTERESTING CASE, and that is why this exists.** The
+/// console reports any PASS - drain plus paint - that runs over 250 ms, but it reports it at the END
+/// of the pass. A console stuck INSIDE one never reaches the report, so an absent line means either
+/// "nothing was slow" or "something was so slow it never finished", and those are opposite answers.
+/// Reading it from the log, I took the absence as proof the console was healthy. It was not proof of
+/// anything.
+///
+/// This asks the KERNEL instead, which is the one party that can answer while the console cannot:
+///
+///   - `Running`            -> the console is executing. It is busy or stuck, and the pass
+///                             instrument will confirm which if it ever completes.
+///   - `BlockRecv`, queue 0 -> it is idle and waiting, and OUR MESSAGE NEVER ARRIVED. That points at
+///                             the send side, not at the console at all.
+///   - `BlockRecv`, queue >0-> it holds the request and is not processing it, which should be
+///                             impossible and would be the most interesting answer of the three.
+///
+/// One `TaskStat` syscall, only on the failure path, so it costs nothing when things work.
+fn console_state_note(ctx: &ServiceContext) -> (&'static str, u8) {
+    match slot_of(ctx, "console") {
+        Some(slot) => { let st = ctx.task_stat(slot); (st.state_str(), st.queue_depth) }
+        None => ("not-found", 0),
+    }
+}
+
 fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
     // REACQUIRE FIRST, ONCE, BEFORE ANY KEYSTROKE CAN PAY FOR A STALE HANDLE.
     //
@@ -858,7 +884,10 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
 
     // Enter on the first PgUp. Nothing retained means nothing to look at - no mode, no bar.
     let Some((mut view, _)) = ctx.console_scroll(SCROLL_PAGE_UP) else {
-        ctx.console_writeln("scrollback: the console did not answer - not scrolling");
+        let (state, q) = console_state_note(ctx);
+        ctx.console_writeln_fmt(format_args!(
+            "scrollback: the console did not answer - not scrolling (console is {}, queue {})",
+            state, q));
         return;
     };
     if view == 0 { return; }
@@ -903,7 +932,10 @@ fn scrollback_mode(ctx: &ShellCtx, line: &mut Line) {
             // puts the display right. If the console is gone entirely the message does not land
             // either, but then the screen is frozen regardless and nothing here could help.
             None => {
-                ctx.console_writeln("scrollback: the console stopped answering - left the view");
+                let (state, q) = console_state_note(ctx);
+                ctx.console_writeln_fmt(format_args!(
+                    "scrollback: the console stopped answering - left the view (console is {}, queue {})",
+                    state, q));
                 return;
             }
         }
