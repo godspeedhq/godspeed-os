@@ -5587,7 +5587,31 @@ fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
 }
 
 /// One `console_history` reply. Matches `HISTORY_MAX` in `services/console`.
-const SB_FETCH: usize = 2048;
+const SB_FETCH: usize = 3584;
+
+/// One screenful of history, held while it is fetched.
+///
+/// **THE FRAME IS ASSEMBLED BEFORE ANY OF IT IS DRAWN, and that is not a tidiness preference - the
+/// first version interleaved the two and a Dell Wyse took two seconds a frame for it.** It wrote the
+/// header, fetched twenty lines, wrote them, fetched the rest. Each fetch is a blocking call, and
+/// each one was queued BEHIND the painting its own preceding writes had just asked for. Moving the
+/// repaint out of the console's request handler did not help, because the request still waited in
+/// line behind a repaint - it had simply moved one place in the queue. Frames slowed, then every
+/// fetch hit its deadline and the body came up blank while the status line still showed the total
+/// from the one call that had worked (`backlog/37`).
+///
+/// Fetch first, paint second: the reads go out back to back with nothing of ours queued ahead of
+/// them, and the painting happens afterwards, finishing long before the next keypress asks for
+/// anything.
+///
+/// 8 KiB is a bounded arena, not a guess at a maximum (§26.6.1). A line is stored already clipped to
+/// the screen, so this holds ~85 rows of 96 columns; where a console is wider than the arena can
+/// fill, FEWER rows are shown and the status line counts what is actually there rather than what was
+/// asked for. A short frame is a visible, honest degradation; a wrong count is not.
+const SB_FRAME: usize = 8192;
+
+/// Rows one frame can hold. `term::MAX_ROWS` in the console.
+const SB_ROWS: usize = 64;
 
 /// `scrollback` - read back what has already scrolled off the screen.
 ///
@@ -5650,6 +5674,9 @@ fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<()
     let cols = if cols == 0 { 80 } else { cols as usize };
     let body = rows.saturating_sub(2).max(1);
     let clip = cols.saturating_sub(1);
+    let mut store = [0u8; SB_FRAME];
+    let mut lens = [0u16; SB_ROWS];
+    let mut cut = [false; SB_ROWS];
 
     // OPENED ONE PAGE BACK WHEN PgUp BROUGHT US HERE, at the newest line when the command was typed.
     // The key already meant "go back a page", and making the operator press it twice to see one page
@@ -5664,36 +5691,54 @@ fn cmd_scrollback(ctx: &ServiceContext, depth: u8, page_back: bool) -> Result<()
         ctx.console_write_fmt(format_args!(
             "scrollback {} - what has scrolled off the screen\x1b[K\n", UTIL_VERSION));
 
-        let mut frame = FrameBuf::new();
-        let mut drawn = 0usize;
+        // ---- PHASE 1: FETCH. Not one console write in here, so nothing of ours is queued ahead
+        // of a request and no reply waits on a repaint we asked for ourselves.
+        let mut have = 0usize;
+        let mut used = 0usize;
         let mut i = top;
-        while drawn < body && i < total {
+        while have < body && have < SB_ROWS && i < total {
             let (n, t, a, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
             total = t as usize;
             aged = a;
             if n == 0 { break; }
             let mut off = SB_HDR;
+            let mut stop = false;
             for _ in 0..n {
-                if drawn >= body || off >= k { break; }
-                let ln = (buf[off] as usize).min(k - off - 1);
+                if have >= body || have >= SB_ROWS || off >= k { break; }
+                let full = (buf[off] as usize).min(k - off - 1);
                 off += 1;
-                let mut lb = LineBuf::new();
-                RecordSink::put(&mut lb, &buf[off..off + ln]);
                 // Clipped, never wrapped: a wrapped line pushes every row below it down and makes
                 // the count in the status line a lie about what is on the screen.
-                if lb.n > clip { lb.n = clip; RecordSink::put(&mut lb, b">"); }
-                lb.flush_into(ctx, &mut frame);
-                off += ln;
-                drawn += 1;
+                let take = full.min(clip);
+                if used + take > SB_FRAME { stop = true; break; }
+                store[used..used + take].copy_from_slice(&buf[off..off + take]);
+                used += take;
+                lens[have] = take as u16;
+                cut[have] = full > take;
+                have += 1;
+                off += full;
                 i += 1;
             }
+            if stop { break; }
         }
-        while drawn < body { frame.put(ctx, b"\x1b[K\n"); drawn += 1; }
+
+        // ---- PHASE 2: PAINT. One frame, batched, with the console free to do nothing else.
+        let mut frame = FrameBuf::new();
+        let mut at = 0usize;
+        for r in 0..have {
+            let n = lens[r] as usize;
+            let mut lb = LineBuf::new();
+            RecordSink::put(&mut lb, &store[at..at + n]);
+            if cut[r] { RecordSink::put(&mut lb, b">"); }
+            lb.flush_into(ctx, &mut frame);
+            at += n;
+        }
+        for _ in have..body { frame.put(ctx, b"\x1b[K\n"); }
         frame.flush(ctx);
 
         ctx.console_write_fmt(format_args!(
             "[ {}-{} of {}{} ]  [arrows] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit",
-            top + 1, (top + body).min(total), total,
+            top + 1, top + have, total,
             if aged { ", older lines aged out" } else { "" }));
         ctx.console_write("\x1b[J");
 

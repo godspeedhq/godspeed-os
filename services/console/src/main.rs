@@ -85,9 +85,12 @@ const REQ_SCROLL: u8 = 2;
 /// itself as the beginning is the same wrong answer as a truncated directory listing (§26.7).
 const REQ_HISTORY: u8 = 3;
 
-/// Reply buffer for one `REQ_HISTORY`. Under the 4 KiB message ceiling (§8.5) with room to spare,
-/// and large enough that an ordinary screenful takes one or two requests rather than dozens.
-const HISTORY_MAX: usize = 2048;
+/// Reply buffer for one `REQ_HISTORY`. Under the 4 KiB message ceiling (§8.5) with room to spare.
+///
+/// Sized so an ordinary screenful arrives in ONE request. Every extra round trip is a blocking call
+/// the caller has to make, and on a 4K console a call can land behind a repaint - so the number of
+/// requests per frame is the number that matters here, not the size of any one of them.
+const HISTORY_MAX: usize = 3584;
 
 /// `[n, total_lo, total_hi, aged]`.
 const HISTORY_HDR: usize = 4;

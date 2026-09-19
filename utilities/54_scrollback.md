@@ -1,6 +1,7 @@
 # Utility: `scrollback` - read back what has scrolled off the screen
 
-**Status:** **Built + QEMU-verified** (`osdev test shell`). A shell built-in, full-screen.
+**Status:** **Built + QEMU-verified** (`osdev test shell`) for the data path; the repaint-cost
+behaviour is only observable on real hardware (§4a). A shell built-in, full-screen.
 Trails `CLAUDE.md`; does not amend it.
 
 ---
@@ -68,6 +69,41 @@ It also takes the view offset **out** of the console. That was a second place ho
 of where the operator is looking, which is what §26.4 is about, and it was exactly the state that
 could disagree with the shell's idea of it.
 
+## 4a. Fetch the whole frame, THEN paint it
+
+The first build of this utility interleaved the two, and a Dell Wyse took **two seconds a frame** for
+it before degrading to a blank body:
+
+```
+write the header       queued
+fetch lines 1-20       the request sits BEHIND that write: the console paints, then answers
+write those lines      queued
+fetch the rest         sits behind THOSE paints
+```
+
+Moving the repaint out of the console's request handler (§4) did not help on its own. The request
+simply moved one place down the same queue and still waited on a repaint - except now one the
+utility had asked for itself. Frames slowed until every fetch hit its one-second deadline, at which
+point the body came up empty while the status line still showed the total from the single call that
+had worked.
+
+So the phases are separate and the order is the point: **all the reads go out with nothing of ours
+queued ahead of them, then the frame is painted in one batch**, which finishes long before the next
+keypress needs anything. The console's reply is sized so an ordinary screenful arrives in ONE
+request, because what costs here is the number of round trips, not the size of any one of them.
+
+Holding a frame needs somewhere to put it: an 8 KiB bounded arena (§26.6.1), storing lines already
+clipped to the screen. Where a console is wider than the arena can fill, **fewer rows are shown and
+the status line counts what is actually on screen**. A short frame is a visible, honest degradation;
+a status line that counts rows that are not there is not.
+
+**The suite cannot catch this, and did not.** `osdev test shell` was green before the fix and green
+after, at the same 202 cases. The failure is a request queuing behind a repaint, and QEMU paints
+nearly for free - so the interleaving is invisible there by construction. This is the SECOND time on
+this feature that a green suite has meant less than it looked like (§6 has the first), and it is
+recorded rather than papered over: the guard against a reintroduction is this section plus the phase
+comment in `cmd_scrollback`, not a test.
+
 ## 5. In a script it prints
 
 `depth > 0` - a script, `run`, `assert` or `selfcheck` - dumps the retained lines and returns. A
@@ -93,9 +129,16 @@ Two kinds of marker are safe. An **escape sequence**, because the ring stores th
 cases wait on `ESC[J`. Or a string introduced **after** the output under test, which is what the
 dump case does.
 
-There is a second lesson underneath: the old mode's tests passed through the entire bug, because
-what broke was a repaint cost on a 4K panel and QEMU has no such panel. Asking for bytes is
-deterministic, so this path is genuinely covered rather than merely green.
+There is a second lesson underneath, and §4a is the proof it was not learned the first time: the old
+mode's tests passed through the entire bug, because what broke was a repaint cost on a 4K panel and
+QEMU has no such panel.
+
+What the suite covers now is the DATA path - ask for lines, get bytes, page them - and that much is
+deterministic on any framebuffer. What it still cannot see is anything whose cost is a repaint, and
+§4a is exactly such a bug: green before the fix, green after, same 202 cases. So the honest
+statement is that this utility is well covered where coverage is possible and uncovered where the
+hardware is the variable, and the standing rule stays what it has been all day - **a green suite is
+not evidence about a 4K console.**
 
 ## 7. Implementation
 
