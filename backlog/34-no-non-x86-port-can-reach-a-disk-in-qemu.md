@@ -1,10 +1,10 @@
 # 34. No non-x86 port can reach a disk in QEMU, so storage is testable on one architecture
 
-**Status: OPEN, NARROWED HARD 2026-09-20 - riscv64 now reaches a disk, mounts GSFS, and reads and
-writes files in QEMU. The row below that said "none attached" is closed; what remains open is
-FORMATTING on that port, and the two ARM rows. A real Commandment-level defect was found on the way
-and is FIXED (see the end). It is no longer true that every storage guarantee is verified on one
-architecture: it is true that every one involving `drives flash` still is.**
+**Status: OPEN for the two ARM rows ONLY. riscv64 is CLOSED 2026-09-20: it reaches a disk, formats
+GSFS, and writes and reads files back in QEMU. Two real defects were found getting there and both are
+FIXED - a driver that hung when its host service was silent, and a capacity that was latched at mount
+and never refreshed. A third was found by accident and is the most serious of them: `fs`'s own
+protocol selftest can format the live disk, and what prevents it is one argument.**
 
 **Status: OPEN, and it is a TEST-INFRASTRUCTURE limit rather than a defect in the OS. Each port fails
 for its own concrete reason, measured today rather than assumed. The consequence is that every
@@ -173,9 +173,9 @@ Verified: riscv64 with no storage now reports and SERVES (`USB mass storage serv
 sectors = 0 MiB)`, 0 timeouts, was 4); riscv64 with a stick unaffected; `osdev test fs-all` **25 of 25
 in ~31 min** on x86.
 
-## What is still open on this port: FLASH
+## The capacity latch (FIXED), and the selftest it nearly destroyed the disk with
 
-`fs` mounts and serves, but `drives flash data` is refused on a disk that is present and serving:
+`fs` mounts and serves, but `drives flash data` was refused on a disk that is present and serving:
 
 ```
 fs: drives-info - capacity 32768 sectors, mounted false
@@ -183,34 +183,80 @@ fs: flash requested (capacity 0 sectors, forced false)
 fs: flash REFUSED - block-driver reports 0 capacity
 ```
 
-Two of our own statements contradicting each other, four lines apart, on one boot. The cause is
-found and is item 3 of the list above - a capacity that arrives late and is latched - except the
-latch is in `fs`, not in `block-driver`: `capacity` is a PARAMETER of `serve_once`, computed once at
-mount and never refreshed. `OP_DRIVES_INFO` shadows it with a fresh `block_capacity(ctx)`;
-`OP_FLASH` and `OP_RESET` use the stale one. On riscv64 the stick finishes enumerating after `fs`
-starts, so the latch is 0 forever.
+Two of our own statements disagreeing four lines apart on one boot. The cause is item 3 of the list
+above - a capacity that arrives late and is latched - except the latch is in `fs`, not in
+`block-driver`: `capacity` is a PARAMETER of `serve_once`, computed once at mount and never asked
+again. `OP_DRIVES_INFO` shadows it with a fresh `block_capacity(ctx)`; nothing else does. On riscv64
+the stick finishes enumerating after `fs` starts, so the latch stays 0 forever.
 
-**The obvious fix is NOT SHIPPED, and this is the useful part of the record.** Re-deriving in those
-two arms makes riscv64 work end to end - flash accepted, `wrote /hello.txt (18 bytes)`,
-`riscv64-wrote-this` read back, `dir` listing it. **It also takes `fs-all` on x86 from 25 of 25 to 2
-of 25.** Reproduced and controlled: baseline 9/9 on `fs-check` four times, the change 2/9 twice and
-4/9 with only the `OP_FLASH` half applied.
+### The obvious fix is a disk-wiper, and this is why
 
-Ruled out so the next attempt does not re-derive them:
+Re-deriving inside `OP_FLASH` and `OP_RESET` makes riscv64 work end to end. **It also takes `fs-all`
+on x86 from 25 of 25 to 2 of 25** - and the reason is worth every line of this section.
 
-- **not the stack** - `serve_once` grows 12,888 -> 12,904 bytes against a 256 KiB budget;
-- **not a taken branch** - `fs-check` sends only `drives check` and `read`, and the only sender of
-  `OP_FLASH` anywhere is the shell's `drives flash`, so the inserted call site never executes;
-- **not the harness setup** - the failing run's `mkfs`, both `bake` lines and the drift are
-  byte-identical to a passing one.
+`fs` runs a `protocol_selftest` at startup that walks **every opcode from 0 to 255** through
+`serve_once`, checking that no malformed request crashes it. Three of those opcodes are destructive:
+**21 `OP_FLASH`**, **149 `OP_FLASH | 0x80`** (the forced variant) and **23 `OP_RESET`**. The only
+thing that makes walking them safe is the third argument at its call site:
 
-And yet the symptom is that the disk the OS mounts has been REFORMATTED: fsck reports `1 files, 1
-dirs, 76 blocks used` and `the free count already agreed with the tree - nothing was repaired`, where
-a passing run reports `3 files, 1 dirs, 78 blocks used` and REPAIRS the deliberate drift. The baked
-`/alpha.txt` and `/beta.txt` are gone.
+```rust
+serve_once(ctx, vol, 0, false, p, 0, CapHandle(0), &mut out[..], &mut len);
+//                   ^ capacity = 0, and every destructive arm refuses on it
+```
 
-A storage change whose failure mode cannot be explained does not ship, so this is recorded rather
-than half-fixed (§26.7). The next attempt starts here, not from scratch.
+An arm that asks `block_capacity()` for itself **ignores that injected zero**. The selftest then
+formats the machine's real disk during boot, twice, before a prompt exists to object. Every suite's
+disk was being wiped before its first command - which is why a suite that never types `flash`, like
+`fs-check`, reported `1 files, 1 dirs` where it had baked two files and drifted the free count.
+
+**How it was found, recorded because the reasoning was wrong three times first.** The symptom said
+"reformatted"; the arm that reformats is never reached by `fs-check`; the only sender of `OP_FLASH`
+anywhere is the shell's `drives flash`, which needs a typed `y`. Stack was ruled out (`serve_once`
+12,888 -> 12,904 bytes of a 256 KiB budget), harness setup was ruled out (byte-identical `mkfs`,
+bakes and drift). What settled it was logging the op byte of every request `fs` received and seeing
+single-byte payloads counting 0, 1, 2, 3 - a walk, not a command. **Every theory was about who could
+have SENT a flash; nothing had sent one, because the selftest calls `serve_once` directly.**
+
+### What shipped
+
+The refresh happens at the CALLER, in the live serve loop, where the selftest is not involved - and
+only while capacity is still 0, so `read` and `write` never pay a round trip for a question already
+answered:
+
+```rust
+if capacity == 0 {
+    if let Some(n) = block_capacity(&ctx) { if n > 0 { capacity = n; } }
+}
+```
+
+And the constraint is now written on `serve_once` itself, because nothing marked that parameter as an
+injection point and that omission is the whole of this section: **`capacity` IS AN INJECTION POINT,
+NOT JUST A NUMBER - do not re-derive it inside an arm.**
+
+Verified: `fs-check` 9/9 (2/9 under the bad version, 9/9 baseline); `osdev test fs-all` **24 of 25,
+the one failure `fs-blockdeath` being a precondition flake that passes 11/11 on a re-run** with `fs
+noticed 202.3671ms after the kill`; riscv64 formats and mounts:
+
+```
+drives flash data
+This ERASES the drive. Continue? [y/N] y
+fs: flash requested (capacity 32768 sectors, forced false)
+drives: formatted as GSFS - mounted, ready to use now (no reboot)
+wrote /hello.txt (18 bytes)
+riscv64-wrote-this
+```
+
+`docs/gsfs-carnage.md` 3.11 - write a GSFS volume on one architecture and read it on another - was
+recorded as NOT REACHABLE in QEMU. It is reachable now.
+
+### Still worth doing, and NOT done here
+
+The selftest walking destructive opcodes is defended by exactly one argument value. That is fragile
+in a way this entry has now demonstrated rather than predicted: the next person to touch those arms
+has no reason to know. A structural guard - a flag on the call, or a read-only entry point the
+selftest drives - would make it impossible rather than merely documented. Recorded rather than built,
+because it is a change to the shape of the serve path and this branch has had enough of those
+(§26.7).
 
 ## The two ARM rows, unchanged
 

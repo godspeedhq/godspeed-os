@@ -902,6 +902,36 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 continue;
             }
         };
+        // A CAPACITY THAT ARRIVES LATE. `capacity` is what block-driver reported when this service
+        // mounted, and it was never asked again - so a stick that finishes enumerating AFTER `fs`
+        // starts leaves it 0 forever, and `drives flash` then refuses a disk that is present and
+        // serving. Measured on riscv64 (`backlog/34`), where the USB stack binds the stick after we
+        // are already up:
+        //     fs: drives-info - capacity 32768 sectors, mounted false
+        //     fs: flash requested (capacity 0 sectors, forced false)
+        //     fs: flash REFUSED - block-driver reports 0 capacity
+        // Two of our own statements disagreeing four lines apart, because `OP_DRIVES_INFO` re-derives
+        // and nothing else does.
+        //
+        // ONLY WHILE WE BELIEVE THERE IS NO DISK. Once a real capacity is known this costs nothing,
+        // and read/write never pay an extra round trip for a question already answered.
+        //
+        // AND IT IS DONE HERE, AT THE CALLER, NOT INSIDE THE ARMS THAT NEED IT - which is the whole
+        // reason this comment is long. `protocol_selftest` walks EVERY opcode 0..=255 through
+        // `serve_once`, and 21 is `OP_FLASH`, 149 is `OP_FLASH | 0x80` (forced) and 23 is `OP_RESET`.
+        // The only thing that stops that selftest formatting the live disk on every boot is the
+        // `capacity = 0` it passes in. Re-deriving inside those arms overrides the injected zero and
+        // the selftest wipes the machine's storage before the prompt appears - measured, twice per
+        // boot, and it took `fs-all` from 25 of 25 to 2 of 25 with no suite ever typing `flash`.
+        if capacity == 0 {
+            if let Some(n) = block_capacity(&ctx) {
+                if n > 0 {
+                    ctx.log_fmt(format_args!(
+                        "fs: block-driver now reports {} sectors (it reported none at mount) - adopting it", n));
+                    capacity = n;
+                }
+            }
+        }
         match badge {
             Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable,
                                                 msg.payload_bytes(), reply, &mut reply_fails),
@@ -1390,6 +1420,17 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// minted file capability in its reply, and a capability transfer is not bytes - it moves authority
 /// through the kernel (§8.5). That arm sends for itself and sets `out_len` to [`REPLY_SENT_DIRECTLY`]
 /// so the caller does not then send a second, empty reply on top of it.
+/// `capacity` IS AN INJECTION POINT, NOT JUST A NUMBER - do not re-derive it inside an arm.
+///
+/// `protocol_selftest` drives this function with every opcode from 0 to 255, and three of those are
+/// destructive: 21 `OP_FLASH`, 149 `OP_FLASH | 0x80` (forced) and 23 `OP_RESET`. What makes that
+/// safe is the `capacity = 0` the selftest passes, which every destructive arm refuses on. An arm
+/// that asks `block_capacity()` for itself ignores that zero, and the selftest then formats the
+/// machine's real disk during boot, before any prompt exists to object.
+///
+/// That is not hypothetical: it was done on 2026-09-20 and took `fs-all` from 25 of 25 to 2 of 25,
+/// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
+/// (see the serve loop), where the selftest is not involved.
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
               tag: u8, reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
     let mut send = |bytes: &[u8]| {
