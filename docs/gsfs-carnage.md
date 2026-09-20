@@ -627,12 +627,12 @@ So this gate is recorded as **not reachable in QEMU** rather than merely not don
 different fact: it changes what the hardware pass is FOR. For everything else in this file hardware
 is a confirmation at the end. For this, it is the only way to get an answer at all.
 
-### 3.12 Physical hardware - PARTIAL (1 of 5 boards), and the journal half is now CLOSED
+### 3.12 Physical hardware - PARTIAL (1 of 5 boards), and the journal half is CLOSED and REPRODUCED
 
 Real controllers, hotplug, restart, and the flush/durability assumptions that QEMU does not model.
 Five boards. **A QEMU pass is never recorded as a hardware pass.**
 
-#### Journal recovery on silicon - PROVEN, 2026-09-18, Dell Wyse 5070
+#### Journal recovery on silicon - PROVEN 2026-09-18, reproduced twice 2026-09-20, Dell Wyse 5070
 
 This was the standing hole and it is worth stating exactly what closed it, because three earlier
 power cuts on this same board did NOT close it: they survived cleanly, and the journal was never
@@ -673,6 +673,49 @@ already correct rather than merely correctable.
 **And it remains one board.** The backend-conditional caveat in `CLAUDE.md` §6.1 is untouched: this
 is a SATA SSD behind AHCI, which attests durability at the journal barriers. The Pi 2's USB stick
 refuses `SYNCHRONIZE CACHE` outright, so nothing here transfers to it.
+
+#### Reproduced twice more, 2026-09-20 - and the POST-MORTEM is now one command
+
+Two further cuts on the same board landed in the window, so the sub-millisecond window has now been
+hit three times. That matters less than what happened next, which is a change in how the evidence is
+collected rather than in what it says.
+
+**The problem the third run solves: the evidence expires.** After a cut the machine reboots with
+`/churn` still on disk, holding the only record of whether recovery held - and the NEXT churn
+overwrites it. Every earlier run depended on a human remembering to type `churn verify` before
+anything else touched the disk, at a bench, with the lid off. Forgetting it destroys the answer
+silently.
+
+`selfcheck` now verifies a leftover run before starting a new one, so the whole post-mortem is one
+command:
+
+```
+17:05:43  smp: 4 cores ready
+17:05:44  fs: journal recovered 1 block(s) from an interrupted write
+          selfcheck: an earlier churn is still on disk - verifying it BEFORE it is overwritten
+          churn verify: 7 file(s) checked, 0 empty, NONE torn
+          PASS  churn - the earlier run holds no torn file (if it was cut, recovery held)
+17:06:26  run: ran 502, failed 0, skipped 0
+```
+
+Recovery ran 1.1 seconds after the cores came up, the content check found no file holding a mix of
+two writes, and the suite that reported it is the same one an operator runs for everything else.
+
+**What `selfcheck` still cannot do is pull its own power.** A deliberate recovery test remains
+`churn <seconds>` and a hand on the cord; what is automated is the VERDICT, not the fault. Saying so
+matters because the automation is easy to mistake for coverage.
+
+**Two `selfcheck` runs in one boot, both clean** (`ran 501, failed 0` then `ran 500, failed 0`),
+which closes `backlog/36` on hardware rather than in QEMU. That entry existed because the second run
+in a boot failed intermittently on `events persist status` - a fixed `wait 3` racing a variable
+extent pre-fill. The state it waited for (`preparing`) never appeared in this capture and the poll's
+30-attempt bound was never approached, so the fix reaches the real state immediately rather than the
+old sleep merely having been long enough.
+
+**Still one board.** Three cuts on one Dell Wyse is three samples of the same SATA-behind-AHCI
+backend, and §6.1's caveat is untouched by repetition: a drive that attests durability at the
+barriers is the favourable case, and `fs-lyingflush` exists precisely because the Pi 2's stick is
+not it. Four boards remain.
 
 ## 4. Merge evidence
 
