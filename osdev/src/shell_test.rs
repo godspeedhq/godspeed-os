@@ -7660,7 +7660,18 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         /// was booted by hand afterwards and the filesystem was perfectly consistent. A false FAIL is
         /// the worst kind of test failure - it trains a reader to discount red, which is the whole
         /// subject of `backlog/32`.
-        answered: &'static str,
+        /// Every SHAPE a successful probe can take - not one of them.
+        ///
+        /// This was a single string and it made a passing filesystem look broken. The `move` case
+        /// declared `answered: "entries"`, while its own oracle declares `(empty)` and `tear.txt`
+        /// both legal - and `dir` prints `  (empty)` with no header and no count for an empty
+        /// directory. After a torn move the destination is usually empty, so the probe had its
+        /// answer on screen and waited out its 20 s anyway, reporting a TIMEOUT for all 17 tear
+        /// points. `fs-tear` went from 18/0 to 17/14 with nothing wrong in the filesystem.
+        ///
+        /// The bug is the oracle and the answered-marker disagreeing about what an answer looks
+        /// like. A list cannot drift that way: every outcome the oracle admits is listed here too.
+        answered: &'static [&'static str],
     }
     const CASES: &[TearCase] = &[
         // A whole-file overwrite: the old content complete, or the new content complete. Never a
@@ -7668,13 +7679,13 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         TearCase { name: "overwrite", setup: &["read /tear.txt"],
                    op: "write /tear.txt NEWNEWNEW", probe: "read /tear.txt",
                    oracle: Oracle::ExactlyOne("ORIGINAL", "NEWNEWNEW"),
-                   probe_secs: 20, answered: "read /tear.txt" },
+                   probe_secs: 20, answered: &["read /tear.txt"] },
         // A rename: the old name or the new name, never both, never neither. Two directory-entry
         // mutations in one transaction, which is what the journal is for.
         TearCase { name: "rename", setup: &["dir /"],
                    op: "rename /tear.txt ZZrenamed.txt", probe: "dir /",
                    oracle: Oracle::ExactlyOne("tear.txt", "ZZrenamed.txt"),
-                   probe_secs: 20, answered: "NAME" },
+                   probe_secs: 20, answered: &["NAME"] },
         // A move ACROSS directories: an add into the destination and a remove from the source, in
         // one transaction. The file is in exactly one of the two places - never in both (a second
         // reference to one extent) and never in neither (the file lost outright).
@@ -7685,7 +7696,7 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         TearCase { name: "move", setup: &["mkdir /zdir", "dir /zdir"],
                    op: "move /tear.txt /zdir/tear.txt", probe: "dir /zdir",
                    oracle: Oracle::ExactlyOne("(empty)", "tear.txt"),
-                   probe_secs: 20, answered: "entries" },
+                   probe_secs: 20, answered: &["entries", "(empty)"] },
         // DELETE, and it needs the other oracle. Present-with-its-blocks and absent-with-them-freed
         // are BOTH permitted, so there is nothing to exclude - but the two failures that matter are
         // invisible in a listing. A LEAK (absent from the directory, blocks still marked used) looks
@@ -7699,7 +7710,7 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
                    // 150s: measured, not guessed. The check answered in well under a minute when
                    // asked by hand; the 20s the other probes use was not enough and the shortfall
                    // read as a filesystem defect.
-                   probe_secs: 150, answered: "check:" },
+                   probe_secs: 150, answered: &["check:"] },
     ];
 
     let mut total_points = 0u64;
@@ -7772,7 +7783,7 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
             // DID IT ANSWER AT ALL? A probe that ran out of time has told us nothing, and calling
             // that a violation is a false FAIL - which is worse than a missed one, because it
             // teaches a reader to discount red.
-            if !out.contains(case.answered) {
+            if !case.answered.iter().any(|m| out.contains(m)) {
                 check!(false, format!(
                     "[{}] k={k}: the probe `{}` DID NOT ANSWER within {}s - this is a TIMEOUT, not a \
                      verdict on the filesystem. Image kept at {img}",
