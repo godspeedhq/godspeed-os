@@ -591,10 +591,26 @@ assert ok events persist status
 assert ok events persist start /sc/cap.log 256KiB
 # THE CAPTURE PREPARES BEFORE IT RECORDS. `start` answers at once and the extent is made readable in
 # the recorder's own loop, so nothing blocks the prompt on device I/O - which is what broke on the Pi 4,
-# where filling 4 MiB over USB took longer than the caller was willing to wait. On slow storage this
-# takes a moment, so wait for readiness rather than assuming it.
-wait 3
-events persist status | assert contains recording
+# where filling 4 MiB over USB took longer than the caller was willing to wait.
+#
+# SO WAIT ON THE TRUTH, NOT ON A CLOCK (Commandment VIII). This was `wait 3` racing a variable
+# pre-fill and it lost intermittently - `backlog/36` has the post-mortem. Staged through a file
+# because gsh refuses to capture a pipeline (see the hw-enumerator probe above); `count` counts DATA
+# rows, so a match is 1 and no match is 0.
+let mut capready = 0
+for i in range 30 {
+    if $capready < 1 {
+        events persist status | where state=recording | count | write /sc/pr.txt
+        for line in (read /sc/pr.txt) { if $line > 0 { capready = 1 } }
+        if $capready < 1 { wait 1 }
+    }
+}
+delete /sc/pr.txt
+if $capready > 0 {
+    events persist status | assert contains recording
+} else {
+    fail 'events persist: the capture never reached `recording` in 30s - the extent pre-fill did not finish'
+}
 # BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
 # allocates a file's whole extent up front, so the size is fixed when the capture starts and total
 # disk use is twice that, no matter how long it runs. A forgotten capture cannot fill a disk.
