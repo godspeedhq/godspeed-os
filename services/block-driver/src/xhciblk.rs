@@ -61,10 +61,53 @@ pub(crate) const XHCI: &str = env!("STORAGE_HOST");
 /// stale. Reacquiring by name re-establishes the same path (§14.3). It is ONE retry, not a loop -
 /// a service that is genuinely gone must surface as a failure rather than as an operation that
 /// never returns.
-fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+/// How long ONE question to the USB host service may take. Two numbers, because the two kinds of
+/// question have nothing in common:
+///
+///   * a CAPACITY query is answered out of state the service already holds, in microseconds, so a
+///     live peer never needs seconds. The bound exists for the peer that will never answer.
+///   * a READ or WRITE crosses BOT/SCSI to real media and legitimately takes time.
+///
+/// Both stay under the 30 s `fs` allows this service, so a stuck peer is reported HERE - by the
+/// service that knows which peer - rather than surfacing as `fs` timing out on us.
+const CAPACITY_RPC_SECS: i64 = 2;
+const IO_RPC_SECS: i64 = 10;
+
+/// One request to the USB host service, BOUNDED.
+///
+/// This used `request_with_reply`, whose own SDK comment says it plainly: "No deadline on this
+/// variant, so `None` is always a lost peer, never a timeout." An unbounded `call` wakes on a reply
+/// or on the replier's DEATH (§8.6) - and an idling peer is neither. Measured 2026-09-20 on riscv64
+/// with no USB controller attached: `xhci` comes up, logs `no controller MMIO granted - idling`,
+/// receives this request and never replies, and this service blocked here FOREVER - before
+/// `usbdisk::run`, so it served nothing, answered nothing, and logged nothing. `fs` then ate a 30 s
+/// timeout per request and never reached `serving file API`.
+///
+/// **That is the rule above all the others broken: a dependency that is missing, dead or silent must
+/// RETURN with a loud "unavailable", never hang.** The x86 side of this crate already gets it right -
+/// no AHCI controller means `serve_no_disk` answers capacity with a truthful zero - and `main.rs`
+/// carries a long comment about fixing exactly this defect once before, on that path. It was fixed
+/// there and not here because nothing had ever booted a `storage_is_usb` board with no USB host.
+///
+/// Note what the bound does NOT fix, so nobody reads more into it: `sectors()` already wrapped this
+/// in a 20 s deadline loop, and that bound was INERT, because a bound around a call that never
+/// returns is never evaluated. An outer deadline cannot rescue an unbounded inner call.
+fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
     let msg = Message::from_bytes(req);
-    if let Some(r) = ctx.request_with_reply(XHCI, &msg) {
-        return Some(r);
+    match ctx.request_with_reply_call_err(XHCI, &msg, secs) {
+        Ok(Some(r)) => return Some(r),
+        Ok(None) => {
+            // THE DEADLINE PASSED, AND THIS IS NOT RETRIED. The request may still be in flight, so a
+            // second one would leave the first reply to arrive as an orphan and desync every exchange
+            // after it - the same reason `fs` refuses to re-send a request we did not answer in time.
+            // Retry belongs to `Err` alone, which means the SEND failed and nothing is outstanding.
+            ctx.log_fmt(format_args!(
+                "block-driver: '{}' did not answer within {} s - reporting storage UNAVAILABLE rather \
+                 than waiting on it (it is reachable but silent: busy, wedged, or idling with no \
+                 controller)", XHCI, secs));
+            return None;
+        }
+        Err(_) => {}   // the SEND failed: no request is outstanding, so a retry is safe
     }
     // WHEN BOTH ATTEMPTS FAIL, SAY WHETHER THE REACQUIRE WORKED. That is the one distinction left
     // between the two causes this path can have, and they need opposite fixes:
@@ -76,7 +119,10 @@ fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     // Logged only when the RETRY also fails, so an ordinary stale-cap recovery - which is the common
     // case and works - stays silent.
     let reacquired = ctx.reacquire_by_name(XHCI);
-    let out = ctx.request_with_reply(XHCI, &msg);
+    let out = match ctx.request_with_reply_call_err(XHCI, &msg, secs) {
+        Ok(v)  => v,
+        Err(_) => None,
+    };
     if out.is_none() {
         ctx.log_fmt(format_args!(
             "block-driver: '{}' did not answer, and the retry after reacquire {} - {}",
@@ -86,6 +132,12 @@ fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
             else { "the name does not resolve: no live instance" }));
     }
     out
+}
+
+/// The I/O-shaped wrapper. Reads, writes and flushes cross to real media; capacity does not, and
+/// asks for `CAPACITY_RPC_SECS` explicitly at its two call sites.
+fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+    rpc_within(ctx, req, IO_RPC_SECS)
 }
 
 /// How long to wait for `xhci` to report a capacity - a REAL DURATION, in milliseconds.
@@ -117,7 +169,7 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        if let Some(r) = rpc(ctx, &[OP_CAPACITY]) {
+        if let Some(r) = rpc_within(ctx, &[OP_CAPACITY], CAPACITY_RPC_SECS) {
             let p = r.payload_bytes();
             if p.len() >= 9 && p[0] == STATUS_OK {
                 let n = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
@@ -190,7 +242,7 @@ pub fn sectors_now(ctx: &ServiceContext) -> Capacity {
     //
     // Logged only on the ZERO paths, so a healthy mount stays silent and a stuck one explains itself
     // on the first request rather than after another hardware round (§26.7).
-    let Some(r) = rpc(ctx, &[OP_CAPACITY]) else {
+    let Some(r) = rpc_within(ctx, &[OP_CAPACITY], CAPACITY_RPC_SECS) else {
         // UNREACHABLE, not empty. See `Capacity` - this is the case that took storage down.
         ctx.log("block-driver: the USB host service did not ANSWER (restarting, or its cap went stale) - reporting storage UNAVAILABLE, not 'no disk'");
         return Capacity::Unreachable;
