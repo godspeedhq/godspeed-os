@@ -89,6 +89,29 @@ echo got:$phrase | assert contains got:hi
 fn greeting who { echo hello-$who }      # $(fn): capture a FUNCTION's output (bounded 4 KiB, no heap)
 let g = $(greeting Ada)
 echo capfn:$g | assert contains capfn:hello-Ada
+# A SKIP IS NOT A PASS - and two of these lines said it was.
+#
+# Every conditional section announces itself when it declines to run: the clock on a machine that
+# cannot know the time, PCI on a Pi 2 that has none, DHCP with nothing serving it, DNS with no
+# internet, churn with no disk. That was always right - a silent skip is a test that has quietly
+# stopped testing.
+#
+# Five of them said `SKIP`. Two said `PASS  ... - skipped`, which claims a check succeeded when it
+# never ran. That is an unearned claim, and on a machine whose disk is raw or absent it is not a
+# small one: the storage sections are a large part of this suite, and a reader scanning for PASS
+# would conclude the filesystem had been exercised. The inconsistency is the tell - the wording
+# drifted where nobody was comparing the two.
+#
+# All seven are `skip` STATEMENTS now, not echoes - which is the part that makes the difference
+# countable. `skip` is the counterpart to `fail` the language was missing: `fail` says a check did
+# not hold, `skip` says it was never in a position to run, and neither is a pass. The run ends with
+#
+#     --- skipped ---
+#     SKIP  skip 'churn - no storage to churn on this machine; not a failure'
+#     run: ran 492, failed 0, skipped 3
+#
+# so a machine with a raw or absent disk reports 0 FAILURES and says plainly how much it did not do.
+# An echo could never do that: it printed a word into a wall of output and the tally never saw it.
 
 echo ''
 echo '===== 6. FOR LOOPS - words, range, mutable accumulation, and lines of a producer ====='
@@ -118,7 +141,7 @@ if write /sc_fl.txt oneline {
     for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
     if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
 } else {
-    echo 'SKIP for-line: no writable storage on this machine'
+    skip 'for-line: no writable storage on this machine'
 }
 delete /sc_fl.txt
 
@@ -283,7 +306,7 @@ for line in (date epoch) { if $line > 0 { clockset = 1 } }
 if $clockset > 0 {
     date | assert contains :
 } else {
-    echo 'SKIP  date - the clock is not set on this machine (no RTC, no network); not a failure'
+    skip 'date - the clock is not set on this machine (no RTC, no network); not a failure'
 }
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
@@ -406,7 +429,7 @@ if $hwe > 0 {
     caps hw-enumerator | assert lacks reboot
     caps hw-enumerator | assert lacks image_spawn
 } else {
-    echo 'SKIP  hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
+    skip 'hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
 }
 
 # `caps` must NAME a well-known resource, never print it as an anonymous number.
@@ -943,6 +966,46 @@ if result == Ok { echo fmt-ok | assert contains fmt-ok } else { fail "fmt: not c
 read /sc_fmt.gsh | assert contains bbb   # semantics-preserving: the content survived the format
 delete /sc_fmt.gsh
 
+# ===== churn: sustained writes, and the evidence a POWER CUT leaves behind =====
+#
+# THE FIRST BLOCK IS THE IMPORTANT ONE, and it is why churn belongs in here at all.
+#
+# `churn` exists to be INTERRUPTED. The commit-to-checkpoint window is sub-millisecond, so the only
+# way a human ever lands in it is to write thousands of transactions and pull the cord. When that
+# happens the machine reboots with `/churn` still on disk, holding the only evidence of whether
+# recovery held - and that evidence is destroyed by the next churn that overwrites it.
+#
+# So: if a previous run is still there, VERIFY IT BEFORE STARTING A NEW ONE. After a cut the whole
+# post-mortem becomes one command - boot, run selfcheck, and it tells you whether any file holds a
+# mix of two generations. Forgetting to run `churn verify` before the next churn is how that answer
+# gets lost, and it is an easy thing to forget at a bench with the lid off.
+#
+# What selfcheck CANNOT do is the cut itself. No self-test can pull its own power, so a deliberate
+# recovery test is still `churn <seconds>` and a hand on the cord - this automates the verdict, not
+# the fault.
+echo '===== churn: sustained writes, and any evidence left by an earlier power cut ====='
+if dir /churn {
+    echo 'selfcheck: an earlier churn is still on disk - verifying it BEFORE it is overwritten'
+    if churn verify {
+        echo 'PASS  churn - the earlier run holds no torn file (if it was cut, recovery held)'
+    } else {
+        fail 'churn: a file from the earlier run holds a MIX of two generations - DATA INTEGRITY, report the serial'
+    }
+}
+# ...then a short fresh run, as an ordinary exercise of the write path under sustained load.
+# Deliberately brief: this is the integrity half, and a long churn here would make every selfcheck
+# slow for a test whose interesting half needs a human anyway.
+if churn 4 {
+    if churn verify {
+        echo 'PASS  churn - thousands of transactions, every file holds one generation end to end'
+    } else {
+        fail 'churn: a file was torn by an UNINTERRUPTED run - that is a write-path fault, not a power cut'
+    }
+    churn reset
+} else {
+    skip 'churn - no storage to churn on this machine; not a failure'
+}
+
 # ===== cleanup: proves delete + delete recursive =====
 echo ''
 echo '===== cleanup: proves delete + delete recursive ====='
@@ -1003,8 +1066,8 @@ if $leaseok > 0 {
     # not a verdict. The check regains its teeth the moment it can ask the stack how many frames it
     # has RECEIVED - zero frames with a live link is unambiguously ours - and that wants a counter in
     # net-stack's status reply, which is real work and not a constant (26.7).
-    echo 'SKIP  net - link is up but no lease in 20s: either nothing is serving DHCP, or our receive'
-    echo 'SKIP  net - path is broken. This check cannot tell those apart - re-run where a server exists.'
+    skip 'net - link is up but no lease in 20s: either nothing is serving DHCP, or our receive'
+    skip 'net - path is broken. This check cannot tell those apart - re-run where a server exists.'
 }
 
 # ---- network: NAME RESOLUTION, asserted only where it can be OUR fault -----------------------
@@ -1038,5 +1101,5 @@ if ping count 2 8.8.8.8 {
         fail 'dns: ICMP to 8.8.8.8 works but no name resolves - the UDP request/reply path is broken'
     }
 } else {
-    echo 'PASS  dns - skipped, no internet to resolve through (not a fault of this system)'
+    skip 'dns - no internet to resolve through; not a failure'
 }

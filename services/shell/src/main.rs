@@ -2782,7 +2782,17 @@ fn stmt_reassign(ctx: &ShellCtx, cwd: &Cwd, name: &str, value: &str, vars: &mut 
 }
 
 /// The outcome of one gsh statement: continue to the next, or stop the run (a `fail`).
-enum StmtOutcome { Cont(Result<(), ShellError>), Stop(Result<(), ShellError>) }
+enum StmtOutcome {
+    Cont(Result<(), ShellError>),
+    Stop(Result<(), ShellError>),
+    /// `skip <why>` - the check DECLINED TO RUN, which is neither a pass nor a failure.
+    ///
+    /// A third outcome rather than a flag, because the compiler then forces every site that handles
+    /// a statement to say what it does with one. The suite already skipped things - a clock on a
+    /// machine with no RTC, PCI on a Pi 2, churn with no disk - but announced them with `echo`, so
+    /// they were invisible to the tally and a reader had to notice the word in a wall of output.
+    Skip,
+}
 
 /// Run one gsh statement: a `let`/reassignment/`fail`, or - after `$`-expansion - a plain command
 /// handed to the existing `execute`. `vars` is the run's variable table; `params` its parameters.
@@ -2797,6 +2807,24 @@ fn run_stmt(ctx: &ShellCtx, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellErr
             ctx.console_writeln("fail");
         }
         return StmtOutcome::Stop(Err(ShellError::Unknown));
+    }
+    // `skip <why>` - the counterpart to `fail`, and deliberately symmetric with it.
+    //
+    // `fail` says a check did not hold; `skip` says it was never in a position to. Conflating them
+    // is what the suite did before: a skip printed `PASS ... - skipped`, claiming a check succeeded
+    // when it never ran. On a machine whose disk is raw or absent that is not cosmetic - the storage
+    // sections are a large part of the suite, and a reader scanning for PASS would conclude the
+    // filesystem had been exercised.
+    //
+    // Unlike `fail` it does NOT stop the run: a machine lacking hardware should complete the rest.
+    if head == "skip" {
+        let mut exp = ExpBuf::new();
+        if expand_val(ctx, rest, vars, params, &mut exp).is_ok() {
+            ctx.console_writeln_fmt(format_args!("SKIP  {}", str_of(exp.as_bytes())));
+        } else {
+            ctx.console_writeln("SKIP");
+        }
+        return StmtOutcome::Skip;
     }
     // `let [mut] name = value`
     if head == "let" {
@@ -3867,6 +3895,10 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
     let mut fail_off = [0u16; RUN_MAX_FAILS];
     let mut fail_len = [0u16; RUN_MAX_FAILS];
     let mut nfail_rec = 0usize;
+    let mut skip_off = [0u16; RUN_MAX_FAILS];
+    let mut skip_len = [0u16; RUN_MAX_FAILS];
+    let mut nskip_rec = 0usize;
+    let mut skipped: u32 = 0;
     let b = src;
     let ft = prescan_fns(ctx, b); // index `fn` definitions so a call may precede its definition (§7)
     let sdepth = depth + 1; // statements/conditions run one level deeper (a nested `run` is refused)
@@ -4247,13 +4279,17 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             out.put(ctx, "> ");
             out.line(ctx, s);
         }
-        let (res, stop) = {
+        let (res, stop, was_skip) = {
             // While a $(fn) capture is active, the command's OUTPUT goes to the capture buffer, not
             // the console (the transcript `> stmt` above still goes to `out`).
             let mut cmd_out = if capturing { Out::FnCap(&mut fncap) } else { Out::Console };
             match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut cmd_out) {
-                StmtOutcome::Cont(r) => (r, false),
-                StmtOutcome::Stop(r) => (r, true),
+                StmtOutcome::Cont(r) => (r, false, false),
+                StmtOutcome::Stop(r) => (r, true, false),
+                // A SKIP IS `Ok` SO THE RUN CONTINUES, and counted separately so it is not read as
+                // a pass. `last` matters here: a following `if result == Ok` must not be told a
+                // check succeeded when it never ran.
+                StmtOutcome::Skip     => (Ok(()), false, true),
             }
         };
         last = res;
@@ -4266,6 +4302,14 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                 fail_off[nfail_rec] = stmt_off as u16;
                 fail_len[nfail_rec] = stmt.len() as u16;
                 nfail_rec += 1;
+            }
+        }
+        if was_skip {
+            skipped += 1;
+            if nskip_rec < RUN_MAX_FAILS {
+                skip_off[nskip_rec] = stmt_off as u16;
+                skip_len[nskip_rec] = stmt.len() as u16;
+                nskip_rec += 1;
             }
         }
         if stop { break; }
@@ -4303,7 +4347,24 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                     failed as usize - nfail_rec, RUN_MAX_FAILS));
             }
         }
-        out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
+        // WHAT DECLINED TO RUN, named the same way failures are. A count on its own invites the
+        // reader to assume which sections it was, and on a diskless machine that guess is wrong in
+        // the direction that matters (§26.7).
+        if skipped > 0 {
+            out.line(ctx, "--- skipped ---");
+            for j in 0..nskip_rec.min(RUN_MAX_FAILS) {
+                out.put(ctx, "SKIP  ");
+                out.line(ctx, str_of(&b[skip_off[j] as usize..skip_off[j] as usize + skip_len[j] as usize]));
+            }
+            if skipped as usize > nskip_rec {
+                out.line_fmt(ctx, format_args!(
+                    "SKIP  ... and {} more (only the first {} are listed)",
+                    skipped as usize - nskip_rec, RUN_MAX_FAILS));
+            }
+        }
+        // APPENDED, never reshaped: six harness checks match `run: ran N, failed M` exactly, and a
+        // tally line is an interface.
+        out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
     }
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }

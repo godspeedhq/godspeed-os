@@ -3151,6 +3151,29 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
         None => { println!("files-test: FAIL - run timeout"); fail += 3; }
     }
+    // ── skip: the third outcome. A check that DECLINED TO RUN is neither a pass nor a failure.
+    //
+    // WITHOUT THIS THE FEATURE IS UNTESTED, and the way it would have gone untested is worth
+    // recording: after adding `skip`, the only fresh evidence was a tally reading `skipped 0` on a
+    // machine that skipped nothing. A counter that always reads zero proves the FIELD exists, not
+    // that it counts - and no suite runs `selfcheck` without a disk, which is the only condition
+    // that makes the real ones fire.
+    //
+    // So the outcome is exercised directly: one skip, one pass, one failure, and the tally must
+    // separate all three. `fail` stops the run, `skip` must NOT - a machine lacking hardware has to
+    // complete everything it can.
+    let _ = run!(b"write /skip.gsh echo before ; skip 'no hardware here' ; echo after\r", 10);
+    match run!(b"run /skip.gsh\r", 16) {
+        Some(r) => {
+            check!(r.contains("SKIP  no hardware here"), "skip: announces itself with its reason");
+            check!(r.contains("run: ran 3, failed 0, skipped 1"),
+                   "skip: counted separately - not a pass, not a failure");
+            check!(r.contains("--- skipped ---"), "skip: the report NAMES what declined to run");
+            check!(r.contains("> echo after"), "skip: does NOT stop the run (unlike `fail`)");
+        }
+        None => { println!("files-test: FAIL - skip-script timeout"); fail += 4; }
+    }
+
     // a missing script reports not found (and `run` returns Err).
     match run!(b"run /no_such.gsh\r", 10) {
         Some(r) => check!(r.contains("not found"), "run: a missing script reports not found"),
