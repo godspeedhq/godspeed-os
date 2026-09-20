@@ -107,11 +107,24 @@ implemented was the half nobody had asked about.
 ### What IS fixed now
 
 The reroute was **silent** - no log line on any path. That is the part that needs no constitutional
-decision, because invariant 12 settles it, so it is fixed rather than left:
+decision, because invariant 12 settles it, so it is fixed rather than left.
+
+**Observed firing**, rather than merely compiled. Booting `--smp 1` makes every service that prefers
+core 1, 2 or 3 ask for a core that is not ready, which is the arm that had never printed anything:
 
 ```
-task: preferred core 2 is not ready - placing on core 0 instead (9.2 preference)
+task: preferred core 2 is not ready - placing on core 0 instead (§9.2 preference)
+task: 'events' spawned OK on core 0 (slot 1)
+...
+task: preferred core 3 is not ready - placing on core 0 instead (§9.2 preference)
+task: 'adv-ba8' spawned OK on core 0 (slot 28)
+task: preferred core 3 is not ready - placing on core 0 instead (§9.2 preference)
+task: 'adv-ba8-witness' spawned OK on core 0 (slot 29)
 ```
+
+Three reroutes on that boot, and **the first one is `events`** - a service whose row prefers core 2,
+placed on core 0 on every single-core boot since single-core boots began, with nothing said. That is
+the exact sentence this entry opened with in 2026-09-06, still true today, and now at least audible.
 
 A contracted core being ignored is now a thing you can see in the boot log. Whether it should be
 ignored at all is still open.

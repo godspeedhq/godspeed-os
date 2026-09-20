@@ -1,7 +1,10 @@
 # 35. Six copies of "the services", and no two of them agree
 
-**Status: OPEN, counted rather than estimated. Nothing here is broken today; the risk is that these
-lists drift apart silently, and two of them already have.**
+**Status: OPEN, but the blocking question is ANSWERED as of 2026-09-20.** Every difference between
+the three shell lists has been worked through (table at the end); one was pure drift and is fixed;
+two are real decisions and are named. What remains is those two decisions and the four copies
+outside the shell. This entry's own enumeration of the differences was also incomplete - it missed
+`time` and `ping`/`pong` entirely.
 
 `CHAOS_RESTARTABLE`'s own comment says it is "the same fact as the supervisor's MANAGED and the
 kernel's two by-name sets, stated a fourth time". Wiring deeper tab completion turned up two more,
@@ -56,3 +59,51 @@ Until then, the honest intermediate step is smaller: **write down, per list, whi
 `CHAOS_RESTARTABLE` and why.** Four of the six differences above have no recorded rationale, so today
 nobody can tell an intentional exclusion from a forgotten one - which is the actual problem, and it
 survives any amount of code tidying.
+
+
+---
+
+## 2026-09-20: the differences, established
+
+The entry said *"nobody has established which of those differences are deliberate and which are
+drift"* and called that the work. It is done. First, the fact that decides how much any of it
+matters:
+
+**These lists are CONVENIENCE, not validation.** `cmd_kill` and `cmd_restart` pass any name through
+to `kill_one` / `restart_one`; the only refusals are `supervisor` (for spawn/restart - `kill` is
+allowed, the kernel respawns it), `shell` (special-cased into a self-kill), and the `observe`
+variants. `CORE_SERVICES` is one entry long. So a name missing from a completion list costs
+**discoverability, never capability** - which is what the entry already suspected and is now
+checked rather than assumed.
+
+| name | `CHAOS_RESTARTABLE` | `KILL_TARGETS` | `RESTART_TARGETS` | verdict |
+|---|---|---|---|---|
+| `supervisor` | yes | yes | yes | agree |
+| `block-driver` `fs` `events` `xhci` `ehci` `nic-driver` `net-stack` | yes | yes | yes | agree |
+| `time` | yes | **no** | **no** | **DRIFT - fixed.** A real service on every board, `kill time` always legal, and chaos storms it routinely. Nobody decided to hide it |
+| `control` | yes | no | no | **DELIBERATE, and worth keeping.** It is the test harness's own channel; offering an operator a one-key path to cutting the harness out from under a running suite is not a convenience |
+| `dwc2` | yes | no | no | **ARCH, and the one genuine open question.** arm32 only. Chaos lists it because chaos runs there; completion is not arch-gated, so offering it on x86 would name a service that does not exist on this machine. Offering nothing on arm32 is the other half of the same problem |
+| `shell` | **no** | yes | yes | **DELIBERATE.** Killing the shell is a different path (self-kill, respawn a fresh prompt), which is exactly why chaos does not storm it |
+| `ping` `pong` | no | no | yes | **DELIBERATE.** Demo services in `examples/`, spawnable and restartable, not part of the storm set |
+| `all-services` | no | yes | no | **DELIBERATE.** A `kill`-only keyword; there is no "restart everything" |
+
+### What changed
+
+`time` is now offered by `kill` and `restart` completion. That is the only behaviour change: it was
+a legal command that nothing advertised, which is the precise failure this entry describes - "the
+completer quietly teaches a smaller vocabulary than the command accepts".
+
+Nothing else was collapsed, for the reason this entry gives and which the table now supports rather
+than assumes: **five of the differences are real**, so merging the lists would silently change what
+three commands offer on the theory that they were accidents. They were not.
+
+### What is still open
+
+1. **`dwc2`.** Completion is not arch-gated and the lists are compile-time constants. Gating them on
+   `target_arch` would work and would be the fifth place the shell learns which board it is on,
+   which `backlog/21` and `backlog/25` are both about not doing. A device-class question the kernel
+   could answer is the better shape, and that is the same answer those two entries are waiting for.
+2. **`control`.** Recorded as deliberate above. If that reading is wrong it is a one-word change.
+3. **The four copies outside the shell** - the supervisor's `MANAGED` and the kernel's two by-name
+   sets. Untouched here; they are the authority and the spawn/notify sets, and reconciling them is a
+   different question from what a completer offers.

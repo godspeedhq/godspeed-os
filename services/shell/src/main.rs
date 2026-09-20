@@ -1086,8 +1086,11 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // comma-separated list, so complete the segment after the LAST comma (like chaos max-carnage) - so
     // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
     if "kill".as_bytes() == cmd && prior == 0 {
+        // `time` added 2026-09-20 (`backlog/35`): it is a real service on every board, `kill time`
+        // has always been legal, and `chaos kill-storm time` storms it routinely - it was offered by
+        // no completion list at all, which is drift rather than a decision anyone made.
         const KILL_TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
+            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack", "time", "version", "help"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -1117,13 +1120,15 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
     if "restart".as_bytes() == cmd && prior == 0 {
-        // KEPT AS ITS OWN LIST for now, and this is the honest reason rather than an oversight: it
-        // differs from `CHAOS_RESTARTABLE` (no `dwc2`, no `control`) and nobody has established which
-        // difference is deliberate. Collapsing two lists that are not the same fact would be worse
-        // than leaving both - see the note on `CHAOS_RESTARTABLE`, which already counts four copies
-        // of a list nobody has reconciled. `backlog/35`.
+        // KEPT AS ITS OWN LIST, and now for an established reason rather than an unexamined one.
+        // Every difference from `CHAOS_RESTARTABLE` was worked through on 2026-09-20 and the table is
+        // in `backlog/35`: `shell`, `ping` and `pong` belong here and not there; `dwc2` (arm32 only)
+        // and `control` (the test harness's own channel) are the two genuine open questions; `time`
+        // was pure drift and has been added. These lists are CONVENIENCE, not validation - `kill` and
+        // `restart` accept any name and the only refusals are `supervisor`, `shell` and the `observe`
+        // variants - so an omission costs discoverability, never capability.
         const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "events", "xhci",
-            "ehci", "shell", "nic-driver", "net-stack", "ping", "pong", "version", "help"];
+            "ehci", "shell", "nic-driver", "net-stack", "time", "ping", "pong", "version", "help"];
         return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
     }
 
