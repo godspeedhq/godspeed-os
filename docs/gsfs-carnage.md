@@ -1,6 +1,6 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
-**Status, as of 2026-09-18.** BUILT AND PASSING in QEMU: torn writes (`fs-tear` 18/0, four
+**Status, as of 2026-09-20.** `osdev test fs-all` runs **25 suites** and all 25 pass together (~30 min, each in its own process). That sweep is the point: two of them were sitting RED with nothing watching, and BOTH were faults in the TEST rather than the filesystem - `fs-tear-detect` assumed a precondition instead of establishing it, and `fs-tear`'s probe did not recognise one of the two answers its own oracle calls legal. A suite that rots quietly is what `backlog/32` exists to prevent.
 operations, 75 tear points, 35 exercising journal recovery), resource exhaustion (`fs-full` 14/0),
 power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
 (`fs-model`, §3.2), the block layer (§3.7 - `fs-blockchaos` for the completion stream,

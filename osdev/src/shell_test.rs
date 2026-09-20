@@ -7211,9 +7211,14 @@ pub fn run_fs_cache(image_path: &Path, persist_path: &str, smp: u32, lying: bool
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
     let mut pass = 0usize; let mut fail = 0usize;
+    // NAME ITSELF AFTER THE DRIVE IT MODELS. Both modes ran under the label `fs-cache` and wrote the
+    // same `fs_cache_serial.log`, so the sweep printed `fs-lyingflush ... fs-cache: 7 passed` and
+    // the second run ERASED the first one's evidence. A suite whose serial is overwritten by another
+    // suite cannot be gone back to, which is the whole reason it is kept.
+    let who = if lying { "fs-lyingflush" } else { "fs-cache" };
     macro_rules! check { ($ok:expr, $label:expr) => {
-        if $ok { println!("fs-cache: PASS - {}", $label); pass += 1; }
-        else { println!("fs-cache: FAIL - {}", $label); fail += 1; }
+        if $ok { println!("{}: PASS - {}", who, $label); pass += 1; }
+        else { println!("{}: FAIL - {}", who, $label); fail += 1; }
     }; }
 
     let boot = |cmds: &[&str], kill_on: Option<&str>, secs: u64| -> String {
@@ -7269,7 +7274,7 @@ pub fn run_fs_cache(image_path: &Path, persist_path: &str, smp: u32, lying: bool
         whole
     };
 
-    println!("fs-cache: boot 1 - a canary, then churn against a {} cache, then cut",
+    println!("{who}: boot 1 - a canary, then churn against a {} cache, then cut",
              if lying { "LYING (barrier ignored)" } else { "volatile" });
     let w1 = boot(&["write /canary.txt survives-a-volatile-cache", "churn 25"],
                   Some("churn: 2s elapsed"), 90);
@@ -7283,7 +7288,7 @@ pub fn run_fs_cache(image_path: &Path, persist_path: &str, smp: u32, lying: bool
     check!(w1.contains("s elapsed"), "churn was demonstrably writing when the machine was cut");
     check!(!w1.contains("churn: done"), "the machine was cut mid-churn");
 
-    println!("fs-cache: boot 2 - what came back");
+    println!("{who}: boot 2 - what came back");
     let w2 = boot(&["read /canary.txt", "churn verify", "drives check"], None, 240);
     check!(w2.contains("mounted GSFS0008") || w2.contains("storage recovered")
                || w2.contains("refus") || w2.contains("NOT match"),
@@ -7314,16 +7319,17 @@ pub fn run_fs_cache(image_path: &Path, persist_path: &str, smp: u32, lying: bool
     // one occurs depends on where the cut fell, and saying which makes the run interpretable instead
     // of merely green.
     if w2.contains("journal payload does NOT match") {
-        println!("fs-cache: (the journal REFUSED a transaction whose payload the device never durably wrote");
-        println!("fs-cache:  - the `data_crc` defence fired, which is the case this suite exists to reach)");
+        println!("{who}: (the journal REFUSED a transaction whose payload the device never durably wrote");
+        println!("{who}:  - the `data_crc` defence fired, which is the case this suite exists to reach)");
     } else if w2.contains("journal recovered") {
-        println!("fs-cache: (the commit record AND its staged blocks were flushed - the journal replayed)");
+        println!("{who}: (the commit record AND its staged blocks were flushed - the journal replayed)");
     } else {
-        println!("fs-cache: (the cut fell outside any commit window - no replay, the common case)");
+        println!("{who}: (the cut fell outside any commit window - no replay, the common case)");
     }
 
-    let _ = std::fs::write("build/tests/fs_cache_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
-    println!("\nfs-cache: {pass} passed, {fail} failed  (serial -> build/tests/fs_cache_serial.log)");
+    let log = format!("build/tests/{who}_serial.log");
+    let _ = std::fs::write(&log, format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\n{who}: {pass} passed, {fail} failed  (serial -> {log})");
     if fail > 0 { std::process::exit(1); }
 }
 
