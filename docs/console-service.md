@@ -533,79 +533,41 @@ moment a line leaves the screen - every other path either stays on screen or cle
 deliberately. Retaining it there means scrollback cannot miss output, whatever produced it,
 and no producer needs to know scrollback exists.
 
-### 10.4 Scrolling is a REQUEST, never an escape sequence
+### 10.4 Scrolling was a REQUEST, and the request is GONE
 
-Console output is untrusted content: a file being `read` can contain any bytes at all, so a
-scroll expressed as a CSI sequence would let a file scroll the view of the terminal
-displaying it. This is the argument `dir` already makes about filenames, one layer out.
+This service used to answer `REQ_SCROLL`: move your view, and report where it now is. The SDK's
+`console_scroll(action)` was how a holder of the keyboard asked, the shell drove it from a mode of
+its own, and output arriving snapped the view back to live.
 
-Requests carry a reply cap and output does not, which is what separates the two channels in
-this service - by construction, not by inspecting the payload. `REQ_SCROLL` joins `REQ_DIMS`
-on that channel, and the SDK's `console_scroll(action)` is how a holder of the keyboard asks.
+**All of it is deleted, and the reason is `backlog/37`.**
 
-**The console does the arithmetic**, because only it knows how many lines it holds and how
-tall the screen is. A copy of either number in the shell would be a second thing to drift.
+To answer "move your view" this service had to `paint_view` and `present` BEFORE it could compute
+the reply - a full repaint of the framebuffer, synchronously, inside the caller's request. On a
+3840x2160 panel that is the most expensive thing it does. The caller allowed one second and ran on
+the same core. A scroll therefore "took over two seconds to answer", and four rounds of investigation
+looked for a lost reply that never existed: **nothing was stuck, the work did not fit the deadline.**
 
-### 10.5 Scrollback is a MODE, which is what makes the keys unambiguous
+Holding a scrolled view also cost this service state it could otherwise do without - a view offset,
+an in-view flag, and a branch in the output path to snap back out of it. State that only one feature
+needs, and that feature was the one that did not work.
 
-**PgUp enters it. Esc leaves it.** While the bar is up, the shell reads keys in a loop of its
-own (`scrollback_mode`) rather than through the line editor:
+### 10.5 What replaced it: `REQ_HISTORY`, and the work moved
 
-| key | in the view |
-|---|---|
-| arrows | scroll a line |
-| PgUp / PgDn, Enter | a page / a line |
-| Home / End | the oldest kept line / live |
-| Esc | back to live |
-| any printable key | back to live, **and it types itself** |
+The ring stays; the VIEW went. `REQ_HISTORY` hands the caller bytes out of the scrollback - a bounded
+memcpy, no painting - and the caller paints its own screen with ordinary output, which is a send and
+carries no deadline at all. The `scrollback` utility (`utilities/54_scrollback.md`) reads the whole
+history ONCE when it opens, so a keypress costs this service nothing whatsoever.
 
-The pinned bottom row says `[arrows] line  [PgUp/PgDn] page  [Home/End] ends  [Esc] live`, in
-reverse video so it cannot be mistaken for content. It is the mode indicator as well as the
-legend: no bar, no mode.
+**The lesson is about which side does the work, not about tuning a number.** Widening the deadline
+would have hidden the same coupling: this service was both the thing being read from and the thing
+being drawn to, one endpoint and one 16-deep queue, so a request made mid-frame could always end up
+behind painting the caller itself had just asked for. Moving the work removes that by construction;
+a larger timeout only makes it rarer.
 
-**Why a mode rather than conditional keys.** The first design claimed Home and End *only while
-the view happened to be scrolled* - at the prompt they edited the line, and scrolled they
-scrolled. That worked, and it could not be extended to the **arrows**, which are what a reader
-actually reaches for. Up and Down are command history and are pressed constantly, so each one
-would have had to **ask the console where the view was** before deciding what it meant; on the
-Dell Wyse the console can be 30-40 ms into a repaint when you ask.
-
-A mode removes the question instead of answering it over and over. It also gives Home and End
-back to the line editor **unconditionally**, which is where they have always belonged - you
-cannot be scrolled at the prompt any more, because being scrolled means being in here.
-
-The key set is `paginate`'s on purpose, so the two things in this shell that show you more than
-a screenful behave the same way. `q` is deliberately not bound: in `paginate` you are quitting
-something that is *running*, here you are stepping back from a view - and `q` gets you out
-regardless, because every printable key does.
-
-**"Oldest kept", never "start".** Once the ring has wrapped, the top of the view is not the
-beginning of the session - it is the oldest line that survived. Presenting it as the beginning
-would be claiming to show history that was discarded, which is the same shape of wrong answer
-as a truncated directory listing reported as a total (§26.7). The ring counts what it has aged
-out so the view can say which case it is in.
-
-### 10.6 Output snaps the view back to live - the safety net, no longer the mechanism
-
-> **Amendment: with scrollback as a mode (§10.5), typing no longer *relies* on this.** A
-> printable key leaves the view by asking for `SCROLL_LIVE` explicitly, so the exit is a
-> decision rather than a side effect - which is why the log now reads `returned to live
-> (requested)` where it used to read `(output arrived)`.
->
-> The snap stays as the defensive case it always was: if anything else writes to the console
-> while a reader is scrolled, the screen returns to live rather than silently showing stale
-> content with new output hidden behind it. The reasoning below is unchanged and is why that
-> case is rare here.
-
-### 10.6 Output snaps the view back to live - the deliberate simplification
-
-A desktop terminal holds your position and lets the backlog grow behind you. That needs the
-glyph path to update the shadow grid **without** touching the framebuffer - a suppression flag
-threaded through every draw - and it is worth much less here than it looks: service logs go to
-the kernel ring and serial (§11.4), not to this service, so on a framebuffer the only writer is
-whoever the operator just ran. **Output arrives because you asked for it.**
-
-Recorded as the simplification it is, rather than left to be inferred from the behaviour.
+**Untrusted content is still the reason it was a request and not an escape sequence.** A file being
+`read` can contain any bytes, so a scroll expressed as a CSI sequence would let a file scroll the
+terminal displaying it - the argument `dir` already makes about filenames, one layer out. That
+argument is intact and now applies to `REQ_HISTORY`, which carries a reply cap where output does not.
 
 ### 10.7 What adding it uncovered
 

@@ -40,52 +40,12 @@ use godspeed_sdk::Framebuffer;
 use crate::render;
 use crate::render::{CELL_H, CELL_W};
 
-/// Char-grid shadow bounds. **Sized from the font-scale rule, not from a raw pixel count.**
-///
-/// The old bounds (448 x 128) assumed 4K edge-to-edge at a 1x cell. That case cannot occur:
-/// `render::cell_scale` upscales at 1200 px and above, so a panel wide enough for 427 columns is always
-/// rendering at 2x or 3x and gets far fewer. Taking the scale into account, the widest real grid is at
-/// **1920x1080** - just under the 1200 px step, so still 1x - which after the 5% safe-area inset gives
-/// 1728/9 = 192 columns and 972/20 = 48 rows. Every denser panel scales up and lands lower (3840x2160 at
-/// 3x is 128 x 32; 2560x1440 at 2x is 128 x 32), and every smaller one is smaller.
-///
-/// This matters here in a way it did not in the kernel: the grid and its attribute plane are now a
-/// **stack-resident** part of the terminal state, and the old bounds were 64 KiB of a 256 KiB service
-/// stack (§26.6.1 - the bound must be one you can read off the source and afford). 208 x 64 keeps a
-/// margin over the worst real case at about 15 KiB. A larger display than this clamps its text area, as
-/// it always did; nothing overruns.
-/// Bytes retained for lines that have scrolled off the top of the screen.
-///
-/// 32 KiB is roughly five hundred typical terminal lines - about eight screens on a 4K display and
-/// twenty on a serial-sized one.
-///
-/// **THE BOUND IS THE STACK, NOT THE MEMORY LIMIT, and that is worth knowing before raising it.**
-/// This service may use 8 MiB, but `Term` is a LOCAL of `service_main` and the user stack is 256
-/// KiB. The first cut of this was 64 KiB + 1024 lines, which put `Term::new` at 180 KiB and
-/// `service_main` at 118 KiB - 299 KiB together, against a 256 KiB stack, which faults on the first
-/// store of its own prologue. `scripts/stack_fit_check.py` measures it; it could not, on x86, until
-/// this change taught it the prologue, which is how a 45%-of-stack frame had gone unnoticed.
-/// What a scroll request asks for. The shell sends one of these; the console does the arithmetic,
-/// because only it knows how many lines it is holding and how tall the screen is.
-pub const SCROLL_LIVE: u8 = 0;      // End - back to the live screen
-pub const SCROLL_UP: u8 = 1;        // one line further into history
-pub const SCROLL_DOWN: u8 = 2;      // one line back toward live
-pub const SCROLL_PAGE_UP: u8 = 3;   // PgUp
-pub const SCROLL_PAGE_DOWN: u8 = 4; // PgDn
-pub const SCROLL_TOP: u8 = 5;       // Home - the OLDEST LINE STILL KEPT, which is not the start
-/// Ask where the view is WITHOUT moving it or repainting.
-///
-/// The shell needs this because Home and End are shared with the line editor: it must know whether
-/// the view is already scrolled before deciding which of the two meanings a keypress has. A query
-/// that repainted would flicker the screen on every Home at an ordinary prompt.
-pub const SCROLL_QUERY: u8 = 6;
 /// End - jump to the NEWEST line and STAY in the view. Distinct from `SCROLL_LIVE`, which leaves.
 ///
 /// They were the same action, and that was wrong: `End` took you to the bottom and dropped you out,
 /// so the only way to reach the newest line and keep looking was to not press the key named "End".
 /// Leaving is `Esc`'s job. "The view is at offset 0" and "there is no view" are different states and
 /// now have different actions.
-pub const SCROLL_BOTTOM: u8 = 7;
 
 pub(crate) const SB_BYTES: usize = 32 * 1024;
 
@@ -298,22 +258,7 @@ pub(crate) struct Fb {
     // pagers, and why they can stop needing them.
     pub(crate) sb: Scrollback,
 
-    /// Set when OUTPUT snapped the view back to live, cleared when that is reported.
-    ///
-    /// Needed because the console reports the two view transitions, and "returned to live" happens
-    /// two ways: a scroll request asked for it, or output arrived. The first is reported by the
-    /// request handler; without this flag the pass-level check reported the same transition a second
-    /// time, so a single `End` produced both lines and the log claimed two events where there was
-    /// one. An instrument that double-counts is worse than one that says less.
-    pub(crate) snapped_by_output: bool,
 
-    /// Whether the scrollback VIEW is open at all, independent of how far back it is scrolled.
-    ///
-    /// Offset 0 used to mean "no view", which collapsed two different states: being at the newest
-    /// line WITH the view open, and not being in the view. `End` therefore had to exit in order to
-    /// reach the bottom. The bar is drawn whenever this is set, so it is also what tells the reader
-    /// they are still in a mode when the content behind it happens to be the live screen.
-    pub(crate) in_view: bool,
 
     /// Lines the view is scrolled back from live. 0 means the screen shows the live grid, which is
     /// every moment except while somebody is reading history.
@@ -323,7 +268,6 @@ pub(crate) struct Fb {
     /// `repaint_all` from the grid that was there all along. Keeping a second copy of the live
     /// screen to restore from would be another 15 KiB on a stack that has already been the problem
     /// once in this file.
-    pub(crate) view: usize,
 
     // Precomputed foreground-blend LUT: blend_lut[intensity] = the glyph-pixel colour for that
     // antialiasing intensity, composed in the device layout. Lets an antialiased glyph edge blit as a
@@ -381,9 +325,6 @@ impl Term {
                 grid: [[b' '; MAX_COLS]; MAX_ROWS],
                 attr: [[0; ATTR_STRIDE]; MAX_ROWS],
                 sb: Scrollback::new(),
-                view: 0,
-                in_view: false,
-                snapped_by_output: false,
                 blend_lut: [0; 256],
             },
         }
@@ -425,55 +366,10 @@ impl Term {
         // to this service, so on a framebuffer the only writer is whoever the operator just ran.
         // Output arrives because you asked for it. Recorded as the deliberate simplification it is.
         // Output ends the VIEW, not merely its offset: the reader is doing something else now.
-        if self.s.in_view || self.s.view != 0 {
-            self.s.view = 0;
-            self.s.in_view = false;
-            self.s.repaint_pending = true;
-            self.s.snapped_by_output = true;
-        }
         for &b in bytes {
             process_byte(&mut self.s, b);
         }
     }
-
-    /// Move the scrolled view, and repaint it. Returns `(lines back, most it can go back)`.
-    ///
-    /// The console owns this arithmetic rather than the shell, because the shell knows neither how
-    /// many lines are retained nor how tall the screen is - and a second copy of either number is a
-    /// second thing to drift.
-    pub fn scroll_view(&mut self, action: u8) -> (usize, usize) {
-        let s = &mut self.s;
-        if s.rows == 0 { return (0, 0); }
-        // Answered before anything moves or paints - see `SCROLL_QUERY`.
-        if action == SCROLL_QUERY { return (s.view, s.sb.len()); }
-        // A page leaves one line of overlap, so a reader can see where the last page ended.
-        let page = s.rows.saturating_sub(2).max(1);
-        let max = s.sb.len();
-        let was_open = s.in_view;
-        // LEAVING is its own action, and the only one that closes the view.
-        if action == SCROLL_LIVE {
-            s.view = 0;
-            s.in_view = false;
-            if was_open { repaint_all(s); render::present(); }
-            return (0, max);
-        }
-        s.in_view = true;
-        s.view = match action {
-            SCROLL_BOTTOM    => 0,
-            SCROLL_UP        => (s.view + 1).min(max),
-            SCROLL_DOWN      => s.view.saturating_sub(1),
-            SCROLL_PAGE_UP   => (s.view + page).min(max),
-            SCROLL_PAGE_DOWN => s.view.saturating_sub(page),
-            SCROLL_TOP       => max,
-            _                => s.view,
-        };
-        paint_view(s);
-        render::present();
-        (s.view, max)
-    }
-
-    /// Lines the view is scrolled back, and the most it could be.
-    pub fn view(&self) -> (usize, usize) { (self.s.view, self.s.sb.len()) }
 
     /// Copy history lines from `from` onward into `out` as `[len, bytes...]` records.
     ///
@@ -504,14 +400,6 @@ impl Term {
             i += 1;
         }
         (n, used, total, aged)
-    }
-
-    /// Did OUTPUT just snap the view back to live? Clears the flag, so the transition is reported
-    /// exactly once and cannot be double-counted against a scroll request that did the same thing.
-    pub fn take_output_snap(&mut self) -> bool {
-        let was = self.s.snapped_by_output;
-        self.s.snapped_by_output = false;
-        was
     }
 
     /// Show everything written since the last flush.
@@ -1029,96 +917,6 @@ fn scroll(s: &mut Fb) {
     // the sort of shortcut that would show up as a highlight silently vanishing after a scroll.
     // Deferred, not skipped: `flush` paints this before anything is shown. See `Fb::repaint_pending`.
     s.repaint_pending = true;
-}
-
-/// Paint the scrolled-back view: history above, an indicator on the bottom row.
-///
-/// THE HISTORY IS `scrollback ++ live grid`, one flat sequence of `sb.len() + rows` lines, and the
-/// view is a window of it ending `view` lines from the end. That framing is what makes scrolling
-/// past the top of the live screen and into the ring seamless rather than a special case: the join
-/// between the two is just an index comparison.
-///
-/// Nothing here touches the shadow grid. Returning to live is `repaint_all` from a grid that was
-/// never disturbed.
-fn paint_view(s: &mut Fb) {
-    let (rows, cols) = (s.rows, s.cols);
-    if rows == 0 { return; }
-    let body = rows - 1;                       // the bottom row carries the indicator
-    let sbn = s.sb.len();
-    let total = sbn + rows;
-    let bottom = total.saturating_sub(s.view); // history index just past the last visible line
-    let width = cols.min(MAX_COLS);
-    let mut line = [b' '; MAX_COLS];
-    for r in 0..body {
-        let j = (bottom + r).saturating_sub(body);
-        for c in 0..width { line[c] = b' '; }
-        if j < sbn {
-            s.sb.line(j, &mut line[..width]);
-        } else if j - sbn < rows {
-            let gr = j - sbn;
-            line[..width].copy_from_slice(&s.grid[gr][..width]);
-        }
-        paint_plain_row(s, r, width, &line);
-    }
-    paint_view_indicator(s, body, width);
-}
-
-/// Draw one row of plain text straight to the framebuffer - no attributes, no shadow-grid write.
-///
-/// Trailing blanks are filled as one rectangle for the reason `paint_row_content` gives: a console
-/// line is mostly blank, and painting a blank as a space GLYPH costs a font lookup and a full cell of
-/// non-cacheable stores per column.
-fn paint_plain_row(s: &mut Fb, r: usize, width: usize, line: &[u8; MAX_COLS]) {
-    let mut tail = width;
-    while tail > 0 && line[tail - 1] == b' ' { tail -= 1; }
-    let saved = s.reverse;
-    s.reverse = false;
-    for c in 0..tail {
-        render::draw_glyph(s, line[c], c, r);
-    }
-    s.reverse = saved;
-    blank_row_tail(s, r, tail, width);
-}
-
-/// The bottom row while scrolled: where you are, and how to get back.
-///
-/// **IT SAYS "OLDEST KEPT", NEVER "START".** Once the ring has wrapped, the top of the view is not
-/// the beginning of the session - it is the oldest line that survived - and presenting it as the
-/// beginning would be claiming to show history that was discarded (§26.7). `aged` is how it knows.
-fn paint_view_indicator(s: &mut Fb, r: usize, width: usize) {
-    let mut buf = [b' '; MAX_COLS];
-    let mut n = 0usize;
-    let mut put = |b: &mut [u8; MAX_COLS], n: &mut usize, t: &[u8]| {
-        for &c in t { if *n < width { b[*n] = c; *n += 1; } }
-    };
-    put(&mut buf, &mut n, b" scrollback ");
-    put_num(&mut buf, &mut n, s.view as u64, width);
-    put(&mut buf, &mut n, b" of ");
-    put_num(&mut buf, &mut n, s.sb.len() as u64, width);
-    put(&mut buf, &mut n, if s.sb.aged() > 0 { b" lines kept " } else { b" lines " });
-    if s.view == 0 { put(&mut buf, &mut n, b" (newest) "); }
-    // THE BAR IS THE ONLY THING THAT SAYS WHICH KEYS WORK, so it names all of them. It listed
-    // PgUp/PgDn/Home/End when those were the whole set; the view is a MODE now (see the shell's
-    // `scrollback_mode`) and the arrows and Esc belong to it too.
-    put(&mut buf, &mut n, b"  [arrows] line  [PgUp/PgDn] page  [Home/End] ends  [Esc] live ");
-    // Reverse video, so the indicator cannot be mistaken for content - it is the one row on screen
-    // that is not something a program printed.
-    let saved = s.reverse;
-    s.reverse = true;
-    for c in 0..width { render::draw_glyph(s, buf[c], c, r); }
-    s.reverse = saved;
-}
-
-/// Append a decimal number to a fixed buffer. No heap, no `format_args!` - this file has no logger.
-fn put_num(b: &mut [u8; MAX_COLS], n: &mut usize, mut v: u64, width: usize) {
-    let mut d = [0u8; 20];
-    let mut k = 0usize;
-    if v == 0 { d[k] = b'0'; k = 1; }
-    while v > 0 { d[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
-    while k > 0 {
-        k -= 1;
-        if *n < width { b[*n] = d[k]; *n += 1; }
-    }
 }
 
 /// Paint the whole screen from the shadow grid. The deferred half of `scroll`.

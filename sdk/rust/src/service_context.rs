@@ -2865,19 +2865,18 @@ impl ServiceContext {
     ///
     /// Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
     /// console that has just restarted is rebuilding the screen anyway; the next `console_dims`
-    /// reacquires for everyone.
-    pub fn console_scroll(&self, action: u8) -> Option<(u16, u16)> {
-        let mut buf = [0u8; 8];
-        // Opcode 2 = REQ_SCROLL (`services/console/src/main.rs`).
-        let req = [2u8, action];
-        match self.request_with_reply_deadline_into("console", &req, &mut buf, 1) {
-            Some(k) if k >= 4 => Some((
-                u16::from_le_bytes([buf[0], buf[1]]),
-                u16::from_le_bytes([buf[2], buf[3]]),
-            )),
-            _ => None,
-        }
-    }
+        // `console_scroll` IS GONE, and it is the mechanism `backlog/37` was about.
+    //
+    // It asked the console to move its own view, and the console could not answer until it had
+    // repainted the framebuffer - `paint_view` + `present`, synchronously, inside the request. On a
+    // 3840x2160 panel that is the most expensive thing it does, and the caller gave it one second
+    // from the same core. That is why a scroll took "over two seconds to answer": nothing was lost
+    // or stuck, the work simply did not fit the deadline.
+    //
+    // `console_history` below replaced it by moving the WORK rather than tuning the number: the
+    // console hands over bytes, and the caller paints its own screen through ordinary output, which
+    // is a send and carries no deadline at all. Deleting this leaves no way to reintroduce the
+    // shape by accident.
 
     /// Read a page of the console's scrollback AS DATA, starting at line `from` (0 = oldest KEPT).
     ///
