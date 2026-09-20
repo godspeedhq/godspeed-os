@@ -1,9 +1,14 @@
 # 32. The `fs` suites run in no gate, and two of them were red
 
-**Status: the two red suites are FIXED, `osdev test fs-all` runs all fourteen in ~12 minutes, and
+**Status: `osdev test fs-all` runs 25 suites in ~31 minutes, 25 of 25 green (2026-09-20), and
 `.github/workflows/storage.yml` runs it in CI. ONE THING REMAINS OPEN, and it is not technical: that
 workflow is `workflow_dispatch` only, because push triggers across this project are deliberately
 paused to conserve CI minutes.**
+
+**AND THE THESIS HAS NOW BEEN PROVEN TWICE.** The sweep on 2026-09-20 found TWO MORE suites sitting
+red - `fs-tear-detect` and `fs-tear` - neither of which was a filesystem fault, and neither of which
+anything would have reported. Details at the end; the short version is that this entry's argument is
+no longer a prediction.
 
 ## What happened
 
@@ -54,9 +59,10 @@ existed and the reporting did not, which is the whole of this entry.
 
 ## Step one is DONE: `osdev test fs-all`
 
-There are **fifteen** suites now, not eleven - `feat/gsfs` added `fs-fuzz`, `fs-hostile`, `fs-time`
-and `fs-tear`, which made the problem worse before it made it better. `osdev test fs-all` runs all
-fifteen and reports one tally, with each suite's full output kept in
+There are **25** suites now, not eleven. `feat/gsfs` added `fs-fuzz`, `fs-hostile`, `fs-time`,
+`fs-tear`, `fs-tear-detect`, `fs-model`, `fs-window`, `fs-churn`, `fs-blockchaos`, `fs-blockdeath`,
+`fs-dupop`, `fs-cache` and `fs-lyingflush` - which made the problem worse before it made it better.
+`osdev test fs-all` runs all 25 and reports one tally, with each suite's full output kept in
 `build/tests/fs_all_<name>.log`.
 
 **`fs-tear` roughly doubles the run** (it boots QEMU once per tear point, ~55 of them plus a
@@ -98,26 +104,63 @@ otherwise would be the same optimism that let the suites rot.
 
 The trigger above. And, if the minutes stay scarce, which shape to spend them on:
 
-**Measured, not estimated: the full run is 11 to 12 minutes**, 14 of 14 green:
+**Measured, not estimated (2026-09-20): the full run is ~31 minutes**, 25 of 25 green:
 
 ```
-fs-all: [ 1/14] fs-restart   PASS   32s    ...   [ 4/14] fs-corrupt   PASS  118s
-fs-all: [ 6/14] fs-journal   PASS  106s    ...   [ 9/14] fs-frag      PASS   84s
-fs-all: 14 of 14 suites passed in ~12 min
+fs-all: [16/25] fs-tear-detect PASS   30s
+fs-all: [17/25] fs-tear        PASS  547s
+fs-all: 25 of 25 suites passed in ~30 min
+fs-all: the storage stack is green
 ```
 
-Four suites account for most of it (`fs-corrupt` 118s, `fs-journal` 106s, `fs-frag` 84s, `fs-large`
-and `fs-djournal` 67s each) because each boots QEMU more than once. That shape matters for option 3:
-a subset gate does not have to guess, it can just drop the five slowest and keep nine suites in about
-four minutes.
+**ONE SUITE IS 29% OF THE RUN.** `fs-tear` costs 547s by itself - it boots QEMU once per tear point,
+75 of them across four operations, plus a recording boot per operation and a control. The next five
+together (`fs-corrupt` 117s, `fs-journal` 106s, `fs-lyingflush` 92s, `fs-cache` 92s, `fs-frag` 84s)
+come to 491s.
 
-1. **Into an existing gate.** Twelve minutes on top of `osdev test shell` roughly triples the
-   pre-merge wait, and a gate nobody can afford to wait for gets skipped - which is the failure mode
-   this entry is already about.
+That single number decides option 3 rather than leaving it to judgement: **dropping `fs-tear` alone
+takes the run from 31 minutes to 22**, and dropping the top six leaves 19 suites in about 12 - the
+budget this entry was originally written against. A subset gate does not need somebody to choose
+honestly between twenty-five suites; it needs one decision about the tear sweep.
+
+1. **Into an existing gate.** At twelve minutes this was arguable. At **thirty-one** it is not: a
+   gate nobody can afford to wait for gets skipped, which is the failure mode this entry is already
+   about. Struck rather than deleted, because the reason it died is the measurement.
 2. **A workflow on push to `main`**, accepting that it reports after the fact rather than before.
-   Twelve minutes is nothing to a runner and a lot to a person, which is the strongest argument of
-   the three - and `identity.yml` is already exactly this shape, so it is a copy rather than a
-   design.
-3. **A subset gate**: the four or five suites that cover the paths most likely to break, in the
-   pre-merge gate, with the full run in CI. Needs somebody to choose the subset honestly rather than
-   by what is fastest.
+   Thirty-one minutes is nothing to a runner and impossible for a person, so the growth has made
+   this the strongest of the three by some distance - and `identity.yml` is already exactly this
+   shape, so it is a copy rather than a design.
+3. **A subset gate**: the pre-merge gate runs everything EXCEPT `fs-tear`, with the full run in CI.
+   The measurement above turns this from a judgement call into one: 24 suites in ~22 minutes, or 19
+   in ~12 if the next five go too. The honesty risk this option always carried - choosing the subset
+   by what is fastest rather than by what breaks - is smaller when the cut is one suite whose cost
+   is structural (a boot per tear point) rather than five chosen for convenience.
+
+
+---
+
+## 2026-09-20: swept again, and it happened AGAIN
+
+The first sweep of the day reported **24 of 25**, and the second found a second failure once the
+first was fixed. Neither was a filesystem fault. Neither would have been reported by anything.
+
+| suite | what failed | why |
+|---|---|---|
+| `fs-tear-detect` | 4 passed, 3 failed | it ran `churn 8` under a comment asserting eight seconds produced a multi-block file. Under the load of 25 back-to-back suites it did not, and `churn tear` had nothing large enough to tear. **A fixed DURATION standing in for a COUNT** |
+| `fs-tear` | 17 passed, 14 failed | its `move` case waited for the marker `"entries"` while its own oracle declares `(empty)` legal - and `dir` prints an empty directory with no header and no count. After a torn move the destination is usually empty, so the probe had its answer and timed out anyway. **17 of 17 move tear points reported TIMEOUT, and `delete` never ran at all** |
+
+`fs-tear`'s is the one worth dwelling on. The doc recorded it at **18/0 as of 2026-09-18** while it
+was red, which is a document asserting a guarantee that did not hold. It was found only because the
+sweep ran it - and it had been red long enough that an earlier session's log (`fstear6.log`) shows it
+passing 18/0 across 75 tear points, so `dir`'s empty-directory wording changed at some point and
+nothing re-ran the suite that cared.
+
+**Both were caught by the sweep this entry exists to justify, and by nothing else.** The two original
+red suites could be read as a one-off; four across two sweeps is a rate. The entry's claim - that the
+storage stack has the deepest coverage and the least automatic attention - is now measured rather
+than argued.
+
+One correction to the framing above, in fairness to the tests: all four failures were **test faults,
+not filesystem faults**. That is not reassuring, it is the point. A suite that fails for its own
+reasons is the one nobody investigates, and it trains exactly the reflex the entry names - discount
+red, re-run, move on.

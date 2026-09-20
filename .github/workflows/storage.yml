@@ -21,7 +21,11 @@ jobs:
   storage:
     name: Every fs suite (osdev test fs-all)
     runs-on: ubuntu-latest
-    timeout-minutes: 45     # the run is ~12 min; the margin is for a cold cache and a slow runner
+    # 90, from a MEASUREMENT rather than a guess: the sweep is ~31 min locally (25 suites,
+    # 2026-09-20), and `fs-tear` alone is 9 of those because it boots QEMU once per tear point.
+    # This said 45 with the note "the run is ~12 min" - true when written, and 14 minutes of margin
+    # on a runner slower than a dev box is how a green suite reports as a red job.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
