@@ -1,5 +1,10 @@
 # 11. `ehci` resets a controller the BIOS still owns - no USBLEGSUP handoff
 
+**Status: OPEN - FIXED IN CODE, NEVER EXECUTED ANYWHERE.** The handoff is implemented and wired
+at the EHCI MMIO grant (`39327cea`), and the reasoning below is settled. But **QEMU has no EHCI**,
+so that call has not run on any machine, in any suite, once. It needs the single-core T630 boot
+that motivated it. Until then this is a fix with no evidence, which is not a closed item.
+
 **Severity:** latent defect on EVERY machine; FATAL on a single core.
 **Root-caused:** 2026-09-06, T630, by instrumenting the fatal window after four theories failed.
 

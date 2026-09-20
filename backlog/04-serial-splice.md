@@ -1,5 +1,10 @@
 # 4. The kernel splices one log line into another under load
 
+**Status: OPEN - the HARNESS copes, the KERNEL is untouched.** Three places in `osdev/` now
+recognise a spliced line rather than reporting a false FAIL or, worse, a false PASS. The
+interleave itself is unfixed; the proposed fix is ~200-300 kernel lines and the 26.2 test for it
+is argued at the end rather than assumed.
+
 **Severity:** observability - and it corrupts the evidence used to debug everything else.
 **Seen on:** arm32, x86_64, and aarch64. Not arch-specific.
 

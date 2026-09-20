@@ -1,6 +1,6 @@
 # 15. The NIC receive ring is only drained when somebody asks
 
-**Status:** open, recorded rather than closed (§26.7). Not a regression - it was always true, and it
+**Status: OPEN**, recorded rather than closed (§26.7). Not a regression - it was always true, and it
 became visible only once the packet loss ahead of it was fixed.
 
 ## What happens

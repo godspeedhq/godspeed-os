@@ -1,5 +1,8 @@
 # 3. Pi 4: the shell faults with a return address of ASCII spaces
 
+**Status: OPEN.** Three sightings, most recent 2026-09-06 @ `f91663e8`. Cause NOT established.
+The next step is a kernel change and two hardware round-trips - see the end of the file.
+
 **Severity:** correctness. Costs one command, never the machine - the supervisor respawns a fresh
 prompt, which is 6.2 working.
 **Sightings:** three. Most recent 2026-09-06 @ f91663e8, mid-`selfcheck`, right after

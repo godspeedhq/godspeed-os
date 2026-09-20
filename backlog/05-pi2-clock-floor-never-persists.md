@@ -1,5 +1,8 @@
 # 5. Pi 2 never writes `/clock.last`, so every boot starts at 1970
 
+**Status: OPEN.** Unchanged. The loud refusal is the RIGHT half and is working as designed; what
+is missing is the recovery, and nothing has been built for it.
+
 **Severity:** correctness, degrading gracefully. The failure is LOUD and the clock refuses to lie,
 which is the right behaviour - what is missing is the recovery.
 

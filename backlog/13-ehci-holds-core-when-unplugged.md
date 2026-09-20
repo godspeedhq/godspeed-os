@@ -1,5 +1,8 @@
 # 13. EHCI holds a core while a device is unplugged, and xHCI `Enable Slot` timeouts
 
+**Status: OPEN, cosmetic-to-minor.** Unchanged. Neither half costs a test failure on any machine
+and both predate the single-core work.
+
 **Severity:** cosmetic-to-minor. Neither costs a test failure on any machine; both are pre-existing and
 predate the single-core work.
 **Observed:** 2026-09-07, HP T630 and Wyse 5070, both booted single-core.

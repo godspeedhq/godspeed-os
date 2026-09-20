@@ -1,6 +1,8 @@
 # 2. GodspeedOS on ONE core - does it actually work, and what has been hiding behind SMP?
 
-> **CLOSED 2026-09-07. It works, and the build flag that proved it has been REMOVED.**
+**Status: CLOSED 2026-09-07.** It works, and the build flag that proved it has been REMOVED.
+
+> **The evidence, as recorded at the time:**
 >
 > Verified on all four machines - HP T630 (AMD), Wyse 5070 (Intel), Pi 4 (aarch64), Pi 2 (arm32) -
 > each with selfcheck, a 100-round chaos storm and hot-plug: 0 failures, 0 kernel panics, 0 liveness

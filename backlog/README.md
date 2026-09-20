@@ -35,6 +35,11 @@ missed status lines on line 6, and one read by eye and put three closed items in
 
 ## One place, and what that means precisely
 
+**Every entry carries a status line, and that is enforced.** `**Status:` within the first 12
+lines, carrying CLOSED / OPEN / RESOLVED / FIXED in capitals, checked by
+`scripts/backlog_check.py` - which also refuses an entry that no row above links to. Coverage
+reached 38 of 38 on 2026-09-20 and the check became a gate the same day, so it can only be held.
+
 **Status lives here and nowhere else.** Whether a thing is open, what rules it out, and what the
 next step is - that is this folder's, exclusively. Before this existed the same item could be
 "recorded" in a service doc, a design note and a commit message, and those three would drift; the
@@ -67,7 +72,7 @@ direction.
 | [8](08-d3-assignment-vs-reenumeration.md) | D3: the assignment/re-enumeration split, and "cost 2" | Design decision | the D3 gate |
 | [9](09-constrained-targets-and-sizing.md) | Constrained targets: boot-size the arenas (~22 MiB of .bss), and what really blocks a microcontroller | Design question | any small-memory port |
 | [12](12-xhci-probe-blocks-input.md) | xHCI hub probes block the input loop - typing lags on one core | Latency | - |
-| [11](11-ehci-bios-handoff.md) | `ehci` resets a BIOS-owned controller with no USBLEGSUP handoff - fatal on one core | **Latent everywhere** | single-core on the T630 |
+| [11](11-ehci-bios-handoff.md) | `ehci` resets a BIOS-owned controller with no USBLEGSUP handoff - fatal on one core. **Fixed in code and wired, but QEMU has no EHCI so the call has never executed anywhere** | **Latent everywhere / unverified fix** | a single-core T630 boot |
 | [10](10-ipc-efficiency.md) | IPC cost: fewer ROUND TRIPS, not a tighter protocol - batching, co-location, and the fixed 4 KiB message | Performance | the hot paths |
 | [13](13-ehci-holds-core-when-unplugged.md) | EHCI holds a core while a device is unplugged; xHCI `Enable Slot` timeouts | Cosmetic-to-minor | - |
 | [14](14-riscv64-port.md) | The RISC-V 64 port (StarFive VisionFive 2 Lite) - **shipped in v0.16.0**; open tails only | Feature / shipped | - |

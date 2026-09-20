@@ -1,6 +1,8 @@
 # 12. xHCI hub probes block the input loop - typing lags on a single core
 
-> **RESOLVED 2026-09-07.** Root cause was neither the hub probes this file opened with nor the
+**Status: RESOLVED 2026-09-07.** The stated cause was wrong twice over - see below.
+
+> Root cause was neither the hub probes this file opened with nor the
 > polling fallback that first masked the symptom: **core 0's LAPIC id was published only inside
 > `start_all_aps`, which a `single-core` build never calls.** `CORE_LAPIC_ID[0]` therefore stayed 0
 > while the T630's BSP is id 16, so every MSI aimed at the driver's own core went to a core that does
