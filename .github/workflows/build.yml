@@ -80,6 +80,11 @@ jobs:
       - name: Fact check (a number a doc restates must match the code that owns it)
         run: python3 scripts/facts_check.py
 
+      # The backlog index promised "this is the index" while entries 33-38 were linked from
+      # nowhere. doc_refs checks a citation resolves; this checks an ENTRY is reachable.
+      - name: Backlog check (every entry is reachable from the backlog index)
+        run: python3 scripts/backlog_check.py
+
       - name: Site check (the hand-written pages still describe the real repository)
         run: python3 scripts/site_check.py
 

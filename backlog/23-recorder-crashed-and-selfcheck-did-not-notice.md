@@ -3,7 +3,9 @@
 **Severity:** two items. The crash is a real service fault (non-fatal, the kernel handled it exactly
 as it should). The assertions that passed over it are worse, because they are why `ran 461, failed 0`
 did not mention any of this.
-**Status: OPEN.** One occurrence, not reproduced on the very next run of the same step.
+**Status: item 2 FIXED 2026-09-20; item 1 OPEN.** The four assertions now have a liveness check
+in front of them, so the suite can no longer sleep through `recorder` dying. The CRASH itself is
+still one unreproduced occurrence with nothing to measure - see the end.
 
 ## 1. The crash
 
@@ -70,3 +72,45 @@ alongside, which the suite already does for `hw-enumerator` one section earlier 
 it just was not applied here).
 
 That is a change to the selfcheck script, which is code, so it is recorded here rather than made.
+
+
+---
+
+## Item 2 fixed 2026-09-20 - the assertions now require a live `recorder`
+
+Exactly the fix this entry specified, using the pattern it pointed at:
+
+```gsh
+status | where name contains recorder | assert contains recorder
+status | where name contains recorder | assert lacks Dead
+events persist status | assert contains rotations
+...
+```
+
+Placed immediately before the four rendering assertions, so the window they were blind to is the
+window that is now checked. `scripts/selfcheck.gsh`, verified by `osdev test script`, which runs the
+embedded selfcheck twice in one boot and requires `failed 0`.
+
+**Why this was worth doing rather than leaving recorded.** It is the same defect that was found four
+separate ways elsewhere on 2026-09-20, in checks that passed on an empty string, on the echoed
+command line, on the words "storage unavailable", and on a marker that the displayed content itself
+contained. The general form: **asserting the ABSENCE of a failure, or a string that something other
+than the subject also produces, confirms nothing.** Here the "something other" was the shell's own
+renderer, which answers whether or not the service it describes is alive.
+
+`ran 461, failed 0` was a true sentence about a suite that had not looked. That is worse than a red
+test, because it is a green one.
+
+### Item 1, the crash, is unchanged and stays open
+
+One occurrence, on aarch64, not reproduced on the immediately following identical run. The register
+dump is nearly empty (PC = 0, LR = 0, callee-saved registers zeroed except `x26`/`x27`), which is the
+clue and also why there is nothing to work with: a branch to null leaves no trail. The next step is
+still the one recorded above - frame pointers in `recorder`, or a deliberate poison in `x27` so its
+origin is known - and it is not worth building until it recurs.
+
+**What HAS changed is the odds of noticing the recurrence.** Before this fix, a repeat would have
+produced the same `failed 0` it produced the first time, and would have been found only by someone
+reading the serial log for another reason. Now the run goes red in the section the crash happens in.
+That does not fix item 1, but it converts it from a bug that hides into a bug that reports itself,
+which is the precondition for ever measuring it.

@@ -123,7 +123,7 @@ jobs:
         run: |
           set -e
           for c in commandments unsafe_check dash_check arch_boundary_check arch_seam_check \
-                   shared_surface_check contract_check doc_refs facts_check site_check                    line_ending_check; do
+                   shared_surface_check contract_check doc_refs facts_check site_check                    line_ending_check backlog_check; do
             echo "--- $c"
             python3 "scripts/$c.py"
           done

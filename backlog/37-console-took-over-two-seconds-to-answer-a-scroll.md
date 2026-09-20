@@ -1,7 +1,7 @@
 # 37. The console took over two seconds to answer a scroll request, and I do not know why
 
-**Status: STILL OPEN. The reply-mailbox fix below was a real latent bug and is NOT this one - the
-drain never fired on the failing hardware run. New evidence points at `backlog/28`.**
+**Status: CLOSED 2026-09-20. The cause was in `term.rs` the whole time and no measurement was going
+to find it - see the post-mortem at the end. The mechanism is now DELETED, not merely unused.**
 
 > **2026-09-19, fourth measurement.** The SDK drain was added and the fault reproduced unchanged,
 > with **no `sdk: discarded ... abandoned` line anywhere in the log**. So the reply mailbox was
@@ -379,3 +379,68 @@ Still **OPEN**. What this run cost the entry is one more wrong theory; what it b
 (slow repaint on a shared core) that is measurable rather than speculative - the next step is to
 have the console REPORT its repaint cost, so the deadline is derived from a measurement instead of
 being chosen and then defended.
+
+
+---
+
+## Closed 2026-09-20 - the answer was three lines of `scroll_view`
+
+Four measurements, each retracting the last, ending "New evidence points at `backlog/28`". None of
+them were going to find it, because every one asked *where did the reply go* - and no reply was ever
+lost.
+
+```rust
+paint_view(s);
+render::present();
+(s.view, max)          // the reply, computed AFTER a full repaint
+```
+
+**To answer "move your view", the console had to repaint the framebuffer SYNCHRONOUSLY, inside the
+caller's request.** On the Wyse's 3840x2160 panel that is the most expensive thing it does. The
+caller allowed one second. `console` is contracted to `core = 0` and the shell was round-robined onto
+core 0 as well, so the caller was blocked on the core doing the painting.
+
+Nothing was stuck. **The work did not fit the deadline.**
+
+### Why four rounds missed it
+
+Every instrument asked about DELIVERY, and delivery was never in question:
+
+| round | theory | what actually refuted it |
+|---|---|---|
+| 1 | a stale cap | the gen-mismatch lines were outside the failure window, and three scrolls succeeded after one |
+| 2 | "no long-pass line means the console is healthy" | that report fires at the END of a pass |
+| 3 | the SDK reply-mailbox drain | a genuine latent bug, fixed and kept - but it never fired on the failing run |
+| 4 | `backlog/28`, a 23 s `net-stack` serve pass | real, in the same window, and not this |
+
+And one instrument was mine and wrong: `our queue N` read the shell TASK's endpoint depth while
+`request_with_reply*` waits on the reply MAILBOX, a different endpoint `task_stat` cannot see. It
+reported a zero about somewhere the reply was never going to arrive.
+
+**The thing that found it was reading `scroll_view` while building something else.** Recorded because
+the lesson is not "measure more": it is that a question asked four different ways is still one
+question, and the answer was in the handler the whole time.
+
+### What was deleted
+
+The fix shipped earlier, when `scrollback` became a utility reading BYTES (`utilities/54_scrollback.md`).
+This entry closes with the mechanism removed rather than left unreachable:
+
+* `console_scroll` (SDK) - zero callers
+* `REQ_SCROLL` and its handler (`services/console`)
+* `scroll_view`, `paint_view`, `paint_view_indicator`, `view()`, `take_output_snap`, the
+  `view`/`in_view`/`snapped_by_output` state, the `SCROLL_*` action bytes, and `put_num`
+
+Deleted rather than kept: a future caller finding `REQ_SCROLL` in the header would rebuild the exact
+shape, and dead code that once caused a bug is an invitation. It also removed state the console kept
+ONLY for that feature, including a branch in the OUTPUT path whose sole job was to snap back out of a
+view that can no longer exist.
+
+### The general form, which outlives this bug
+
+**The console was both the service being read FROM and the service drawn TO** - one endpoint, one
+16-deep queue - so a request made mid-frame could always land behind painting the caller itself had
+just asked for. Widening the deadline would have hidden that, not fixed it. What fixed it was moving
+the work to the side that was not also the bottleneck.
+
+`backlog/28` remains open and is a different fault.

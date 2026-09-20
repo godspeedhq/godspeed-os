@@ -611,6 +611,12 @@ if $capready > 0 {
 } else {
     fail 'events persist: the capture never reached `recording` in 30s - the extent pre-fill did not finish'
 }
+# THE RECORDER IS ALIVE - assert it before trusting anything below (`backlog/23`). Every assertion
+# from here to `capacity` reads the SHELL's rendering of a status line, and that rendering does not
+# need `recorder` to exist. On the Pi 4 it crashed mid-section and four of them passed over the
+# corpse, so `ran 461, failed 0` slept through a service fault. Same pattern as hw-enumerator above.
+status | where name contains recorder | assert contains recorder
+status | where name contains recorder | assert lacks Dead
 # BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
 # allocates a file's whole extent up front, so the size is fixed when the capture starts and total
 # disk use is twice that, no matter how long it runs. A forgotten capture cannot fill a disk.

@@ -2510,7 +2510,23 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     macro_rules! run {
         ($c:expr, $secs:expr) => {{
             send(&mut write_half, $c);
-            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+            let r = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs));
+            if r.is_none() {
+                // RESYNC AFTER A TIMEOUT (`backlog/38`). A case that times out leaves its reply in
+                // flight, so the NEXT case reads the previous one's output instead of its own and
+                // fails for a reason that has nothing to do with it. That is why one fault has
+                // reported as 2, 3 and 6 failures on different days, and why the count has never
+                // said how many things were actually wrong.
+                //
+                // Re-establish a known prompt before returning, so one event costs one failure.
+                // Bounded (two prompts, 5s each) and reached ONLY on the failure path: a run in
+                // which nothing times out does not execute a line of this.
+                for _ in 0..2 {
+                    send(&mut write_half, b"\r");
+                    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)).is_none() { break; }
+                }
+            }
+            r
         }};
     }
 

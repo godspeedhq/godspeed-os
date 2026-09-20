@@ -22,6 +22,14 @@ fails, and the file may shrink freely. Same shape as `SHARED-SURFACE.baseline.tx
 NOT SCANNED: `audits/` and `milestones/`. Those are append-only EVIDENCE and dated history (CLAUDE.md
 §5) - a symbol that existed when the audit ran is CORRECT there, and rewriting it would falsify the
 record. Same reason `backlog/29` keeps the serial capture it quotes verbatim.
+
+A RECURRING CASE, recorded so the next person does not re-argue it from scratch: a CLOSED backlog
+entry's post-mortem names the code it deleted, and naming it is the point - `backlog/37` explains a
+bug by listing the five functions removed to fix it. That is the same "dated history" argument the
+paragraph above makes for `audits/`, and it will happen again every time a removal is written up.
+It is baselined per-symbol for now rather than exempting closed entries wholesale, because the
+exemption would silently stop checking eleven existing files to make one new one pass. If this
+keeps recurring, generalise it THEN, on the evidence of several cases rather than the first.
 """
 import io
 import os
