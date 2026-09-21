@@ -5,8 +5,9 @@ operations, 75 tear points, 35 exercising journal recovery), resource exhaustion
 power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
 (`fs-model`, §3.2), the block layer (§3.7 - `fs-blockchaos` for the completion stream,
 `fs-blockdeath` for the driver dying mid-request; hot-unplug is not), and the duplicate-destructive-op
-gap (§3.5, `fs-dupop`). NOT RUN: the rest of §3.5 (two clients on one path), the
-remaining rows of §3.3, and cross-ISA (§3.11, not reachable in QEMU).
+gap (§3.5, `fs-dupop`), and **cross-ISA** (§3.11, `cross_isa.py` 12/0 - one volume carried
+x86-64 -> riscv64 -> x86-64). NOT RUN: the rest of §3.5 (two clients on one path) and the
+remaining rows of §3.3.
 
 **Mostly QEMU-validated.** The hardware results are recorded in §4 and §3.12. The one that matters
 landed on 2026-09-18: a power cut during `churn` fell INSIDE the commit-to-checkpoint window on a
@@ -596,10 +597,46 @@ Recorded as NOT APPLICABLE rather than PASS, because the honest claim is "the de
 exist", not "we tested its absence". If logs are ever re-pointed at a service, this becomes a live
 gate immediately - which is precisely why 11.4 forbids it.
 
-### 3.11 Cross-ISA - NOT RUN, and NOT REACHABLE IN QEMU (`backlog/34`)
+### 3.11 Cross-ISA - BUILT, PASSES in QEMU (`py scripts/cross_isa.py`, 12/0)
 
-Attempted, and the attempt is the result. **No non-x86 port can reach a disk in QEMU**, each for its
-own concrete reason, measured rather than assumed:
+**One GSFS volume, formatted and written by x86-64 over AHCI, then mounted, read, fsck'd and written
+by riscv64 over USB BOT/SCSI, then carried back to x86-64 with riscv64's writes intact.** The same
+raw file is attached to both machines; only the transport and the instruction set differ, which is
+the whole test.
+
+```
+leg 1  x86-64 (AHCI)            formats, writes /from-x86.txt and /shared/note.txt, reads them back
+leg 2  riscv64 (USB/BOT-SCSI)   mounts it, reads both, writes /from-riscv.txt, `drives check` 0 bad
+leg 3  x86-64 (AHCI)            reads /from-riscv.txt, its own files survive, `drives check` 0 bad
+```
+
+So the expectation this section was written to remove is now a result: the format travels, and the
+block transport does not change the picture. A volume written through one sector-at-a-time AHCI
+controller is read through BOT/SCSI over a split transaction by a different ISA, and neither `fs`
+nor `drives check` can tell.
+
+**WHAT MADE IT REACHABLE, recorded because the obvious attempt was wrong.** The blocker below was
+"riscv64 has no drive option at all", and the first fix attached an AHCI controller - reasoning that
+`virt` has a real PCIe host bridge and `block-driver` already speaks AHCI. The kernel dutifully
+granted `block-driver` an ABAR it would never read: `services/block-driver/build.rs` maps riscv64 to
+`storage_is_usb`, and `main.rs` gates `#[cfg(not(storage_is_usb))] mod ahci`, so that file is not
+compiled on this port. The device it needed was a USB stick behind `qemu-xhci`. Two real defects
+were found on the way and both are fixed - a driver that hung when its host service was silent, and
+a capacity latched at mount and never refreshed (`backlog/34`).
+
+**One trap the gate now defends against itself**, because it cost a full red run: `riscv_build.py
+--visionfive` links the kernel at 0x40200000 for the board, and QEMU's `virt` loads at 0x80200000.
+Run the gate after a board build and OpenSBI comes up, our kernel prints nothing, and every riscv64
+assertion fails - which reads exactly like "riscv64 cannot mount an x86 volume". The script builds
+the kernel it needs rather than trusting what is lying in `target/`.
+
+**Still cross-ISA only between two of the four ports.** The ARM rows below stand: `raspi4b` emulates
+no VL805 and `raspi2b`'s stick re-enumerates endlessly, so aarch64 and arm32 remain unreachable in
+QEMU and are a hardware job.
+
+#### The blocker, as it stood - each port's own concrete reason
+
+**riscv64's row is CLOSED** (see above). The other two are unchanged, measured rather than assumed:
 
 | port | disk in QEMU | what happens |
 |---|---|---|
@@ -613,9 +650,10 @@ boots clean, `supervisor: ready`, prompt working, **zero** connect events. Real 
 storage stack fine - that is how `selfcheck` reaches 349/0 on the board - so this is QEMU's dwc2
 emulation rather than the driver on silicon.
 
-**The half that IS done:** a GSFS volume was flashed and written on x86-64 and is sitting on disk,
-holding `/from-x86.txt` and `/shared/note.txt`. When a board is available, that image goes on a stick
-and the second half runs unchanged.
+**That half-done note is superseded.** It read: "a GSFS volume was flashed and written on x86-64 and
+is sitting on disk ... when a board is available, that image goes on a stick and the second half runs
+unchanged." The second half runs now, in QEMU, on every run of `cross_isa.py` - and it did not need a
+board.
 
 **Why this matters more than one gate.** Every storage guarantee in this file is verified on ONE
 architecture - fifteen suites, 75 tear points, the recovery measurements, all x86-64 and all AHCI. It
@@ -623,14 +661,51 @@ also hides a whole category of bug: anything where the BLOCK TRANSPORT changes t
 hands `fs` a sector; USB mass storage hands it one through BOT/SCSI over a split transaction. The
 filesystem should not care, and "should not" is the phrase this programme exists to remove.
 
-So this gate is recorded as **not reachable in QEMU** rather than merely not done, which is a
-different fact: it changes what the hardware pass is FOR. For everything else in this file hardware
-is a confirmation at the end. For this, it is the only way to get an answer at all.
+That reasoning held for as long as no port could attach a disk, and it is why this was recorded as
+**not reachable** rather than merely not done. It stopped being true on 2026-09-21. What remains
+true is the narrower version: for aarch64 and arm32, hardware is still the only way to get an
+answer.
 
-### 3.12 Physical hardware - PARTIAL (1 of 5 boards), and the journal half is CLOSED and REPRODUCED
+### 3.12 Physical hardware - ALL FIVE BOARDS PASS (2026-09-21), and the journal half is CLOSED and REPRODUCED
 
 Real controllers, hotplug, restart, and the flush/durability assumptions that QEMU does not model.
 Five boards. **A QEMU pass is never recorded as a hardware pass.**
+
+#### The five-board pass, 2026-09-21 - one image per architecture, `selfcheck` twice on each
+
+| board | arch | `selfcheck` | what only this board could say |
+|---|---|---|---|
+| Dell Wyse 5070 | x86-64 | 502 / 0 / 0, twice | no EHCI present, so it could not test the handoff below |
+| HP T630 | x86-64 | 502 / 0 / 0, twice | **the EHCI BIOS handoff ran for the first time ever** |
+| Raspberry Pi 2 | armv7 | 493 / 0 / **1**, three times | `chaos kill-storm dwc2` 100 rounds, 100/100 recovered |
+| Raspberry Pi 4 | aarch64 | 502 / 0 / 0, twice | no `backlog/03` fault, no `backlog/22` blanking |
+| VisionFive 2 Lite | riscv64 | 502 / 0 / 0, twice | **`reboot` was a spin loop**; fixed and verified |
+
+**The counts are self-consistent, which is worth more than the zeros.** 502 wherever PCI exists and
+493 + 1 skipped where it does not: the Pi 2 is the only board without PCI and the only one that
+skips, and it names the reason (`hw-enumerator - this machine has no PCI to enumerate`). Nothing is
+being silently dropped on any machine, which is the failure mode a bare "0 failed" cannot rule out.
+
+**Two defects were found BY the hardware, not confirmed by it** - both in code that no QEMU run
+could reach:
+
+* **The EHCI USBLEGSUP handoff had never executed on any machine.** QEMU has no EHCI and the Wyse
+  has none either, so only the T630 could run it. It hit the hard case on the first try: the
+  firmware held the controller (`USBLEGSUP` bit 16 set) and REFUSED to release it, so ownership was
+  forced - and the keyboard behind the hub kept working, which was the stated fear.
+  (`backlog/11`, closed.)
+* **`reboot` on riscv64 was `loop { spin_loop() }`** that printed `reboot: hardware reset` first.
+  It wedged a hart inside syscall 18 and the liveness watchdog panicked ten seconds later, exactly
+  as designed. Now SBI SRST, warm before cold - because a cold reboot power-cycles through the PMIC
+  and OpenSBI's PMIC driver fails on this board (`pmic_ops: cannot read pmic power register`), while
+  a warm one never touches it. Two clean reboots on the board, one with the stick pulled.
+
+**What the hardware pass did NOT establish, said plainly.** The two USB-path fixes from the same day
+have no positive hardware proof. Every board booted with its USB host controller PRESENT and
+answering, so none reached the condition the fix addresses - a host service alive but SILENT. That
+condition is what QEMU's `virt` produces (no USB controller at all, so `xhci` idles and never
+replies), and it is structural on silicon: the VisionFive has its controller on-SoC, the Pi 2 has
+DWC2, the Pi 4 has the VL805. Three boards establish NO REGRESSION, which is not the same claim.
 
 #### Journal recovery on silicon - PROVEN 2026-09-18, reproduced twice 2026-09-20, Dell Wyse 5070
 
@@ -738,7 +813,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
-| Cross-ISA QEMU image tests | NOT RUN - NOT REACHABLE | 3.11 / `backlog/34`. No non-x86 port can attach a usable disk in QEMU: riscv64 has no drive option, aarch64 has no VL805 emulation, arm32's stick re-enumerates 126 times and never settles. The x86 half is written and waiting |
+| Cross-ISA QEMU image tests | **PASSES (QEMU)** | 3.11 - `py scripts/cross_isa.py` 12/0. One volume, x86-64 (AHCI) -> riscv64 (USB BOT/SCSI) -> x86-64: each side reads the other's files and `drives check` reports 0 bad on both. aarch64 and arm32 remain unreachable in QEMU (no VL805 emulation; the arm32 stick re-enumerates) and are a hardware job. |
 | Physical-hardware validation | PARTIAL (1 of 5 boards), journal half CLOSED | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD. A power cut during `churn` landed INSIDE the commit-to-checkpoint window: the next mount reported `journal recovered 4 block(s) from an interrupted write`, and `churn verify` then found 6 files, NONE torn. `drives check` then reported `0 bad` and `nothing was repaired`, with the free count identical to the one the recovery mount computed - so both the content and the structural question are answered, and the structural one in its strong form. Recovery on silicon is proven (§3.12). Three earlier cuts had survived cleanly without ever invoking the journal, which proved consistency and not recovery. Still open: four boards |
 | Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
 
