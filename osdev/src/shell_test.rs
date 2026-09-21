@@ -7028,6 +7028,8 @@ pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
     send(&mut write_half, b"churn 12\r");
     let writing = collect_until(&buf, &mut cursor, b"s elapsed", Duration::from_secs(60));
     check!(writing.is_some(), "churn was demonstrably WRITING before the driver was killed");
+    // Owned here, like `pass` and `fail` - see the block below for what it counts and why.
+    let mut skip = 0usize;
 
     let killed_at = std::time::Instant::now();
     match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
@@ -7052,10 +7054,24 @@ pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
     // dependency: RETURN, loudly, rather than hang.
     let noticed = collect_until(&buf, &mut cursor, b"block-driver send failed", Duration::from_secs(30));
     let notice_at = killed_at.elapsed();
-    check!(noticed.is_some(), "fs NOTICED the driver's death rather than hanging on it");
-    check!(notice_at < Duration::from_secs(10),
-           "fs noticed PROMPTLY - the death-wake fired, it did not sit out its 30 s deadline");
-    println!("fs-blockdeath: (fs noticed {notice_at:?} after the kill; its request deadline is 30 s)");
+    // ONE FAULT MUST COST ONE FAILURE. These two assertions are about what happens to a request that
+    // is IN FLIGHT when the driver dies, so if churn never got writing there is no in-flight request
+    // and they are not answerable - they are unevaluated, not failed. Reporting them red turned a
+    // single missed precondition into four FAILs and named three innocent properties, which is how a
+    // reader is sent after the death-wake when the actual fault was that the machine was too busy to
+    // start churn inside 60 s (`net-stack` can block a serve pass for 22 s - `backlog/28`).
+    if writing.is_some() {
+        check!(noticed.is_some(), "fs NOTICED the driver's death rather than hanging on it");
+        check!(notice_at < Duration::from_secs(10),
+               "fs noticed PROMPTLY - the death-wake fired, it did not sit out its 30 s deadline");
+        println!("fs-blockdeath: (fs noticed {notice_at:?} after the kill; its request deadline is 30 s)");
+    } else {
+        skip += 2;
+        println!("fs-blockdeath: SKIP - fs NOTICED the driver's death rather than hanging on it");
+        println!("fs-blockdeath: SKIP - fs noticed PROMPTLY - the death-wake fired");
+        println!("fs-blockdeath: (both SKIPPED: churn never reported writing, so nothing was in \
+                  flight to notice. The precondition is the failure; these are not)");
+    }
 
     // DMA IS QUIESCED WHEN THE DRIVER DIES, which the first run surfaced and is worth pinning here
     // rather than leaving as a line somebody once saw. An unconfined DMA-capable driver has
@@ -7068,7 +7084,12 @@ pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
     let restarted = collect_until(&buf, &mut cursor, b"block-driver restarted", Duration::from_secs(60));
     check!(restarted.is_some(), "supervisor observed the death and restarted block-driver");
     let recovered = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120));
-    check!(recovered.is_some(), "the shell returned to a prompt after the driver died mid-request");
+    if writing.is_some() {
+        check!(recovered.is_some(), "the shell returned to a prompt after the driver died mid-request");
+    } else {
+        skip += 1;
+        println!("fs-blockdeath: SKIP - the shell returned to a prompt after the driver died mid-request");
+    }
 
     // AND IT STILL WORKS. Every one of these runs after the driver has died and been respawned.
     send(&mut write_half, b"write /afterdeath.txt driver-died-mid-request\r");
@@ -7098,6 +7119,10 @@ pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
            "no SILENT data change - any torn file is accompanied by a reported failure");
     check!(!w.contains("KERNEL PANIC"), "no kernel panic");
 
+    if skip > 0 {
+        println!("\nfs-blockdeath: {pass} passed, {fail} failed, {skip} SKIPPED - the skipped ones were \
+                  not evaluated because churn never started writing, NOT because they held");
+    }
     println!("\nfs-blockdeath: {pass} passed, {fail} failed  (serial -> build/tests/fs_blockdeath_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }
