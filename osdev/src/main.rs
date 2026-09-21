@@ -1459,6 +1459,8 @@ fn cmd_test(suite: &str) {
         "fs-dupop"       => run_fs_dupop_test(),
         "fs-lostreq"     => run_fs_lostreq_test(),
         "fs-twoclient"   => run_fs_twoclient_test(),
+        "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
+        "cross-isa"      => run_cross_isa_test(),
         "fs-cache"       => run_fs_cache_test(),
         "fs-lyingflush"  => run_fs_lyingflush_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
@@ -2814,6 +2816,49 @@ fn run_fs_check_test() {
 /// calling them in-process would let the first failure kill the run and hide every suite after it -
 /// which is the exact shape of problem this is meant to end. Isolated, one failure costs one line
 /// and the rest still report.
+/// Carnage §3.11: one GSFS volume carried x86-64 -> riscv64 -> x86-64.
+///
+/// **It builds its own x86 image first, and that is not boilerplate.** `build/os.img` is rebuilt by
+/// nearly every `fs` suite with whatever fault-injection feature it needs, so inside `fs-all` this
+/// one would inherit the previous suite's `fs`. It did: run straight after `fs-twoclient` it came
+/// back 6/6, with riscv64 mounting a volume that was formatted but EMPTY - leg 1 had written files
+/// that never reached the backing file. The script already builds the riscv64 kernel it needs for
+/// exactly this reason (a board-linked kernel boots nothing on `virt`); this is the same rule
+/// applied to the other machine. A suite that trusts what is lying in `build/` is a suite whose
+/// result depends on what ran before it.
+fn run_cross_isa_test() {
+    build_blockdev_fs("", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    run_python_suite("fs: one volume across two architectures (§3.11)", "cross_isa.py");
+}
+
+/// Run a suite that lives in `scripts/` rather than in this binary.
+///
+/// TWO SUITES DRIVE A NON-x86 MACHINE, and that is why they are Python. `cross_isa.py` boots x86-64
+/// AND riscv64 over one raw image; `fs_unplug.py` needs riscv64 because QEMU's AHCI refuses
+/// `device_del` ("Bus 'ahci.0' does not support hotplugging") so only a USB bus can be unplugged.
+/// The riscv64 launch, its kernel build and its board-vs-QEMU load address already live in
+/// `scripts/`, and re-implementing them in Rust to keep every suite in one language would be
+/// duplicating the thing most likely to drift.
+///
+/// What matters is that `osdev test <name>` remains the ONE way to run a suite, so `fs-all` needs
+/// no special case and nobody has to remember that two of them are different.
+fn run_python_suite(name: &str, script: &str) {
+    println!("\n=== {name} (scripts/{script}) ===");
+    match std::process::Command::new("python").args([&format!("scripts/{script}")]).status() {
+        Ok(st) if st.success() => {}
+        Ok(_) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("osdev: cannot run scripts/{script} ({e}). A suite that cannot run is not a suite that passed.");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_fs_all_tests() {
     // Ordered cheapest-first so a broken build or a broken mount is reported in a minute rather than
     // at the end of a long run.
@@ -2861,6 +2906,10 @@ fn run_fs_all_tests() {
         // contention is on a shared directory block rather than simulated. Pins the guarantee
         // written down in `docs/persistence.md` 6.18.
         "fs-twoclient",
+        // §3.7 and §3.11, and the two that are NOT x86: both drive riscv64, so both live in
+        // `scripts/`. Last because each builds a second kernel before it boots anything.
+        "fs-unplug",
+        "cross-isa",
         // §3.3. The only suite that cuts a drive which had NOT yet committed what it acknowledged.
         "fs-cache",
         "fs-lyingflush",
