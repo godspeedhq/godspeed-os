@@ -1337,11 +1337,12 @@ fn emit_dec_lockfree(v: u64) {
 pub fn hardware_reset() -> ! {
     // Reaching PAST this call at all means the reset did not happen - so name which way it failed,
     // rather than falling through to a hang that looks identical to every other hang.
-    match sbi::system_reset_cold() {
+    match sbi::system_reset() {
         sbi::ResetRefusal::NoExtension => crate::kprintln!(
             "reboot: this firmware implements no SBI SRST extension - it cannot restart the board"),
-        sbi::ResetRefusal::Firmware(e) => crate::kprintln!(
-            "reboot: SBI SRST refused a cold reboot (error {}) - the machine is NOT resetting", e),
+        sbi::ResetRefusal::Both { warm, cold } => crate::kprintln!(
+            "reboot: SBI SRST refused BOTH reboot types (warm {}, cold {}) - the machine is NOT resetting",
+            warm, cold),
     }
 
     // NOTHING LEFT TO TRY, AND THAT IS THE HONEST END OF IT. There is no RISC-V equivalent of a

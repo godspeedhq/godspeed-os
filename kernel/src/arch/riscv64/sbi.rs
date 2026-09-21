@@ -51,11 +51,16 @@ pub const EXT_IPI: u64 = 0x0073_5049;
 pub const EXT_SRST: u64 = 0x5352_5354;
 /// `sbi_system_reset(reset_type, reset_reason)` - SRST function 0, its only function.
 pub const FID_SYSTEM_RESET: u64 = 0;
-/// Reset types. `COLD_REBOOT` is what `reboot` means: power-cycle the platform and run firmware
-/// again from the start. A warm reboot skips that and is not what an operator typing `reboot`
-/// after pulling a disk is asking for.
+/// Reset types. BOTH reboots restart the machine and run firmware again; the difference is the
+/// POWER. A cold reboot power-cycles the platform, a warm one does not.
+///
+/// An earlier version of this comment said a warm reboot "is not what an operator typing `reboot`
+/// is asking for", and that was wrong. An operator asking for `reboot` wants the machine to come
+/// back, and both do that - which matters here because the power half is exactly what fails on the
+/// VisionFive 2 (see `system_reset` below).
 pub const RESET_TYPE_SHUTDOWN: u64 = 0x0000_0000;
 pub const RESET_TYPE_COLD_REBOOT: u64 = 0x0000_0001;
+pub const RESET_TYPE_WARM_REBOOT: u64 = 0x0000_0002;
 /// Reset reasons. `NONE` is an ordinary, requested reset - not a fault.
 pub const RESET_REASON_NONE: u64 = 0x0000_0000;
 const FID_SEND_IPI: u64 = 0;
@@ -118,11 +123,11 @@ pub unsafe fn call(eid: u64, fid: u64, a0: u64, a1: u64) -> SbiRet {
 pub enum ResetRefusal {
     /// The firmware implements no SRST extension at all.
     NoExtension,
-    /// It implements it and declined, with this SBI error code.
-    Firmware(i64),
+    /// It implements it and declined BOTH reboot types, with these SBI error codes.
+    Both { warm: i64, cold: i64 },
 }
 
-/// Ask firmware to COLD-REBOOT the platform, and return only if it did not.
+/// Ask firmware to restart the platform, and return only if it did not.
 ///
 /// A safe wrapper that probes first, exactly as `hart_start` and `send_ipi` do and for the same
 /// reason: an unimplemented extension answers with a silent nothing, and "firmware refused" and
@@ -132,15 +137,37 @@ pub enum ResetRefusal {
 /// that resets a board - x86 has a triple fault to fall back on and both ARM ports write the SoC's
 /// own watchdog block, while the JH7110's reset controller belongs to M-mode. So when this returns,
 /// the caller has genuinely run out of mechanisms and should say so rather than spin (`mod.rs`).
-pub fn system_reset_cold() -> ResetRefusal {
+///
+/// **WARM IS TRIED FIRST, and the board is the reason.** On the VisionFive 2 Lite a cold reboot
+/// reaches OpenSBI v1.2's `pm-reset` driver and dies inside it:
+///
+///     reboot: hardware reset
+///     pmic_ops: cannot read pmic power register        <- OpenSBI, not this kernel
+///
+/// and the board goes dark without restarting. That message is about POWER: a cold reboot
+/// power-cycles the platform through the PMIC, and reading the PMIC is what failed. A warm reboot
+/// restarts without cutting power, so it need not touch that register at all.
+///
+/// Trying it costs nothing. The SBI specification requires an unsupported `reset_type` to be
+/// REFUSED with an error rather than acted on, so firmware that has no warm reboot answers and we
+/// fall through to cold - which is exactly today's behaviour, unchanged. QEMU's `virt` uses
+/// `syscon-reboot` and honours both, which is why this failure could only ever be found on the
+/// board (the QEMU run restarted cleanly, twice).
+pub fn system_reset() -> ResetRefusal {
     if !probe(EXT_SRST) {
         return ResetRefusal::NoExtension;
     }
-    // SAFETY: SRST function 0 with a specification-defined type (cold reboot) and reason (none).
-    // On success it never returns; on failure it answers with an error code like any other SBI
-    // call, and touches no memory this kernel owns either way.
-    let r = unsafe { call(EXT_SRST, FID_SYSTEM_RESET, RESET_TYPE_COLD_REBOOT, RESET_REASON_NONE) };
-    ResetRefusal::Firmware(r.error)
+    // SAFETY: SRST function 0 with specification-defined types and reason. Neither call returns on
+    // success; on failure each answers with an error code like any other SBI call, and neither
+    // touches memory this kernel owns.
+    // ONE block for both, because they are one operation asked two ways and share every word of
+    // the argument above. Tuple elements evaluate left to right, so warm is attempted first and
+    // cold is only reached if it came back - which it does not, on success.
+    let (warm, cold) = unsafe {
+        (call(EXT_SRST, FID_SYSTEM_RESET, RESET_TYPE_WARM_REBOOT, RESET_REASON_NONE),
+         call(EXT_SRST, FID_SYSTEM_RESET, RESET_TYPE_COLD_REBOOT, RESET_REASON_NONE))
+    };
+    ResetRefusal::Both { warm: warm.error, cold: cold.error }
 }
 
 /// The SBI specification version the firmware implements, as (major, minor).
