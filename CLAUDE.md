@@ -343,7 +343,7 @@ os/
     naming-design.md     #   name resolution out of the kernel (Path C)
     persistence.md       #   block driver + filesystem, file-as-capability
     console-service.md   #   the terminal, and the kernel's boot/panic floor
-    ...                  #   (41 files; the index lists them all)
+    ...                  #   the index lists them all
 
   audits/                # append-only EVIDENCE, not documentation
     unsafe-audit.md      #   every unsafe block; CI checks it matches source
@@ -382,7 +382,7 @@ os/
     test_report.py       #   collate a suite run into a report
     arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
 
-  utilities/             # the SPEC for every shell utility, one file each (54 + 0_conventions)
+  utilities/             # the SPEC for every shell utility, one file each, plus 0_conventions
     0_conventions.md     #   the 13 rules every utility obeys
   website/               # the published book (mdBook); pages `{{#include}}` the
                          #   sources above, so a doc and its page cannot drift
