@@ -1,6 +1,6 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
-**Status, as of 2026-09-20.** `osdev test fs-all` runs **25 suites** and all 25 pass together (~30 min, each in its own process). That sweep is the point: two of them were sitting RED with nothing watching, and BOTH were faults in the TEST rather than the filesystem - `fs-tear-detect` assumed a precondition instead of establishing it, and `fs-tear`'s probe did not recognise one of the two answers its own oracle calls legal. A suite that rots quietly is what `backlog/32` exists to prevent.
+**Status, as of 2026-09-21.** `osdev test fs-all` runs **30 suites** and all 30 pass together (~41 min, each in its own process). That sweep is the point: two of them were sitting RED with nothing watching, and BOTH were faults in the TEST rather than the filesystem - `fs-tear-detect` assumed a precondition instead of establishing it, and `fs-tear`'s probe did not recognise one of the two answers its own oracle calls legal. A suite that rots quietly is what `backlog/32` exists to prevent.
 operations, 75 tear points, 35 exercising journal recovery), resource exhaustion (`fs-full` 14/0),
 power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
 (`fs-model`, §3.2), the block layer (§3.7 - `fs-blockchaos` for the completion stream,
@@ -39,7 +39,7 @@ before `fs-tear` joined and roughly doubles with it, because `fs-tear` boots QEM
 
 | suite | what it actually attacks |
 |---|---|
-| `fs-tear` | **NEW.** Every prefix of an operation's writes, recorded from the real driver and booted. 3 operations, 54 tear points, plus a control proving the oracle can reject. Section 3.1 |
+| `fs-tear` | **NEW.** Every prefix of an operation's writes, recorded from the real driver and booted. 4 operations, 75 tear points, plus a control proving the oracle can reject. Section 3.1 |
 | `fs-corrupt` | metadata damaged host-side: bad superblock CRC, bad directory CRC, bad magic. 14 checks |
 | `fs-hostile` | genuinely malicious disks: a directory that contains itself, a name carrying `ESC [ 2J`, a `name_len` past the record |
 | `fs-journal` | a committed-but-unfinished transaction is replayed; an invalid commit record is rejected |
@@ -118,7 +118,7 @@ test, and it answers "did this tear survive" rather than "does any tear survive"
    not a model of a power cut. It is exactly the disk state one produces.**
 4. Boot each `A_k`, mount, and check the outcome is in the permitted set - and nothing else.
 
-**Results so far - three operations, 54 tear points, every one inside the permitted set:**
+**Results so far - four operations, 75 tear points, every one inside the permitted set:**
 
 | operation | sectors written | tear points | of which replay | outcome |
 |---|---|---|---|---|
@@ -702,7 +702,7 @@ The `read_only` mount path is the right mechanism for the refusal case and is al
 
 ### 3.9 Corruption and format validation - LARGELY COVERED
 
-`fs-corrupt` (14), `fs-hostile` (6), `fs-fuzz` (43) and `fs-compat` (12) cover mutated headers,
+`fs-corrupt` (14), `fs-hostile` (6), `fs-fuzz` (83) and `fs-compat` (12) cover mutated headers,
 damaged directory entries, cycles, impossible lengths, malformed names, and version/compat handling.
 `fs-scrub` is read-only by construction and a suite asserts it repairs nothing.
 
@@ -921,7 +921,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 
 | Gate | Result | Evidence / notes |
 |---|---|---|
-| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (19 suites, including `fs-tear` and `fs-model`); `files` 239/0; `shell` 183/0 (measured 2026-09-18) |
+| Feature and operation tests | PASS (QEMU) | `osdev test fs-all` 30 of 30 in ~41 min, including `fs-tear` and `fs-model`; `files` 239/0; `shell` 183/0 (measured 2026-09-21) |
 | Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and 5 of the 12 operations, are named as uncovered in 3.2 |
 | Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
 | Data/metadata exhaustion | **PASSES (QEMU)** | 3.4 - `fs-full` 14/0 and `fs-metafull` 9/0. The second fills a DIRECTORY until a create is refused and found a real leak: one block stranded per refused create, with a control attributing it to the refusal rather than the writing. Fixed. Metadata and data are not separate pools here, so exhausting one independently is unreachable. Per-allocation-point injection is still not covered. |
@@ -934,7 +934,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Power cut on a drive with a VOLATILE WRITE CACHE | **`fs-cache` 8/0** | 3.3. The first suite to cut a medium that had not yet committed what it acknowledged |
 | Power cut on a drive that IGNORES the barrier | **`fs-lyingflush` 7/0** | 3.3 / 6.1's unguaranteed case. Asserts detection, not recovery |
 | Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
-| Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 43/0, `fs-compat` 12/0. Gaps named in 3.9 |
+| Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 83/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | **PASSES (QEMU)** | 3.11 - `py scripts/cross_isa.py` 12/0. One volume, x86-64 (AHCI) -> riscv64 (USB BOT/SCSI) -> x86-64: each side reads the other's files and `drives check` reports 0 bad on both. aarch64 and arm32 remain unreachable in QEMU (no VL805 emulation; the arm32 stick re-enumerates) and are a hardware job. |
 | Physical-hardware validation | PARTIAL (1 of 5 boards), journal half CLOSED | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD. A power cut during `churn` landed INSIDE the commit-to-checkpoint window: the next mount reported `journal recovered 4 block(s) from an interrupted write`, and `churn verify` then found 6 files, NONE torn. `drives check` then reported `0 bad` and `nothing was repaired`, with the free count identical to the one the recovery mount computed - so both the content and the structural question are answered, and the structural one in its strong form. Recovery on silicon is proven (§3.12). Three earlier cuts had survived cleanly without ever invoking the journal, which proved consistency and not recovery. Still open: four boards |

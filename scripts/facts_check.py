@@ -443,6 +443,47 @@ def facts():
     out.append(("utility specs", n_util, "utilities/*.md on disk",
                 [r"([0-9]+) utility specs", r"([0-9]+) utilities\b"]))
 
+    # HOW MANY SUITES `fs-all` RUNS, and how many operations `fs-tear` cuts. Both are counts a
+    # reader is told in prose and neither had a gate, so both were wrong when this was written:
+    # the storage sweep was documented as 16, 19 and 25 suites in three different files while the
+    # list held 30, and `fs-tear` announced "3 operations, 54 tear points" twice on the same page
+    # as the table that lists four of them.
+    #
+    # This is the same failure the utility/example/doc counts above were added for, and it is worth
+    # being blunt about why it keeps happening HERE: the storage suites grow one at a time, every
+    # addition is correct in isolation, and the number that goes stale is in a different file from
+    # the change that invalidates it. Nobody is ever wrong on the day; the count is just never
+    # re-taken. So derive it.
+    #
+    # The tear POINT count (75) is deliberately not gated: it is discovered at runtime by recording
+    # what the driver actually writes, so no source owns it and a gate here would be a number
+    # checking itself.
+    m = re.search(r"const\s+SUITES\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
+                  read("osdev/src/main.rs"), re.S)
+    if m:
+        # STRIP THE COMMENTS FIRST. That list is more comment than data - each entry says why it is
+        # there - and one of those comments contains the phrase "every fs suite" in quotes, which a
+        # naive count of quoted strings reads as a 31st suite. Caught on this fact's first run,
+        # reporting a correct document wrong, which is the exact trap the examples count above
+        # records hitting with `.cargo`.
+        body = re.sub(r"//[^\n]*", "", m.group(1))
+        n_suites = len(re.findall(r'"[^"]+"', body))
+        if n_suites:
+            out.append(("fs-all suites", n_suites, "osdev/src/main.rs SUITES",
+                        [r"`osdev test fs-all`[^|]*?\(([0-9]+) suites",
+                         r"runs \*{0,2}([0-9]+) suites",
+                         r"runs ([0-9]+) suites",
+                         r"#\s*([0-9]+) suites,",
+                         r"fs-all: ([0-9]+) suites"]))
+
+    # `struct TearCase {` is the DECLARATION, not a case, and counting it made four operations
+    # read as five. Only a construction inside the table counts, so the declaration is excluded
+    # rather than the pattern being loosened.
+    n_tear = len(re.findall(r"(?<!struct )\bTearCase\s*\{", read("osdev/src/shell_test.rs")))
+    if n_tear:
+        out.append(("fs-tear operations", n_tear, "osdev/src/shell_test.rs TearCase entries",
+                    [r"([0-9]+) operations, [0-9]+ tear points"]))
+
     return [f for f in out if f[3]]
 
 
