@@ -332,7 +332,7 @@ assumed). The state is now REACHABLE, which it was not before; making it reliabl
 the mistake this whole programme exists to stop repeating: `fs-restart` is a good test of a different
 thing.
 
-### 3.4 Resource exhaustion - BUILT, PASSES in QEMU (`osdev test fs-full`, 14/0)
+### 3.4 Resource exhaustion - BUILT (`fs-full` 14/0, `fs-metafull` 9/0), and the second one FOUND A LEAK
 
 The interesting question is not whether a write fails when the disk is full. It is what the failure
 COSTS: whether the refusal is reported accurately, whether the blocks it half-claimed are handed
@@ -366,8 +366,47 @@ which is ample for one block. A test that only fails when the arithmetic is exac
 of the arithmetic. Asking for 10,600 blocks against a few hundred cannot be rescued by a rounding
 error, and the large claim also makes a leak obvious if the refusal strands what it reserved.
 
-**Not yet covered:** exhausting METADATA while data space remains (and the reverse), and injecting
-allocation failure at each individual allocation point rather than only at the natural boundary.
+#### Exhaustion through DIRECTORY GROWTH - `fs-metafull` 9/0, and it found a real leak
+
+**First, the half of this row that cannot be built, said plainly.** This paragraph used to list
+"exhausting METADATA while data space remains (and the reverse)" as uncovered. In GSFS those are not
+separate pools: `grow_dir` and `alloc_file` both call `alloc_run` against the one free bitmap, so
+there is no metadata reserve to exhaust independently and testing for it would be theatre - the same
+shape as 3.5's note that a single-threaded `fs` makes intra-operation interleaving unreachable.
+
+**What IS reachable is the other allocation path, and nothing had touched it.** `fs-full` refuses one
+large file: that is `alloc_file`, and the directory never grows during it. `fs-metafull` fills a
+DIRECTORY instead, one tiny file at a time, so `grow_dir` runs repeatedly as the volume runs down -
+and a directory growth that fails does so on the shared metadata every other entry depends on.
+
+**It found a block leak on the first run.**
+
+```
+check: REPAIRED the FREE COUNT - the superblock claimed 12 free, the tree says 13
+       (counted too little free space, off by 1)
+```
+
+One block, stranded permanently, on every refused create. `alloc_file` took the extent; `dir_add`
+then failed inside `grow_dir` for want of one more directory block; the error propagated with the
+extent still reserved. Nothing referenced those blocks afterwards - not the directory, not a
+listing, not a walk - so only the free accounting knew, and it had one block fewer to give out for
+the life of the volume. Exactly what this section's own warning describes: *an allocator that strands
+a few blocks on every refusal turns a full disk into a shrinking one, and nothing in a listing would
+ever show it.*
+
+**The control is what makes it a finding rather than a coincidence.** Stopping twenty-nine creates
+short of exhaustion gives `ok - filesystem is consistent` with nothing repaired. The strand belongs
+to the REFUSAL, not to the writing.
+
+**The fix is a rollback on the create path** (`write_path`, and the same shape in `write_new`). The
+overwrite branch directly above it already reasoned about this ordering - "alloc the new file first,
+free the old extent only after the record points at the new one" - and the create branch had no
+rollback at all. A failed rollback does not mask the failure that caused it: the caller still gets
+the original error.
+
+**Still not covered:** injecting allocation failure at each individual allocation point rather than
+only at the natural boundary. That needs an injector rather than a full disk, and is recorded rather
+than half-done.
 
 ### 3.5 Concurrency, ordering and retries - BUILT (`fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0), and NARROWER than it looks
 
@@ -885,7 +924,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Feature and operation tests | PASS (QEMU) | `osdev test fs-all` (19 suites, including `fs-tear` and `fs-model`); `files` 239/0; `shell` 183/0 (measured 2026-09-18) |
 | Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and 5 of the 12 operations, are named as uncovered in 3.2 |
 | Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
-| Data/metadata exhaustion | PARTIAL (QEMU) | `osdev test fs-full` 14/0 - a refused allocation names its reason, damages no bystander and leaks nothing. Metadata-vs-data exhaustion not covered |
+| Data/metadata exhaustion | **PASSES (QEMU)** | 3.4 - `fs-full` 14/0 and `fs-metafull` 9/0. The second fills a DIRECTORY until a create is refused and found a real leak: one block stranded per refused create, with a control attributing it to the refusal rather than the writing. Fixed. Metadata and data are not separate pools here, so exhausting one independently is unreachable. Per-allocation-point injection is still not covered. |
 | Concurrency and retry ordering | **PASSES (QEMU)** | 3.5 - `fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0. Timeouts on BOTH sides of the commit, and two real clients on one directory. The ordering guarantee is documented in `docs/persistence.md` 6.18. The duplicate-request gap is still real and still recorded: closing it needs a client-supplied op id plus a bounded reply cache in `fs`. |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
 | Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |

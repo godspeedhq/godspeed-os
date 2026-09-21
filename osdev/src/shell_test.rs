@@ -6956,6 +6956,127 @@ pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.4's remaining row: exhaustion reached through METADATA growth.
+///
+/// **First, what this row is NOT, because the section asked for something that cannot happen here.**
+/// 3.4 lists "exhausting METADATA while data space remains (and the reverse)" as uncovered. In GSFS
+/// those are not separate pools: `grow_dir` and `alloc_file` both call `alloc_run` against the one
+/// free bitmap, so there is no metadata reserve to exhaust independently and testing for it would be
+/// theatre - the same shape as 3.5's note that `fs` being single-threaded makes intra-operation
+/// interleaving unreachable.
+///
+/// **What IS reachable, and is untested, is the other allocation path.** `fs-full` refuses one large
+/// file: that is `alloc_file`, and the directory never grows during it. This fills a DIRECTORY
+/// instead, one small file at a time, so `grow_dir` runs repeatedly as the volume runs out - and a
+/// directory growth that fails does so mid-transaction on the shared metadata every other entry in
+/// that directory depends on, which is a different blast radius from refusing one file.
+///
+/// The gate is the same one 3.4 says actually matters: not that the refusal happens, but what it
+/// COSTS. Nothing leaked, no bystander touched, the directory still readable, and valid work
+/// accepted again afterwards.
+pub fn run_fs_metafull(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-metafull: PASS - {}", $label); pass += 1; }
+        else { println!("fs-metafull: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-metafull: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-metafull: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-metafull: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    // The baked canary must be readable before anything else, or every later claim is about a
+    // volume we never established was sound.
+    let canary0 = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    check!(canary0.contains("do-not-disturb"), "the volume mounted and the bystander reads correctly");
+
+    // ---- FILL THE DIRECTORY, one entry at a time, until something refuses. Each file is tiny, so
+    //      the blocks go on ENTRIES and the directory growths they force, not on payload.
+    let mut created = 0u32;
+    let mut refusal = String::new();
+    for i in 0..90u32 {
+        let out = run!(format!("write /m{i}.txt x\r").as_bytes(), 60).unwrap_or_default();
+        if out.contains("no space") || out.contains("failed") || out.contains("full") {
+            refusal = out;
+            break;
+        }
+        created += 1;
+    }
+    check!(!refusal.is_empty(),
+           "the volume refused a create once it ran out - exhaustion was actually reached");
+    check!(refusal.contains("no space") || refusal.contains("failed"),
+           "the refusal NAMES its reason rather than failing silently");
+    println!("fs-metafull: (created {created} entries before the refusal)");
+    check!(created >= 8,
+           "the directory GREW before it ran out - grow_dir ran, this is not just a first-write refusal");
+
+    // ---- what the refusal left behind.
+    let canary1 = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    let listing = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck = run!(b"drives check\r", 120).unwrap_or_default();
+
+    // ---- and whether the volume still works once space is returned.
+    let _ = run!(b"delete /fill3.bin\r", 90);
+    let again = run!(b"write /after.txt recovered\r", 60).unwrap_or_default();
+    let readback = run!(b"read /after.txt\r", 60).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_metafull_serial.log", &w);
+
+    // ---- THE GATE ----
+    check!(canary1.contains("do-not-disturb"),
+           "the bystander is untouched by a refused metadata allocation");
+    check!(listing.contains("canary.txt") && listing.contains("m0.txt"),
+           "the directory is still readable, and still holds what it accepted");
+    check!(fsck.contains("0 bad"), "no corrupt blocks after a directory ran out of room");
+    // THE ONE THAT MATTERS. A refused growth that keeps the blocks it reserved is invisible from
+    // every other angle - no listing, read or walk would show them. Only the free accounting knows.
+    check!(!fsck.contains("REPAIRED"),
+           "NOTHING LEAKED - fsck had nothing to repair, so the refused claim was handed back in full");
+    check!(again.contains("wrote") && readback.contains("recovered"),
+           "the volume accepts valid work again once space is returned");
+
+    println!("\nfs-metafull: {pass} passed, {fail} failed  (serial -> build/tests/fs_metafull_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Carnage §3.5, third bullet: TWO CLIENTS issuing conflicting sequences against one path.
 ///
 /// The bullet asked for the observable ordering to be checked against "what is documented - which

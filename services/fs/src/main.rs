@@ -3274,7 +3274,34 @@ fn replay_window(_ctx: &ServiceContext) {}
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)?;
             }
-            None => self.dir_add(ctx, &mut parent, name, itype, data.len() as u64, first, count)?,
+            // HAND THE EXTENT BACK IF THE ENTRY CANNOT BE MADE. `alloc_file` above has already
+            // taken the blocks; if `dir_add` then fails - and on a full volume it fails inside
+            // `grow_dir` -> `alloc_run`, finding no room for one more directory block - the error
+            // used to propagate with those blocks still reserved. Nothing referenced them
+            // afterwards: not the directory, not a listing, not a walk. Only the free accounting
+            // knew, and it had one block fewer to give out for the life of the volume.
+            //
+            // Measured by `fs-metafull`, filling a directory until a create is refused:
+            //
+            //     check: REPAIRED the FREE COUNT - the superblock claimed 12 free, the tree says 13
+            //            (counted too little free space, off by 1)
+            //
+            // with a control stopping short of exhaustion reporting `ok` and nothing repaired, so
+            // the strand belongs to the REFUSAL rather than to the writing.
+            //
+            // The `Some(e)` branch above already reasons about this ordering - "alloc the new file
+            // first, free the old extent only after the record points at the new one" - and this
+            // branch had no rollback at all. A failed rollback must not mask the failure that
+            // caused it, so the ORIGINAL error is what the caller gets either way (26.7).
+            None => match self.dir_add(ctx, &mut parent, name, itype, data.len() as u64, first, count) {
+                Ok(()) => {}
+                Err(why) => {
+                    let orphan = Entry { itype, sealed: false, size: data.len() as u64,
+                                         first_block: first, block_count: count, loc: None };
+                    let _ = self.free_file(ctx, &orphan);
+                    return Err(why);
+                }
+            },
         }
         Ok(())
     }
@@ -3340,7 +3367,42 @@ fn replay_window(_ctx: &ServiceContext) {}
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)
             }
-            None => self.dir_add(ctx, &mut parent, name, itype, total, first, count),
+            None => {
+                // HAND THE EXTENT BACK IF THE ENTRY CANNOT BE MADE.
+                //
+                // `alloc_file` above has already taken the blocks. If `dir_add` then fails - and the
+                // way it fails on a full volume is `grow_dir` -> `alloc_run` finding no space for one
+                // more directory block - the error propagated with those blocks still reserved.
+                // Nothing referenced them afterwards: not the directory, not any listing, not a walk.
+                // Only the free accounting knew, and it simply had one block fewer to give out, for
+                // the life of the volume.
+                //
+                // Measured by `fs-metafull`, which fills a directory until a create is refused:
+                //
+                //     check: REPAIRED the FREE COUNT - the superblock claimed 12 free, the tree says
+                //            13 (counted too little free space, off by 1)
+                //
+                // and its control, stopping 29 creates short of exhaustion, reports `ok` with nothing
+                // repaired. So the strand is the REFUSAL, not the writing. One block per refused
+                // create is the shape 3.4 of the carnage document warns about: "an allocator that
+                // strands a few blocks on every refusal turns a full disk into a shrinking one, and
+                // nothing in a listing would ever show it".
+                //
+                // The overwrite branch above already reasons about exactly this ordering ("alloc the
+                // new file first ... free the old extent only after the record points at the new
+                // one"); this branch had no rollback at all.
+                match self.dir_add(ctx, &mut parent, name, itype, total, first, count) {
+                    Ok(()) => Ok(()),
+                    Err(why) => {
+                        // Best effort, and the ORIGINAL error is what the caller gets either way: a
+                        // failed rollback must not mask the failure that caused it (26.7).
+                        let orphan = Entry { itype, sealed: false, size: total,
+                                             first_block: first, block_count: count, loc: None };
+                        let _ = self.free_file(ctx, &orphan);
+                        Err(why)
+                    }
+                }
+            }
         }
     }
 

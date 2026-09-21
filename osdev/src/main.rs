@@ -1459,6 +1459,7 @@ fn cmd_test(suite: &str) {
         "fs-dupop"       => run_fs_dupop_test(),
         "fs-lostreq"     => run_fs_lostreq_test(),
         "fs-twoclient"   => run_fs_twoclient_test(),
+        "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
         "cross-isa"      => run_cross_isa_test(),
         "fs-cache"       => run_fs_cache_test(),
@@ -2906,6 +2907,7 @@ fn run_fs_all_tests() {
         // contention is on a shared directory block rather than simulated. Pins the guarantee
         // written down in `docs/persistence.md` 6.18.
         "fs-twoclient",
+        "fs-metafull",
         // §3.7 and §3.11, and the two that are NOT x86: both drive riscv64, so both live in
         // `scripts/`. Last because each builds a second kernel before it boots anything.
         "fs-unplug",
@@ -3449,6 +3451,31 @@ fn run_fs_lyingflush_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
     crate::shell_test::run_fs_cache(&image_path, persist, 4, true);
+}
+
+/// Carnage §3.4: exhaustion reached through DIRECTORY GROWTH rather than one large file.
+fn run_fs_metafull_test() {
+    println!("\n=== fs: a DIRECTORY that runs out of room (§3.4) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_metafull.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    // Tighter than `fs-full` on purpose. That suite leaves a few HUNDRED blocks so one large
+    // copy is refused; this leaves a few DOZEN so a stream of tiny files runs the volume down
+    // through the directory growths they force. 32768 blocks, ~138 for superblock/bitmap/
+    // journal/root, three fills of 10,830 -> roughly 50 free.
+    let filler = vec![0xA5u8; 10_865 * 508];
+    for name in ["fill1.bin", "fill2.bin", "fill3.bin"] {
+        gsfs_add_file(persist, name, &filler);
+    }
+    crate::shell_test::run_fs_metafull(&image_path, persist, 4);
 }
 
 /// Carnage §3.5, third bullet: two clients, one directory.
