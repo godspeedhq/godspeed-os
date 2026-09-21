@@ -99,6 +99,7 @@ direction.
 | [35](35-six-copies-of-the-service-list-and-no-two-agree.md) | Six copies of "the services" and no two agree - the shell's three are **established** now (5 differences deliberate, `time` was drift and is fixed); `dwc2` and `control` are the open decisions | Open / narrowed | `backlog/21`, `backlog/25` |
 | [36](36-selfcheck-second-run-races-events-persist-status.md) | `selfcheck`'s second run raced the capture's pre-fill - **CLOSED**, and its originally stated cause was WRONG; it waits on the state now, not a clock | Closed | - |
 | [37](37-console-took-over-two-seconds-to-answer-a-scroll.md) | The console took over 2 s to answer a scroll - **CLOSED**: it repainted a 4K framebuffer inside the caller's deadline. Four measurements missed it; the mechanism is deleted | Closed | - |
+| [39](39-a-reset-that-is-a-spin-loop-on-two-more-arch-paths.md) | `hardware_reset` is `loop { spin_loop() }` on a non-Pi4 aarch64 build and still prints that it reset - the riscv64 defect fixed 2026-09-21, one feature flag away on a port that DOES run userspace | Recorded (26.7) | a second aarch64 target |
 | [38](38-tab-completion-of-a-file-path-times-out-about-one-run-in-three.md) | Tab completion of a file path times out ~1 run in 3 and drags the next case down with it - bisected far enough to EXONERATE the console; not root-caused | Open / measured | `osdev test files` reliability |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md

@@ -40,6 +40,24 @@ const FID_HART_START: u64 = 0;
 /// has to travel out of band, which is what the per-core pending mask in `arch/riscv64/mod.rs` is
 /// for. Named here because it is the difference that shapes the receiving side.
 pub const EXT_IPI: u64 = 0x0073_5049;
+
+/// System Reset ("SRST"). The ONLY way this ISA can restart the board.
+///
+/// x86 has three mechanisms ending in a guaranteed triple fault, and both ARM ports write the
+/// SoC's own watchdog registers. RISC-V has neither: there is no architectural instruction that
+/// resets a machine, and the reset controller is a SoC detail S-mode does not own. Restarting is a
+/// request to firmware, and if the firmware does not implement it there is nothing else to try -
+/// which is why `hardware_reset` below says so out loud rather than pretending.
+pub const EXT_SRST: u64 = 0x5352_5354;
+/// `sbi_system_reset(reset_type, reset_reason)` - SRST function 0, its only function.
+pub const FID_SYSTEM_RESET: u64 = 0;
+/// Reset types. `COLD_REBOOT` is what `reboot` means: power-cycle the platform and run firmware
+/// again from the start. A warm reboot skips that and is not what an operator typing `reboot`
+/// after pulling a disk is asking for.
+pub const RESET_TYPE_SHUTDOWN: u64 = 0x0000_0000;
+pub const RESET_TYPE_COLD_REBOOT: u64 = 0x0000_0001;
+/// Reset reasons. `NONE` is an ordinary, requested reset - not a fault.
+pub const RESET_REASON_NONE: u64 = 0x0000_0000;
 const FID_SEND_IPI: u64 = 0;
 
 /// Remote fences ("RFNC"), which is how one hart reaches another hart's caches and TLBs - and which
@@ -93,6 +111,36 @@ pub unsafe fn call(eid: u64, fid: u64, a0: u64, a1: u64) -> SbiRet {
         );
     }
     SbiRet { error: err, value: val }
+}
+
+/// Why a cold reboot did not happen. There is no success variant: SRST does not return when it
+/// works, so every value this can hold is a refusal.
+pub enum ResetRefusal {
+    /// The firmware implements no SRST extension at all.
+    NoExtension,
+    /// It implements it and declined, with this SBI error code.
+    Firmware(i64),
+}
+
+/// Ask firmware to COLD-REBOOT the platform, and return only if it did not.
+///
+/// A safe wrapper that probes first, exactly as `hart_start` and `send_ipi` do and for the same
+/// reason: an unimplemented extension answers with a silent nothing, and "firmware refused" and
+/// "firmware never had the feature" need different words in front of an operator.
+///
+/// This is the ONLY way a RISC-V machine restarts itself. There is no architectural instruction
+/// that resets a board - x86 has a triple fault to fall back on and both ARM ports write the SoC's
+/// own watchdog block, while the JH7110's reset controller belongs to M-mode. So when this returns,
+/// the caller has genuinely run out of mechanisms and should say so rather than spin (`mod.rs`).
+pub fn system_reset_cold() -> ResetRefusal {
+    if !probe(EXT_SRST) {
+        return ResetRefusal::NoExtension;
+    }
+    // SAFETY: SRST function 0 with a specification-defined type (cold reboot) and reason (none).
+    // On success it never returns; on failure it answers with an error code like any other SBI
+    // call, and touches no memory this kernel owns either way.
+    let r = unsafe { call(EXT_SRST, FID_SYSTEM_RESET, RESET_TYPE_COLD_REBOOT, RESET_REASON_NONE) };
+    ResetRefusal::Firmware(r.error)
 }
 
 /// The SBI specification version the firmware implements, as (major, minor).

@@ -1315,6 +1315,7 @@ matching the x86/ARM implementations so a real port inherits the obligation rath
 
 | File | Change | Why |
 |------|--------|-----|
+| `arch/riscv64/sbi.rs` | 10 -> 11 (+1) | 2026-09-21: `system_reset_cold`, which is how this ISA restarts a board - and the line it replaces was `pub fn hardware_reset() -> ! { loop { spin_loop() } }`, a stub that printed `reboot: hardware reset` and then hung the calling hart. Found on the VisionFive 2: `reboot` wedged hart 1 inside syscall 18 and the liveness watchdog panicked ten seconds later, correctly. ONE `ecall`, and it is the ONLY mechanism available - x86 escalates to a triple fault the ISA guarantees and both ARM ports write the SoC's own watchdog block, while RISC-V has no architectural reset instruction and the JH7110's reset controller belongs to M-mode. Sound because SRST function 0 takes two specification-defined scalars, touches no memory this kernel owns, and does not return on success; on failure it answers with an error code like any other SBI call. PROBED first, the same discipline `hart_start` and `send_ipi` already state here, because an unimplemented extension answers with a silent nothing and "firmware refused" needs different words in front of an operator than "firmware never had it". It lives in this file rather than at the call site so `mod.rs` grows no `unsafe` and every SBI consumer keeps going through a safe wrapper. |
 | `arch/aarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. The boot path was also reworked for the Pi 4 (EL2 -> EL1 drop, BCM2711 PL011 at 0xFE201000, a bounded TXFF wait) but that is net-neutral on the count: `CurrentEL` read and the UART poll replace the old unguarded byte writes. |
 | `arch/loongarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
 | `arch/riscv64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
@@ -2527,7 +2528,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
-| arch/riscv64/sbi.rs | 10 | permitted |
+| arch/riscv64/sbi.rs | 11 | permitted |
 | arch/riscv64/sv39.rs | 29 | permitted |
 | arch/riscv64/trap.rs | 7 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
