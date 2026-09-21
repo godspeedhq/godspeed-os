@@ -2851,6 +2851,16 @@ fn run_fs_all_tests() {
         // §3.5. Not a device fault at all - a DESTRUCTIVE op whose reply is lost, and what the
         // client does next. It found a real gap and the fix is in the shell, not the filesystem.
         "fs-dupop",
+        // §3.5, the same fault on the OTHER side of the commit: the request is discarded BEFORE it
+        // runs, so the move never happened. Indistinguishable from `fs-dupop` at the client, which
+        // is why both exist - one proves the conservative answer is necessary, this one proves it
+        // stays honest when nothing happened, and that an abandoned request leaves no partial state.
+        "fs-lostreq",
+        // §3.5, the third bullet: TWO REAL CLIENTS on one directory. `recorder` writes a capture
+        // through `fs` on its own schedule while the shell churns a path beside it, so the
+        // contention is on a shared directory block rather than simulated. Pins the guarantee
+        // written down in `docs/persistence.md` 6.18.
+        "fs-twoclient",
         // §3.3. The only suite that cuts a drive which had NOT yet committed what it acknowledged.
         "fs-cache",
         "fs-lyingflush",
