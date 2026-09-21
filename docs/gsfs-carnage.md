@@ -466,7 +466,7 @@ What is NOT covered is the reuse case the checklist names: open A, restart `fs`,
 its storage, then use A's old handle. The generation mechanism should make this impossible, and
 "should" is exactly the word this programme exists to remove.
 
-### 3.7 Attack the block layer - BUILT (`fs-blockchaos` 10/0, `fs-blockdeath` 11/0)
+### 3.7 Attack the block layer - BUILT (`fs-blockchaos` 10/0, `fs-blockdeath` 11/0, `fs-unplug` 8/0)
 
 Kill and restart `block-driver` with requests outstanding; simulate hot-unplug, delayed return, I/O
 error and device disappearance mid-write; inject late, duplicate, missing and out-of-order
@@ -536,9 +536,54 @@ kernel has already handed out. And `fs` reports storage unavailable **in the gap
 instance dying and the new one registering, then recovers on a later attempt - the window is real,
 bounded, and loud rather than silent.
 
-**STILL NOT RUN:** hot-unplug and device disappearance mid-write. Those need the emulated DEVICE to
-vanish rather than the driver, which is a QEMU-side injection (`device_del` over the monitor) and a
-separate piece of work.
+**BUILT: hot-unplug and device disappearance mid-write (`py scripts/fs_unplug.py`, 8/0).** The
+DEVICE vanishes and does not come back - nothing is restarted and nothing recovers it, which is what
+separates this from `fs-blockdeath` above, where the driver dies and the disk was there the whole
+time.
+
+**It does not run on x86, and finding out why changed the plan.** This paragraph used to say the row
+needed "`device_del` over the monitor". It does, and on the machine every other storage suite uses
+that command is refused:
+
+```
+(qemu) device_del thedisk
+Error: Bus 'ahci.0' does not support hotplugging
+```
+
+QEMU's AHCI cannot hot-unplug at all. riscv64 carries its disk as a USB stick behind xHCI
+(`storage_is_usb`), where the same `device_del` is accepted and the device is simply gone - and that
+is the more honest unplug anyway, since people pull USB sticks and nobody hot-pulls a SATA disk.
+Asked rather than assumed, which is the only reason a suite was not written against a mechanism that
+refuses.
+
+The stick is pulled with `churn` genuinely writing - 116 writes in, not at an idle prompt - and what
+must hold is that the failure is LOUD and BOUNDED:
+
+```
+block-driver: 'xhci' did not answer within 10 s - reporting storage UNAVAILABLE rather than
+              waiting on it (it is reachable but silent: busy, wedged, or idling with no controller)
+fs: block read failed at lba 0 (device I/O error)
+fs: op 10 took 11424500 us, 5 block ops, 99% of it inside them
+fs: device I/O error seen - re-mounting before serving
+```
+
+No kernel panic, no wedged core, the shell back at a prompt, the disappearance **reported 12.5 s
+after the unplug** - inside the 30 s a block request is allowed - and no stale content served from a
+device that is gone.
+
+**AND IT IS THE POSITIVE TEST FOR A FIX THAT HAD NONE.** The bounded `rpc` in `xhciblk.rs` (2026-09-21)
+replaced an unbounded `request_with_reply` that waits forever on a peer which is alive but silent.
+Every board in the hardware pass booted with its USB controller PRESENT and answering, so none of
+them could reach that state - the fix had QEMU evidence and hardware no-regression, and nothing
+more. A device pulled from under a live driver produces exactly it: `xhci` holding a request for
+hardware that no longer exists. The `did not answer within 10 s` line above IS that bound firing.
+Without it, `block-driver` blocks forever and `fs` eats a 30 s timeout per request with the shell
+stalled behind it.
+
+**One measurement note, because the first version of it was wrong.** The harness originally slept
+45 s after the unplug and reported the latency as 45 s every time - it measured its own patience.
+It now polls in one-second steps and stops the moment the system says something about the disk, so
+12.5 s is the system's latency. A timing assertion that cannot fail is not an assertion.
 
 Two calibration notes, because both first read as failures of the filesystem and were failures of the
 test: a MISSING completion costs the caller its full 30 s deadline **by design** (`block-driver`
@@ -845,7 +890,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
 | Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |
 | Block-driver killed WITH REQUESTS OUTSTANDING | **`fs-blockdeath` 11/0** | 3.7. Noticed in 201 ms against a 30 s deadline - woken, not timed out |
-| Hot-unplug / device disappearance mid-write | NOT RUN | 3.7. Needs the DEVICE to vanish (QEMU `device_del`), not the driver |
+| Hot-unplug / device disappearance mid-write | **PASSES (QEMU)** | 3.7 - `py scripts/fs_unplug.py` 8/0. The stick is pulled with `churn` writing; no panic, no wedge, reported 12.5 s after the unplug and no stale content served. On riscv64 because QEMU's AHCI refuses `device_del` outright - USB is the only bus that can be unplugged, and the more honest one. |
 | A destructive op whose REPLY is lost, then retried | **`fs-dupop` 5/0** | 3.5. Found a live gap: a succeeded `move` reported as failed. Fixed at the client |
 | Power cut on a drive with a VOLATILE WRITE CACHE | **`fs-cache` 8/0** | 3.3. The first suite to cut a medium that had not yet committed what it acknowledged |
 | Power cut on a drive that IGNORES the barrier | **`fs-lyingflush` 7/0** | 3.3 / 6.1's unguaranteed case. Asserts detection, not recovery |
