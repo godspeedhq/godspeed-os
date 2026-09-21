@@ -6956,6 +6956,123 @@ pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.5, third bullet: TWO CLIENTS issuing conflicting sequences against one path.
+///
+/// The bullet asked for the observable ordering to be checked against "what is documented - which
+/// currently is nothing, so documenting it is part of the gate". The guarantee is now written down
+/// in `docs/persistence.md`, and it is this: **`fs` serves one request to completion before
+/// dequeuing the next** (`loop { let msg = ctx.recv(); .. }`, single-threaded), and every mutating
+/// op commits through a journal transaction. So each operation is ATOMIC with respect to every
+/// other client - there is no read-modify-write window a second client can enter - while a single
+/// client's multi-request IDIOM is not, because another client can be served between its two
+/// requests.
+///
+/// **The second client is real, not simulated.** `recorder` writes a capture through `fs` on its
+/// own schedule, driven by `events persist start`. Pointing it at a directory the shell is
+/// simultaneously churning puts two independent clients on the same DIRECTORY BLOCK, which is the
+/// shared metadata that matters - one file each, contending for the entries around them.
+pub fn run_fs_twoclient(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-twoclient: PASS - {}", $label); pass += 1; }
+        else { println!("fs-twoclient: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-twoclient: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-twoclient: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-twoclient: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    let _ = run!(b"mkdir /contested\r", 60);
+
+    // THE SECOND CLIENT STARTS HERE and writes on its own schedule from now on.
+    let started = run!(b"events persist start /contested/cap.log 256KiB\r", 60).unwrap_or_default();
+    check!(!started.contains("could not") && !started.contains("FAIL"),
+           "the second client (`recorder`) is writing into the same directory");
+
+    // ---- THE CONTENDED ROUNDS. Each is a create / read / rename / read / delete cycle on ONE
+    //      path, while `recorder` appends to its capture in the SAME directory.
+    let mut torn = 0usize;
+    let mut lost = 0usize;
+    for round in 0..6u32 {
+        let payload = format!("round-{round}-payload");
+        let _ = run!(format!("write /contested/x.txt {payload}\r").as_bytes(), 60);
+        let r1 = run!(b"read /contested/x.txt\r", 60).unwrap_or_default();
+        // ATOMIC, NOT PARTIAL: the read must return exactly this round's payload. A previous
+        // round's value, or a truncated one, would mean a client saw a half-applied write.
+        if !r1.contains(&payload) { torn += 1; }
+        let _ = run!(b"move /contested/x.txt /contested/y.txt\r", 60);
+        let r2 = run!(b"read /contested/y.txt\r", 60).unwrap_or_default();
+        if !r2.contains(&payload) { torn += 1; }
+        let _ = run!(b"delete /contested/y.txt\r", 60);
+        let r3 = run!(b"dir /contested\r", 60).unwrap_or_default();
+        // The OTHER client's file must survive every one of our rounds.
+        if !r3.contains("cap.log") { lost += 1; }
+    }
+
+    let _ = run!(b"events persist stop\r", 60);
+    let listing = run!(b"dir /contested\r", 60).unwrap_or_default();
+    let fsck = run!(b"drives check\r", 120).unwrap_or_default();
+    let cap = run!(b"read /contested/cap.log | count\r", 90).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_twoclient_serial.log", &w);
+
+    // ---- THE GATE.
+    check!(torn == 0,
+           "every read returned its own round's payload - no client saw a half-applied write");
+    check!(lost == 0,
+           "the other client's file survived every round of churn in its directory");
+    check!(listing.contains("cap.log"),
+           "the capture is still listed after six contended rounds");
+    check!(!listing.contains("x.txt") && !listing.contains("y.txt"),
+           "our own churn left nothing behind - the directory holds exactly what it should");
+    check!(fsck.contains("0 bad"), "fsck finds no corrupt blocks after two clients contended");
+    check!(fsck.contains("consistent") || fsck.contains("ok"),
+           "the volume is consistent after two clients contended");
+    check!(cap.contains("lines,") || cap.contains("line,"),
+           "the second client's file is READABLE and non-empty - its writes were not lost");
+
+    println!("\nfs-twoclient: {pass} passed, {fail} failed  (serial -> build/tests/fs_twoclient_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Carnage §3.5, second bullet: a client timeout on the OTHER side of the commit.
 ///
 /// `fs-dupop` loses the reply to a move that ALREADY RAN. This discards the request BEFORE it runs,

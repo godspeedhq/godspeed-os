@@ -1029,6 +1029,57 @@ date survived, that a file with no time is still `unknown` afterwards rather tha
 one, that the write to the times region did not break the record CRC every build reads, and that a
 seal survives the reboot with the write still refused and the content still original.
 
+### 6.18 What TWO CLIENTS see - the ordering guarantee, stated
+
+Written down because it was not. `docs/gsfs-carnage.md` §3.5 asked for two clients'
+observable ordering to be checked "against what is documented - which currently is nothing, so
+documenting it is part of the gate". This is that.
+
+**The guarantee, in one sentence: every `fs` operation is atomic with respect to every other
+client.**
+
+It falls out of two facts rather than any locking:
+
+1. **`fs` is single-threaded and serves one request to completion before dequeuing the next.** The
+   serve loop is `loop { let msg = ctx.recv(); ... }` - there is no second thread, because nothing
+   in this system has one (§9: a task is a service). A request is received, served, replied to, and
+   only then is the next taken.
+2. **Every mutating op commits through the redo-journal** (§6.8). Its blocks are staged, the commit
+   record is made durable, and only then does any home block move. A reader either sees the state
+   before the transaction or the state after it.
+
+So there is **no read-modify-write window a second client can enter**. Two clients cannot interleave
+*inside* one operation, because there is no inside to reach: the operation is the unit `fs` serves.
+
+**What is NOT atomic, and this is the part worth knowing.** A single client's multi-request IDIOM is
+not a transaction. Between a client's two requests, `fs` may serve another client. So:
+
+```
+client A:  write /x.txt  ......................  move /x.txt /y.txt
+client B:  ..................  delete /x.txt  ...
+```
+
+is a legal ordering, and A's `move` will correctly report that its source is gone. Each of the three
+operations was atomic; the SEQUENCE was not, and nothing promises otherwise. A client that needs a
+compound operation to be indivisible does not have one available - that would be a transaction API,
+and none exists (nothing has needed it: §26.2).
+
+**Ordering between clients is arrival order at `fs`'s endpoint**, which is the kernel's per-endpoint
+queue - FIFO, depth 16 (§8.3, §8.5). Not priority, not fairness: whoever's message is dequeued first is
+served first. A client whose queue slot is taken while `fs` is busy blocks in `send` until space
+frees (§8.2), which is backpressure rather than loss.
+
+**What this is NOT a claim about.** Nothing here says two clients cannot produce a surprising
+RESULT - B deleting the file A is about to move is surprising and entirely legal. The guarantee is
+about state, not about outcomes being agreeable: the filesystem is never left half-applied, and no
+client ever observes a partial operation.
+
+**Pinned by `osdev test fs-twoclient`** (8/0), which puts `recorder` and the shell on the same
+directory - a genuine second client writing a capture on its own schedule - and churns one path
+through create / read / rename / read / delete for six rounds while it does. Every read returns its
+own round's payload, the other client's file survives every round, and `drives check` reports the
+volume consistent with no corrupt blocks.
+
 ## 7. File = capability (the north star)
 
 The spine that makes this filesystem *ours* rather than a generic store: a file is named

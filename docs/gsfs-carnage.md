@@ -369,7 +369,7 @@ error, and the large claim also makes a leak obvious if the refusal strands what
 **Not yet covered:** exhausting METADATA while data space remains (and the reverse), and injecting
 allocation failure at each individual allocation point rather than only at the natural boundary.
 
-### 3.5 Concurrency, ordering and retries - PARTIAL (`fs-dupop` 5/0, `fs-lostreq` 10/0), and NARROWER than it looks
+### 3.5 Concurrency, ordering and retries - BUILT (`fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0), and NARROWER than it looks
 
 Stated honestly rather than adopted wholesale: **`fs` is single-threaded and serves one request to
 completion before dequeuing the next.** There is no intra-operation interleaving to find, so "two
@@ -434,9 +434,26 @@ weakness:
 
   That last line is the one worth having. An abandoned request leaves no partial state behind, so
   the operator's own recovery - check with `dir`, then do it again - actually works.
-- Two clients issuing conflicting sequences (create, rename, delete, recreate) against the same
-  paths, checking the observable ordering matches what is documented - which currently is nothing,
-  so documenting it is part of the gate.
+- **Two clients on one path - BUILT (`fs-twoclient` 8/0), and the ordering is DOCUMENTED.** The
+  bullet asked for the observable ordering to be checked against "what is documented - which
+  currently is nothing, so documenting it is part of the gate". It is written down now, in
+  `docs/persistence.md` 6.18, and the guarantee is one sentence: **every `fs` operation is atomic
+  with respect to every other client.**
+
+  It needs no locking. `fs` serves one request to completion before dequeuing the next, and every
+  mutating op commits through the redo-journal - so there is no read-modify-write window a second
+  client can enter, because there is no inside of an operation to reach.
+
+  What is NOT atomic is a single client's multi-request IDIOM: between its two requests another
+  client may be served. `write /x.txt` then `move /x.txt /y.txt` can legally have another client's
+  `delete /x.txt` land between them, and the move then correctly reports its source gone. Each op
+  was atomic; the sequence was not, and nothing promises otherwise.
+
+  The test uses a REAL second client rather than a simulated one - `recorder` writing a capture
+  through `fs` on its own schedule - and churns one path through create / read / rename / read /
+  delete for six rounds in the same directory. Every read returned its own round's payload, the
+  other client's file survived every round, the directory ended holding exactly what it should, and
+  `drives check` reported 0 bad and consistent.
 
 ### 3.6 Stale identity and authority - PARTIALLY COVERED
 
@@ -824,7 +841,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and 5 of the 12 operations, are named as uncovered in 3.2 |
 | Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
 | Data/metadata exhaustion | PARTIAL (QEMU) | `osdev test fs-full` 14/0 - a refused allocation names its reason, damages no bystander and leaks nothing. Metadata-vs-data exhaustion not covered |
-| Concurrency and retry ordering | NOT RUN | 3.5, and narrower than it reads - see the single-threaded note. The duplicate-request gap is real |
+| Concurrency and retry ordering | **PASSES (QEMU)** | 3.5 - `fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0. Timeouts on BOTH sides of the commit, and two real clients on one directory. The ordering guarantee is documented in `docs/persistence.md` 6.18. The duplicate-request gap is still real and still recorded: closing it needs a client-supplied op id plus a bounded reply cache in `fs`. |
 | Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
 | Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |
 | Block-driver killed WITH REQUESTS OUTSTANDING | **`fs-blockdeath` 11/0** | 3.7. Noticed in 201 ms against a 30 s deadline - woken, not timed out |

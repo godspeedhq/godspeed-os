@@ -1458,6 +1458,7 @@ fn cmd_test(suite: &str) {
         "fs-blockdeath"  => run_fs_blockdeath_test(),
         "fs-dupop"       => run_fs_dupop_test(),
         "fs-lostreq"     => run_fs_lostreq_test(),
+        "fs-twoclient"   => run_fs_twoclient_test(),
         "fs-cache"       => run_fs_cache_test(),
         "fs-lyingflush"  => run_fs_lyingflush_test(),
         // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
@@ -3389,6 +3390,22 @@ fn run_fs_lyingflush_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
     crate::shell_test::run_fs_cache(&image_path, persist, 4, true);
+}
+
+/// Carnage §3.5, third bullet: two clients, one directory.
+fn run_fs_twoclient_test() {
+    println!("\n=== fs: TWO CLIENTS contending on one directory (§3.5) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_twoclient.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_twoclient(&image_path, persist, 4);
 }
 
 /// Carnage §3.5, second bullet: a request discarded BEFORE it runs - the other side of the commit.
