@@ -11,6 +11,7 @@ path = "src/main.rs"
 # Carnage §3.5: complete a destructive op and LOSE its reply, so the client times out and retries a
 # request that already succeeded. See `LoseReply` in src/main.rs.
 lose-reply-test = []
+drop-request-test = []
 # Hold the commit-to-checkpoint window OPEN for a few seconds, on demand, so an operator with a
 # power cable can aim at it. The journal's recovery path is the one thing three real power cuts on
 # a Dell Wyse never reached: that window is sub-millisecond, so a hand-timed cut samples a fraction

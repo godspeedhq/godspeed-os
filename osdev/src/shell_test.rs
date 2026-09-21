@@ -6956,6 +6956,116 @@ pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// Carnage §3.5, second bullet: a client timeout on the OTHER side of the commit.
+///
+/// `fs-dupop` loses the reply to a move that ALREADY RAN. This discards the request BEFORE it runs,
+/// so the move never happened at all - and from the client the two are indistinguishable: a request
+/// sent, no reply, a deadline passed.
+///
+/// **That indistinguishability is the subject, not a gap in the test.** The shell refuses to retry a
+/// mutating op either way and answers `OUTCOME UNKNOWN`, which is conservative here (nothing
+/// happened, so a retry would have been free) and necessary in `fs-dupop` (something did). What this
+/// pins is that the conservative answer stays HONEST on this side: the filesystem is untouched, no
+/// half-applied state is left behind, the operator is not told something false, and re-issuing the
+/// operation afterwards simply works.
+pub fn run_fs_lostreq(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-lostreq: PASS - {}", $label); pass += 1; }
+        else { println!("fs-lostreq: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-lostreq: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-lostreq: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-lostreq: never reached a prompt"); std::process::exit(1);
+    }
+
+    send(&mut write_half, b"write /lost-a.txt abandoned-request-evidence\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+
+    // THE REQUEST IS DISCARDED BEFORE IT RUNS. The shell's fs deadline is 20 s and it does not
+    // retry a mutating op, so this answers after one deadline rather than two.
+    send(&mut write_half, b"move /lost-a.txt /lost-b.txt\r");
+    let injected = collect_until(&buf, &mut cursor, b"[drop-request-test]", Duration::from_secs(30));
+    check!(injected.is_some(), "a move was discarded BEFORE it ran (the fault was injected)");
+    let outcome = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)).unwrap_or_default();
+
+    // ---- what is on disk, asked independently of what the shell claimed.
+    send(&mut write_half, b"read /lost-a.txt\r");
+    let src = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"read /lost-b.txt\r");
+    let dst = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"drives check\r");
+    let fsck = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)).unwrap_or_default();
+
+    // ---- AND IT IS CLEANLY RE-ISSUABLE. The injector fires once, so this second attempt is served
+    //      normally - which is the property that says nothing was left half-applied.
+    send(&mut write_half, b"move /lost-a.txt /lost-b.txt\r");
+    let retry = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)).unwrap_or_default();
+    send(&mut write_half, b"read /lost-b.txt\r");
+    let after = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_lostreq_serial.log", &w);
+
+    // ---- THE GATE: the operation did NOT happen, and nothing is half-applied.
+    check!(src.contains("abandoned-request-evidence"),
+           "the source file is untouched - the discarded move did NOT take effect");
+    check!(!dst.contains("abandoned-request-evidence"),
+           "the destination was never created");
+    check!(fsck.contains("0 bad"), "fsck finds no corrupt blocks after an abandoned request");
+    check!(fsck.contains("consistent") || fsck.contains("ok"),
+           "the volume is consistent after an abandoned request");
+
+    // ---- ...and the operator was not told something false about it.
+    check!(!outcome.contains("wrote") && !outcome.contains("moved"),
+           "the shell did NOT claim the move succeeded");
+    check!(outcome.contains("OUTCOME UNKNOWN") && outcome.contains("MAY HAVE SUCCEEDED"),
+           "an ambiguous outcome is reported AS ambiguous - the client cannot tell which side it fell");
+    check!(outcome.contains("Not re-sent"),
+           "...and says WHY, so the operator knows it is theirs to verify");
+
+    // ---- ...and the same operation, issued again, simply works.
+    check!(!retry.contains("OUTCOME UNKNOWN"), "the re-issued move was served normally");
+    check!(after.contains("abandoned-request-evidence"),
+           "re-issuing the operation AFTER an abandoned request works - nothing was left half-applied");
+
+    println!("\nfs-lostreq: {pass} passed, {fail} failed  (serial -> build/tests/fs_lostreq_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// Carnage §3.7, the other half: kill `block-driver` WITH REQUESTS OUTSTANDING.
 ///
 /// `fs-blockchaos` makes the driver answer WRONGLY. This makes it stop existing mid-request, which

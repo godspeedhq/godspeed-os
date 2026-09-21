@@ -369,7 +369,7 @@ error, and the large claim also makes a leak obvious if the refusal strands what
 **Not yet covered:** exhausting METADATA while data space remains (and the reverse), and injecting
 allocation failure at each individual allocation point rather than only at the natural boundary.
 
-### 3.5 Concurrency, ordering and retries - PARTIAL (`fs-dupop` 5/0), and NARROWER than it looks
+### 3.5 Concurrency, ordering and retries - PARTIAL (`fs-dupop` 5/0, `fs-lostreq` 10/0), and NARROWER than it looks
 
 Stated honestly rather than adopted wholesale: **`fs` is single-threaded and serves one request to
 completion before dequeuing the next.** There is no intra-operation interleaving to find, so "two
@@ -410,8 +410,30 @@ weakness:
   Reads are still retried: nothing happened, so asking again is free. The mutating set is
   `op_is_mutating`, mirrored from `fs` because the shell must make this call at the moment `fs` is
   not answering.
-- Client timeouts injected immediately before and after a commit, then retried, with the outcome
-  inspected.
+- **Client timeouts on BOTH sides of the commit - BUILT (`fs-lostreq` 10/0).** `fs-dupop` above
+  covers the after side: the move ran, its reply was swallowed. `fs-lostreq` covers the before side
+  with a second injector (`drop-request-test`) that discards the request unserved, so the move never
+  happened at all.
+
+  **The two are indistinguishable from the client, and that is the finding rather than a gap.** A
+  request sent, no reply, a deadline passed - identical in both. So the shell refuses to retry a
+  mutating op either way and answers `OUTCOME UNKNOWN`, which is conservative here (nothing
+  happened, so a retry would have been free) and necessary there (something did). Closing that gap
+  properly needs the client-supplied operation id and bounded reply cache recorded above; until it
+  exists, the conservative answer is the only honest one.
+
+  What `fs-lostreq` pins is that the conservative answer stays TRUE on this side:
+
+  ```
+  the source file is untouched - the discarded move did NOT take effect
+  the destination was never created
+  fsck finds no corrupt blocks / the volume is consistent
+  the shell did NOT claim the move succeeded
+  re-issuing the operation AFTER an abandoned request works - nothing was left half-applied
+  ```
+
+  That last line is the one worth having. An abandoned request leaves no partial state behind, so
+  the operator's own recovery - check with `dir`, then do it again - actually works.
 - Two clients issuing conflicting sequences (create, rename, delete, recreate) against the same
   paths, checking the observable ordering matches what is documented - which currently is nothing,
   so documenting it is part of the gate.

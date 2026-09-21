@@ -676,6 +676,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Owned here and threaded, exactly like `reply_fails` above (Commandment VI). Zero-sized unless
     // `lose-reply-test` is built in, so a shipping build cannot lose a reply.
     let mut lose = LoseReply::new();
+    // Owned here and threaded exactly like `lose` above (Commandment VI). Zero-sized unless
+    // `drop-request-test` is built in, so a shipping build cannot discard a request.
+    let mut dropreq = DropRequest::new();
     // ONE `Fs`, DECLARED FIRST AND FILLED IN PLACE.
     //
     // This was an `if/else` EXPRESSION whose else-branch built the volume in a local called `mounted`
@@ -902,6 +905,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 continue;
             }
         };
+        // DISCARD BEFORE SERVING, when the injector is built in. Placed here rather than inside
+        // `serve` so the operation genuinely never runs - dropping the reply afterwards is what
+        // `LoseReply` already does, and the whole point of this one is the other side of the commit.
+        {
+            let p = msg.payload_bytes();
+            // Byte 0 is the correlation tag, byte 1 is the op - the split `serve` makes below.
+            let op = if p.len() >= 2 { p[1] } else { 255 };
+            if dropreq.discard(&ctx, op) { continue; }
+        }
         // A CAPACITY THAT ARRIVES LATE. `capacity` is what block-driver reported when this service
         // mounted, and it was never asked again - so a stick that finishes enumerating AFTER `fs`
         // starts leaves it 0 forever, and `drives flash` then refuses a disk that is present and
@@ -1301,6 +1313,47 @@ impl LoseReply {
     #[cfg(not(feature = "lose-reply-test"))]
     #[inline(always)]
     pub fn swallow(&mut self, _ctx: &ServiceContext, _op: u8) -> bool { false }
+}
+
+/// The OTHER side of a lost reply, and the one `lose-reply-test` cannot reach.
+///
+/// `LoseReply` drops a reply AFTER the operation committed: the move happened, the client never
+/// heard, and re-sending would repeat a destructive op. This drops the REQUEST BEFORE it is served:
+/// the move never happened at all, and re-sending would be free.
+///
+/// **The client cannot tell these apart, and that is the finding rather than a gap.** Both look
+/// identical from the caller - a request sent, no reply, a deadline passed. So the shell refuses to
+/// retry a mutating op in BOTH cases and says `OUTCOME UNKNOWN`, which is conservative in this one
+/// (nothing happened) and correct in the other (something did). What this injector tests is that
+/// the conservative answer is still HONEST: the filesystem is consistent, the operator is not told
+/// something false, and `dir` settles it.
+///
+/// Carnage 3.5, second bullet: "client timeouts injected immediately before and after a commit,
+/// then retried, with the outcome inspected."
+#[cfg(feature = "drop-request-test")]
+pub struct DropRequest { armed: bool }
+#[cfg(not(feature = "drop-request-test"))]
+pub struct DropRequest;
+
+impl DropRequest {
+    #[cfg(feature = "drop-request-test")]
+    pub fn new() -> Self { DropRequest { armed: true } }
+    #[cfg(not(feature = "drop-request-test"))]
+    pub fn new() -> Self { DropRequest }
+
+    /// True if this REQUEST should be discarded unserved. Fires once, for one op, and never on a
+    /// shipping build - the same shape and the same guarantee as `LoseReply::swallow`.
+    #[cfg(feature = "drop-request-test")]
+    pub fn discard(&mut self, ctx: &ServiceContext, op: u8) -> bool {
+        if !self.armed || op != OP_MOVE { return false; }
+        self.armed = false;
+        ctx.log("fs: [drop-request-test] discarding a MOVE BEFORE it runs - the client will time out \
+                 on an operation that never happened");
+        true
+    }
+    #[cfg(not(feature = "drop-request-test"))]
+    #[inline(always)]
+    pub fn discard(&mut self, _ctx: &ServiceContext, _op: u8) -> bool { false }
 }
 
 fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
