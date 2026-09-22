@@ -2492,11 +2492,39 @@ impl Fs {
     /// Replay a committed-but-unfinished transaction at mount (idempotent). Called with the
     /// journal geometry from the just-validated superblock, before serving any request.
     fn recover(ctx: &ServiceContext, journal_start: u64) {
-        let commit = match block_read(ctx, journal_start) { Some(b) => b, None => return };
+        let commit = match block_read(ctx, journal_start) {
+            Some(b) => b,
+            None => {
+                ctx.log("fs: could not READ the journal block at mount - recovery did not run. This says nothing about whether a journal is there; the tree is not known consistent, so run `drives check`.");
+                return;
+            }
+        };
+        // NO MAGIC = NO JOURNAL. The one genuinely uneventful case, and the only silent one: this is
+        // what an ordinary clean shutdown leaves behind.
         if u32_at(&commit, 0) != JOURNAL_MAGIC { return; }
+        // PAST HERE A RECORD EXISTS. Every remaining bail is a decision about a real journal and says
+        // so, because "nothing was printed" must mean ONE thing, not two.
         let n = u32_at(&commit, 4) as usize;
-        if n == 0 || n > TXN_CAP || 12 + n * 8 > COMMIT_CRC_OFF { return; }
-        if crc32(&commit[..12 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        if n == 0 || n > TXN_CAP || 12 + n * 8 > COMMIT_CRC_OFF {
+            ctx.log_fmt(format_args!("fs: the journal record is present but its BLOCK COUNT is impossible ({} of at most {}) - it was torn mid-write or is not a record at all. Applying NOTHING, which is correct: a count this size was never durably written, so the transaction was never committed and home is untouched.", n, TXN_CAP));
+            return;
+        }
+        if crc32(&commit[..12 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) {
+            // THE CUT LANDED INSIDE THE COMMIT WINDOW AND THE RECORD DID NOT SURVIVE IT.
+            //
+            // Correct outcome, and worth being precise about: `commit_txn` writes this record only
+            // after every staged block is durable, and no home block moves until it is durable in
+            // turn. A record whose own CRC fails therefore never authorised anything - the
+            // transaction was not committed, home is untouched, and the filesystem is consistent.
+            // Discarding is the design, not a fallback.
+            //
+            // It is reported because it is EVIDENCE. A clean mount with no message means the cut
+            // missed the window; this message means it hit the window and the device did not finish
+            // the record. Those are different facts about the hardware, and 6.1's backend-conditional
+            // guarantee turns on exactly which one a given board produces.
+            ctx.log_fmt(format_args!("fs: the journal record is present but TORN - its own CRC does not match ({} block(s) claimed). Applying NOTHING, which is correct: the record was never durably written, so the transaction was never committed and HOME IS UNTOUCHED. What this tells you is that the power was lost INSIDE the commit window rather than outside it.", n));
+            return;
+        }
         // VERIFY THE PAYLOAD BEFORE APPLYING ANY OF IT. Read every staged block first and check it
         // against the checksum the commit recorded. A transaction whose blocks do not match is one the
         // device never durably wrote - replaying it would copy garbage over live metadata, which is

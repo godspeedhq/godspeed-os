@@ -8811,6 +8811,9 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
     ];
 
     let mut total_points = 0u64;
+    // Across the whole suite: how many cuts hit the commit window and tore the record. This is the
+    // number that proves the reporting path is REACHED, not merely written.
+    let mut total_torn = 0u64;
     for case in CASES {
         // ---- 1. RECORD -------------------------------------------------------------------------
         println!("fs-tear: [{}] recording - the operation and every sector it writes", case.name);
@@ -8865,6 +8868,14 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         // not tested recovery at all, however many tear points it passed, and saying so stops a
         // green tally implying coverage it does not have.
         let mut replayed = 0u64;
+        // THE FIRST tear point that replayed, kept for the torn-record case below.
+        //
+        // It is the useful one and no later one will do: the commit record is durable before ANY
+        // home block moves, so at the first replaying cut home is still entirely un-applied. Discard
+        // the record there and the volume must read exactly as it did before the operation started -
+        // which is what lets the case's own oracle judge "home untouched" instead of a hand-rolled
+        // assertion about bytes.
+        let mut first_replay_k: Option<u64> = None;
         for k in (op_start + 1)..=op_end {
             let img = format!("build/tests/fs_tear_{}_k{}.img", case.name, k);
             if apply_writes_prefix(&base, &writes, k, &img).is_err() {
@@ -8874,7 +8885,10 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
             let (o, w, _) = boot(&img, &[case.probe], case.probe_secs, false);       // REPLAY: no tap, no splicing
             let out = o.first().cloned().unwrap_or_default();
             let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
-            if w.contains("journal recovered") { replayed += 1; }
+            if w.contains("journal recovered") {
+                replayed += 1;
+                if first_replay_k.is_none() { first_replay_k = Some(k); }
+            }
             // A failure to mount is outside the table whatever the oracle says: the operation
             // corrupted the structure rather than landing on one side of it.
             // DID IT ANSWER AT ALL? A probe that ran out of time has told us nothing, and calling
@@ -8931,6 +8945,51 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         println!("fs-tear: [{}] {} of {} tear point(s) made the journal REPLAY on mount{}",
                  case.name, replayed, points,
                  if replayed == 0 { "  <- recovery was never exercised by this case" } else { "" });
+
+        // ---- 3. THE RECORD ITSELF UNREADABLE -----------------------------------------------
+        //
+        // The branch no tear point above can reach. `recover` bails four ways, and the one that
+        // matters on real hardware is a commit record that IS present and whose own CRC fails: the
+        // device began the record and lost power part-way through it. Nothing may be applied (the
+        // record never authorised anything, so home is untouched and the volume is consistent), and
+        // `fs` must SAY which case it is in - a clean mount with no message means the cut missed the
+        // window, and these two must not look alike.
+        //
+        // Built rather than found: take the first replaying tear point, where the record has landed
+        // and no home block has, and corrupt one byte inside the region the record's CRC covers.
+        if let Some(k) = first_replay_k {
+            let img = format!("build/tests/fs_torn_{}_k{}.img", case.name, k);
+            if apply_writes_prefix(&base, &writes, k, &img).is_ok() && corrupt_commit_record(&img) {
+                let (o, w, _) = boot(&img, &[case.probe], case.probe_secs, false);
+                let out = o.first().cloned().unwrap_or_default();
+                let said = w.contains("the journal record is present but TORN");
+                let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+                let replayed_anyway = w.contains("journal recovered");
+                check!(said, format!(
+                    "[{}] a TORN commit record is REPORTED, not discarded in silence (this is the \
+branch no tear point can reach - the tap cuts between sectors, so it can never half-write the record)",
+                    case.name));
+                check!(mounted && !replayed_anyway, format!(
+                    "[{}] a TORN commit record applies NOTHING and the volume still mounts \
+(mounted={mounted} replayed={replayed_anyway})", case.name));
+                // HOME UNTOUCHED, judged by the case's own oracle: at the first replaying cut no home
+                // block has moved, so discarding the record must leave the pre-operation state.
+                let before_ok = match case.oracle {
+                    Oracle::ExactlyOne(b, a) => out.contains(b) && !out.contains(a),
+                    Oracle::MustContain(_)   => mounted,
+                    Oracle::Forbids(t)       => !out.contains(t),
+                };
+                check!(before_ok, format!(
+                    "[{}] a TORN commit record leaves HOME UNTOUCHED - the volume reads as it did \
+before the operation began", case.name));
+                if said && mounted && before_ok { let _ = std::fs::remove_file(&img); }
+                total_torn += 1;
+            } else {
+                check!(false, format!(
+                    "[{}] could not stage a torn-commit-record image (no JOURNAL_MAGIC found at k={k})",
+                    case.name));
+            }
+        }
     }
 
     // ---- 3. PROVE THE ORACLE CAN FAIL ----------------------------------------------------------
@@ -8965,8 +9024,60 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
 
     println!("fs-tear: {} tear point(s) across {} operation(s); recordings kept in build/tests/",
              total_points, CASES.len());
+    // BOTH halves of the recovery decision must be exercised, not just the one the oracles need.
+    //
+    // The replay half is covered implicitly - the oracles depend on it. The torn half has no oracle
+    // depending on it (a discarded record leaves the same state as a record never written), so
+    // without this it could stop firing and all 220 tear points would still pass.
+    check!(total_torn > 0,
+           format!("the TORN-commit-record path was EXERCISED on {total_torn} operation(s) - a \
+record whose CRC fails must be found, discarded, and REPORTED. No tear point can produce this (the \
+tap cuts between sectors and the record is one sector), so it is built deliberately or not tested \
+at all"));
     println!("\nfs-tear: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }
+}
+
+/// Make a committed journal record UNREADABLE, the way a half-written sector does on real silicon.
+///
+/// The commit record is one 512-byte block laid out by `services/fs`:
+///
+/// ```text
+///   [0..4]           JOURNAL_MAGIC "GJ04"  (0x474A3034, little-endian)
+///   [4..8]           n - how many blocks this transaction staged (1..=56)
+///   [8..8+n*8]       the home LBA of each staged block
+///   [8+n*8..12+n*8]  CRC32 of the staged payload
+///   [508..512]       CRC32 of [0..12+n*8]   <- what this function invalidates
+/// ```
+///
+/// The corruption is deliberately the MILDEST one that reaches the target branch: one bit flipped
+/// inside the first home LBA. Magic stays valid and `n` stays in range, so `recover` walks past the
+/// two earlier bails and reaches the CRC check specifically - which is the branch under test.
+/// Zeroing the block or scribbling the magic would trip an earlier return and prove nothing about
+/// it.
+///
+/// Returns false if no plausible record is present, which the caller reports rather than skips: at
+/// a tear point that replayed, a record MUST be there, so its absence is a defect in the staging,
+/// not a reason to pass quietly.
+fn corrupt_commit_record(img: &str) -> bool {
+    const BLOCK: usize = 512;
+    const MAGIC: [u8; 4] = [0x34, 0x30, 0x4A, 0x47]; // "GJ04" little-endian
+    const TXN_CAP: u32 = 56;
+    let mut bytes = match std::fs::read(img) { Ok(b) => b, Err(_) => return false };
+    let mut off = 0usize;
+    while off + BLOCK <= bytes.len() {
+        if bytes[off..off + 4] == MAGIC {
+            let n = u32::from_le_bytes([bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]]);
+            // A real record, not four bytes of file data that happen to match: the count must be one
+            // this filesystem could have written.
+            if n >= 1 && n <= TXN_CAP {
+                bytes[off + 8] ^= 0x01;             // one bit, inside the CRC'd region
+                return std::fs::write(img, &bytes).is_ok();
+            }
+        }
+        off += BLOCK;
+    }
+    false
 }
 
 pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
