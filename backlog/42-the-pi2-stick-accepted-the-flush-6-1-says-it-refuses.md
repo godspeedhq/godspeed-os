@@ -53,6 +53,16 @@ The stick attested durability every time. That is three independent sessions wit
 one, the deterministic-cut run earlier the same day, and the VisionFive through `xhci` - a different
 driver, same physical stick.
 
+## A fourth session, on a third controller
+
+Raspberry Pi 4, 2026-09-22, same physical stick: `selfcheck` 509/0/0 twice, a deterministic cut
+recovered (`journal recovered 4 block(s)`, `churn verify` 6 files NONE torn, `drives check` 0 bad
+and nothing repaired), and again **zero** `durability NOT attested` lines.
+
+So the stick attests durability through all three USB stacks it meets: `dwc2` on the Pi 2, `xhci` on
+the Pi 4, and `xhci` on the VisionFive. Four sessions, no refusal, two of them with the corrected
+instrument that can tell a refusing device from an absent driver.
+
 ## The only local evidence for the refusal is an instrument that could not tell
 
 `build/pi2a.log` (2026-08-30) contains the warning twice. Both times it is immediately preceded by:
