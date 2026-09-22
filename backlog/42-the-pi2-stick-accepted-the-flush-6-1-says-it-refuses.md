@@ -36,6 +36,23 @@ was enforceable on this run.
 **The same stick is used on all three SBCs** (the operator's own words), and it accepts the flush
 through `xhci` on the VisionFive as well.
 
+## A second Pi 2 session, with the corrected instrument
+
+2026-09-22, plain image (no crash-window), carrying the fix that separates `Refused` from
+`NoAnswer`:
+
+```
+run: ran 500, failed 0, skipped 1          (the skip is the PCI this board has not got)
+mounts: 2
+writes: /tour/a.txt, /sc_fl.txt, /sc/a.txt, the events capture - real transactions
+fs: durability NOT attested ...            ZERO occurrences
+```
+
+Writes happened, so `durable_or_warn` ran at both commit barriers on both mounts and stayed silent.
+The stick attested durability every time. That is three independent sessions with no refusal: this
+one, the deterministic-cut run earlier the same day, and the VisionFive through `xhci` - a different
+driver, same physical stick.
+
 ## The only local evidence for the refusal is an instrument that could not tell
 
 `build/pi2a.log` (2026-08-30) contains the warning twice. Both times it is immediately preceded by:
