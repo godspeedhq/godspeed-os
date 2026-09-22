@@ -2070,6 +2070,10 @@ impl Fs {
         // read-only mount still recovers: replaying an already-committed write is not a new write,
         // and leaving the fs torn would be worse - see §6.15.)
         Fs::recover(ctx, u64_at(&sb, 108));
+        // The replay may have rewritten the superblock - see the note above this function. Read it
+        // again, and fall back to the pre-replay copy if that read fails, because a mount that got
+        // this far on the first read must not be lost to a transient failure on the second.
+        let sb = Self::read_superblock(ctx).unwrap_or(sb);
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);

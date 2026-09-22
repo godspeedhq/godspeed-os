@@ -124,8 +124,21 @@ def main():
     # then the kernel that embeds the supervisor. Building the other way round embeds whatever was
     # last on disk, which is the stale-image trap this comment exists to prevent.
     if "--no-userspace" not in sys.argv:
+        crash_window = "--crash-window" in sys.argv
         for svc in SERVICES:
-            run(["cargo", "build", "-p", svc, "--target", TARGET, "--release"])
+            feats_svc = []
+            if svc == "fs" and crash_window:
+                feats_svc = ["--features", "crash-window"]
+            run(["cargo", "build", "-p", svc, "--target", TARGET, "--release"] + feats_svc)
+        if crash_window:
+            print("")
+            print("*** THIS IS A CRASH-WINDOW IMAGE - NOT A NORMAL ONE. ***")
+            print("    `fs` holds the commit-to-checkpoint window open for 10 s whenever a")
+            print("    transaction touches a path beginning /cutme. Write to /cutme.txt, then")
+            print("    pull the power within ten seconds: the cut is GUARANTEED to land inside")
+            print("    the window, so the next mount must report `journal recovered`.")
+            print("    Reflash a normal image afterwards - this one deliberately stalls writes.")
+            print("")
         run(["cargo", "build", "-p", "supervisor", "--target", TARGET, "--release",
              "--features", "bare-metal"])
         sup = os.path.join(ROOT, "target", TARGET, "release", "supervisor")
@@ -151,6 +164,15 @@ def main():
         stack_fit_check.enforce(shutil.which("rust-objdump") or "rust-objdump",
                                 ROOT, TARGET, "release", SERVICES, 64 * 4096)
 
+    if board and not rel:
+        sys.exit("--visionfive without --release: refusing.\n"
+                 "        A board image is never a debug build. Debug stack frames are several\n"
+                 "        times larger, and a debug kernel on this board faults with an\n"
+                 "        `instruction access fault` shortly after `xhci` goes interrupt-driven -\n"
+                 "        a kernel stack overflow that reads like a corrupt pointer. `arm_build.py`\n"
+                 "        carries the same rule for the same reason.\n"
+                 "        Use: py scripts/riscv_build.py --visionfive --release")
+
     run(["cargo", "build", "-p", "kernel", "--target", TARGET] + feats + rel)
 
     elf = os.path.join(ROOT, "target", TARGET, prof, "kernel")
@@ -163,9 +185,19 @@ def main():
     ksize = os.path.getsize(elf)
     print("OK  %s  (%d bytes, target=%s, profile=%s%s)"
           % (elf, ksize, TARGET, prof, ", board=visionfive" if board else ""))
-    if "--no-userspace" not in sys.argv and ksize < 1_000_000:
-        print("WARNING: the kernel is small enough that it probably embedded the PLACEHOLDER")
-        print("         supervisor rather than the real one. Check kernel/build.rs `riscv64_built`.")
+    # THE THRESHOLD WAS CALIBRATED FOR A RELEASE KERNEL AND SAID NOTHING ABOUT A DEBUG ONE. A debug
+    # kernel is ~4 MB of its own, so it clears 1 MB comfortably WITHOUT the supervisor in it - which
+    # is precisely the build that shipped a placeholder to a card on 2026-09-22 and panicked.
+    #
+    # Compare against what the supervisor actually weighs instead of a constant: the kernel must be
+    # bigger than the thing it embeds. `kernel/build.rs` now refuses the missing-binary case
+    # outright, so this is the second line of defence rather than the only one.
+    if "--no-userspace" not in sys.argv:
+        sup_size = os.path.getsize(sup)
+        if ksize < sup_size:
+            sys.exit("the kernel (%d bytes) is SMALLER than the supervisor it must embed (%d) - it\n"
+                     "        embedded the placeholder. Check kernel/build.rs `riscv64_built` and\n"
+                     "        that the userspace was built for %s." % (ksize, sup_size, TARGET))
 
     if not board:
         # WITHOUT `--visionfive` THIS LEAVES THE DEPLOYABLE IMAGE UNTOUCHED, and the deploy script

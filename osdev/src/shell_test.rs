@@ -6740,12 +6740,22 @@ pub fn run_fs_nested(image_path: &Path, replay_image: &Path, persist_path: &str,
     check!(w3.contains("0 bad"), "no corrupt blocks - repeating the replay did not worsen the damage");
     check!(!w3.contains("DANGEROUS DIRECTION"),
            "the BITMAP did not drift in the dangerous direction across three interrupted boots");
-    // The COUNT is a separate, milder question and is allowed to drift - `alloc_run` scans the
-    // bitmap and never reads it, so a stale count costs reporting accuracy until the next check.
-    // Recorded rather than asserted, because a replay currently DOES leave it one high.
-    if w3.contains("REPAIRED the FREE COUNT") {
-        println!("fs-nested: (the free count drifted after replay - known, count-only, see the note)");
-    }
+    // THE COUNT USED TO BE ALLOWED TO DRIFT, AND IS NOT ANY MORE.
+    //
+    // This was a recorded tolerance with sound reasoning: `alloc_run` scans the bitmap and never
+    // reads the count, so a stale scalar cost reporting accuracy and nothing else. It stayed
+    // tolerated because nobody had found the cause.
+    //
+    // The cause was one line. `mount_into` read the superblock, ran `recover` - which REWRITES the
+    // superblock, since it is one of the blocks a transaction stages - and then built the in-memory
+    // `Fs` from the bytes read BEFORE the replay. Disk correct, memory one transaction behind, and
+    // the next persist wrote the stale value back over the recovered one.
+    //
+    // Found on the VisionFive on 2026-09-22 by a deterministic cut inside the commit window: the
+    // count came back exactly one high, which is what the interrupted write had allocated. The fix
+    // re-reads the superblock after recovery, so the tolerance becomes an assertion.
+    check!(!w3.contains("REPAIRED the FREE COUNT"),
+           "the free count is CORRECT after a replay - the mount re-reads the superblock the replay rewrote");
     check!(!w3.contains("KERNEL PANIC"), "no kernel panic across any of the three boots");
 
     let _ = std::fs::write("build/tests/fs_nested_serial.log",

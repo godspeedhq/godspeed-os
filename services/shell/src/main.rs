@@ -17231,6 +17231,13 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
 /// stored_free_before:u64] - the last field is what the SUPERBLOCK claimed before the rebuild, so a
 /// repair that was NEEDED can be reported rather than only its result.
 fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
+    // POINT AT THE DETACHABLE FORM, because `[q] quit` is the only key this can honestly offer and
+    // an operator reasonably expects `[b] background` beside it (that pair is the premise job
+    // control was designed from). It cannot be offered HERE: a foreground check is the shell parked
+    // in ONE `fs` request, so there is no running state to hand to a service - `b` could only
+    // abandon the pass and start it again from scratch, queued behind the one `fs` is still doing.
+    // Saying where the real thing lives costs a line and does not lie about a key.
+    ctx.console_writeln("drives check - walking the tree   [q] quit   (detach it next time: background drives check)");
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {

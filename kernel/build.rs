@@ -262,10 +262,12 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // silently accepting the first turns the second into `LoadFailed(TooSmall)` at boot - which reads
     // like a corrupt image rather than a build-list omission.
     let riscv64_built: &[&str] = &["supervisor"];
+    // `release`, NOT `profile`: the cross-built userspace is always release (see `riscv_build.py`),
+    // so following the kernel's own profile looks in a directory nothing ever writes.
     let riscv64_dir = workspace
         .join("target")
         .join("riscv64imac-unknown-none-elf")
-        .join(&profile);
+        .join("release");
 
     for (env_name, bin_name) in services {
         let elf = if is_arm {
@@ -277,10 +279,21 @@ const ARM_ONLY: &[&str] = &["dwc2"];
             let a64_bin = aarch64_dir.join(bin_name);
             if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
         } else if is_riscv64 {
-            // The RISC-V supervisor if it has been built; otherwise the placeholder, so the kernel
-            // still links for the boundary test even when no userspace has been cross-compiled.
+            // Listed and present: the real binary. NOT listed: the placeholder, because the service
+            // is simply not ported to this arch. Listed and MISSING: stop the build - that is a
+            // build-list or build-order mistake, and letting it through ships a kernel that panics
+            // at `spawn_supervisor` with an error that reads like a corrupt image.
             let rv_bin = riscv64_dir.join(bin_name);
-            if riscv64_built.contains(bin_name) && rv_bin.exists() { rv_bin } else { placeholder.clone() }
+            if !riscv64_built.contains(bin_name) {
+                placeholder.clone()
+            } else if rv_bin.exists() {
+                rv_bin
+            } else {
+                panic!("riscv64: `{}` is in `riscv64_built` but {} does not exist. Build the \
+                        userspace first (scripts/riscv_build.py does this) - embedding the \
+                        placeholder here would boot to `LoadFailed(TooSmall)`.",
+                       bin_name, rv_bin.display());
+            }
         } else if use_placeholder {
             placeholder.clone()
         } else if ARM_ONLY.contains(bin_name) {
