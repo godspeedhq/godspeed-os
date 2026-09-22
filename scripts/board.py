@@ -8,7 +8,7 @@ WHY THIS EXISTS. Four ports had four build interfaces, and the differences were 
 they cost two flashes and a bisect on 2026-09-22:
 
     port        flags style   release          board flag     crash-window   artifact
-    x86         osdev CLI     implicit         -              no             build/os.img
+    x86         osdev CLI     implicit         -              no             build/os-usb.img
     arm32       argparse      --release        -              added that day kernel7.img + config-pi2.txt
     aarch64     sys.argv      DEFAULT ON       -              no             kernel8.img, deployed AS godspeed8.img
     riscv64     sys.argv      --release        --visionfive   added that day godspeed-riscv64-visionfive.img
@@ -73,8 +73,13 @@ BOARDS = {
     "x86": {
         "desc": "x86-64 (HP T630, Dell Wyse)",
         "cmd": None,                                   # osdev, not a script - see run_x86
-        "artifacts": ["build/os.img"],
-        "deploy": ["write build/os.img to a USB stick (dd), boot it UEFI"],
+        # `os-usb.img`, NOT `os.img`. Both exist and they are DIFFERENT files: `osdev image` writes
+        # the bare-metal UEFI image as `os-usb.img`, while `build/os.img` is what the QEMU suites
+        # stage for themselves. Naming the wrong one here pointed at a file that was 56 minutes
+        # stale on the first x86 build through this script - caught by the freshness check below,
+        # which is the trap `feedback_stale_image_trap` records costing a false "verified in QEMU".
+        "artifacts": ["build/os-usb.img"],
+        "deploy": ["write build/os-usb.img to a USB stick (Rufus DD mode, or dd), boot it UEFI"],
     },
 }
 
