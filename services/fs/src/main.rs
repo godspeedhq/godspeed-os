@@ -2288,12 +2288,21 @@ impl Fs {
 
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
         let t_blk = self.blk_begin(ctx);
-        let flushed = block_flush(ctx);
+        let outcome = block_flush_outcome(ctx);
         self.blk_end(ctx, t_blk);
-        if flushed { return true; }
+        if matches!(outcome, FlushOutcome::Durable) { return true; }
         if !self.flush_warned.get() {
             self.flush_warned.set(true);
-            ctx.log("fs: durability NOT attested by this drive - it accepts no cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25).");
+            match outcome {
+                // THE DEVICE ANSWERED AND SAID NO. This is the case CLAUDE.md 6.1 describes, and the
+                // only one that is evidence about the drive.
+                FlushOutcome::Refused => ctx.log("fs: durability NOT attested - this drive ANSWERED and refused the cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25)."),
+                // NOBODY ANSWERED. The barrier did not happen, so the same risk applies to THIS
+                // transaction - but it says nothing about the device, and must not be read as though
+                // it did. `build/pi2a.log` is what happens otherwise: this fired twice during a chaos
+                // run, right after `block-driver died, restarting`, reading as a verdict on the stick.
+                _ => ctx.log("fs: durability NOT attested - the block driver did not answer the flush (dead, restarting, or slow). The barrier did not happen for this transaction; this says NOTHING about whether the drive supports a cache flush."),
+            }
         }
         false
     }
@@ -4922,11 +4931,27 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
 ///
 /// So durability is requested explicitly, at the points that promise it, and the answer is checked -
 /// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
-fn block_flush(ctx: &ServiceContext) -> bool {
+enum FlushOutcome {
+    /// The device made its cache durable.
+    Durable,
+    /// The device ANSWERED and refused. This - and only this - is evidence about the DEVICE.
+    Refused,
+    /// Nobody answered: the driver is dead, restarting, or too slow. Says nothing about the drive.
+    NoAnswer,
+}
+
+fn block_flush_outcome(ctx: &ServiceContext) -> FlushOutcome {
     match block_rpc(ctx, &[OP_FLUSH]) {
-        Some(reply) => reply.body().first() == Some(&BLK_OK),
-        None => false,
+        Some(reply) => {
+            if reply.body().first() == Some(&BLK_OK) { FlushOutcome::Durable }
+            else { FlushOutcome::Refused }
+        }
+        None => FlushOutcome::NoAnswer,
     }
+}
+
+fn block_flush(ctx: &ServiceContext) -> bool {
+    matches!(block_flush_outcome(ctx), FlushOutcome::Durable)
 }
 
 /// Stamp a **directory block**'s CRC trailer over its record region and write it (raw, no
