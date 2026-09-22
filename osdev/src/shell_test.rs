@@ -6991,6 +6991,95 @@ pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
 /// the shell compete with the copier for `fs` on every iteration, so the thing being measured is
 /// slowed by the measuring. The first run of this suite did exactly that and reached 12% in sixty
 /// polls.
+/// `fs-reuse` - a file capability minted BEFORE an `fs` restart must reach nothing after it.
+///
+/// THE ROW THIS CLOSES. `file-cap` (§22 Test 14) proves a file cap is revoked on delete, close and
+/// rename - all of them actions `fs` TAKES while it is alive and holding its `ResourceId -> file`
+/// map. What no suite asked was what happens when that map is destroyed: `fs` restarts, its
+/// in-memory table is empty, and the blocks the file occupied are handed to something else.
+///
+/// If a stale capability resolved after that, the holder would read a file it was never granted,
+/// through a handle the kernel still considers valid. That is not a leak of SPACE - which an fsck
+/// would find - it is a leak of AUTHORITY, and nothing in a listing or a check would show it.
+pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-reuse: PASS - {}", $label); pass += 1; }
+        else { println!("fs-reuse: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-reuse: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-reuse: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-reuse: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    let canary = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    check!(canary.contains("do-not-disturb"), "the volume mounted and the bystander reads correctly");
+
+    // The whole scenario is ONE command, because a capability cannot outlive the function holding
+    // it - the shell keeps no cap table between prompts, so `fcap` here and `kill fs` there would
+    // drop the handle before the interesting moment.
+    let out = run!(b"fcap reuse\r", 180).unwrap_or_default();
+
+    let after = run!(b"drives check\r", 180).unwrap_or_default();
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_reuse_serial.log", &w);
+
+    // ---- THE GATE ----
+    // The cap must WORK first, or a later refusal proves nothing: a handle that was never valid is
+    // refused for the wrong reason, and the test would pass while testing nothing.
+    check!(out.contains("reads the original before the restart"),
+           "the capability worked BEFORE the restart - so a refusal afterwards means something");
+    check!(out.contains("killing fs"), "`fs` was restarted with the capability still held");
+    check!(!out.contains("fs never came back"), "`fs` came back and served again");
+    // THE ONE THAT MATTERS.
+    check!(!out.contains("THE STALE CAP READ THE REPLACEMENT"),
+           "THE STALE CAP DID NOT READ THE REPLACEMENT FILE - authority did not survive the restart");
+    check!(!out.contains("still resolved to something"),
+           "the stale capability resolved to nothing at all, not merely to the wrong thing");
+    check!(out.contains("fcap reuse: ok"), "the whole sequence reported success");
+    check!(after.contains("0 bad"), "the volume is intact after a restart with a live capability");
+
+    println!("\nfs-reuse: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -8282,6 +8371,170 @@ pub fn run_fs_full(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `fs-rtear` - CRASHING DURING RECOVERY. A second-order tear: cut the replay itself.
+///
+/// THE ROW THIS CLOSES. `fs-tear` cuts an OPERATION and checks the next mount lands inside the
+/// permitted set; 220 tear points across nine operations say it does. But every one of those
+/// recoveries was allowed to FINISH. The question nobody had asked is what happens when the machine
+/// dies again while the journal is being replayed - which is not exotic, it is what a flapping power
+/// supply does, and it is the one moment when the filesystem is deliberately mid-surgery.
+///
+/// **Why the answer must be "nothing changes".** A redo journal's replay is IDEMPOTENT by
+/// construction: it copies staged blocks to their home locations, and doing that twice writes the
+/// same bytes to the same places. So a cut partway through must leave a volume that simply replays
+/// again on the next mount. If it did not - if a half-applied replay could leave the volume
+/// unmountable or its accounting contradictory - then the recovery mechanism would itself be a
+/// window of corruption, and every guarantee resting on it would be conditional on nobody dying
+/// twice.
+///
+/// **How it is built, which is the whole trick.** `fs-tear`'s machinery is reused to MANUFACTURE a
+/// disk that must recover: record an operation's sectors, then apply a prefix and boot it until one
+/// is found whose mount announces `journal recovered`. That image is the starting point. It is then
+/// booted with the write tap to capture what RECOVERY writes, and prefixes of THOSE are applied to
+/// it - each one a machine that died in the middle of replaying.
+pub fn run_fs_rtear(tapped_image: &Path, plain_image: &Path, persist_path: &str, smp: u32) {
+    let qemu       = crate::qemu::qemu_binary();
+    let tapped_str = tapped_image.to_string_lossy().replace('\\', "/");
+    let plain_str  = plain_image.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-rtear: PASS - {}", $label); pass += 1; }
+        else { println!("fs-rtear: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let base = match std::fs::read(persist_path) { Ok(b) => b, Err(e) => { eprintln!("fs-rtear: no base disk: {e}"); std::process::exit(1); } };
+
+    let boot = |disk_path: &str, cmds: &[&str], cmd_secs: u64, tap: bool| -> (Vec<String>, String) {
+        let disk = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let image = if tap { &tapped_str } else { &plain_str };
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return (vec![], String::new()) };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(12)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return (vec![], String::new()); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(70)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(cmd_secs)).unwrap_or_default());
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole)
+    };
+
+    // ---- 1. MANUFACTURE A DISK THAT MUST RECOVER ----------------------------------------------
+    // `delete` is used because `fs-tear` measured it as the operation with the widest replay window
+    // - 10 of its 21 tear points announce `journal recovered` - so a prefix that needs recovery is
+    // found in a few boots rather than twenty.
+    let rec_disk = "build/tests/fs_rtear_record.img";
+    if std::fs::write(rec_disk, &base).is_err() {
+        check!(false, "could not stage the record disk"); println!("\nfs-rtear: {pass} passed, {fail} failed");
+        if fail > 0 { std::process::exit(1); } return;
+    }
+    let (_o, rserial) = boot(rec_disk, &["dir /", "delete /tear.txt", "dir /"], 60, true);
+    let writes = parse_write_tap(&rserial);
+    check!(!writes.is_empty(), "the write tap recorded the manufacturing operation");
+    if writes.is_empty() {
+        println!("\nfs-rtear: {pass} passed, {fail} failed"); std::process::exit(1);
+    }
+    let last = writes.last().map_or(0, |w| w.seq);
+
+    // Walk BACKWARDS from the last sector: the commit record lands late in the operation, so the
+    // tear points that replay cluster near the end. Forwards would boot through every point that
+    // pre-dates the commit and recovers nothing.
+    let mut torn_path = String::new();
+    let mut found_k = 0u64;
+    for k in (1..=last).rev() {
+        let img = format!("build/tests/fs_rtear_torn_k{k}.img");
+        if apply_writes_prefix(&base, &writes, k, &img).is_err() { continue; }
+        let (_o, w) = boot(&img, &["drives check"], 150, false);
+        if w.contains("journal recovered") {
+            found_k = k;
+            // REBUILT, NOT REUSED. `img` has just been booted, and that boot replayed the journal
+            // and wrote the result back - the disk is read-write to QEMU. Reusing it would hand the
+            // next stage an already-recovered volume, which is exactly what it did the first time:
+            // `recovery wrote 0 sector(s)`.
+            torn_path = format!("build/tests/fs_rtear_torn_fresh_k{k}.img");
+            if apply_writes_prefix(&base, &writes, k, &torn_path).is_err() { torn_path = String::new(); }
+            break;
+        }
+    }
+    check!(!torn_path.is_empty(),
+           format!("manufactured a disk whose mount MUST replay the journal (tear point k={found_k})"));
+    if torn_path.is_empty() {
+        println!("\nfs-rtear: {pass} passed, {fail} failed"); std::process::exit(1);
+    }
+
+    // ---- 2. RECORD WHAT RECOVERY WRITES -------------------------------------------------------
+    let torn = match std::fs::read(&torn_path) { Ok(b) => b, Err(_) => { check!(false, "could not read the torn disk"); vec![] } };
+    let rtap_disk = "build/tests/fs_rtear_tap.img";
+    let _ = std::fs::write(rtap_disk, &torn);
+    let (_o, rw) = boot(rtap_disk, &[], 60, true);
+    // Only the writes BEFORE the first prompt: those are the mount's, which is where the replay
+    // happens. Anything after is the shell starting up and has nothing to do with recovery.
+    let cut = rw.find("gsh>").unwrap_or(rw.len());
+    let rwrites = parse_write_tap(&rw[..cut]);
+    check!(!rwrites.is_empty(),
+           "the write tap recorded what RECOVERY writes (zero means the torn image had already been recovered by an earlier boot)");
+    let rlast = rwrites.last().map_or(0, |w| w.seq);
+    println!("fs-rtear: recovery wrote {} sector(s); cutting at each one", rlast);
+
+    // ---- 3. CUT THE RECOVERY AT EVERY POINT ---------------------------------------------------
+    let mut ok_points = 0u64;
+    let mut replayed_again = 0u64;
+    for j in 1..=rlast {
+        let img = format!("build/tests/fs_rtear_j{j}.img");
+        if apply_writes_prefix(&torn, &rwrites, j, &img).is_err() { continue; }
+        let (o, w) = boot(&img, &["drives check"], 150, false);
+        let out = o.first().cloned().unwrap_or_default();
+        let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+        if w.contains("journal recovered") { replayed_again += 1; }
+        // A replay interrupted partway must leave a volume that MOUNTS and whose accounting does
+        // not contradict itself. Both halves matter: a volume that mounts with a corrupt bitmap is
+        // worse than one that refuses, because the next allocation writes over live data.
+        let consistent = !out.contains("marked free but are IN USE") && out.contains("check:");
+        if mounted && consistent { ok_points += 1; }
+        else {
+            println!("fs-rtear: j={j} - mounted={mounted} consistent={consistent} (image kept: {img})");
+        }
+    }
+    check!(rlast > 0 && ok_points == rlast,
+           format!("every cut DURING recovery left a mountable, self-consistent volume ({ok_points}/{rlast})"));
+    // A sweep where recovery never re-ran has not tested re-entry at all, however many points it
+    // passed - the same argument `fs-tear` makes about counting its own replays.
+    check!(replayed_again > 0,
+           format!("recovery RE-RAN after being interrupted ({replayed_again} of {rlast} cuts replayed again) - replay is re-entrant, not one-shot"));
+
+    println!("\nfs-rtear: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, smp: u32) {
     let qemu       = crate::qemu::qemu_binary();
     let tapped_str = tapped_image.to_string_lossy().replace('\\', "/");
@@ -8460,6 +8713,79 @@ pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, 
         // the next allocation writes over live data. `drives check` walks the tree and compares its
         // count against the superblock's, and now SAYS whether they disagreed, so a torn delete that
         // left the accounting inconsistent is caught by the one instrument that can see it.
+        // ---- FOUR MORE OPERATIONS FROM SECTION 2, added 2026-09-22. Each one is a row in the
+        //      permitted-outcome table that nothing had ever cut.
+        //
+        //      OPERAND SIZE IS THE RUNTIME. This suite boots QEMU once per SECTOR the operation
+        //      writes, so a case that copies a megabyte is not thorough, it is a suite nobody runs.
+        //      Every operand below is deliberately tiny: the question is whether the TRANSACTION is
+        //      atomic, and a transaction's atomicity does not depend on how much data rides in it.
+
+        // LABEL: the smallest transaction in the filesystem - one superblock field. Two texts, both
+        // visible, mutually exclusive: the drive answers to the old name or the new one. A label
+        // that came back blank, or as a mixture, would be a superblock written non-atomically, and
+        // every other guarantee rests on that block being readable.
+        TearCase { name: "label", setup: &["drives label 0 tearvol", "drives"],
+                   op: "drives label 0 ZZNEWLABEL", probe: "drives",
+                   oracle: Oracle::ExactlyOne("tearvol", "ZZNEWLABEL"),
+                   probe_secs: 30, answered: &["LABEL"] },
+
+        // MKDIR -P: none of the directories exist, or all of them do. Three levels in ONE
+        // transaction, so a tear that left `/pa` without `/pa/pb` would be a partially-applied
+        // multi-entry commit - the exact thing the journal exists to prevent, and the one shape
+        // `rename` and `move` (two entries) cannot show because three is where a prefix becomes
+        // possible.
+        //
+        // The probe asks about the DEEPEST directory: `/pa` alone existing is the violation, and a
+        // probe that looked at `/pa` could not tell the difference between "all three" and "the
+        // first one only".
+        TearCase { name: "mkdir-p", setup: &["dir /"],
+                   op: "mkdir /pa/pb/pc parents", probe: "dir /pa/pb/pc",
+                   oracle: Oracle::ExactlyOne("not a directory", "(empty)"),
+                   probe_secs: 30, answered: &["not a directory", "(empty)", "entries"] },
+
+        // SEAL: sealed, or not sealed. The `ro_compat` superblock bit and the entry's flag commit
+        // TOGETHER, and a tear between them is the one outcome that would be quietly catastrophic:
+        // a file the entry calls sealed while the volume does not know it, or a volume that refuses
+        // every write because a bit survived a seal that did not.
+        //
+        // The probe is a WRITE, because "is it sealed" is not a question a listing answers - the
+        // flag is only visible in what the filesystem permits. `fs` refuses a sealed write by name
+        // ("file is sealed"), and a successful one says "wrote", so the two outcomes are exclusive
+        // and both are visible.
+        TearCase { name: "seal", setup: &["write /sl.txt BEFORE", "dir /"],
+                   op: "seal /sl.txt yes", probe: "write /sl.txt CHANGED",
+                   // (BEFORE, AFTER), which is what the control check reads: it asserts the
+                   // SECOND text appears when nothing interrupts the operation. Written the other
+                   // way round first, and the control caught it - a sealed file refuses a write,
+                   // so "wrote" is the state BEFORE the seal, not after.
+                   oracle: Oracle::ExactlyOne("wrote", "file is sealed"),
+                   probe_secs: 30, answered: &["file is sealed", "wrote", "failed"] },
+
+        // DELETE-TREE: a PREFIX of the tree may be gone, because each entry's removal is atomic and
+        // the WALK across them is not. So presence proves nothing and absence proves nothing - the
+        // only thing that must hold is the accounting, which is what `delete` uses the same oracle
+        // for. A block marked free while a surviving file still references it is the outcome that
+        // destroys data silently: the next allocation writes over it.
+        TearCase { name: "delete-tree", setup: &["mkdir /dt/sub parents", "write /dt/one.txt AAA", "write /dt/sub/two.txt BBB", "dir /dt"],
+                   op: "delete /dt recursive", probe: "drives check",
+                   oracle: Oracle::Forbids("marked free but are IN USE"),
+                   probe_secs: 150, answered: &["check:"] },
+
+        // WRITE-NEW: the file does not exist, or it exists at its full declared size. The extent is
+        // allocated BEFORE the directory entry is made, so a tear between the two leaves blocks
+        // held by nothing - a leak, which section 2 does NOT list as a permitted outcome. `copy` is
+        // how the shell issues `OP_WRITE_NEW`, and the source is three bytes so the streaming half
+        // costs one sector rather than hundreds.
+        //
+        // The oracle is the accounting rather than the listing, for the reason `delete` uses it:
+        // an absent file whose blocks are still held looks exactly like a file that was never
+        // created, and only fsck can tell them apart.
+        TearCase { name: "write-new", setup: &["write /wn.txt AAA", "dir /"],
+                   op: "copy /wn.txt /wn2.txt", probe: "drives check",
+                   oracle: Oracle::Forbids("marked free but are IN USE"),
+                   probe_secs: 150, answered: &["check:"] },
+
         TearCase { name: "delete", setup: &["dir /"],
                    op: "delete /tear.txt", probe: "drives check",
                    oracle: Oracle::Forbids("marked free but are IN USE"),

@@ -39,7 +39,9 @@ before `fs-tear` joined and roughly doubles with it, because `fs-tear` boots QEM
 
 | suite | what it actually attacks |
 |---|---|
-| `fs-tear` | **NEW.** Every prefix of an operation's writes, recorded from the real driver and booted. 4 operations, 75 tear points, plus a control proving the oracle can reject. Section 3.1 |
+| `fs-tear` | Every prefix of an operation's writes, recorded from the real driver and booted. 9 operations, 220 tear points, plus a control proving the oracle can reject. Section 3.1 |
+| `fs-rtear` | **NEW.** The SECOND-ORDER tear: cut the RECOVERY itself, at every sector the replay writes. Section 3.8 |
+| `fs-reuse` | **NEW.** A file capability minted before an `fs` restart must reach nothing after it - including the file that now occupies its blocks. Section 3.6 |
 | `fs-corrupt` | metadata damaged host-side: bad superblock CRC, bad directory CRC, bad magic. 14 checks |
 | `fs-hostile` | genuinely malicious disks: a directory that contains itself, a name carrying `ESC [ 2J`, a `name_len` past the record |
 | `fs-journal` | a committed-but-unfinished transaction is replayed; an invalid commit record is rejected |
@@ -118,14 +120,33 @@ test, and it answers "did this tear survive" rather than "does any tear survive"
    not a model of a power cut. It is exactly the disk state one produces.**
 4. Boot each `A_k`, mount, and check the outcome is in the permitted set - and nothing else.
 
-**Results so far - four operations, 75 tear points, every one inside the permitted set:**
+**Results - nine operations, 220 tear points, every one inside the permitted set:**
 
-| operation | sectors written | tear points | of which replay | outcome |
-|---|---|---|---|---|
-| overwrite a whole file | 22 | 22 | 10 | wholly `ORIGINAL` or wholly `NEWNEWNEW`, never a mix |
-| rename | 15 | 15 | 7 | the old name or the new name, never both, never neither |
-| move across directories | 17 | 17 | 8 | in the source or in the destination, never both, never neither |
-| delete | 21 | 21 | 10 | gone, or still there, or gone-with-a-leak. Never a block marked free while a live file uses it |
+| operation | tear points | outcome |
+|---|---|---|
+| overwrite a whole file | 22 | wholly `ORIGINAL` or wholly `NEWNEWNEW`, never a mix |
+| rename | 15 | the old name or the new name, never both, never neither |
+| move across directories | 17 | in the source or in the destination, never both, never neither |
+| delete | 21 | gone, or still there, or gone-with-a-leak. Never a block marked free while a live file uses it |
+| **label** | 17 | the old label or the new one. The smallest transaction there is - one superblock field - and everything else rests on that block being readable |
+| **mkdir -p** | 27 | none of the three directories, or all of them. THREE entries in one commit, which is where a prefix first becomes possible: `rename` and `move` have two |
+| **seal** | 19 | sealed or not sealed. The probe is a WRITE, because the flag is only visible in what the filesystem permits |
+| **delete-tree** | 58 | a prefix of the tree may be gone; what may never happen is a block marked free while a survivor still references it |
+| **write-new** | 24 | the extent is allocated BEFORE the entry exists, so a tear between the two would leave blocks held by nothing. None did |
+
+**FIVE OF THESE WERE ADDED 2026-09-22, and two of the five are the ones that cross an allocation
+boundary.** `delete-tree` frees blocks across a walk the journal does not make atomic, and
+`write-new` allocates an extent before the directory entry that will own it. Both are the shape
+`fs-metafull` found violated on the REFUSAL path the same day - a block stranded on every refused
+create - and neither strands anything on the CRASH path, at any of their 82 cut points.
+
+**Two rows of section 2 are not separately reachable, and are recorded rather than faked.**
+`write-at` and its journaled variant have no shell verb that issues `OP_WRITE_AT` alone - `copy`
+issues `write_new` and then a run of `write_at`, which is what the `write-new` case already cuts.
+Section 2 also declares the unjournaled form's permitted outcome to be ANY prefix of the chunks with
+metadata unchanged, so there is no exclusive pair to test; the invariant that does exist (size and
+extent unaffected) is what `write-new`'s fsck oracle checks across its 24 points. Inventing a shell
+verb to reach one opcode would be a test shaping the product rather than the reverse.
 
 Each case is a row in a table rather than a copy of the harness: a setup whose last command writes
 nothing (that is the boundary marker), the one operation to tear, a probe, and the two mutually
@@ -923,21 +944,21 @@ Filled in from what has actually been run. NOT RUN means not run.
 |---|---|---|
 | Feature and operation tests | PASS (QEMU) | `osdev test fs-all` 30 of 30 in ~41 min, including `fs-tear` and `fs-model`; `files` 239/0; `shell` 183/0 (measured 2026-09-21) |
 | Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and 5 of the 12 operations, are named as uncovered in 3.2 |
-| Crash-point and persistence matrix | PARTIAL (QEMU) | `osdev test fs-tear` 18/0 - four operations, 75/75 tear points, oracle proved able to reject. Seven rows of section 2 remain |
+| Crash-point and persistence matrix | **PASSES (QEMU)** | `osdev test fs-tear` - NINE operations, 220 tear points, every one inside the permitted set, plus a control proving the oracle can reject. Nine of the eleven rows of section 2; the two `write-at` forms have no shell verb that issues `OP_WRITE_AT` alone and section 2 permits any prefix of their chunks, so they are recorded as not separately reachable rather than faked (3.1). |
 | Data/metadata exhaustion | **PASSES (QEMU)** | 3.4 - `fs-full` 14/0 and `fs-metafull` 9/0. The second fills a DIRECTORY until a create is refused and found a real leak: one block stranded per refused create, with a control attributing it to the refusal rather than the writing. Fixed. Metadata and data are not separate pools here, so exhausting one independently is unreachable. Per-allocation-point injection is still not covered. |
 | Concurrency and retry ordering | **PASSES (QEMU)** | 3.5 - `fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0. Timeouts on BOTH sides of the commit, and two real clients on one directory. The ordering guarantee is documented in `docs/persistence.md` 6.18. The duplicate-request gap is still real and still recorded: closing it needs a client-supplied op id plus a bounded reply cache in `fs`. |
-| Stale-handle and identity tests | PARTIAL (QEMU) | `file-cap` 13/0 covers revocation on delete/close/rename; storage REUSE across an `fs` restart is not covered |
+| Stale-handle and identity tests | **PASSES (QEMU)** | `file-cap` 13/0 covers revocation on delete/close/rename. `fs-reuse` 8/0 covers the case none of those could: a capability minted BEFORE an `fs` restart, with the blocks it named handed to a different file afterwards. The stale cap resolved to nothing - not to the replacement, not to anything. That would have been a leak of AUTHORITY rather than space, which no fsck can see (3.6). |
 | Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |
 | Block-driver killed WITH REQUESTS OUTSTANDING | **`fs-blockdeath` 11/0** | 3.7. Noticed in 201 ms against a 30 s deadline - woken, not timed out |
 | Hot-unplug / device disappearance mid-write | **PASSES (QEMU)** | 3.7 - `py scripts/fs_unplug.py` 8/0. The stick is pulled with `churn` writing; no panic, no wedge, reported 12.5 s after the unplug and no stale content served. On riscv64 because QEMU's AHCI refuses `device_del` outright - USB is the only bus that can be unplugged, and the more honest one. |
 | A destructive op whose REPLY is lost, then retried | **`fs-dupop` 5/0** | 3.5. Found a live gap: a succeeded `move` reported as failed. Fixed at the client |
 | Power cut on a drive with a VOLATILE WRITE CACHE | **`fs-cache` 8/0** | 3.3. The first suite to cut a medium that had not yet committed what it acknowledged |
 | Power cut on a drive that IGNORES the barrier | **`fs-lyingflush` 7/0** | 3.3 / 6.1's unguaranteed case. Asserts detection, not recovery |
-| Interrupted recovery | PARTIAL (QEMU) | 3.8 - recovery RUNS on 35 of 75 tear points (measured) and lands inside the permitted set every time. Plus `fs-window` 8/0 (a real machine kill inside the commit window, recovered) and `fs-churn` 8/0 (a cut at an unchosen moment). Crashing DURING recovery is still not covered |
+| Interrupted recovery | **PASSES (QEMU)** | 3.8 - recovery RUNS on 35 of 75 measured tear points and lands inside the permitted set every time; `fs-window` 8/0 (a real machine kill inside the commit window) and `fs-churn` 9/0 (a cut at an unchosen moment). And now `fs-rtear` 5/0: the SECOND-ORDER tear, cutting the REPLAY itself at every sector it writes. 4 of 5 cuts made recovery re-run, so replay is re-entrant rather than one-shot - which is what a redo journal's idempotence claims and what nothing had checked. |
 | Corruption and format validation | PASS (QEMU) | `fs-corrupt` 14/0, `fs-hostile` 6/0, `fs-fuzz` 83/0, `fs-compat` 12/0. Gaps named in 3.9 |
 | Observability-unavailable | NOT APPLICABLE | 3.10 - `fs` logging does not route through any service; `CLAUDE.md` 11.4 |
 | Cross-ISA QEMU image tests | **PASSES (QEMU)** | 3.11 - `py scripts/cross_isa.py` 12/0. One volume, x86-64 (AHCI) -> riscv64 (USB BOT/SCSI) -> x86-64: each side reads the other's files and `drives check` reports 0 bad on both. aarch64 and arm32 remain unreachable in QEMU (no VL805 emulation; the arm32 stick re-enumerates) and are a hardware job. |
-| Physical-hardware validation | PARTIAL (1 of 5 boards), journal half CLOSED | Dell Wyse 5070, 2026-09-18: `selfcheck` 492/0 on a 30 GB SSD. A power cut during `churn` landed INSIDE the commit-to-checkpoint window: the next mount reported `journal recovered 4 block(s) from an interrupted write`, and `churn verify` then found 6 files, NONE torn. `drives check` then reported `0 bad` and `nothing was repaired`, with the free count identical to the one the recovery mount computed - so both the content and the structural question are answered, and the structural one in its strong form. Recovery on silicon is proven (§3.12). Three earlier cuts had survived cleanly without ever invoking the journal, which proved consistency and not recovery. Still open: four boards |
+| Physical-hardware validation | **selfcheck: PASSES on 5 of 5.** Power cut: 1 of 5 | TWO DIFFERENT TESTS, and this row used to conflate them. **`selfcheck` passed on all five boards 2026-09-21** - Wyse, T630, Pi 4 and VisionFive at 502/0/0 twice each, Pi 2 at 493/0/1 three times, the skip being the PCI it does not have (3.12). **The POWER CUT is the half that is 1 of 5**: Dell Wyse 5070, 2026-09-18, a cut during `churn` landed inside the commit-to-checkpoint window, the next mount reported `journal recovered 4 block(s) from an interrupted write`, `churn verify` found 6 files NONE torn, and `drives check` reported `0 bad` with nothing repaired and a free count identical to the recovery mount's. Recovery on silicon is proven - on ONE backend. The four boards still open are open because their BACKENDS differ, which is the whole point: the Pi 2's stick refuses `SYNCHRONIZE CACHE`, so 6.1 records `fs` as restartable but NOT crash-recoverable there, and that claim has never been put to a machine. |
 | Kernel changes / scope boundary review | PASS | No kernel source change on this branch. `osdev build` runs 20 commandment checks and 73 redteam probes, including the kernel module set against 4.3 |
 
 **Merge rule adopted:** do not merge until the required gates pass, genuinely inapplicable gates are

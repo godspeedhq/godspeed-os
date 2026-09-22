@@ -5244,7 +5244,8 @@ static HELP: &[HelpRow] = &[
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
     Row("background copy <src> <dst>", "start a long copy detached; the prompt comes straight back"),
     Row("background delete <path> recursive", "remove a whole subtree detached"),
-    Row("background drives check", "scrub the volume detached; foreground replays what it said"),
+    Row("background drives check", "check the volume detached; foreground replays the verdict"),
+    Row("background drives scrub", "read-only CRC sweep detached; foreground replays the verdict"),
     Row("background churn <seconds>", "sustained write traffic detached, so the prompt stays usable"),
     Row("jobs", "what `background` started: id, state, progress (a producer - pipe it)"),
     Row("jobs quit <job>", "stop a job without attaching to it"),
@@ -14289,7 +14290,114 @@ fn cmd_fcap_help(ctx: &ServiceContext) {
     ctx.console_writeln("  - revocable: the cap goes stale on close and on rename (no silent rebind)");
     ctx.console_writeln("It takes no path and never touches your files. See CLAUDE.md 7.10 / Test 14.");
 }
+/// `fcap reuse` - THE STALE-HANDLE QUESTION THAT `fcap` CANNOT ASK: does a file capability
+/// minted before an `fs` restart reach whatever occupies its blocks afterwards?
+///
+/// **Why this needs its own command.** A capability cannot outlive the function that holds it here:
+/// the shell keeps no cap table of its own between commands, so an `fcap` at one prompt and a
+/// `kill fs` at the next would drop the handle before the interesting moment. The whole scenario -
+/// mint, restart, reuse, re-invoke - has to happen inside one command, which is what this is.
+///
+/// **What it proves, and what would be catastrophic.** `fs` mints a delegated resource capability
+/// per open (§7.10) and holds the `ResourceId -> file` map IN MEMORY. A restart empties that map
+/// and bumps the endpoint's generation, so every outstanding file cap should go stale. If one did
+/// NOT - if a `ResourceId` were reissued to a different file after the restart - the old holder
+/// would read a file it was never granted, through a capability the kernel still considers valid.
+/// That is not a leak of space, it is a leak of AUTHORITY, and nothing in a listing or an fsck
+/// would show it.
+///
+/// The sequence deliberately puts a DIFFERENT file in the same blocks: delete the original and
+/// write a replacement of the same size, so the allocator hands out the extent that was just freed.
+/// A stale cap that still resolved would then return the new file's bytes, and the test asserts
+/// exactly that text never comes back.
+fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
+    const OLDP: &[u8] = b"/ru_old.txt";
+    const NEWP: &[u8] = b"/ru_new.txt";
+    let mut ok = true;
+
+    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
+    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    if !matches!(fs_request(ctx, OP_WRITE_FILE, OLDP, b"OLDDATA").as_ref()
+                   .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+        ctx.console_writeln("fcap reuse: FAIL - could not create the original");
+        return Err(ShellError::Unknown);
+    }
+
+    let held = match fc_open(ctx, OLDP, RIGHT_READ) {
+        Some(c) => c,
+        None => { ctx.console_writeln("fcap reuse: FAIL - could not open the original as a cap"); return Err(ShellError::Unknown); }
+    };
+    // Prove the cap WORKS before the restart, or a later refusal proves nothing: a handle that was
+    // never valid is refused for the wrong reason and the test would pass while testing nothing.
+    let mut rbuf = [0u8; 1 + 8 + 4];
+    rbuf[0] = FOP_READ;
+    rbuf[9..13].copy_from_slice(&7u32.to_le_bytes());
+    match fc_invoke(ctx, held, RIGHT_READ, &rbuf) {
+        Some(r) if r.payload_bytes().len() >= 12 && &r.payload_bytes()[5..12] == b"OLDDATA" =>
+            ctx.console_writeln("fcap reuse: the cap reads the original before the restart"),
+        _ => { ctx.console_writeln("fcap reuse: FAIL - the cap did not read the original"); ctx.remove_cap(held); return Err(ShellError::Unknown); }
+    }
+
+    // RESTART `fs` UNDER THE HELD CAP.
+    ctx.console_writeln("fcap reuse: killing fs with the cap still held");
+    if ctx.kill("fs").is_err() {
+        ctx.console_writeln("fcap reuse: FAIL - could not kill fs");
+        ctx.remove_cap(held);
+        return Err(ShellError::Unknown);
+    }
+    // Wait on the TRUTH: `fs` answering again, not a fixed sleep (Commandment VIII).
+    let mut back = false;
+    for _ in 0..40 {
+        let _ = ctx.reacquire_by_name("fs");
+        if fs_request(ctx, OP_STAT_FILE, b"/", &[]).is_some() { back = true; break; }
+        ctx.yield_cpu();
+    }
+    if !back {
+        ctx.console_writeln("fcap reuse: FAIL - fs never came back");
+        ctx.remove_cap(held);
+        return Err(ShellError::Unknown);
+    }
+
+    // FREE THE BLOCKS, THEN PUT SOMETHING ELSE IN THEM. Same length, so the allocator is offered
+    // the extent it just reclaimed.
+    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
+    if !matches!(fs_request(ctx, OP_WRITE_FILE, NEWP, b"NEWDATA").as_ref()
+                   .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+        ctx.console_writeln("fcap reuse: FAIL - could not write the replacement");
+        ctx.remove_cap(held);
+        return Err(ShellError::Unknown);
+    }
+
+    // THE QUESTION. The old capability must not resolve to anything - and above all must not
+    // return the REPLACEMENT's bytes.
+    match fc_invoke(ctx, held, RIGHT_READ, &rbuf) {
+        None => ctx.console_writeln("fcap reuse: the stale cap is refused after the restart"),
+        Some(r) => {
+            let p = r.payload_bytes();
+            if p.len() >= 12 && &p[5..12] == b"NEWDATA" {
+                ctx.console_writeln("fcap reuse: FAIL - THE STALE CAP READ THE REPLACEMENT FILE");
+                ok = false;
+            } else if p.first() == Some(&FS_OK) {
+                ctx.console_writeln("fcap reuse: FAIL - the stale cap still resolved to something");
+                ok = false;
+            } else {
+                ctx.console_writeln("fcap reuse: the stale cap was refused by fs after the restart");
+            }
+        }
+    }
+
+    ctx.remove_cap(held);
+    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    if ok {
+        ctx.console_writeln("fcap reuse: ok - a capability minted before the restart reaches nothing after it");
+        Ok(())
+    } else {
+        Err(ShellError::Unknown)
+    }
+}
+
 fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    if arg.trim() == "reuse" { return cmd_fcap_reuse(ctx); }
     if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
     if !arg.trim().is_empty() {
         ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");

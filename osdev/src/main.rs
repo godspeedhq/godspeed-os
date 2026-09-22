@@ -1459,6 +1459,8 @@ fn cmd_test(suite: &str) {
         "fs-dupop"       => run_fs_dupop_test(),
         "fs-lostreq"     => run_fs_lostreq_test(),
         "fs-twoclient"   => run_fs_twoclient_test(),
+        "fs-rtear"       => run_fs_rtear_test(),
+        "fs-reuse"       => run_fs_reuse_test(),
         "jobs"           => run_jobs_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
@@ -2909,6 +2911,8 @@ fn run_fs_all_tests() {
         // written down in `docs/persistence.md` 6.18.
         "fs-twoclient",
         "fs-metafull",
+        "fs-reuse",
+        "fs-rtear",
         // Job control. It lives in this sweep rather than beside the shell suites because it
         // is disk-backed - it copies 5.2 MiB, deletes a subtree, and its real assertions are
         // filesystem ones: fsck finds nothing to repair after a copy, after a CANCELLED copy,
@@ -3290,6 +3294,45 @@ fn run_fs_tear_test() {
     crate::shell_test::run_fs_tear(&tapped, &image_path, persist, 4);
 }
 
+fn run_fs_rtear_test() {
+    println!("\n=== fs: CRASHING DURING RECOVERY - cut the replay itself (carnage 3.8)"); println!("=== (was: TORN WRITES - every prefix of one operation's writes, booted (carnage 3.1) ===");
+    // TWO IMAGES, and the reason is that one of them was corrupting its own measurement.
+    //
+    // `write-tap` logs every sector written - eight lines of serial per sector - which is exactly
+    // what the RECORDING boot needs and pure noise during the REPLAYS. It is not harmless noise:
+    // under that load the kernel splices one log line into another (a known defect), so a
+    // `drives check` verdict came back with a `btap` line spliced INTO the middle of it and the
+    // oracle's phrase match failed. Three tear points were reported as filesystem defects when the
+    // filesystem was correct and the instrument had mangled its own evidence.
+    //
+    // `services/fs` states the principle this broke, about its own metrics: "an observer that
+    // changes the thing it observes is not an observer".
+    //
+    // So: a TAPPED image to record with, and a PLAIN one to replay on. The replays are faster for
+    // it too, which is most of the suite's wall clock.
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    let limine_dir = std::path::Path::new("tools/limine");
+    let _ = std::fs::create_dir_all("build/tests");
+
+    build_blockdev_fs("selftest", "write-tap");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let tapped = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-tapped.img"));
+    disk_image::install_bootloader(limine_dir, &tapped);
+
+    build_blockdev_fs("selftest", "");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let persist = "build/tests/persist_fs_rtear.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // The file the operation overwrites. Baked host-side so its OLD content is known exactly, which
+    // is what makes "wholly old or wholly new" a decidable question rather than a judgement.
+    gsfs_add_file(persist, "tear.txt", b"ORIGINAL");
+
+    crate::shell_test::run_fs_rtear(&tapped, &image_path, persist, 4);
+}
+
 fn run_fs_fuzz_test() {
     println!("
 === fs: adversarial - hostile paths, names, and limits (Phase M) ===");
@@ -3461,6 +3504,22 @@ fn run_fs_lyingflush_test() {
 }
 
 /// Carnage §3.4: exhaustion reached through DIRECTORY GROWTH rather than one large file.
+fn run_fs_reuse_test() {
+    println!("\n=== fs: a file capability across an `fs` RESTART (stale-handle / block reuse) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_reuse.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    crate::shell_test::run_fs_reuse(&image_path, persist, 4);
+}
+
 fn run_jobs_test() {
     println!("\n=== shell: background / jobs / foreground, against a real disk ===");
     build_blockdev_fs("selftest", "");
