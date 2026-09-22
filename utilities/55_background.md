@@ -68,7 +68,7 @@ it sorts the candidates cleanly:
 | `drives check` | **yes** | one `fs` request, and its report lives in the transcript (§4a) until asked for |
 | `drives scrub` | **yes** | the same shape as `check` - one request, one verdict - which is what made it nearly free |
 | `churn <seconds>` | **yes** | the effect is thousands of transactions on disk. It is also the command somebody most wants the prompt back during: it holds the console for its whole run, so a ten-minute churn is ten minutes of a blind machine |
-| `selfcheck`, `chaos`, `run` | no | **not an output problem.** These drive other shell built-ins through the shell's own dispatch; a service cannot call into it, and there is one console input ring with one reader. Detaching them would mean reimplementing the shell inside the job |
+| `selfcheck`, `chaos`, `run` | **no, permanently** | **not an output problem.** These drive other shell built-ins through the shell's own dispatch; a service cannot call into it, and there is one console input ring with one reader. See §3a - the obvious way to make them detach was designed, costed and REJECTED |
 | `find` | not yet | the shell walks directories itself, so the service would need that walk. The transcript already solves its other half |
 | `copy <src> <dst> recursive` | no | an interrupted WALK leaves a prefix of a tree - a different permitted-outcome question, and one nothing here answers |
 | `delete <path>` (no `recursive`) | no | one metadata edit; it would be over before `jobs` could list it |
@@ -111,6 +111,31 @@ different crates that deliberately do not share headers - and if those two expre
 disagreed, `churn verify` would report `NONE torn` while no longer able to recognise a tear at all.
 A safety check that passes because it broke is worse than no check, because somebody trusts it. So
 the pattern moved to the SDK, where there is one of it and both sides name the same function.
+
+## 3a. NOT ALL COMMANDS ARE BACKGROUNDABLE, and that is the settled answer
+
+This is worth stating flatly, because the shape of the feature invites the opposite assumption: that
+the list above is a work queue and everything reaches it eventually. It is not.
+
+The obvious way to detach `selfcheck` and `run` is to spawn a SECOND, throwaway shell to run them
+and capture its output. That was designed and costed - about two days, and none of it hard - and
+then **rejected on security**, which is `backlog/41`:
+
+A service whose job is to execute whatever command arrives on its endpoint must hold the authority
+to execute ANY command. Its power is then exercisable by **whoever can send to it**, rather than by
+whoever is at the console. That is a confused deputy: it acts on instructions without being able to
+know whether the instructor was entitled to what is being asked. And the protection degrades from a
+property of the SERVICE (it holds `fs` and nothing else, true no matter what else changes) to a
+property of the whole GRANT TABLE (it holds everything, and nobody dangerous can currently reach it
+- one grant away from false, with nothing failing when it becomes false).
+
+It is also the exact failure the capability model exists to prevent: authority flowing from IDENTITY
+rather than from possession, which is invariant 3.
+
+So the honest statement is not "these cannot detach yet". It is: **a command whose execution needs
+the shell's own authority cannot become a background job without giving that authority to a service
+that takes orders, and that trade is refused.** `find` is the one genuine "not yet" in the table
+above - it needs a directory walk and nothing more.
 
 **A recursive delete shows no percentage, and does not invent one.** `fs` owns the walk, so nothing
 here can say how far it has got. The column shows `-`; `0%` would read as stuck and `100%` as
