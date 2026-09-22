@@ -511,6 +511,24 @@ SECTION_REF = re.compile(r"\(?§\s*[0-9]+(\.[0-9]+)*\)?|\bsection\s+[0-9]+(\.[0-
 # A line that reports a past run or names a date is evidence, not a claim about now.
 HISTORICAL = re.compile(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}|Verified:|verified on|Amendment|was\b.*\bnow\b")
 
+# ...EXCEPT a line that declares the CURRENT STATE and happens to date it. That is not evidence about
+# the past, it is a claim about now wearing a date, and it is the single construct most likely to go
+# stale - which made it the worst possible thing to exempt.
+#
+# Found by drift this gate was written to catch and did not: `docs/gsfs-carnage.md` opened with
+#
+#     **Status, as of 2026-09-21.** `osdev test fs-all` runs **30 suites** and all 30 pass together
+#
+# while SUITES held 33. The suite-count fact has a pattern that matches `runs **30 suites**`
+# perfectly; it never ran, because the date earlier in the same line sent the whole line to
+# HISTORICAL. A checker that is silent because it declined to look is worse than no checker: it is
+# the reassurance without the check, which is what `backlog/32` exists to prevent.
+#
+# So a status line is read like any other. The exemption keeps its real job - amendments, dated
+# verification notes, "was X, now Y" - and loses the one case where a date meant the opposite of
+# historical.
+STATUS_CLAIM = re.compile(r"\*\*\s*Status\b|^\s*Status[ ,:]|\bStatus,? as of\b", re.I)
+
 
 def main():
     import glob
@@ -534,7 +552,7 @@ def main():
             if not text:
                 continue
             for line_no, line in enumerate(text.split("\n"), 1):
-                if HISTORICAL.search(line):
+                if HISTORICAL.search(line) and not STATUS_CLAIM.search(line):
                     continue
                 line = SECTION_REF.sub(" ", line)
                 for pat in pats:

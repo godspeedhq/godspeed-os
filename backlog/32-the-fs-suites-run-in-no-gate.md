@@ -1,6 +1,7 @@
 # 32. The `fs` suites run in no gate, and two of them were red
 
-**Status: `osdev test fs-all` runs 30 suites in ~41 minutes, 30 of 30 green (2026-09-21), and
+**Status: `osdev test fs-all` runs 33 suites in ~60 minutes, last full green 33 of 33
+(2026-09-22, re-run after the journal-reporting change), and
 `.github/workflows/storage.yml` runs it in CI. ONE THING REMAINS OPEN, and it is not technical: that
 workflow is `workflow_dispatch` only, because push triggers across this project are deliberately
 paused to conserve CI minutes.**
