@@ -4958,6 +4958,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("background delete <path> recursive", "remove a whole subtree detached", "background delete /old recursive"),
             ("background drives check", "check the volume detached; `foreground` replays the verdict", "background drives check"),
             ("background drives scrub", "read-only CRC sweep, detached", "background drives scrub"),
+            ("background churn <seconds>", "sustained write traffic, detached - the prompt stays yours", "background churn 300"),
             ("jobs", "what exists and what state it is in", "jobs"),
             ("foreground <job>", "attach the console to it again", "foreground 1"),
             ("what can detach?", "commands whose value is an EFFECT; a job holds no console, so reports cannot", "background copy /a /b"),
@@ -5244,6 +5245,7 @@ static HELP: &[HelpRow] = &[
     Row("background copy <src> <dst>", "start a long copy detached; the prompt comes straight back"),
     Row("background delete <path> recursive", "remove a whole subtree detached"),
     Row("background drives check", "scrub the volume detached; foreground replays what it said"),
+    Row("background churn <seconds>", "sustained write traffic detached, so the prompt stays usable"),
     Row("jobs", "what `background` started: id, state, progress (a producer - pipe it)"),
     Row("jobs quit <job>", "stop a job without attaching to it"),
     Row("foreground <job>", "attach to a job again; q stops it, b detaches it"),
@@ -7904,7 +7906,8 @@ fn build_jobs_table(ctx: &ShellCtx) -> Table {
         let command = t.intern(&cmd[..clen]);
         let src = t.intern(&r.src[..r.slen]);
         let dst = t.intern(&r.dst[..r.dlen]);
-        let pct = if r.kind != KIND_COPY || r.total == 0 { 0 } else { r.copied * 100 / r.total };
+        let pct = if (r.kind != KIND_COPY && r.kind != KIND_CHURN) || r.total == 0 { 0 }
+                  else { r.copied * 100 / r.total };
         t.add_row(&[
             Value::Int(r.id as u64), state, command, Value::Int(pct),
             Value::Int(r.copied), Value::Int(r.total), src, dst,
@@ -7930,6 +7933,7 @@ fn job_command(r: &JobRow, out: &mut [u8; 2 * PATH_MAX + 32]) -> usize {
     let _ = match r.kind {
         KIND_CHECK => write!(sink, "drives check"),
         KIND_SCRUB => write!(sink, "drives scrub"),
+        KIND_CHURN => write!(sink, "churn {}", r.total),
         KIND_DELETE_TREE => write!(sink, "delete {} recursive", str_of(&r.src[..r.slen])),
         _ => write!(sink, "copy {} {}", str_of(&r.src[..r.slen]), str_of(&r.dst[..r.dlen])),
     };
@@ -13929,23 +13933,11 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         let slot = (i % SLOTS as u64) as usize;
         let n = SIZES[(i as usize / SLOTS) % SIZES.len()];
         // SELF-DESCRIBING CONTENT, so a torn file can be DETECTED rather than merely suspected.
-        //
-        // Every byte encodes the generation that wrote it: `byte[k] = (gen + k) mod 251`. A file
-        // written wholly in one generation therefore satisfies that relation for every k, and a file
-        // holding a MIX of two generations breaks it at exactly the byte where the tear happened.
-        // `churn verify` reads byte 0 to learn the generation and then checks the rest.
-        //
-        // This is the half that was missing. `drives check` validates STRUCTURE - the tree, the
-        // bitmap, the CRCs - and nothing validated CONTENT, so a file left holding the first half of
-        // one write and the second half of another would have passed every check this project has.
-        // The permitted-outcome table says a whole-file `write` must be old-complete or new-complete
-        // and never a mix; until now nothing on hardware could tell.
-        //
-        // 251 is the largest prime under 256: a prime stride means the pattern does not align with
-        // the 508-byte block payload, so a tear on a block boundary still lands mid-pattern and is
-        // visible rather than looking like a continuation.
-        let gen = (i % 251) as u8;
-        for k in 0..n { buf[k] = gen.wrapping_add((k % 251) as u8) % 251; }
+        // The pattern, and the argument for it, live in `sdk::churn` - ONE definition shared by
+        // this writer and by `churn verify`, because if the two ever disagree the verifier reports
+        // "NONE torn" while no longer able to recognise a tear.
+        let gen = godspeed_sdk::churn::generation(i);
+        godspeed_sdk::churn::fill(&mut buf[..n], gen);
         let mut pl = 0usize;
         for &b in DIR { path[pl] = b; pl += 1; }
         path[pl] = b'/'; pl += 1;
@@ -14157,10 +14149,8 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         if n == 0 { empty += 1; continue; }
         // The generation is byte 0 by construction; every later byte is then predicted.
         let gen = data[0];
-        let mut bad_at: Option<usize> = None;
-        for k in 0..n {
-            if data[k] != gen.wrapping_add((k % 251) as u8) % 251 { bad_at = Some(k); break; }
-        }
+        // Same source as the writer (`sdk::churn`), which is the whole point of it being there.
+        let bad_at = godspeed_sdk::churn::first_divergence(&data[..n]);
         if let Some(k) = bad_at {
             torn += 1;
             out.line_fmt(ctx, format_args!(
@@ -15553,6 +15543,7 @@ const KIND_COPY: u8 = 0;
 const KIND_DELETE_TREE: u8 = 1;
 const KIND_CHECK: u8 = 2;
 const KIND_SCRUB: u8 = 3;
+const KIND_CHURN: u8 = 4;
 
 /// EVERY DETACHABLE COMMAND, ONCE. The refusal message is BUILT from this, so it cannot advertise a
 /// set the dispatch does not accept - the previous version was a hand-written sentence with a
@@ -15566,6 +15557,7 @@ const DETACHABLE: &[&str] = &[
     "delete <path> recursive",
     "drives check",
     "drives scrub",
+    "churn <seconds>",
 ];
 
 /// The list as one line, for the refusal. Fixed buffer, no allocation.
@@ -15769,6 +15761,11 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         // transcript gives the answer somewhere to live until `foreground` asks for it.
         "drives" if argc >= 3 && args[2] == "check" => KIND_CHECK,
         "drives" if argc >= 3 && args[2] == "scrub" => KIND_SCRUB,
+        // `churn` detaches because its value is what it WRITES, and because it is the one command
+        // somebody wants the prompt back during: it holds the console for its whole duration today,
+        // so a ten-minute run is ten minutes of a blind machine. Only the DURATION form - `churn
+        // verify`, `tear` and `reset` are one-shot and stay at the prompt.
+        "churn" if argc >= 3 && args[2].parse::<u64>().is_ok() => KIND_CHURN,
         other => {
             ctx.console_writeln_fmt(format_args!(
                 "background: `{}` not supported for it runs inside the shell - a job runs as a detachable separate service.",
@@ -15779,7 +15776,9 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
             return Err(ShellError::Unknown);
         }
     };
-    if kind == KIND_CHECK || kind == KIND_SCRUB {
+    if kind == KIND_CHURN {
+        // No paths: the job owns /churn. The seconds ride as the trailing parameter.
+    } else if kind == KIND_CHECK || kind == KIND_SCRUB {
         // No paths: the job walks the whole volume.
     } else if kind == KIND_DELETE_TREE {
         // Only the RECURSIVE form is worth detaching: a plain delete is one quick metadata edit.
@@ -15812,7 +15811,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     let mut sbuf = [0u8; PATH_MAX];
     let mut slocal = [0u8; PATH_MAX];
     let mut slen = 0usize;
-    if kind != KIND_CHECK && kind != KIND_SCRUB {
+    if kind != KIND_CHECK && kind != KIND_SCRUB && kind != KIND_CHURN {
         let src = match resolve_or_err(ctx, cwd, args[2], &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
         slen = src.len();
         slocal[..slen].copy_from_slice(src);
@@ -15855,14 +15854,20 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     }
     let _ = ctx.reacquire_by_name("copier");
 
-    let mut req = [0u8; 4 + 2 * PATH_MAX];
+    let mut req = [0u8; 4 + 2 * PATH_MAX + 8];
     req[0] = CP_OP_START;
     req[1] = kind;
     req[2] = slen as u8;
     req[3..3 + slen].copy_from_slice(&slocal[..slen]);
     req[3 + slen] = dlen as u8;
     req[4 + slen..4 + slen + dlen].copy_from_slice(&dlocal[..dlen]);
-    let n = 4 + slen + dlen;
+    let mut n = 4 + slen + dlen;
+    // The trailing parameter: churn's duration. Kinds that take none send none.
+    if kind == KIND_CHURN {
+        let secs: u64 = args[2].parse().unwrap_or(30);
+        req[n..n + 8].copy_from_slice(&secs.to_le_bytes());
+        n += 8;
+    }
 
     let ok = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req[..n]), 12) {
         Some(r) => {
@@ -15977,7 +15982,7 @@ fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         // would read as stuck and "100%" as finished; both would be inventions.
         let mut cmd = [0u8; 2 * PATH_MAX + 32];
         let clen = job_command(r, &mut cmd);
-        if r.kind == KIND_COPY {
+        if r.kind == KIND_COPY || r.kind == KIND_CHURN {
             let pct = if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 };
             out.line_fmt(ctx, format_args!("{:<4} {:<8} {:>3}%      {}",
                 r.id, state_word(r.state), pct, str_of(&cmd[..clen])));

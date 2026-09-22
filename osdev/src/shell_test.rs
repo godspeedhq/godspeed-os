@@ -7061,7 +7061,8 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "the refusal leads with the REASON - this command runs inside the shell, and a job does not");
     check!(notacmd.contains("detachable services:") && notacmd.contains("drives check"),
            "the refusal LISTS WHAT WORKS - a reason is only useful if it tells you what to type instead");
-    check!(notacmd.contains("copy") && notacmd.contains("delete") && notacmd.contains("drives scrub"),
+    check!(notacmd.contains("copy") && notacmd.contains("delete") && notacmd.contains("drives scrub")
+           && notacmd.contains("churn"),
            "the advertised list names EVERY working verb - it is built from the same table the dispatch reads");
     let notselfcheck = run!(b"background selfcheck\r", 30).unwrap_or_default();
     check!(notselfcheck.contains("not supported") && notselfcheck.contains("selfcheck"),
@@ -7211,6 +7212,33 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     }
     let scr_replay = run!(b"foreground 5\r", 60).unwrap_or_default();
 
+    // ---- THE FIFTH KIND: churn, the one job with a REAL percentage that is not a byte count -
+    //      its bound is a duration, so elapsed-over-total is measured rather than invented.
+    //
+    //      THE POINT OF DETACHING IT is that the prompt stays usable: `churn` holds the console for
+    //      its whole run today, so a long one leaves the machine blind. The check below is exactly
+    //      that - an unrelated command answering while the churn writes.
+    let ch_start = run!(b"background churn 12\r", 60).unwrap_or_default();
+    let ch_table = run!(b"jobs\r", 60).unwrap_or_default();
+    let ch_busy = run!(b"dir /\r", 90).unwrap_or_default();
+    let mut ch_settled = false;
+    let mut ch_final = String::new();
+    for _ in 0..40 {
+        let _ = run!(b"wait 2\r", 60);
+        ch_final = run!(b"jobs\r", 60).unwrap_or_default();
+        if ch_final.contains("6    done") || ch_final.contains("6    failed") || ch_final.contains("6    lost") {
+            ch_settled = true;
+            break;
+        }
+    }
+    let ch_replay = run!(b"foreground 6\r", 60).unwrap_or_default();
+    // THE VERIFIER MUST STILL RECOGNISE WHAT THE SERVICE WROTE. This is the assertion the whole
+    // `sdk::churn` refactor exists for: the writer moved into another crate, and if its pattern had
+    // drifted from the shell's checker, `churn verify` would report NONE TORN while no longer able
+    // to see a tear at all.
+    let ch_verify = run!(b"churn verify\r", 120).unwrap_or_default();
+    let _ = run!(b"churn reset\r", 120);
+
     let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     child.kill().ok(); child.wait().ok();
     let _ = std::fs::write("build/tests/jobs_serial.log", &w);
@@ -7267,6 +7295,18 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "`foreground` replays the scrub's transcript");
     check!(scr_replay.contains("0 bad") && scr_replay.contains("director"),
            "the scrub verdict is rendered too - this is the one that exposed the pass-through bug");
+
+    check!(ch_start.contains("[backgrounded] job 6"), "`background churn <seconds>` starts a job");
+    check!(ch_table.contains("churn 12"), "`jobs` renders the churn job with its duration");
+    check!(ch_busy.contains("canary.txt"),
+           "THE PROMPT STAYS USABLE while churn writes - which is the whole reason to detach it");
+    check!(ch_settled, "the churn job reached a terminal state at its own deadline");
+    check!(ch_replay.contains("writes") && !ch_replay.contains("0 writes"),
+           "the churn job actually WROTE - a run reporting `done` with 0 writes is a job that achieved nothing");
+    check!(ch_replay.contains("renames") && !ch_replay.contains("0 renames"),
+           "and it RENAMED - writing only would exercise one transaction shape while claiming three");
+    check!(ch_verify.contains("NONE torn") && !ch_verify.contains("0 file(s) checked"),
+           "`churn verify` recognised what the detached writer wrote, over a NON-EMPTY set - `NONE torn` across zero files is the vacuous pass this refactor exists to prevent");
 
     println!("\njobs: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }

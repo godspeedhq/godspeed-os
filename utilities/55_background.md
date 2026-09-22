@@ -37,6 +37,7 @@ job 1 done
 | `background delete <path> recursive` | remove a whole subtree detached |
 | `background drives check` | check the volume detached; `foreground` replays the verdict |
 | `background drives scrub` | read-only CRC sweep, detached |
+| `background churn <seconds>` | sustained write traffic, detached - the prompt stays yours |
 | `jobs` | the table: id, state, progress, command |
 | `jobs quit <job>` | stop a job without attaching to it first |
 | `foreground <job>` | attach the console to a running job, or report a finished one |
@@ -66,6 +67,7 @@ it sorts the candidates cleanly:
 | `delete <path> recursive` | **yes** | `fs` does the whole walk in ONE operation, so the job is one request and a wait |
 | `drives check` | **yes** | one `fs` request, and its report lives in the transcript (§4a) until asked for |
 | `drives scrub` | **yes** | the same shape as `check` - one request, one verdict - which is what made it nearly free |
+| `churn <seconds>` | **yes** | the effect is thousands of transactions on disk. It is also the command somebody most wants the prompt back during: it holds the console for its whole run, so a ten-minute churn is ten minutes of a blind machine |
 | `selfcheck`, `chaos`, `run` | no | **not an output problem.** These drive other shell built-ins through the shell's own dispatch; a service cannot call into it, and there is one console input ring with one reader. Detaching them would mean reimplementing the shell inside the job |
 | `find` | not yet | the shell walks directories itself, so the service would need that walk. The transcript already solves its other half |
 | `copy <src> <dst> recursive` | no | an interrupted WALK leaves a prefix of a tree - a different permitted-outcome question, and one nothing here answers |
@@ -91,6 +93,24 @@ and `osdev test jobs` asserts the advertised list names every verb that works.
 Refusing is the honest answer rather than the incomplete one (§26.2: the preferred state of an
 unneeded feature is "not implemented; will be implemented when a test requires it"). `background
 chaos` in particular would be a storm nobody can watch or stop, which is worse than no answer.
+
+**CHURN HAS A REAL PERCENTAGE, and that sharpens the rule.** The column shows a number when
+something MEASURES it, not when the job happens to be a copy: churn's bound is a duration, so
+elapsed-over-total is measured. A finished churn reads `100%`, because the clock stops at the full
+duration rather than at the last second sampled before the deadline - a completed run sitting at
+`91%` reads as one that stopped short.
+
+**Only the duration form detaches.** `churn verify`, `churn tear` and `churn reset` are one-shot and
+stay at the prompt.
+
+**THE TEAR PATTERN LIVES IN `sdk::churn`, NOT IN EITHER CALLER.** Churn's whole purpose is that a
+torn file is detectable: every byte encodes the generation that wrote it (`byte[k] = (gen + k) mod
+251`), so a file holding a mix of two writes breaks the relation at the exact byte where the tear
+happened. Detaching churn put the WRITER in `services/copier` and left the CHECKER in the shell, in
+different crates that deliberately do not share headers - and if those two expressions ever
+disagreed, `churn verify` would report `NONE torn` while no longer able to recognise a tear at all.
+A safety check that passes because it broke is worse than no check, because somebody trusts it. So
+the pattern moved to the SDK, where there is one of it and both sides name the same function.
 
 **A recursive delete shows no percentage, and does not invent one.** `fs` owns the walk, so nothing
 here can say how far it has got. The column shows `-`; `0%` would read as stuck and `100%` as
@@ -240,6 +260,13 @@ and `drives check` acts, `events` is a producer and `events persist start` acts.
   name; two kinds of row would make the table mean two things.
 - **No detached subtree copy.** `background copy <dir> <dir>` is refused: an interrupted walk leaves
   a prefix of a tree, which is a different permitted-outcome question and one nothing here answers.
+- **No detached `run` or `selfcheck`.** Not an output problem: a `.gsh` script drives shell built-ins
+  through the shell's own dispatch, and no buffer helps with that.
+- **Applications do not need this.** An application IS a service, and `spawn <name>` already returns
+  immediately while it runs - `status`, `kill` and `restart` manage it. `background` exists only to
+  give shell BUILT-INS, which have no service of their own, somewhere to run. The real gap is that
+  `spawn` takes a name and nothing else, so an application cannot be given arguments or
+  invocation-scoped capabilities (`10_spawn.md` §5).
   Note that a detached recursive DELETE is fine for the opposite reason - `fs` performs that walk
   itself, in one operation, so this feature never holds a half-finished tree.
 - **No cancelling a running recursive delete.** It is one blocking `fs` request; a cancel arrives

@@ -73,6 +73,16 @@ pub const KIND_CHECK: u8 = 2;
 /// request, a verdict, and a transcript to put it in. It is here because that shape made it nearly
 /// free, not because somebody wanted a longer list.
 pub const KIND_SCRUB: u8 = 3;
+/// `churn <seconds>` - sustained write/rename/delete traffic so a power cut lands somewhere.
+///
+/// The one job kind with a REAL percentage that is not a byte count: its bound is a duration, so
+/// elapsed-over-total is a true measure rather than an invented one.
+///
+/// The content pattern is `sdk::churn`, NOT a copy of it. The shell's `churn verify` reads the same
+/// module, so a writer here and a checker there cannot drift - and if they did, verify would report
+/// "NONE torn" while no longer able to recognise a tear, which is a safety check that passes
+/// because it broke.
+pub const KIND_CHURN: u8 = 4;
 
 /// Job states, four words and no abbreviations (`docs/job-control-design.md` §6).
 pub const ST_IDLE: u8 = 0;
@@ -102,6 +112,9 @@ const FS_OP_DELETE: u8 = 16;
 const FS_OP_DELETE_TREE: u8 = 19;
 const FS_OP_CHECK: u8 = 27;
 const FS_OP_SCRUB: u8 = 29;
+const FS_OP_MKDIR: u8 = 13;
+const FS_OP_WRITE_FILE: u8 = 10;
+const FS_OP_RENAME: u8 = 15;
 const FS_OP_WRITE_NEW: u8 = 24;
 const FS_OP_WRITE_AT: u8 = 25;
 const FS_OP_READ_AT: u8 = 26;
@@ -193,6 +206,13 @@ struct Job {
     why: u8,
     kind: u8,
     out: Transcript,
+    /// Churn only: the iteration counter, and what it has managed so far. Reported at the end
+    /// because a load generator that says only "it ran" hides the case where it exercised one
+    /// transaction shape while claiming three - which is a bug this churn has actually had.
+    step: u64,
+    writes: u64,
+    renames: u64,
+    deletes: u64,
     src: [u8; PATH_MAX],
     slen: usize,
     dst: [u8; PATH_MAX],
@@ -210,6 +230,10 @@ impl Job {
             why: WHY_NONE,
             kind: KIND_COPY,
             out: Transcript::new(),
+            step: 0,
+            writes: 0,
+            renames: 0,
+            deletes: 0,
             src: [0u8; PATH_MAX],
             slen: 0,
             dst: [0u8; PATH_MAX],
@@ -474,6 +498,92 @@ fn copy_chunk(ctx: &ServiceContext, job: &mut Job) {
     }
 }
 
+/// One churn iteration: write a slot, and every fifth one rename it and delete the result.
+///
+/// ONE ITERATION PER LOOP PASS, for the reason a copy does one chunk: this service is
+/// single-threaded, and a job that did its whole run inside one call would answer no status and no
+/// cancel for its entire duration.
+///
+/// The mix is the shell's, deliberately: a whole-file write takes the journal path, while rename and
+/// delete move directory entries and free extents, which is where the interesting interrupted states
+/// live. Writing only files would exercise one transaction shape while claiming three.
+fn churn_step(ctx: &ServiceContext, job: &mut Job) {
+    const DIR: &[u8] = b"/churn";
+    const SLOTS: u64 = 8;
+    const SIZES: [usize; 4] = [64, 500, 1200, 3000];
+
+    let elapsed = (ctx.epoch_secs_monotonic() as u64).saturating_sub(job.started_at);
+    if elapsed >= job.total {
+        job.state = ST_DONE;
+        // THE CLOCK STOPS AT THE FULL DURATION. Without this the last figure recorded was the
+        // second before the deadline, so a finished churn sat at 91% - which reads as a run that
+        // stopped short rather than one that completed.
+        job.copied = job.total;
+        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+        let mut line = [0u8; 160];
+        let n = render_churn(&mut line, job);
+        job.out.write(&line[..n]);
+        return;
+    }
+    job.copied = elapsed;
+
+    let i = job.step;
+    job.step += 1;
+    let slot = (i % SLOTS) as usize;
+    let n = SIZES[(i as usize / SLOTS as usize) % SIZES.len()];
+
+    let mut buf = [0u8; 3000];
+    let gen = godspeed_sdk::churn::generation(i);
+    godspeed_sdk::churn::fill(&mut buf[..n], gen);
+
+    let mut path = [0u8; 32];
+    let mut pl = 0usize;
+    for &b in DIR { path[pl] = b; pl += 1; }
+    path[pl] = b'/'; pl += 1;
+    path[pl] = b'f'; pl += 1;
+    path[pl] = b'0' + slot as u8; pl += 1;
+    path[pl..pl + 4].copy_from_slice(b".bin");
+    pl += 4;
+
+    let mut sink = [0u8; 8];
+    if matches!(fs_call(ctx, FS_OP_WRITE_FILE, &path[..pl], &buf[..n], &mut sink), Fs::Ok(_)) {
+        job.writes += 1;
+    }
+
+    if i % 5 == 4 {
+        let mut np = [0u8; 32];
+        np[..pl].copy_from_slice(&path[..pl]);
+        np[pl - 4..pl].copy_from_slice(b".ren");
+        // OP_RENAME takes the NEW NAME, not a path: the slice starts after the final `/`, or every
+        // rename is refused for containing a slash and the run silently becomes writes-only.
+        let name_at = DIR.len() + 1;
+        if matches!(fs_call(ctx, FS_OP_RENAME, &path[..pl], &np[name_at..pl], &mut sink), Fs::Ok(_)) {
+            job.renames += 1;
+            if matches!(fs_call(ctx, FS_OP_DELETE, &np[..pl], &[], &mut sink), Fs::Ok(_)) {
+                job.deletes += 1;
+            }
+        }
+    }
+}
+
+/// What the run DID, not that it ran.
+fn render_churn(out: &mut [u8; 160], job: &Job) -> usize {
+    use core::fmt::Write as _;
+    struct Sink<'a> { buf: &'a mut [u8; 160], n: usize }
+    impl core::fmt::Write for Sink<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &c in s.as_bytes() {
+                if self.n < self.buf.len() { self.buf[self.n] = c; self.n += 1; }
+            }
+            Ok(())
+        }
+    }
+    let mut sink = Sink { buf: out, n: 0 };
+    let _ = write!(sink, "churn: {} writes, {} renames, {} deletes in {}s\n",
+                   job.writes, job.renames, job.deletes, job.total);
+    sink.n
+}
+
 /// Render a check/scrub verdict into the transcript. Numbers in, one line out.
 ///
 /// `write!` into a fixed array rather than digit-by-digit arithmetic: `format_args!` does not
@@ -568,6 +678,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         reply_op(&ctx, op_code, CP_ERR);
                         continue;
                     }
+                    // A TRAILING u64 PARAMETER, read only by the kinds that take one. Appending it
+                    // rather than threading it through every kind's fields keeps the kinds that
+                    // have no parameter unchanged.
+                    let pend = 4 + slen + dlen;
+                    let param = if p.len() >= pend + 8 {
+                        u64::from_le_bytes([p[pend], p[pend + 1], p[pend + 2], p[pend + 3],
+                                            p[pend + 4], p[pend + 5], p[pend + 6], p[pend + 7]])
+                    } else { 0 };
                     let mut fresh = Job::new();
                     fresh.kind = kind;
                     fresh.slen = slen;
@@ -581,6 +699,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // rendering is deliberately the SUMMARY only - the per-block detail `fs` logs
                     // goes to the log floor as it always has, and duplicating it here would be a
                     // second copy of a truth that already has an owner (§26.4).
+                    if kind == KIND_CHURN {
+                        // Bounded by the caller's duration, and by this service's own ceiling: an
+                        // unbounded churn is a service that never stops writing to somebody's disk.
+                        fresh.total = if param == 0 || param > 3600 { 30 } else { param };
+                        fresh.state = ST_RUNNING;
+                        fresh.started_at = ctx.epoch_secs_monotonic() as u64;
+                        job = fresh;
+                        job.out.clear();
+                        job.out.write(b"churn: writing continuously - CUT THE POWER AT ANY POINT\n");
+                        let mut sink = [0u8; 8];
+                        let _ = fs_call(&ctx, FS_OP_MKDIR, b"/churn", &[], &mut sink);
+                        reply_op(&ctx, op_code, CP_OK);
+                        continue;
+                    }
+
                     if kind == KIND_CHECK || kind == KIND_SCRUB {
                         fresh.state = ST_RUNNING;
                         fresh.started_at = ctx.epoch_secs_monotonic() as u64;
@@ -770,8 +903,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
 
-        if job.state == ST_RUNNING && job.kind == KIND_COPY {
-            copy_chunk(&ctx, &mut job);
+        if job.state == ST_RUNNING {
+            match job.kind {
+                KIND_COPY => copy_chunk(&ctx, &mut job),
+                KIND_CHURN => churn_step(&ctx, &mut job),
+                _ => {}
+            }
         }
     }
 }
