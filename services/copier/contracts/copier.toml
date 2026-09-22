@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# `copier` - copies one file, detached from the prompt, so a long copy does not own the console.
+#
+# NOT SPAWNED AT BOOT. The shell starts it on `background copy <src> <dst>` and it idles until told
+# what to copy - the same shape as `recorder` (`events persist start`), and for the same reason: a
+# service absent from the kernel's managed lists keeps this a zero-kernel-change feature.
+#
+# It is deliberately NOT restarted on death. A respawned copier would not know what it was copying,
+# so it would be alive and copying nothing while `jobs` said `running` - worse than dead. The shell
+# sees the death as the job failing, which is the truth.
+#
+# WHAT IT CANNOT DO IS THE POINT. No `console_push`, so a detached job cannot write over a prompt
+# somebody is typing at - not by convention, but because it holds no cap that reaches the console.
+# No `spawn`, no `reboot`, no network. `fs` is its whole reach, which is strictly less than the
+# shell's own authority - the thing that would be handed to a job that ran inside the shell's loop.
+name    = "copier"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+ipc_receive = ["copier"]
+# `fs` - both ends of the copy. The source is read and the destination written through the same
+# service, so the job needs exactly one peer.
+ipc_send    = ["fs"]
+log_write   = true

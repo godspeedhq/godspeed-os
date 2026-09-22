@@ -563,7 +563,7 @@ fn stack_fit_check(services: &[&str]) {
 /// records: a MISSING binary is caught by a guard, and a STALE one is not, because a stale file is
 /// not missing. `scripts/embed_order_check.py` catches the ordering; nothing caught the omission.
 const SERVICE_CRATES: &[&str] = &[
-    "events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
+    "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
     "resource-server", "holder",
@@ -1459,6 +1459,7 @@ fn cmd_test(suite: &str) {
         "fs-dupop"       => run_fs_dupop_test(),
         "fs-lostreq"     => run_fs_lostreq_test(),
         "fs-twoclient"   => run_fs_twoclient_test(),
+        "jobs"           => run_jobs_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
         "cross-isa"      => run_cross_isa_test(),
@@ -2908,6 +2909,12 @@ fn run_fs_all_tests() {
         // written down in `docs/persistence.md` 6.18.
         "fs-twoclient",
         "fs-metafull",
+        // Job control. It lives in this sweep rather than beside the shell suites because it
+        // is disk-backed - it copies 5.2 MiB, deletes a subtree, and its real assertions are
+        // filesystem ones: fsck finds nothing to repair after a copy, after a CANCELLED copy,
+        // and after a detached recursive delete. A suite that sits outside "every fs suite" is
+        // precisely the rot `backlog/32` is about.
+        "jobs",
         // §3.7 and §3.11, and the two that are NOT x86: both drive riscv64, so both live in
         // `scripts/`. Last because each builds a second kernel before it boots anything.
         "fs-unplug",
@@ -3454,6 +3461,28 @@ fn run_fs_lyingflush_test() {
 }
 
 /// Carnage §3.4: exhaustion reached through DIRECTORY GROWTH rather than one large file.
+fn run_jobs_test() {
+    println!("\n=== shell: background / jobs / foreground, against a real disk ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_jobs.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    // ONE large file and room to copy it. 32768 blocks, ~138 for superblock/bitmap/journal/root:
+    // a 10,865-block source plus its copy is about 21,730, which leaves the volume comfortable.
+    // The size matters for what it proves - the copy streams in 3556-byte chunks, so this is
+    // roughly 1,550 round trips rather than one.
+    let filler = vec![0xA5u8; 10_865 * 508];
+    gsfs_add_file(persist, "fill3.bin", &filler);
+    crate::shell_test::run_jobs(&image_path, persist, 4);
+}
+
 fn run_fs_metafull_test() {
     println!("\n=== fs: a DIRECTORY that runs out of room (§3.4) ===");
     build_blockdev_fs("selftest", "");

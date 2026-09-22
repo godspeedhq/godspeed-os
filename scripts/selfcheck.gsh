@@ -1028,6 +1028,15 @@ if churn 4 {
     skip 'churn - no storage to churn on this machine; not a failure'
 }
 
+# ===== job control (utilities/55_background.md; backlog/40 on why this is short) =====
+echo ''
+echo '===== job control: background / jobs / foreground ====='
+assert fails background selfcheck
+assert fails foreground 99
+assert fails jobs quit 99
+background drives scrub
+jobs | assert contains 'drives scrub'
+
 # ===== cleanup: proves delete + delete recursive =====
 echo ''
 echo '===== cleanup: proves delete + delete recursive ====='

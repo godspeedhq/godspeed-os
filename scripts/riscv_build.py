@@ -57,7 +57,7 @@ TARGET = "riscv64imac-unknown-none-elf"
 # it because no non-x86 build asks for `probe` at all, which is a different statement with a different
 # fix. riscv64 bodies are genuinely missing, and what that costs is recorded in `backlog/24`.
 SERVICES = [
-    "events", "recorder", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
+    "events", "recorder", "copier", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
     # `hw-enumerator` joins the build now that this arch answers `pci_cfg_read32`. It was absent
     # because the seam member returned None unconditionally, so the service had nothing to enumerate
     # WITH - not because the board has no PCI (QEMU `virt` has a generic host bridge and this port

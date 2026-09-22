@@ -1,7 +1,9 @@
 # Job control: `jobs`, `background`, `foreground` - work that outlives the prompt
 
-**Status:** **DESIGN ONLY - nothing here is built.** Written before any code so the structural
-decision below can be argued with rather than discovered. Trails `CLAUDE.md`; does not amend it.
+**Status:** **BUILT** (`osdev test jobs`, 25/0, QEMU with a real disk). Written before any code so
+the structural decision below could be argued with rather than discovered; kept as written, with a
+section 9 recording what the building changed. Trails `CLAUDE.md`; does not amend it. The as-built
+reference is `utilities/55_background.md`.
 
 **WHY THIS IS IN `docs/` AND NOT `utilities/`, because the enforcement layer taught it.** It was
 written as a numbered spec under `utilities/` first, and `scripts/commandments.py` refused the
@@ -164,3 +166,55 @@ before somebody is surprised by it: **a detached job's output is exactly what a 
 see by waiting for a prompt**, because the prompt comes back immediately. Assertions go on `jobs`
 rows and on the job's effect (the copied file), never on output arriving at a particular moment -
 which is the trap `54_scrollback.md` 6 records, in a different disguise.
+
+---
+
+## 9. What building it changed
+
+The design above is kept as it was argued. This section records where reality differed, so a reader
+can see which parts survived contact and which did not.
+
+**§4's choice was right and its capability argument was overstated.** A background job IS a spawned
+service (`services/copier`), and the three mechanical reasons hold exactly as written: `q` is a
+service cancel, the shell's stack does not grow, and a faulting job is a faulting service rather
+than a faulting shell. What does NOT hold is the sentence about minting a READ cap for the source
+and a WRITE cap for the destination and handing over exactly those. **The shell's `spawn` takes a
+name and nothing else** - per-invocation capability delegation is future work, named as such in
+`utilities/10_spawn.md` §5 - so the job's bound is its CONTRACT's (`fs`, entire) rather than the two
+paths'. It is still strictly less than the alternative: a job running inside the shell's loop would
+hold the shell's own authority, including `spawn` and `reboot`. The claim is narrowed, not dropped,
+and `55_background.md` §4 carries the narrowed version.
+
+**§5's open question answered itself: option 1, and it costs nothing.** A detached job writes no
+output at all, because the service holds no `console_push` capability. "A background job must never
+write to the console unasked" stopped being a rule to obey and became a thing it cannot do. Progress
+is polled through `STATUS` when somebody asks for it, so there is no buffer to bound and no `save`
+to compose. Options 2 and 3 remain available if a job ever needs a transcript.
+
+**§6's eight slots and four states shipped unchanged**, plus a fifth the design did not anticipate:
+**`lost`**. `copier` is deliberately not restarted on death, so a service that dies mid-job leaves a
+row the shell believes is running. `failed` would claim knowledge of a failure nobody observed, and
+leaving it `running` would be a row that never changes again. `lost` says the job did not finish and
+how far it got is unknown, which is the only true statement available.
+
+**§8's warning was worth writing down in advance, and the suite still fell into a cousin of it.**
+The assertions do sit on the table and on the job's effect, never on output arriving at a chosen
+moment. But the first run waited for the marker `cancel` and then asserted on `[b] background` -
+text the wait had deliberately stopped before. Same lesson one level down: what a test WAITS for
+decides what it is allowed to assert.
+
+**Two findings from running it that the design did not foresee:**
+
+1. **A slow filesystem was reported as a failed write.** A `drives check` held `fs` for 6.2 seconds,
+   the copier's 5-second deadline passed, and the job died saying "writing the destination failed" -
+   pointing at the disk when the truth was contention. `Slow` and `Failed` are now different facts
+   in the service, and only the two positionally-idempotent operations (`READ_AT`, `WRITE_AT` at a
+   fixed offset into an already-allocated extent) may be re-sent. That is deliberately NOT the
+   `op_is_mutating` rule the shell applies to `rename`/`move`/`delete`, where a re-send can report
+   failure for work that succeeded (carnage §3.5); the difference is that a positional overwrite
+   does not depend on state the first attempt may have changed.
+2. **A scrub during a copy correctly reports blocks it cannot verify.** `fs` allocates the whole
+   extent up front, so the unwritten tail has no CRC yet and `drives check` refuses it. That is this
+   document's own "full-size file with an undefined tail" seen from the fsck side. It is not a bug
+   and it is not silent, but it does mean a scrub and a running copy answer different questions and
+   should not be mixed. It is also why a cancelled or failed job deletes its destination.

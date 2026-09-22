@@ -417,6 +417,10 @@ pub struct ShellCtx {
     /// unknown and was deliberately not retried. Read by the handlers that report failures, so they
     /// say "unknown" rather than "failed" - the distinction carnage §3.5 is about.
     fs_unknown: core::cell::Cell<bool>,
+    /// The job table: what `background` started, what `jobs` lists, what `foreground` attaches to.
+    /// Owned here for the reason `pipe_stack_hwm` and `last_write_err` are - a module-level `static`
+    /// is the anonymous singleton invariant 9 forbids.
+    jobs: core::cell::RefCell<JobTable>,
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -446,6 +450,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         pipe_stack_hwm: core::cell::Cell::new(0),
         last_write_err: core::cell::RefCell::new(LastWriteErr::new()),
         fs_unknown: core::cell::Cell::new(false),
+        jobs: core::cell::RefCell::new(JobTable::new()),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -2017,6 +2022,17 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             if argc < 3 { ctx.console_writeln("usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
+        }
+        "background" => cmd_background(ctx, cwd, &args, argc),
+        "jobs"    => {
+            if argc >= 2 && args[1] == "quit" {
+                if argc < 3 { ctx.console_writeln("usage: jobs quit <job>"); Err(ShellError::Unknown) }
+                else { cmd_jobs_quit(ctx, args[2]) }
+            } else { cmd_jobs(ctx, out) }
+        }
+        "foreground" => {
+            if argc < 2 { ctx.console_writeln("usage: foreground <job>"); Err(ShellError::Unknown) }
+            else { cmd_foreground(ctx, args[1]) }
         }
         "churn"   => {
             if argc < 2 { ctx.console_writeln("usage: churn <seconds> | churn verify | churn tear | churn reset"); Err(ShellError::Unknown) }
@@ -4639,6 +4655,7 @@ const UTILS: &[&str] = &[
     // `events ipc` still reach their own dispatch untouched.
     "events", "trace", "docs", "scrollback",
     "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
+    "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
     "where", "select", "to", "from", "sum", "min", "max", "avg",
@@ -4936,6 +4953,23 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
             ("mkdir <a>,<b>,...", "create several directories (comma-separated)", "mkdir /docs,/tmp"),
         ], true),
+        "background" => help_block(ctx, "background", "start a long job detached, so it does not own the prompt", &[
+            ("background copy <src> <dst>", "start the copy and give the prompt straight back", "background copy /big.bin /backup/big.bin"),
+            ("background delete <path> recursive", "remove a whole subtree detached", "background delete /old recursive"),
+            ("background drives check", "check the volume detached; `foreground` replays the verdict", "background drives check"),
+            ("background drives scrub", "read-only CRC sweep, detached", "background drives scrub"),
+            ("jobs", "what exists and what state it is in", "jobs"),
+            ("foreground <job>", "attach the console to it again", "foreground 1"),
+            ("what can detach?", "commands whose value is an EFFECT; a job holds no console, so reports cannot", "background copy /a /b"),
+        ], true),
+        "jobs" => help_block(ctx, "jobs", "the job table - what `background` started", &[
+            ("jobs", "one row per job: id, state, progress, command", "jobs"),
+            ("jobs | where state=running", "filter like any other producer (rule 12)", "jobs | where state=running"),
+            ("jobs quit <job>", "stop a job without attaching to it first", "jobs quit 1"),
+        ], true),
+        "foreground" => help_block(ctx, "foreground", "attach the console to a background job", &[
+            ("foreground <job>", "watch it; q cancels the JOB, b detaches it again", "foreground 1"),
+        ], true),
         "copy" => help_block(ctx, "copy", "copy a file or a whole subtree", &[
             ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
             ("copy <src> <dst> recursive", "copy directory <src> and everything under it", "copy /docs /backup recursive"),
@@ -5207,6 +5241,12 @@ static HELP: &[HelpRow] = &[
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
     Row("mkdir <path>[,path,...] [parents]", "create a directory or a comma-list"),
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
+    Row("background copy <src> <dst>", "start a long copy detached; the prompt comes straight back"),
+    Row("background delete <path> recursive", "remove a whole subtree detached"),
+    Row("background drives check", "scrub the volume detached; foreground replays what it said"),
+    Row("jobs", "what `background` started: id, state, progress (a producer - pipe it)"),
+    Row("jobs quit <job>", "stop a job without attaching to it"),
+    Row("foreground <job>", "attach to a job again; q stops it, b detaches it"),
     Row("move <src> <dst>", "relocate a file/dir"),
     Row("rename <path> <name>", "rename an entry in place"),
     Row("delete <path>[,path,...] [recursive]", "remove a file/dir/subtree or a comma-list"),
@@ -7841,6 +7881,61 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
     t
 }
 
+/// `jobs` as a record producer: one row per job, so it filters like any other table
+/// (`jobs | where state=running`). Conventions rule 12 - a utility's output is a pipeable
+/// structure, and a bespoke `jobs running` positional filter would be a second way to say `where`.
+///
+/// REFRESHES FIRST, exactly as the rendered form does. A piped read that skipped the refresh would
+/// answer from a stale row, so `jobs | where state=done` could miss a job that had just finished -
+/// two views of one table disagreeing, which is the drift 26.4 permits a derived view only if it
+/// avoids.
+#[inline(never)] // keep this builder's frame out of pipe_run's 16 KiB Stream frame, like every
+                 // sibling record-builder - a byte pipe overflows the user stack otherwise.
+fn build_jobs_table(ctx: &ShellCtx) -> Table {
+    refresh_jobs(ctx);
+    let mut t = Table::new(&["job", "state", "command", "percent", "copied", "total", "src", "dst"]);
+    let tab = ctx.jobs.borrow();
+    for r in tab.rows.iter().filter(|r| r.used) {
+        let state = t.intern(state_word(r.state).as_bytes());
+        // The COMMAND, spelled as the rendered table spells it. A check or a scrub has no paths at
+        // all, so a reader of the record form had no way to tell one job from another.
+        let mut cmd = [0u8; 2 * PATH_MAX + 32];
+        let clen = job_command(r, &mut cmd);
+        let command = t.intern(&cmd[..clen]);
+        let src = t.intern(&r.src[..r.slen]);
+        let dst = t.intern(&r.dst[..r.dlen]);
+        let pct = if r.kind != KIND_COPY || r.total == 0 { 0 } else { r.copied * 100 / r.total };
+        t.add_row(&[
+            Value::Int(r.id as u64), state, command, Value::Int(pct),
+            Value::Int(r.copied), Value::Int(r.total), src, dst,
+        ]);
+    }
+    t
+}
+
+/// The one place a job's command is spelled. Both the rendered table and the record table call it,
+/// so they cannot say different things about the same row.
+fn job_command(r: &JobRow, out: &mut [u8; 2 * PATH_MAX + 32]) -> usize {
+    use core::fmt::Write as _;
+    struct Sink<'a> { buf: &'a mut [u8; 2 * PATH_MAX + 32], n: usize }
+    impl core::fmt::Write for Sink<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &c in s.as_bytes() {
+                if self.n < self.buf.len() { self.buf[self.n] = c; self.n += 1; }
+            }
+            Ok(())
+        }
+    }
+    let mut sink = Sink { buf: out, n: 0 };
+    let _ = match r.kind {
+        KIND_CHECK => write!(sink, "drives check"),
+        KIND_SCRUB => write!(sink, "drives scrub"),
+        KIND_DELETE_TREE => write!(sink, "delete {} recursive", str_of(&r.src[..r.slen])),
+        _ => write!(sink, "copy {} {}", str_of(&r.src[..r.slen]), str_of(&r.dst[..r.dlen])),
+    };
+    sink.n
+}
+
 /// `uptime` as a record producer: one row, columns `uptime` (human `Nd HH:MM:SS`) and `seconds`
 /// (total seconds since boot). Bare `uptime` renders the grid; `uptime | to json|yaml` renders the
 /// row; `uptime | select seconds` etc. work like any record stream. The clock is a wall-clock RTC
@@ -7956,7 +8051,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// roster), `dir` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs")
 }
 
 /// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -8287,6 +8382,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
+            "jobs"    => build_jobs_table(ctx),
             // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
             // is refused loudly rather than quietly yielding the wrong thing.
@@ -15423,6 +15519,621 @@ fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -
     out[..dst_root.len()].copy_from_slice(dst_root);
     out[dst_root.len()..dst_root.len() + suffix.len()].copy_from_slice(suffix);
     Some(dst_root.len() + suffix.len())
+}
+
+// ===================================================================================
+// JOB CONTROL - `background`, `jobs`, `foreground`
+//
+// Design note: `docs/job-control-design.md`. Spec: `utilities/55_background.md`.
+//
+// A background job is a SPAWNED SERVICE (`copier`), not a state machine advanced inside this
+// loop. The argument is in §4 of the design note; the short form is that this shell has no
+// threads, its main loop blocks on keys, and the alternative hands the job the SHELL's authority
+// and the shell's 256 KiB stack. A service holds its own contract's caps and dies on its own.
+//
+// WHAT THIS TABLE IS, precisely: the shell's record of jobs it started. It is NOT the state of the
+// work - `copier` owns that, and the state shown for a live row is read from the service every
+// time it is displayed (§26.4: a derived view is legitimate when the source wins and it is
+// reconciled). When a job ends, its final state is FROZEN into the row, because the service keeps
+// only its most recent job and a finished job must stay reportable (§6 of the design note).
+// ===================================================================================
+
+/// `copier` control opcodes and states. Duplicated here rather than shared: services do not depend
+/// on one another's headers, which is the same call `recorder`'s opcodes get a few hundred lines up.
+const CP_OP_START: u8 = 1;
+const CP_OP_STATUS: u8 = 2;
+const CP_OP_CANCEL: u8 = 3;
+const CP_OP_OUTPUT: u8 = 4;
+const CP_OK: u8 = 0;
+
+/// What kind of work a job is. The bar for adding a third is NOT "is the command slow" - it is
+/// "is the command's value its EFFECT rather than its OUTPUT". A detached job holds no console
+/// capability, so anything whose whole product is printed text has nowhere to put it.
+const KIND_COPY: u8 = 0;
+const KIND_DELETE_TREE: u8 = 1;
+const KIND_CHECK: u8 = 2;
+const KIND_SCRUB: u8 = 3;
+
+/// EVERY DETACHABLE COMMAND, ONCE. The refusal message is BUILT from this, so it cannot advertise a
+/// set the dispatch does not accept - the previous version was a hand-written sentence with a
+/// comment asking the next person to keep it in step, which is the drift this repository keeps
+/// having to repair (see `facts_check.py`, which exists for exactly this class of mistake).
+///
+/// `osdev test jobs` closes the other direction: it types every entry here and asserts none of them
+/// is refused, so a row that stops working fails a test rather than misleading a reader.
+const DETACHABLE: &[&str] = &[
+    "copy <src> <dst>",
+    "delete <path> recursive",
+    "drives check",
+    "drives scrub",
+];
+
+/// The list as one line, for the refusal. Fixed buffer, no allocation.
+fn detachable_line(buf: &mut [u8; 192]) -> usize {
+    let mut n = 0usize;
+    for (i, entry) in DETACHABLE.iter().enumerate() {
+        if i > 0 {
+            for &c in b", " {
+                if n < buf.len() { buf[n] = c; n += 1; }
+            }
+        }
+        for &c in entry.as_bytes() {
+            if n < buf.len() { buf[n] = c; n += 1; }
+        }
+    }
+    n
+}
+
+const ST_IDLE: u8 = 0;
+const ST_RUNNING: u8 = 1;
+const ST_DONE: u8 = 2;
+const ST_FAILED: u8 = 3;
+const ST_CANCELLED: u8 = 4;
+/// Not a `copier` state. The shell's own verdict when the service that was doing a live job is
+/// gone: the job did not finish and nobody can say how far it got, which is a different fact from
+/// `failed` and is reported as one.
+const ST_LOST: u8 = 5;
+
+const WHY_NO_SOURCE: u8 = 1;
+const WHY_NO_DEST: u8 = 2;
+const WHY_READ: u8 = 3;
+const WHY_WRITE: u8 = 4;
+const WHY_UNANSWERED: u8 = 5;
+
+/// Eight rows, fixed. `background` on a full table refuses and says so; it does not grow, queue, or
+/// evict a row somebody has not read (§26.6, and §6 of the design note).
+const JOBS_MAX: usize = 8;
+
+#[derive(Clone, Copy)]
+struct JobRow {
+    used: bool,
+    kind: u8,
+    /// True while this row is the one `copier` is working on. Exactly one row can be live, because
+    /// there is one `copier` and it takes one job at a time.
+    live: bool,
+    id: u32,
+    state: u8,
+    why: u8,
+    copied: u64,
+    total: u64,
+    elapsed: u64,
+    src: [u8; PATH_MAX],
+    slen: usize,
+    dst: [u8; PATH_MAX],
+    dlen: usize,
+}
+
+impl JobRow {
+    const fn empty() -> Self {
+        JobRow { used: false, kind: KIND_COPY, live: false, id: 0, state: ST_IDLE, why: 0,
+                 copied: 0, total: 0, elapsed: 0,
+                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0 }
+    }
+}
+
+struct JobTable {
+    rows: [JobRow; JOBS_MAX],
+    /// Ids never repeat within a session, so `foreground 3` cannot reach a different job than the
+    /// one the operator saw. They are not slots.
+    next_id: u32,
+}
+
+impl JobTable {
+    const fn new() -> Self {
+        JobTable { rows: [JobRow::empty(); JOBS_MAX], next_id: 1 }
+    }
+}
+
+fn state_word(st: u8) -> &'static str {
+    match st {
+        ST_RUNNING => "running",
+        ST_DONE => "done",
+        ST_FAILED => "failed",
+        ST_CANCELLED => "stopped",
+        ST_LOST => "lost",
+        _ => "idle",
+    }
+}
+
+/// Why a job failed, in words. `failed` alone makes the operator guess which half went wrong, and
+/// the two halves have different fixes.
+fn why_words(why: u8) -> &'static str {
+    match why {
+        WHY_NO_SOURCE => "the source does not exist, or is a directory",
+        WHY_NO_DEST => "the destination could not be created (no space, bad path, or it exists)",
+        WHY_READ => "reading the source failed",
+        WHY_WRITE => "writing the destination failed",
+        WHY_UNANSWERED => "the filesystem stopped answering (it is slow or stuck, not necessarily broken)",
+        _ => "no reason recorded",
+    }
+}
+
+/// Ask `copier` where it is. `None` means it did not answer - which, for a row this shell believes
+/// is live, is itself the answer (see `refresh_jobs`).
+/// What asking `copier` produced. THE THIRD CASE IS THE POINT: a service that is alive and does not
+/// answer is not a service that is gone, and collapsing the two made a busy job look like a dead
+/// one. `copier` is single-threaded, so while it is inside one long `fs` request - a recursive
+/// delete is exactly that - it reads no messages at all. Reporting that as `lost` would declare a
+/// job dead precisely while it is doing its work.
+enum Ask {
+    Answer(u8, u8, u8, u64, u64, u64), // state, why, kind, copied, total, elapsed
+    Busy,                              // alive, did not answer in time
+    Gone,                              // the service is not running
+}
+
+fn copier_status(ctx: &ShellCtx) -> Ask {
+    if slot_of(ctx, "copier").is_none() {
+        return Ask::Gone;
+    }
+    let _ = ctx.reacquire_by_name("copier");
+    let r = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_STATUS]), 8) {
+        Some(r) => r,
+        None => return Ask::Busy,
+    };
+    let p = r.payload_bytes();
+    // Byte 1 is the op being answered. A reply for a different op is a stale one left over from an
+    // abandoned request, and reading it as this answer is how a status display starts lying.
+    if p.len() < 29 || p[0] != CP_OK || p[1] != CP_OP_STATUS {
+        return Ask::Busy;
+    }
+    let st = p[2];
+    let why = p[3];
+    let kind = p[4];
+    let copied = u64::from_le_bytes([p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12]]);
+    let total = u64::from_le_bytes([p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20]]);
+    let elapsed = u64::from_le_bytes([p[21], p[22], p[23], p[24], p[25], p[26], p[27], p[28]]);
+    Ask::Answer(st, why, kind, copied, total, elapsed)
+}
+
+/// Bring the live row up to date from the service, and FREEZE it if the job has ended.
+///
+/// A SERVICE THAT IS GONE MEANS THE JOB IS GONE. `copier` is deliberately not restarted on death
+/// (its contract says why), so if the shell believes a job is running and the service does not
+/// answer, the honest report is `lost` - not `running` forever, and not `failed`, which would claim
+/// knowledge of a failure nobody observed.
+fn refresh_jobs(ctx: &ShellCtx) {
+    let live_idx = {
+        let t = ctx.jobs.borrow();
+        t.rows.iter().position(|r| r.used && r.live)
+    };
+    let i = match live_idx { Some(i) => i, None => return };
+    match copier_status(ctx) {
+        Ask::Answer(st, why, kind, copied, total, elapsed) => {
+            let mut t = ctx.jobs.borrow_mut();
+            let row = &mut t.rows[i];
+            row.state = st;
+            row.why = why;
+            row.kind = kind;
+            row.copied = copied;
+            row.total = total;
+            row.elapsed = elapsed;
+            if st != ST_RUNNING {
+                row.live = false;
+            }
+        }
+        // ALIVE AND BUSY. Leave the row exactly as it was: the last figures this shell saw are
+        // still the last true ones, and inventing a state here would be worse than showing a
+        // reading that is a few seconds old.
+        Ask::Busy => {}
+        Ask::Gone => {
+            let mut t = ctx.jobs.borrow_mut();
+            let row = &mut t.rows[i];
+            row.state = ST_LOST;
+            row.live = false;
+        }
+    }
+}
+
+/// `background <command...>` - start a job detached and give the prompt straight back.
+fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+    if argc < 2 {
+        ctx.console_writeln("usage: background copy <src> <dst>");
+        return Err(ShellError::Unknown);
+    }
+    // ONE COMMAND, NOT A CATEGORY. `background` is not a modifier that can be put in front of
+    // anything: a detached job is a service holding its own caps, so a command is backgroundable
+    // exactly when a service exists to run it (§26.2, and §4 of the design note). `copy` is the
+    // one that does. Anything else is refused by name rather than half-working - `background chaos`
+    // would be a storm nobody can see or stop, which is worse than no answer.
+    // TWO COMMANDS, and the bar for a third is not "is it slow". A detached job holds no console
+    // capability, so a command whose value is its OUTPUT has nowhere to put it: `selfcheck`, `chaos`,
+    // `find`, `run` and `drives check` all produce a report somebody has to read, and detaching one
+    // would mean either discarding the answer or inventing a transcript this shell does not have.
+    // They are refused by name and told why, which is the honest answer rather than the incomplete
+    // one (§26.2, §26.7).
+    let kind = match args[1] {
+        "copy" => KIND_COPY,
+        "delete" => KIND_DELETE_TREE,
+        // `drives check` - the first detachable command whose product is a REPORT. It qualifies
+        // because it is ONE `fs` request the job service can issue itself, and because the
+        // transcript gives the answer somewhere to live until `foreground` asks for it.
+        "drives" if argc >= 3 && args[2] == "check" => KIND_CHECK,
+        "drives" if argc >= 3 && args[2] == "scrub" => KIND_SCRUB,
+        other => {
+            ctx.console_writeln_fmt(format_args!(
+                "background: `{}` not supported for it runs inside the shell - a job runs as a detachable separate service.",
+                other));
+            let mut buf = [0u8; 192];
+            let n = detachable_line(&mut buf);
+            ctx.console_writeln_fmt(format_args!("  detachable services: {}", str_of(&buf[..n])));
+            return Err(ShellError::Unknown);
+        }
+    };
+    if kind == KIND_CHECK || kind == KIND_SCRUB {
+        // No paths: the job walks the whole volume.
+    } else if kind == KIND_DELETE_TREE {
+        // Only the RECURSIVE form is worth detaching: a plain delete is one quick metadata edit.
+        // Refusing the short form rather than accepting it keeps `jobs` free of rows that were
+        // over before they were listed.
+        if argc < 4 || args[3] != "recursive" {
+            ctx.console_writeln("background: a plain delete is one edit - just run it, or say `recursive`");
+            return Err(ShellError::Unknown);
+        }
+    } else if argc < 4 {
+        ctx.console_writeln("usage: background copy <src> <dst>");
+        return Err(ShellError::Unknown);
+    }
+    // No nesting: `background background x` is refused, not defined (§7 of the design note).
+    if args[2] == "background" {
+        ctx.console_writeln("background: cannot nest");
+        return Err(ShellError::Unknown);
+    }
+
+    refresh_jobs(ctx);
+    {
+        let t = ctx.jobs.borrow();
+        if let Some(r) = t.rows.iter().find(|r| r.used && r.live) {
+            ctx.console_writeln_fmt(format_args!(
+                "background: job {} is still running - one at a time", r.id));
+            return Err(ShellError::Unknown);
+        }
+    }
+
+    let mut sbuf = [0u8; PATH_MAX];
+    let mut slocal = [0u8; PATH_MAX];
+    let mut slen = 0usize;
+    if kind != KIND_CHECK && kind != KIND_SCRUB {
+        let src = match resolve_or_err(ctx, cwd, args[2], &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+        slen = src.len();
+        slocal[..slen].copy_from_slice(src);
+    }
+    let mut dbuf = [0u8; PATH_MAX];
+    let mut dlocal = [0u8; PATH_MAX];
+    let mut dlen = 0usize;
+    if kind == KIND_COPY {
+        let dst = match resolve_or_err(ctx, cwd, args[3], &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+        dlen = dst.len();
+        dlocal[..dlen].copy_from_slice(dst);
+    }
+
+    // A free row BEFORE spawning anything: a table that cannot record the job must not start it,
+    // or the copy runs with nothing able to report or stop it.
+    let slot = {
+        let t = ctx.jobs.borrow();
+        match t.rows.iter().position(|r| !r.used) {
+            Some(i) => i,
+            // No free row: take the OLDEST FINISHED one. Ids are monotonic, so the smallest id
+            // among the not-live rows is the oldest job, and a finished row is a record somebody
+            // may not have read - which is why the oldest goes first rather than an arbitrary one.
+            None => match t.rows.iter().enumerate()
+                        .filter(|(_, r)| r.used && !r.live)
+                        .min_by_key(|(_, r)| r.id)
+                        .map(|(i, _)| i) {
+                Some(i) => i,
+                None => {
+                    ctx.console_writeln("background: every job row is live - nothing can be evicted");
+                    return Err(ShellError::Unknown);
+                }
+            }
+        }
+    };
+
+    // SPAWN ON DEMAND, the `recorder` shape: nothing costs anything until a job is wanted.
+    if slot_of(ctx, "copier").is_none() && ctx.spawn("copier").is_err() {
+        ctx.console_writeln("background: could not spawn `copier`");
+        return Err(ShellError::Unknown);
+    }
+    let _ = ctx.reacquire_by_name("copier");
+
+    let mut req = [0u8; 4 + 2 * PATH_MAX];
+    req[0] = CP_OP_START;
+    req[1] = kind;
+    req[2] = slen as u8;
+    req[3..3 + slen].copy_from_slice(&slocal[..slen]);
+    req[3 + slen] = dlen as u8;
+    req[4 + slen..4 + slen + dlen].copy_from_slice(&dlocal[..dlen]);
+    let n = 4 + slen + dlen;
+
+    let ok = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req[..n]), 12) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            p.first() == Some(&CP_OK) && p.get(1) == Some(&CP_OP_START)
+        }
+        None => {
+            ctx.console_writeln("background: `copier` did not answer");
+            return Err(ShellError::Unknown);
+        }
+    };
+    if !ok {
+        // The service records WHY it refused before it answers, so ask rather than print a shrug.
+        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _) => w, _ => 0 };
+        ctx.console_writeln_fmt(format_args!("background: refused - {}", why_words(why)));
+        return Err(ShellError::Unknown);
+    }
+
+    let mut t = ctx.jobs.borrow_mut();
+    let id = t.next_id;
+    t.next_id += 1;
+    let row = &mut t.rows[slot];
+    *row = JobRow::empty();
+    row.used = true;
+    row.kind = kind;
+    row.live = true;
+    row.id = id;
+    row.state = ST_RUNNING;
+    row.slen = slen;
+    row.src[..slen].copy_from_slice(&slocal[..slen]);
+    row.dlen = dlen;
+    row.dst[..dlen].copy_from_slice(&dlocal[..dlen]);
+    drop(t);
+    ctx.console_writeln_fmt(format_args!("[backgrounded] job {}", id));
+    Ok(())
+}
+
+/// `jobs` - the table. A PRODUCER: one row per line, so `jobs | where state=running` works and no
+/// bespoke positional filter is needed (conventions rule 12, and §3 of the design note).
+/// Is `id` the job the service is still holding a transcript for?
+///
+/// THE SERVICE KEEPS ONE, not eight. It runs one job at a time and its ring is cleared when the next
+/// one starts, so only the most recent job's output still exists. Asking for an older one's would
+/// replay the WRONG job's text under the right job's heading - a lie that would read perfectly.
+/// The shell therefore checks before replaying, and says nothing rather than something false.
+fn is_newest(ctx: &ShellCtx, id: u32) -> bool {
+    let t = ctx.jobs.borrow();
+    t.rows.iter().filter(|r| r.used).map(|r| r.id).max() == Some(id)
+}
+
+/// `jobs quit <id>` - stop a job without attaching to it first.
+///
+/// WHY THIS EXISTS given `foreground <id>` then `q` already works: because making somebody attach to
+/// a job in order to stop it is the interface forgetting what they just told it - the same argument
+/// §2 of the design note makes for why `background` exists when `b` already would.
+///
+/// AND WHY IT IS NOT `kill copier`: killing the service skips its cleanup, so a half-written
+/// destination survives as a full-size file with an undefined tail. This routes through the
+/// service's own cancel, which removes it. A job is not the service that happens to be running it.
+fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let want: u32 = match arg.trim().parse() {
+        Ok(v) => v,
+        Err(_) => { ctx.console_writeln("usage: jobs quit <job>"); return Err(ShellError::Unknown); }
+    };
+    refresh_jobs(ctx);
+    let (found, live, state) = {
+        let t = ctx.jobs.borrow();
+        match t.rows.iter().find(|r| r.used && r.id == want) {
+            Some(r) => (true, r.live, r.state),
+            None => (false, false, ST_IDLE),
+        }
+    };
+    if !found {
+        ctx.console_writeln_fmt(format_args!("jobs quit: no job {}", want));
+        return Err(ShellError::Unknown);
+    }
+    if !live {
+        // Refused rather than reported as done: asking to stop something that already stopped is
+        // worth saying out loud, because the operator believed it was still running.
+        ctx.console_writeln_fmt(format_args!("jobs quit: job {} is already {}", want, state_word(state)));
+        return Err(ShellError::Unknown);
+    }
+    match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 12) {
+        Some(_) => {
+            refresh_jobs(ctx);
+            ctx.console_writeln_fmt(format_args!("job {} stopped", want));
+            Ok(())
+        }
+        None => {
+            // The cancel did not land. Saying "stopped" here would be the silent-failure this
+            // project forbids: the job may well still be running.
+            ctx.console_writeln_fmt(format_args!(
+                "jobs quit: job {} did not acknowledge - it may still be running; check `jobs`", want));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    refresh_jobs(ctx);
+    let t = ctx.jobs.borrow();
+    if !t.rows.iter().any(|r| r.used) {
+        out.line(ctx, "no jobs");
+        return Ok(());
+    }
+    out.line(ctx, "JOB  STATE    PROGRESS  COMMAND");
+    for r in t.rows.iter().filter(|r| r.used) {
+        // Percent is derived and shown only where it means something: a zero-byte file is 100% done
+        // the moment it starts, and "0%" on a finished job reads as a failure.
+        // A recursive delete has no measurable progress - `fs` does the whole walk in one
+        // operation - so the column says so rather than printing a number nobody computed. "0%"
+        // would read as stuck and "100%" as finished; both would be inventions.
+        let mut cmd = [0u8; 2 * PATH_MAX + 32];
+        let clen = job_command(r, &mut cmd);
+        if r.kind == KIND_COPY {
+            let pct = if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 };
+            out.line_fmt(ctx, format_args!("{:<4} {:<8} {:>3}%      {}",
+                r.id, state_word(r.state), pct, str_of(&cmd[..clen])));
+        } else {
+            // No percentage for a job whose progress nothing can measure - `-`, not an invented 0.
+            out.line_fmt(ctx, format_args!("{:<4} {:<8}    -      {}",
+                r.id, state_word(r.state), str_of(&cmd[..clen])));
+        }
+        if r.state == ST_FAILED {
+            out.line_fmt(ctx, format_args!("     reason: {}", why_words(r.why)));
+        }
+        if r.state == ST_LOST {
+            out.line(ctx, "     reason: `copier` is gone - the job did not finish and how far it got is unknown");
+        }
+    }
+    Ok(())
+}
+
+/// Replay a job's transcript: what it had to say, held in a fixed ring in the job service until
+/// somebody asks for it.
+///
+/// THIS IS WHY A DETACHED JOB CAN PRODUCE OUTPUT WITHOUT HOLDING A CONSOLE. The bytes sit in the
+/// service; nothing is pushed anywhere; `foreground` pulls them. So the property that makes the
+/// whole design safe is untouched - a job still cannot write over a prompt somebody is typing at,
+/// because it still holds no capability that reaches the console.
+///
+/// A DROP IS ANNOUNCED. The ring is 4 KiB and ages out its oldest lines, so a long report can be
+/// incomplete - and an incomplete report that looks complete is exactly the silent failure this
+/// project forbids. The count comes back with every page and is printed before the text.
+fn replay_transcript(ctx: &ShellCtx) {
+    if slot_of(ctx, "copier").is_none() {
+        return;
+    }
+    let mut off = 0u32;
+    let mut announced = false;
+    // Bounded: the ring is 4 KiB and a page carries up to 2 KiB, so three passes is already more
+    // than it can hold. A loop that trusted the service to terminate it would hang the prompt on a
+    // service that answered oddly.
+    for _ in 0..4 {
+        let mut req = [0u8; 5];
+        req[0] = CP_OP_OUTPUT;
+        req[1..5].copy_from_slice(&off.to_le_bytes());
+        let r = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req), 8) {
+            Some(r) => r,
+            None => return,
+        };
+        let p = r.payload_bytes();
+        if p.len() < 10 || p[0] != CP_OK || p[1] != CP_OP_OUTPUT {
+            return;
+        }
+        let dropped = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
+        let total = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
+        if !announced {
+            announced = true;
+            if dropped > 0 {
+                ctx.console_writeln_fmt(format_args!(
+                    "  ... {} earlier byte(s) dropped - the transcript is 4 KiB and this job said more", dropped));
+            }
+        }
+        let body = &p[10..];
+        if body.is_empty() {
+            return;
+        }
+        for line in body.split(|&c| c == b'\n') {
+            if !line.is_empty() {
+                ctx.console_writeln_fmt(format_args!("  {}", str_of(line)));
+            }
+        }
+        off += body.len() as u32;
+        if off >= total {
+            return;
+        }
+    }
+}
+
+/// `foreground <id>` - attach the console to a job again.
+fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let want: u32 = match arg.parse() {
+        Ok(v) => v,
+        Err(_) => { ctx.console_writeln("usage: foreground <job>"); return Err(ShellError::Unknown); }
+    };
+    refresh_jobs(ctx);
+    let (found, live, state, why) = {
+        let t = ctx.jobs.borrow();
+        match t.rows.iter().find(|r| r.used && r.id == want) {
+            Some(r) => (true, r.live, r.state, r.why),
+            None => (false, false, ST_IDLE, 0),
+        }
+    };
+    if !found {
+        ctx.console_writeln_fmt(format_args!("foreground: no job {}", want));
+        return Err(ShellError::Unknown);
+    }
+    if !live {
+        // A finished job still answers `foreground` with its outcome rather than an error: the
+        // operator asked what happened, and "no such job" would be false.
+        ctx.console_writeln_fmt(format_args!("job {} is {}", want, state_word(state)));
+        if state == ST_FAILED {
+            ctx.console_writeln_fmt(format_args!("  reason: {}", why_words(why)));
+        }
+        // ATTACHING TO A FINISHED JOB MEANS READING WHAT IT SAID. That is what makes a report-
+        // producing command detachable at all, and it is why no `jobs output <id>` verb exists:
+        // replaying a transcript IS attaching, so a second word for it would be a second way to
+        // say `foreground` (§26.2).
+        if is_newest(ctx, want) {
+            replay_transcript(ctx);
+        }
+        return Ok(());
+    }
+
+    ctx.console_writeln("[q] cancel   [b] background");
+    let mut shown = 101u32; // impossible, so the first sample always prints
+    loop {
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'b' || b == b'B' {
+                ctx.console_writeln_fmt(format_args!("[backgrounded] job {}", want));
+                return Ok(());
+            }
+            if b == b'q' || b == b'Q' || b == 0x1b {
+                // `q` STOPS THE TASK, not just this view of it (conventions rule 11). Anything else
+                // would make the key mean two different things depending on what it is pressed in.
+                let _ = ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 8);
+                refresh_jobs(ctx);
+                ctx.console_writeln_fmt(format_args!("job {} stopped", want));
+                return Ok(());
+            }
+        }
+        refresh_jobs(ctx);
+        let (st, pct, why) = {
+            let t = ctx.jobs.borrow();
+            match t.rows.iter().find(|r| r.used && r.id == want) {
+                Some(r) => (r.state,
+                            if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 },
+                            r.why),
+                None => (ST_LOST, 0, 0),
+            }
+        };
+        if st != ST_RUNNING {
+            match st {
+                ST_DONE => ctx.console_writeln_fmt(format_args!("job {} done", want)),
+                ST_FAILED => {
+                    ctx.console_writeln_fmt(format_args!("job {} failed", want));
+                    ctx.console_writeln_fmt(format_args!("  reason: {}", why_words(why)));
+                }
+                ST_LOST => ctx.console_writeln_fmt(format_args!(
+                    "job {} lost - `copier` is gone and how far it got is unknown", want)),
+                _ => ctx.console_writeln_fmt(format_args!("job {} {}", want, state_word(st))),
+            }
+            return Ok(());
+        }
+        if pct != shown {
+            shown = pct;
+            ctx.console_writeln_fmt(format_args!("copying... {}%", pct));
+        }
+        ctx.yield_cpu();
+    }
 }
 
 /// `rename <path> <newname>` - rename an entry in place (not a move; newname is one

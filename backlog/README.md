@@ -100,6 +100,7 @@ direction.
 | [36](36-selfcheck-second-run-races-events-persist-status.md) | `selfcheck`'s second run raced the capture's pre-fill - **CLOSED**, and its originally stated cause was WRONG; it waits on the state now, not a clock | Closed | - |
 | [37](37-console-took-over-two-seconds-to-answer-a-scroll.md) | The console took over 2 s to answer a scroll - **CLOSED**: it repainted a 4K framebuffer inside the caller's deadline. Four measurements missed it; the mechanism is deleted | Closed | - |
 | [39](39-a-reset-that-is-a-spin-loop-on-two-more-arch-paths.md) | `hardware_reset` is `loop { spin_loop() }` on a non-Pi4 aarch64 build and still prints that it reset - the riscv64 defect fixed 2026-09-21, one feature flag away on a port that DOES run userspace | Recorded (26.7) | a second aarch64 target |
+| [40](40-selfcheck-is-out-of-room.md) | `selfcheck.gsh` is 376 bytes from a HARD 64 KiB ceiling (u16 prescan offsets; over it the interpreter dispatches the wrong function body, silently). Job control landed a 330-byte hardware check instead of the 960-byte one that reads a job's effect back | Recorded (26.7) | widening the offsets to u32 |
 | [38](38-tab-completion-of-a-file-path-times-out-about-one-run-in-three.md) | Tab completion of a file path times out ~1 run in 3 and drags the next case down with it - bisected far enough to EXONERATE the console; not root-caused | Open / measured | `osdev test files` reliability |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md

@@ -6974,6 +6974,304 @@ pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
 /// The gate is the same one 3.4 says actually matters: not that the refusal happens, but what it
 /// COSTS. Nothing leaked, no bystander touched, the directory still readable, and valid work
 /// accepted again afterwards.
+/// `jobs` - `background` / `jobs` / `foreground`, end to end against a real disk.
+///
+/// THE SOURCE IS DELIBERATELY LARGE (5.2 MiB, ~1,550 streamed chunks). A small one would finish
+/// before the first `jobs` and the suite would then be testing a table, not a background job: the
+/// one-at-a-time refusal, the attach-and-detach path and the cancel path all need a job that is
+/// genuinely still running when the next command is typed.
+///
+/// WHAT IT DOES NOT ASSERT, and why: that any particular PERCENTAGE is seen. Whether the copy is
+/// 12% or 80% done when `jobs` is typed depends on the host, so `docs/job-control-design.md` §8
+/// says in advance where the assertions go - on the table and on the job's EFFECT, never on output
+/// arriving at a chosen moment. A suite that asserted "38%" would pass on a slow host and fail on
+/// a fast one.
+///
+/// WAITING IS DONE WITH `wait`, NOT BY HAMMERING `jobs`. A poll loop of bare `jobs` commands makes
+/// the shell compete with the copier for `fs` on every iteration, so the thing being measured is
+/// slowed by the measuring. The first run of this suite did exactly that and reached 12% in sixty
+/// polls.
+pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("jobs: PASS - {}", $label); pass += 1; }
+        else { println!("jobs: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("jobs: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("jobs: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("jobs: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+    /// Send raw bytes and wait for a marker that is NOT the prompt - `foreground` on a running job
+    /// deliberately does not return one until a key says so.
+    macro_rules! run_until { ($c:expr, $marker:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, $marker, Duration::from_secs($secs))
+    }}; }
+
+    // ---- the volume is sound before anything is claimed about it.
+    let canary0 = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    check!(canary0.contains("do-not-disturb"), "the volume mounted and the bystander reads correctly");
+
+    // ---- EMPTY TABLE. `jobs` before anything exists must say so rather than print a header over
+    //      nothing - an empty table that looks like a table reads as "something is running".
+    let none = run!(b"jobs\r", 30).unwrap_or_default();
+    check!(none.contains("no jobs"), "`jobs` with nothing started says so plainly");
+
+    // ---- REFUSALS FIRST, while nothing is running, so none can be confused with a busy table.
+    let notacmd = run!(b"background chaos max-carnage 5\r", 30).unwrap_or_default();
+    check!(notacmd.contains("not supported") && notacmd.contains("chaos"),
+           "`background chaos` is refused BY NAME - backgroundable is not a property of every command");
+    check!(notacmd.contains("runs inside the shell") && notacmd.contains("detachable separate service"),
+           "the refusal leads with the REASON - this command runs inside the shell, and a job does not");
+    check!(notacmd.contains("detachable services:") && notacmd.contains("drives check"),
+           "the refusal LISTS WHAT WORKS - a reason is only useful if it tells you what to type instead");
+    check!(notacmd.contains("copy") && notacmd.contains("delete") && notacmd.contains("drives scrub"),
+           "the advertised list names EVERY working verb - it is built from the same table the dispatch reads");
+    let notselfcheck = run!(b"background selfcheck\r", 30).unwrap_or_default();
+    check!(notselfcheck.contains("not supported") && notselfcheck.contains("selfcheck"),
+           "`background selfcheck` is refused too - its product is a report, and a job has nowhere to write one");
+    let shortdel = run!(b"background delete /etc\r", 30).unwrap_or_default();
+    check!(shortdel.contains("recursive"),
+           "a NON-recursive background delete is refused - one metadata edit is not a job");
+    let missing = run!(b"background copy /nosuch.txt /out.txt\r", 60).unwrap_or_default();
+    check!(missing.contains("refused") || missing.contains("does not exist"),
+           "a missing source is refused, with the reason");
+    let nojob = run!(b"foreground 99\r", 30).unwrap_or_default();
+    check!(nojob.contains("no job 99"), "`foreground` on an id that never existed says which id");
+
+    // ---- THE REAL THING: 5.2 MiB, ~1,550 chunks. The copy loop actually loops.
+    let started = run!(b"background copy /fill3.bin /copy.bin\r", 60).unwrap_or_default();
+    check!(started.contains("[backgrounded] job 1"),
+           "`background copy` returns a job id, and returns it straight away");
+
+    // ---- ONE AT A TIME, refused rather than queued.
+    let second = run!(b"background copy /canary.txt /copy2.bin\r", 60).unwrap_or_default();
+    check!(second.contains("still running") && second.contains("job 1"),
+           "a second job while one runs is refused, naming the job that is still going");
+
+    // ---- THE PROMPT IS STILL THE OPERATOR'S. This is the whole point of the feature, and it is
+    //      the one property a job table cannot fake: an unrelated command runs to completion while
+    //      the copy is in flight.
+    let busy_dir = run!(b"dir /\r", 90).unwrap_or_default();
+    check!(busy_dir.contains("canary.txt"),
+           "an unrelated command still runs while the job is going - the prompt was never owned");
+
+    // ---- ATTACH, THEN DETACH WITH `b`. `foreground` on a running job does not return a prompt -
+    //      it is attached - so wait for its own marker and then press the key.
+    let attached = run_until!(b"foreground 1\r", b"[b] background", 60).unwrap_or_default();
+    check!(attached.contains("[q] cancel") && attached.contains("[b] background"),
+           "`foreground` on a RUNNING job attaches and shows what the two keys do");
+    let detached = run_until!(b"b", b"gsh>", 60).unwrap_or_default();
+    check!(detached.contains("[backgrounded] job 1"),
+           "`b` detaches a foregrounded job and gives the prompt back");
+
+    // ---- `jobs quit` ON A JOB THAT HAS ALREADY ENDED comes later; first prove the guard that
+    //      says an id nobody started is refused rather than silently accepted.
+    let quit_none = run!(b"jobs quit 99\r", 30).unwrap_or_default();
+    check!(quit_none.contains("no job 99"), "`jobs quit` on an id that never existed says which id");
+
+    // ---- WAIT ON THE TABLE. `wait` rather than a poll storm, so the copier is not competing with
+    //      the shell for `fs` on every iteration.
+    let mut table = String::new();
+    let mut settled = false;
+    for _ in 0..90 {
+        let _ = run!(b"wait 5\r", 60);
+        table = run!(b"jobs\r", 60).unwrap_or_default();
+        if table.contains("done") || table.contains("failed") || table.contains("lost") || table.contains("stopped") {
+            settled = true;
+            break;
+        }
+    }
+    check!(settled, "the job reached a terminal state (polled the TABLE, never a fixed sleep)");
+    check!(table.contains("copy /fill3.bin /copy.bin"),
+           "`jobs` shows the command it is running, not just an id");
+    check!(table.contains("done"), "the 5.2 MiB copy finished cleanly");
+
+    // ---- THE EFFECT proves the copy, not the progress display. `drives check` runs only NOW: a
+    //      copy in flight has a preallocated extent whose unwritten tail has no CRC yet, so a scrub
+    //      during one correctly reports blocks it cannot verify. That is the design's own
+    //      "full-size file with an undefined tail" seen from the fsck side, not a bug - but it does
+    //      mean a scrub and a running copy answer different questions and must not be mixed.
+    let listing = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck = run!(b"drives check\r", 180).unwrap_or_default();
+    let done = run!(b"foreground 1\r", 30).unwrap_or_default();
+    let piped = run!(b"jobs | where state=done\r", 60).unwrap_or_default();
+
+    // ---- CANCEL. The safety property: an interrupted copy must not leave a full-size file with an
+    //      undefined tail, because that is worse than no file - `dir` shows the expected size and
+    //      nothing says the content is garbage.
+    //
+    //      The finished copy is deleted FIRST. A 16 MiB volume holding the 5.2 MiB source and its
+    //      5.2 MiB copy has no room for a third, and the first run of this block was refused with
+    //      exactly that - `the destination could not be created (no space...)`, which is the
+    //      filesystem being right and the test being wrong about what it had left.
+    let freed = run!(b"delete /copy.bin\r", 90).unwrap_or_default();
+    let cancel_start = run!(b"background copy /fill3.bin /cancelme.bin\r", 60).unwrap_or_default();
+    let cancel_attach = run_until!(b"foreground 2\r", b"[b] background", 60).unwrap_or_default();
+    let cancelled = run_until!(b"q", b"gsh>", 90).unwrap_or_default();
+    let after_cancel = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck2 = run!(b"drives check\r", 180).unwrap_or_default();
+
+    // ---- `jobs quit` ON A FINISHED JOB. Refused, because the operator believed it was running
+    //      and saying "stopped" would confirm a belief that is wrong.
+    let quit_done = run!(b"jobs quit 1\r", 30).unwrap_or_default();
+
+    // ---- THE SECOND JOB KIND: a recursive delete. Cheap to support because `fs` does the walk in
+    //      one operation, which is exactly why it qualified as low-hanging and a subtree COPY did
+    //      not. Build a small tree first so there is something to remove.
+    let _ = run!(b"mkdir /tree/a/b parents\r", 90);
+    let _ = run!(b"write /tree/a/one.txt x\r", 60);
+    let _ = run!(b"write /tree/a/b/two.txt y\r", 60);
+    // /tree holds only the directory a; the FILES are one level down, which the first run of
+    // this assertion got wrong - it looked in /tree for a file that was never there. The
+    // feature was fine and the test was reading the wrong directory.
+    let before_tree = run!(b"dir /tree/a\r", 90).unwrap_or_default();
+    let del_start = run!(b"background delete /tree recursive\r", 60).unwrap_or_default();
+    let mut del_table = String::new();
+    let mut del_settled = false;
+    for _ in 0..40 {
+        let _ = run!(b"wait 2\r", 60);
+        del_table = run!(b"jobs\r", 60).unwrap_or_default();
+        if del_table.contains("3    done") || del_table.contains("3    failed") || del_table.contains("3    lost") {
+            del_settled = true;
+            break;
+        }
+    }
+    let after_tree = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck3 = run!(b"drives check\r", 180).unwrap_or_default();
+
+    // ---- THE THIRD KIND: a command whose product is a REPORT. It is only detachable because the
+    //      job service holds a bounded transcript - it still has no console capability, so nothing
+    //      is pushed anywhere; `foreground` PULLS the text when somebody asks for it.
+    let chk_start = run!(b"background drives check\r", 60).unwrap_or_default();
+    let mut chk_table = String::new();
+    let mut chk_settled = false;
+    for _ in 0..60 {
+        let _ = run!(b"wait 2\r", 60);
+        chk_table = run!(b"jobs\r", 60).unwrap_or_default();
+        if chk_table.contains("4    done") || chk_table.contains("4    failed") || chk_table.contains("4    lost") {
+            chk_settled = true;
+            break;
+        }
+    }
+    // The prompt must NOT have received the report while the job ran - a detached job that writes
+    // unasked is the one thing this whole design is built to prevent.
+    let unasked = chk_table.contains("consistent") || chk_table.contains("0 bad");
+    let replay = run!(b"foreground 4\r", 60).unwrap_or_default();
+
+    // ---- THE FOURTH KIND: `drives scrub`, the read-only sweep. It is here because it was nearly
+    //      free once `check` existed - the same one-request-and-a-verdict shape - which is the
+    //      whole basis on which a command earns a place in that list.
+    let scr_start = run!(b"background drives scrub\r", 60).unwrap_or_default();
+    let mut scr_table = String::new();
+    let mut scr_settled = false;
+    for _ in 0..60 {
+        let _ = run!(b"wait 2\r", 60);
+        scr_table = run!(b"jobs\r", 60).unwrap_or_default();
+        if scr_table.contains("5    done") || scr_table.contains("5    failed") || scr_table.contains("5    lost") {
+            scr_settled = true;
+            break;
+        }
+    }
+    let scr_replay = run!(b"foreground 5\r", 60).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/jobs_serial.log", &w);
+
+    // ---- THE GATE ----
+    check!(listing.contains("copy.bin"), "the destination exists on the volume");
+    check!(listing.contains("canary.txt"), "the bystander is still listed");
+    check!(fsck.contains("0 bad"), "no corrupt blocks after a detached copy");
+    // A detached copy allocates an extent and streams into it. If it stranded blocks the way a
+    // refused create used to (carnage §3.4), only the free accounting would ever know.
+    check!(!fsck.contains("REPAIRED"), "NOTHING LEAKED - fsck had nothing to repair");
+    check!(done.contains("job 1 is done"),
+           "`foreground` on a FINISHED job reports its outcome rather than erroring");
+    check!(piped.contains("copy.bin") && !piped.contains("not a pipe source"),
+           "`jobs` is a record producer - `| where state=done` filters it like any other table");
+
+    check!(!freed.contains("failed"), "the finished copy is deleted, making room for the next job");
+    check!(cancel_start.contains("[backgrounded] job 2"), "a second job runs once the first has ended");
+    check!(cancel_attach.contains("[q] cancel"), "the second job can be attached to");
+    check!(cancelled.contains("job 2 stopped"), "`q` stops the JOB, and says so");
+    check!(!after_cancel.contains("cancelme.bin"),
+           "THE PARTIAL DESTINATION IS GONE - a cancelled copy does not leave a full-size file with an undefined tail");
+    check!(fsck2.contains("0 bad") && !fsck2.contains("REPAIRED"),
+           "the volume is still clean after a cancelled copy - the extent was handed back, not stranded");
+
+    check!(quit_done.contains("already"),
+           "`jobs quit` on a job that has already ended is REFUSED, not reported as a stop");
+    check!(before_tree.contains("one.txt"), "the subtree to delete was built");
+    check!(del_start.contains("[backgrounded] job 3"), "`background delete ... recursive` starts a job");
+    check!(del_settled, "the delete job reached a terminal state");
+    check!(del_table.contains("delete /tree recursive"),
+           "`jobs` renders a delete job as the command it is, with no invented percentage");
+    check!(!after_tree.contains("tree"), "THE SUBTREE IS GONE - the detached delete did the work");
+    check!(fsck3.contains("0 bad") && !fsck3.contains("REPAIRED"),
+           "the volume is clean after a detached recursive delete");
+
+    check!(chk_start.contains("[backgrounded] job 4"),
+           "`background drives check` starts a job - a REPORT-producing command can detach now");
+    check!(chk_settled, "the check job reached a terminal state");
+    check!(chk_table.contains("drives check"), "`jobs` renders the check job as the command it is");
+    check!(!unasked,
+           "THE REPORT DID NOT ARRIVE UNASKED - a detached job holds no console, so `jobs` showed a row and no verdict");
+    check!(replay.contains("job 4 is done"), "`foreground` reports the check job's outcome");
+    check!(replay.contains("drives check - walking the volume"),
+           "`foreground` REPLAYS THE TRANSCRIPT - the output was held in bounded RAM until it was asked for");
+    check!(replay.contains("0 bad") && replay.contains("file(s)"),
+           "the verdict is RENDERED, not passed through - fs answers with counts, and raw counts printed as text are garbage");
+
+    check!(scr_start.contains("[backgrounded] job 5"), "`background drives scrub` starts a job");
+    check!(scr_settled, "the scrub job reached a terminal state");
+    check!(scr_table.contains("drives scrub"),
+           "`jobs` tells the two sweeps apart - a row that said `check` for a scrub would be a quiet lie");
+    check!(scr_replay.contains("drives scrub - verifying"),
+           "`foreground` replays the scrub's transcript");
+    check!(scr_replay.contains("0 bad") && scr_replay.contains("director"),
+           "the scrub verdict is rendered too - this is the one that exposed the pass-through bug");
+
+    println!("\njobs: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_fs_metafull(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");

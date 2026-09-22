@@ -293,6 +293,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "copier"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

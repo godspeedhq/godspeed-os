@@ -83,7 +83,7 @@ is the trap this project has hit most:
 
 ```
 osdev build                 # 20 commandments, 73 redteam probes, 15 checkers
-osdev test fs-all           # 30 suites, roughly 40 minutes
+osdev test fs-all           # 31 suites, roughly 45 minutes
 osdev test shell            # 174
 osdev test files            # 222
 ```
