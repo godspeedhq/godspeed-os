@@ -589,7 +589,8 @@ fn render_churn(out: &mut [u8; 160], job: &Job) -> usize {
 /// `write!` into a fixed array rather than digit-by-digit arithmetic: `format_args!` does not
 /// allocate, and §26.6.1 says so explicitly - hand-rolling number formatting to avoid a heap that
 /// was never involved is itself the mistake that section warns about.
-fn render_verdict(out: &mut [u8; 160], files: u32, dirs: u32, bad: u32) -> usize {
+fn render_verdict(out: &mut [u8; 160], files: u32, dirs: u32, bad: u32,
+                  free: u64, stored_before: u64) -> usize {
     use core::fmt::Write as _;
     struct Sink<'a> { buf: &'a mut [u8; 160], n: usize }
     impl core::fmt::Write for Sink<'_> {
@@ -607,6 +608,19 @@ fn render_verdict(out: &mut [u8; 160], files: u32, dirs: u32, bad: u32) -> usize
         let _ = write!(sink, "{} BAD block(s) - {} file(s), {} director(ies) scanned\n", bad, files, dirs);
     } else {
         let _ = write!(sink, "ok - 0 bad, {} file(s), {} director(ies) scanned\n", files, dirs);
+    }
+    // THE REPAIR QUESTION, which is why a check is usually run after a crash. The superblock's count
+    // before the rebuild against the tree's count after it: equal means the accounting was already
+    // right, and any difference is named with its direction, because the two directions have
+    // opposite consequences. Higher-than-truth means a block the tree owns was considered free.
+    if stored_before == free {
+        let _ = write!(sink, "the free count already agreed with the tree - nothing was repaired\n");
+    } else if stored_before > free {
+        let _ = write!(sink, "REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted too much free space, off by {})\n",
+                       stored_before, free, stored_before - free);
+    } else {
+        let _ = write!(sink, "REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted too little free space, off by {})\n",
+                       stored_before, free, free - stored_before);
     }
     sink.n
 }
@@ -740,8 +754,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     let files = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                                     let dirs = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
                                     let bad = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+                                    // A CHECK carries the accounting too; a SCRUB does not - it is
+                                    // read-only and repairs nothing, so there is nothing to report.
+                                    let rd = |o: usize| if n >= o + 8 {
+                                        u64::from_le_bytes([body[o], body[o+1], body[o+2], body[o+3],
+                                                            body[o+4], body[o+5], body[o+6], body[o+7]])
+                                    } else { 0 };
+                                    let (free, before) = if kind == KIND_CHECK && n >= 36 {
+                                        (rd(20), rd(28))
+                                    } else { (0, 0) };
                                     let mut line = [0u8; 160];
-                                    let len = render_verdict(&mut line, files, dirs, bad);
+                                    let len = render_verdict(&mut line, files, dirs, bad, free, before);
                                     job.out.write(&line[..len]);
                                 } else {
                                     job.out.write(b"ok - nothing to report\n");

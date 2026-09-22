@@ -7385,6 +7385,11 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "`foreground` REPLAYS THE TRANSCRIPT - the output was held in bounded RAM until it was asked for");
     check!(replay.contains("0 bad") && replay.contains("file(s)"),
            "the verdict is RENDERED, not passed through - fs answers with counts, and raw counts printed as text are garbage");
+    // THE DETACHED FORM MUST SAY WHAT THE ATTACHED ONE SAYS. A backgrounded check that omits the
+    // repair line answers less than `drives check` does, silently - and `drives check` REPAIRS as it
+    // goes, so a second run cannot recover the answer. That cost a hardware run on 2026-09-22.
+    check!(replay.contains("nothing was repaired") || replay.contains("REPAIRED the FREE COUNT"),
+           "the detached check reports WHETHER THE ACCOUNTING NEEDED REPAIR - the question a check after a crash is run to answer");
 
     check!(scr_start.contains("[backgrounded] job 5"), "`background drives scrub` starts a job");
     check!(scr_settled, "the scrub job reached a terminal state");
