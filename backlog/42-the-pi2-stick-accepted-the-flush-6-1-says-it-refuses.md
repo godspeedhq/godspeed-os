@@ -63,6 +63,21 @@ So the stick attests durability through all three USB stacks it meets: `dwc2` on
 the Pi 4, and `xhci` on the VisionFive. Four sessions, no refusal, two of them with the corrected
 instrument that can tell a refusing device from an absent driver.
 
+## The HP T630 is NOT a fifth data point, deliberately
+
+2026-09-22, HP T630, an unassisted power cut recovered in the strong form with zero
+`durability NOT attested` lines. It is recorded in `docs/gsfs-carnage.md` and it is **excluded here
+on purpose.**
+
+That board writes to an **AHCI SSD**, not the shared USB stick. 6.1 already states that an AHCI
+backend attests durability, so a clean run there confirms the half of the amendment nobody disputes
+and says nothing whatever about the device this entry is about. Counting it would be the very error
+this entry was opened to correct: reading an outcome as evidence about a device it did not come
+from.
+
+The four sessions above are the evidence, and all four are the SAME PHYSICAL STICK through three
+different USB stacks. A fifth would have to be that stick again.
+
 ## The only local evidence for the refusal is an instrument that could not tell
 
 `build/pi2a.log` (2026-08-30) contains the warning twice. Both times it is immediately preceded by:
@@ -95,6 +110,17 @@ would reach for cannot support the claim, and the device it names does not refus
 3. **If it does refuse on some mounts**, that is more interesting than either: a device that
    sometimes honours a barrier is worse than one that never does, because the guarantee becomes
    conditional on a coin toss and nothing in the system would notice.
+
+## The one test that is still missing
+
+Every session above had something helping it. Three were `crash-window` builds holding the window
+open for ten seconds; the fourth was a plain mount with no cut at all. **No cut on this stick has
+yet landed at a moment nobody chose.**
+
+The T630 run is what shows that gap is real and testable: x86 has no crash-window flag, so its cut
+WAS unassisted, and it recovered anyway. The same test on the Pi 2 - `churn 30` on a plain image,
+power pulled at any moment - is the one run that would settle 6.1 either way, because an idle stick
+with ten seconds to flush on its own is not being asked the question.
 
 ## What NOT to do
 
