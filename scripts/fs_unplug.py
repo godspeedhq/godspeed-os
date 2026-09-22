@@ -48,9 +48,55 @@ def check(ok, label):
     print("fs-unplug: %s - %s" % ("PASS" if ok else "FAIL", label))
 
 
+# QEMU `virt` enters the kernel at 0x8020_0000; the StarFive VisionFive 2 Lite enters at
+# 0x4020_0000 (`kernel/kernel-riscv64.ld` and `kernel-riscv64-visionfive.ld` respectively).
+QEMU_VIRT_ENTRY = 0x80200000
+
+
+def elf_entry(path):
+    """The ELF entry address, or None if this is not a 64-bit little-endian ELF."""
+    with open(path, "rb") as fh:
+        head = fh.read(64)
+    if len(head) < 64 or head[:4] != b"\x7fELF" or head[4] != 2 or head[5] != 1:
+        return None
+    return int.from_bytes(head[24:32], "little")
+
+
 def main():
     if not os.path.exists(KERNEL):
         sys.exit("fs-unplug: no riscv64 kernel - py scripts/riscv_build.py --release")
+
+    # IS THIS KERNEL BUILT FOR THIS MACHINE? One arch, two machines, ONE artifact path - and a board
+    # build overwrites the QEMU one without either side noticing.
+    #
+    # That is not hypothetical. This suite reported 3 passed / 5 FAILED on 2026-09-22 with a serial
+    # log that stops dead at OpenSBI's banner: `Domain0 Next Address : 0x0000000040200000`, then
+    # nothing. Earlier the same session someone had run `scripts/board.py visionfive`, which writes a
+    # 0x4020_0000 kernel to the very path this suite reads. QEMU `virt` puts RAM at 0x8000_0000, so
+    # the image landed nowhere, printed nothing, and every assertion that needed a booted machine
+    # failed - starting with the setup, which made it read like a filesystem defect.
+    #
+    # The failure was ALSO self-healing in the worst way: `cross-isa` runs a minute later in
+    # `fs-all`, rebuilds the artifact for QEMU, and leaves a tree where re-running this suite passes.
+    # A red that cannot be reproduced afterwards is the kind that gets written off as flake.
+    #
+    # So the entry address is checked rather than assumed. It is the one byte-level fact that
+    # distinguishes the two builds and it costs a 64-byte read.
+    entry = elf_entry(KERNEL)
+    if entry is None:
+        sys.exit("fs-unplug: %s is not a 64-bit ELF.\n"
+                 "        `--visionfive` emits a FLAT BINARY for U-Boot, not an ELF, and QEMU's\n"
+                 "        `-kernel` needs the ELF. Rebuild for QEMU: py scripts/riscv_build.py --release"
+                 % os.path.relpath(KERNEL, ROOT))
+    if entry != QEMU_VIRT_ENTRY:
+        sys.exit("fs-unplug: this riscv64 kernel is built for the WRONG MACHINE.\n"
+                 "        entry 0x%x, and QEMU `virt` needs 0x%x.\n"
+                 "        0x40200000 is the StarFive VisionFive 2 Lite - `scripts/board.py visionfive`\n"
+                 "        (or `riscv_build.py --visionfive`) wrote a BOARD kernel to the path this\n"
+                 "        suite boots. It would load nowhere and print nothing, and the failure would\n"
+                 "        read as a filesystem defect.\n"
+                 "        Rebuild for QEMU: py scripts/riscv_build.py --release"
+                 % (entry, QEMU_VIRT_ENTRY))
 
     os.makedirs(os.path.dirname(VOLUME), exist_ok=True)
     with open(VOLUME, "wb") as fh:

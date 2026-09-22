@@ -3986,7 +3986,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     // and no command line here contains that.
     send(&mut write_half, b"read /docs/sb.txt | count\r");
     let sv2 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
-    check!(sv2.contains(" lines,") && !sv2.contains("0 lines,"),
+    check!(count_before(&sv2, " lines,") > 0,
            "scrollback save: the file reads back with real content");
 
     // AND CLEAN UP, so the tree the later cases see is the tree they expect.
@@ -7405,11 +7405,11 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     check!(ch_busy.contains("canary.txt"),
            "THE PROMPT STAYS USABLE while churn writes - which is the whole reason to detach it");
     check!(ch_settled, "the churn job reached a terminal state at its own deadline");
-    check!(ch_replay.contains("writes") && !ch_replay.contains("0 writes"),
+    check!(count_before(&ch_replay, " writes") > 0,
            "the churn job actually WROTE - a run reporting `done` with 0 writes is a job that achieved nothing");
-    check!(ch_replay.contains("renames") && !ch_replay.contains("0 renames"),
+    check!(count_before(&ch_replay, " renames") > 0,
            "and it RENAMED - writing only would exercise one transaction shape while claiming three");
-    check!(ch_verify.contains("NONE torn") && !ch_verify.contains("0 file(s) checked"),
+    check!(ch_verify.contains("NONE torn") && count_before(&ch_verify, " file(s) checked") > 0,
            "`churn verify` recognised what the detached writer wrote, over a NON-EMPTY set - `NONE torn` across zero files is the vacuous pass this refactor exists to prevent");
 
     println!("\njobs: {pass} passed, {fail} failed");
@@ -9036,6 +9036,36 @@ tap cuts between sectors and the record is one sector), so it is built deliberat
 at all"));
     println!("\nfs-tear: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }
+}
+
+/// The largest number written immediately before `suffix`, or 0 if there is none.
+///
+/// `!out.contains("0 writes")` is the obvious way to assert "it wrote something" and it is WRONG:
+/// **"390 writes" contains "0 writes"**. So does "10 writes", "20 writes", and every other count
+/// ending in zero - the guard passes on a healthy run nine times in ten and FAILS on the tenth, for
+/// no reason connected to the system under test.
+///
+/// It cost a red `fs-all`. The `jobs` suite reported `the churn job actually WROTE` as FAILED on a
+/// run whose transcript says `churn: 390 writes, 78 renames, 78 deletes in 12s`. Nothing was wrong
+/// with the filesystem, the job, or the shell; the assertion was matching its own failure string
+/// inside the success it was reading.
+///
+/// That is the failure mode this harness elsewhere calls out as worse than a missed one, because a
+/// false FAIL teaches a reader to discount red. Four assertions in this file had the same shape and
+/// all four now go through here: read the NUMBER, do not pattern-match the text around it.
+///
+/// The maximum is taken because a transcript usually carries running counts as well as the total
+/// (`1s elapsed, 7 writes` ... `done - 390 writes`), and the question being asked is whether the
+/// work happened at all.
+fn count_before(s: &str, suffix: &str) -> u64 {
+    let mut best = 0u64;
+    for (i, _) in s.match_indices(suffix) {
+        let digits: Vec<char> = s[..i].chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() { continue; }
+        let n = digits.iter().rev().collect::<String>().parse::<u64>().unwrap_or(0);
+        if n > best { best = n; }
+    }
+    best
 }
 
 /// Make a committed journal record UNREADABLE, the way a half-written sector does on real silicon.
