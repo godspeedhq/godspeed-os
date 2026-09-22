@@ -148,22 +148,67 @@ window rather than outside it.
 So the run is not evidence either way about ordering. It is the run that found the reason no run of
 its kind could have been.
 
-## The one test that is still missing
+## CORRECTION: an unassisted cut CANNOT settle this on the Pi 2, and the arithmetic was available
 
-Every session above had something helping it. Three were `crash-window` builds holding the window
-open for ten seconds; the fourth was a plain mount with no cut at all. **No cut on this stick has
-yet landed at a moment nobody chose.**
+This entry previously called the unassisted cut "the one run that would settle 6.1 either way". That
+was wrong, and it sent two plug-pulls after an answer they could not return.
 
-The T630 run is what shows that gap is real and testable: x86 has no crash-window flag, so its cut
-WAS unassisted, and it recovered anyway. The same test on the Pi 2 has now been RUN once (above) and
-returned no verdict, because the cut did not reach the journal and the build could not say so.
+**The commit-to-checkpoint window lasts under a millisecond.** `services/fs/src/main.rs` says so at
+the crash-window feature itself, and gives the same evidence: *"it normally lasts under a
+millisecond - which is why three real power cuts on a Dell Wyse produced three clean mounts and not
+one `journal recovered` line."* The feature exists BECAUSE the window cannot be hit by aiming.
 
-**The repeat is therefore the live task, and it is now worth running**: same unassisted `churn 30`
-cut, on a build whose recovery path distinguishes a miss from a hit. One of three lines must appear
-and each means something different - `journal recovered` (the window was hit and ordering HELD, so
-6.1's example is wrong), `the journal record is present but TORN` (the window was hit and the device
-did not finish the record - correct, harmless, and exactly 6.1's case), or nothing at all (missed
-again, repeat). Until this fix there was no third reading; there was one silence covering two.
+On the Pi 2 a transaction takes about 52 ms (churn sustains ~19 operations/second on this stick), so
+an unaimed cut lands in the window with probability under 2%:
+
+| attempts | chance of at least one hit |
+|---|---|
+| 2 (what was run) | ~4% |
+| 35 | ~50% |
+| 115 | ~90% |
+
+Two misses is the expected result, not bad luck. The T630 hitting on its first attempt was luck, and
+plausible only because an SSD transaction is short enough that a sub-millisecond window is a
+respectable fraction of it. The same cut on a USB stick spends nearly all of its time in the two
+flushes, and both of those sit OUTSIDE the window.
+
+So: this board will not answer the ordering question by aiming at it, in any number of attempts a
+person will actually do.
+
+## What the unassisted cuts DID measure, which is not nothing
+
+`journal recovered` was the wrong success criterion, and fixing that makes the runs worth having.
+
+The failure 6.1 warns about is **reordering**: home blocks reaching the medium BEFORE the commit
+record, leaving torn metadata with no record to replay from. That does not need the window. It
+shows up on ANY cut, as a CRC failure on read or a tree that disagrees with the free count - and
+both are checked directly.
+
+| | cut 1 (18 s in) | cut 2 (17 s in) |
+|---|---|---|
+| mount | clean | clean |
+| `journal recovered` | absent | absent |
+| `churn verify` | 6 files, 0 empty, NONE torn | - |
+| `drives check` | 0 bad; free count exact, nothing repaired | - |
+| `durability NOT attested` | absent | absent |
+
+Two unaimed cuts, no reordering damage either time. Each further cut is another independent sample
+of the same question and costs about 45 seconds (`churn 30`, cut, reboot, `churn verify`,
+`drives check` - no `selfcheck` needed, it has passed twice on this build). Clean samples accumulate
+into a real statement about the device even though none of them will reach the journal.
+
+## The instrument that WOULD answer it
+
+Not built, recorded (26.7). A **deliberately short crash window** - tens of milliseconds rather than
+ten seconds - makes the hit near-certain while leaving far too little idle time for "the stick
+flushed on its own during the pause" to explain a recovery. That is the objection which makes the
+existing 10-second window weak evidence about ordering, and shrinking the window is the direct
+answer to it.
+
+It is written down rather than built because nothing yet requires it (26.2): the safety question is
+being answered by the accumulating clean cuts above, and the ordering question has no consumer today
+beyond this entry. If 6.1 is ever to be amended on evidence rather than argument, this is the
+instrument that would do it.
 
 ## What NOT to do
 

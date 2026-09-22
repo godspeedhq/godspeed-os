@@ -6,14 +6,23 @@ one that matters.** Dell Wyse 5070 (2026-09-18), then VisionFive 2, Raspberry Pi
 the checklist for the five, written while the QEMU work was fresh so that the reasons behind each
 step are recorded rather than reconstructed later.
 
-**What the last board is for.** It is not a fifth confirmation. `CLAUDE.md` 6.1 records `fs` on the
-Pi 2 as restartable but NOT crash-recoverable, because its USB stick refuses `SYNCHRONIZE CACHE` -
-and `backlog/42` records that the same stick has now attested durability across four sessions and
-three USB stacks. A constitutional claim and a machine disagree. The run that settles it is a
-PROBABILISTIC cut on a plain image (`churn 30`, no crash-window), because that is the only form that
-asks the device about ordering without a ten-second idle window answering for it. The T630 is the
-proof such a run is meaningful: x86 has no crash-window flag, its cut was unassisted, and it landed
-inside the commit window on the first attempt.
+**What the last board is for, corrected after two runs.** It is not a fifth confirmation.
+`CLAUDE.md` 6.1 records `fs` on the Pi 2 as restartable but NOT crash-recoverable, because its USB
+stick refuses `SYNCHRONIZE CACHE` - and `backlog/42` records that the same stick has now attested
+durability across six sessions and three USB stacks. A constitutional claim and a machine disagree.
+
+This document previously said a PROBABILISTIC cut would settle it. **It will not, on this board.**
+The commit-to-checkpoint window lasts under a millisecond against a ~52 ms transaction on a USB
+stick, so an unaimed cut reaches it with probability under 2%; two were run and both missed, which
+is what those odds predict. The T630's first-attempt hit was luck on hardware where the whole
+transaction is short enough for a sub-millisecond window to be a real fraction of it.
+
+What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: home blocks reaching
+the medium before the commit record, which leaves torn metadata with no record to replay from. That
+needs no window and is caught by `churn verify` (content) and `drives check` (structure). Both runs
+came back clean on both. Further cuts are worth doing for that reason and cost ~45 seconds each;
+none of them will reach the journal. `backlog/42` carries the arithmetic and the instrument that
+would close the ordering question properly.
 
 ## Result so far: Dell Wyse 5070 (x86-64, AHCI, 30 GB SSD)
 
