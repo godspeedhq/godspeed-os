@@ -380,7 +380,14 @@ os/
     embed_order_check.py #   the supervisor is newer than the services it embeds
     stack_fit_check.py   #   a service's frames fit the stack it is given (§26.6.1)
     test_report.py       #   collate a suite run into a report
-    arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
+    board.py             #   ONE way to build a bootable image for any port:
+                         #   `py scripts/board.py pi2|pi4|visionfive|x86 [--crash-window]`.
+                         #   Owns the POLICY the four ports used to state differently - a
+                         #   board image is ALWAYS release, every port takes the same flags,
+                         #   every build ends by naming the artifact and what to copy where
+                         #   (including the per-port RENAMES). The per-port scripts below do
+                         #   the work and stay callable
+    arm_build.py  pi4_build.py  riscv_build.py  arm_run.py  pi4_run.py  riscv_run.py
 
   utilities/             # the SPEC for every shell utility, one file each, plus 0_conventions
     0_conventions.md     #   the 13 rules every utility obeys

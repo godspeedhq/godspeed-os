@@ -1,7 +1,11 @@
 # GodspeedOS - Raspberry Pi 2 (BCM2836, ARMv7) boot config.
 #
-# Canonical copy. `scripts/arm_build.py` copies this next to the built kernel as
-# build/config.txt; deploy by copying it and build/kernel7.img to the FAT boot
+# Canonical copy. `scripts/arm_build.py` stages it as build/config-pi2.txt - NOT as
+# build/config.txt, which does not exist. YOU rename it when you copy it: the card
+# needs it called `config.txt`, and a card with our kernel7.img but the Imager's
+# config.txt sits on the rainbow screen, because the firmware never learns which
+# kernel to load. That is what this comment used to send people looking for.
+# Deploy by copying it AS config.txt, with build/kernel7.img, to the FAT boot
 # partition of a card that already carries the Pi firmware (bootcode.bin /
 # start.elf / fixup.dat - written by the Raspberry Pi Imager, or restored from a
 # backup). See docs/pi2-deploy.md for the full procedure.
