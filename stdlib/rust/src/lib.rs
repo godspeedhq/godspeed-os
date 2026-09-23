@@ -73,6 +73,7 @@ pub mod error;
 // meet a real filesystem that can really be restarted. A mock would only prove this library agrees
 // with a mock.
 #[cfg(not(test))] pub mod call;
+#[cfg(not(test))] pub mod cap;
 #[cfg(not(test))] pub mod fs;
 #[cfg(not(test))] pub mod io;
 #[cfg(not(test))] pub mod net;
@@ -85,6 +86,7 @@ pub use error::Error;
 #[cfg(not(test))]
 pub mod prelude {
     pub use crate::error::Error;
+    pub use crate::cap::File;
     pub use crate::fs::Fs;
     pub use crate::net::Net;
     pub use crate::io;

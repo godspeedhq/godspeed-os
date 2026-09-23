@@ -4999,6 +4999,13 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
                    "an append-only cap CANNOT go back over what it already wrote");
             check!(r.contains("still accepted after the refusal"),
                    "a refused write did not rewind the high-water mark");
+            // THE STANDARD LIBRARY, over the same protocol. Named rather than left to the aggregate
+            // below: `gs::cap` is the only caller that must work from a task which also serves
+            // clients, so a silent regression here is the one that would not be noticed.
+            check!(r.contains("gs::cap wrote and read the file THROUGH the capability"),
+                   "gs::cap round-trips a file through the capability");
+            check!(r.contains("gs::cap non-escalation holds"),
+                   "gs::cap cannot widen rights - a READ cap is refused its write by the kernel");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }

@@ -672,3 +672,99 @@ deleting the attribute to watch the gate fire:
 Both fixed, and the guard now fires on a deleted attribute. Worth stating plainly: **for the whole
 of this branch, the one property making "the library cannot manufacture capability" structural
 rather than aspirational was resting on nobody deleting a line by accident.**
+
+## 14. `gs::cap` is built, and the answer was rung B all along
+
+Section 12 said this module would not be built because the OS did not possess safe general resource
+invocation. That was right about the OS and **wrong about why**, and the error was mine: I had
+recorded, in `backlog/46`,
+
+> **A service-layer tag cannot fix this.** Echoing a caller-supplied tag would let the caller
+> RECOGNISE a wrong message, but `recv` has already CONSUMED it and there is no requeue. Selective
+> dequeue is inherently kernel-side.
+
+The first sentence is true and the conclusion does not follow. **A caller does not have to requeue a
+message it should not have taken. It can HOLD it and hand it back.** Correlation is what makes
+holding possible, and correlation is a protocol property, not a kernel one. So this was rung B -
+existing userspace machinery, composed wrongly - and it needed no kernel change. `kernel/` and `sdk/`
+are still untouched on this branch.
+
+### What was actually missing
+
+`services/fs` speaks two protocols. The NAMED one (`OP_WRITE_FILE` and friends) carries a tag at byte
+0 of the request and echoes it at byte 0 of the reply. The FILE-CAP one (`FOP_READ`/`WRITE`/`STAT`/
+`CLOSE`) carried none. **Same service, same file, opposite answers to the same question.**
+
+That asymmetry was the whole blocker. With nothing to match on, a holder must either block on a bare
+`recv` and read whatever arrives as its reply, or drain its queue and destroy anything else in it.
+The shell drains, which is safe only because the shell serves nobody.
+
+The fix is one tag, restoring the convention the sibling protocol always had:
+
+```text
+request   [tag, FOP_*, ..]      (was [FOP_*, ..])
+reply     [tag, FS_*,  ..]      (was [FS_*,  ..])
+```
+
+The edit is deliberately tiny: `p` is shadowed past the tag so every offset below is unchanged, and
+the `send` closure prepends so every reply site is unchanged. One extra 3562-byte reply buffer in
+`serve_filecap`, against a 256 KiB frame limit.
+
+### What the library does with it
+
+`File::invoke` sends tagged and waits. A message that is not the reply is **held in a bounded array
+and handed back** via `File::take_held`, never dropped. If there is no room left to hold, the
+operation stops rather than dropping: what was taken is handed back, what was not taken is still in
+the kernel queue, and the caller gets `OutcomeUnknown` because that is the truth.
+
+`HELD_MAX` is 2. A held message is a full 4 KiB `Message`, so the bound is small and readable from
+the source (26.6.1) rather than generous and invisible.
+
+**The obligation is stated rather than hidden**: a task that serves clients must drain `take_held`
+after each operation. Ignoring those messages loses them just as surely as draining would have - the
+difference is that here you are told.
+
+### One design decision worth naming
+
+`File` borrows `&mut Fs`. The two speak to one service over one endpoint, so they must share ONE tag
+counter; two counters can mint the same tag for two exchanges in flight, and the result is not a loud
+rejection but a stale reply silently accepted as the current answer. The borrow makes that
+structural - **the borrow checker will not let the bug be spelled**. The cost is one open file per
+handle, and `Fs::from_tag`/`Fs::tag` are the escape for anyone who needs two.
+
+### The dogfood earned its keep again
+
+`fcap` - the `osdev test file-cap` self-check that pins 22 Test 14 - gained a section repeating the
+core property through `gs::cap`. It failed on the first run:
+
+```text
+fcap: FAIL gs::cap round trip - the service sent a reply this library could not parse
+```
+
+`invoke` VERIFIES the tag and returns the message whole; it does not strip it, because stripping
+means rebuilding a 4 KiB `Message` per read. My own doc comment claimed otherwise - *"the tag is
+already checked and stripped"* - and `read_at` and `size` believed the comment rather than the code,
+reading the status byte as the first byte of the length. **A comment that lies is worse than no
+comment, and this one lied to its own author within the hour.**
+
+Fixed, and the two library checks are now NAMED assertions rather than folded into the aggregate,
+because `gs::cap` is the one caller that must work from a task which also serves clients.
+
+### Verified
+
+- `osdev test file-cap`: **15 passed, 0 failed** (was 13 - the two new assertions).
+- `osdev test files`: **245 passed, 0 failed**. An earlier run reported one failure,
+  `tab abs-path timeout`, on a code path this change does not touch; it passed on re-run and is
+  recorded here as the host-load flake it was rather than quietly re-run until green.
+- `osdev test fs-restart`: **11 passed, 0 failed**.
+- 13 of 13 gates green; `cargo test -p godspeed` 7/7.
+
+### What is still open
+
+`backlog/46` stays open, narrowed. The fs file-capability path is correlated now, but the same gap
+remains wherever else a delegated resource cap is invoked:
+
+- **`net-stack`'s socket and listener caps** carry no tag, so `sock` still relies on draining.
+- **`examples/holder`** still does a bare `ctx.recv()` and hangs forever if its owner dies - hole 2,
+  the missing `ReplyDead`, which a tag does NOT fix. That one is genuinely about the mechanism, not
+  the protocol, and is left recorded rather than papered over.

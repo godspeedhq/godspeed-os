@@ -1868,8 +1868,27 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
 /// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
 fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle,
                  reply_fails: &mut u32) {
+    // THE CORRELATION TAG, which this protocol lacked while the NAMED one in this same file has
+    // always had it. Byte 0 of the request, echoed at byte 0 of every reply.
+    //
+    // Without it a holder cannot tell our reply from any other message on its endpoint, so it must
+    // either block on a bare `recv` and read whatever arrives as the answer, or drain its queue and
+    // destroy whatever else was in it. The shell does the latter and gets away with it because it
+    // serves nobody; a service that serves clients cannot. With a tag, a caller that receives
+    // something else can HOLD it and hand it back instead of losing it - which is what makes safe
+    // general resource invocation a protocol property rather than a missing kernel primitive.
+    let tag = p.first().copied().unwrap_or(0);
+    // Shadowed past the tag so every offset below is unchanged - this is a framing change, not a
+    // re-cut of the operations.
+    let p = if p.len() > 1 { &p[1..] } else { &[][..] };
     let mut send = |bytes: &[u8]| {
-        let r = ctx.try_send_by_handle(reply, &Message::from_bytes(bytes));
+        // One buffer, sized for the largest reply (FOP_READ's [FS_OK, n:u32, bytes]) plus the tag,
+        // so no call site below has to know the tag exists.
+        let mut out = [0u8; 6 + MAX_FILE_BYTES];
+        out[0] = tag;
+        let n = bytes.len().min(out.len() - 1);
+        out[1..1 + n].copy_from_slice(&bytes[..n]);
+        let r = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + n]));
         reply_nonblocking(r, ctx, reply_fails);
     };
     let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };

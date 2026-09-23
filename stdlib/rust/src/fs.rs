@@ -60,6 +60,7 @@ const OP_LIST_DIR: u8 = 14;
 const OP_MOVE: u8 = 17;
 const OP_MKDIR_P: u8 = 18;
 const OP_DELETE_TREE: u8 = 19;
+const OP_OPEN: u8 = 30;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_DELETE: u8 = 16;
@@ -244,6 +245,15 @@ impl<'a> Fs<'a> {
     /// already carrying, which makes a loud failure quieter for no reason (26.7).
     pub fn reason(&self) -> &str {
         core::str::from_utf8(&self.reason[..self.reason_len as usize]).unwrap_or("")
+    }
+
+    /// The next tag, for the `cap` module - which speaks to the SAME service on the SAME endpoint
+    /// and therefore must draw from THIS counter rather than start a second one.
+    ///
+    /// `pub(crate)` rather than public: sharing the counter is an internal invariant of this
+    /// library, not something a caller should be able to interleave with by hand.
+    pub(crate) fn next_tag_pub(&mut self) -> u8 {
+        self.next_tag()
     }
 
     /// The next request tag: wrapping +1, never 0.
@@ -464,6 +474,42 @@ impl<'a> Fs<'a> {
     pub fn delete_all(&mut self, path: &str) -> Result<(), Error> {
         self.call(OP_DELETE_TREE, path.as_bytes(), &[], call::DEFAULT_SECS)?;
         Ok(())
+    }
+
+    /// Open a file as a CAPABILITY (CLAUDE.md 7.10), rather than acting on it by path.
+    ///
+    /// The returned [`File`](crate::cap::File) holds an unforgeable, revocable, non-escalating
+    /// kernel capability to exactly this file. A read-only one cannot write, and the refusal comes
+    /// from the KERNEL before `fs` is reached - which is the difference between a capability and a
+    /// handle a service merely agrees to honour.
+    ///
+    /// `rights` is a mask of [`cap::READ`](crate::cap::READ), [`cap::WRITE`](crate::cap::WRITE) and
+    /// [`cap::APPEND`](crate::cap::APPEND). **Check
+    /// [`File::rights`](crate::cap::File::rights) on the result**: `fs` narrows rather than refuses
+    /// in one case - it will not mint a writable capability to a SEALED file, and hands back a
+    /// read-only one instead of a capability it could not honour.
+    ///
+    /// # Why this borrows the handle
+    ///
+    /// The `File` and this `Fs` share one correlation-tag counter, because they talk to one service
+    /// over one endpoint. The borrow is what makes that structural rather than a rule to remember.
+    /// See [`File`](crate::cap::File) for how to hold two files at once.
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability
+    /// - opening a file grants nothing the contract did not already grant.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] - no such file.
+    /// - [`Error::PermissionDenied`] - a writable capability was asked for on a sealed file and no
+    ///   read-only fallback was available.
+    /// - [`Error::Failed`] - `fs` replied without a capability. Retrying an open is safe.
+    pub fn open<'f>(&'f mut self, path: &str, rights: u8) -> Result<crate::cap::File<'f, 'a>, Error> {
+        let ctx = self.ctx;
+        self.call(OP_OPEN, path.as_bytes(), &[rights], call::DEFAULT_SECS)?;
+        // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
+        // it in our table on receipt and it is ours to claim or leak.
+        let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
+        Ok(crate::cap::File::new(self, ctx, cap, rights))
     }
 
     /// Ask whether a path exists, and what it is.

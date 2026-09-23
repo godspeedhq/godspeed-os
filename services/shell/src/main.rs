@@ -14274,8 +14274,21 @@ fn fc_open(ctx: &ShellCtx, path: &[u8], rights: u8) -> Option<CapHandle> {
 /// Invoke a file cap (§7.10): the kernel validates `file` holds `right`, badges the request, and
 /// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
 /// (the cap lacks `right` - non-escalation - or is stale/revoked), so no reply comes back.
-fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+fn fc_invoke(ctx: &ShellCtx, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
     while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
+    // TAGGED NOW (`serve_filecap` echoes byte 0). The drain above stays because the shell still
+    // wants a clean slate after an aborted invoke, but it is no longer what makes this correct: a
+    // reply whose tag does not match is REFUSED below rather than believed.
+    //
+    // The tag comes from the shell's ONE fs counter, not a second one. Both fs protocols reply onto
+    // this same endpoint, so a tag only has to be unique against everything else in flight here -
+    // and two counters on one endpoint is exactly how a stale reply gets accepted as the answer.
+    let tag = next_fs_tag(ctx);
+    if payload.len() + 1 > FC_REQ_MAX { return None; }
+    let mut req = [0u8; FC_REQ_MAX];
+    req[0] = tag;
+    req[1..1 + payload.len()].copy_from_slice(payload);
+    let payload = &req[..1 + payload.len()];
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(file, right, reply, &Message::from_bytes(payload)).is_err() {
@@ -14291,7 +14304,13 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
     // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
     match outcome {
-        ReqOutcome::Reply(m) => Some(m),
+        ReqOutcome::Reply(m) => {
+            let b = m.payload_bytes();
+            // A reply carrying someone else's tag is the answer to a question we already gave up
+            // on. Reading it as this one's is how a channel goes out of step.
+            if b.first() != Some(&tag) { return None; }
+            Some(Message::from_bytes(&b[1..]))
+        }
         _ => { ctx.remove_cap(reply); None }
     }
 }
@@ -14300,6 +14319,9 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
 /// DIAGNOSTIC, not a file tool: it creates its own throwaway file, exercises every property the
 /// capability model promises against it, then deletes it - so it never touches a file of yours
 /// and takes no argument. Each line is asserted by `osdev test file-cap` (§22 Test 14).
+/// The largest file-cap request the shell builds, plus its tag. Every `fcap` request is a short
+/// header and a small chunk; a caller needing more is refused rather than silently truncated.
+const FC_REQ_MAX: usize = 512;
 const FCAP_TMP: &[u8] = b"/.fcap-selftest";
 const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
 fn cmd_fcap_help(ctx: &ServiceContext) {
@@ -14583,8 +14605,68 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     ctx.remove_cap(rw);
     let _ = fs_request(ctx, OP_DELETE, FCAP_TMP_RENAMED, &[]);
 
+    // ---- THE SAME PROPERTY, THROUGH THE STANDARD LIBRARY -------------------------------------
+    //
+    // Everything above hand-rolls the protocol. This repeats the core of it through `gs::cap`, so
+    // the library is proven by the test that pins 22 Test 14 rather than by inspection.
+    //
+    // It is a real check and not a formality: both paths now share one wire protocol AND one tag
+    // counter (the `File` borrows the `Fs` handle precisely so a second counter cannot exist). If
+    // the tag is wrong in either direction, or the counters diverge, this read returns somebody
+    // else's answer instead of "gsdata".
+    const GSCAP_PATH: &str = "/.fcap-gs";
+    {
+        let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let r = (|| -> Result<(), gs::Error> {
+            gfs.create_sized(GSCAP_PATH, 32)?;
+            let mut f = gfs.open(GSCAP_PATH, gs::cap::READ | gs::cap::WRITE)?;
+            f.write_at(0, b"gsdata")?;
+            let mut buf = [0u8; 32];
+            let n = f.read_at(0, &mut buf)?;
+            if &buf[..6] != b"gsdata" { return Err(gs::Error::Failed); }
+            let sz = f.size()?;
+            f.close()?;
+            if n < 6 || sz < 6 { return Err(gs::Error::Failed); }
+            Ok(())
+        })();
+        ctx.fs_tag.set(gfs.tag());
+        match r {
+            Ok(()) => ctx.console_writeln("fcap: gs::cap wrote and read the file THROUGH the capability"),
+            Err(e) => {
+                out_fail_gs(ctx, e);
+                ok = false;
+            }
+        }
+        // A READ-only capability must be refused its write by the KERNEL, before fs is reached.
+        // Same non-escalation assertion as above, made through the library.
+        let mut gfs2 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let denied = match gfs2.open(GSCAP_PATH, gs::cap::READ) {
+            Ok(mut ro2) => {
+                let e = ro2.write_at(0, b"nope");
+                let _ = ro2.close();
+                matches!(e, Err(gs::Error::PermissionDenied))
+            }
+            Err(_) => false,
+        };
+        ctx.fs_tag.set(gfs2.tag());
+        if denied {
+            ctx.console_writeln("fcap: gs::cap non-escalation holds - a READ cap cannot write");
+        } else {
+            fail(ctx, "fcap: FAIL gs::cap let a READ-only capability write");
+            ok = false;
+        }
+        let mut gfs3 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let _ = gfs3.delete(GSCAP_PATH);
+        ctx.fs_tag.set(gfs3.tag());
+    }
+
     if ok { ctx.console_writeln("fcap: all file-capability checks passed"); Ok(()) }
     else { Err(ShellError::Unknown) }
+}
+
+/// Report a `gs::Error` from the `fcap` self-check, naming it rather than saying "failed".
+fn out_fail_gs(ctx: &ShellCtx, e: gs::Error) {
+    ctx.console_writeln_fmt(format_args!("fcap: FAIL gs::cap round trip - {}", e.as_str()));
 }
 
 // ── edit: a full-screen text editor (utilities/36_edit.md) ───────────────────────────────────

@@ -1,7 +1,9 @@
 # 46 - resource capability invocation has no bounded, correlated reply
 
 **Opened:** 2026-09-23
-**Status:** OPEN - architectural question RECORDED, deliberately not acted on
+**Status:** PARTLY CLOSED (2026-09-23). Hole 1 is fixed for `fs` file capabilities by a protocol
+change in userspace, and `gs::cap` is built on it. Hole 2, and hole 1 for every OTHER resource-cap
+issuer, remain open.
 **Found by:** designing `gs::cap` on `feat/stdlib`, before writing it.
 
 > **`feat/stdlib` CONTAINS NO KERNEL CHANGE, and none is proposed for it.** Verified rather than
@@ -38,9 +40,34 @@ That is verbatim the failure `CLAUDE.md` 8.2's `CallDeadline` amendment was writ
 amendment fixed the NAMED-PEER path (`request_with_reply_call` matches the reply by its sender) and
 left the RESOURCE path on the primitive it had just condemned.
 
+> **CORRECTION (2026-09-23): the paragraph below is WRONG, and being wrong is what kept `gs::cap`
+> unbuilt for a day.** The first sentence is true; the conclusion does not follow. **A caller does
+> not have to requeue a message it should not have taken - it can HOLD it and hand it back.**
+> Correlation is what makes holding possible, and correlation is a protocol property, not a kernel
+> one. This was rung B (userspace, composed wrongly) all along. Left in place rather than deleted,
+> because a plausible-sounding false step is the thing worth being able to re-read.
+
 **A service-layer tag cannot fix this.** Echoing a caller-supplied tag would let the caller
 RECOGNISE a wrong message, but `recv` has already CONSUMED it and there is no requeue. Selective
 dequeue is inherently kernel-side - it is what `call_dequeue` does.
+
+### How hole 1 was actually closed, for `fs`
+
+`services/fs` speaks two protocols. The NAMED one tags at byte 0 both ways; the FILE-CAP one carried
+no tag at all. Same service, same file, opposite answers to the same question - and that asymmetry
+was the entire blocker. The file-cap protocol now carries the tag its sibling always had:
+
+```text
+request   [tag, FOP_*, ..]        reply   [tag, FS_*, ..]
+```
+
+`gs::cap` sends tagged, and any message that is not the reply is held in a bounded array and handed
+back through `File::take_held` rather than dropped. If there is no room to hold, the operation stops:
+what was taken is returned, what was not taken stays in the kernel queue, and the caller is told the
+outcome is unknown. **No kernel change**; `kernel/` and `sdk/` are untouched on that branch.
+
+Pinned by `osdev test file-cap` (15 passed, 0 failed), including a named assertion that a READ-only
+capability is refused its write by the kernel.
 
 ### 2. No `ReplyDead`
 
@@ -128,6 +155,19 @@ Independently of `gs::cap`, and from first principles:
 Acceptable outcomes include concluding that `resource_invoke` is intentionally narrow and its
 contract sufficient - in which case the contract gets written down and `examples/holder` gets fixed
 or explained, and that alone is worth the investigation.
+
+## What remains open, precisely
+
+1. **Hole 2, everywhere.** A tag does not fix the missing `ReplyDead`: the kernel is still never told
+   a reply is awaited, so an owner that dies mid-invocation does not wake its caller. `gs::cap`
+   bounds this with a deadline, which is a caller-side mitigation and not the 8.6 guarantee. This one
+   IS about the mechanism rather than the protocol.
+2. **Hole 1 for every other issuer.** `net-stack`'s socket and listener caps carry no tag, so the
+   shell's `sock` still relies on draining - safe only because the shell serves nobody. The same
+   one-byte protocol fix would work there; it simply has not been done.
+3. **`examples/holder`** still does a bare, unbounded `ctx.recv()`. It remains Commandment VIII
+   broken in the example that teaches the mechanism, and fixing it needs either a deadline (easy, and
+   only a mitigation) or hole 2 closed (the real answer).
 
 ---
 
