@@ -299,3 +299,53 @@ this library agrees with a mock.
 
 **Still open, unchanged:** the terminating task (§1), `net` (needs `net-stack` inspected properly),
 and target-side suites for `fs`/`call` against a real service restart.
+
+---
+
+## 8. `net`: inspected, and the answer is NOT YET
+
+§4 deferred `net` rather than guessing at a socket API. Inspected properly now, and the deferral
+holds - but the inspection found something better than a socket module.
+
+### Why not now
+
+| | `fs` (shipped) | `net-stack` |
+|---|---|---|
+| Crates duplicating its constants | **4** (`fs`, `shell`, `copier`, `recorder`) | 0 |
+| Real clients | 3 | **2** - `shell` (17 references) and `time` (ONE fire-and-forget `try_send`) |
+| Protocol commits, v0.16.0 to now | - | **34**, one of them on this branch |
+
+Two clients is not repeated application plumbing, it is two call sites, and one of them sends a
+single byte. Against that, the protocol moved 34 times in three releases. The brief is explicit on
+both counts: *"Every abstraction must correspond to a demonstrated application need"*, and *"be
+conservative about declaring APIs stable... small enough that we understand the semantics of what we
+commit to."*
+
+Wrapping it now would freeze a shape that is still moving, for one and a half consumers.
+
+### What the inspection found instead
+
+**A socket is a delegated resource capability**, the same §7.10 mechanism as file-as-capability -
+`resource_mint` to issue, `resource_invoke` to use, `last_recv_badge` to authenticate, with a rights
+check on every operation (`LOP_ACCEPT` and `LOP_CLOSE` both demand `RIGHT_WRITE`, because both change
+what the machine does on the wire).
+
+That mechanism has **two independent issuers already** - `fs` for files and `net-stack` for sockets -
+plus the shell as a consumer of both, and two worked examples. So the abstraction with demonstrated
+need is not `net`. It is:
+
+> **`gs::cap` - hold, invoke and narrow a delegated resource capability, without hand-rolling the
+> badge and rights dance.**
+
+That is the honest next slice by the brief's own test: it removes plumbing that is genuinely repeated
+across two unrelated services, it wraps one named Godspeed mechanism rather than a protocol still in
+flux, and it cannot widen authority because rights only ever narrow on transfer (§7.3).
+
+It is NOT being built now either, for the same reason `net` is not: the shell is the only real
+consumer today, and a second would settle the shape. **Recorded, not started.**
+
+### What would change the answer for `net`
+
+A second substantive client. If `time` ever needs more than one byte, or an application wants a
+socket, the repeated plumbing appears and `gs::net` earns its place - most likely on top of `gs::cap`
+rather than beside it.
