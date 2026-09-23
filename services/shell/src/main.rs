@@ -15643,23 +15643,47 @@ fn cmd_mkdir(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), 
 fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
-    let reply = match fs_request(ctx, op, path, &[]) {
-        Some(r) => r,
-        None => { fs_no_answer(ctx, "mkdir"); return Err(ShellError::Unknown); }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = if parents { g.create_dir_all(path) } else { g.create_dir(path) };
+    let why = g.reason();
+    let answer = match r {
+        Ok(()) => {
+            ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
+            Ok(())
+        }
+        // A DIRECTORY IS A MUTATION TOO. If the reply was lost the entry may exist, and telling the
+        // operator it failed sends them to create it again - which then fails for real, as already
+        // present, and looks like the first failure was a lie.
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln_fmt(format_args!(
+                "mkdir: OUTCOME UNKNOWN - {} MAY HAVE BEEN created. Check with `dir`", str_of(path)));
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => { fs_no_answer(ctx, "mkdir"); Err(ShellError::Unknown) }
+        Err(_) if !why.is_empty() && parents => {
+            ctx.console_writeln_fmt(format_args!("mkdir: failed - {}", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if !why.is_empty() => {
+            ctx.console_writeln_fmt(format_args!(
+                "mkdir: failed - {} (a missing parent needs 'mkdir <path> parents')", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if parents => {
+            ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
+            Err(ShellError::Unknown)
+        }
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) {
-        ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
-        Ok(())
-    } else if parents {
-        ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
-        Err(ShellError::Unknown)
-    } else {
-        ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
-        Err(ShellError::Unknown)
-    }
+    ctx.fs_tag.set(g.tag());
+    answer
 }
 
 /// `cd [path]` - change the current directory (validates it exists + is a directory).
@@ -16621,18 +16645,57 @@ fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(
     let mut pp = [0u8; PATH_MAX];
     let pl = path.len();
     pp[..pl].copy_from_slice(path);
-    let op = if recursive { OP_DELETE_TREE } else { OP_DELETE };
-    match fs_request(ctx, op, &pp[..pl], &[]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+    // `delete_all` carries the SWEEP budget, because a tree delete walks the tree and the ordinary
+    // request deadline is shorter than that walk.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = if recursive { g.delete_all(&pp[..pl]) } else { g.delete(&pp[..pl]) };
+    let why = g.reason();
+    let answer = match r {
+        Ok(()) => {
             let what = if recursive { "deleted (recursive)" } else { "deleted" };
             ctx.console_writeln_fmt(format_args!("{} {}", what, str_of(&pp[..pl])));
             Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) if recursive => { ctx.console_writeln("delete: failed (not found, or tree too deep?)"); Err(ShellError::Unknown) }
-        Some(_) => { ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"); Err(ShellError::Unknown) }
-        None    => { fs_no_answer(ctx, "delete"); Err(ShellError::Unknown) }
-    }
+        // THE WORST CASE IN THE SHELL for a lost reply. A tree delete frees in batches, so the tree
+        // may be wholly gone, partly gone, or untouched, and "delete: failed" asserts the last of
+        // the three. Name the command that settles it instead.
+        Err(gs::Error::OutcomeUnknown) if recursive => {
+            ctx.console_writeln_fmt(format_args!(
+                "delete: OUTCOME UNKNOWN - {} may be PARTLY removed. Check with `dir`", str_of(&pp[..pl])));
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln_fmt(format_args!(
+                "delete: OUTCOME UNKNOWN - {} MAY HAVE BEEN removed. Check with `dir`", str_of(&pp[..pl])));
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => { fs_no_answer(ctx, "delete"); Err(ShellError::Unknown) }
+        // The service's sentence REPLACES the guess but not the ADVICE: "directory not empty" is the
+        // fact, and "use `delete <path> recursive`" is the thing to do about it.
+        Err(_) if !why.is_empty() && recursive => {
+            ctx.console_writeln_fmt(format_args!("delete: failed - {}", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if !why.is_empty() => {
+            ctx.console_writeln_fmt(format_args!(
+                "delete: failed - {} (a non-empty directory needs 'delete <path> recursive')", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if recursive => {
+            ctx.console_writeln("delete: failed (not found, or tree too deep?)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')");
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(g.tag());
+    answer
 }
 
 /// `move <src> <dst>` - relocate an entry (same data; only the directory entries change).
