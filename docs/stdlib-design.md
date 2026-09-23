@@ -1104,3 +1104,30 @@ arrived at the same 120 independently for its own version.
 This is a property of every deadline in the system built on `epoch_secs_monotonic` differences, not
 of the standard library. Anyone sizing a budget out of a retry count and a per-try timeout is
 computing N x S and getting a number that is up to N seconds short.
+
+### The fourth instance, in the test harness
+
+Section 19's rule broke once more before the day was out, and this time I caused the breakage by
+fixing something else. Recorded because the shape is now unmistakable.
+
+Raising `SOCKET_SECS` to 30 made `sock` able to take thirty seconds. The harness step that reads its
+output waits:
+
+```rust
+let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8))
+```
+
+**Eight seconds.** Correct while the shell gave up after five; wrong the moment the command could
+outlive it. And the failure is not local - when `collect_until` returns early the harness is reading
+the wrong place in the stream, so EVERY LATER STEP cascades.
+
+The symptom was five consecutive runs of one build giving **12, 6, 1, 11 and 50** failures. I spent
+two of those runs treating it as host load, which it was not: the serial log carried **zero kernel
+panics and zero liveness wedges**, and simply stopped partway. That is the signature of a harness
+losing its place, not a guest breaking, and reading it would have been quicker than re-running.
+
+What decided each run was whether the DNS peer answered inside eight seconds.
+
+So the rule holds in one more place than stated: **a waiter's bound must exceed the work it waits
+on - and a test harness is a waiter.** Four instances now: the UDP socket, the TCP transaction, the
+recursive delete, and the harness step that watches them.

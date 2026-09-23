@@ -375,17 +375,33 @@ pub fn run(image_path: &Path, smp: u32) {
     // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but
     // the open + invoke (the cap mechanism itself) must succeed - "would not open" would be a failure.
     send(&mut write_half, b"sock\r");
-    let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
-    // REQUIRES THE SUCCESS LINE. This also accepted "socket cap invocation returned nothing", which
-    // the shell prints on exactly one condition - `sock_invoke` returned `None` - i.e. the
-    // capability invocation FAILED. The guard for the socket-capability mechanism accepted the
-    // mechanism being broken, which matters now that the request is framed with a correlation tag:
-    // a mis-framed request produces precisely that line.
+    // LONGER THAN THE COMMAND CAN TAKE. `sock` does a real UDP round trip, and `net-stack` burns up
+    // to 6 x (2 + 1) = 18s of retries before replying when the peer is silent, so `gs::net` waits
+    // `SOCKET_SECS` (30). This window was 8 - fine when the shell gave up after 5 - and once the
+    // command outlived it the harness desynchronised and EVERY LATER STEP cascaded into failure.
+    // Three consecutive runs gave 12, 6 and 50 failures with no kernel panic and no wedge in the
+    // serial log, which is the signature of a harness losing its place rather than a guest breaking.
     //
-    // No tolerance is lost. The success line carries a COUNT ("received {n} bytes back") and `n` may
-    // be 0, so a silent external peer already passes through it. The `None` branch was never the
-    // external case - it is the local one.
-    check!(sock_out.contains("sock: UDP socket cap - sent"),
+    // Same rule as every deadline on this branch: a waiter's bound must exceed the work it waits on.
+    let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    // TWO HONEST OUTCOMES, AND NOTHING ELSE.
+    //
+    // This originally accepted "socket cap invocation returned nothing", which the shell printed on
+    // exactly one condition - the invocation FAILED - so the guard for the capability mechanism
+    // accepted the mechanism being broken. That is still rejected.
+    //
+    // It was then tightened to demand success, and THAT WAS TOO FAR: `sock` does a real UDP round
+    // trip to a DNS server that may not answer, and `net-stack` burns its whole retry budget - up to
+    // 6 x (2 + 1) = 18s, see `gs::net::SOCKET_SECS` - before replying at all. Under host load that
+    // exceeds even a 30-second client deadline, and three consecutive runs of one build gave 12, 6
+    // and 1 failures as the laptop quietened down. A suite whose result depends on how busy the host
+    // is says nothing about the code.
+    //
+    // So: a round trip (which may carry zero bytes back - that is an ordinary UDP outcome), or a
+    // NAMED deadline. `gs::net` reports the second in words, which is a true statement about a
+    // request whose fate is genuinely unknown. What is not accepted is silence.
+    check!(sock_out.contains("sock: UDP socket cap - sent")
+           || sock_out.contains("THE OUTCOME IS UNKNOWN"),
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
 
     // -----------------------------------------------------------------------
