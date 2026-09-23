@@ -122,3 +122,96 @@ Independently of `gs::cap`, and from first principles:
 Acceptable outcomes include concluding that `resource_invoke` is intentionally narrow and its
 contract sufficient - in which case the contract gets written down and `examples/holder` gets fixed
 or explained, and that alone is worth the investigation.
+
+---
+
+## Triage against the operator's ladder (2026-09-23)
+
+The operator supplied a five-rung ladder: A stdlib abstraction wrong, B userspace composed wrong,
+C SDK does not expose an existing kernel mechanism, D accidental limitation in the mechanism,
+E genuinely missing MISCIS primitive. Walked against the code, not reasoned about abstractly.
+
+### A - is the `gs::cap` abstraction wrong? NO
+
+The hole is reachable with no standard library in the picture: `examples/holder` hangs, and
+`services/shell` uses the same shape on its socket path. An abstraction cannot be the cause of a
+defect in the mechanism it would wrap. Redesigning `gs::cap` changes who trips over it, not whether
+it is there.
+
+### B - is existing userspace machinery sufficient, composed wrongly? NO
+
+The obvious composition is "await the reply on a DEDICATED endpoint that carries no client traffic",
+which would make a plain `recv` correlated by construction. **It is not available: a task owns
+exactly one endpoint.** There is no endpoint-create syscall - `EndpointCreate` appears nowhere in
+`kernel/src/syscall/dispatch.rs`, and the SDK's only endpoint-shaped calls are introspection plus
+`self_grant_handle`, a grant to the task's own single endpoint.
+
+The second composition - correlate with a caller-supplied tag - fails for the reason recorded above:
+`recv` has already CONSUMED the wrong message before the tag can be read, and there is no requeue.
+
+### C - does the kernel already support it, with the SDK failing to expose it? NO
+
+Two independent blockers, both checked:
+
+1. `do_call` (syscall 41/50) validates the target with `Rights::SEND` and then does
+   `EndpointId(target_cap.resource_id.0)` - it treats the target cap's resource id AS an endpoint
+   id. A delegated resource cap's id is not an endpoint id; it must go through
+   `delegated::owner_of()`. Passing a resource cap to syscall 50 does not route to the owner.
+2. The badge is what makes a resource invocation meaningful (7.10), and it is set in exactly one
+   place: `handle_resource_invoke` sets `msg.badge_id` / `msg.badge_right` AFTER validating the cap.
+   `do_call` sets neither. An SDK cannot fabricate it - that is precisely the unforgeability the
+   badge exists for.
+
+So there is no existing kernel entry point that both badges the message and awaits the reply. The
+SDK is not withholding anything.
+
+### D - accidental limitation in the existing mechanism? YES. This is the rung.
+
+The machinery `resource_invoke` needs is **already present, already generic, and keyed on a value
+`resource_invoke` already computes and then throws away**:
+
+| what is needed | what exists | keyed on |
+|---|---|---|
+| selective dequeue, leaving other traffic queued | `MessageQueue::dequeue_matching(sender_ep)` - takes only the matching message, shifts the rest back, FIFO preserved | an endpoint id |
+| bounded wait | `do_call`'s deadline loop, same shape as `handle_recv_timeout` | - |
+| wake on the replier's death (`ReplyDead`, 8.6) | `set_call_await(caller_slot, target: EndpointId)` | an endpoint id |
+
+And `handle_resource_invoke` step 1 already has that endpoint:
+
+```rust
+let owner = match delegated::owner_of(file_cap.resource_id) {
+    Some(o) => EndpointId(o),   // <- exactly the key both mechanisms want
+```
+
+It uses `owner` to enqueue, and then discards it. Nothing about `dequeue_matching` or
+`set_call_await` is specific to a named peer; both are generic over "the endpoint that will reply".
+
+**So the limitation is accidental, not intentional.** `resource_invoke` was written as a bare send
+and simply never received the completion the named-peer path got in the 8.2 `CallDeadline` amendment
+(2026-08-21). Nothing in 7.10, 8.2 or 8.6 states the "endpoint otherwise idle" contract it currently
+relies on, and `examples/holder` does not honour it knowingly.
+
+### E - a genuinely missing primitive in C/I of MISCIS? NO
+
+Nothing is missing. Correlated selective dequeue exists, bounded waiting exists, the death-wake
+registration exists, and all three are already generic over an endpoint id. This is not a capability
+or IPC semantic the kernel lacks; it is one existing syscall not using machinery that is already
+there.
+
+## What this changes about the cost
+
+The earlier entry implied a new primitive. It is not one. `do_call` and `handle_resource_invoke`
+differ in exactly **one** respect - how the target endpoint is derived (a SEND-validated endpoint cap
+versus `delegated::owner_of`), plus setting the badge. Everything from "embed the reply cap" onward
+is identical and already written.
+
+The shape of a remedy is therefore a **shared body with two target resolutions**, not a parallel
+mechanism. That is a much smaller and much better-understood change than "add a syscall".
+
+## Still not being done
+
+Recorded, not acted on, per the operator's position: a kernel edit costs re-verification across four
+ports whatever its size, and the finding creates no urgency. What the triage buys is that whenever it
+IS taken up, the question is already answered - it is rung D, the remedy is a completion rather than
+an addition, and the two rungs that would have kept it out of the kernel (B and C) have been tested
+and ruled out with evidence rather than assumed.
