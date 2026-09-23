@@ -1131,3 +1131,40 @@ What decided each run was whether the DNS peer answered inside eight seconds.
 So the rule holds in one more place than stated: **a waiter's bound must exceed the work it waits
 on - and a test harness is a waiter.** Four instances now: the UDP socket, the TCP transaction, the
 recursive delete, and the harness step that watches them.
+
+## 20. `services/time` is correctly NOT migrated, and it names a real gap
+
+`time` was the last service talking to `fs` and `net-stack` by hand, so it was the obvious sixth
+dogfood. It should not be one, and the reason is worth more than the migration would have been.
+
+```rust
+/// Ask `fs` for the persisted floor. Non-blocking: the answer arrives later, tagged.
+fn floor_load(ctx: &ServiceContext) -> bool {
+```
+
+**`time` never waits for a reply.** It sends a request carrying a reply cap and returns immediately;
+the answer arrives later and is matched by tag in its main loop. That is not an accident of style -
+it is the clock service, and a clock that blocks on the filesystem stops being one.
+
+`gs::fs` and `gs::net` are synchronous request/reply. Putting `time` on them would make it block,
+which is a functional regression in the one service that must never stall. The brief's own rule
+settles it: **do not make Godspeed easier to use by making Godspeed less Godspeed.**
+
+Its net-stack use is smaller still - a fire-and-forget `try_send(&[11])`, the capless clock nudge,
+with no reply expected at all. There is nothing there for a request/reply library to remove.
+
+### The gap, stated plainly
+
+**This library has no answer for a client that cannot block.** Everything in it is
+send-then-wait-for-this-reply. A service that must keep serving while an answer is outstanding has to
+do what `time` does: hand-roll the reply cap, tag the request, and demultiplex replies in its own
+loop - which is exactly the plumbing the library exists to remove, in the one case where it cannot.
+
+That is not an argument for adding an asynchronous surface now. It has ONE caller, and a second
+would be needed before the shape could be designed from evidence rather than imagination (26.2). It
+is an argument for writing the boundary down, so the next person does not read "no repeated plumbing
+was found in `time`" - which is what the brief says - and conclude the plumbing is not there. It is
+there; it is just a different shape, and this library does not fit it.
+
+**Five migrations, and the sixth candidate correctly refused.** `recorder`, the shell's `tcp`, `dir`,
+`fcap`, `sock` and `copier` all shrank and all found defects. `time` would have grown a bug.
