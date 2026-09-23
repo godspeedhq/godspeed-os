@@ -50,7 +50,7 @@ use crate::error::{from_fs_status, Error};
 pub const PATH_MAX: usize = 120;
 
 /// The most file content one request can carry, as `services/fs` frames it (7 * 508). Reads and
-/// writes larger than this are split by [`read_into`] and [`write`]; it is public because a caller
+/// writes larger than this are split by [`read_into`](Fs::read_into) and [`write`]; it is public because a caller
 /// sizing its own buffer benefits from knowing the natural stride.
 pub const IO_CHUNK: usize = 7 * 508;
 
@@ -164,7 +164,7 @@ pub struct Fs<'a> {
     notice: Option<&'a dyn Fn()>,
 }
 
-/// What [`stat`] found.
+/// What [`stat`](Fs::stat) found.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Stat {
     /// Size in bytes. Zero for a directory.
@@ -411,7 +411,7 @@ impl<'a> Fs<'a> {
     ///
     /// Succeeds if the directory already exists, which is what makes it usable at start-up: a
     /// service that ensures its own data directory should not have to care whether it is the first
-    /// to run. Use [`create_dir`] where the path's absence is itself the thing being asserted.
+    /// to run. Use [`create_dir`](Fs::create_dir) where the path's absence is itself the thing being asserted.
     ///
     /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
     ///
@@ -496,7 +496,7 @@ impl<'a> Fs<'a> {
     /// # Errors
     /// - [`Error::NotFound`] - no such file, or it is a directory.
     /// - [`Error::BufferTooSmall`] - the file does not fit. **Nothing is written**; call again with
-    ///   room, having learned the size from [`stat`].
+    ///   room, having learned the size from [`stat`](Fs::stat).
     /// - A read is idempotent, so every no-answer error here may safely be retried.
     pub fn read_into(&mut self, path: &str, buf: &mut [u8]) -> Result<usize, Error> {
         let st = self.stat(path)?;
@@ -578,11 +578,11 @@ impl<'a> Fs<'a> {
 
     /// Allocate a file of `capacity` bytes without writing content into it.
     ///
-    /// The extent is reserved up front, so later [`write_at`] calls land in space that is already
+    /// The extent is reserved up front, so later [`write_at`](Fs::write_at) calls land in space that is already
     /// the file's. That is what makes a long append-style writer bounded: it cannot run out of room
     /// halfway and leave a half-file behind.
     ///
-    /// **Blocks. Changes state**: on [`Error::OutcomeUnknown`] the file may exist. Use [`exists`] to
+    /// **Blocks. Changes state**: on [`Error::OutcomeUnknown`] the file may exist. Use [`exists`](Fs::exists) to
     /// find out rather than calling this again, which would fail differently depending on timing.
     ///
     /// Added because `services/recorder` needed it during migration. It is a real filesystem
@@ -617,14 +617,14 @@ impl<'a> Fs<'a> {
     ///
     /// **Blocks. Changes state, and is NOT idempotent**: a second rename after a successful one
     /// fails with [`Error::NotFound`], because the source is already gone. On
-    /// [`Error::OutcomeUnknown`] check with [`exists`] rather than re-sending - this is precisely
+    /// [`Error::OutcomeUnknown`] check with [`exists`](Fs::exists) rather than re-sending - this is precisely
     /// the case where a retry reports failure for work that succeeded.
     pub fn rename(&mut self, path: &str, new_name: &str) -> Result<(), Error> {
         self.call(OP_RENAME, path.as_bytes(), new_name.as_bytes(), call::DEFAULT_SECS)?;
         Ok(())
     }
 
-    /// Does this path exist? A convenience over [`stat`], and read-only.
+    /// Does this path exist? A convenience over [`stat`](Fs::stat), and read-only.
     pub fn exists(&mut self, path: &str) -> Result<bool, Error> {
         match self.stat(path) {
             Ok(_) => Ok(true),

@@ -9,6 +9,12 @@
 - [Glossary](glossary.md)
 - [The Almanac](almanac.md)
 
+# The Standard Library
+
+- [Writing a program for GodspeedOS](stdlib.md)
+  - [Design report: what building it changed](design/stdlib.md)
+  - [The brief it was built from](design/stdlib-brief.md)
+
 # The System
 
 - [The services, and how they reach each other](services.md)

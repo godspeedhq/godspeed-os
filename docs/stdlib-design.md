@@ -575,11 +575,44 @@ serves clients; and without draining it inherits a wait that can eat a message. 
 for ordinary services - a facility only usable by a task with no clients is not the public interface
 22.7 measures - so it is not started.
 
-The fix is a `ResourceInvokeDeadline`: the same deadline machinery, matching the reply to the
-embedded reply cap. Arguably it is the 8.2 amendment finishing its job. But a new syscall is a new
-kernel responsibility, Commandment I pins that surface, and the enforcement layer will refuse it
-until 8.2 is amended to record it - which is the operator's gate and not a library author's.
+**A correction to what this section first said.** It concluded "a new syscall is a new kernel
+responsibility, so this is the operator's gate". That reasoning is wrong, and the operator corrected
+it: **syscall count is not responsibility count.** A primitive completing the semantics of a
+responsibility the kernel already owns is not kernel growth. The question is not "does this add a
+syscall" but "does an existing MISCIS mechanism have an incomplete semantic".
 
-Writing it anyway with the hazard in a doc comment would be shipping the defect with a warning label
-attached, which is the papering-over 26.7 forbids. So: recorded, with the three options in
-`backlog/46`, and the library stops here until the gate is decided.
+Applying that test properly changes the finding, and makes it larger rather than smaller.
+
+**The hole is generic, and it predates this library.** Three services mint delegated resource caps -
+`fs` (files), `net-stack` (TCP connection and listener caps) and `shell` - and 7.10 is written in
+terms of an opaque `ResourceId` whose meaning only the owner knows. `examples/resource-server` and
+`examples/holder` are a worked pair naming no filesystem at all, and `holder` waits like this:
+
+```rust
+Ok(())  => Ok(ctx.recv()),   // routed: block for the owner's reply on our endpoint
+```
+
+An unbounded `recv`. If the owner dies after receiving the invocation and before replying, `holder`
+hangs forever - Commandment VIII broken in the example that teaches the mechanism, and 8.6 has a row
+promising exactly that caller is woken on the `Call` path.
+
+So there are **two** holes, not one: no reply correlation (hole 1, above) and no `ReplyDead` reaching
+resource invocation (hole 2), because a SEND never tells the kernel a reply is awaited.
+
+**Answering the MISCIS test - if `gs::cap` never existed, would the hole exist?** Yes, and it already
+does, in a published example and on the shell's socket path. `gs::cap` did not create this; it was
+the first caller that could not look away from it, because a library cannot assume its caller serves
+nobody.
+
+**No kernel change is being proposed or made.** That a standard-library feature exposed this creates
+no urgency to change the kernel, and a mechanism must justify itself independently of the feature
+that revealed it. `backlog/46` records the question, the first-principles answers, the genericity
+test, and what a future investigation should settle - including the entirely acceptable outcome that
+`resource_invoke` is intentionally narrow, in which case its contract gets written down and
+`examples/holder` gets fixed or explained.
+
+`gs::cap` stays unbuilt. Nothing is lost: file-as-capability works today for the caller it has.
+
+**The useful thing here is not a feature.** No code shipped from this section. What it produced is a
+hidden assumption made visible - that resource invocation is safe only from a task whose endpoint is
+otherwise idle, a contract nothing states and one published example does not honour.

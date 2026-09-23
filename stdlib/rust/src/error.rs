@@ -3,7 +3,7 @@
 //!
 //! # This is not a new failure model
 //!
-//! GodspeedOS already had one. [`ServiceContext::request_with_reply_deadline_outcome`] returns
+//! GodspeedOS already had one. `ServiceContext::request_with_reply_deadline_outcome` returns
 //! `DeadlineOutcome { Reply, SendFailed, QueueFull, Timeout }`, and those four states are exactly
 //! right. This module does not replace them; it carries them to the application unchanged, alongside
 //! the filesystem's own status byte, so that one `Error` answers both "what happened" and "what may

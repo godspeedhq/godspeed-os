@@ -1,69 +1,124 @@
-# 46 - a delegated resource capability cannot be invoked through a reply-matched call
+# 46 - resource capability invocation has no bounded, correlated reply
 
 **Opened:** 2026-09-23
-**Status:** OPEN - blocks `gs::cap` for any caller that serves clients
+**Status:** OPEN - architectural question RECORDED, deliberately not acted on
 **Found by:** designing `gs::cap` on `feat/stdlib`, before writing it.
 
-## The gap
+> **This entry was rewritten the day it was opened.** The first version concluded "a new syscall is
+> a new kernel responsibility, so this is the operator's gate". That reasoning was wrong and the
+> operator corrected it: **syscall count is not responsibility count.** A primitive that completes
+> the semantics of a responsibility the kernel ALREADY owns is not kernel growth. The question is
+> not "does this add a syscall", it is "does an existing MISCIS mechanism have an incomplete
+> semantic". The original framing is left recorded here rather than quietly replaced, because the
+> error - letting a feature's needs decide a kernel question - is the one worth not repeating.
 
-`CLAUDE.md` 8.2's `CallDeadline` amendment (2026-08-21) records why a bounded request/reply must be
-one primitive rather than `send` plus `recv`:
+## What `resource_invoke` guarantees today
 
-> A plain recv takes whatever is next, and a service that SERVES clients on the endpoint it awaits
-> replies on would therefore consume an unrelated client request, fail to match it, and drop it:
-> the request lost outright, and the real reply arriving later as an orphan that desynced every
-> following exchange.
+**Delivery, and nothing else.** Syscall 31 validates the cap holds `right`, routes the message to
+the owning service badged with the resource id, and embeds a reply cap. `Ok(())` means it was
+routed. The kernel then forgets the exchange.
 
-That fix landed for NAMED PEERS. `ServiceContext::request_with_reply_call` uses `CallDeadline`
-(syscall 50) and matches the reply by its sender.
+The caller waits with a plain `recv` on its own endpoint.
 
-**It did not land for delegated resource capabilities.** `resource_invoke` (syscall 31) is a SEND
-that embeds a reply cap; there is no `CallDeadline` form of it. Every file-as-capability invocation
-is therefore `resource_invoke` + a plain `recv` - the exact shape 8.2 says loses messages.
+## Two holes, and both are generic
 
-## Why it has not bitten yet
+### 1. No reply correlation
 
-The only caller is `services/shell`, and it does this first:
+A plain `recv` takes whatever is next. A caller that also SERVES clients on that endpoint will
+dequeue a client request, fail to match it, and have nowhere to put it back - the request is lost,
+and the real reply arrives later as an orphan that desyncs every exchange after it.
+
+That is verbatim the failure `CLAUDE.md` 8.2's `CallDeadline` amendment was written to remove. That
+amendment fixed the NAMED-PEER path (`request_with_reply_call` matches the reply by its sender) and
+left the RESOURCE path on the primitive it had just condemned.
+
+**A service-layer tag cannot fix this.** Echoing a caller-supplied tag would let the caller
+RECOGNISE a wrong message, but `recv` has already CONSUMED it and there is no requeue. Selective
+dequeue is inherently kernel-side - it is what `call_dequeue` does.
+
+### 2. No `ReplyDead`
+
+8.6's reply-side death-wake reaches a caller blocked in a synchronous `Call`, because the kernel
+knows which endpoint that caller awaits. `resource_invoke` is a SEND, so the kernel is never told a
+reply is awaited, and the owner dying does not wake the caller.
+
+`examples/holder` - the published worked example of this mechanism - is exactly this:
 
 ```rust
-while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
+Ok(())  => Ok(ctx.recv()),   // routed: block for the owner's reply on our endpoint
 ```
 
-That drain is safe **only because the shell serves nobody on that endpoint**. In a service that
-does, the same line is the bug: it discards live client requests. So the existing caller is not
-evidence the pattern is sound, it is evidence that one caller happens to be exempt.
+An unbounded `recv`. If `resource-server` dies after receiving the invocation and before replying,
+`holder` hangs forever. **That is Commandment VIII broken in the example that teaches the
+mechanism**, and 8.6's table has a row for precisely this case on the `Call` path.
 
-## Why this blocks the standard library
+## The MISCIS test: would this hole exist if `gs::cap` never existed?
 
-`gs::cap` is meant for ORDINARY SERVICES, not only the shell - a file is a capability (7.10) is one
-of the system's north stars, and a library that can only be used by a task with no clients is not
-the public interface 22.7 measures. The library cannot copy the shell's drain, and without either
-the drain or a reply-matched primitive it inherits a message-losing wait.
+**Yes, and it already does.** The evidence predates the standard library entirely:
 
-So `gs::cap` is NOT STARTED. Building it on this foundation and documenting the hazard in a doc
-comment would be shipping the defect with a warning label attached, which is the papering-over
-26.7 forbids.
+- **Three independent issuers** mint delegated resource caps: `fs` (files), `net-stack` (TCP
+  connection and listener caps), and `shell`. The mechanism was never file-specific; 7.10 is written
+  in terms of an opaque `ResourceId` whose meaning only the owner knows.
+- **`examples/resource-server` + `examples/holder`** are a worked pair that mention no filesystem at
+  all, and `holder` carries hole 2 in three words of code.
+- **`services/shell` hits it on the socket path too** (`sock` invokes connection caps), not only on
+  the file path.
 
-## The fix, and why it is not a small one
+So this is not stdlib pressure. `gs::cap` did not create the problem; it was the first caller that
+could not look away from it, because a library cannot make the assumption the shell makes.
 
-A `ResourceInvokeDeadline` - `resource_invoke` with the deadline machinery `CallDeadline` already
-has, matching the reply to the embedded reply cap. Same reply-cap semantics, same `call_dequeue`.
+## The assumption, named
 
-**That is a new syscall, and a new syscall is a new kernel responsibility.** Commandment I pins the
-surface and the enforcement layer refuses the change until `CLAUDE.md` 8.2 is amended to record it,
-exactly as `CallDeadline` itself was. It is mechanism not policy (the kernel learns a deadline, not
-what is being awaited), and it is arguably the same amendment finishing its job - 8.2 fixed the
-named-peer path and left the resource path on the primitive it had just condemned - but it is the
-operator's gate, not a library author's.
+The shell opens every resource invocation by draining its queue:
 
-## Options, for the record
+```rust
+while ctx.try_recv().is_some() { .. }
+```
 
-1. **Add `ResourceInvokeDeadline`.** The real fix. Kernel change, amendment, re-verification on all
-   four ports.
-2. **Ship `gs::cap` restricted**, documented as usable only by a task that serves no clients on its
-   endpoint. Honest, and narrow enough to be a trap the first time someone writes a service.
-3. **Leave `gs::cap` unbuilt** and keep file-as-capability a shell-only facility for now. Costs
-   nothing and hides nothing.
+That is correct **only because the shell serves nobody on that endpoint**. So the current contract
+of `resource_invoke` is, unwritten:
 
-Recorded rather than chosen: 1 needs the operator, and 2 versus 3 turns on whether a restricted
-version is worth more than its trap.
+> safe to use only from a task whose endpoint carries no traffic but this reply
+
+Is that an intentional contract or an accidental limitation? Nothing in 7.10, 8.2 or 8.6 states it,
+`examples/holder` does not honour it knowingly, and the mechanism is offered generically to any
+service. **It reads as accidental.** That is the finding.
+
+## The genericity test
+
+A bounded, correlated resource invocation can be specified without naming files, GSFS, `gs::cap` or
+filesystem handles:
+
+> Invoke a resource capability and wait no longer than the supplied deadline for the reply
+> associated with that invocation; wake if the owner dies first.
+
+That is capability invocation + bounded waiting + reply correlation + IPC - four things the kernel
+already owns under MISCIS. On that reading it would COMPLETE an existing responsibility rather than
+add one, exactly as `CallDeadline` did for the named-peer path ("it is `call` with a bound, not a
+new capability").
+
+## What is NOT being done, and why
+
+**No kernel change. No `ResourceInvokeDeadline`.** The operator's position, and it is the right one:
+the fact that the stdlib exposed this creates no urgency to change the kernel, and a mechanism must
+justify itself independently of the feature that happened to reveal it.
+
+`gs::cap` stays unbuilt. Nothing is lost - file-as-capability works today for the caller it has.
+
+## What a future investigation should settle
+
+Independently of `gs::cap`, and from first principles:
+
+1. Is the "endpoint otherwise idle" assumption intentional? If so it belongs in 7.10 in writing, and
+   `examples/holder` needs a deadline and a comment saying why it is allowed to block.
+2. Is hole 2 (`ReplyDead` not reaching resource invocation) separable from hole 1? It may be the
+   smaller and more clearly-owed of the two: 8.6 already promises a caller is never left hanging by
+   a dead replier, and this path does not deliver that promise.
+3. Would a bounded correlated form be reachable by REUSING `CallDeadline`'s machinery rather than
+   adding a parallel one - the same `call_dequeue`, keyed on the reply cap already embedded?
+4. Is a third option available: does a resource-cap holder even need to await on its own general
+   endpoint, or could the reply cap name a dedicated one?
+
+Acceptable outcomes include concluding that `resource_invoke` is intentionally narrow and its
+contract sufficient - in which case the contract gets written down and `examples/holder` gets fixed
+or explained, and that alone is worth the investigation.
