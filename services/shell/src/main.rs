@@ -16440,15 +16440,42 @@ fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<()
     let pl = abspath.len();
     pp[..pl].copy_from_slice(abspath);
     // fs_request appends `newname` after the path - exactly the OP_RENAME wire format.
-    match fs_request(ctx, OP_RENAME, &pp[..pl], newname.as_bytes()) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.rename(&pp[..pl], newname.as_bytes());
+    let out = match r {
+        Ok(()) => {
             ctx.console_writeln_fmt(format_args!("renamed {} → {}", str_of(&pp[..pl]), newname));
             Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) => { ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"); Err(ShellError::Unknown) }
-        None    => { fs_no_answer(ctx, "rename"); Err(ShellError::Unknown) }
-    }
+        // A RENAME IS DESTRUCTIVE AND WAS NOT RE-SENT. It may have happened; saying it failed would
+        // be a confident wrong answer about a mutation (carnage §3.5).
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln("rename: OUTCOME UNKNOWN - the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - check with `dir`");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            // NAME THE REASON. This said "failed (not found, or name exists, or bad name)" - three
+            // unrelated faults offered as a guess, while `fs` knew which and said so in a reply
+            // nobody read. The same shape `seal` carries a comment about.
+            let why = g.reason();
+            if why.is_empty() {
+                ctx.console_writeln("rename: failed - see fs's log");
+            } else {
+                ctx.console_writeln_fmt(format_args!("rename: failed - {}", why));
+            }
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(g.tag());
+    out
 }
 
 /// `delete <path>` - remove a file or empty directory; `delete <path> recursive` removes a
@@ -16511,23 +16538,40 @@ fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
         ctx.console_writeln("move: cannot move into itself");
         return Err(ShellError::Unknown);
     }
-    match fs_request(ctx, OP_MOVE, &sp[..sl], &dp[..dl]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.move_to(&sp[..sl], &dp[..dl]);
+    let out = match r {
+        Ok(()) => {
             ctx.console_writeln_fmt(format_args!("moved {} → {}", str_of(&sp[..sl]), str_of(&dp[..dl])));
             Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(ref m) => {
-            match fs_err_reason(m) {
-                Some(why) if ctx.fs_unknown.get() =>
-                    ctx.console_writeln_fmt(format_args!("move: OUTCOME UNKNOWN - {}", why)),
-                Some(why) => ctx.console_writeln_fmt(format_args!("move: failed - {}", why)),
-                None      => ctx.console_writeln("move: failed (not found, or dest exists?)"),
+        // The distinction this command used to read off `ctx.fs_unknown` arrives IN THE ANSWER now.
+        // The flag existed because the old helper returned `None` for both a dead service and a lost
+        // reply to a mutation, and had nowhere else to put the difference.
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln("move: OUTCOME UNKNOWN - the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - check with `dir`");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            let why = g.reason();
+            if why.is_empty() {
+                ctx.console_writeln("move: failed (not found, or dest exists?)");
+            } else {
+                ctx.console_writeln_fmt(format_args!("move: failed - {}", why));
             }
             Err(ShellError::Unknown)
         }
-        None    => { fs_no_answer(ctx, "move"); Err(ShellError::Unknown) }
-    }
+    };
+    ctx.fs_tag.set(g.tag());
+    out
 }
 
 /// `find <pattern> [path]` - search a subtree (default the whole filesystem, `/`) for entries
@@ -16844,6 +16888,51 @@ fn str_of(b: &[u8]) -> &str {
 // by default, `*`/`?` glob like `find` (shared `contains`/`glob_match`); `except` inverts.
 // See utilities/27_match.md.
 
+/// The most a filter built-in reads from a file in one pass.
+///
+/// Deliberately larger than the 3556 bytes one `OP_READ_FILE` message could carry. That ceiling was
+/// invisible and reported a too-large file as NOT FOUND.
+const FILTER_READ_MAX: usize = 8192;
+
+/// Read a whole file for a filter built-in, reporting the outcome in this shell's words.
+///
+/// `Err(())` means the operator has already been told; the caller just returns. The distinction that
+/// matters is the one the old path could not make: a file that is ABSENT versus one that is merely
+/// bigger than the buffer. Both used to print "not found".
+fn filter_read(ctx: &ShellCtx, verb: &str, path: &[u8], buf: &mut [u8]) -> Result<usize, ()> {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.read_into(path, buf);
+    ctx.fs_tag.set(g.tag());
+    match r {
+        Ok(n) => Ok(n),
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("{}: not found: {}", verb, str_of(path)));
+            Err(())
+        }
+        // THE ANSWER THAT USED TO BE A LIE: the file is there, it does not fit.
+        Err(gs::Error::BufferTooSmall) => {
+            ctx.console_writeln_fmt(format_args!(
+                "{}: {} is larger than {} bytes - too big to filter in one pass",
+                verb, str_of(path), FILTER_READ_MAX));
+            Err(())
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(())
+        }
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(())
+        }
+        // The operator's own `q`: not a fault, and nothing to report.
+        Err(gs::Error::Cancelled) => Err(()),
+        Err(_) => {
+            ctx.console_writeln_fmt(format_args!("{}: storage unavailable", verb));
+            Err(())
+        }
+    }
+}
+
 /// Filter `input`'s lines by `pattern`, writing each matching line (with its newline) to `out`.
 /// Substring by default; a pattern with `*`/`?` is an anchored glob (same as `find`). `invert`
 /// keeps the lines that do NOT match (the `except` form). Blank lines are skipped.
@@ -16888,22 +16977,15 @@ fn cmd_match(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<()
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, "match", abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        match_lines(ctx, &p[5..end], pattern.as_bytes(), invert, &mut Out::Console);
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("match: not found: {}", str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    match_lines(ctx, &fbuf[..n_read], pattern.as_bytes(), invert, &mut Out::Console);
+    Ok(())
 }
 
 /// Run a filter built-in (`match`, `count`) over `input`, writing its output to `out`. Used
@@ -16977,22 +17059,15 @@ fn cmd_count(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<()
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, "count", abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        write_count(ctx, &p[5..end], &mut Out::Console);
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("count: not found: {}", str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    write_count(ctx, &fbuf[..n_read], &mut Out::Console);
+    Ok(())
 }
 
 // ── sort - order the lines (ascending, or `reverse`) ─────────────────────────────
@@ -17057,22 +17132,15 @@ fn cmd_sort(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(),
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, "sort", abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        write_sorted(ctx, &p[5..end], reverse, &mut Out::Console);
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("sort: not found: {}", str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    write_sorted(ctx, &fbuf[..n_read], reverse, &mut Out::Console);
+    Ok(())
 }
 
 // ── first / last - keep the first or last N lines (the head/tail-equivalent) ──────
@@ -17144,23 +17212,16 @@ fn cmd_take(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, name, abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let cnt = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + cnt).min(p.len());
-        if last { write_last(ctx, &p[5..end], n, &mut Out::Console); }
-        else    { write_first(ctx, &p[5..end], n, &mut Out::Console); }
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("{}: not found: {}", name, str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    if last { write_last(ctx, &fbuf[..n_read], n, &mut Out::Console); }
+    else    { write_first(ctx, &fbuf[..n_read], n, &mut Out::Console); }
+    Ok(())
 }
 
 /// Bounded stack of directory paths still to visit during a `find` walk (§26.6). Pushing
