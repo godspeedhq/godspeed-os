@@ -230,7 +230,10 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     /// index 1 of the reply, which this maps to an [`Error`].
     fn invoke(&mut self, right: u8, body: &[u8]) -> Result<Message, Error> {
         let tag = self.fs.next_tag_pub();
-        let m = resource::invoke(self.ctx, self.cap, right, tag, body, call::DEFAULT_SECS,
+        // NO PATIENCE BYTE. `fs` answers a file-capability invocation from its own serve loop and
+        // never puts one aside, so the byte would be carried and never read - and `serve_filecap`
+        // reads the operation at index 1 of what it receives.
+        let m = resource::invoke(self.ctx, self.cap, right, tag, None, body, call::DEFAULT_SECS,
                                  &mut self.held)?;
         // `[tag, status, ..]`. The tag is verified and LEFT IN PLACE, so a body starts at index 2.
         let status = *m.payload_bytes().get(1).ok_or(Error::Malformed)?;

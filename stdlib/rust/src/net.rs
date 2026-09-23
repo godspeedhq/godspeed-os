@@ -454,8 +454,10 @@ impl<'n, 'a: 'n> Socket<'n, 'a> {
         body[6..6 + data.len()].copy_from_slice(data);
 
         let tag = self.net.next_tag_pub();
-        let m = resource::invoke(self.ctx, self.cap, RIGHT_WRITE, tag, &body[..6 + data.len()],
-                                 SOCKET_SECS, &mut self.held)?;
+        // The patience byte is THIS call's deadline, so the two cannot disagree - see `Net::call`,
+        // which says the same thing about a named request.
+        let m = resource::invoke(self.ctx, self.cap, RIGHT_WRITE, tag, Some(SOCKET_SECS as u8),
+                                 &body[..6 + data.len()], SOCKET_SECS, &mut self.held)?;
         // `[tag, response..]` - the tag is verified and left in place, so the body starts at 1.
         let b = m.payload_bytes();
         let resp = if b.len() > 1 { &b[1..] } else { &[][..] };
@@ -508,9 +510,15 @@ pub struct Listener<'n, 'a: 'n> {
 
 impl<'n, 'a: 'n> Listener<'n, 'a> {
     /// One invocation on a capability this listener owns, drawing from the one tag counter.
+    ///
+    /// The patience byte is this call's deadline. `accept` is the reason it has to be there: a server
+    /// polling for a caller is a LONG wait on a held capability, and `net-stack` used to put such a
+    /// request aside for a fixed 1500 ms and then throw it away while the client waited twenty
+    /// seconds for an answer that no longer existed.
     fn call(&mut self, cap: CapHandle, right: u8, body_bytes: &[u8]) -> Result<Message, Error> {
         let tag = self.net.next_tag_pub();
-        resource::invoke(self.ctx, cap, right, tag, body_bytes, NET_SECS, &mut self.held)
+        resource::invoke(self.ctx, cap, right, tag, Some(NET_SECS as u8), body_bytes, NET_SECS,
+                         &mut self.held)
     }
 
     /// Take the next connection, if one is waiting.

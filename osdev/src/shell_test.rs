@@ -394,18 +394,22 @@ pub fn run(image_path: &Path, smp: u32) {
     // exactly one condition - the invocation FAILED - so the guard for the capability mechanism
     // accepted the mechanism being broken. That is still rejected.
     //
-    // It was then tightened to demand success, and THAT WAS TOO FAR: `sock` does a real UDP round
-    // trip to a DNS server that may not answer, and `net-stack` burns its whole retry budget - up to
-    // 6 x (2 + 1) = 18s, see `gs::net::SOCKET_SECS` - before replying at all. Under host load that
-    // exceeds even a 30-second client deadline, and three consecutive runs of one build gave 12, 6
-    // and 1 failures as the laptop quietened down. A suite whose result depends on how busy the host
-    // is says nothing about the code.
+    // It was then tightened to demand success, loosened AGAIN to accept a named deadline because the
+    // command kept timing out under load, and is tightened back here - because the timeouts had a
+    // cause, and the tolerance was hiding it.
     //
-    // So: a round trip (which may carry zero bytes back - that is an ordinary UDP outcome), or a
-    // NAMED deadline. `gs::net` reports the second in words, which is a true statement about a
-    // request whose fate is genuinely unknown. What is not accepted is silence.
-    check!(sock_out.contains("sock: UDP socket cap - sent")
-           || sock_out.contains("THE OUTCOME IS UNKNOWN"),
+    // The cause: `net-stack` put a badged capability invocation aside while it talked to the driver
+    // and dropped it after a fixed 1500 ms, while this client waited thirty seconds for an answer
+    // that no longer existed. A badged request now says how long its client will wait, exactly as a
+    // named one always did, so the request is held for as long as it is worth answering. Measured on
+    // the same machine that produced the timeouts: `sock` round-trips, and `net-stack`s slowest
+    // serve pass fell from 64 s to 1.7 s.
+    //
+    // So: a round trip, which may carry zero bytes back - an unanswered datagram is an ordinary UDP
+    // outcome and is still a success for what this guards, which is the CAPABILITY mechanism. A
+    // deadline is not accepted any more. If one returns, the honest place to look is `net-stack`s
+    // retry budget (up to 6 x (2 + 1) = 18 s) against `gs::net::SOCKET_SECS`, not this line.
+    check!(sock_out.contains("sock: UDP socket cap - sent"),
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
 
     // serve (utilities/42_serve.md): a TCP LISTENER as a capability, exercised by a real client.

@@ -506,14 +506,16 @@ impl Displaced {
             self.live -= 1;
         }
         let slot = (self.head + self.live) % STASH_N;
-        // THE CLIENT SAID HOW LONG IT WILL WAIT (byte 1 of a tagged request). Hold it for that,
-        // rather than for one global guess - see `HOLD_MS`. A badged invocation carries no header, so
-        // it gets the default. Holding longer than the client will wait is pure waste; holding for
-        // less is the bug this fixes.
-        let hold_ms = match badge {
-            None => pl.get(1).map(|p| (*p as u64).saturating_mul(1_000)).unwrap_or(HOLD_MS),
-            Some(_) => HOLD_MS,
-        };
+        // THE CLIENT SAID HOW LONG IT WILL WAIT (byte 1). Hold it for that, rather than for one
+        // global guess - see `HOLD_MS`. Holding longer than the client will wait is pure waste;
+        // holding for less is the bug this fixes.
+        //
+        // BADGED AND NAMED ALIKE. This read the byte for a named request and handed a badged one the
+        // constant, which is the defect `HOLD_MS` describes, left standing on the other path: an
+        // `accept` whose client waits twenty seconds was dropped after 1500 ms. Both carry the byte
+        // now, so there is one rule rather than a rule and an exception.
+        let hold_ms = pl.get(1).map(|p| (*p as u64).saturating_mul(1_000)).unwrap_or(HOLD_MS);
+        let _ = badge;
         let mut h = Held {
             len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), hold_ms,
             body: [0u8; HELD_BYTES],
@@ -2987,13 +2989,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // means to resolve it. The cost was a DRAIN in `services/shell`'s `sock_invoke`, safe only
         // because the shell serves nobody, plus the cap-reclaim that drain made necessary (SEC-35).
         //
-        // ONE header byte, not the two a named request carries: the tag to echo. Patience is the
-        // stash's business, and a badged request does not go through the stash.
+        // THE SAME TWO HEADER BYTES AS A NAMED REQUEST: the tag to echo, and how long the client
+        // will wait. An earlier cut of this took only the tag, on the reasoning that "patience is the
+        // stash's business, and a badged request does not go through the stash".
+        //
+        // It does. `pending.note` runs for EVERY message, and it had an explicit arm handing a badged
+        // one the `HOLD_MS` constant - so `accept`, whose client waits twenty seconds, was put aside
+        // for 1500 ms and then dropped, and `serve` never saw a connection that had already arrived.
+        // `HOLD_MS`'s own comment had diagnosed exactly this for the named path and stopped one path
+        // short: "a constant cannot know a client's deadline, so it stopped guessing and the client
+        // now says." Now both say.
         let (pl, reply) = match badge {
             Some(_) => match (pl_raw.first(), pl_raw.len()) {
-                (Some(t), n) if n >= 2 => (&pl_raw[1..], Reply { cap: reply_cap, tag: Some(*t) }),
-                // One byte or none: nothing to strip and nothing to echo, exactly as on the named
-                // path. A holder that sends a bare op still reaches the right arm.
+                (Some(t), n) if n >= 3 => (&pl_raw[2..], Reply { cap: reply_cap, tag: Some(*t) }),
+                // Too short to carry the header: nothing to strip and nothing to echo, exactly as on
+                // the named path. A holder that sends a bare op still reaches the right arm, and
+                // falls back to `HOLD_MS` because it said nothing about how long it will wait.
                 _ => (pl_raw, Reply { cap: reply_cap, tag: None }),
             },
             // TWO header bytes: the tag to echo, and how long the client will wait (used by the

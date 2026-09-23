@@ -74,21 +74,34 @@ pub(crate) fn invoke(
     cap: CapHandle,
     right: u8,
     tag: u8,
+    patience: Option<u8>,
     body: &[u8],
     secs: i64,
     held: &mut Held,
 ) -> Result<Message, Error> {
-    if body.len() + 1 > REQ_MAX {
+    // The header is built HERE rather than by each caller, so nobody has to keep a second buffer to
+    // prepend one byte to - this function already owns a `REQ_MAX` one.
+    //
+    // `patience` is how many seconds the caller is about to wait. A service that has to put this
+    // request aside while it talks to something else can then hold it for as long as it is actually
+    // worth answering, instead of against a constant that cannot know. `None` is for an owner that
+    // does no such holding (`fs`), and costs a byte nothing would read.
+    let hdr = 1 + patience.is_some() as usize;
+    if body.len() + hdr > REQ_MAX {
         return Err(Error::InvalidInput);
     }
     let mut req = [0u8; REQ_MAX];
     req[0] = tag;
-    req[1..1 + body.len()].copy_from_slice(body);
+    if let Some(p) = patience {
+        req[1] = p;
+    }
+    let body_end = hdr + body.len();
+    req[hdr..body_end].copy_from_slice(body);
 
     let self_grant = ctx.self_grant_handle().ok_or(Error::Unreachable)?;
     let reply_cap = ctx.derive_cap(self_grant).ok_or(Error::Busy)?;
 
-    if let Err(e) = ctx.resource_invoke(cap, right, reply_cap, &Message::from_bytes(&req[..1 + body.len()])) {
+    if let Err(e) = ctx.resource_invoke(cap, right, reply_cap, &Message::from_bytes(&req[..body_end])) {
         // Refused before routing, so the reply cap was NOT consumed: reclaim the slot (8.5).
         ctx.remove_cap(reply_cap);
         return Err(match e {
