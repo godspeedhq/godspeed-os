@@ -13573,21 +13573,47 @@ impl LastWriteErr {
 }
 
 fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
-    let r = fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes());
-    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
-    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.create_sized(path, total);
+    let ok = r.is_ok();
+    if !ok {
+        // ALLOCATION IS A MUTATION. A lost reply may still have allocated the extent, so the stored
+        // sentence says "unknown" rather than "failed" - the caller prints it, and an operator told
+        // a write failed when it may have landed is being handed a confident wrong answer.
+        let why = g.reason();
+        if matches!(r, Err(gs::Error::OutcomeUnknown)) {
+            ctx.last_write_err.borrow_mut().set_text(
+                "the reply was lost; the space MAY HAVE BEEN allocated. Not re-sent - check with `dir`");
+        } else if why.is_empty() {
+            ctx.last_write_err.borrow_mut().set_text("fs refused the allocation - see its log");
+        } else {
+            ctx.last_write_err.borrow_mut().set_text(why);
+        }
+    }
+    ctx.fs_tag.set(g.tag());
     ok
 }
 
 /// Write `chunk` into `path` at block-aligned byte `offset`.
 fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
-    let mut tail = [0u8; 8 + IO_CHUNK];
-    tail[..8].copy_from_slice(&offset.to_le_bytes());
+    // The offset packing and the chunk cap are the library's; the IO_CHUNK clamp stays here because
+    // a caller handing over more than one message carries is this layer's business to notice.
     let n = chunk.len().min(IO_CHUNK);
-    tail[8..8 + n].copy_from_slice(&chunk[..n]);
-    let r = fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]);
-    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
-    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.write_at(path, offset, &chunk[..n]);
+    let ok = r.is_ok();
+    if !ok {
+        let why = g.reason();
+        if matches!(r, Err(gs::Error::OutcomeUnknown)) {
+            ctx.last_write_err.borrow_mut().set_text(
+                "the reply was lost; the chunk MAY HAVE BEEN written. Not re-sent - check with `read`");
+        } else if why.is_empty() {
+            ctx.last_write_err.borrow_mut().set_text("fs refused the chunk - see its log");
+        } else {
+            ctx.last_write_err.borrow_mut().set_text(why);
+        }
+    }
+    ctx.fs_tag.set(g.tag());
     ok
 }
 
