@@ -13789,39 +13789,17 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     out.line_fmt(ctx, format_args!("{}", str_of(path)));
     let mut listed = 0usize;
     let mut header_done = false;
-    let mut cur = DirCursor::new();
-    while let Some(from) = cur.next() {
-    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_NOTFOUND) {
-        ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
-        return Err(ShellError::FileNotFound);
-    }
-    // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
-    // error - the stick pulled and replugged - came out as a claim about the path, sending the operator
-    // to look at `/` when the problem was the device. Name what actually happened (§26.7).
-    if p.first() == Some(&FS_ERR) || p.len() < DIR_HDR {
-        ctx.console_writeln_fmt(format_args!(
-            "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
-            str_of(path)));
-        return Err(ShellError::Unknown);
-    }
-    let count = cur.take(p);
-    if count > 0 && !header_done {
-        out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
-        header_done = true;
-    }
-    let mut i = DIR_HDR;
-    for _ in 0..count {
-        if i >= p.len() { break; }
-        let nl = p[i] as usize;
-        i += 1;
-        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+    let mut truncated = false;
+    // The PAGING, the entry layout, the page cap and the did-it-finish answer are the library's.
+    // What stays here is what `dir` means by a row.
+    let notice = || ctx.console_writeln("  [q] quit");
+    let listing = {
+        let mut fs = gs::fs::Fs::from_tag(&*ctx, ctx.fs_tag.get()).noticing(&notice);
+        let r = fs.list_dir(str_of(path), |e| {
+        if !header_done {
+            out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
+            header_done = true;
+        }
         // A NAME IS UNTRUSTED INPUT, AND THIS IS WHERE IT MEETS A TERMINAL.
         //
         // `fs` refuses to CREATE a name carrying control bytes, but a disk prepared elsewhere
@@ -13830,18 +13808,17 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
         // a terminal acts on the bytes it is handed, and a name containing `ESC [ 2J` clears the
         // screen when listed, scrolling itself and everything after it out of the listing that was
         // supposed to reveal it. Found by `osdev test fs-fuzz` against a disk baked with that name.
+        //
+        // This is ALSO why `DirEntry::name` is raw bytes: sanitising in the library would have made
+        // the unsafe name unprintable AND unreachable, so `delete` could not remove it either.
         let mut safe = [b'?'; 64];
-        let shown = nl.min(safe.len());
+        let shown = e.name.len().min(safe.len());
         for k in 0..shown {
-            let b = p[i + k];
+            let b = e.name[k];
             safe[k] = if b >= 0x20 && b < 0x7f { b } else { b'.' };
         }
         let name = core::str::from_utf8(&safe[..shown]).unwrap_or("?");
-        let is_dir = p[i + nl] != 0;
-        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        let mtime = u32_le(&p[i + nl + 9..i + nl + 13]);
-        let sealed = p[i + nl + 13] & 1 != 0;
-        i += nl + 1 + 8 + 4 + 1;
+        let (is_dir, size, mtime, sealed) = (e.is_dir, e.size, e.mtime, e.sealed);
         // A time this volume does not record prints as "unknown" rather than as 1970 - an absent
         // date is honest and a wrong one is not (Phase O).
         let when = if mtime == 0 {
@@ -13863,7 +13840,42 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
                                            name, kind, SizeCol(size, exact), when));
         }
         listed += 1;
-    }
+        true
+        });
+        ctx.fs_tag.set(fs.tag());
+        r
+    };
+    match listing {
+        // The operator's own `q`. Not a fault, so not an error line and not a failing exit.
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(gs::Error::Unavailable) => {
+            // Present-but-unreadable disk: the data may still be intact, so flashing would DESTROY
+            // it. Deliberately does NOT advise 'drives flash'.
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            return Err(ShellError::Unknown);
+        }
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln("dir: storage unavailable");
+            return Err(ShellError::Unknown);
+        }
+        // A read error is NOT "not a directory". Lumping the two together is how a storage I/O
+        // error - the stick pulled and replugged - came out as a claim about the path, sending the
+        // operator to look at `/` when the problem was the device. Name what happened (26.7).
+        Err(_) => {
+            ctx.console_writeln_fmt(format_args!(
+                "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
+                str_of(path)));
+            return Err(ShellError::Unknown);
+        }
+        Ok(l) => truncated = !l.complete,
     }
     if listed == 0 {
         out.line(ctx, "  (empty)");
@@ -13872,10 +13884,10 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     }
     // The walk hit its own bound rather than the end of the directory. Say so where the count is,
     // because the count is the number a reader will otherwise take as the whole truth (26.7).
-    if cur.cut() {
+    if truncated {
         out.line_fmt(ctx, format_args!(
             "  INCOMPLETE - this directory is larger than {} listing pages; the entries above are not all of it",
-            DIR_PAGE_MAX));
+            gs::fs::DIR_PAGE_MAX));
     }
     Ok(())
 }

@@ -56,6 +56,10 @@ pub const IO_CHUNK: usize = 7 * 508;
 
 // The opcodes, owned here. These are `services/fs`'s numbers and must not be guessed.
 const OP_WRITE_FILE: u8 = 10;
+const OP_LIST_DIR: u8 = 14;
+const OP_MOVE: u8 = 17;
+const OP_MKDIR_P: u8 = 18;
+const OP_DELETE_TREE: u8 = 19;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_DELETE: u8 = 16;
@@ -64,13 +68,76 @@ const OP_WRITE_NEW: u8 = 24;
 const OP_WRITE_AT: u8 = 25;
 const OP_READ_AT: u8 = 26;
 
-/// The first byte of every request and of its reply, so a late answer to an EARLIER request is
-/// recognised instead of being read as the answer to this one.
+/// The tag a fresh handle starts from. Any non-zero value would do; what matters is that
+/// consecutive requests on one channel differ.
 ///
-/// This is not decoration. Without it, running one command twice could leave the filesystem
-/// protocol "out of step" - a reply arriving after its deadline was matched to the next request,
-/// and every exchange after it was answering the question before.
-const TAG_BASE: u8 = 0xC0;
+/// The tag is the first byte of every request and of its reply, so a late answer to an EARLIER
+/// request is recognised instead of being read as the answer to this one. This is not decoration:
+/// without it, running one command twice could leave the filesystem protocol "out of step" - a
+/// reply arriving after its deadline matched to the next request, and every exchange after it
+/// answering the question before.
+///
+/// **There is deliberately no separate tag RANGE for this library.** An earlier draft minted tags
+/// from a 0xC0..0xFF band, which reads as tidy and is actively harmful: `services/shell` mints
+/// from the whole 1..=255 range, so the two overlapped, and a collision does not fail loudly - it
+/// lets a stale reply be ACCEPTED as the current request's answer. Two counters on one channel is
+/// the bug the tag exists to prevent. Use [`Fs::from_tag`] to share the one counter instead.
+const TAG_START: u8 = 1;
+
+/// The most of a service-supplied failure reason [`Fs::reason`] keeps. Bounded on purpose: the
+/// handle is a stack value, so its size must be readable from this line (26.6.1).
+pub const REASON_MAX: usize = 64;
+
+/// The most pages [`Fs::list_dir`] will request before stopping and saying so.
+///
+/// The same bound `services/shell` uses. A walk has to terminate on its own rather than on the
+/// service being well-behaved (26.6), and 512 pages is far past any directory this filesystem
+/// holds while still being a number rather than "however many it takes".
+pub const DIR_PAGE_MAX: u16 = 512;
+
+/// What [`Fs::list_dir`] did.
+///
+/// `visited` cannot be read without seeing `complete`, and that is the whole point of it being a
+/// struct: a partial listing that reads as a full one is the failure this type exists to prevent.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Listing {
+    /// How many entries the closure was shown.
+    pub visited: usize,
+    /// `true` if the directory ended. `false` means the walk stopped first - the closure returned
+    /// `false`, or [`DIR_PAGE_MAX`] was reached - and there are MORE ENTRIES THAN YOU SAW. Say so
+    /// in whatever you report; do not present the count as the size of the directory.
+    pub complete: bool,
+}
+
+/// One entry from [`Fs::list_dir`].
+///
+/// `name` is BYTES, not `&str`, and that is not laziness. `services/fs` accepts any byte above
+/// 0x1f except `/` and 0x7f in a name, so a name is not guaranteed to be UTF-8 and a type that
+/// promised otherwise would be lying about the filesystem it reads. [`DirEntry::name_str`] is the
+/// convenience for the ordinary case.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct DirEntry<'n> {
+    /// The entry's name within its directory. Never contains a `/`.
+    pub name: &'n [u8],
+    /// `true` if this entry is itself a directory.
+    pub is_dir: bool,
+    /// Size in bytes. Zero for a directory.
+    pub size: u64,
+    /// Last-modified time as `services/fs` records it.
+    pub mtime: u32,
+    /// `true` if the file is sealed (append-only; writes to it are refused).
+    pub sealed: bool,
+}
+
+impl<'n> DirEntry<'n> {
+    /// The name as text, or `None` if it is not UTF-8.
+    ///
+    /// The honest call site is `e.name_str().unwrap_or("<not utf-8>")` - print something rather
+    /// than skipping a file that really exists.
+    pub fn name_str(&self) -> Option<&'n str> {
+        core::str::from_utf8(self.name).ok()
+    }
+}
 
 /// A handle to the filesystem service.
 ///
@@ -92,6 +159,9 @@ const TAG_BASE: u8 = 0xC0;
 pub struct Fs<'a> {
     ctx: &'a ServiceContext,
     tag: u8,
+    reason: [u8; REASON_MAX],
+    reason_len: u8,
+    notice: Option<&'a dyn Fn()>,
 }
 
 /// What [`stat`] found.
@@ -108,13 +178,82 @@ impl<'a> Fs<'a> {
     ///
     /// Cheap, allocates nothing, and grants nothing. See the type's authority note.
     pub fn new(ctx: &'a ServiceContext) -> Fs<'a> {
-        Fs { ctx, tag: TAG_BASE }
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None }
     }
 
-    /// The next request tag. Wraps within the tag band, which is fine: it only has to differ from
-    /// the request immediately before it.
+    /// A handle that calls `notice` when a request has been waiting a while.
+    ///
+    /// The callback takes nothing and returns nothing, and that is the whole of its contract: it
+    /// means only **"you have been waiting"**. It cannot cancel, cannot inspect the request, and
+    /// the library learns nothing about consoles from it - the shell prints `[q] quit` there, and
+    /// something headless prints nothing at all.
+    ///
+    /// **Use this for anything a person is waiting at.** A filesystem call can block on a device
+    /// that is settling after a replug, and a command that goes quiet for twenty seconds with no
+    /// way out is one the operator has to reboot out of (`utilities/0_conventions.md` rule 9). A
+    /// request the operator then aborts returns [`Error::Cancelled`], which is NOT a fault - report
+    /// it as the deliberate act it was.
+    pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Fs<'a> {
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice) }
+    }
+
+    /// Take a handle that CONTINUES an existing tag sequence for this channel.
+    ///
+    /// For a caller that still makes some `fs` requests by hand: lend the handle your counter, and
+    /// take it back with [`tag`](Fs::tag) when you are done.
+    ///
+    /// ```ignore
+    /// let mut fs = Fs::from_tag(ctx, my_fs_tag.get());
+    /// let r = fs.list_dir("/data", |e| { .. })?;
+    /// my_fs_tag.set(fs.tag());          // hand-rolled calls resume where the handle left off
+    /// ```
+    ///
+    /// **Use this whenever anything else in the same task also talks to `fs` directly.** Two
+    /// counters on one channel can mint the same tag for two in-flight requests, and the result is
+    /// not a loud rejection - it is a stale reply silently accepted as the answer to the current
+    /// question. See [`TAG_START`](self).
+    pub fn from_tag(ctx: &'a ServiceContext, tag: u8) -> Fs<'a> {
+        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None }
+    }
+
+    /// Lend this handle a waiting-notice, as [`with_notice`](Fs::with_notice) describes.
+    ///
+    /// Separate from [`from_tag`](Fs::from_tag) rather than a fourth constructor taking both,
+    /// because a caller that shares a tag counter usually also wants the notice and the
+    /// combinations multiply faster than the constructors are worth.
+    pub fn noticing(mut self, notice: &'a dyn Fn()) -> Fs<'a> {
+        self.notice = Some(notice);
+        self
+    }
+
+    /// The tag this handle last used, to hand back to whatever owns the channel's counter.
+    pub fn tag(&self) -> u8 {
+        self.tag
+    }
+
+    /// Why the last call failed, IN THE SERVICE'S OWN WORDS, or `""` if it did not fail or said
+    /// nothing.
+    ///
+    /// **This is for reporting, never for control flow.** Branch on the [`Error`]; print this.
+    /// It is free-text owned by `services/fs` and may be reworded at any time, so a caller that
+    /// matched on its content would break silently the next time somebody improved a message.
+    ///
+    /// It exists because the service already sends it and this library used to discard it:
+    /// `FS_ERR` became [`Error::Failed`] and "name already exists" was lost between the two. An
+    /// operator reading `fs: failed` has to go to the service log for a sentence the reply was
+    /// already carrying, which makes a loud failure quieter for no reason (26.7).
+    pub fn reason(&self) -> &str {
+        core::str::from_utf8(&self.reason[..self.reason_len as usize]).unwrap_or("")
+    }
+
+    /// The next request tag: wrapping +1, never 0.
+    ///
+    /// Identical to the rule `services/shell` uses, so one counter can be shared across both (see
+    /// [`from_tag`](Fs::from_tag)). Zero is skipped because a zero tag can only have come from a
+    /// sender that does not tag at all, and that must stay distinguishable.
     fn next_tag(&mut self) -> u8 {
-        self.tag = TAG_BASE.wrapping_add(self.tag.wrapping_sub(TAG_BASE).wrapping_add(1) & 0x3F);
+        let t = self.tag.wrapping_add(1);
+        self.tag = if t == 0 { 1 } else { t };
         self.tag
     }
 
@@ -139,7 +278,8 @@ impl<'a> Fs<'a> {
         req[3..3 + path.len()].copy_from_slice(path);
         req[3 + path.len()..n].copy_from_slice(tail);
 
-        let reply = call::request_within(self.ctx, "fs", &Message::from_bytes(&req[..n]), secs)?;
+        let reply = call::request_within_notice(
+            self.ctx, "fs", &Message::from_bytes(&req[..n]), secs, self.notice)?;
         let body = reply.payload_bytes();
 
         // The tag must match, or this is an answer to a question we already gave up on.
@@ -147,8 +287,183 @@ impl<'a> Fs<'a> {
             return Err(Error::Malformed);
         }
         let status = *body.get(1).ok_or(Error::Malformed)?;
+        // Take the service's words BEFORE `from_fs_status` collapses the byte to an `Error`. Only
+        // FS_ERR carries a reason; every other status has one meaning and needs no sentence.
+        self.reason_len = 0;
+        if status == 1 {
+            let why = if body.len() > 2 { &body[2..] } else { &[][..] };
+            let n = why.len().min(REASON_MAX);
+            self.reason[..n].copy_from_slice(&why[..n]);
+            self.reason_len = n as u8;
+        }
         from_fs_status(status)?;
         Ok(Reply { msg: reply })
+    }
+
+
+    /// Visit every entry of a directory, in the order `services/fs` stores them.
+    ///
+    /// `f` is called once per entry and returns `true` to continue or `false` to stop early.
+    ///
+    /// ```ignore
+    /// let mut files = 0;
+    /// let r = fs.list_dir("/data", |e| { if !e.is_dir { files += 1; } true })?;
+    /// if !r.complete { io::println(ctx, "  (listing truncated - there are more)"); }
+    /// ```
+    ///
+    /// # This is where a hand-rolled version goes wrong
+    ///
+    /// The reply is ONE PAGE: `[count, more, next]` plus the entries that fit in a block. A caller
+    /// that reads `count` entries and stops has silently listed a PREFIX of a large directory, and
+    /// nothing anywhere reports a problem. This follows `next` until `more` is clear, so the
+    /// closure sees the whole directory or the call returns an error - never a quiet partial.
+    ///
+    /// **Blocks**, once per page. **Authority:** the caller's existing `fs` capability.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] - no such path, or it is a file rather than a directory. Returned
+    ///   only for the FIRST page: a later page that fails ends the walk with `complete: false`,
+    ///   because entries were already delivered and reporting "no such directory" for a read error
+    ///   part way through would name the wrong fault.
+    /// - [`Error::Malformed`] - the service claimed more entries without advancing. Listing is
+    ///   read-only, so every no-answer error here is safe to retry.
+    pub fn list_dir<F>(&mut self, path: &str, mut f: F) -> Result<Listing, Error>
+    where
+        F: FnMut(DirEntry<'_>) -> bool,
+    {
+        const HDR: usize = 6; // [count, more, next:u32] - the entries follow
+        let mut from = 0u32;
+        let mut total = 0usize;
+        let mut pages = 0u16;
+        loop {
+            let r = match self.call(OP_LIST_DIR, path.as_bytes(), &from.to_le_bytes(), call::DEFAULT_SECS) {
+                Ok(r) => r,
+                // The FIRST page failing means the path is not a readable directory, and the caller
+                // needs that error. A LATER one failing is a read error inside a walk that already
+                // produced real entries - so the honest answer is the entries plus "not complete",
+                // not an error that describes the directory rather than what happened.
+                Err(e) if pages == 0 => return Err(e),
+                Err(_) => return Ok(Listing { visited: total, complete: false }),
+            };
+            pages += 1;
+            let b = r.body();
+            if b.len() < HDR {
+                return Err(Error::Malformed);
+            }
+            let count = b[0] as usize;
+            let more = b[1] == 1;
+            let next = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+
+            let mut w = HDR;
+            for _ in 0..count {
+                // Every field is bounds-checked against the REPLY, not against what the header
+                // promised. A truncated or malformed page must not be read past its end.
+                if w >= b.len() {
+                    return Err(Error::Malformed);
+                }
+                let nl = b[w] as usize;
+                if w + 15 + nl > b.len() {
+                    return Err(Error::Malformed);
+                }
+                let name = &b[w + 1..w + 1 + nl];
+                let size = u64::from_le_bytes([
+                    b[w + 2 + nl], b[w + 3 + nl], b[w + 4 + nl], b[w + 5 + nl],
+                    b[w + 6 + nl], b[w + 7 + nl], b[w + 8 + nl], b[w + 9 + nl],
+                ]);
+                let mtime = u32::from_le_bytes([
+                    b[w + 10 + nl], b[w + 11 + nl], b[w + 12 + nl], b[w + 13 + nl],
+                ]);
+                total += 1;
+                let go_on = f(DirEntry {
+                    name,
+                    is_dir: b[w + 1 + nl] == 1,
+                    size,
+                    mtime,
+                    sealed: b[w + 14 + nl] & 1 != 0,
+                });
+                if !go_on {
+                    // The caller stopped us, so the directory did not end: NOT complete.
+                    return Ok(Listing { visited: total, complete: false });
+                }
+                w += 15 + nl;
+            }
+
+            if !more {
+                return Ok(Listing { visited: total, complete: true });
+            }
+            // THE WALK TERMINATES ON ITS OWN. Following `more` for as long as the service offers it
+            // is an unbounded loop wearing a condition; the cap is what makes this bounded (26.6),
+            // and `complete: false` is what stops the cap from lying about what was read.
+            if pages >= DIR_PAGE_MAX {
+                return Ok(Listing { visited: total, complete: false });
+            }
+            // NO PROGRESS IS A LOUD ERROR, NOT A LOOP. `next` names the entry that did not fit, so
+            // it must advance past where this page started. A service that answers "more" without
+            // moving would otherwise spin here forever, asking the same question (26.6).
+            if next <= from {
+                return Err(Error::Malformed);
+            }
+            from = next;
+        }
+    }
+
+    /// Create a directory and any missing parents, like `mkdir -p`.
+    ///
+    /// Succeeds if the directory already exists, which is what makes it usable at start-up: a
+    /// service that ensures its own data directory should not have to care whether it is the first
+    /// to run. Use [`create_dir`] where the path's absence is itself the thing being asserted.
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    ///
+    /// # Errors
+    /// [`Error::Failed`] with [`reason`](Fs::reason) naming the step that failed (a parent that is
+    /// a file, say). **A no-answer error must NOT be blindly retried** - see [`Error::retry_is_safe`];
+    /// creating directories is idempotent, but the transaction may have committed unseen, so
+    /// re-issuing is only safe once you accept that it is a second attempt rather than the first.
+    pub fn create_dir_all(&mut self, path: &str) -> Result<(), Error> {
+        self.call(OP_MKDIR_P, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+        Ok(())
+    }
+
+    /// Move a file or directory to `dest`, ACROSS directories.
+    ///
+    /// This is the different operation from [`rename`](Fs::rename), which changes a name within one
+    /// parent. `dest` is a full path, and `services/fs` refuses a move that would put a directory
+    /// inside itself - the tree stays a tree, and that rule is the service's to enforce, not the
+    /// caller's to remember.
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if the source is absent; [`Error::Failed`] with
+    /// [`reason`](Fs::reason) for a refused move ("name already exists", "cannot move root", a
+    /// destination inside the source). A move MUTATES - do not retry on a no-answer error without
+    /// first checking what happened.
+    pub fn move_to(&mut self, path: &str, dest: &str) -> Result<(), Error> {
+        if dest.len() > PATH_MAX {
+            return Err(Error::InvalidInput);
+        }
+        self.call(OP_MOVE, path.as_bytes(), dest.as_bytes(), call::DEFAULT_SECS)?;
+        Ok(())
+    }
+
+    /// Delete a file, or a directory AND EVERYTHING INSIDE IT.
+    ///
+    /// The recursive one. [`delete`](Fs::delete) removes a single file and refuses a non-empty
+    /// directory; this removes the subtree. The names differ deliberately - a caller reaching for
+    /// the destructive one should have to type something that says so.
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`], and longer for a large tree than any single-file
+    /// call. **Authority:** the caller's existing `fs` capability.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if the path is absent; [`Error::Failed`] with [`reason`](Fs::reason)
+    /// otherwise. **Never retry this on [`Error::OutcomeUnknown`]**: the service batches its
+    /// frees, so a deadline that passes mid-delete may leave the tree partly removed, and a blind
+    /// retry cannot tell that from never having started.
+    pub fn delete_all(&mut self, path: &str) -> Result<(), Error> {
+        self.call(OP_DELETE_TREE, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+        Ok(())
     }
 
     /// Ask whether a path exists, and what it is.

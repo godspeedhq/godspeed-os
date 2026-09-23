@@ -43,7 +43,12 @@ BASELINE = os.path.join(ROOT, "scripts", "DOC-SYMBOLS.baseline.txt")
 # `help_philosophy_problems`" is exactly the kind of cross-reference this gate should be validating,
 # not refusing. Scanning only Rust made a correct reference look like a stale one, which is the
 # false positive that gets a checker ignored.
-SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "osdev/src", "examples", "scripts"]
+# `stdlib/rust/src` was MISSING here until 2026-09-23, so this gate never saw the standard
+# library at all: every symbol `docs/stdlib-design.md` named was checked against a source set
+# that excluded the crate the document is about. A checker that silently covers nothing is
+# worse than no checker, because its silence reads as a pass.
+SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "stdlib/rust/src", "osdev/src",
+            "examples", "scripts"]
 DOC_DIRS = ["docs", "utilities", "backlog"]
 DOC_FILES = ["CLAUDE.md", "COMMANDMENTS.md", "README.md", "osdev/CLAUDE.md"]
 

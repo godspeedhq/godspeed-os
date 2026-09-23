@@ -450,3 +450,100 @@ hardware re-test of the protocol - what it owes is the same target-side testing 
 record.
 
 **Still owed, unchanged:** target-side tests against a service that really restarts, and `gs::cap`.
+
+## 11. Four file operations, and three things the shell knew that the library did not
+
+`gs::fs` gains `list_dir`, `create_dir_all`, `move_to` and `delete_all` - the ordinary file
+operations that had callers hand-rolling them. Two corrections to what section 9 claimed about the
+ceiling, made while reading the service rather than its comments:
+
+- **`OP_CAPACITY` and `OP_FLUSH` are not file operations.** They are `block-driver` opcodes that
+  `fs` uses as a CLIENT. Counting them as candidates for `gs::fs` was reading a constant list
+  without reading what serves it.
+- **`send_res!` already sends a REASON.** On `FS_ERR` the service appends its own words - "name
+  already exists", "cannot move root", "source not found" - and `from_fs_status` mapped the status
+  byte and dropped the sentence. A loud failure was being made quieter in transit (26.7). `Fs::reason`
+  keeps it in a bounded buffer the handle owns, documented as diagnostic-only: branch on the
+  `Error`, print the reason.
+
+### The shell's hand-rolled version was better than mine, twice
+
+`services/shell` has nine `OP_LIST_DIR` call sites behind one `DirCursor`. I wrote `list_dir` first
+and read `DirCursor` after, which is the wrong order, and it had two properties I had missed:
+
+1. **A page cap.** My loop followed `next` for as long as the service said `more` - an unbounded
+   execution scope (26.6) resting entirely on the service behaving. `DIR_PAGE_MAX` is now the same
+   512 the shell uses.
+2. **A `cut` flag.** Hitting that cap must not look like finishing. The shell's own comment is the
+   rule: *"a partial answer that reads as a complete one is the thing this whole mechanism exists to
+   remove"*. My `Result<usize, Error>` had nowhere to put it - an error would have been a lie, since
+   the entries WERE delivered, and a bare count would have been exactly the silent truncation the
+   pagination handling existed to prevent. Hence `Listing { visited, complete }`: the count cannot be
+   read without the field that says whether it is the whole directory.
+
+**This is the dogfood working in the opposite direction from the usual story.** The library did not
+teach the caller; the caller taught the library. Worth recording plainly, because a design report
+that only lists what the new code improved is not an honest instrument.
+
+### A hazard that had to be fixed before any migration was safe
+
+`gs::fs` minted tags from a `0xC0..0xFF` band; the shell mints from the whole `1..=255` range. **Two
+independent counters on one channel, with overlapping ranges.** A tag check only REJECTS a mismatch,
+so a collision does not fail loudly - it lets a stale reply be ACCEPTED as the current request's
+answer, which is precisely the "run it twice and the protocol loses step" desync tagging was added
+to remove. Rare, silent, and therefore worse than common and loud.
+
+So migrating one shell site while the others still called `next_fs_tag` would have introduced a rare
+wrong answer. The band bought nothing (a tag need only differ from the request before it on the SAME
+channel, and `net` is a different channel), so it is gone: `Fs` advances exactly as the shell does,
+and `Fs::from_tag` / `Fs::tag` let a caller lend its counter and take it back. One counter per
+channel.
+
+### Architectural friction, reported rather than worked around
+
+**`list_dir`'s closure borrows the handle mutably, so you cannot make another `fs` call while
+listing.** That makes the API right for the simple case the Stranger Test asks about ("list a
+directory") and wrong for an interleaved one.
+
+`cmd_churn_verify` - the power-cut verifier - is the interleaved case: it lists `/churn` and reads
+each file as it goes. Migrating it would have forced a two-pass collect into a roughly 16 KB stack
+buffer the original never needed, on a shell stack already known to be tight. That is a memory
+discipline regression caused by the shape of my API, so **it was not migrated**, and the reason is
+recorded here instead of being engineered around. The page-at-a-time alternative that would fix it
+is what `DirCursor` already is; whether the library should offer that second shape is an open
+question and not a thing to add speculatively (26.2).
+
+### What was migrated, and what it proves
+
+`cmd_dir` - a pure listing, decoding exactly the five fields `DirEntry` carries. It also needed
+`Fs::with_notice`, an inconsistency I had introduced rather than found: `cmd_tcp` got
+`Net::with_notice` so a lingering request keeps offering `[q] quit`, and every shell filesystem call
+uses `fs_request_q`, so migrating any of them without the equivalent would have silently deleted
+that affordance (`utilities/0_conventions.md` rule 9).
+
+What deliberately stayed in the shell: a name is rendered SAFE there, because that is a property of
+writing to a terminal, not of reading a directory. A name holding `ESC [ 2J` clears the screen when
+listed, scrolling away the listing meant to reveal it (found by `osdev test fs-fuzz`).
+`DirEntry::name` is raw bytes precisely so this layer can decide - a library that pre-sanitised
+would have made the hostile name unprintable AND unreachable, so `delete` could not remove it either.
+
+Verified in QEMU, `osdev test files`, **245 passed 0 failed**, including the three cases that pin
+exactly what this change risked:
+
+```
+many: dir lists all 45 entries across pages
+many: dir does not report a truncated listing
+many: dir shows both the first and the last entry
+```
+
+### A gate that was covering nothing
+
+`scripts/doc_symbols_check.py` never scanned `stdlib/rust/src`. Every backticked symbol in
+`docs/stdlib-design.md` was being checked against a source set that EXCLUDED the crate the document
+is about, so the gate's silence read as a pass while it verified nothing. Found because a correct
+reference (`request_within_notice`) failed. Fixed; the scan now covers the crate, and one stale
+baseline entry could be dropped as a result.
+
+**Still owed, unchanged:** target-side tests against a service that really restarts, and `gs::cap`.
+Newly recorded: `backlog/45`, the published book has no standard-library section, which blocks the
+Stranger Test from an honest first run.
