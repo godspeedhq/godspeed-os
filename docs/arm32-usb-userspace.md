@@ -515,7 +515,7 @@ from HCTSIZ; do not track it.
 ### Still to port for 3c
 
 - **Recovery**: `bot_recover`, `note_busy`, `recover_or_revive`. NOT optional on this board - the
-  stick refuses SYNCHRONIZE CACHE, and goes BUSY for tens of seconds under load (a 45-second stall
+  stick goes BUSY for tens of seconds under load (a 45-second stall
   was seen on this branch). A bulk timeout must distinguish "busy, ask again" from "failed", or a
   healthy device gets reset repeatedly: the kernel driver logged 564 spurious recoveries in ONE
   selfcheck before that distinction was made.
@@ -543,8 +543,10 @@ in. The kernel driver's `bot_command` is the reference, and its surrounding reco
 (`bot_recover`, `note_busy`, `recover_or_revive`) is worth reading BEFORE writing the happy path,
 because on this board it is not optional:
 
-- the Pi 2's stick REFUSES `SYNCHRONIZE CACHE` outright, and FUA costs more per write than the
-  driver's command budget allows (`USE_FUA`, CLAUDE.md §6.1 amendment 2026-07-25);
+- FUA costs more per write than the driver's command budget allows (`USE_FUA`). This bullet also
+  said the stick REFUSES `SYNCHRONIZE CACHE` outright; it does not, and that was never tested before
+  it was written (CLAUDE.md §6.1, amendment 2026-09-23 - seven sessions accepting the flush, and an
+  unassisted power cut that replayed the journal). The FUA cost is unaffected and still true;
 - it goes BUSY for tens of seconds under load - a 45-second stall was observed on this very branch -
   so a bulk timeout must distinguish "busy, ask again" from "failed", which is exactly what
   `note_busy` exists for.

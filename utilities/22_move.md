@@ -1,9 +1,9 @@
 # Utility: `move` - relocate a file
 
-**Status:** **Built + QEMU-verified** (`osdev test files` 21/21) on GSFS0003. Same-drive move
-is a **relink** - only the directory entries change, no data copied and (so) no reclamation
-needed; `fs` treats a same-directory move as a rename. (Cross-drive move = copy + delete is
-later, with multi-drive.) Trails `CLAUDE.md`; does not amend it.
+**Status:** **Built + QEMU-verified** (`osdev test files`, 222/0). Same-drive move is a
+**relink** - only the directory entries change, no data copied and (so) no reclamation needed; `fs`
+treats a same-directory move as a rename. (Cross-drive move = copy + delete is later, with
+multi-drive.) Trails `CLAUDE.md`; does not amend it.
 
 ---
 
@@ -27,25 +27,64 @@ usage:
 <src>,<dst> = [index:]label/path | /abs | rel   (see docs/drives.md §4.1)
 ```
 
-## 3. Behaviour & why it's gated
+## 3. Behaviour
 
-`move` = copy `src` to `dst`, then **free** `src`. The free step is what blocks it: Phase-2
-GSFS has no reclamation (overwrite/delete leak blocks until reformat - a stated carry-over,
-`docs/persistence.md`). Until the reclamation phase, a "move" would leave the source's blocks
-stranded, so `move` is deliberately not shipped rather than shipped leaking. Cross-drive move
-is copy-then-delete; same-drive move re-points the directory entry and frees the old extent
-only where layout requires it.
+**Built and shipping.** This section used to read "why it's gated" and explained that `move` was
+deliberately withheld because GSFS had no block reclamation, so a move would strand the source's
+blocks. Reclamation landed (`docs/persistence.md` §6.11) and `move` shipped with it; the section
+described a state that had not been true for some time.
 
-## 4. Implementation (when unblocked)
+A same-directory move is a **rename** (re-point the entry). Across directories it is an `dir_add`
+into the destination followed by a `dir_remove` from the source, both inside one journal
+transaction, so a crash leaves the file in exactly one of the two places and never in neither or
+both. Moving a directory moves its whole subtree with it; nothing is copied, because nothing needs
+to be.
 
-Mutating, least-authority shape of the writers (`19_write.md` §4): `fs` copy + a real
-`Delete` (op TBD) that returns freed blocks to the allocator.
+Open capabilities to the moved path are **revoked** (`revoke_open_subtree`), including for every
+descendant when a directory moves. A capability names a path, the path no longer names that file,
+and a holder that kept using it would be a confused deputy (§7.10, SEC-5).
+
+### A directory cannot be moved into itself, or into its own subtree
+
+`move /a /a/b` would write an entry inside `/a` pointing at `/a`, then unlink `/a` from its parent.
+The subtree becomes a cycle that the root cannot reach - and **`drives check` rebuilds the free
+bitmap by walking the tree**, so those still-occupied blocks would be marked free and handed to the
+next allocation, which overwrites live data. `MAX_TREE_DEPTH` keeps a walk from hanging on it, so it
+would show up as a leak that turns into corruption rather than as a hang.
+
+**It is refused in two places, deliberately.** `move` itself refuses before sending
+(`move: cannot move into itself`), which gives the better message and costs a round trip. `fs`
+refuses it too, because a check in the caller is a convention and only a check in the owner is an
+enforcement: `fs` owns the tree, and owns the bitmap rebuild that depends on the tree being acyclic.
+Leaving that to the client means the next client - a script, another service, a refactor of this one
+- inherits an obligation nobody told it about.
+
+`fs` proves the predicate on every boot (`fs: path guard selftest PASS`), including the case a
+sloppy prefix test gets wrong: `/ab` is **not** inside `/a`, and moving it there must succeed.
+
+## 4. Failure
+
+`fs` now sends the REASON back with the failure rather than only logging it, so these are its
+words, not a guess made at the prompt:
+
+| what happened | what you see |
+|---|---|
+| the source does not exist | `move: failed - path not found` |
+| the destination already exists | `move: failed - dest exists` |
+| the destination's parent is a file | `move: failed - dest not a directory` |
+| moving a directory into itself or its subtree | `move: cannot move into itself` (the shell's own check, before the round trip) |
+| storage is not available | `move: storage unavailable` |
+
+**This table used to say the first two were indistinguishable** - "the same line; `fs` distinguishes
+them in its log". That was true and it was the wrong place to leave it: the reason was already in
+hand at the moment of failure and was being thrown away at the reply. See `docs/persistence.md`
+§6.17 and `send_res!` in `services/fs`. A client that has not been taught to read the reason still
+gets the old wording, because the reason is appended after an unchanged `FS_ERR` byte.
 
 ## 5. Later (separate doc so it can grow)
 
-- **Recursive** directory move, once a tree walk + reclamation exist.
-- Move is the natural client of the reclamation work - its arrival is the milestone that
-  proves the allocator frees correctly.
+- Cross-DRIVE move, which is genuinely copy-then-delete rather than a re-point, and therefore needs
+  a progress report and an interruption story of its own.
 
 ## 6. Conformance
 

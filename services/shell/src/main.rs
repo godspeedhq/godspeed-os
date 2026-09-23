@@ -60,6 +60,99 @@ const OP_READ_FILE: u8 = 11;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_LIST_DIR: u8 = 14;
+
+/// Bytes of header on a `LIST_DIR` reply before the first entry: `[FS_OK, count, more, next:u32]`.
+///
+/// **This is `fs`'s `DIR_HDR` and must equal it.** It used to be a bare `3` written out at nine
+/// call sites here, which is a wire format that changes in eight places and breaks in the ninth.
+/// `scripts/facts_check.py` compares the two constants across the crates.
+const DIR_HDR: usize = 7;
+
+/// Most pages one `LIST_DIR` walk will ask for, at roughly twenty entries each.
+///
+/// A bound, not a guess: the walk has to terminate even if `fs` is wrong or the reply is corrupt
+/// (§26.6), and ten thousand entries in one directory is far past anything else in this system.
+/// Reaching it is reported, never silent.
+const DIR_PAGE_MAX: u16 = 512;
+
+/// Where a `LIST_DIR` walk has reached, across the several round trips a long directory needs.
+///
+/// One reply block carries about twenty entries, so a bigger directory arrives in pages
+/// (`backlog/33`). Before this, every caller read one page and stopped: `dir` said TRUNCATED, but
+/// `find`, `tree` and `copy` just walked what they could see and reported success - a recursive
+/// copy that silently skipped files and said it had copied the directory.
+///
+/// The cursor is a POSITION carried in the request and returned in the reply, so `fs` keeps no
+/// per-client iteration state (see its `list_dir` for why that matters, and for what a multi-page
+/// walk does and does not guarantee while the directory is being changed underneath it).
+///
+/// Usage is a loop around the existing per-page body:
+///
+/// ```ignore
+/// let mut cur = DirCursor::new();
+/// while let Some(from) = cur.next() {
+///     let reply = /* LIST_DIR with `&from` as the request tail */;
+///     let count = cur.take(reply_payload);
+///     let mut i = DIR_HDR;
+///     for _ in 0..count { /* unchanged */ }
+/// }
+/// ```
+struct DirCursor {
+    /// Entry ordinal to resume at, as `fs` reported it.
+    from: u32,
+    /// `fs` says another page exists.
+    more: bool,
+    /// Pages asked for so far - the termination bound.
+    pages: u16,
+    /// The walk stopped before the end of the directory. Set when the page cap is hit, and when
+    /// `fs` claims another page but hands back a cursor that has not advanced.
+    cut: bool,
+}
+
+impl DirCursor {
+    fn new() -> Self { DirCursor { from: 0, more: false, pages: 0, cut: false } }
+
+    /// The 4-byte request tail for the next page, or `None` when the walk is over.
+    fn next(&mut self) -> Option<[u8; 4]> {
+        if self.pages > 0 && !self.more { return None; }
+        if self.pages >= DIR_PAGE_MAX {
+            if self.more { self.cut = true; self.more = false; }
+            return None;
+        }
+        self.pages += 1;
+        Some(self.from.to_le_bytes())
+    }
+
+    /// Read a reply's header: returns how many entries it carries, and records where to resume.
+    ///
+    /// A page that claims more but does NOT advance the cursor ends the walk and sets `cut`. That
+    /// is the one failure a bounded walk must not have - re-asking an identical question forever -
+    /// and it costs one comparison to make impossible rather than merely unlikely.
+    fn take(&mut self, p: &[u8]) -> usize {
+        if p.len() < DIR_HDR { self.more = false; return 0; }
+        let count = p[1] as usize;
+        let next = u32::from_le_bytes([p[3], p[4], p[5], p[6]]);
+        if p[2] != 0 && next > self.from {
+            self.from = next;
+            self.more = true;
+        } else {
+            self.cut = p[2] != 0;
+            self.more = false;
+        }
+        count
+    }
+
+    /// True if the walk ended before the directory did. Callers SAY SO - a partial answer that
+    /// reads as a complete one is the thing this whole mechanism exists to remove (§26.7).
+    fn cut(&self) -> bool { self.cut }
+
+    /// Pages requested so far. A caller uses this to tell "the FIRST request failed" - the path is
+    /// not a directory - from "a LATER page failed", which is a read error part way through a walk
+    /// that had already returned real entries. Reporting both as "no such directory" would be a
+    /// wrong answer for the second (§26.7), exactly the way a storage error once came out as a
+    /// claim about the path.
+    fn pages_asked(&self) -> u16 { self.pages }
+}
 const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
 const OP_MOVE: u8 = 17;
@@ -90,12 +183,17 @@ const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a forei
 const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
                          // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
+const OP_SEAL: u8 = 31;  // [op, plen, path] - freeze a file's content, permanently
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
 const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]  (needs WRITE)
 const FOP_CLOSE: u8 = 4; // [FOP_CLOSE] → revoke the resource
 const RIGHT_READ: u8 = 1 << 0;
 const RIGHT_WRITE: u8 = 1 << 1;
+/// Ask `fs` to open a file APPEND-ONLY. A flag in the fs OPEN protocol, NOT a kernel right - the
+/// kernel's bit 2 is SEND, so this could never have been one. `fs` mints an ordinary WRITE cap and
+/// records against the resource that writes may only extend it (`OPEN_APPEND_ONLY` there).
+const OPEN_APPEND_ONLY: u8 = 1 << 6;
 const LABEL_MAX: usize = 31;
 const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 
@@ -311,6 +409,18 @@ pub struct ShellCtx {
     /// `static`, which is the anonymous singleton Invariant 9 forbids - the same mistake that had to be
     /// undone in `xhci` an hour ago, and one this file already avoids for `fs_tag`.
     pipe_stack_hwm: core::cell::Cell<usize>,
+    /// The reason `fs` gave for the most recent failed write - see `LastWriteErr`. Owned here for
+    /// the reason `pipe_stack_hwm` is: a module-level `static` is the anonymous singleton invariant
+    /// 9 forbids.
+    last_write_err: core::cell::RefCell<LastWriteErr>,
+    /// Set when a DESTRUCTIVE fs request completed with its reply lost, so the outcome is genuinely
+    /// unknown and was deliberately not retried. Read by the handlers that report failures, so they
+    /// say "unknown" rather than "failed" - the distinction carnage §3.5 is about.
+    fs_unknown: core::cell::Cell<bool>,
+    /// The job table: what `background` started, what `jobs` lists, what `foreground` attaches to.
+    /// Owned here for the reason `pipe_stack_hwm` and `last_write_err` are - a module-level `static`
+    /// is the anonymous singleton invariant 9 forbids.
+    jobs: core::cell::RefCell<JobTable>,
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -338,6 +448,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         fs_tag: core::cell::Cell::new(0),
         net_tag: core::cell::Cell::new(0),
         pipe_stack_hwm: core::cell::Cell::new(0),
+        last_write_err: core::cell::RefCell::new(LastWriteErr::new()),
+        fs_unknown: core::cell::Cell::new(false),
+        jobs: core::cell::RefCell::new(JobTable::new()),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -697,6 +810,9 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
+///
+/// The `SCROLL_*` action bytes that used to sit here are gone with the code that sent them: the
+/// shell no longer drives the console's view, it opens `scrollback` and reads the ring as data.
 fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
@@ -745,13 +861,20 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
         }
         b'C' => line.right(ctx), // Right - move cursor within the line
         b'D' => line.left(ctx),  // Left
+        // UNCONDITIONAL AGAIN. These were briefly "scroll if the view happens to be scrolled,
+        // otherwise edit the line"; with scrollback as a mode you cannot be scrolled at the prompt,
+        // so they are line editing and nothing else - which is what they have always been.
         b'H' => line.home(ctx),  // Home (ESC[H)
         b'F' => line.end(ctx),   // End  (ESC[F)
         b'~' => match param {    // navigation cluster: ESC[<n>~
             1 | 7 => line.home(ctx),   // Home
             4 | 8 => line.end(ctx),    // End
             3     => line.delete(ctx), // Delete (forward delete)
-            // 2 = Insert, 5 = PageUp, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
+            // PageUp OPENS `scrollback`, one page back - the key does what it was pressed for.
+            // PageDown from a live prompt stays inert: you are already at the bottom, and opening a
+            // viewer already scrolled to the end is a no-op dressed as an action.
+            5     => { let _ = scrollback_view(ctx, 0, true); line.reprint(ctx); }
+            // 2 = Insert, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
             _ => { let _ = have_param; }
         },
         _ => {} // unknown final byte - already consumed, do nothing
@@ -796,7 +919,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// Commands whose arguments are service names, numbers, or fixed keywords - NEVER file paths. Tab at
 /// an argument position for these must not list the filesystem (which surfaced /.gsh_history). Their
 /// keyword/target arguments are completed in `complete_keyword`; anything past that has no completion,
-/// rather than falling through to path completion. (Path-taking commands - ls/read/write/mkdir/... -
+/// rather than falling through to path completion. (Path-taking commands - dir/read/write/mkdir/... -
 /// are absent, so they still path-complete.)
 ///
 /// CONVENTION (`utilities/0_conventions.md` rule 9): a new non-path utility must be added here in the
@@ -804,7 +927,18 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
     "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve",
+    // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
+    // directory listing for a position that accepts neither a path nor a keyword.
+    "paginate",
 ];
+
+/// The command-name completion list is a fixed 96-slot array filled from `UTILS` + `LIBRARY`, and
+/// entries past it were silently dropped - a command that quietly stops completing because a list
+/// grew, which is the shape of failure this shell keeps removing elsewhere. Now it does not build.
+const _: () = assert!(
+    UTILS.len() + LIBRARY.len() <= 96,
+    "the command-name completion array in `complete_command` is too small for UTILS + LIBRARY -      grow it, do not let names fall off the end"
+);
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
 /// fixed keyword - completed only at that position. Pipe-stage verbs (`to`/`from`/`sort`/`match`) are
@@ -820,12 +954,83 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
+    // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
+    // `ls /d long` are the same command, and documented as such). A first-position token that
+    // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
+    ("churn",    &["verify", "tear", "reset"]),
+    ("dir",      &["bytes"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
     ("sort",    &["reverse"]),
     ("match",   &["except"]),
     ("to",      &["json", "yaml"]),
     ("from",    &["json"]),
+];
+
+/// The COLUMNS each record producer emits, so a pipe stage can complete them.
+///
+/// `dir | where t<tab>` should offer `type`, and did not - the record stages (`where`, `select`,
+/// `sort`, `sum`, `min`, `max`, `avg`) all take a column name and none completed one. They are the
+/// most-typed part of the pipeline and the part where a typo is silent: `where typ=file` matches
+/// nothing and says nothing.
+///
+/// PER PRODUCER, not a union. The columns differ - `dir` has `sealed`, `drives` has `free_mib`,
+/// `events ipc` has `outcome` - and a union would offer `kib_day` while listing a directory. An
+/// offer for a column that does not exist on this row is a worse answer than no offer: it reads as
+/// confirmation that the name is right.
+///
+/// Keyed on the producer at the START of the pipeline, which is what decides the shape of every row
+/// downstream. Kept in sync with each `Table::new(&[..])` call site.
+const PRODUCER_COLS: &[(&str, &[&str])] = &[
+    ("dir",     &["name", "type", "size", "sealed"]),
+    ("find",    &["name", "type", "path", "size"]),
+    ("status",  &["slot", "name", "core", "state", "mem", "queue", "restarts"]),
+    ("caps",    &["resource", "rights"]),
+    ("drives",  &["index", "label", "status", "size_mib", "free_mib"]),
+    ("roster",  &["name", "type", "size"]),
+    ("uptime",  &["owner", "text"]),
+];
+
+/// Pipe stages whose first argument is a COLUMN of the row flowing into them.
+const COLUMN_STAGES: &[&str] = &["where", "select", "sort", "sum", "min", "max", "avg"];
+
+/// SECOND-LEVEL subcommands: the words valid at position 2, given the word at position 1.
+///
+/// `SUBCMD_FIRST` stops after one level, so `events persist s⇥` and `chaos kill-storm f⇥` offered
+/// nothing and fell through to a filesystem listing - a path menu for an argument that is a keyword
+/// or a service name. Completion that goes one level deep on a surface that goes three teaches the
+/// operator that tab does not work here, which is worse than it being absent.
+///
+/// Entries reference existing lists rather than restating them (`CHAOS_RESTARTABLE`), because a
+/// completion table that carries its own copy of the service names is one more place for them to
+/// drift - the exact complaint `CHAOS_RESTARTABLE`'s own comment makes about the other three copies.
+const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
+    ("events", "persist",      &["start", "stop", "status"]),
+    // The storms take a SERVICE, and a misspelt service name is refused with a list - so completing
+    // it is the difference between one keystroke and reading an error.
+    ("chaos",  "kill-storm",   CHAOS_RESTARTABLE),
+    ("chaos",  "flood-storm",  CHAOS_RESTARTABLE),
+    ("chaos",  "max-carnage",  CHAOS_RESTARTABLE),
+    ("trace",  "deps",         CHAOS_RESTARTABLE),
+    ("trace",  "chain",        CHAOS_RESTARTABLE),
+];
+
+/// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
+/// has one - `events persist start <path> <size> [sticky]` is the deepest thing in the shell, and
+/// `sticky` was reachable by typing it in full and no other way.
+const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
+    ("events", "persist", "start", &["sticky"]),
+];
+
+/// Commands whose FIRST argument is a command name rather than a path or a keyword.
+///
+/// `assert ok d⇥` should offer `dir`/`date`/`delete`, not the contents of the current directory.
+/// `watch` and `whatis` already had this; `assert` takes a command after its verb, which is one
+/// level deeper and so was never reached.
+const CMDNAME_AFTER: &[(&str, &str)] = &[
+    ("assert", "ok"),
+    ("assert", "fails"),
+    ("assert", "fails-with"),
 ];
 
 /// Info / no-argument utilities: their only first-argument subcommands are the universal `version`
@@ -849,6 +1054,7 @@ const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
     ("mkdir",  &["parents"]),
     ("copy",   &["recursive"]),
     ("delete", &["recursive"]),
+    ("dir",     &["bytes"]),
 ];
 
 /// Complete the current token (`tok_start..end`) as a subcommand keyword of its segment's command.
@@ -885,8 +1091,11 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     // comma-separated list, so complete the segment after the LAST comma (like chaos max-carnage) - so
     // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
     if "kill".as_bytes() == cmd && prior == 0 {
+        // `time` added 2026-09-20 (`backlog/35`): it is a real service on every board, `kill time`
+        // has always been legal, and `chaos kill-storm time` storms it routinely - it was offered by
+        // no completion list at all, which is drift rather than a decision anyone made.
         const KILL_TARGETS: &[&str] =
-            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack", "version", "help"];
+            &["all-services", "supervisor", "block-driver", "fs", "events", "xhci", "ehci", "shell", "nic-driver", "net-stack", "time", "version", "help"];
         let seg_start = {
             let tok = &line.bytes()[tok_start..];
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
@@ -916,8 +1125,15 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 
     // `restart <name> [core]`: complete the restartable services (single target, not a comma-list).
     if "restart".as_bytes() == cmd && prior == 0 {
+        // KEPT AS ITS OWN LIST, and now for an established reason rather than an unexamined one.
+        // Every difference from `CHAOS_RESTARTABLE` was worked through on 2026-09-20 and the table is
+        // in `backlog/35`: `shell`, `ping` and `pong` belong here and not there; `dwc2` (arm32 only)
+        // and `control` (the test harness's own channel) are the two genuine open questions; `time`
+        // was pure drift and has been added. These lists are CONVENIENCE, not validation - `kill` and
+        // `restart` accept any name and the only refusals are `supervisor`, `shell` and the `observe`
+        // variants - so an omission costs discoverability, never capability.
         const RESTART_TARGETS: &[&str] = &["supervisor", "block-driver", "fs", "events", "xhci",
-            "ehci", "shell", "nic-driver", "net-stack", "ping", "pong", "version", "help"];
+            "ehci", "shell", "nic-driver", "net-stack", "time", "ping", "pong", "version", "help"];
         return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
     }
 
@@ -941,6 +1157,81 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
     if prior == 0 && INFO_CMDS.iter().any(|c| c.as_bytes() == cmd) {
         complete_from_list(ctx, line, tok_start, &["version", "help"]);
         return true;
+    }
+
+    // ---- A COLUMN OF WHATEVER IS FLOWING DOWN THE PIPE -------------------------------------
+    //
+    // The stage's own name says nothing about its argument: `where` takes a column of the row, and
+    // which columns exist is decided by the PRODUCER at the head of the pipeline. So look back past
+    // every `|` to the first command on the line and complete from its columns.
+    //
+    // `sort` is in both this list and `SUBCMD_FIRST` (it also takes `reverse`), so its columns are
+    // offered alongside that keyword rather than instead of it.
+    if prior == 0 && COLUMN_STAGES.contains(&core::str::from_utf8(cmd).unwrap_or("")) {
+        let whole = &line.bytes()[..seg_start];
+        let producer = whole.split(|&b| b == b'|')
+            .next()
+            .and_then(|seg| seg.split(|&b| b == b' ').find(|w| !w.is_empty()));
+        if let Some(prod) = producer {
+            if let Some((_, cols)) = PRODUCER_COLS.iter().find(|(c, _)| c.as_bytes() == prod) {
+                let mut all: [&str; 16] = [""; 16];
+                let mut n = 0usize;
+                for &c in *cols { if n < all.len() { all[n] = c; n += 1; } }
+                // `sort reverse` is a keyword at the same position as a column name.
+                if cmd == b"sort" && n < all.len() { all[n] = "reverse"; n += 1; }
+                if n > 0 { return complete_from_list(ctx, line, tok_start, &all[..n]); }
+            }
+        }
+    }
+
+    // ---- DEEPER THAN ONE LEVEL -------------------------------------------------------------
+    //
+    // `SUBCMD_FIRST` stops after the first argument, so everything past it fell through to PATH
+    // completion - offering a directory listing for an argument that is a keyword or a service name.
+    // Completion that goes one level deep on a surface three deep teaches the operator that tab does
+    // not work here, which is worse than it being absent.
+    //
+    // Checked before the first-level table because a command can appear in both: `events` has
+    // first-level words AND `events persist <start|stop|status>` beneath one of them.
+    let first_arg = words.clone().next();
+
+    // Position 3: `events persist start <path> <size> [sticky]` is the deepest surface in the shell,
+    // and `sticky` was reachable only by typing it in full.
+    if prior >= 1 {
+        let second_arg = words.clone().nth(1);
+        if let (Some(a1), Some(a2)) = (first_arg, second_arg) {
+            if let Some((_, _, _, cands)) = SUBCMD_THIRD.iter().find(
+                |(c, f, sd, _)| c.as_bytes() == cmd && f.as_bytes() == a1 && sd.as_bytes() == a2) {
+                // Offer only what is not already present, like the trailing-modifier table.
+                let mut avail = [""; 8];
+                let mut a = 0usize;
+                for &k in *cands {
+                    let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
+                    if !used && a < avail.len() { avail[a] = k; a += 1; }
+                }
+                if a > 0 { return complete_from_list(ctx, line, tok_start, &avail[..a]); }
+            }
+        }
+    }
+
+    // Position 2: the word after a first-level keyword.
+    if prior == 1 {
+        if let Some(a1) = first_arg {
+            // A COMMAND NAME, where the surface takes one - `assert ok d<tab>` must offer `dir`,
+            // `date`, `delete`, not the contents of the current directory. `watch` and `whatis`
+            // already had this at position 1; nothing had it at position 2.
+            if CMDNAME_AFTER.iter().any(|(c, f)| c.as_bytes() == cmd && f.as_bytes() == a1) {
+                let mut names: [&str; 96] = [""; 96];
+                let mut n = 0usize;
+                for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
+                for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
+                return complete_from_list(ctx, line, tok_start, &names[..n]);
+            }
+            if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
+                |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
+                return complete_from_list(ctx, line, tok_start, cands);
+            }
+        }
     }
 
     if let Some((_, cands)) = SUBCMD_FIRST.iter().find(|(c, _)| c.as_bytes() == cmd) {
@@ -1048,7 +1339,7 @@ struct PathHit { off: usize, len: usize, is_dir: bool }
 /// resolved dir and match entries whose name starts with the leaf. One match → fill it (+ `/` for a
 /// dir, ` ` for a file); several → fill the common prefix, print a numbered menu, then **digit**
 /// selects or **Tab** cycles to the next candidate (any other key keeps the line). No new authority
-/// - the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
+/// - the shell already holds the `fs` LIST_DIR cap (the same `dir` uses).
 fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let bytes = line.bytes();
     let token = &bytes[tok_start..];
@@ -1067,31 +1358,38 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
             None => return,
         }
     };
-    // LIST_DIR (the reply is one ≤512-byte block); copy it so it can outlive the fs reply across
-    // the menu/cycle loop below.
+    // `rbuf` holds the MATCHED NAMES, packed - not a copy of the reply block.
+    //
+    // It used to be the raw reply, with `hits` carrying offsets into it, which meant completion
+    // could only ever see one page of a directory: a name past the twentieth entry was not offered,
+    // and nothing said so. Packing just the matches makes the offsets survive across pages AND
+    // makes the 512 bytes go much further, since only names that could be completed are kept.
     let mut rbuf = [0u8; 512];
-    let rn;
-    {
-        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &[]) { Some(r) => r, None => return };
-        let pb = reply.payload_bytes();
-        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
-        rn = pb.len().min(512);
-        rbuf[..rn].copy_from_slice(&pb[..rn]);
-    }
-    // Collect entries whose name starts with `leaf`.
-    let count = rbuf[1] as usize;
+    let mut w = 0usize;
     let mut hits = [PathHit { off: 0, len: 0, is_dir: false }; 32];
     let mut n = 0usize;
-    let mut i = 2usize;
-    for _ in 0..count {
-        if i >= rn { break; }
-        let nl = rbuf[i] as usize; i += 1;
-        if i + nl + 9 > rn { break; }                 // entry = name_len, name, is_dir, size:u64
-        let is_dir = rbuf[i + nl] != 0;
-        if rbuf[i..i + nl].starts_with(leaf) && n < hits.len() {
-            hits[n] = PathHit { off: i, len: nl, is_dir }; n += 1;
+    let mut cur = DirCursor::new();
+    while let Some(from) = cur.next() {
+        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &from) { Some(r) => r, None => return };
+        let pb = reply.payload_bytes();
+        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
+        let count = cur.take(pb);
+        let mut i = DIR_HDR;
+        for _ in 0..count {
+            if i >= pb.len() { break; }
+            let nl = pb[i] as usize; i += 1;
+            if i + nl + 14 > pb.len() { break; }      // entry = name_len, name, is_dir, size:u64, mtime:u32
+            let is_dir = pb[i + nl] != 0;
+            if pb[i..i + nl].starts_with(leaf) && n < hits.len() && w + nl <= rbuf.len() {
+                rbuf[w..w + nl].copy_from_slice(&pb[i..i + nl]);
+                hits[n] = PathHit { off: w, len: nl, is_dir };
+                w += nl; n += 1;
+            }
+            i += nl + 14;
         }
-        i += nl + 9;
+        // Enough candidates to fill the menu, or no room left to keep them. More pages cannot
+        // change what is offered, so stop asking.
+        if n >= hits.len() { break; }
     }
     if n == 0 { return; }
     let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
@@ -1427,6 +1725,20 @@ impl Line {
 
     /// Clear to an empty line (cursor at 0), erasing what was shown.
     fn clear(&mut self, ctx: &ServiceContext) { self.set(ctx, &[]); }
+
+    /// Put the prompt and the half-typed line back after something OWNED the whole screen.
+    ///
+    /// `set` cannot do this: it starts with an absolute `CHA` to the column after the prompt, which
+    /// assumes the prompt is still on the screen. It is not - `scrollback` clears on the way out,
+    /// the same as `help` and `edit` - so the prompt has to be printed, not jumped to.
+    fn reprint(&self, ctx: &ServiceContext) {
+        ctx.console_write(PROMPT);
+        if self.len > 0 {
+            ctx.console_write(core::str::from_utf8(&self.buf[..self.len]).unwrap_or(""));
+        }
+        // Back to where the cursor actually was, not to the end of the text.
+        for _ in self.cur..self.len { ctx.console_write("\x08"); }
+    }
 }
 
 /// Wait until the input subsystem reports in - the deterministic end-of-boot
@@ -1557,7 +1869,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     if s.contains('|') {
         // One unified pipeline: threads bytes or records, with from/to bridging the two worlds.
         // Returns the pipeline's Result - an `… | assert` sink sets it (else Ok / a stage error).
-        return pipe_run(ctx, cwd, s, out);
+        return pipe_run(ctx, cwd, s, out, depth);
     }
 
     let mut args = [""; MAX_ARGS];
@@ -1569,7 +1881,18 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     // help (`<util> <sub> help`, e.g. `drives flash help`) is intercepted just below.
     if argc == 2 && is_util(args[0]) {
         if args[1] == "version" { util_version(ctx, args[0]); return Ok(()); }
-        if args[1] == "help" { util_help(ctx, args[0]); return Ok(()); }
+        // NOT `let _ =`. A utility in UTILS with no help block used to print nothing at all and
+        // report success - the exact silent discard §26.7 forbids, and how `docs help` went out
+        // mute. Gated by `util_help_coverage_problems` now; this is the runtime half, because a
+        // gate that is added can also be skipped.
+        if args[1] == "help" {
+            if !util_help(ctx, args[0]) {
+                ctx.console_writeln_fmt(format_args!(
+                    "{}: no help block - this is a bug, not a command without help", args[0]));
+                return Err(ShellError::Unknown);
+            }
+            return Ok(());
+        }
     }
     if argc == 3 && args[2] == "help" && is_util(args[0]) {
         if sub_help(ctx, args[0], args[1]) { return Ok(()); }
@@ -1612,7 +1935,16 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     // Dispatch - every command returns its `Result` (Ok/Err); an unknown command is `Err`.
     // The info commands always succeed (they return `Ok`), but they are on the model uniformly.
     return match args[0] {
-        "help"    => cmd_help(ctx, depth),
+        // `help <word>` OPENS ON THAT WORD. It is not a synonym for `<util> help`, which gives one
+        // command's detail - this is what `man` actually means, "find this in the manual", and it
+        // exists because the browser LISTS the commands: reading `dir` there and typing `help dir`
+        // is an expectation this interface creates, so honouring it is not a POSIX concession.
+        //
+        // It also stops the argument being SILENTLY DISCARDED, which is what happened before: you
+        // asked for something specific and got the general thing with nothing said (§26.7).
+        "help"    => cmd_help(ctx, depth, if argc > 1 { args[1] } else { "" }),
+        "docs"    => cmd_docs(ctx, depth, if argc > 1 { args[1] } else { "" }),
+        "scrollback" => cmd_scrollback(ctx, cwd, depth, s["scrollback".len()..].trim()),
         "clear"   => cmd_clear(ctx),
         "echo"    => cmd_echo(ctx, strip_quotes(s["echo".len()..].trim()), out),
         "input"   => { run_input(ctx, s["input".len()..].trim(), out); Ok(()) }
@@ -1677,7 +2009,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // open → write/read VIA THE CAP → non-escalation (RO cap can't write) → forged-handle →
         // revoke-on-close. Prints per-step results; the harness asserts on them (Test 14).
         "fcap"    => cmd_fcap(ctx, if argc >= 2 { args[1] } else { "" }),
-        "ls"      => cmd_ls(ctx, cwd, if argc >= 2 { args[1] } else { "" }, out),
+        "dir"      => cmd_dir(ctx, cwd, &args[1..argc.min(args.len())], out),
         "edit"    => cmd_edit(ctx, cwd, s["edit".len()..].trim()),
         "write"   => cmd_write(ctx, cwd, s["write".len()..].trim()),
         "fmt"     => cmd_fmt(ctx, cwd, s["fmt".len()..].trim()),
@@ -1690,6 +2022,28 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             if argc < 3 { ctx.console_writeln("usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
+        }
+        "background" => cmd_background(ctx, cwd, &args, argc),
+        "jobs"    => {
+            if argc >= 2 && args[1] == "quit" {
+                if argc < 3 { ctx.console_writeln("usage: jobs quit <job>"); Err(ShellError::Unknown) }
+                else { cmd_jobs_quit(ctx, args[2]) }
+            } else { cmd_jobs(ctx, out) }
+        }
+        "foreground" => {
+            if argc < 2 { ctx.console_writeln("usage: foreground <job>"); Err(ShellError::Unknown) }
+            else { cmd_foreground(ctx, args[1]) }
+        }
+        "churn"   => {
+            if argc < 2 { ctx.console_writeln("usage: churn <seconds> | churn verify | churn tear | churn reset"); Err(ShellError::Unknown) }
+            else if args[1] == "verify" { cmd_churn_verify(ctx, out) }
+            else if args[1] == "tear"   { cmd_churn_tear(ctx, out) }
+            else if args[1] == "reset"  { cmd_churn_reset(ctx, out) }
+            else { cmd_churn(ctx, args[1], out) }
+        }
+        "seal"    => {
+            if argc < 2 { ctx.console_writeln("usage: seal <path> [yes]"); Err(ShellError::Unknown) }
+            else { cmd_seal(ctx, cwd, args[1], argc >= 3 && args[2] == "yes") }
         }
         "rename"  => {
             if argc < 3 { ctx.console_writeln("usage: rename <path> <newname>"); Err(ShellError::Unknown) }
@@ -1733,6 +2087,13 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             write_bytes(&mut buf, &mut pos, b"unknown: ");
             write_bytes(&mut buf, &mut pos, other.as_bytes());
             ctx.console_writeln(core::str::from_utf8(&buf[..pos]).unwrap_or("unknown cmd"));
+            // If they reached for a POSIX or DOS name, name the word we use - once, and without
+            // running anything. See `FOREIGN_HINTS`: a hint, never an alias, and it states no rule
+            // about the vocabulary because every such rule here has exceptions.
+            if let Some(ours) = foreign_hint(other) {
+                ctx.console_writeln_fmt(format_args!(
+                    "  try `{}` - see `help` for every command.", ours));
+            }
             Err(ShellError::Unknown) // an unknown command is a failure (so `assert fails …` holds)
         }
     };
@@ -2442,7 +2803,17 @@ fn stmt_reassign(ctx: &ShellCtx, cwd: &Cwd, name: &str, value: &str, vars: &mut 
 }
 
 /// The outcome of one gsh statement: continue to the next, or stop the run (a `fail`).
-enum StmtOutcome { Cont(Result<(), ShellError>), Stop(Result<(), ShellError>) }
+enum StmtOutcome {
+    Cont(Result<(), ShellError>),
+    Stop(Result<(), ShellError>),
+    /// `skip <why>` - the check DECLINED TO RUN, which is neither a pass nor a failure.
+    ///
+    /// A third outcome rather than a flag, because the compiler then forces every site that handles
+    /// a statement to say what it does with one. The suite already skipped things - a clock on a
+    /// machine with no RTC, PCI on a Pi 2, churn with no disk - but announced them with `echo`, so
+    /// they were invisible to the tally and a reader had to notice the word in a wall of output.
+    Skip,
+}
 
 /// Run one gsh statement: a `let`/reassignment/`fail`, or - after `$`-expansion - a plain command
 /// handed to the existing `execute`. `vars` is the run's variable table; `params` its parameters.
@@ -2457,6 +2828,24 @@ fn run_stmt(ctx: &ShellCtx, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellErr
             ctx.console_writeln("fail");
         }
         return StmtOutcome::Stop(Err(ShellError::Unknown));
+    }
+    // `skip <why>` - the counterpart to `fail`, and deliberately symmetric with it.
+    //
+    // `fail` says a check did not hold; `skip` says it was never in a position to. Conflating them
+    // is what the suite did before: a skip printed `PASS ... - skipped`, claiming a check succeeded
+    // when it never ran. On a machine whose disk is raw or absent that is not cosmetic - the storage
+    // sections are a large part of the suite, and a reader scanning for PASS would conclude the
+    // filesystem had been exercised.
+    //
+    // Unlike `fail` it does NOT stop the run: a machine lacking hardware should complete the rest.
+    if head == "skip" {
+        let mut exp = ExpBuf::new();
+        if expand_val(ctx, rest, vars, params, &mut exp).is_ok() {
+            ctx.console_writeln_fmt(format_args!("SKIP  {}", str_of(exp.as_bytes())));
+        } else {
+            ctx.console_writeln("SKIP");
+        }
+        return StmtOutcome::Skip;
     }
     // `let [mut] name = value`
     if head == "let" {
@@ -3527,6 +3916,10 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
     let mut fail_off = [0u16; RUN_MAX_FAILS];
     let mut fail_len = [0u16; RUN_MAX_FAILS];
     let mut nfail_rec = 0usize;
+    let mut skip_off = [0u16; RUN_MAX_FAILS];
+    let mut skip_len = [0u16; RUN_MAX_FAILS];
+    let mut nskip_rec = 0usize;
+    let mut skipped: u32 = 0;
     let b = src;
     let ft = prescan_fns(ctx, b); // index `fn` definitions so a call may precede its definition (§7)
     let sdepth = depth + 1; // statements/conditions run one level deeper (a nested `run` is refused)
@@ -3907,13 +4300,17 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             out.put(ctx, "> ");
             out.line(ctx, s);
         }
-        let (res, stop) = {
+        let (res, stop, was_skip) = {
             // While a $(fn) capture is active, the command's OUTPUT goes to the capture buffer, not
             // the console (the transcript `> stmt` above still goes to `out`).
             let mut cmd_out = if capturing { Out::FnCap(&mut fncap) } else { Out::Console };
             match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut cmd_out) {
-                StmtOutcome::Cont(r) => (r, false),
-                StmtOutcome::Stop(r) => (r, true),
+                StmtOutcome::Cont(r) => (r, false, false),
+                StmtOutcome::Stop(r) => (r, true, false),
+                // A SKIP IS `Ok` SO THE RUN CONTINUES, and counted separately so it is not read as
+                // a pass. `last` matters here: a following `if result == Ok` must not be told a
+                // check succeeded when it never ran.
+                StmtOutcome::Skip     => (Ok(()), false, true),
             }
         };
         last = res;
@@ -3926,6 +4323,14 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                 fail_off[nfail_rec] = stmt_off as u16;
                 fail_len[nfail_rec] = stmt.len() as u16;
                 nfail_rec += 1;
+            }
+        }
+        if was_skip {
+            skipped += 1;
+            if nskip_rec < RUN_MAX_FAILS {
+                skip_off[nskip_rec] = stmt_off as u16;
+                skip_len[nskip_rec] = stmt.len() as u16;
+                nskip_rec += 1;
             }
         }
         if stop { break; }
@@ -3963,7 +4368,24 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                     failed as usize - nfail_rec, RUN_MAX_FAILS));
             }
         }
-        out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
+        // WHAT DECLINED TO RUN, named the same way failures are. A count on its own invites the
+        // reader to assume which sections it was, and on a diskless machine that guess is wrong in
+        // the direction that matters (§26.7).
+        if skipped > 0 {
+            out.line(ctx, "--- skipped ---");
+            for j in 0..nskip_rec.min(RUN_MAX_FAILS) {
+                out.put(ctx, "SKIP  ");
+                out.line(ctx, str_of(&b[skip_off[j] as usize..skip_off[j] as usize + skip_len[j] as usize]));
+            }
+            if skipped as usize > nskip_rec {
+                out.line_fmt(ctx, format_args!(
+                    "SKIP  ... and {} more (only the first {} are listed)",
+                    skipped as usize - nskip_rec, RUN_MAX_FAILS));
+            }
+        }
+        // APPENDED, never reshaped: six harness checks match `run: ran N, failed M` exactly, and a
+        // tally line is an interface.
+        out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
     }
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
@@ -4163,15 +4585,84 @@ fn cmd_assert(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<()
 
 const UTIL_VERSION: &str = "0.4.0";
 
+/// What someone typed when they meant one of ours, and what to point them at.
+///
+/// **Teaching the vocabulary at the moment somebody reaches for the wrong word.** Somebody arriving
+/// with POSIX or DOS fingers gets `unknown: cat` and no idea that `read` is the word here, which
+/// costs them a trip to `help` to learn one substitution.
+///
+/// **The hint names the word and claims nothing about the vocabulary**, because any rule stated here
+/// would be false. This is not "GodspeedOS uses whole words": `cd` is kept precisely because it
+/// reads well, and `find`, `kill`, `echo` and `clear` are shared with POSIX outright. The vocabulary
+/// is chosen command by command on whether the name says what the thing does - sometimes that
+/// coincides with POSIX and sometimes it does not. A hint that lectures about a pattern will be
+/// wrong for whichever command is the next exception.
+///
+/// **A hint, never an alias.** The command does NOT run. An alias would reward the reflex and keep
+/// the borrowed vocabulary in front of the user, which is the opposite of the point: these tools are
+/// not their POSIX namesakes and do not take their flags (there are no flags - conventions rule 4),
+/// there are no mode bits, no owner, no inodes and no symlinks. Being told the right word once is
+/// how the reflex retrains; being silently served is how it never does.
+///
+/// Kept deliberately short. It covers the commands whose absence is genuinely surprising, not every
+/// binary on a Linux box - a hint for something we do not do and never will is noise, and pretending
+/// to recognise `awk` implies a plan to have one.
+const FOREIGN_HINTS: &[(&str, &str)] = &[
+    // POSIX
+    ("ls",    "dir"),       // the Unix reflex; here it is `dir` - what `mkdir` makes
+    ("cat",   "read"),
+    ("more",  "read"),
+    ("less",  "read"),
+    ("mv",    "move"),      // ... or `rename`; POSIX conflates them and we deliberately do not
+    ("rm",    "delete"),
+    ("cp",    "copy"),
+    ("grep",  "match"),
+    ("wc",    "count"),
+    ("head",  "first"),
+    ("tail",  "last"),
+    ("touch", "write"),
+    ("pwd",   "cd"),        // `cd` with no argument prints where you are
+    ("ps",    "status"),
+    ("top",   "observe"),
+    ("htop",  "observe"),
+    ("df",    "drives"),
+    ("du",    "drives"),
+    ("fsck",  "drives check"),
+    ("chmod", "seal"),      // the nearest thing: there are no mode bits, only a capability
+    ("chown", "caps"),      // ... and no ownership either; authority is what a holder was granted
+    ("shutdown", "reboot"),
+    ("halt",  "reboot"),
+    ("poweroff", "reboot"),
+    ("uname", "about"),
+    ("man",   "help"),
+    ("which", "whatis"),
+];
+
+/// The hint for a word we do not have, if there is one worth giving.
+fn foreign_hint(cmd: &str) -> Option<&'static str> {
+    FOREIGN_HINTS.iter().find(|(foreign, _)| *foreign == cmd).map(|(_, ours)| *ours)
+}
+
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "chaos", "drives", "ls", "cd", "read", "write", "edit", "fcap",
-    "mkdir", "copy", "move", "rename", "delete", "find", "tree", "match", "count", "sort",
+    "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
+    // `events` and `trace` were absent, so they alone among the utilities answered neither
+    // `<util> version` nor `<util> help` - conventions rule 1, unmet since they shipped. Both already
+    // HAD help blocks; nothing referred a reader to them. Safe to add: the intercept fires only on
+    // exactly `<util> version` / `<util> help` / `<util> <sub> help`, so `events log 5` and
+    // `events ipc` still reach their own dispatch untouched.
+    "events", "trace", "docs", "scrollback",
+    "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
+    "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
     "where", "select", "to", "from", "sum", "min", "max", "avg",
+    // A pipe-only stage like the record verbs above, and in this list for the same reason: rule 1
+    // says every utility answers `<util> version` and `<util> help`, including the ones that can
+    // only appear after a `|`.
+    "paginate",
 ];
 fn is_util(name: &str) -> bool { UTILS.contains(&name) }
 
@@ -4189,26 +4680,18 @@ type Row = (&'static str, &'static str, &'static str);
 fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
     // PAGE IT WHEN IT DOES NOT FIT. `help` (the full list) has paged for a long time; a single
     // command's help never did, because no command's help was taller than a screen. `trace`'s is: it
-    // documents six views and eight columns, and on a 34-row console the top scrolled away for good
-    // on a framebuffer with no scrollback. The fix is not to write less - the column notes are the
-    // useful part - it is to reuse the pager that already exists.
+    // documents six views and eight columns, and on a 34-row console the top scrolled away for good.
+    // The fix is not to write less - the column notes are the useful part - it is to reuse the pager
+    // that already exists.
+    //
+    // Same standing as `cmd_help`'s pager: the "framebuffer has no scrollback" that justified this
+    // is no longer true, and both go together once scrollback is hardware-proven.
+    // NO PAGER, for the same reason `cmd_help` no longer has one: the console keeps scrollback
+    // now, and `<command> help | paginate` is there when you want to page deliberately. `trace`'s
+    // help is the tall one - six views and eight columns - and on a 32-row console it is what
+    // PgUp exists for.
     let lines = help_block_lines(rows, footer);
-    let (rows_avail, _) = ctx.console_dims();
-    // Unknown geometry is not "no terminal": a failed lookup returns 0, and `edit` and `trace` both
-    // assume 24 rather than dropping the feature.
-    let rows_avail = if rows_avail == 0 { 24 } else { rows_avail as usize };
-    if lines + 3 <= rows_avail {
-        help_block_render(ctx, title, desc, rows, footer, 0, lines);
-        return;
-    }
-    line_pager(ctx, lines, rows_avail,
-        &|c| {
-            c.console_write_fmt(format_args!("{} {} - {}\x1b[K\n", title, UTIL_VERSION, desc));
-            c.console_write("\x1b[K\n");
-            c.console_write("usage:\x1b[K\n");
-            3
-        },
-        &|c, i| help_block_line(c, rows, footer, i), &|_| {});
+    help_block_render(ctx, title, desc, rows, footer, 0, lines);
 }
 
 /// How many scrolling lines a help block has (the header is pinned, so it does not count).
@@ -4217,55 +4700,6 @@ fn help_block_lines(rows: &[Row], footer: bool) -> usize {
     for (_, _, ex) in rows { n += if ex.is_empty() { 1 } else { 2 }; }
     if footer { n += 2; }
     n
-}
-
-/// Render scrolling line `i` of a help block, erasing its tail for the pager's in-place repaint.
-///
-/// CLAMPED TO THE CONSOLE WIDTH, and that is load-bearing rather than cosmetic. The pager counts
-/// LOGICAL lines and paints one per screen row; a line longer than the terminal wraps onto a second
-/// row, so every wrapped row pushes the frame down, scrolls the pinned header off the top and makes
-/// the whole thing look like it started in the middle. That is exactly what `events help` did on a
-/// 102-column display while looking perfect on serial, which has no width at all.
-///
-/// The rows are short now, but content should not be able to break the frame - so an over-long line
-/// is cut and marked with a `>` rather than silently wrapped. Visible truncation is a bug report; a
-/// broken pager is a mystery.
-fn help_block_line(ctx: &ServiceContext, rows: &[Row], footer: bool, i: usize) {
-    let mut n = 0usize;
-    for (sig, d, ex) in rows {
-        if n == i {
-            help_write_clamped(ctx, format_args!("  {:<28}  {}", sig, d));
-            return;
-        }
-        n += 1;
-        if !ex.is_empty() {
-            if n == i {
-                help_write_clamped(ctx, format_args!("      e.g. {}", ex));
-                return;
-            }
-            n += 1;
-        }
-    }
-    if footer {
-        if n == i     { ctx.console_write("  version\x1b[K\n"); return; }
-        if n + 1 == i { ctx.console_write("  help\x1b[K\n"); }
-    }
-}
-
-/// Write one pager line, cut to the console width so it occupies exactly one screen row.
-fn help_write_clamped(ctx: &ServiceContext, args: core::fmt::Arguments) {
-    let (_, cols) = ctx.console_dims();
-    let cols = if cols == 0 { 80 } else { cols as usize };
-    let mut buf = [0u8; 256];
-    let mut w = ClampWriter { buf: &mut buf, n: 0 };
-    let _ = core::fmt::write(&mut w, args);
-    let n = w.n;
-    let keep = n.min(cols.saturating_sub(1)).min(256);
-    if let Ok(text) = core::str::from_utf8(&buf[..keep]) {
-        ctx.console_write(text);
-        if keep < n { ctx.console_write(">"); }
-    }
-    ctx.console_write("\x1b[K\n");
 }
 
 /// A fixed-buffer `fmt::Write` sink. Bounded, no heap (26.6.1).
@@ -4307,7 +4741,28 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
+            ("help <word>", "open the list already scrolled to that word", "help dir"),
         ], true),
+        // `docs` was added to UTILS alongside `events` and `trace` on the note that those two
+        // "already HAD help blocks". It did not, and nothing checked - so `docs help` printed
+        // NOTHING and returned Ok: conventions rule 1 unmet, silently, by the change that was
+        // meant to meet it. `util_help_coverage_problems` is what stops the next one.
+        "docs" => help_block(ctx, "docs", "the manual: what this system is, and what you can rely on", &[
+            ("docs", "open the manual at the top", "docs"),
+            ("docs <word>", "open it already scrolled to that word", "docs capabilities"),
+        ], true),
+        // `fcap` is the opposite failure to `docs` above, and the sharper one: it HAS good help,
+        // and putting it in UTILS made the intercept above shadow it, so the message `help`'s own
+        // row points a reader at ("fcap help") stopped printing. Routed here rather than rewritten
+        // into rows, because the four properties it lists are prose, not usage lines.
+        "scrollback" => help_block(ctx, "scrollback", "read back what has scrolled off the screen", &[
+            ("scrollback", "open at the newest line", "scrollback"),
+            ("scrollback save <path>", "write the whole history to a file, unclipped", "scrollback save /log.txt"),
+            ("PgUp (at the prompt)", "the same view, opened one page back", "PgUp"),
+            ("arrows / PgUp / PgDn", "a line, or a page", "PgDn"),
+            ("Home / End, q", "the ends; q or Esc leaves", "q"),
+        ], true),
+        "fcap" => cmd_fcap_help(ctx),
         "events" => help_block(ctx, "events", "what the sink RECORDED: logs, IPC traces, metrics", &[
             ("events ipc", "recent IPC exchanges, oldest first", "events ipc"),
             ("events failures", "the same, only timeouts and lost peers", "events failures"),
@@ -4356,7 +4811,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("assert fails <command>", "the command must fail (negative test)", "assert fails read /nope"),
             ("assert fails-with <V> <command>", "must fail with the named Err variant", "assert fails-with FileNotFound read /nope"),
             ("<producer> | assert contains <text>", "piped output must contain <text>", "roster | where role=core | assert contains Matthew"),
-            ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "ls / | assert lacks secret"),
+            ("… | assert lacks <text> / empty", "must NOT contain / must be empty", "dir / | assert lacks secret"),
         ], true),
         "echo" => help_block(ctx, "echo", "print text", &[
             ("echo <text>", "print text verbatim", "echo hello world"),
@@ -4378,7 +4833,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
         ], true),
         "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
-            ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis ls"),
+            ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis dir"),
             // The one collision in the vocabulary: whatis's argument domain CONTAINS the words
             // `help` and `version`, and the universal `<util> help|version` rule answers first -
             // so this help text itself carries the answer you were asking for.
@@ -4423,7 +4878,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("status", "slot, name, core, state of every task", "status"),
         ], true),
         "observe" => help_block(ctx, "observe", "live system metrics view (records when piped)", &[
-            ("observe", "full-screen live view (q to quit)", "observe"),
+            ("observe", "full-screen live view; q quits", "observe"),
             ("observe now", "one-shot metrics frame", "observe now"),
             ("observe now | <verb>", "piped: records + a 'ticks' (cpu-time) column", "observe now | sort reverse ticks"),
         ], true),
@@ -4469,11 +4924,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("drives check [drive]", "verify (fsck): rebuild bitmap/free, report CRC failures", "drives check"),
             ("drives scrub [drive]", "read-only integrity sweep: verify every block's CRC, report (changes nothing)", "drives scrub"),
         ], true),
-        "ls" => help_block(ctx, "ls", "list a directory (records when piped)", &[
-            ("ls", "list the current directory", "ls"),
-            ("ls <path>", "list the directory at <path>", "ls /docs"),
-            ("ls [path] | <verb>", "piped: emits records name/type/size", "ls | where size>0"),
-            ("ls | select … / sort …", "project / order the listing", "ls | sort reverse size"),
+        "dir" => help_block(ctx, "dir", "list a directory (records when piped)", &[
+            ("dir", "list the current directory", "dir"),
+            ("dir <path>", "list the directory at <path>", "dir /docs"),
+            ("dir bytes", "sizes as an exact byte count, not KiB/MiB/GiB", "dir bytes /docs"),
+            ("dir [path] | <verb>", "piped: emits records name/type/size", "dir | where size>0"),
+            ("dir | select … / sort …", "project / order the listing", "dir | sort reverse size"),
         ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
@@ -4497,6 +4953,24 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("mkdir <path> parents", "create missing parent dirs too", "mkdir /a/b/c parents"),
             ("mkdir <a>,<b>,...", "create several directories (comma-separated)", "mkdir /docs,/tmp"),
         ], true),
+        "background" => help_block(ctx, "background", "start a long job detached, so it does not own the prompt", &[
+            ("background copy <src> <dst>", "start the copy and give the prompt straight back", "background copy /big.bin /backup/big.bin"),
+            ("background delete <path> recursive", "remove a whole subtree detached", "background delete /old recursive"),
+            ("background drives check", "check the volume detached; `foreground` replays the verdict", "background drives check"),
+            ("background drives scrub", "read-only CRC sweep, detached", "background drives scrub"),
+            ("background churn <seconds>", "sustained write traffic, detached - the prompt stays yours", "background churn 300"),
+            ("jobs", "what exists and what state it is in", "jobs"),
+            ("foreground <job>", "attach the console to it again", "foreground 1"),
+            ("what can detach?", "commands whose value is an EFFECT; a job holds no console, so reports cannot", "background copy /a /b"),
+        ], true),
+        "jobs" => help_block(ctx, "jobs", "the job table - what `background` started", &[
+            ("jobs", "one row per job: id, state, progress, command", "jobs"),
+            ("jobs | where state=running", "filter like any other producer (rule 12)", "jobs | where state=running"),
+            ("jobs quit <job>", "stop a job without attaching to it first", "jobs quit 1"),
+        ], true),
+        "foreground" => help_block(ctx, "foreground", "attach the console to a background job", &[
+            ("foreground <job>", "watch it; q cancels the JOB, b detaches it again", "foreground 1"),
+        ], true),
         "copy" => help_block(ctx, "copy", "copy a file or a whole subtree", &[
             ("copy <src> <dst>", "copy file <src> to <dst>", "copy /docs/a.txt /docs/b.txt"),
             ("copy <src> <dst> recursive", "copy directory <src> and everything under it", "copy /docs /backup recursive"),
@@ -4511,6 +4985,16 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("delete <path>", "remove the file/empty dir <path>", "delete /docs/old.txt"),
             ("delete <path> recursive", "remove directory <path> and everything under it", "delete /docs recursive"),
             ("delete <a>,<b>,...", "remove several (comma-separated; recursive applies to all)", "delete /a.txt,/b.txt"),
+        ], true),
+        "churn" => help_block(ctx, "churn", "hammer the filesystem for N seconds so a power cut lands somewhere", &[
+            ("churn <seconds>", "write/rename/delete continuously, then stop", "churn 30"),
+            ("churn verify", "after a cut: is any file a MIX of two writes? (content, not structure)", "churn verify"),
+            ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
+            ("churn <seconds>", "q quits early; run BOTH `churn verify` and `drives check` after", "churn 120"),
+        ], true),
+        "seal" => help_block(ctx, "seal", "freeze a file's content, permanently - there is NO unseal", &[
+            ("seal <path>", "freeze <path>'s bytes after asking [y/N]", "seal /audit.log"),
+            ("seal <path> yes", "freeze it without asking (for a script; the warning still prints)", "seal /audit.log yes"),
         ], true),
         "find" => help_block(ctx, "find", "search the tree by name (substring/glob; records when piped)", &[
             ("find <name>", "matches names containing <name>", "find report"),
@@ -4549,6 +5033,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("<records> | where <col><op><val>", "ops: = != > < >= <=, and the word `contains`", "status | where mem>0"),
             ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
             ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps events | where rights contains send"),
+        ], true),
+        "paginate" => help_block(ctx, "paginate", "read long output a screenful at a time (pipe stage)", &[
+            ("<producer> | paginate", "page any long output - text or records", "read /long.txt | paginate"),
+            ("dir /big | paginate", "a record stream keeps its column header pinned while you scroll", "dir /big | paginate"),
+            ("", "arrows scroll a line; PgUp/PgDn and space move a page; Home/End jump; q quits", ""),
+            ("", "in a script or a capture it just prints - there is nobody to press a key", "run /s.gsh"),
         ], true),
         "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
             ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
@@ -4643,10 +5133,70 @@ enum HelpRow {
     Row(&'static str, &'static str),
 }
 use HelpRow::*;
+/// THE MANUAL. `help` is a reference you consult mid-task; this is a document you read once.
+///
+/// **They were one thing for about an hour and that was the wrong shape.** A philosophy section
+/// inside `help` means `help` opens on prose when you wanted the word for `dir`'s byte counts, and
+/// it makes `help` the place everything explanatory accumulates - the dumping ground §4.4 and §26.2
+/// exist to prevent. Splitting them gives each one job. `help` names this one on its first screen,
+/// so a newcomer still finds it by typing the obvious thing.
+///
+/// Same browser, different document: the contents, search and keys are parameterised, not copied.
+static DOCS: &[HelpRow] = &[
+    Gap,
+    // The six responsibilities below restate `CLAUDE.md` §4.3, and a restatement rots - nine
+    // commands had just fallen out of `help` with nothing watching. So it is GATED:
+    // `scripts/facts_check.py` derives the six from the constitution, using the same slice
+    // `commandments.py` uses, and fails if this text stops naming one.
+    //
+    // The conceptual diagram stays deliberately small for the same reason. The one that CANNOT
+    // drift - drawn live from the kernel - is `[a]`.
+    Sec("What this is"),
+    Text("  A capability microkernel. Authority is never ambient: a program can do exactly what it"),
+    Text("  was handed a capability for, and nothing else - there is no root, and no way to ask."),
+    Text(""),
+    Text("      applications            replaceable, restartable"),
+    Text("      services                shell - fs - console - net-stack - drivers"),
+    Text("      supervisor              restarts anything that dies (itself included)"),
+    Text("      kernel                  MISCIS, and nothing else"),
+    Text("      arch/<isa>              the only code that knows which machine this is"),
+    Gap,
+    Sec("MISCIS - the whole of what the kernel does"),
+    Text("  Said like `misses`:"),
+    Text("      memory isolation, IPC, scheduling, capabilities, interrupts, SMP routing."),
+    Text(""),
+    Text("  A filesystem, a network stack and a display driver are NOT in that list, so they are"),
+    Text("  ordinary services out here. Killing one is a restart, not a reboot - and the only"),
+    Text("  thing that cannot be restarted is the kernel itself."),
+    Gap,
+    Sec("What you can rely on"),
+    Text("  Failures are loud, never silent. A command that could not do what you asked says so"),
+    Text("  and says why; nothing retries behind your back or quietly does something smaller."),
+    Text(""),
+    Text("  Bounded by design: fixed queues, no heap, and a limit reached is REPORTED. A listing"),
+    Text("  that cannot fit, a disk that cannot take a write, a walk too deep - each says so"),
+    Text("  rather than returning a smaller answer that looks complete."),
+    Text(""),
+    Text("  A file is a real capability, not a number the filesystem trusts you about. `fcap`"),
+    Text("  opens one and proves it: read through it, then watch a read-only one refuse to write."),
+    Gap,
+    Sec("Seeing it work"),
+    Text("  status            every service, its core, its state, its memory"),
+    Text("  trace deps        who talks to whom, live"),
+    Text("  chaos             kill things on purpose and watch them come back"),
+    Text("  selfcheck         a few hundred assertions about this machine, right now"),
+    Text("  drives check      the filesystem's structure, rebuilt from the tree and compared"),
+    Text(""),
+    Text("  Press [a] for what is running on THIS machine, read live from the kernel."),
+    Gap,
+];
+
 static HELP: &[HelpRow] = &[
     Gap,
     Sec("Console"),
     Row("help", "show this message"),
+    Row("docs", "the manual: what this system is, and what you can rely on"),
+    Row("scrollback [save <path>]", "read back what has scrolled off the screen (also: PgUp)"),
     Row("<prefix> Tab", "complete a command; if several match, press the shown digit to pick"),
     Row("arrows/Home/End/Del", "edit the line in place; Up/Down recall history; Esc clears"),
     Row("clear", "clear the screen"),
@@ -4671,7 +5221,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
-    Row("observe [now]", "live view (q to quit) / one-shot frame"),
+    Row("observe [now]", "live view (q quits) / one-shot frame"),
     // Neither of these was ever listed here, so `help` did not mention the observability tools at all.
     // Two entries because they are two commands over two SOURCES: `trace` walks live kernel state,
     // `events` reads what the sink recorded.
@@ -4685,13 +5235,21 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
-    Row("ls [path]", "list a directory"),
+    Row("dir [path]", "list a directory"),
     Row("cd [path|-]", "change directory (- = previous)"),
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
     Row("mkdir <path>[,path,...] [parents]", "create a directory or a comma-list"),
     Row("copy <src> <dst> [recursive]", "copy a file or subtree"),
+    Row("background copy <src> <dst>", "start a long copy detached; the prompt comes straight back"),
+    Row("background delete <path> recursive", "remove a whole subtree detached"),
+    Row("background drives check", "check the volume detached; foreground replays the verdict"),
+    Row("background drives scrub", "read-only CRC sweep detached; foreground replays the verdict"),
+    Row("background churn <seconds>", "sustained write traffic detached, so the prompt stays usable"),
+    Row("jobs", "what `background` started: id, state, progress (a producer - pipe it)"),
+    Row("jobs quit <job>", "stop a job without attaching to it"),
+    Row("foreground <job>", "attach to a job again; q stops it, b detaches it"),
     Row("move <src> <dst>", "relocate a file/dir"),
     Row("rename <path> <name>", "rename an entry in place"),
     Row("delete <path>[,path,...] [recursive]", "remove a file/dir/subtree or a comma-list"),
@@ -4701,18 +5259,28 @@ static HELP: &[HelpRow] = &[
     Row("count [path]", "count lines/words/bytes (also: <prod> | count)"),
     Row("sort [reverse] [path]", "order lines (also: <prod> | sort)"),
     Row("first / last [N] [path]", "keep first/last N lines (also: <prod> |)"),
+    Row("seal <path> [yes]", "freeze a file's bytes forever - there is no unseal"),
+    Row("churn <seconds>", "hammer the filesystem so a power cut lands somewhere"),
+    Row("churn verify / tear / reset", "after a cut: torn? | make one torn, to prove it can tell | clean up"),
     Gap,
     Sec("Pipes"),
     Row("<producer> | [filter |…] <sink>", "compose stages (Appendix D)"),
     Row("  e.g. read /f | upper", "filter a file through a service"),
     Row("  e.g. tree / | write /out", "capture output to a file"),
     Row("  e.g. greet | upper | write /g", "producer | filter | sink"),
+    Row("  e.g. read /long | paginate", "read long output a screenful at a time"),
+    Row("input <prompt>", "read one line from the operator, for a script"),
     Gap,
     Sec("Records (typed pipes - docs/records.md)"),
     Row("status | where mem>0", "filter the task table by field (=,!=,>,<,~)"),
     Row("status | select name state", "keep only some columns"),
     Row("status | sort [reverse] mem", "order rows by a column"),
     Row("status | to json | to yaml", "render the table (default: a grid)"),
+    Row("read /x.json | from json", "parse text INTO records - the other direction"),
+    Row("status | sum|min|max|avg mem", "reduce a numeric column; non-numeric is loud, never a silent 0"),
+    Gap,
+    Sec("Network"),
+    Row("sock", "open a UDP socket as a real capability and send through it"),
     Gap,
     Sec("Power"),
     Row("reboot", "hardware reset"),
@@ -4731,47 +5299,753 @@ static HELP: &[HelpRow] = &[
 /// Render help line `idx` (0 = the versioned header, then `HELP[idx-1]`). When `clear_eol`
 /// the line ends with `ESC[K` (erase to end of line) before the newline - the pager repaints
 /// each row in place over the old frame, so a shorter line must wipe the longer one's tail.
-fn help_render_line(ctx: &ServiceContext, idx: usize, clear_eol: bool) {
-    let eol = if clear_eol { "\x1b[K" } else { "" };
-    if idx == 0 {
-        // Rule 6 (0_conventions.md): help output's first line is `<util> <version>`.
-        ctx.console_write_fmt(format_args!("help {} - GodspeedOS shell commands", UTIL_VERSION));
-    } else {
-        match &HELP[idx - 1] {
-            Gap => {}
-            Sec(s) | Text(s) => ctx.console_write(s),
-            // One "  command  description" row, left-justified to a fixed width so the
-            // description columns line up (ASCII-only - renders the same on TV and serial).
-            Row(cmd, desc) => ctx.console_write_fmt(format_args!("  {:<21}  {}", cmd, desc)),
-        }
-    }
-    ctx.console_write(eol);
-    ctx.console_write("\n");
+/// `clear_eol` WAS REMOVED ON A REASON THAT STOPPED BEING TRUE, and a Dell Wyse showed the cost.
+///
+/// It emitted `ESC[K` so an in-place repaint could wipe the tail of a longer previous frame, and it
+/// was deleted with the note "nothing repaints in place any more, and every caller was passing
+/// `false`". Both halves were true the day they were written. Then `help` got its browser back - a
+/// pager that homes the cursor and redraws - and nothing restored the erase, because the argument
+/// for removing it had been recorded as a fact about the FUNCTION rather than about its callers.
+///
+/// What that looks like on a screen: every row shows the tail of the longer row it overwrote.
+/// `Storage` drawn over a 9-character line reads `Storagert`; a 58-character description drawn over
+/// an 88-character one reads `... - watch is built on it)ore)an up`. It is not a content bug and
+/// there is nothing wrong with the table - the frame is simply never cleared.
+///
+/// So the capability is back, and this time it is not a flag: a line knows the WIDTH it must fit.
+/// `width == 0` means "no screen" - the script dump - and emits plain text. Anything else is a
+/// console of that many columns, and the line is clipped to it and erased to end of line. The two
+/// cases cannot be confused because neither is a bare `true`/`false` at a call site.
+fn help_render_line(ctx: &ServiceContext, idx: usize) {
+    help_render_line_of(ctx, HELP, "help", idx)
 }
 
-fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
-    let total = HELP.len() + 1; // +1 for the header line
-    // Page only for a direct interactive `help` (depth 0). When help is run from a
-    // script, `assert`, or `selfcheck` (depth > 0) there is no human to press keys -
-    // the pager would block the run - so just dump it. The framebuffer console has no
-    // scrollback, so an interactive help longer than the screen scrolls its top off
-    // forever; page it then (a serial terminal has its own scrollback, but paging there
-    // is harmless and consistent). rows==0 means geometry is unknown → just print it.
-    let (rows, _cols) = ctx.console_dims();
-    let rows = rows as usize;
-    // UNKNOWN GEOMETRY IS NOT "NO TERMINAL". A failed `console_dims` returns 0, and this treated that
-    // as a reason to dump sixty lines past the top of the screen - the pager silently disappearing
-    // because a lookup missed. `edit` handles the same zero by assuming 24 rows and carrying on; this
-    // now does the same, so a future failure degrades instead of removing a feature.
-    //
-    // `depth > 0` stays a real reason to skip: nested help is being rendered into someone else's
-    // output (a pipe, `help | write`), where a pager would be wrong rather than merely unhelpful.
-    let rows = if rows == 0 { 24 } else { rows };
-    if depth > 0 || total <= rows {
-        for i in 0..total { help_render_line(ctx, i, false); }
+/// One line of `doc` as a PLAIN dump - a script, `run`, `assert` or `selfcheck` (`width == 0`).
+fn help_render_line_of(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, idx: usize) {
+    let mut lb = LineBuf::new();
+    help_line_text(doc, title, idx, help_term_width_at(doc, idx), &mut lb);
+    let n = lb.n.min(lb.b.len());
+    if let Ok(t) = core::str::from_utf8(&lb.b[..n]) { ctx.console_write(t); }
+    ctx.console_writeln("");
+}
+
+/// The command column is measured PER SECTION, and the numbers say it has to be.
+///
+/// The column was pinned at 21, so every command longer than that shoved its description out of
+/// alignment - that is the visible half of the mess on a 4K television. The obvious fix, one column
+/// wide enough for the whole document, does not survive being measured: fitting 90% of the 70
+/// commands needs 30 characters, and the longest description then wants 102 columns on a screen
+/// that has about 96. Every choice either clips text or leaves a lake of whitespace after `mem`.
+///
+/// Sections are the natural unit because they are HOMOGENEOUS - Storage's commands all look like
+/// `move <src> <dst>`, System's all look like `uptime`. Measuring each block separately gives every
+/// one a column just wide enough for itself, which is both tighter and tidier than any single
+/// number, and it is what a well-set reference page looks like.
+const HELP_TERM_MIN: usize = 10;
+const HELP_TERM_MAX: usize = 34;
+
+/// The command-column width for the section containing line `idx`.
+///
+/// Scans out from `idx` to the section boundaries and takes the widest command between them. O(n)
+/// per line over a 91-line document, called for the ~30 lines of one frame - a few thousand length
+/// comparisons per keypress, against a repaint that costs two orders of magnitude more. Recomputing
+/// beats caching here: there is no second copy to fall out of step with the table (26.4).
+fn help_term_width_at(doc: &'static [HelpRow], idx: usize) -> usize {
+    if idx == 0 || idx > doc.len() { return HELP_TERM_MIN; }
+    let i = idx - 1;
+    // Back to the start of this section (just past the preceding `Sec`, or the top).
+    let mut lo = i;
+    while lo > 0 && !matches!(doc[lo], Sec(_)) { lo -= 1; }
+    // Forward to the next one.
+    let mut hi = i + 1;
+    while hi < doc.len() && !matches!(doc[hi], Sec(_)) { hi += 1; }
+    let mut w = 0usize;
+    for row in &doc[lo..hi] {
+        if let Row(cmd, _) = row { if cmd.len() > w { w = cmd.len(); } }
+    }
+    w.clamp(HELP_TERM_MIN, HELP_TERM_MAX)
+}
+
+/// The TEXT of one line of `doc`, with no escapes and no newline. Line 0 is the title.
+///
+/// MAN-PAGE SHAPE, and the reason is that this is a reference you SCAN rather than read. A section
+/// heading is upper-case and sits at the left margin; everything under it is indented beneath it, so
+/// the eye finds the group first and the command second. `Gap` rows already separate the sections,
+/// which is where the breathing room comes from.
+///
+/// ONE LINE PER ROW IS AN INVARIANT, not a layout preference. The browser indexes `doc[idx - 1]` by
+/// screen line, and `total`, `help_sections`, `help_find_from` and the contents jump all count on
+/// that. A long command wrapping its description onto a second line - which is what `man` itself
+/// does - would silently break every one of them. So a long command pushes its own description
+/// right instead, and the clip at the screen edge is what keeps the row to one line.
+fn help_line_text(doc: &'static [HelpRow], title: &str, idx: usize, term_w: usize,
+                  out: &mut LineBuf) {
+    use core::fmt::Write;
+    struct W<'a>(&'a mut LineBuf);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            RecordSink::put(self.0, s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut w = W(out);
+    if idx == 0 {
+        // Rule 6 (0_conventions.md): a utility's first line of output is `<util> <version>`.
+        let _ = write!(w, "{} {} - GodspeedOS", title, UTIL_VERSION);
+        return;
+    }
+    match &doc[idx - 1] {
+        Gap => {}
+        Sec(s) => {
+            let _ = w.write_str("  ");
+            for b in s.bytes() {
+                let up = [b.to_ascii_uppercase()];
+                let _ = w.write_str(core::str::from_utf8(&up).unwrap_or(" "));
+            }
+        }
+        Text(s) => { let _ = write!(w, "    {}", s); }
+        Row(cmd, desc) => { let _ = write!(w, "    {:<1$}  ", cmd, term_w); let _ = w.write_str(desc); }
+    }
+}
+
+/// Sections of `help`, as (line index, name). Derived from `HELP` itself, so a section added to the
+/// table appears in the table of contents with nothing else to edit.
+fn help_sections(doc: &'static [HelpRow],
+                 out: &mut [(usize, &'static str); HELP_SECTIONS_MAX]) -> usize {
+    let mut n = 0usize;
+    for (i, row) in doc.iter().enumerate() {
+        if let Sec(name) = row {
+            if n < out.len() { out[n] = (i + 1, name); n += 1; }   // +1: line 0 is the title
+        }
+    }
+    n
+}
+
+/// Most sections the contents view can list. `help` has eight; the ceiling is stated rather than
+/// assumed, and a section past it is dropped from the CONTENTS only - never from the document.
+const HELP_SECTIONS_MAX: usize = 24;
+
+/// Longest search term the browser keeps. A term nobody would type past is not a limit anybody
+/// meets, and a fixed buffer is the bounded shape (§26.6.1).
+const HELP_FIND_MAX: usize = 32;
+
+/// `help` - a BROWSABLE document rather than printed output.
+///
+/// **Why this is a browser and `dir` is not.** `help` is not a long command output that happened to
+/// scroll past - that is what the console's scrollback is for, and why `help`'s old pager was
+/// removed. It is a DOCUMENT: you arrive wanting one section, not the top. A table of contents, a
+/// search and a pinned "where am I" line are things scrollback structurally cannot give you, which
+/// is the same reason `trace` keeps its own pager (it pins a column header).
+///
+/// Keys: arrows scroll a line, PgUp/PgDn a page, Home/End the ends, `t` the contents (then a digit
+/// to jump), `/` search, `n` the next match, `q` or Esc to leave.
+///
+/// It still refuses to open with nobody watching: `depth > 0` means a script, `run`, `assert` or
+/// `selfcheck` is driving, and a browser waiting for a keypress there does not degrade, it HANGS.
+/// The piped form goes through `help_to_out` and never reaches here at all.
+fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, seek: &str) {
+    let total = doc.len() + 1;
+    let (rows, cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    // THE WIDTH WAS THROWN AWAY, which is why the text neither filled the screen nor stayed on it.
+    // A line longer than the console WRAPS, and a wrapped line pushes every row below it down by
+    // one - so the pager's own "lines 21-50 of 91" becomes a lie about what is on the screen. Same
+    // reason `paginate` clips (52_paginate.md 5); `help` simply never knew the number.
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let clip = cols.saturating_sub(1);
+    let mut secs = [(0usize, ""); HELP_SECTIONS_MAX];
+    let nsec = help_sections(doc, &mut secs);
+
+    let mut top = 0usize;
+    let mut toc = false;
+    let mut about = false;
+    let mut find = [0u8; HELP_FIND_MAX];
+    let mut find_len = 0usize;
+    // OPENED WITH A TERM: `help dir` lands on `dir` instead of at the top. The search is left ARMED
+    // rather than consumed, so `n` walks the other mentions - a word usually appears in its own row
+    // and again in an example, and stopping at the first would hide the second.
+    // A SEARCH THAT MATCHED NOTHING LOOKS EXACTLY LIKE ONE THAT MATCHED THE FIRST LINE, unless it
+    // says so: both leave you at the top of the document. `help dir` finding nothing and `help dir`
+    // landing on `dir` are then the same screen, which is the silent discard this whole argument
+    // exists to stop (§26.7). The status line reports it.
+    let mut find_hit = true;
+    if !seek.is_empty() {
+        for (i, b) in seek.bytes().enumerate() {
+            if i < find.len() { find[i] = b.to_ascii_lowercase(); find_len = i + 1; }
+        }
+        match help_find_from(doc, &find[..find_len], 1) {
+            Some(hit) => top = hit,
+            None => find_hit = false,
+        }
+    }
+    ctx.console_write("\x1b[?25l");                     // hide the cursor for the session
+    loop {
+        let body = rows.saturating_sub(2).max(1);       // one pinned header, one status line
+        ctx.console_write("\x1b[H");
+        // PINNED: which section you are in. This is the half a scrollback cannot do - scrolled into
+        // the middle of a document you would otherwise have no idea which part you are reading.
+        // The section the TOP OF THE BODY is in. At line 0 no section has begun yet, but the body
+        // visibly starts inside the first one - reporting nothing there would be technically true
+        // and useless, which is the wrong trade for a line whose whole job is "where am I".
+        let mut cur = if nsec > 0 { secs[0].1 } else { "" };
+        for i in 0..nsec { if secs[i].0 <= top { cur = secs[i].1; } }
+        ctx.console_write_fmt(format_args!(
+            "{} {} - GodspeedOS{}{}\x1b[K\n",
+            title, UTIL_VERSION,
+            if cur.is_empty() { "" } else { "   |   " }, cur));
+
+        if about {
+            help_about(ctx, body);
+        } else if toc {
+            for i in 0..body {
+                if i < nsec {
+                    ctx.console_write_fmt(format_args!("  {}. {}\x1b[K\n", i + 1, secs[i].1));
+                } else {
+                    ctx.console_write("\x1b[K\n");
+                }
+            }
+        } else {
+            let max_top = total.saturating_sub(body);
+            if top > max_top { top = max_top; }
+            // THROUGH A FRAME, like `paginate`. Writing each row straight to the console costs two
+            // syscalls per row; a screenful is then well over a hundred messages per keypress
+            // against a 16-deep queue, and holding a scroll key outruns the sink.
+            let mut frame = FrameBuf::new();
+            for i in top..(top + body).min(total) {
+                let mut lb = LineBuf::new();
+                help_line_text(doc, title, i, help_term_width_at(doc, i), &mut lb);
+                if lb.n > clip { lb.n = clip; RecordSink::put(&mut lb, b">"); }
+                lb.flush_into(ctx, &mut frame);
+            }
+            for _ in (top + body).min(total)..(top + body) { frame.put(ctx, b"\x1b[K\n"); }
+            frame.flush(ctx);
+        }
+
+        if about {
+            ctx.console_write_fmt(format_args!(
+                "[ about: what is running HERE, read from the kernel ]   [a] back  [t] contents  [q] quit"));
+        } else if find_len > 0 && !toc {
+            ctx.console_write_fmt(format_args!(
+                "[ {}-{} of {} ]  find: {}{}   [n] next  [t] contents  [q] quit",
+                top + 1, (top + body).min(total), total,
+                core::str::from_utf8(&find[..find_len]).unwrap_or("?"),
+                if find_hit { "" } else { " (no match)" }));
+        } else if toc {
+            ctx.console_write_fmt(format_args!(
+                "[ contents: {} sections ]  press a digit to jump   [t] back  [q] quit", nsec));
+        } else {
+            ctx.console_write_fmt(format_args!(
+                "[ {}-{} of {} ]  [up/down] line  [PgUp/PgDn] page  [t] contents  [a] about  [/] find  [q] quit",
+                top + 1, (top + body).min(total), total));
+        }
+        ctx.console_write("\x1b[J");
+
+        let c = ctx.console_read();
+        // A digit while the contents are open jumps to that section - the "go to a section with a
+        // keypress" this exists for.
+        if toc && c.is_ascii_digit() {
+            let k = (c - b'0') as usize;
+            if k >= 1 && k <= nsec { top = secs[k - 1].0; toc = false; }
+            continue;
+        }
+        match c {
+            b'q' | 0x03 => break,
+            b't' => { toc = !toc; about = false; }
+            b'a' => { about = !about; toc = false; }
+            b'/' => { find_len = help_read_find(ctx, &mut find); find_hit = true;
+                      if find_len > 0 {
+                          match help_find_from(doc, &find[..find_len], top + 1) {
+                              Some(hit) => top = hit,
+                              None => find_hit = false,
+                          }
+                      } }
+            b'n' => { if find_len > 0 {
+                          match help_find_from(doc, &find[..find_len], top + 1) {
+                              Some(hit) => { top = hit; find_hit = true; }
+                              None => find_hit = false,
+                          }
+                      } }
+            b' ' => top += body,
+            b'\r' | b'\n' => top += 1,
+            0x1B => match read_escape_byte(ctx) {
+                None => break,                                   // bare Esc leaves, like `q`
+                Some(b'[') | Some(b'O') => match help_csi(ctx) {
+                    Some(HelpKey::Up) => top = top.saturating_sub(1),
+                    Some(HelpKey::Down) => top += 1,
+                    Some(HelpKey::PageUp) => top = top.saturating_sub(body),
+                    Some(HelpKey::PageDown) => top += body,
+                    Some(HelpKey::Top) => top = 0,
+                    Some(HelpKey::End) => top = total.saturating_sub(body),
+                    None => {}
+                },
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
+}
+
+/// `help`'s about view: the banner, and the architecture OF THIS MACHINE.
+///
+/// **The architecture is drawn from live state, not drawn by hand, and that is the whole point.**
+/// A hand-drawn box diagram would be a second copy of `CLAUDE.md` §4.1 and would rot exactly the way
+/// nine commands rotted out of `help` itself with nothing watching. This asks the kernel what is
+/// actually running, on which core, in what state - so it cannot be wrong, it describes the machine
+/// in front of you rather than an idealised one, and it needs no gate to keep it honest.
+///
+/// The banner is `include_str!` of the same file the kernel prints at boot. One source: a second
+/// copy of eight lines of ASCII is still a second copy.
+fn help_about(ctx: &ServiceContext, body: usize) {
+    let mut drawn = 0usize;
+    for line in include_str!("../../../assets/godspeed-banner.txt").lines() {
+        if drawn < body { ctx.console_write_fmt(format_args!("{}\x1b[K\n", line)); drawn += 1; }
+    }
+    if drawn < body { ctx.console_write("\x1b[K\n"); drawn += 1; }
+    if drawn < body {
+        ctx.console_write_fmt(format_args!(
+            "  kernel   MISCIS: memory isolation, IPC, scheduling, capabilities, interrupts, SMP routing\x1b[K\n"));
+        drawn += 1;
+    }
+    if drawn < body {
+        ctx.console_write("  ---------------------------------------------------------------------------\x1b[K\n");
+        drawn += 1;
+    }
+    // One row per core, listing what the KERNEL says is there. `cores` is the live count.
+    let ncore = ctx.inspect_core_count().max(1);
+    for core in 0..ncore {
+        if drawn >= body { break; }
+        ctx.console_write_fmt(format_args!("  core {}  ", core));
+        let mut n = 0usize;
+        for slot in 0..64u32 {
+            let st = ctx.task_stat(slot);
+            if !st.valid || st.state == 4 /* Dead */ || st.core as u32 != core { continue; }
+            if n == 4 { ctx.console_write(" ..."); break; }          // one line per core, bounded
+            ctx.console_write_fmt(format_args!(" {}", st.name_str()));
+            n += 1;
+        }
+        ctx.console_write("\x1b[K\n");
+        drawn += 1;
+    }
+    while drawn < body { ctx.console_write("\x1b[K\n"); drawn += 1; }
+}
+
+/// Read a search term at the bottom of the screen. Backspace edits; Enter accepts; Esc cancels.
+fn help_read_find(ctx: &ServiceContext, buf: &mut [u8; HELP_FIND_MAX]) -> usize {
+    let mut n = 0usize;
+    loop {
+        ctx.console_write_fmt(format_args!(
+            "\rfind: {}\x1b[K", core::str::from_utf8(&buf[..n]).unwrap_or("")));
+        match ctx.console_read() {
+            b'\r' | b'\n' => return n,
+            0x1B => return 0,                                   // cancelled
+            0x7f | 0x08 => { n = n.saturating_sub(1); }
+            c if (0x20..0x7f).contains(&c) && n < buf.len() => { buf[n] = c.to_ascii_lowercase(); n += 1; }
+            _ => {}
+        }
+    }
+}
+
+/// First help line at or after `from` whose text contains `needle` (case-insensitive).
+fn help_find_from(doc: &'static [HelpRow], needle: &[u8], from: usize) -> Option<usize> {
+    let total = doc.len() + 1;
+    // Wraps once, so a search started near the bottom still finds an earlier match rather than
+    // reporting nothing - a find that silently refuses to wrap reads as a find that is broken.
+    for step in 0..total {
+        let i = (from + step) % total;
+        if i == 0 { continue; }
+        let hit = match &doc[i - 1] {
+            Gap => false,
+            Sec(t) | Text(t) => contains_ci(t.as_bytes(), needle),
+            Row(a, b) => contains_ci(a.as_bytes(), needle) || contains_ci(b.as_bytes(), needle),
+        };
+        if hit { return Some(i); }
+    }
+    None
+}
+
+/// Case-insensitive substring, ASCII. No allocation - `help` is static text and this runs per line.
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() { return false; }
+    for w in 0..=(hay.len() - needle.len()) {
+        if (0..needle.len()).all(|k| hay[w + k].to_ascii_lowercase() == needle[k]) { return true; }
+    }
+    false
+}
+
+enum HelpKey { Up, Down, PageUp, PageDown, Top, End }
+
+/// The body of an escape sequence, as a browser key.
+fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
+    let mut param: u16 = 0;
+    let mut fin = 0u8;
+    for _ in 0..8 {
+        let c = ctx.console_read();
+        if c.is_ascii_digit() { param = param.saturating_mul(10).saturating_add((c - b'0') as u16); }
+        else if c == b';' { continue; }
+        else { fin = c; break; }
+    }
+    match fin {
+        b'A' => Some(HelpKey::Up),
+        b'B' => Some(HelpKey::Down),
+        b'H' => Some(HelpKey::Top),
+        b'F' => Some(HelpKey::End),
+        b'~' => match param {
+            1 | 7 => Some(HelpKey::Top),
+            4 | 8 => Some(HelpKey::End),
+            5 => Some(HelpKey::PageUp),
+            6 => Some(HelpKey::PageDown),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// One `console_history` reply. Matches `HISTORY_MAX` in `services/console`.
+///
+/// **MUST BE A POWER OF TWO.** `call_deadline_into` encodes this buffer's size as a 4-bit
+/// power-of-two class rounded DOWN, so 3584 declares 2048 and the kernel refuses every reply above
+/// that - which is what a Dell Wyse did on every keypress, with `scrollback` reporting no history
+/// while the buffer was in fact large enough. The assert below is the compile-time form of the
+/// warning the SDK already carries, because a comment did not stop it happening.
+const SB_FETCH: usize = 2048;
+const _: () = assert!(SB_FETCH.is_power_of_two(),
+                      "SB_FETCH must be a power of two - call_deadline_into rounds the declared \
+                       capacity DOWN to one, so anything else silently shrinks the reply limit");
+
+/// The WHOLE scrollback, held for the life of one viewing.
+///
+/// **FETCHED ONCE WHEN THE VIEW OPENS, SO A KEYPRESS COSTS NO IPC AT ALL.** That is the property
+/// this arena exists to buy, and it is what finally ends `backlog/37` rather than mitigating it.
+///
+/// The console is both the service this reads FROM and the service it draws TO - one service, one
+/// 16-deep queue - so any request made mid-frame can queue behind painting this very utility just
+/// asked for. That coupling produced three separate failures on a Dell Wyse: a per-keypress view
+/// request waiting on a 4K repaint, then a per-frame fetch waiting on the frame before it, then a
+/// reply larger than a declared buffer class. Every one of them needed a request in the hot path.
+/// With the history already in hand there is no request in the hot path to go wrong.
+///
+/// **SIZED FROM THE RING, NOT GUESSED.** `term::SB_BYTES` is 32 KiB and `term::SB_LINES` is 512, so
+/// this holds all of it - the whole history, never a window onto it. The user stack is 256 KiB
+/// (`USER_STACK_PAGES`), and this frame is entered from the prompt, so ~34 KiB sits comfortably
+/// inside it; `stack_fit_check.py` is what actually holds that claim.
+///
+/// It is a bounded arena in the §26.6.1 sense and not a heap: the maximum is a constant, readable
+/// here. Allocating instead would have meant a new safe wrapper in the SDK (a service cannot
+/// dereference `alloc_mem`'s address - `services/` is `#![deny(unsafe_code)]`) and, worse, a failure
+/// mode: "insufficient memory" is a branch that can only exist if we chose to allocate. The bound is
+/// known when the image is built, so the space is reserved when the image is built, and there is
+/// nothing to be short of.
+const SB_FRAME: usize = 32 * 1024;
+
+/// Lines one viewing can hold. `term::SB_LINES` in the console.
+const SB_ROWS: usize = 512;
+
+/// `scrollback` - read back what has already scrolled off the screen.
+///
+/// **A UTILITY RATHER THAN A MODE, and the reason is measured rather than aesthetic.** The console
+/// used to own a view offset that the shell drove remotely, one blocking request PER KEYPRESS. Each
+/// of those made the console `paint_view` + `present` BEFORE it could reply - a full repaint of a
+/// 3840x2160 framebuffer, inside the caller's deadline, on the core the caller was blocked on. Hold
+/// PgUp and you issue one of those per key repeat; the shell then declared a console that was merely
+/// busy to be dead (`backlog/37`).
+///
+/// Here the console is only ever asked for BYTES, which is a bounded memcpy out of its ring, and this
+/// paints its own screen with ordinary output - a send, with no deadline on it. A keypress costs no
+/// repaint on the console at all.
+///
+/// It also removes the view offset from the console entirely. That was a second place holding a
+/// derived view of where the operator is looking, which is the thing §26.4 is about, and it was
+/// exactly the state that could disagree with the shell's idea of it.
+///
+/// THE HISTORY IS BOUNDED - 32 KiB or 512 lines, whichever runs out first. When anything has aged
+/// out the status line says so, because a view that starts mid-session while presenting itself as
+/// the beginning is the same wrong answer as a truncated directory listing (§26.7).
+/// `scrollback save <path>` - the whole history, unclipped, as a file.
+///
+/// Two passes over the SAME arena rather than two fetches: the size has to be known before
+/// `OP_WRITE_NEW` can be issued, and asking the console twice would be asking it to describe a ring
+/// that moved in between. One read, then a length, then the bytes.
+fn scrollback_save(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    let mut pbuf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+
+    let mut buf = [0u8; SB_FETCH];
+    let mut store = [0u8; SB_FRAME];
+    let mut lens = [0u16; SB_ROWS];
+    let (mut have, mut used, mut i) = (0usize, 0usize, 0usize);
+    let total = match ctx.console_history(0, &mut buf) { Some((_, t, _, _)) => t as usize, None => {
+        ctx.console_writeln("scrollback: the console did not answer - nothing saved");
+        return Err(ShellError::Unknown);
+    }};
+    while have < SB_ROWS && i < total {
+        let (n, _, _, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+        if n == 0 { break; }
+        let mut off = SB_HDR;
+        let mut full_arena = false;
+        for _ in 0..n {
+            if have >= SB_ROWS || off >= k { break; }
+            let ln = (buf[off] as usize).min(k - off - 1);
+            off += 1;
+            if used + ln > SB_FRAME { full_arena = true; break; }
+            store[used..used + ln].copy_from_slice(&buf[off..off + ln]);
+            used += ln;
+            lens[have] = ln as u16;
+            have += 1;
+            off += ln;
+            i += 1;
+        }
+        if full_arena { break; }
+    }
+    if have == 0 {
+        ctx.console_writeln("scrollback: nothing has scrolled off the screen yet - nothing saved");
         return Ok(());
     }
-    help_pager(ctx, total, rows);
+
+    // One newline per line, which the arena does not store.
+    let bytes = (used + have) as u64;
+    if !fs_write_new(ctx, path, bytes) {
+        // SAY WHY, AND SAY WHAT TO DO ABOUT IT. This printed "could not create the file" and stopped
+        // there, which on a Dell Wyse meant `scrollback save /docs/sb.txt` failed with no hint that
+        // `/docs` simply did not exist - the vague failure 26.7 forbids, in the one place an
+        // operator has no other way to find out. `fs_write_new` already captured the real reason;
+        // this used to throw it away. Same shape `copy` reports.
+        //
+        // It does NOT create the parent itself. `mkdir <path> parents` is opt-in everywhere else,
+        // and a save that silently builds directory trees is the kind of magic 26.5 rejects - so it
+        // names the command instead of guessing that you wanted it.
+        match ctx.last_write_err.borrow().get() {
+            Some(why) => ctx.console_writeln_fmt(format_args!(
+                "scrollback: could not create {} - {}", str_of(path), why)),
+            None => ctx.console_writeln_fmt(format_args!(
+                "scrollback: could not create {} - is the parent there? (`mkdir <dir> parents`)",
+                str_of(path))),
+        }
+        return Err(ShellError::Unknown);
+    }
+    let mut chunk = [0u8; IO_CHUNK];
+    let (mut at, mut c, mut off) = (0usize, 0usize, 0u64);
+    for r in 0..have {
+        let n = lens[r] as usize;
+        for b in 0..=n {
+            let byte = if b == n { b'\n' } else { store[at + b] };
+            chunk[c] = byte;
+            c += 1;
+            if c == IO_CHUNK {
+                if !fs_write_at(ctx, path, off, &chunk[..c]) {
+                    let why = ctx.last_write_err.borrow();
+                    ctx.console_writeln_fmt(format_args!(
+                        "scrollback: the write failed part-way - {} is INCOMPLETE ({})",
+                        str_of(path), why.get().unwrap_or("no reason given")));
+                    return Err(ShellError::Unknown);
+                }
+                off += c as u64;
+                c = 0;
+            }
+        }
+        at += n;
+    }
+    if c > 0 && !fs_write_at(ctx, path, off, &chunk[..c]) {
+        let why = ctx.last_write_err.borrow();
+        ctx.console_writeln_fmt(format_args!(
+            "scrollback: the write failed part-way - {} is INCOMPLETE ({})",
+            str_of(path), why.get().unwrap_or("no reason given")));
+        return Err(ShellError::Unknown);
+    }
+    ctx.console_writeln_fmt(format_args!(
+        "scrollback: saved {} line(s), {} bytes to {}", have, bytes, str_of(path)));
+    Ok(())
+}
+
+/// `scrollback` - the view, or `save <path>` to materialise it.
+///
+/// `save` is the word three other utilities already use for exactly this (`selfcheck save`,
+/// `run ... save`, `chaos kill-storm ... save`). A fourth word for one concept is what rule 4
+/// exists to prevent.
+fn cmd_scrollback(ctx: &ShellCtx, cwd: &Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
+    if let Some(rest) = arg.strip_prefix("save") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            ctx.console_writeln("usage: scrollback save <path>");
+            return Err(ShellError::Unknown);
+        }
+        return scrollback_save(ctx, cwd, rest);
+    }
+    if !arg.is_empty() {
+        ctx.console_writeln_fmt(format_args!(
+            "scrollback: unknown argument `{}` (try `scrollback help`)", arg));
+        return Err(ShellError::Unknown);
+    }
+    scrollback_view(ctx, depth, false)
+}
+
+/// The full-screen view. Takes no `cwd` because it touches no files - which is also why PgUp can
+/// reach it from the line editor, where no working directory is in scope.
+fn scrollback_view(ctx: &ShellCtx, depth: u8, page_back: bool) -> Result<(), ShellError> {
+    let mut buf = [0u8; SB_FETCH];
+    let (_, total0, aged0, _) = match ctx.console_history(0, &mut buf) {
+        Some(v) => v,
+        None => {
+            ctx.console_writeln("scrollback: the console did not answer - no history to show");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let mut total = total0 as usize;
+    let mut aged = aged0;
+    if total == 0 {
+        ctx.console_writeln("scrollback: nothing has scrolled off the screen yet");
+        return Ok(());
+    }
+
+    // NOBODY IS THERE TO PRESS A KEY. Same guard `help`, `docs` and `paginate` carry: a full-screen
+    // view waiting on a keystroke inside a script does not degrade, it hangs the run.
+    if depth > 0 {
+        let mut i = 0usize;
+        while i < total {
+            let (n, _, _, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+            if n == 0 { break; }
+            let mut off = SB_HDR;
+            for _ in 0..n {
+                if off >= k { break; }
+                let ln = (buf[off] as usize).min(k - off - 1);
+                off += 1;
+                ctx.console_writeln(core::str::from_utf8(&buf[off..off + ln]).unwrap_or(""));
+                off += ln;
+                i += 1;
+            }
+        }
+        return Ok(());
+    }
+
+    let (rows, cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let body = rows.saturating_sub(2).max(1);
+    let clip = cols.saturating_sub(1);
+    let mut store = [0u8; SB_FRAME];
+    let mut lens = [0u16; SB_ROWS];
+    let mut cut = [false; SB_ROWS];
+
+    // ---- THE ONLY FETCH. Everything after this is local: paint, read a key, paint.
+    let mut have = 0usize;
+    let mut used = 0usize;
+    let mut i = 0usize;
+    while have < SB_ROWS && i < total {
+        let (n, _, _, k) = match ctx.console_history(i as u16, &mut buf) { Some(v) => v, None => break };
+        if n == 0 { break; }
+        let mut off = SB_HDR;
+        let mut full_arena = false;
+        for _ in 0..n {
+            if have >= SB_ROWS || off >= k { break; }
+            let full = (buf[off] as usize).min(k - off - 1);
+            off += 1;
+            // Clipped, never wrapped: a wrapped line pushes every row below it down and makes the
+            // count in the status line a lie about what is on the screen.
+            let take = full.min(clip);
+            if used + take > SB_FRAME { full_arena = true; break; }
+            store[used..used + take].copy_from_slice(&buf[off..off + take]);
+            used += take;
+            lens[have] = take as u16;
+            cut[have] = full > take;
+            have += 1;
+            off += full;
+            i += 1;
+        }
+        if full_arena { break; }
+    }
+    // WHAT WE HOLD IS WHAT WE COUNT. `total` is what the ring has; `have` is what was read back. They
+    // are equal in every ordinary case, and when they are not the status line must not claim lines
+    // that are not there (§26.7) - the same reason it already reports `older lines aged out`.
+    let short = have < total;
+    let total = have;
+    if total == 0 {
+        ctx.console_write("\x1b[?25h");
+        ctx.console_writeln("scrollback: the console did not answer - no history to show");
+        return Err(ShellError::Unknown);
+    }
+
+    // OPENED ONE PAGE BACK WHEN PgUp BROUGHT US HERE, at the newest line when the command was typed.
+    // The key already meant "go back a page", and making the operator press it twice to see one page
+    // is the interface forgetting what it was just told.
+    let mut top = if page_back { total.saturating_sub(body * 2) } else { total.saturating_sub(body) };
+
+    ctx.console_write("\x1b[?25l");
+    loop {
+        let max_top = total.saturating_sub(body);
+        if top > max_top { top = max_top; }
+        ctx.console_write("\x1b[H");
+        ctx.console_write_fmt(format_args!(
+            "scrollback {} - what has scrolled off the screen\x1b[K\n", UTIL_VERSION));
+
+        // PAINT ONLY. No request is made anywhere in this loop, which is the whole point.
+        let mut frame = FrameBuf::new();
+        let mut at = 0usize;
+        for r in 0..top { at += lens[r] as usize; }
+        let shown = (top + body).min(total) - top;
+        for r in top..top + shown {
+            let n = lens[r] as usize;
+            let mut lb = LineBuf::new();
+            RecordSink::put(&mut lb, &store[at..at + n]);
+            if cut[r] { RecordSink::put(&mut lb, b">"); }
+            lb.flush_into(ctx, &mut frame);
+            at += n;
+        }
+        for _ in shown..body { frame.put(ctx, b"\x1b[K\n"); }
+        frame.flush(ctx);
+
+        ctx.console_write_fmt(format_args!(
+            "[ {}-{} of {}{} ]  [up/down] line  [PgUp/PgDn] page  [Home/End] ends  [q] quit",
+            top + 1, (top + body).min(total), total,
+            if short { ", truncated" } else if aged { ", older lines aged out" } else { "" }));
+        ctx.console_write("\x1b[J");
+
+        let c = ctx.console_read();
+        match c {
+            b'q' | 0x03 => break,
+            b' ' => top += body,
+            0x1B => match read_escape_byte(ctx) {
+                None => break,                                   // bare Esc leaves, like `q`
+                Some(b'[') | Some(b'O') => match help_csi(ctx) {
+                    Some(HelpKey::Up) => top = top.saturating_sub(1),
+                    Some(HelpKey::Down) => top += 1,
+                    Some(HelpKey::PageUp) => top = top.saturating_sub(body),
+                    Some(HelpKey::PageDown) => top += body,
+                    Some(HelpKey::Top) => top = 0,
+                    Some(HelpKey::End) => top = total.saturating_sub(body),
+                    None => {}
+                },
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    ctx.console_write("\x1b[?25h\x1b[2J\x1b[H");
+    Ok(())
+}
+
+/// The 4-byte `[n, total_lo, total_hi, aged]` header on a `console_history` reply.
+const SB_HDR: usize = 4;
+
+/// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
+fn cmd_help(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
+    // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert` or `selfcheck` is driving, and a
+    // browser that waits for one does not degrade - it hangs the run. Same guard `paginate` carries,
+    // and the reason paging belongs to things you ask for rather than things a command decides.
+    if depth > 0 {
+        for i in 0..HELP.len() + 1 { help_render_line(ctx, i); }
+        return Ok(());
+    }
+    help_browser(ctx, HELP, "help", arg.trim());
+    Ok(())
+}
+
+/// `docs` - the manual. Same browser, different document (see `DOCS`).
+fn cmd_docs(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
+    if depth > 0 {
+        for i in 0..DOCS.len() + 1 { help_render_line_of(ctx, DOCS, "docs", i); }
+        return Ok(());
+    }
+    help_browser(ctx, DOCS, "docs", arg.trim());
     Ok(())
 }
 
@@ -4787,20 +6061,6 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
             Row(cmd, desc) => out.line_fmt(ctx, format_args!("  {:<21}  {}", cmd, desc)),
         }
     }
-}
-
-/// `less`-style pager for `help`: render a screenful from `top`, a status line, then
-/// read a key and scroll. Space / PageDown page; Up/Down (or j/k) move a line; b /
-/// PageUp page back; g/G jump to top/bottom; q / Esc / Enter quit.
-///
-/// Repaint is done **in place** to avoid the flicker and cost of a full clear: the cursor
-/// is hidden for the session (`ESC[?25l`) so the bulk redraw skips the per-character cursor
-/// toggle, each frame homes (`ESC[H`) instead of clearing to black, every row erases its own
-/// tail (`ESC[K`), and `ESC[J` wipes anything below the status line on a short last page.
-/// This is the same write-only repaint the fast boot-time scroll uses, so scrolling is smooth
-/// rather than a black flash + full reprint. Bounded: at most `total` lines, clamped each step.
-fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
-    line_pager(ctx, total, rows, &|_| 0, &|c, i| help_render_line(c, i, true), &|_| {});
 }
 
 /// The pager, over ANY indexable set of lines.
@@ -4841,10 +6101,25 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
         // on screen as well as last in the code.
         end_frame(ctx);
         ctx.console_write_fmt(format_args!(
-            // SAY WHAT ACTUALLY WORKS. `j`/`k`, `b` and Enter were all handled and none of them were
-            // mentioned - a reader who tries `j` because it is muscle memory finds it works, which
-            // means the line was under-reporting the tool rather than describing it.
-            "[ lines {}-{} of {} ]  up/down or j/k: scroll  space: page down  b: page up  g/G: top/end  q: quit",
+            // THE ADVERTISED SET IS THE IMPLEMENTED SET, and it got there by shrinking the second
+            // one rather than lengthening the line.
+            //
+            // This used to read `up/down or j/k: scroll  space: page down  b: page up  g/G: top/end
+            // q: quit`, which was honest about a key set that had accumulated `less` habits nobody
+            // decided on. Two of them had to go regardless: **`b` is `[b] background`** in the job
+            // control design, and one letter cannot mean both "back" and "background" in the same
+            // shell - that is the rule `q` established, that the LETTER is the mnemonic. `f` was a
+            // second name for space. `g`/`G` had no mnemonic at all and leaned on an upper/lower
+            // case distinction the house style avoids; Home and End say what they do.
+            //
+            // What is left is what a reader would guess: arrows, PgUp/PgDn (and space, the one
+            // habit worth keeping - every thumb goes there), Home/End, and `q`.
+            //
+            // IT ALSO HAS TO FIT. This line is written at the bottom of a frame the pager just sized
+            // to the screen; a status line that WRAPS pushes the whole frame up by a row and makes
+            // the count it is printing wrong. 77 columns at four digits, which leaves room on the
+            // 80-column terminal that is the narrowest anybody uses.
+            "[ lines {}-{} of {} ] [up/down] scroll [PgUp/PgDn] page [Home/End] ends [q] quit",
             top + 1, end, total));
         ctx.console_write("\x1b[J");
         // Read one command key (arrows/PageUp/Down arrive as escape sequences).
@@ -4853,12 +6128,12 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
         let mut to_top = false;
         let mut to_bottom = false;
         match ctx.console_read() {
-            b' ' | b'f' => down = page as i64,
-            b'b' => down = -(page as i64),
-            b'j' | b'\r' | b'\n' => down = 1,
-            b'k' => down = -1,
-            b'g' => to_top = true,
-            b'G' => to_bottom = true,
+            // Space pages forward - the one `less` habit kept, because it collides with nothing and
+            // is what a reader's thumb does unprompted. `f`, `b`, `j`, `k`, `g` and `G` are gone:
+            // see the status line above for which of them were a naming conflict and which were
+            // merely a second name for a key that already worked.
+            b' ' => down = page as i64,
+            b'\r' | b'\n' => down = 1,
             b'q' | 0x03 => quit = true,
             0x1B => match read_escape_byte(ctx) {
                 None => quit = true, // bare ESC quits
@@ -5089,7 +6364,7 @@ const KNOWN_SERVICES: &[&str] = &[
 /// cannot be asked: the universal `<util> version|help` intercept answers for whatis itself.)
 fn cmd_whatis(ctx: &ServiceContext, name: &str, out: &mut Out) -> Result<(), ShellError> {
     if name.is_empty() {
-        ctx.console_writeln("usage: whatis <name>   e.g. whatis ls");
+        ctx.console_writeln("usage: whatis <name>   e.g. whatis dir");
         return Err(ShellError::Unknown);
     }
     if PIPE_ONLY_VERBS.contains(&name) {
@@ -5522,7 +6797,7 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     let bl = (b as u16).to_le_bytes();
     // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
     if count.is_none() {
-        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data (press q to quit):", ip[0], ip[1], ip[2], ip[3], b));
+        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:  [q] quit", ip[0], ip[1], ip[2], ip[3], b));
     } else {
         out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
     }
@@ -5708,7 +6983,7 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
 fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway, press q to abort)"));
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)  [q] quit"));
     let outcome = ns_abortable(ctx, &[8u8], 30);
     match outcome {
         ReqOutcome::Reply(r) => {
@@ -5736,7 +7011,7 @@ fn net_arp(ctx: &ShellCtx, ip_str: &str, out: &mut Out) -> Result<(), ShellError
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{} (press q to abort)", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{}  [q] quit", ip[0], ip[1], ip[2], ip[3]));
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
     let outcome = ns_abortable(ctx, &[6, ip[0], ip[1], ip[2], ip[3]], 8);
     match outcome {
@@ -5768,7 +7043,7 @@ fn net_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
         ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts (press q to abort):", our[0], our[1], our[2]));
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts:  [q] quit", our[0], our[1], our[2]));
     // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
     // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
     // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
@@ -5804,11 +7079,11 @@ fn net_dns(ctx: &ShellCtx, host: &str, out: &mut Out) -> Result<(), ShellError> 
     req[0] = 1;
     req[1..1 + hb.len()].copy_from_slice(hb);
     // A DNS resolve waits on the server, which can take a moment. Route it through net_query (not a
-    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "press q to abort"
+    // blocking send) so it is ABORTABLE: net_query polls q each round and advertises "[q] quit"
     // if the reply does not come in the first second - so a slow or wedged resolve is escapable, not a
     // silent hang.
     ctx.console_writeln("net: resolving ...");
-    let reply = match ns_query(ctx, &req[..1 + hb.len()], 8) {
+    let reply = match ns_query(ctx, &req[..1 + hb.len()], NET_RESOLVE_SECS) {
         NetQ::Reply(r)   => r,
         // A q-aborted resolve did NOT succeed, so it is Err (not Ok): a probe's Result is its verdict,
         // and `online`'s `if net dns ...` must not print a false "dns ok" for an aborted probe (audit U4).
@@ -5888,7 +7163,7 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64, tag
         }
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
-        if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
+        if i == 0 { ctx.console_writeln("net: waiting for a reply  [q] quit"); }
         let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
@@ -6382,7 +7657,7 @@ fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
 fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     if args.len() < 2 || args[1] == "help" {
         out.line(ctx, "usage: serve <port> [for]   - accept ONE connection on <port>, echo it, close");
-        out.line(ctx, "       waits until you press q; `for` bounds it: 30s, 5m, 2h, 1d");
+        out.line(ctx, "       runs until you quit; `for` bounds it: 30s, 5m, 2h, 1d");
         out.line(ctx, "       e.g. serve 8080        serve 8080 5m");
         return Ok(());
     }
@@ -6432,14 +7707,14 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
         if st.len() >= 4 && st[..4] != [0, 0, 0, 0] {
             out.line_fmt(ctx, format_args!(
-                "listening on {}.{}.{}.{}:{} - answering connections until you press q",
+                "listening on {}.{}.{}.{}:{} - answering connections  [q] quit",
                 st[0], st[1], st[2], st[3], port));
             shown = true;
         }
     }
     if !shown {
         out.line_fmt(ctx, format_args!(
-            "listening on port {} - answering connections until you press q", port));
+            "listening on port {} - answering connections  [q] quit", port));
     }
 
     // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.
@@ -6472,9 +7747,9 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
                 last_note = waited;
                 match limit {
                     Some(n) => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s of {}s, {} served (q stops)", waited, n, served)),
+                        "still listening - {}s of {}s, {} served  [q] quit", waited, n, served)),
                     None => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s, {} served (q stops)", waited, served)),
+                        "still listening - {}s, {} served  [q] quit", waited, served)),
                 }
             }
             // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four
@@ -6537,7 +7812,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
         ctx.sleep(ctx.duration_cycles(200));
         ctx.remove_cap(conn_h);
-        out.line(ctx, "closed - waiting for the next connection (q stops)");
+        out.line(ctx, "closed - waiting for the next connection  [q] quit");
         // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
         // connections and is released once, on the way out, by every exit path below.
     }
@@ -6607,6 +7882,63 @@ fn build_status_table(ctx: &ServiceContext) -> Table {
         ]);
     }
     t
+}
+
+/// `jobs` as a record producer: one row per job, so it filters like any other table
+/// (`jobs | where state=running`). Conventions rule 12 - a utility's output is a pipeable
+/// structure, and a bespoke `jobs running` positional filter would be a second way to say `where`.
+///
+/// REFRESHES FIRST, exactly as the rendered form does. A piped read that skipped the refresh would
+/// answer from a stale row, so `jobs | where state=done` could miss a job that had just finished -
+/// two views of one table disagreeing, which is the drift 26.4 permits a derived view only if it
+/// avoids.
+#[inline(never)] // keep this builder's frame out of pipe_run's 16 KiB Stream frame, like every
+                 // sibling record-builder - a byte pipe overflows the user stack otherwise.
+fn build_jobs_table(ctx: &ShellCtx) -> Table {
+    refresh_jobs(ctx);
+    let mut t = Table::new(&["job", "state", "command", "percent", "copied", "total", "src", "dst"]);
+    let tab = ctx.jobs.borrow();
+    for r in tab.rows.iter().filter(|r| r.used) {
+        let state = t.intern(state_word(r.state).as_bytes());
+        // The COMMAND, spelled as the rendered table spells it. A check or a scrub has no paths at
+        // all, so a reader of the record form had no way to tell one job from another.
+        let mut cmd = [0u8; 2 * PATH_MAX + 32];
+        let clen = job_command(r, &mut cmd);
+        let command = t.intern(&cmd[..clen]);
+        let src = t.intern(&r.src[..r.slen]);
+        let dst = t.intern(&r.dst[..r.dlen]);
+        let pct = if (r.kind != KIND_COPY && r.kind != KIND_CHURN) || r.total == 0 { 0 }
+                  else { r.copied * 100 / r.total };
+        t.add_row(&[
+            Value::Int(r.id as u64), state, command, Value::Int(pct),
+            Value::Int(r.copied), Value::Int(r.total), src, dst,
+        ]);
+    }
+    t
+}
+
+/// The one place a job's command is spelled. Both the rendered table and the record table call it,
+/// so they cannot say different things about the same row.
+fn job_command(r: &JobRow, out: &mut [u8; 2 * PATH_MAX + 32]) -> usize {
+    use core::fmt::Write as _;
+    struct Sink<'a> { buf: &'a mut [u8; 2 * PATH_MAX + 32], n: usize }
+    impl core::fmt::Write for Sink<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &c in s.as_bytes() {
+                if self.n < self.buf.len() { self.buf[self.n] = c; self.n += 1; }
+            }
+            Ok(())
+        }
+    }
+    let mut sink = Sink { buf: out, n: 0 };
+    let _ = match r.kind {
+        KIND_CHECK => write!(sink, "drives check"),
+        KIND_SCRUB => write!(sink, "drives scrub"),
+        KIND_CHURN => write!(sink, "churn {}", r.total),
+        KIND_DELETE_TREE => write!(sink, "delete {} recursive", str_of(&r.src[..r.slen])),
+        _ => write!(sink, "copy {} {}", str_of(&r.src[..r.slen]), str_of(&r.dst[..r.dlen])),
+    };
+    sink.n
 }
 
 /// `uptime` as a record producer: one row, columns `uptime` (human `Nd HH:MM:SS`) and `seconds`
@@ -6721,14 +8053,14 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// Producers that emit a structured TABLE rather than text. These are inherently tabular
 /// (uniform rows), so in a pipe they emit records - composed with `where`/`select`/`sort <col>`,
 /// not the text filters. Bare (un-piped) each still prints its normal text. `status` (task
-/// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
+/// roster), `dir` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs")
 }
 
-/// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
-/// `cmd_ls`'s fs parse but emits rows instead of formatted text; `size` is `Int` for files and
+/// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
+/// `cmd_dir`'s fs parse but emits rows instead of formatted text; `size` is `Int` for files and
 /// `Empty` for directories (a dir has no byte size). Errors print and return `None` (abort pipe).
 ///
 /// `#[inline(never)]` (and on all the sibling builders): each holds a multi-KB `Table` (and
@@ -6737,35 +8069,50 @@ fn is_record_producer(name: &str) -> bool {
 /// build a record - and overflow the bounded user stack. Out-of-line, the big frame exists only
 /// while the builder actually runs.
 #[inline(never)]
-fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
+fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
-    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return None,
-        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return None; }
-    };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return None; }
-    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
-        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
-        return None;
-    }
-    let count = p[1] as usize;
-    let mut t = Table::new(&["name", "type", "size"]);
-    let mut i = 2usize;
-    for _ in 0..count {
-        if i >= p.len() { break; }
-        let nl = p[i] as usize;
-        i += 1;
-        if i + nl + 1 + 8 > p.len() { break; }
-        let name = t.intern(&p[i..i + nl]);
-        let is_dir = p[i + nl] != 0;
-        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        i += nl + 1 + 8;
-        let kind = t.intern(if is_dir { b"dir" } else { b"file" });
-        let sz = if is_dir { Value::Empty } else { Value::Int(size) };
-        t.add_row(&[name, kind, sz]);
+    // A `sealed` COLUMN rather than a new `type` value, deliberately. Making a sealed file's type
+    // read `seal` would quietly drop it out of every existing `where type=file` query - a silent
+    // change of meaning in queries people have already written. A separate column adds an answer
+    // without moving an existing one.
+    let mut t = Table::new(&["name", "type", "size", "sealed"]);
+    let mut cur = DirCursor::new();
+    while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
+            ReqOutcome::Reply(r) => r,
+            ReqOutcome::Aborted => return None,
+            ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return None; }
+        };
+        let p = reply.payload_bytes();
+        if no_fs(ctx, p) { return None; }
+        if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
+            return None;
+        }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
+        for _ in 0..count {
+            if i >= p.len() { break; }
+            let nl = p[i] as usize;
+            i += 1;
+            // Phase O: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
+            // four bytes wider than the layout before it. Every consumer of this reply must step by the same
+            // stride or it reads the NEXT entry's name out of this one's timestamp.
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+            let name = t.intern(&p[i..i + nl]);
+            let is_dir = p[i + nl] != 0;
+            let size = u64_le(&p[i + nl + 1..i + nl + 9]);
+            let sealed = p[i + nl + 13] & 1 != 0;      // flags bit 0
+            i += nl + 1 + 8 + 4 + 1;
+            let kind = t.intern(if is_dir { b"dir" } else { b"file" });
+            let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+            let sl = t.intern(if sealed { b"true" } else { b"false" });
+            t.add_row(&[name, kind, sz, sl]);
+        }
+        // The table is full (64 rows, or the string arena). Further pages have nowhere to go, and
+        // `t.overflow()` already tells the reader the answer is short - so stop paying for them.
+        if t.overflow() { break; }
     }
     Some(t)
 }
@@ -6921,28 +8268,33 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     stack.push(start_abs);
     let tb = target.as_bytes();
     let is_glob = tb.iter().any(|&b| b == b'*' || b == b'?');
+    let mut short = false;
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
             ReqOutcome::Reply(r) => r,
             ReqOutcome::Aborted => return None,
             ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return None; }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return None; }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        let count = p[1] as usize;
-        let mut i = 2usize;
+        // `break 'pages`, NOT `continue`: this loop is now the PAGE loop, and a bare `continue`
+        // would re-ask the same unreadable directory forever instead of moving to the next one.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout ls reads
-            i += nl + 1 + 8;
+            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout `dir` reads
+            i += nl + 1 + 8 + 4 + 1;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(tb, name) } else { contains(name, tb) };
@@ -6951,17 +8303,24 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
                     let tv = t.intern(if is_dir { b"dir" } else { b"file" });
                     let pv = t.intern(&child[..clen]);
                     // Files carry their byte size (`find * | where size>1000`, the library's `size`
-                    // sum); a dir's row leaves it Empty, exactly as ls's records do.
+                    // sum); a dir's row leaves it Empty, exactly as `dir`'s records do.
                     let sz = if is_dir { Value::Empty } else { Value::Int(size) };
                     t.add_row(&[nv, tv, pv, sz]);
                 }
                 if is_dir { stack.push(&child[..clen]); }
             }
         }
+        if t.overflow() { break 'pages; }
+        }
+        if cur.cut() { short = true; }
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
+    }
+    if short {
+        ctx.console_writeln_fmt(format_args!(
+            "find: INCOMPLETE - a directory was too large to read fully ({} pages); some entries were NOT searched", DIR_PAGE_MAX));
     }
     Some(t)
 }
@@ -6985,7 +8344,7 @@ enum Stream {
 /// `execute` (which would carry that 16 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
-fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
+fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> Result<(), ShellError> {
     // HIGH-WATER MARK, reported only when it moves. This file's own header says the user stack is
     // 256 KiB and that this frame already sits near it (measured at 177,297 bytes on entry, 68%), and
     // the Pi 4 twice killed the shell inside a
@@ -7022,12 +8381,13 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
     let mut s = if is_record_producer(c0) {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
-            "ls"      => match build_ls_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return Err(ShellError::Unknown) },
             "drives"  => match build_drives_table(ctx)          { Some(t) => t, None => return Err(ShellError::Unknown) },
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
+            "jobs"    => build_jobs_table(ctx),
             // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
             // is refused loudly rather than quietly yielding the wrong thing.
@@ -7119,6 +8479,25 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             if !last { ctx.console_writeln("pipe: assert must be the last stage"); return Err(ShellError::Unknown); }
             return assert_stream(ctx, &s, arg);
         }
+        if cmd == "paginate" {
+            // THE READING SINK. `dir /big | paginate`, `read /long.txt | paginate`.
+            //
+            // Pagination is an EXPLICIT STAGE rather than something a command decides on its own,
+            // and that is the whole design. A command that pages itself has to guess whether a human
+            // is watching, and the guess is wrong exactly when it matters - a `dir | write` or a
+            // `selfcheck` blocks forever on a keypress nobody is there to press. Asking for it
+            // cannot make that mistake: a pipe that captures does not contain the word.
+            //
+            // It also means every producer gets it at once - `find`, `read`, `status`, `caps`,
+            // anything added later - instead of a pager wired into each, which is six copies of one
+            // fact waiting to disagree.
+            if !last { ctx.console_writeln("pipe: paginate must be the last stage - it reads the stream, it does not pass it on"); return Err(ShellError::Unknown); }
+            if !arg.trim().is_empty() {
+                ctx.console_writeln_fmt(format_args!("paginate: takes no arguments (got '{}')", arg.trim()));
+                return Err(ShellError::Unknown);
+            }
+            return paginate_sink(ctx, &s, out, depth);
+        }
         if cmd == "result" {
             // `result` reads the outcome channel, not a stream - same mix-up as `<cmd> | result`.
             ctx.console_writeln("pipe: 'result' checks a command's outcome, not piped output. Run the command, then 'result', or use 'assert ok <command>'");
@@ -7130,6 +8509,42 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
     match &s {
         Stream::Bytes(c) => out.put_bytes(ctx, c.bytes()),
         Stream::Table(t) => t.to_grid(&mut OutSink { ctx, out }),
+    }
+    Ok(())
+}
+
+/// `… | paginate` - the reading pipe sink: show the stream a screenful at a time.
+///
+/// TWO CONDITIONS MUST BOTH HOLD before a key is ever waited for, and between them they are the
+/// reason this is safe where a built-in pager was not:
+///
+///  - **`depth == 0`** - not inside a script, `run`, `assert` or `selfcheck`. A pager with nobody at
+///    the keyboard does not degrade, it HANGS, and it hangs a run that may have been started
+///    precisely because no one was going to watch it.
+///  - **the output is the console** - not `$( )` capture, not `save <path>`, not a function-body
+///    capture. Those have a reader, but the reader is the shell itself.
+///
+/// When either fails the stream is rendered exactly as an unsinked pipe would render it, so
+/// `paginate` in a script is a no-op rather than an error. That is deliberate: a script inherited
+/// from an interactive session should not fail because of a word that only concerns a screen.
+///
+/// `#[inline(never)]`: `pipe_run`'s frame already carries a 16 KiB `Stream`.
+#[inline(never)]
+fn paginate_sink(ctx: &ServiceContext, s: &Stream, out: &mut Out, depth: u8) -> Result<(), ShellError> {
+    let interactive = depth == 0 && matches!(out, Out::Console);
+    if !interactive {
+        match s {
+            Stream::Bytes(c) => out.put_bytes(ctx, c.bytes()),
+            Stream::Table(t) => t.to_grid(&mut OutSink { ctx, out }),
+        }
+        return Ok(());
+    }
+    match s {
+        // A table pages WITH ITS COLUMN HEADER PINNED, which is the one thing the console's
+        // scrollback cannot do for you: scrolled back through a grid, the column names are off the
+        // top and the columns are unlabelled.
+        Stream::Table(t) => paginate_table(ctx, t, &|_, _| 0, 0),
+        Stream::Bytes(c) => paginate_bytes(ctx, c.bytes()),
     }
     Ok(())
 }
@@ -7423,6 +8838,15 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
             ("NO LIVE OWNER", "its task died, or it is a reply-only mailbox", ""),
             ("holder / rights", "every live task holding a cap, and its rights", ""),
         ], false),
+        "persist" => help_block(ctx, "events persist", "capture the log to disk, via `recorder`", &[
+            ("start <path> <size>", "begin capturing to <path>, rotating at <size>", "events persist start /log.txt 256KiB"),
+            ("start ... sticky", "and resume after a reboot (recorded in /persist.conf)", "events persist start /log.txt 256KiB sticky"),
+            ("stop", "end the capture; the file gets its footer so it reads as complete", "events persist stop"),
+            ("status", "what is recording, how much it has taken, and whether lines were LOST", "events persist status"),
+            ("lost", "the window wrapped faster than the disk took it - the gap is real", ""),
+            ("why a separate service", "`events` is a broker, not a store: a persisting sink would", ""),
+            ("", "cycle through `fs`, and make observing a storage failure need storage", ""),
+        ], false),
         "ipc" | "failures" => help_block(ctx, "events ipc", "recent IPC exchanges, oldest first", &[
             ("seq", "the CALLER'S own count. A gap = an event that never arrived", ""),
             ("sec", "when the RING saw it, from the oldest row. Not a latency", ""),
@@ -7564,7 +8988,7 @@ fn cmd_trace(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// hang (Commandment VIII: a missing dependency RETURNS, loudly).
 /// Build the trace ring's events as a `Table`.
 ///
-/// A TABLE and not printed text, so `events ipc` is a record source like `status` or `ls`: it renders
+/// A TABLE and not printed text, so `events ipc` is a record source like `status` or `dir`: it renders
 /// as a grid on the console, pages when it is taller than the screen, and pipes into the record verbs
 /// (`events ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
 /// the alternative was a printer plus a separate serialiser that would drift apart.
@@ -7678,6 +9102,170 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
 /// writes, so a frame costs about a dozen syscalls instead of sixty.
 ///
 /// Bounded and no heap: one fixed buffer, flushed when full and at the end of each frame.
+/// Line index over a flat text buffer, with a one-entry forward cache.
+///
+/// `line_pager` asks for line `i`, then `i+1`, `i+2` within a frame, and moves the top by small
+/// steps between frames - so remembering where the last line started makes the common case a short
+/// scan rather than a scan from the top.
+///
+/// NO INDEX ARRAY, deliberately. A 16 KiB buffer of one-byte lines would need 16,384 offsets, and
+/// `pipe_run`'s frame already sits at 68% of the user stack. §26.6.1 says the move is to change the
+/// representation rather than find room for a big one, and a cached cursor IS the smaller
+/// representation: two words instead of sixteen thousand.
+struct Lines<'a> {
+    b: &'a [u8],
+    /// Line number the cached offset belongs to.
+    at: core::cell::Cell<usize>,
+    /// Byte offset where that line starts.
+    off: core::cell::Cell<usize>,
+}
+
+impl<'a> Lines<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Lines { b, at: core::cell::Cell::new(0), off: core::cell::Cell::new(0) }
+    }
+
+    /// How many lines the buffer holds. A TRAILING NEWLINE TERMINATES the last line rather than
+    /// starting an empty one - which is what every text tool means by a line count, and what the
+    /// status line's "of N" has to agree with or the last page looks short by one.
+    fn count(&self) -> usize {
+        if self.b.is_empty() { return 0; }
+        let mut n = 0usize;
+        for &c in self.b { if c == b'\n' { n += 1; } }
+        if *self.b.last().unwrap_or(&b'\n') != b'\n' { n += 1; }
+        n
+    }
+
+    /// Line `i`, without its terminator. Out of range yields an empty line rather than a panic:
+    /// the pager clamps its own indices, and a rendering routine is the wrong place to discover
+    /// that it did not.
+    fn line(&self, i: usize) -> &'a [u8] {
+        let (mut n, mut o) = if i >= self.at.get() { (self.at.get(), self.off.get()) } else { (0, 0) };
+        while n < i && o < self.b.len() {
+            match self.b[o..].iter().position(|&c| c == b'\n') {
+                Some(pos) => { o += pos + 1; n += 1; }
+                None      => { o = self.b.len(); n = i; }
+            }
+        }
+        self.at.set(n);
+        self.off.set(o);
+        if o >= self.b.len() { return &self.b[0..0]; }
+        let end = self.b[o..].iter().position(|&c| c == b'\n').map(|pos| o + pos).unwrap_or(self.b.len());
+        &self.b[o..end]
+    }
+}
+
+/// Render one line into a frame, SAFELY and within the screen.
+///
+/// A pager owns the whole screen and repaints it by homing the cursor, so it cannot let its content
+/// drive the terminal: one `ESC [ 2J` inside a file would clear the frame mid-paint, and a line
+/// wider than the terminal would wrap and silently push every following row down, making the row
+/// count the pager just computed wrong. Both are the argument `dir` already makes about filenames,
+/// one layer out - the listing that is supposed to reveal the content must not be something the
+/// content controls.
+///
+/// So: printable ASCII passes, a tab becomes one space (it is whitespace, and expanding it properly
+/// needs a column model this does not have), everything else becomes `.`, and an over-long line is
+/// cut at the screen width with a trailing `>` to say it was cut. `read` on its own is unchanged -
+/// it does not own the screen, so it has no reason to filter.
+fn paginate_line(ctx: &ServiceContext, f: &mut FrameBuf, line: &[u8], cols: usize) {
+    let maxw = cols.max(2) - 1;
+    let mut w = 0usize;
+    for &c in line {
+        if c == b'\r' { continue; }   // a CRLF file must not print a stray carriage return
+        if w >= maxw { f.put(ctx, b">"); break; }
+        let ch = if c == b'\t' { b' ' }
+                 else if (0x20..0x7f).contains(&c) { c }
+                 else { b'.' };
+        f.put(ctx, &[ch]);
+        w += 1;
+    }
+    f.put(ctx, b"\x1b[K\n");
+}
+
+/// Page a flat text buffer a screenful at a time.
+///
+/// `#[inline(never)]`: called from `pipe_run`, whose frame already carries a 16 KiB `Stream`.
+#[inline(never)]
+fn paginate_bytes(ctx: &ServiceContext, b: &[u8]) {
+    let (rows, cols) = ctx.console_dims();
+    // UNKNOWN GEOMETRY IS NOT "NO TERMINAL" - the same rule `help` and `edit` follow. A failed
+    // lookup returns 0, and treating that as a reason to skip paging would make the feature vanish
+    // because a query missed rather than because a human was absent.
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let lines = Lines::new(b);
+    let total = lines.count();
+    if total == 0 { return; }
+    // It already fits. Entering a pager to show four lines is a mode the reader then has to leave,
+    // which is worse than the problem; `help` makes the same call.
+    if total + 1 <= rows {
+        let mut f = FrameBuf::new();
+        for i in 0..total { paginate_line(ctx, &mut f, lines.line(i), cols); }
+        f.flush(ctx);
+        return;
+    }
+    let frame = core::cell::RefCell::new(FrameBuf::new());
+    line_pager(ctx, total, rows,
+        &|_| 0,
+        &|c, i| { let mut f = frame.borrow_mut(); paginate_line(c, &mut f, lines.line(i), cols); },
+        &|c| frame.borrow_mut().flush(c));
+}
+
+/// Page a record `Table`, keeping its COLUMN HEADER pinned.
+///
+/// This is the capability a pager has that scrollback structurally cannot: scroll a table up in a
+/// scrollback buffer and the column names are gone, leaving unlabelled columns. Here the header is
+/// repainted at the top of every frame and never scrolls.
+///
+/// `pinned_extra` draws anything above the header that must also stay put (the `trace` legend), and
+/// returns how many lines it actually wrote, so the scrolling area sizes itself. `extra_hint` is the
+/// same number used only to decide whether paging is needed at all - the one that must be EXACT is
+/// the value the closure returns.
+///
+/// `#[inline(never)]`: same frame argument as `paginate_bytes`.
+#[inline(never)]
+fn paginate_table(ctx: &ServiceContext, t: &Table,
+                  pinned_extra: &dyn Fn(&ServiceContext, &mut FrameBuf) -> usize,
+                  extra_hint: usize) {
+    let (rows, _cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let w = t.grid_widths();
+    // Fits unpaged: the pinned block, the column header, and a line of slack.
+    if t.nrows() + extra_hint + 2 <= rows {
+        // The unpaged path batches too: it is the same screenful, drawn once.
+        let mut f = FrameBuf::new();
+        let _ = pinned_extra(ctx, &mut f);
+        let mut lb = LineBuf::new();
+        t.grid_header(&mut lb, &w);
+        lb.flush_into(ctx, &mut f);
+        for r in 0..t.nrows() { t.grid_row(&mut lb, r, &w); lb.flush_into(ctx, &mut f); }
+        f.flush(ctx);
+        return;
+    }
+    // ONE FRAME, A DOZEN SYSCALLS. Every line goes into a shared `FrameBuf` and out in 256-byte
+    // writes, flushed just before the status line. Writing each row straight to the console cost two
+    // syscalls per row - over a hundred console messages per keypress against a 16-deep queue - so
+    // holding a scroll key outran the sink and the keyboard went unresponsive.
+    let frame = core::cell::RefCell::new(FrameBuf::new());
+    line_pager(ctx, t.nrows(), rows,
+        &|c| {
+            let mut f = frame.borrow_mut();
+            let extra = pinned_extra(c, &mut f);
+            let mut lb = LineBuf::new();
+            t.grid_header(&mut lb, &w);
+            lb.flush_into(c, &mut f);
+            extra + 1 // what the pinned block ACTUALLY wrote, plus the column header
+        },
+        &|c, i| {
+            let mut f = frame.borrow_mut();
+            let mut lb = LineBuf::new();
+            t.grid_row(&mut lb, i, &w);
+            lb.flush_into(c, &mut f);
+        },
+        &|c| frame.borrow_mut().flush(c));
+}
+
 struct FrameBuf {
     buf: [u8; 256],
     n: usize,
@@ -8083,54 +9671,26 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
                             else { "trace: no events recorded (is any service granted ipc_send=[\"events\"]?)" });
         return Ok(());
     }
-    // PAGE when it does not fit, exactly as `help` does - a ring dump is routinely taller than the
-    // screen, and the framebuffer console has no scrollback, so the top would otherwise be gone
-    // forever. Unknown geometry is not "no terminal": a failed `console_dims` returns 0, and `edit`
-    // already treats that as 24 rows rather than dropping the feature.
-    let (rows, _cols) = ctx.console_dims();
-    let rows = if rows == 0 { 24 } else { rows as usize };
-    let w = t.grid_widths();
-    // Does it fit unpaged? Legend block, column header, and a line of slack.
-    if t.nrows() + TRACE_LEGEND_LINES + 2 <= rows {
-        // The unpaged path batches too: it is the same screenful, drawn once.
-        let mut f = FrameBuf::new();
-        let _ = trace_legend(ctx, &mut f, t.nrows());
-        let mut lb = LineBuf::new();
-        t.grid_header(&mut lb, &w);
-        lb.flush_into(ctx, &mut f);
-        for r in 0..t.nrows() {
-            t.grid_row(&mut lb, r, &w);
-            lb.flush_into(ctx, &mut f);
-        }
-        f.flush(ctx);
-        return Ok(());
-    }
-    // PINNED: the legend and the column header are repainted at the top of every frame. They used to
-    // be printed before the pager started, which put them exactly where its first `ESC[H` repaint
-    // lands - so on a framebuffer console the legend flashed and vanished. The column header had the
-    // same fate one page in, having been line 0 of the scrolling region.
+    // PAGE when it does not fit. Unknown geometry is not "no terminal": a failed `console_dims`
+    // returns 0, and `edit` already treats that as 24 rows rather than dropping the feature.
     //
-    // ONE FRAME, A DOZEN SYSCALLS. Every line here goes into a shared `FrameBuf` and out in 256-byte
-    // writes, flushed just before the status line. Writing each line straight to the console cost two
-    // syscalls per row - over a hundred console messages per keypress against a 16-deep queue - so
-    // holding a scroll key outran the sink and the keyboard went unresponsive.
-    let frame = core::cell::RefCell::new(FrameBuf::new());
-    line_pager(ctx, t.nrows(), rows,
-        &|c| {
-            let mut f = frame.borrow_mut();
-            let legend = trace_legend(c, &mut f, t.nrows());
-            let mut lb = LineBuf::new();
-            t.grid_header(&mut lb, &w);
-            lb.flush_into(c, &mut f);
-            legend + 1 // what the legend ACTUALLY wrote, plus the column header
-        },
-        &|c, i| {
-            let mut f = frame.borrow_mut();
-            let mut lb = LineBuf::new();
-            t.grid_row(&mut lb, i, &w);
-            lb.flush_into(c, &mut f);
-        },
-        &|c| frame.borrow_mut().flush(c));
+    // **AND UNLIKE `help`'S PAGER, THIS ONE IS PERMANENT.** It used to say the same thing - "the
+    // framebuffer console has no scrollback, so the top would otherwise be gone forever" - which
+    // stopped being true when the console gained scrollback (`docs/console-service.md` §10). The
+    // reason this one survives is the PINNED REGION below: scrolled back through a grid in a
+    // scrollback buffer, the column names are off the top and you are reading unlabelled columns.
+    // Scrollback structurally cannot pin a header; a pager can. That is the whole difference
+    // between the two, and it is why `help`'s was DELETED once scrollback was hardware-verified
+    // (Dell Wyse, 2026-09-18) and this one was not.
+    // PINNED: the legend and the column header are repainted at the top of every frame. They used to
+    // be printed BEFORE the pager started, which put them exactly where its first `ESC[H` repaint
+    // lands - so on a framebuffer console the legend flashed and vanished, and the column header met
+    // the same fate one page in, having been line 0 of the scrolling region.
+    //
+    // This used to be an open-coded pager here. It is `paginate_table` now, which the `paginate`
+    // pipe stage also uses - one pager over tables rather than a second copy of this block, which is
+    // `backlog/35`'s disease in miniature (the same fact stated twice, and the two drifting).
+    paginate_table(ctx, &t, &|c, f| trace_legend(c, f, t.nrows()), TRACE_LEGEND_LINES);
     Ok(())
 }
 
@@ -8157,7 +9717,7 @@ fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> ReqOutcome {
     const MAX_SECS:  i64 = 5;   // the ring is in memory; a healthy answer is immediate
     for _ in 0..3 {
         match ctx.request_with_reply_qhint("events", &Message::from_bytes(req), HINT_SECS, MAX_SECS,
-                                           || ctx.console_writeln("  (q to quit)")) {
+                                           || ctx.console_writeln("  [q] quit")) {
             ReqOutcome::Reply(r) => return ReqOutcome::Reply(r),
             // The user's decision, not a fault - never retried.
             ReqOutcome::Aborted  => return ReqOutcome::Aborted,
@@ -9474,7 +11034,7 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     // snapshot is the WHOLE frame - top not cut off, a faithful freeze of what you were watching. These
     // two strings are byte-for-byte the painter's (services/observe title bar); \x1b[K clears whatever
     // the partial frame left on these two rows.
-    ctx.console_write("observe - live                                      (q to quit)\x1b[K\r\n");
+    ctx.console_write("observe - live                                      [q] quit\x1b[K\r\n");
     ctx.console_write("================================================================\x1b[K\r\n");
     let r = cmd_observe_now(ctx);
     ctx.console_write("\x1b[J\x1b[?25h");
@@ -9743,7 +11303,7 @@ fn split_first(s: &str) -> (&str, &str) {
 }
 
 /// Built-ins that emit text and can be the producer side of a pipe.
-// `ls` and `find` are intentionally absent: they are record producers (`is_record_producer`),
+// `dir` and `find` are intentionally absent: they are record producers (`is_record_producer`),
 // handled on the record path in `pipe_run` before this is consulted, so listing them here would
 // be dead. `tree` stays text - a hierarchy is not a flat table.
 fn is_producer_builtin(name: &str) -> bool {
@@ -9781,7 +11341,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
         "read"         => { let _ = cmd_read(ctx, cwd, arg, out); }
-        // "ls" and "find" are record producers (handled on the record path), not text here.
+        // "dir" and "find" are record producers (handled on the record path), not text here.
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
         // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
@@ -10219,8 +11779,11 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // fourth time. It stays a literal for now because the shell cannot see the supervisor's list, but
 // the honest fix is to derive it from live tasks the way `chaos` derives its own exclusions - which
 // is exactly why chaos has no roster to drift.
-const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
-                                       "nic-driver", "net-stack", "time", "control", "dwc2"];
+/// A `&[&str]` rather than a `[&str; 11]` so TAB COMPLETION can point at the same list instead of
+/// carrying a second copy. The comment above is about this list drifting from the supervisor's; a
+/// copy inside the completion tables would have been a fifth statement of the same fact.
+const CHAOS_RESTARTABLE: &[&str] = &["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
+                                     "nic-driver", "net-stack", "time", "control", "dwc2"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -10403,7 +11966,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
         ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
         ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
         ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
-        ctx.console_writeln("  (press q to abort; an abort clears the override)");
+        ctx.console_writeln("  [q] quit  (quitting clears the override)");
         return Ok(());
     }
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
@@ -10420,7 +11983,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     let clr  = Message::from_bytes(&[8]);
     for cycle in 1..=cycles {
         ctx.console_writeln_fmt(format_args!(
-            "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
+            "chaos link-flap: cycle {}/{} - forcing link DOWN  [q] quit", cycle, cycles));
         match net_query(ctx, "nic-driver", &down, 3, None) {
             NetQ::Aborted => {
                 let _ = net_query(ctx, "nic-driver", &clr, 2, None);
@@ -11080,7 +12643,7 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 
 
 // ---------------------------------------------------------------------------
-// File commands - ls / read / write / mkdir / cd (utilities/16..20). Shell built-ins
+// File commands - dir / read / write / mkdir / cd (utilities/16..20). Shell built-ins
 // that send the fs file API to `fs` over IPC; `fs` holds + enforces all disk authority.
 // The shell tracks the current location (a drive+directory pointer) and resolves
 // relative / `.` / `..` paths to an absolute path before sending - fs only walks
@@ -11176,10 +12739,10 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 ///
 /// Replies were matched to requests by ARRIVAL ORDER alone, which holds only while nothing is ever
 /// overtaken. After a USB stick replug the device is slow, a `.gsh_history` write is still in flight when
-/// the next command's request goes out, and the replies come back one behind - so `ls` read the write's
+/// the next command's request goes out, and the replies come back one behind - so `dir` read the write's
 /// one-byte `[FS_OK]`, saw a reply too short to be a listing, and reported a storage error about a
 /// filesystem that was perfectly fine. The channel then stayed one behind indefinitely, which is why the
-/// SECOND `ls` always worked and why every storage-layer fix left the symptom untouched.
+/// SECOND `dir` always worked and why every storage-layer fix left the symptom untouched.
 ///
 /// A tag makes the match structural instead of circumstantial: the client stamps each request, fs echoes
 /// it, and an answer to a different question is recognisable as one. Cycles 1..=255 and never uses 0, so
@@ -11410,6 +12973,47 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
+/// The REASON `fs` gave for a failure, when it gave one.
+///
+/// An `FS_ERR` reply carries `[FS_ERR, reason bytes...]`. The trailing bytes are optional - older
+/// paths and the ops that have no reason to give still send the single byte - so this returns
+/// `None` rather than an empty string, and a caller falls back to its own wording.
+fn fs_err_reason(m: &Message) -> Option<&str> {
+    let p = m.payload_bytes();
+    if p.first().copied() != Some(FS_ERR) || p.len() < 2 { return None; }
+    core::str::from_utf8(&p[1..]).ok().filter(|r| !r.is_empty())
+}
+
+/// Report a mutating command that got no answer - and say WHICH of the two things happened.
+///
+/// "storage unavailable" is true when the request never reached `fs`. It is a LIE when the request
+/// ran and its reply was lost: storage was fine, the operation may well have succeeded, and telling
+/// an operator their `move` did not happen when the file has moved is a confident wrong answer about
+/// a destructive operation (carnage §3.5, §26.7).
+///
+/// One helper rather than seven hand-written wordings, because the seven sites drifting apart is how
+/// the honest half gets left out of whichever one is touched last.
+fn fs_no_answer(ctx: &ShellCtx, verb: &str) {
+    if ctx.fs_unknown.get() {
+        let why = ctx.last_write_err.borrow();
+        ctx.console_writeln_fmt(format_args!(
+            "{}: OUTCOME UNKNOWN - {}", verb,
+            why.get().unwrap_or("the reply was lost; it MAY HAVE SUCCEEDED - check with `dir`")));
+    } else {
+        ctx.console_writeln_fmt(format_args!("{}: storage unavailable", verb));
+    }
+}
+
+/// Whether an fs op CHANGES the filesystem, and therefore must never be re-sent on a timeout.
+///
+/// Mirrors `op_is_mutating` in `services/fs`. A second copy of a list is a thing that can drift, so
+/// it is worth saying why it exists here: the shell must make this call without asking `fs`, at the
+/// moment `fs` is not answering. `facts_check.py` compares the two.
+fn op_is_mutating(op: u8) -> bool {
+    matches!(op, OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT
+                 | OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE)
+}
+
 fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
@@ -11454,6 +13058,17 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
     // diagnoses have already come from reasoning about which call blocks instead of proving it.
     // "reacquiring" without "reacquired" = this call; neither = the send never returned; both = the
     // retry below.
+    // NEVER RE-SEND A DESTRUCTIVE OP - carnage §3.5, with the argument on `op_is_mutating`.
+    //
+    // The guard is needed in BOTH request paths. It went into the bounded one first and the gate
+    // still failed with `move: failed - source not found`, because `move` comes through HERE. A fix
+    // applied to the path that was easiest to find is not a fix.
+    if op_is_mutating(op) {
+        ctx.fs_unknown.set(true);
+        ctx.last_write_err.borrow_mut().set_text(
+            "the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - a retry can repeat a destructive operation. Check with `dir`");
+        return None;
+    }
     ctx.print("  [diag] fs send failed - reacquiring by name\r\n");
     let got = ctx.reacquire_by_name("fs");
     ctx.print(if got { "  [diag] reacquired fs - retrying\r\n" } else { "  [diag] reacquire FAILED\r\n" });
@@ -11634,9 +13249,24 @@ fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
 /// 8 + 6 is 14, so 20 leaves real slack and still returns while a person is still watching.
 const NET_TXN_SECS: i64 = 20;
 
-/// How long the wait must linger before the `(q to quit)` hint is printed. A fast transaction prints
+/// How long the wait must linger before the `[q] quit` hint is printed. A fast transaction prints
 /// nothing, so a snappy `tcp` is not nagged.
 const NET_HINT_SECS: i64 = 2;
+
+/// How long `net resolve` waits for net-stack to answer a DNS lookup.
+///
+/// **This is the SHORTEST deadline any client gives net-stack, and that makes it load-bearing on the
+/// other side of the wire.** net-stack must finish a DNS resolve - even to report that it failed -
+/// inside this window. If it takes longer, this command gives up first and net-stack's answer lands
+/// afterwards as a stale reply, which does not merely waste the work: the next request receives the
+/// previous one's answer, the correlation tag rejects it, and the stream never catches up.
+///
+/// That is exactly what a Dell Wyse showed (2026-09-17): net-stack's DNS path was bounded by a COUNT
+/// (twelve polls of two seconds), so it could spend 24 seconds on a request this command waited 8 for.
+///
+/// It was a bare `8` at the call site until then. `scripts/facts_check.py` now checks this against
+/// net-stack's own budget, which it cannot do to a literal.
+const NET_RESOLVE_SECS: i64 = 8;
 
 /// Discard anything already queued on our endpoint BEFORE sending a net-stack request, reclaiming any
 /// capability a discarded reply carried.
@@ -11664,7 +13294,7 @@ fn drain_stale_net_replies(ctx: &ServiceContext) {
 }
 
 /// A tagged net-stack request on the transaction path (`tcp`, `sock`, `serve`'s listen): bounded by
-/// `NET_TXN_SECS`, and **`q`-abortable**, with a `(q to quit)` hint once the wait lingers.
+/// `NET_TXN_SECS`, and **`q`-abortable**, with a `[q] quit` hint once the wait lingers.
 ///
 /// **A bound alone was not enough, and the Wyse proved it.** Bounding this at 20 s stopped the shell
 /// hanging forever, but the operator still had a dead prompt for twenty seconds with no way out - they
@@ -11682,7 +13312,7 @@ fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
     let (n, tag) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
     let first = ctx.request_with_reply_qhint(
         "net-stack", &Message::from_bytes(&buf[..n]), NET_HINT_SECS, NET_TXN_SECS,
-        || ctx.console_writeln("  (q to quit)"));
+        || ctx.console_writeln("  [q] quit"));
     match ns_take_tagged(ctx, tag, first, NET_TXN_SECS) {
         // A timeout here means the send never left or the peer is silent. Reacquire by name and retry
         // once, with a FRESH tag - the first request may still be in flight, and its late reply must
@@ -11691,7 +13321,7 @@ fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
             let (n2, tag2) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
             let again = ctx.request_with_reply_qhint(
                 "net-stack", &Message::from_bytes(&buf[..n2]), NET_HINT_SECS, NET_TXN_SECS,
-                || ctx.console_writeln("  (q to quit)"));
+                || ctx.console_writeln("  [q] quit"));
             ns_take_tagged(ctx, tag2, again, NET_TXN_SECS)
         }
         other => other,
@@ -11725,6 +13355,32 @@ fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs
     // solves the same problem with a drain at its own top; this path had no equivalent.
     // Timed out. Do NOT try to reclaim the late reply here - that is the race described in
     // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
+    // NEVER RE-SEND A DESTRUCTIVE OP, and this is the carnage §3.5 gap closed rather than detected.
+    //
+    // The retry below is correct for a READ: nothing happened, so asking again is free. For a
+    // `move`, `delete` or `rename` it is not, and the failure is not hypothetical - a test that
+    // completes a move and swallows its reply produced exactly this:
+    //
+    //     [diag] reacquired fs - retrying
+    //     move: failed - source not found          <- the file was already at the destination
+    //
+    // The first attempt SUCCEEDED. The retry found nothing at the source, and its error was reported
+    // as the move's outcome: a confident wrong answer about a destructive operation (§26.7).
+    //
+    // The protocol cannot deduplicate this away. The correlation tag matches a reply to a request,
+    // and the retry deliberately draws a FRESH one so a late original can be told apart - so a retry
+    // is indistinguishable from a new request BY DESIGN. Making it distinguishable means a client-
+    // supplied operation id that survives retries, plus a reply cache in `fs`; real work, and
+    // recorded as such.
+    //
+    // What needs no protocol change is the honest answer: the operation already ran, re-sending
+    // cannot help, and the outcome is UNKNOWN. Say so.
+    if op_is_mutating(op) {
+        ctx.fs_unknown.set(true);
+        ctx.last_write_err.borrow_mut().set_text(
+            "the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - a retry can repeat a destructive operation. Check with `dir`");
+        return None;
+    }
     if ctx.reacquire_by_name("fs") {
         drain_stale_fs_replies(ctx);
         let tag2 = next_fs_tag(ctx);
@@ -11771,15 +13427,15 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
     }
 }
 
-/// `fs_request` for INTERACTIVE commands (`ls`, `cd`, `read`, `find`, ...): q-abortable, and after a
-/// short lingering threshold it prints a "(q to quit)" hint so the user can bail on a slow op instead
+/// `fs_request` for INTERACTIVE commands (`dir`, `cd`, `read`, `find`, ...): q-abortable, and after a
+/// short lingering threshold it prints a "[q] quit" hint so the user can bail on a slow op instead
 /// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
 /// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
 /// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
 /// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
 /// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
 fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
-    const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
+    const HINT_SECS: i64 = 2;    // print "[q] quit" only if the wait lingers past this
     // How long `fs` gets to answer before the shell declares storage unavailable.
     //
     // **This was 3600, with the comment "effectively unbounded - fs replies fast now; q is the real
@@ -11808,7 +13464,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
     let dn = data.len().min(req.len() - 3 - pl);
     req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..3 + pl + dn]);
-    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
     match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
         // A fresh tag for the fresh request - see `fs_request`.
@@ -11817,7 +13473,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
             let mut req2 = req;
             req2[0] = tag2;
             let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
             fs_take_tagged(ctx, tag2, again, MAX_SECS)
         }
         other => other,
@@ -11834,17 +13490,17 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
 /// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
 /// (`fs_request_q` would append a path-length byte).
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
-    const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
+    const HINT_SECS: i64 = 2;    // print "[q] quit" only once the wait lingers
     const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE, not the volume - a real bound
     let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
-    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
     match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
             let tag2 = next_fs_tag(ctx);
             let msg2 = Message::from_bytes(&[tag2, op]);
-            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
             fs_take_tagged(ctx, tag2, again, MAX_SECS)
         }
         other => other,
@@ -11916,9 +13572,53 @@ fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], 
 
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
 /// `fs_write_at` to stream a large file.
+/// The reason `fs` gave for the most recent failed write, kept so a helper that returns `bool` can
+/// still hand the WHY to whoever prints the message.
+///
+/// **Why a stashed reason and not a richer return type.** `copy` runs through `fs_write_new` and a
+/// loop of `fs_write_at`, both of which answer yes-or-no, and `copy_file_streaming` returns an
+/// `Option<u64>`. Threading a reason through all three changes four signatures and every caller to
+/// carry a string that only one of them ever prints. The alternative was leaving `copy` saying
+/// "write failed (parent missing?)" on a FULL DISK, which is the same misleading guess `write` and
+/// `move` were corrected for earlier - and a full disk is precisely when a person meets it.
+///
+/// Owned by the shell, single-threaded, written immediately before the failure it describes is
+/// reported. Not a cache and never read except on the failure path.
+struct LastWriteErr {
+    // 160, not 64: an fs error reason is short, but the "outcome unknown" sentence (§3.5) has to
+    // carry what happened AND what to do about it, and a truncated explanation of an ambiguous
+    // destructive operation is worse than none.
+    buf: [u8; 160],
+    len: usize,
+}
+impl LastWriteErr {
+    const fn new() -> Self { Self { buf: [0u8; 160], len: 0 } }
+
+    /// Set a reason this shell composed, rather than one `fs` reported.
+    fn set_text(&mut self, why: &str) {
+        let n = why.len().min(self.buf.len());
+        self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
+        self.len = n;
+    }
+    fn set(&mut self, m: Option<&Message>) {
+        self.len = 0;
+        if let Some(why) = m.and_then(fs_err_reason) {
+            let n = why.len().min(self.buf.len());
+            self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
+            self.len = n;
+        }
+    }
+    fn get(&self) -> Option<&str> {
+        if self.len == 0 { return None; }
+        core::str::from_utf8(&self.buf[..self.len]).ok()
+    }
+}
+
 fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
-    matches!(fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes()),
-             Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+    let r = fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes());
+    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
+    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    ok
 }
 
 /// Write `chunk` into `path` at block-aligned byte `offset`.
@@ -11927,8 +13627,10 @@ fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     let n = chunk.len().min(IO_CHUNK);
     tail[8..8 + n].copy_from_slice(&chunk[..n]);
-    matches!(fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]),
-             Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+    let r = fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]);
+    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
+    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    ok
 }
 
 /// True if `fs` replied "no filesystem" - print the standard hint and consume it.
@@ -11948,51 +13650,583 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
     }
 }
 
-/// `ls [path]` - list a directory.
-fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+/// `dir [path]` - list a directory.
+/// A size for the `dir` column: readable by default, exact when the caller asked for `bytes`.
+///
+/// **One type, one layout.** There used to be two renderings and two column sets, which is how the
+/// terse view ended up printing `204800 B` (with a unit) while the detailed one printed a bare
+/// `204800` - the friendlier rendering in the LESS detailed view, which is backwards. There is now
+/// a single layout, so they cannot drift again.
+struct SizeCol(u64, bool);
+
+impl core::fmt::Display for SizeCol {
+    /// **Renders into a small buffer and then `pad`s.** A `Display` impl that writes straight to the
+    /// formatter SILENTLY IGNORES a width - `{:>10}` does nothing unless the impl asks for it - so
+    /// the column came out ragged and a column of ragged numbers is not a column. `f.pad` is what
+    /// applies the caller's width and alignment.
+    ///
+    /// `self.1` is "the caller asked for exact bytes". Note the unit travels WITH the number and the
+    /// whole string is right-aligned, so `8 B` and `1.4 MiB` end at the same column - aligning the
+    /// digits and letting the units straggle is what made this look ragged even once it was padded.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write as _;
+        let mut b = FixedStr::<16>::new();
+        if self.1 { let _ = write!(&mut b, "{}", self.0); } else { let _ = human_bytes(&mut b, self.0); }
+        f.pad(b.as_str())
+    }
+}
+
+/// A tiny stack string, so a `Display` impl can render itself before padding. No heap (§26.6.1);
+/// anything that does not fit is simply not written, which for a byte count cannot happen.
+struct FixedStr<const N: usize> { buf: [u8; N], len: usize }
+
+impl<const N: usize> FixedStr<N> {
+    fn new() -> Self { FixedStr { buf: [0u8; N], len: 0 } }
+    fn as_str(&self) -> &str { core::str::from_utf8(&self.buf[..self.len]).unwrap_or("?") }
+}
+
+impl<const N: usize> core::fmt::Write for FixedStr<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = N.saturating_sub(self.len);
+        let take = s.len().min(room);
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// KiB/MiB/GiB with one decimal, or plain bytes under 1 KiB.
+///
+/// Integer arithmetic only: this is a `no_std` service and there is no float formatting to reach for
+/// even if floats were wanted here (§26.6.1 - the bounded shape is also the simpler one).
+fn human_bytes<W: core::fmt::Write>(f: &mut W, n: u64) -> core::fmt::Result {
+    const K: u64 = 1024;
+    if n < K { return write!(f, "{} B", n); }
+    let (unit, div) = if n < K * K { ("KiB", K) }
+                      else if n < K * K * K { ("MiB", K * K) }
+                      else { ("GiB", K * K * K) };
+    let whole = n / div;
+    let tenth = (n % div) * 10 / div;
+    write!(f, "{}.{} {}", whole, tenth, unit)
+}
+
+/// A modification time, or the honest absence of one.
+enum TimeCol {
+    At(Datetime),
+    /// This volume records no time for the entry - a GSFS0008 file, or one written while no clock
+    /// was known. Printed as `unknown`, never as an epoch date: a wrong date is worse than none.
+    Unknown,
+}
+
+impl core::fmt::Display for TimeCol {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TimeCol::Unknown => f.pad("unknown"),
+            TimeCol::At(d) => {
+                use core::fmt::Write as _;
+                let mut b = FixedStr::<24>::new();
+                let _ = write!(&mut b, "{:04}-{:02}-{:02} {:02}:{:02}",
+                               d.year, d.month, d.day, d.hour, d.minute);
+                f.pad(b.as_str())
+            }
+        }
+    }
+}
+
+/// Read a little-endian u32 from a slice, mirroring `u64_le`.
+fn u32_le(b: &[u8]) -> u32 {
+    if b.len() < 4 { return 0; }
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
+    // WORDS, NOT FLAGS (`utilities/0_conventions.md` rule 4): `dir bytes /docs`, never `dir -b`. Any
+    // order, and mixable with a path, because an order a person has to remember is one they will
+    // guess wrong.
+    //
+    // **`long` and `human` are gone; what they showed is now the default.** They were `ls -l` and
+    // `ls -h` wearing house clothes, and the reason `ls -l` is opt-in on Unix does not apply here:
+    // it hides mode bits, link count, owner and group, none of which exist in this system. Strip
+    // those and what is left - name, type, size, when - is four columns, not nine, and is what
+    // somebody wants. The one thing left to ask for is the EXACT byte count, and `bytes` says so.
+    let mut exact = false;
+    let mut path_arg = "";
+    for tok in args.iter() {
+        match *tok {
+            "bytes" => exact = true,
+            t => if path_arg.is_empty() { path_arg = t; },
+        }
+    }
     let mut buf = [0u8; PATH_MAX];
-    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
+    let path = match resolve_or_err(ctx, cwd, path_arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    // THE COUNT IS WHAT WAS PRINTED, AND IT IS PRINTED LAST.
+    //
+    // A long directory arrives in several pages, so the total is not known until the walk ends. The
+    // obvious fix - walk once to count, then walk again to print - gives two answers that can
+    // DISAGREE, because the directory may change between them, and a header that contradicts the
+    // rows under it is exactly the wrong answer this change exists to remove. Counting what was
+    // actually rendered cannot disagree with itself, and it matches `find` and `tree`, which have
+    // always summarised at the end.
+    //
+    // No pager here. Long output is handled by the console's scrollback (passive) and by
+    // `paginate` when it is asked for (explicit) - never by a command deciding on its own to hold
+    // the shell, which is what would break `dir | write`.
+    out.line_fmt(ctx, format_args!("{}", str_of(path)));
+    let mut listed = 0usize;
+    let mut header_done = false;
+    let mut cur = DirCursor::new();
+    while let Some(from) = cur.next() {
+    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
         ReqOutcome::Reply(r) => r,
         ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("ls: storage unavailable"); return Err(ShellError::Unknown); }
+        ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
     if p.first() == Some(&FS_NOTFOUND) {
-        ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
+        ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
         return Err(ShellError::FileNotFound);
     }
     // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
     // error - the stick pulled and replugged - came out as a claim about the path, sending the operator
     // to look at `/` when the problem was the device. Name what actually happened (§26.7).
-    if p.first() == Some(&FS_ERR) || p.len() < 2 {
+    if p.first() == Some(&FS_ERR) || p.len() < DIR_HDR {
         ctx.console_writeln_fmt(format_args!(
-            "ls: could not read {} - storage error (the device may still be settling after a replug; try again)",
+            "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
             str_of(path)));
         return Err(ShellError::Unknown);
     }
-    let count = p[1] as usize;
-    out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
-    if count > 0 { out.line(ctx, "  NAME                  TYPE   SIZE"); }
-    let mut i = 2usize;
+    let count = cur.take(p);
+    if count > 0 && !header_done {
+        out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
+        header_done = true;
+    }
+    let mut i = DIR_HDR;
     for _ in 0..count {
         if i >= p.len() { break; }
         let nl = p[i] as usize;
         i += 1;
-        if i + nl + 1 + 8 > p.len() { break; }
-        let name = core::str::from_utf8(&p[i..i + nl]).unwrap_or("?");
+        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+        // A NAME IS UNTRUSTED INPUT, AND THIS IS WHERE IT MEETS A TERMINAL.
+        //
+        // `fs` refuses to CREATE a name carrying control bytes, but a disk prepared elsewhere
+        // already holds whatever names it likes - and this shell must still be able to list and
+        // delete them, so the name cannot simply be rejected here. It is RENDERED SAFELY instead:
+        // a terminal acts on the bytes it is handed, and a name containing `ESC [ 2J` clears the
+        // screen when listed, scrolling itself and everything after it out of the listing that was
+        // supposed to reveal it. Found by `osdev test fs-fuzz` against a disk baked with that name.
+        let mut safe = [b'?'; 64];
+        let shown = nl.min(safe.len());
+        for k in 0..shown {
+            let b = p[i + k];
+            safe[k] = if b >= 0x20 && b < 0x7f { b } else { b'.' };
+        }
+        let name = core::str::from_utf8(&safe[..shown]).unwrap_or("?");
         let is_dir = p[i + nl] != 0;
         let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        i += nl + 1 + 8;
-        if is_dir {
-            out.line_fmt(ctx, format_args!("  {:<20}  dir    -", name));
+        let mtime = u32_le(&p[i + nl + 9..i + nl + 13]);
+        let sealed = p[i + nl + 13] & 1 != 0;
+        i += nl + 1 + 8 + 4 + 1;
+        // A time this volume does not record prints as "unknown" rather than as 1970 - an absent
+        // date is honest and a wrong one is not (Phase O).
+        let when = if mtime == 0 {
+            TimeCol::Unknown
         } else {
-            out.line_fmt(ctx, format_args!("  {:<20}  file   {} B", name, size));
+            TimeCol::At(Datetime::from_epoch_secs(mtime as i64))
+        };
+        // A sealed file says so IN THE TYPE COLUMN, and costs no extra column to do it. It is not an
+        // attribute of a file so much as a different kind of thing to have on a disk - one whose
+        // bytes can never change - and a trailing marker is missable precisely when it matters.
+        //
+        // This works because sealing is FILE-ONLY: `fs` refuses "only a file can be sealed", so TYPE
+        // stays single-valued and there is no `dir+sealed` case needing a flag of its own.
+        let kind = if is_dir { "dir" } else if sealed { "seal" } else { "file" };
+        if is_dir {
+            out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>9}  {}", name, kind, "-", when));
+        } else {
+            out.line_fmt(ctx, format_args!("  {:<20}  {:<4}  {:>9}  {}",
+                                           name, kind, SizeCol(size, exact), when));
+        }
+        listed += 1;
+    }
+    }
+    if listed == 0 {
+        out.line(ctx, "  (empty)");
+    } else {
+        out.line_fmt(ctx, format_args!("  {} entries", listed));
+    }
+    // The walk hit its own bound rather than the end of the directory. Say so where the count is,
+    // because the count is the number a reader will otherwise take as the whole truth (26.7).
+    if cur.cut() {
+        out.line_fmt(ctx, format_args!(
+            "  INCOMPLETE - this directory is larger than {} listing pages; the entries above are not all of it",
+            DIR_PAGE_MAX));
+    }
+    Ok(())
+}
+
+/// `churn <seconds>` - keep the filesystem in constant motion so a power cut lands SOMEWHERE.
+///
+/// **Why this exists.** Three real power cuts on a Dell Wyse produced three clean mounts and not one
+/// `journal recovered` line, because the commit-to-checkpoint window is sub-millisecond and a human
+/// with a plug samples a fraction of a percent of a run. There are two ways to fix that and they
+/// answer different questions:
+///
+/// - `write /cutme.txt ...` (the `crash-window` build) holds ONE known window open for ten seconds.
+///   Deterministic. It PROVES the recovery path works.
+/// - `churn` runs thousands of transactions of every shape - create, overwrite, rename, delete, and
+///   the directory and bitmap and superblock writes that hang off them - for as long as you ask.
+///   Probabilistic. It SEARCHES for the windows nobody thought to aim at.
+///
+/// A proof and a search. Maximum carnage wants both, and this is the one that runs on a shipping
+/// build with no test feature compiled in - which matters, because a fault that only appears in a
+/// build nobody ships is a fault about that build.
+///
+/// **Bounded** (26.6): a fixed rotation of files in one directory, each rewritten in place, so the
+/// volume never fills however long it runs. Fixed stack buffers, no heap (26.6.1).
+///
+/// **Abortable** (conventions rule 9): `q` quits it, and it ends on its own at the deadline. A
+/// command that runs for a minute and cannot be interrupted is one the operator has to reboot out of.
+///
+/// The wording is `[q] quit`, and that is now the ONLY form. One key, one word - because the
+/// LETTER is the mnemonic, which is the whole reason the key is `q`. "abort" would have earned the
+/// letter `a` and never had it, yet the shell advertised `(press q to abort)` in six places and
+/// `0_conventions.md` rule 9 mandated it. Both corrected. Unix makes the same association from the
+/// other direction: ctrl+C says "cancel".
+fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let secs: i64 = match arg.parse::<i64>() {
+        Ok(n) if n > 0 && n <= 3600 => n,
+        _ => { ctx.console_writeln("usage: churn <seconds>   e.g. churn 30   (1 to 3600)"); return Err(ShellError::Unknown); }
+    };
+    const DIR: &[u8] = b"/churn";
+    const SLOTS: usize = 8;
+    // Four sizes, so the mix spans a single data block, a partial extent and several blocks - the
+    // allocator takes different paths for each, and a one-size churn would only ever exercise one.
+    const SIZES: [usize; 4] = [64, 500, 1200, 3000];
+
+    let _ = fs_request(ctx, OP_MKDIR, DIR, &[]);
+    out.line_fmt(ctx, format_args!(
+        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
+
+    let mut buf = [0u8; 3000];
+    let mut path = [0u8; 32];
+    let (mut writes, mut renames, mut deletes, mut bytes, mut failures) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let start = ctx.epoch_secs_monotonic();
+    let mut last_beat = start;
+    let mut i = 0u64;
+
+    loop {
+        // Deadline and abort checked EVERY iteration, not every N: a count would mean a different
+        // duration on every machine, which is the trap this project keeps re-learning.
+        let now = ctx.epoch_secs_monotonic();
+        if now.saturating_sub(start) >= secs { break; }
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'q' || b == b'Q' || b == 0x1b {
+                out.line(ctx, "churn: quit");
+                break;
+            }
+        }
+        if now != last_beat {
+            last_beat = now;
+            out.line_fmt(ctx, format_args!("churn: {}s elapsed, {} writes", now.saturating_sub(start), writes));
+        }
+
+        let slot = (i % SLOTS as u64) as usize;
+        let n = SIZES[(i as usize / SLOTS) % SIZES.len()];
+        // SELF-DESCRIBING CONTENT, so a torn file can be DETECTED rather than merely suspected.
+        // The pattern, and the argument for it, live in `sdk::churn` - ONE definition shared by
+        // this writer and by `churn verify`, because if the two ever disagree the verifier reports
+        // "NONE torn" while no longer able to recognise a tear.
+        let gen = godspeed_sdk::churn::generation(i);
+        godspeed_sdk::churn::fill(&mut buf[..n], gen);
+        let mut pl = 0usize;
+        for &b in DIR { path[pl] = b; pl += 1; }
+        path[pl] = b'/'; pl += 1;
+        path[pl] = b'f'; pl += 1;
+        path[pl] = b'0' + slot as u8; pl += 1;
+        path[pl..pl + 4].copy_from_slice(b".bin"); pl += 4;
+
+        match fs_request(ctx, OP_WRITE_FILE, &path[..pl], &buf[..n]).as_ref()
+                 .map(|r| r.payload_bytes().first().copied()) {
+            Some(Some(FS_OK)) => { writes += 1; bytes += n as u64; }
+            _ => failures += 1,
+        }
+
+        // Every few iterations, a DIFFERENT transaction shape. An overwrite alone exercises one
+        // journal path; rename and delete move directory entries and free extents, which are where
+        // the interesting interrupted states live (the tear sweep found its only real finding in a
+        // delete).
+        if i % 5 == 4 {
+            let mut np = [0u8; 32];
+            np[..pl].copy_from_slice(&path[..pl]);
+            np[pl - 4..pl].copy_from_slice(b".ren");
+            // OP_RENAME takes the NEW NAME, not a new path - so the slice must start after the
+            // final `/`. It was `pl - 9`, which began mid-directory ("rn/f0.ren"): a name containing
+            // a slash, refused by `valid_name` every time. Churn was reporting "0 renames, 0 deletes"
+            // out of 119 writes and exercising ONE transaction shape while claiming three.
+            //
+            // Caught because the report prints the counts. A load generator that says only "119
+            // writes" would have hidden this indefinitely, which is the argument for a tool
+            // reporting what it DID rather than that it ran.
+            let name_at = DIR.len() + 1;
+            if matches!(fs_request(ctx, OP_RENAME, &path[..pl], &np[name_at..pl]).as_ref()
+                          .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+                renames += 1;
+                if matches!(fs_request(ctx, OP_DELETE, &np[..pl], &[]).as_ref()
+                              .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+                    deletes += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    out.line_fmt(ctx, format_args!(
+        "churn: done - {} writes, {} renames, {} deletes, {} bytes, {} refused",
+        writes, renames, deletes, bytes, failures));
+    out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
+    out.line(ctx, "churn: /churn is left in place (it is the evidence); `churn reset` removes it");
+    Ok(())
+}
+
+/// `churn tear` - deliberately make one churn file a MIX of two generations, so the detector can
+/// be seen firing.
+///
+/// **A DETECTOR NEVER OBSERVED FIRING IS NOT EVIDENCE.** `churn verify` has reported `NONE torn` on
+/// every hardware run there has ever been, which is the right answer and tells you nothing about
+/// whether it *could* say otherwise. Every corruption test this project has - `fs-corrupt`,
+/// `fs-scrub`, `fs-hostile` - damages the disk HOST-SIDE before boot, which is impossible on a
+/// machine you cannot take the disk out of. This is the same proof, reachable from the shell.
+///
+/// **What it creates is precisely the case the carnage doc says nothing else catches.** From
+/// `docs/gsfs-carnage.md`: a file holding the first half of one write and the second half of
+/// another "has perfectly valid block CRCs (each block was written whole), sits in a perfectly
+/// valid directory, and occupies correctly accounted blocks. Every check this project had would
+/// pass it." So this writes a well-formed block of a DIFFERENT generation into the middle of a
+/// churn file: the structure stays immaculate and the content is a lie. `drives check` and `drives
+/// scrub` must both still report clean afterwards, and `churn verify` must not - which is the whole
+/// argument that they answer different questions, demonstrated rather than asserted.
+///
+/// **IT DOES NOT REPAIR, AND NOTHING WILL.** Detection is the guarantee (`gsfs-carnage.md` §6):
+/// silent repair of data whose correct value is unknown is the second half of the mission statement
+/// this programme exists to defend. The accounting can be rebuilt because the free bitmap is a
+/// derived view of one irreducible source (§26.4); file content has no second source, so there is
+/// nothing to rebuild it from. `churn reset` removes the evidence when you are finished with it.
+fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    const DIR: &[u8] = b"/churn";
+    // 508 bytes of payload per block - the same figure `churn verify` reports its tear point
+    // against, so the offset it names will match the offset written here.
+    const PAYLOAD: usize = 508;
+    // Tear the SECOND block, so there is intact original before it - a tear at the very start
+    // would be indistinguishable from a file simply written by another generation - and, for any
+    // file past 1016 bytes, intact original after it too.
+    //
+    // The third block would be a better demonstration and is not reachable: `churn` cycles file
+    // sizes through 64/500/1200/3000, so after a short run the largest file on disk may be 1200
+    // bytes. Requiring 1524 made this refuse on a volume that had just been churned for eight
+    // seconds, which is the commonest way anyone will reach for it.
+    const AT: u64 = PAYLOAD as u64;
+
+    let mut data = [0u8; 4096];
+    let mut path = [0u8; 32];
+    for slot in 0..8u8 {
+        let mut pl = 0usize;
+        for &b in DIR { path[pl] = b; pl += 1; }
+        path[pl] = b'/'; pl += 1;
+        path[pl] = b'f'; pl += 1;
+        path[pl] = b'0' + slot; pl += 1;
+        path[pl..pl + 4].copy_from_slice(b".bin"); pl += 4;
+
+        let n = match fs_read_file(ctx, &path[..pl], &mut data, 20) { Some(n) => n, None => continue };
+        // Needs a whole block past the tear point, or there is nothing to disagree with.
+        if n < AT as usize + PAYLOAD { continue; }
+
+        let gen = data[0];
+        // A DIFFERENT generation, and one that cannot collide: 251 is prime and 37 is not a
+        // multiple of it, so `gen + 37` is never `gen` mod 251.
+        let gen2 = (gen as usize + 37) as u8 % 251;
+        let mut chunk = [0u8; PAYLOAD];
+        for k in 0..PAYLOAD {
+            let abs = AT as usize + k;
+            chunk[k] = ((gen2 as usize + abs) % 251) as u8;
+        }
+        if !fs_write_at(ctx, &path[..pl], AT, &chunk) {
+            let why = ctx.last_write_err.borrow();
+            out.line_fmt(ctx, format_args!("churn tear: could not write {} - {}",
+                                           str_of(&path[..pl]), why.get().unwrap_or("no reason given")));
+            return Err(ShellError::Unknown);
+        }
+        out.line_fmt(ctx, format_args!(
+            "churn tear: {} now holds generation {} from byte 0 and generation {} from byte {} - a MIX",
+            str_of(&path[..pl]), gen, gen2, AT));
+        out.line(ctx, "churn tear: the blocks are well-formed and their CRCs are correct, so `drives check`");
+        out.line(ctx, "churn tear: and `drives scrub` will BOTH still report clean. Only `churn verify` sees it.");
+        out.line(ctx, "churn tear: nothing repairs this - detection is the guarantee. `churn reset` removes it.");
+        return Ok(());
+    }
+    out.line(ctx, "churn tear: no churn file is large enough - run `churn 10` first, then tear one");
+    Err(ShellError::Unknown)
+}
+
+/// `churn reset` - remove `/churn` and everything in it.
+///
+/// **Explicit, never automatic.** `churn` leaves its files behind on purpose: after a power cut they
+/// ARE the evidence, and `churn verify` reads them. A run that finishes without a cut leaves them too
+/// - deleting data because a command happened to reach its end is the kind of helpfulness this
+/// project avoids, and the operator who wandered off mid-run would come back to find the thing they
+/// meant to examine gone.
+///
+/// The set is bounded at eight files anyway, rewritten in place, so nothing accumulates however many
+/// times it runs. This is for when you want the directory gone, not for hygiene it does not need.
+fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    match fs_request(ctx, OP_DELETE_TREE, b"/churn", &[]).as_ref()
+             .map(|r| r.payload_bytes().first().copied()) {
+        Some(Some(FS_OK))       => { out.line(ctx, "churn: /churn removed"); Ok(()) }
+        Some(Some(FS_NOTFOUND)) => { out.line(ctx, "churn: nothing to remove - /churn does not exist"); Ok(()) }
+        other => {
+            match other.flatten() {
+                Some(_) => out.line(ctx, "churn: could not remove /churn - see fs's log"),
+                None    => out.line(ctx, "churn: storage unavailable"),
+            }
+            Err(ShellError::Unknown)
         }
     }
-    if count == 0 { out.line(ctx, "  (empty)"); }
-    Ok(())
+}
+
+/// `churn verify` - is any file in `/churn` a MIX of two generations?
+///
+/// The companion to the load. `drives check` answers "is the structure sound" - the tree, the
+/// bitmap, the CRCs - and until this existed NOTHING answered "is any file's content a torn mix".
+/// A file holding the first half of one write and the second half of another has perfectly valid
+/// block CRCs (each block was written whole), sits in a perfectly valid directory, and occupies
+/// perfectly accounted blocks. Every check this project had would pass it.
+///
+/// `churn` writes `byte[k] = (gen + k) mod 251`, so one read is enough: take the generation from
+/// byte 0 and every later byte is predicted. The first byte that disagrees is the tear point, and
+/// its offset says which block boundary it fell on.
+fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    const DIR: &[u8] = b"/churn";
+    let mut checked = 0u32;
+    let mut torn = 0u32;
+    let mut empty = 0u32;
+    let mut truncated = false;
+    let mut data = [0u8; 4096];
+    let mut cur = DirCursor::new();
+    'pages: while let Some(from) = cur.next() {
+    let reply = match fs_request(ctx, OP_LIST_DIR, DIR, &from) {
+        Some(r) => r,
+        None => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
+    };
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < DIR_HDR {
+        if cur.pages_asked() == 1 {
+            ctx.console_writeln("churn verify: no /churn directory - nothing to check");
+            return Ok(());
+        }
+        // `break 'pages`, NOT `continue` - this is the page loop, and re-asking would never end.
+        break 'pages;
+    }
+    let count = cur.take(p);
+    let mut i = DIR_HDR;
+
+    for _ in 0..count {
+        if i >= p.len() { break; }
+        let nl = p[i] as usize;
+        i += 1;
+        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+        let is_dir = p[i + nl] != 0;
+        let mut path = [0u8; 64];
+        let mut pl = 0usize;
+        for &b in DIR { path[pl] = b; pl += 1; }
+        path[pl] = b'/'; pl += 1;
+        let take = nl.min(path.len() - pl);
+        path[pl..pl + take].copy_from_slice(&p[i..i + take]);
+        pl += take;
+        i += nl + 1 + 8 + 4 + 1;
+        if is_dir { continue; }
+
+        let n = match fs_read_file(ctx, &path[..pl], &mut data, 20) { Some(n) => n, None => continue };
+        checked += 1;
+        if n == 0 { empty += 1; continue; }
+        // The generation is byte 0 by construction; every later byte is then predicted.
+        let gen = data[0];
+        // Same source as the writer (`sdk::churn`), which is the whole point of it being there.
+        let bad_at = godspeed_sdk::churn::first_divergence(&data[..n]);
+        if let Some(k) = bad_at {
+            torn += 1;
+            out.line_fmt(ctx, format_args!(
+                "churn verify: TORN - {} diverges at byte {} of {} (block {}, offset {} within it)",
+                str_of(&path[..pl]), k, n, k / 508, k % 508));
+        }
+    }
+    }
+    truncated = cur.cut();
+
+    if truncated {
+        out.line(ctx, "churn verify: NOTE - /churn is larger than the walk could read, so some files were NOT checked");
+    }
+    if torn == 0 {
+        out.line_fmt(ctx, format_args!(
+            "churn verify: {} file(s) checked, {} empty, NONE torn - every file holds one generation end to end",
+            checked, empty));
+        Ok(())
+    } else {
+        out.line_fmt(ctx, format_args!(
+            "churn verify: {} of {} file(s) are TORN - each holds a mix of two writes. This is a DATA integrity failure, not a space-accounting one: report it with the serial log.",
+            torn, checked));
+        Err(ShellError::Unknown)
+    }
+}
+
+/// `seal <path>` - freeze a file's content, permanently.
+///
+/// **Asks once, because there is no undo.** Every other destructive-ish command here can be
+/// reversed by doing the opposite; this one cannot, by design - a seal a holder can lift is a
+/// request rather than a guarantee. The prompt is the only chance to have meant something else.
+fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), ShellError> {
+    let mut buf = [0u8; PATH_MAX];
+    let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+    ctx.console_writeln_fmt(format_args!(
+        "seal {} - its content can NEVER be changed again, and there is no unseal.", str_of(path)));
+    // `yes` as a fourth word skips the prompt, the same escape `chaos max-carnage` offers and for
+    // the same reason: a confirm reads the CONSOLE, so a script cannot answer one. The warning above
+    // still prints either way - what `yes` buys is not silence, it is the ability to be automated.
+    if !yes {
+        ctx.console_write(" Seal it? [y/N]: ");
+        // `read_confirm`, the same line-edited prompt `drives flash` and `max-carnage` use: the
+        // operator can backspace a typo, and the decision is the FINAL line - a mistyped `y`
+        // corrected to `n` cancels rather than proceeds.
+        if !read_confirm(ctx) {
+            ctx.console_writeln("seal: cancelled");
+            return Ok(());
+        }
+    }
+    let reply = fs_request(ctx, OP_SEAL, path, &[]);
+    match reply.as_ref().map(|r| r.payload_bytes().first().copied()) {
+        Some(Some(FS_OK)) => {
+            ctx.console_writeln_fmt(format_args!("sealed {}", str_of(path)));
+            Ok(())
+        }
+        Some(Some(FS_NOTFOUND)) => {
+            ctx.console_writeln_fmt(format_args!("seal: not found: {}", str_of(path)));
+            Err(ShellError::FileNotFound)
+        }
+        _ => {
+            // NAME THE REASON `fs` GAVE. This said "a directory, or storage unavailable" - two
+            // unrelated faults offered as a guess, and the operator left to open a service log to
+            // find out which. `fs` distinguishes them perfectly well ("only a file can be sealed" vs
+            // a storage failure) and now sends the reason back; it was simply not being read here.
+            //
+            // The fourth command today with this shape, after `write`, `move` and `copy`. The pattern
+            // is worth naming: a layer that knows why something failed and answers with a menu of
+            // possibilities costs the reader the one thing it could have told them (26.7).
+            match reply.as_ref().and_then(fs_err_reason) {
+                Some(why) => ctx.console_writeln_fmt(format_args!("seal: failed - {}", why)),
+                None      => ctx.console_writeln("seal: failed - see fs's log"),
+            }
+            Err(ShellError::Unknown)
+        }
+    }
 }
 
 /// `read <path>` - print a file's contents. The first command on the Ok/Err `Result` model:
@@ -12042,7 +14276,8 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
 const FCAP_TMP: &[u8] = b"/.fcap-selftest";
 const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
 fn cmd_fcap_help(ctx: &ServiceContext) {
-    ctx.console_writeln("fcap - file-as-capability self-check (a diagnostic, not a file tool)");
+    ctx.console_writeln_fmt(format_args!(
+        "fcap {} - file-as-capability self-check (a diagnostic, not a file tool)", UTIL_VERSION));
     ctx.console_writeln("");
     ctx.console_writeln("usage: fcap          run the self-check");
     ctx.console_writeln("       fcap help     this message");
@@ -12055,7 +14290,114 @@ fn cmd_fcap_help(ctx: &ServiceContext) {
     ctx.console_writeln("  - revocable: the cap goes stale on close and on rename (no silent rebind)");
     ctx.console_writeln("It takes no path and never touches your files. See CLAUDE.md 7.10 / Test 14.");
 }
+/// `fcap reuse` - THE STALE-HANDLE QUESTION THAT `fcap` CANNOT ASK: does a file capability
+/// minted before an `fs` restart reach whatever occupies its blocks afterwards?
+///
+/// **Why this needs its own command.** A capability cannot outlive the function that holds it here:
+/// the shell keeps no cap table of its own between commands, so an `fcap` at one prompt and a
+/// `kill fs` at the next would drop the handle before the interesting moment. The whole scenario -
+/// mint, restart, reuse, re-invoke - has to happen inside one command, which is what this is.
+///
+/// **What it proves, and what would be catastrophic.** `fs` mints a delegated resource capability
+/// per open (§7.10) and holds the `ResourceId -> file` map IN MEMORY. A restart empties that map
+/// and bumps the endpoint's generation, so every outstanding file cap should go stale. If one did
+/// NOT - if a `ResourceId` were reissued to a different file after the restart - the old holder
+/// would read a file it was never granted, through a capability the kernel still considers valid.
+/// That is not a leak of space, it is a leak of AUTHORITY, and nothing in a listing or an fsck
+/// would show it.
+///
+/// The sequence deliberately puts a DIFFERENT file in the same blocks: delete the original and
+/// write a replacement of the same size, so the allocator hands out the extent that was just freed.
+/// A stale cap that still resolved would then return the new file's bytes, and the test asserts
+/// exactly that text never comes back.
+fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
+    const OLDP: &[u8] = b"/ru_old.txt";
+    const NEWP: &[u8] = b"/ru_new.txt";
+    let mut ok = true;
+
+    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
+    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    if !matches!(fs_request(ctx, OP_WRITE_FILE, OLDP, b"OLDDATA").as_ref()
+                   .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+        ctx.console_writeln("fcap reuse: FAIL - could not create the original");
+        return Err(ShellError::Unknown);
+    }
+
+    let held = match fc_open(ctx, OLDP, RIGHT_READ) {
+        Some(c) => c,
+        None => { ctx.console_writeln("fcap reuse: FAIL - could not open the original as a cap"); return Err(ShellError::Unknown); }
+    };
+    // Prove the cap WORKS before the restart, or a later refusal proves nothing: a handle that was
+    // never valid is refused for the wrong reason and the test would pass while testing nothing.
+    let mut rbuf = [0u8; 1 + 8 + 4];
+    rbuf[0] = FOP_READ;
+    rbuf[9..13].copy_from_slice(&7u32.to_le_bytes());
+    match fc_invoke(ctx, held, RIGHT_READ, &rbuf) {
+        Some(r) if r.payload_bytes().len() >= 12 && &r.payload_bytes()[5..12] == b"OLDDATA" =>
+            ctx.console_writeln("fcap reuse: the cap reads the original before the restart"),
+        _ => { ctx.console_writeln("fcap reuse: FAIL - the cap did not read the original"); ctx.remove_cap(held); return Err(ShellError::Unknown); }
+    }
+
+    // RESTART `fs` UNDER THE HELD CAP.
+    ctx.console_writeln("fcap reuse: killing fs with the cap still held");
+    if ctx.kill("fs").is_err() {
+        ctx.console_writeln("fcap reuse: FAIL - could not kill fs");
+        ctx.remove_cap(held);
+        return Err(ShellError::Unknown);
+    }
+    // Wait on the TRUTH: `fs` answering again, not a fixed sleep (Commandment VIII).
+    let mut back = false;
+    for _ in 0..40 {
+        let _ = ctx.reacquire_by_name("fs");
+        if fs_request(ctx, OP_STAT_FILE, b"/", &[]).is_some() { back = true; break; }
+        ctx.yield_cpu();
+    }
+    if !back {
+        ctx.console_writeln("fcap reuse: FAIL - fs never came back");
+        ctx.remove_cap(held);
+        return Err(ShellError::Unknown);
+    }
+
+    // FREE THE BLOCKS, THEN PUT SOMETHING ELSE IN THEM. Same length, so the allocator is offered
+    // the extent it just reclaimed.
+    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
+    if !matches!(fs_request(ctx, OP_WRITE_FILE, NEWP, b"NEWDATA").as_ref()
+                   .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+        ctx.console_writeln("fcap reuse: FAIL - could not write the replacement");
+        ctx.remove_cap(held);
+        return Err(ShellError::Unknown);
+    }
+
+    // THE QUESTION. The old capability must not resolve to anything - and above all must not
+    // return the REPLACEMENT's bytes.
+    match fc_invoke(ctx, held, RIGHT_READ, &rbuf) {
+        None => ctx.console_writeln("fcap reuse: the stale cap is refused after the restart"),
+        Some(r) => {
+            let p = r.payload_bytes();
+            if p.len() >= 12 && &p[5..12] == b"NEWDATA" {
+                ctx.console_writeln("fcap reuse: FAIL - THE STALE CAP READ THE REPLACEMENT FILE");
+                ok = false;
+            } else if p.first() == Some(&FS_OK) {
+                ctx.console_writeln("fcap reuse: FAIL - the stale cap still resolved to something");
+                ok = false;
+            } else {
+                ctx.console_writeln("fcap reuse: the stale cap was refused by fs after the restart");
+            }
+        }
+    }
+
+    ctx.remove_cap(held);
+    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    if ok {
+        ctx.console_writeln("fcap reuse: ok - a capability minted before the restart reaches nothing after it");
+        Ok(())
+    } else {
+        Err(ShellError::Unknown)
+    }
+}
+
 fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    if arg.trim() == "reuse" { return cmd_fcap_reuse(ctx); }
     if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
     if !arg.trim().is_empty() {
         ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");
@@ -12150,6 +14492,62 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         None    => ctx.console_writeln("fcap: cap revoked after rename"),
         Some(_) => { fail(ctx, "fcap: FAIL cap usable after rename"); ok = false; }
     }
+
+    // ---- APPEND-ONLY: a capability whose writes may only move FORWARD ----
+    //
+    // This is the right `recorder` needs and could not have. Streaming a capture used to require
+    // full WRITE - the authority to go back over and rewrite the very history being recorded - so a
+    // log's integrity rested on the writer being well-behaved. A capability that cannot write
+    // backwards makes it unrewritable by construction instead (§7.3).
+    //
+    // Shaped like a real log, because that is what it is for: `WRITE_NEW` allocates the whole extent
+    // up front and chunks go in at block-aligned offsets, exactly as `recorder` does it. So the rule
+    // is against the resource's own HIGH-WATER MARK, not against end-of-file - the file is its final
+    // size from the first moment.
+    const APPEND_PATH: &[u8] = b"/.fcap_append";
+    const BLK: u64 = 508;   // DATA_PAYLOAD - `write_at` demands block-aligned offsets
+    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
+    let mut newreq = [0u8; 8];
+    newreq[..8].copy_from_slice(&(3 * BLK).to_le_bytes());
+    if !matches!(fs_request(ctx, OP_WRITE_NEW, APPEND_PATH, &newreq).as_ref().map(|r| r.payload_bytes().first().copied()),
+                 Some(Some(FS_OK))) {
+        fail(ctx, "fcap: FAIL pre-allocate append test file");
+        ok = false;
+    } else if let Some(ap) = fc_open(ctx, APPEND_PATH, RIGHT_READ | OPEN_APPEND_ONLY) {
+        ctx.console_writeln("fcap: opened append-only (file cap)");
+        let mut wr = |off: u64, tag: &[u8; 4]| -> Option<u8> {
+            let mut w = [0u8; 13];
+            w[0] = FOP_WRITE;
+            w[1..9].copy_from_slice(&off.to_le_bytes());
+            w[9..13].copy_from_slice(tag);
+            fc_invoke(ctx, ap, RIGHT_WRITE, &w).and_then(|r| r.payload_bytes().first().copied())
+        };
+        // Writing forward is the whole point and must succeed: two chunks, ascending.
+        let first  = wr(0, b"AAAA");
+        let second = wr(BLK, b"BBBB");
+        if first == Some(FS_OK) && second == Some(FS_OK) {
+            ctx.console_writeln("fcap: append-only writes moving FORWARD accepted");
+        } else {
+            fail(ctx, "fcap: FAIL append-only refused a forward write");
+            ok = false;
+        }
+        // Going BACK over what it already wrote must be refused. This is the assertion the whole
+        // right exists for; a pass here would mean the right is decorative.
+        match wr(0, b"XXXX") {
+            Some(FS_DENIED) => ctx.console_writeln("fcap: rewriting earlier bytes through an append-only cap DENIED"),
+            _ => { fail(ctx, "fcap: FAIL append-only cap could REWRITE what it had already written"); ok = false; }
+        }
+        // And the mark did not move backwards: a forward write still works afterwards.
+        match wr(2 * BLK, b"CCCC") {
+            Some(FS_OK) => ctx.console_writeln("fcap: a later forward write still accepted after the refusal"),
+            _ => { fail(ctx, "fcap: FAIL a refused write broke the high-water mark"); ok = false; }
+        }
+        ctx.remove_cap(ap);
+    } else {
+        fail(ctx, "fcap: FAIL open append-only");
+        ok = false;
+    }
+    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
 
     // Cleanup so `fcap` is leak-free and re-runnable (e.g. in selfcheck): drop both shell handles
     // (rw revoked at close, ro revoked at rename) and delete the throwaway file (now at the renamed
@@ -12803,7 +15201,7 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     }
     let reply = match fs_request(ctx, OP_WRITE_FILE, p, content.as_bytes()) {
         Some(r) => r,
-        None => { ctx.console_writeln("write: storage unavailable"); return Err(ShellError::Unknown); }
+        None => { fs_no_answer(ctx, "write"); return Err(ShellError::Unknown); }
     };
     let rp = reply.payload_bytes();
     if no_fs(ctx, rp) { return Err(ShellError::Unknown); }
@@ -12811,7 +15209,10 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
         Ok(())
     } else {
-        ctx.console_writeln("write: failed (bad path, or parent missing?)");
+        match fs_err_reason(&reply) {
+            Some(why) => ctx.console_writeln_fmt(format_args!("write: failed - {}", why)),
+            None      => ctx.console_writeln("write: failed (bad path, or parent missing?)"),
+        }
         Err(ShellError::Unknown)
     }
 }
@@ -12971,7 +15372,7 @@ fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), 
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
     let reply = match fs_request(ctx, op, path, &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("mkdir: storage unavailable"); return Err(ShellError::Unknown); }
+        None => { fs_no_answer(ctx, "mkdir"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
@@ -13040,7 +15441,7 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
     // Check the source exists and is a file (also surfaces the "no filesystem" hint).
     let stat = match fs_request(ctx, OP_STAT_FILE, &sp[..sl], &[]) {
         Some(r) => r,
-        None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
+        None => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
     };
     let stp = stat.payload_bytes();
     if no_fs(ctx, stp) { return Err(ShellError::Unknown); }
@@ -13065,7 +15466,15 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
             ctx.console_writeln_fmt(format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), bytes));
             Ok(())
         }
-        None => { ctx.console_writeln("copy: write failed (parent missing?)"); Err(ShellError::Unknown) }
+        None => {
+            match ctx.last_write_err.borrow().get() {
+                Some(why) if ctx.fs_unknown.get() =>
+                    ctx.console_writeln_fmt(format_args!("copy: OUTCOME UNKNOWN - {}", why)),
+                Some(why) => ctx.console_writeln_fmt(format_args!("copy: failed - {}", why)),
+                None      => ctx.console_writeln("copy: write failed (parent missing?)"),
+            }
+            Err(ShellError::Unknown)
+        }
     }
 }
 
@@ -13108,24 +15517,28 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
     let mut stack = PathStack::new();
     stack.push(&sp[..sl]);
     let (mut dirs, mut files) = (1u32, 0u32);
+    let mut short = false;
     while let Some(slen) = stack.pop(&mut sbuf) {
-        let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request(ctx, OP_LIST_DIR, &sbuf[..slen], &from) {
             Some(r) => r,
-            None => { ctx.console_writeln("copy: storage unavailable"); return Err(ShellError::Unknown); }
+            None => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        let count = p[1] as usize;
-        let mut i = 2usize;
+        // `break 'pages`, NOT `continue` - see `find`. This is the page loop now.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
+            i += nl + 1 + 8 + 4 + 1; // name_len + name + is_dir + size:u64 + mtime:u32
             let mut schild = [0u8; PATH_MAX];
             let clen = match join_path(&sbuf[..slen], name, &mut schild) { Some(c) => c, None => continue };
             let mut dchild = [0u8; PATH_MAX];
@@ -13137,10 +15550,20 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
                 files += 1;
             }
         }
+        }
+        if cur.cut() { short = true; }
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "copy: truncated - tree wider than {} pending directories (bounded walk)", FIND_QCAP));
+    }
+    // A COPY THAT SKIPPED FILES MUST NOT REPORT SUCCESS. Before the listing gained a cursor this
+    // was the everyday case rather than the edge one: past about twenty entries the rest of a
+    // directory was simply invisible here, and the summary below counted what it had seen and
+    // called it a copy of the tree (§26.7).
+    if short {
+        ctx.console_writeln_fmt(format_args!(
+            "copy: INCOMPLETE - a directory was too large to read fully ({} pages); some files were NOT copied", DIR_PAGE_MAX));
     }
     ctx.console_writeln_fmt(format_args!(
         "copied {} → {} ({} dirs, {} files)", str_of(&sp[..sl]), str_of(&dp[..dl]), dirs, files));
@@ -13196,6 +15619,644 @@ fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -
     Some(dst_root.len() + suffix.len())
 }
 
+// ===================================================================================
+// JOB CONTROL - `background`, `jobs`, `foreground`
+//
+// Design note: `docs/job-control-design.md`. Spec: `utilities/55_background.md`.
+//
+// A background job is a SPAWNED SERVICE (`copier`), not a state machine advanced inside this
+// loop. The argument is in §4 of the design note; the short form is that this shell has no
+// threads, its main loop blocks on keys, and the alternative hands the job the SHELL's authority
+// and the shell's 256 KiB stack. A service holds its own contract's caps and dies on its own.
+//
+// WHAT THIS TABLE IS, precisely: the shell's record of jobs it started. It is NOT the state of the
+// work - `copier` owns that, and the state shown for a live row is read from the service every
+// time it is displayed (§26.4: a derived view is legitimate when the source wins and it is
+// reconciled). When a job ends, its final state is FROZEN into the row, because the service keeps
+// only its most recent job and a finished job must stay reportable (§6 of the design note).
+// ===================================================================================
+
+/// `copier` control opcodes and states. Duplicated here rather than shared: services do not depend
+/// on one another's headers, which is the same call `recorder`'s opcodes get a few hundred lines up.
+const CP_OP_START: u8 = 1;
+const CP_OP_STATUS: u8 = 2;
+const CP_OP_CANCEL: u8 = 3;
+const CP_OP_OUTPUT: u8 = 4;
+const CP_OK: u8 = 0;
+
+/// What kind of work a job is. The bar for adding a third is NOT "is the command slow" - it is
+/// "is the command's value its EFFECT rather than its OUTPUT". A detached job holds no console
+/// capability, so anything whose whole product is printed text has nowhere to put it.
+const KIND_COPY: u8 = 0;
+const KIND_DELETE_TREE: u8 = 1;
+const KIND_CHECK: u8 = 2;
+const KIND_SCRUB: u8 = 3;
+const KIND_CHURN: u8 = 4;
+
+/// EVERY DETACHABLE COMMAND, ONCE. The refusal message is BUILT from this, so it cannot advertise a
+/// set the dispatch does not accept - the previous version was a hand-written sentence with a
+/// comment asking the next person to keep it in step, which is the drift this repository keeps
+/// having to repair (see `facts_check.py`, which exists for exactly this class of mistake).
+///
+/// `osdev test jobs` closes the other direction: it types every entry here and asserts none of them
+/// is refused, so a row that stops working fails a test rather than misleading a reader.
+const DETACHABLE: &[&str] = &[
+    "copy <src> <dst>",
+    "delete <path> recursive",
+    "drives check",
+    "drives scrub",
+    "churn <seconds>",
+];
+
+/// The list as one line, for the refusal. Fixed buffer, no allocation.
+fn detachable_line(buf: &mut [u8; 192]) -> usize {
+    let mut n = 0usize;
+    for (i, entry) in DETACHABLE.iter().enumerate() {
+        if i > 0 {
+            for &c in b", " {
+                if n < buf.len() { buf[n] = c; n += 1; }
+            }
+        }
+        for &c in entry.as_bytes() {
+            if n < buf.len() { buf[n] = c; n += 1; }
+        }
+    }
+    n
+}
+
+const ST_IDLE: u8 = 0;
+const ST_RUNNING: u8 = 1;
+const ST_DONE: u8 = 2;
+const ST_FAILED: u8 = 3;
+const ST_CANCELLED: u8 = 4;
+/// Not a `copier` state. The shell's own verdict when the service that was doing a live job is
+/// gone: the job did not finish and nobody can say how far it got, which is a different fact from
+/// `failed` and is reported as one.
+const ST_LOST: u8 = 5;
+
+const WHY_NO_SOURCE: u8 = 1;
+const WHY_NO_DEST: u8 = 2;
+const WHY_READ: u8 = 3;
+const WHY_WRITE: u8 = 4;
+const WHY_UNANSWERED: u8 = 5;
+
+/// Eight rows, fixed. The table does not GROW and does not QUEUE (§26.6, and §6 of the design
+/// note); a ninth job takes the row of the OLDEST FINISHED one, and is refused outright only when
+/// all eight are still live.
+///
+/// This used to say it would never "evict a row somebody has not read", which was the behaviour
+/// before eviction existed and was contradicted 240 lines below by the allocation site's own
+/// comment. Keeping a finished row forever is not a bound, it is a leak with a friendly name: the
+/// ninth `background` of a session was refused permanently, and the row it was protecting had in
+/// most cases already been read. Oldest-finished-first is the compromise - a record may be lost,
+/// the one least likely to still be wanted, and never a RUNNING job.
+const JOBS_MAX: usize = 8;
+
+#[derive(Clone, Copy)]
+struct JobRow {
+    used: bool,
+    kind: u8,
+    /// True while this row is the one `copier` is working on. Exactly one row can be live, because
+    /// there is one `copier` and it takes one job at a time.
+    live: bool,
+    id: u32,
+    state: u8,
+    why: u8,
+    copied: u64,
+    total: u64,
+    elapsed: u64,
+    src: [u8; PATH_MAX],
+    slen: usize,
+    dst: [u8; PATH_MAX],
+    dlen: usize,
+}
+
+impl JobRow {
+    const fn empty() -> Self {
+        JobRow { used: false, kind: KIND_COPY, live: false, id: 0, state: ST_IDLE, why: 0,
+                 copied: 0, total: 0, elapsed: 0,
+                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0 }
+    }
+}
+
+struct JobTable {
+    rows: [JobRow; JOBS_MAX],
+    /// Ids never repeat within a session, so `foreground 3` cannot reach a different job than the
+    /// one the operator saw. They are not slots.
+    next_id: u32,
+}
+
+impl JobTable {
+    const fn new() -> Self {
+        JobTable { rows: [JobRow::empty(); JOBS_MAX], next_id: 1 }
+    }
+}
+
+fn state_word(st: u8) -> &'static str {
+    match st {
+        ST_RUNNING => "running",
+        ST_DONE => "done",
+        ST_FAILED => "failed",
+        ST_CANCELLED => "stopped",
+        ST_LOST => "lost",
+        _ => "idle",
+    }
+}
+
+/// Why a job failed, in words. `failed` alone makes the operator guess which half went wrong, and
+/// the two halves have different fixes.
+fn why_words(why: u8) -> &'static str {
+    match why {
+        WHY_NO_SOURCE => "the source does not exist, or is a directory",
+        WHY_NO_DEST => "the destination could not be created (no space, bad path, or it exists)",
+        WHY_READ => "reading the source failed",
+        WHY_WRITE => "writing the destination failed",
+        WHY_UNANSWERED => "the filesystem stopped answering (it is slow or stuck, not necessarily broken)",
+        _ => "no reason recorded",
+    }
+}
+
+/// Ask `copier` where it is. `None` means it did not answer - which, for a row this shell believes
+/// is live, is itself the answer (see `refresh_jobs`).
+/// What asking `copier` produced. THE THIRD CASE IS THE POINT: a service that is alive and does not
+/// answer is not a service that is gone, and collapsing the two made a busy job look like a dead
+/// one. `copier` is single-threaded, so while it is inside one long `fs` request - a recursive
+/// delete is exactly that - it reads no messages at all. Reporting that as `lost` would declare a
+/// job dead precisely while it is doing its work.
+enum Ask {
+    Answer(u8, u8, u8, u64, u64, u64), // state, why, kind, copied, total, elapsed
+    Busy,                              // alive, did not answer in time
+    Gone,                              // the service is not running
+}
+
+fn copier_status(ctx: &ShellCtx) -> Ask {
+    if slot_of(ctx, "copier").is_none() {
+        return Ask::Gone;
+    }
+    let _ = ctx.reacquire_by_name("copier");
+    let r = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_STATUS]), 8) {
+        Some(r) => r,
+        None => return Ask::Busy,
+    };
+    let p = r.payload_bytes();
+    // Byte 1 is the op being answered. A reply for a different op is a stale one left over from an
+    // abandoned request, and reading it as this answer is how a status display starts lying.
+    if p.len() < 29 || p[0] != CP_OK || p[1] != CP_OP_STATUS {
+        return Ask::Busy;
+    }
+    let st = p[2];
+    let why = p[3];
+    let kind = p[4];
+    let copied = u64::from_le_bytes([p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12]]);
+    let total = u64::from_le_bytes([p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20]]);
+    let elapsed = u64::from_le_bytes([p[21], p[22], p[23], p[24], p[25], p[26], p[27], p[28]]);
+    Ask::Answer(st, why, kind, copied, total, elapsed)
+}
+
+/// Bring the live row up to date from the service, and FREEZE it if the job has ended.
+///
+/// A SERVICE THAT IS GONE MEANS THE JOB IS GONE. `copier` is deliberately not restarted on death
+/// (its contract says why), so if the shell believes a job is running and the service does not
+/// answer, the honest report is `lost` - not `running` forever, and not `failed`, which would claim
+/// knowledge of a failure nobody observed.
+fn refresh_jobs(ctx: &ShellCtx) {
+    let live_idx = {
+        let t = ctx.jobs.borrow();
+        t.rows.iter().position(|r| r.used && r.live)
+    };
+    let i = match live_idx { Some(i) => i, None => return };
+    match copier_status(ctx) {
+        Ask::Answer(st, why, kind, copied, total, elapsed) => {
+            let mut t = ctx.jobs.borrow_mut();
+            let row = &mut t.rows[i];
+            row.state = st;
+            row.why = why;
+            row.kind = kind;
+            row.copied = copied;
+            row.total = total;
+            row.elapsed = elapsed;
+            if st != ST_RUNNING {
+                row.live = false;
+            }
+        }
+        // ALIVE AND BUSY. Leave the row exactly as it was: the last figures this shell saw are
+        // still the last true ones, and inventing a state here would be worse than showing a
+        // reading that is a few seconds old.
+        Ask::Busy => {}
+        Ask::Gone => {
+            let mut t = ctx.jobs.borrow_mut();
+            let row = &mut t.rows[i];
+            row.state = ST_LOST;
+            row.live = false;
+        }
+    }
+}
+
+/// `background <command...>` - start a job detached and give the prompt straight back.
+fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+    if argc < 2 {
+        ctx.console_writeln("usage: background copy <src> <dst>");
+        return Err(ShellError::Unknown);
+    }
+    // ONE COMMAND, NOT A CATEGORY. `background` is not a modifier that can be put in front of
+    // anything: a detached job is a service holding its own caps, so a command is backgroundable
+    // exactly when a service exists to run it (§26.2, and §4 of the design note). `copy` is the
+    // one that does. Anything else is refused by name rather than half-working - `background chaos`
+    // would be a storm nobody can see or stop, which is worse than no answer.
+    // TWO COMMANDS, and the bar for a third is not "is it slow". A detached job holds no console
+    // capability, so a command whose value is its OUTPUT has nowhere to put it: `selfcheck`, `chaos`,
+    // `find`, `run` and `drives check` all produce a report somebody has to read, and detaching one
+    // would mean either discarding the answer or inventing a transcript this shell does not have.
+    // They are refused by name and told why, which is the honest answer rather than the incomplete
+    // one (§26.2, §26.7).
+    let kind = match args[1] {
+        "copy" => KIND_COPY,
+        "delete" => KIND_DELETE_TREE,
+        // `drives check` - the first detachable command whose product is a REPORT. It qualifies
+        // because it is ONE `fs` request the job service can issue itself, and because the
+        // transcript gives the answer somewhere to live until `foreground` asks for it.
+        "drives" if argc >= 3 && args[2] == "check" => KIND_CHECK,
+        "drives" if argc >= 3 && args[2] == "scrub" => KIND_SCRUB,
+        // `churn` detaches because its value is what it WRITES, and because it is the one command
+        // somebody wants the prompt back during: it holds the console for its whole duration today,
+        // so a ten-minute run is ten minutes of a blind machine. Only the DURATION form - `churn
+        // verify`, `tear` and `reset` are one-shot and stay at the prompt.
+        "churn" if argc >= 3 && args[2].parse::<u64>().is_ok() => KIND_CHURN,
+        other => {
+            ctx.console_writeln_fmt(format_args!(
+                "background: `{}` not supported for it runs inside the shell - a job runs as a detachable separate service.",
+                other));
+            let mut buf = [0u8; 192];
+            let n = detachable_line(&mut buf);
+            ctx.console_writeln_fmt(format_args!("  detachable services: {}", str_of(&buf[..n])));
+            return Err(ShellError::Unknown);
+        }
+    };
+    if kind == KIND_CHURN {
+        // No paths: the job owns /churn. The seconds ride as the trailing parameter.
+    } else if kind == KIND_CHECK || kind == KIND_SCRUB {
+        // No paths: the job walks the whole volume.
+    } else if kind == KIND_DELETE_TREE {
+        // Only the RECURSIVE form is worth detaching: a plain delete is one quick metadata edit.
+        // Refusing the short form rather than accepting it keeps `jobs` free of rows that were
+        // over before they were listed.
+        if argc < 4 || args[3] != "recursive" {
+            ctx.console_writeln("background: a plain delete is one edit - just run it, or say `recursive`");
+            return Err(ShellError::Unknown);
+        }
+    } else if argc < 4 {
+        ctx.console_writeln("usage: background copy <src> <dst>");
+        return Err(ShellError::Unknown);
+    }
+    // No nesting: `background background x` is refused, not defined (§7 of the design note).
+    if args[2] == "background" {
+        ctx.console_writeln("background: cannot nest");
+        return Err(ShellError::Unknown);
+    }
+
+    refresh_jobs(ctx);
+    {
+        let t = ctx.jobs.borrow();
+        if let Some(r) = t.rows.iter().find(|r| r.used && r.live) {
+            ctx.console_writeln_fmt(format_args!(
+                "background: job {} is still running - one at a time", r.id));
+            return Err(ShellError::Unknown);
+        }
+    }
+
+    let mut sbuf = [0u8; PATH_MAX];
+    let mut slocal = [0u8; PATH_MAX];
+    let mut slen = 0usize;
+    if kind != KIND_CHECK && kind != KIND_SCRUB && kind != KIND_CHURN {
+        let src = match resolve_or_err(ctx, cwd, args[2], &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+        slen = src.len();
+        slocal[..slen].copy_from_slice(src);
+    }
+    let mut dbuf = [0u8; PATH_MAX];
+    let mut dlocal = [0u8; PATH_MAX];
+    let mut dlen = 0usize;
+    if kind == KIND_COPY {
+        let dst = match resolve_or_err(ctx, cwd, args[3], &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
+        dlen = dst.len();
+        dlocal[..dlen].copy_from_slice(dst);
+    }
+
+    // A free row BEFORE spawning anything: a table that cannot record the job must not start it,
+    // or the copy runs with nothing able to report or stop it.
+    let slot = {
+        let t = ctx.jobs.borrow();
+        match t.rows.iter().position(|r| !r.used) {
+            Some(i) => i,
+            // No free row: take the OLDEST FINISHED one. Ids are monotonic, so the smallest id
+            // among the not-live rows is the oldest job, and a finished row is a record somebody
+            // may not have read - which is why the oldest goes first rather than an arbitrary one.
+            None => match t.rows.iter().enumerate()
+                        .filter(|(_, r)| r.used && !r.live)
+                        .min_by_key(|(_, r)| r.id)
+                        .map(|(i, _)| i) {
+                Some(i) => i,
+                None => {
+                    ctx.console_writeln("background: every job row is live - nothing can be evicted");
+                    return Err(ShellError::Unknown);
+                }
+            }
+        }
+    };
+
+    // SPAWN ON DEMAND, the `recorder` shape: nothing costs anything until a job is wanted.
+    if slot_of(ctx, "copier").is_none() && ctx.spawn("copier").is_err() {
+        ctx.console_writeln("background: could not spawn `copier`");
+        return Err(ShellError::Unknown);
+    }
+    let _ = ctx.reacquire_by_name("copier");
+
+    let mut req = [0u8; 4 + 2 * PATH_MAX + 8];
+    req[0] = CP_OP_START;
+    req[1] = kind;
+    req[2] = slen as u8;
+    req[3..3 + slen].copy_from_slice(&slocal[..slen]);
+    req[3 + slen] = dlen as u8;
+    req[4 + slen..4 + slen + dlen].copy_from_slice(&dlocal[..dlen]);
+    let mut n = 4 + slen + dlen;
+    // The trailing parameter: churn's duration. Kinds that take none send none.
+    if kind == KIND_CHURN {
+        let secs: u64 = args[2].parse().unwrap_or(30);
+        req[n..n + 8].copy_from_slice(&secs.to_le_bytes());
+        n += 8;
+    }
+
+    let ok = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req[..n]), 12) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            p.first() == Some(&CP_OK) && p.get(1) == Some(&CP_OP_START)
+        }
+        None => {
+            ctx.console_writeln("background: `copier` did not answer");
+            return Err(ShellError::Unknown);
+        }
+    };
+    if !ok {
+        // The service records WHY it refused before it answers, so ask rather than print a shrug.
+        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _) => w, _ => 0 };
+        ctx.console_writeln_fmt(format_args!("background: refused - {}", why_words(why)));
+        return Err(ShellError::Unknown);
+    }
+
+    let mut t = ctx.jobs.borrow_mut();
+    let id = t.next_id;
+    t.next_id += 1;
+    let row = &mut t.rows[slot];
+    *row = JobRow::empty();
+    row.used = true;
+    row.kind = kind;
+    row.live = true;
+    row.id = id;
+    row.state = ST_RUNNING;
+    row.slen = slen;
+    row.src[..slen].copy_from_slice(&slocal[..slen]);
+    row.dlen = dlen;
+    row.dst[..dlen].copy_from_slice(&dlocal[..dlen]);
+    drop(t);
+    ctx.console_writeln_fmt(format_args!("[backgrounded] job {}", id));
+    Ok(())
+}
+
+/// `jobs` - the table. A PRODUCER: one row per line, so `jobs | where state=running` works and no
+/// bespoke positional filter is needed (conventions rule 12, and §3 of the design note).
+/// Is `id` the job the service is still holding a transcript for?
+///
+/// THE SERVICE KEEPS ONE, not eight. It runs one job at a time and its ring is cleared when the next
+/// one starts, so only the most recent job's output still exists. Asking for an older one's would
+/// replay the WRONG job's text under the right job's heading - a lie that would read perfectly.
+/// The shell therefore checks before replaying, and says nothing rather than something false.
+fn is_newest(ctx: &ShellCtx, id: u32) -> bool {
+    let t = ctx.jobs.borrow();
+    t.rows.iter().filter(|r| r.used).map(|r| r.id).max() == Some(id)
+}
+
+/// `jobs quit <id>` - stop a job without attaching to it first.
+///
+/// WHY THIS EXISTS given `foreground <id>` then `q` already works: because making somebody attach to
+/// a job in order to stop it is the interface forgetting what they just told it - the same argument
+/// §2 of the design note makes for why `background` exists when `b` already would.
+///
+/// AND WHY IT IS NOT `kill copier`: killing the service skips its cleanup, so a half-written
+/// destination survives as a full-size file with an undefined tail. This routes through the
+/// service's own cancel, which removes it. A job is not the service that happens to be running it.
+fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let want: u32 = match arg.trim().parse() {
+        Ok(v) => v,
+        Err(_) => { ctx.console_writeln("usage: jobs quit <job>"); return Err(ShellError::Unknown); }
+    };
+    refresh_jobs(ctx);
+    let (found, live, state) = {
+        let t = ctx.jobs.borrow();
+        match t.rows.iter().find(|r| r.used && r.id == want) {
+            Some(r) => (true, r.live, r.state),
+            None => (false, false, ST_IDLE),
+        }
+    };
+    if !found {
+        ctx.console_writeln_fmt(format_args!("jobs quit: no job {}", want));
+        return Err(ShellError::Unknown);
+    }
+    if !live {
+        // Refused rather than reported as done: asking to stop something that already stopped is
+        // worth saying out loud, because the operator believed it was still running.
+        ctx.console_writeln_fmt(format_args!("jobs quit: job {} is already {}", want, state_word(state)));
+        return Err(ShellError::Unknown);
+    }
+    match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 12) {
+        Some(_) => {
+            refresh_jobs(ctx);
+            ctx.console_writeln_fmt(format_args!("job {} stopped", want));
+            Ok(())
+        }
+        None => {
+            // The cancel did not land. Saying "stopped" here would be the silent-failure this
+            // project forbids: the job may well still be running.
+            ctx.console_writeln_fmt(format_args!(
+                "jobs quit: job {} did not acknowledge - it may still be running; check `jobs`", want));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    refresh_jobs(ctx);
+    let t = ctx.jobs.borrow();
+    if !t.rows.iter().any(|r| r.used) {
+        out.line(ctx, "no jobs");
+        return Ok(());
+    }
+    out.line(ctx, "JOB  STATE    PROGRESS  COMMAND");
+    for r in t.rows.iter().filter(|r| r.used) {
+        // Percent is derived and shown only where it means something: a zero-byte file is 100% done
+        // the moment it starts, and "0%" on a finished job reads as a failure.
+        // A recursive delete has no measurable progress - `fs` does the whole walk in one
+        // operation - so the column says so rather than printing a number nobody computed. "0%"
+        // would read as stuck and "100%" as finished; both would be inventions.
+        let mut cmd = [0u8; 2 * PATH_MAX + 32];
+        let clen = job_command(r, &mut cmd);
+        if r.kind == KIND_COPY || r.kind == KIND_CHURN {
+            let pct = if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 };
+            out.line_fmt(ctx, format_args!("{:<4} {:<8} {:>3}%      {}",
+                r.id, state_word(r.state), pct, str_of(&cmd[..clen])));
+        } else {
+            // No percentage for a job whose progress nothing can measure - `-`, not an invented 0.
+            out.line_fmt(ctx, format_args!("{:<4} {:<8}    -      {}",
+                r.id, state_word(r.state), str_of(&cmd[..clen])));
+        }
+        if r.state == ST_FAILED {
+            out.line_fmt(ctx, format_args!("     reason: {}", why_words(r.why)));
+        }
+        if r.state == ST_LOST {
+            out.line(ctx, "     reason: `copier` is gone - the job did not finish and how far it got is unknown");
+        }
+    }
+    Ok(())
+}
+
+/// Replay a job's transcript: what it had to say, held in a fixed ring in the job service until
+/// somebody asks for it.
+///
+/// THIS IS WHY A DETACHED JOB CAN PRODUCE OUTPUT WITHOUT HOLDING A CONSOLE. The bytes sit in the
+/// service; nothing is pushed anywhere; `foreground` pulls them. So the property that makes the
+/// whole design safe is untouched - a job still cannot write over a prompt somebody is typing at,
+/// because it still holds no capability that reaches the console.
+///
+/// A DROP IS ANNOUNCED. The ring is 4 KiB and ages out its oldest lines, so a long report can be
+/// incomplete - and an incomplete report that looks complete is exactly the silent failure this
+/// project forbids. The count comes back with every page and is printed before the text.
+fn replay_transcript(ctx: &ShellCtx) {
+    if slot_of(ctx, "copier").is_none() {
+        return;
+    }
+    let mut off = 0u32;
+    let mut announced = false;
+    // Bounded: the ring is 4 KiB and a page carries up to 2 KiB, so three passes is already more
+    // than it can hold. A loop that trusted the service to terminate it would hang the prompt on a
+    // service that answered oddly.
+    for _ in 0..4 {
+        let mut req = [0u8; 5];
+        req[0] = CP_OP_OUTPUT;
+        req[1..5].copy_from_slice(&off.to_le_bytes());
+        let r = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req), 8) {
+            Some(r) => r,
+            None => return,
+        };
+        let p = r.payload_bytes();
+        if p.len() < 10 || p[0] != CP_OK || p[1] != CP_OP_OUTPUT {
+            return;
+        }
+        let dropped = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
+        let total = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
+        if !announced {
+            announced = true;
+            if dropped > 0 {
+                ctx.console_writeln_fmt(format_args!(
+                    "  ... {} earlier byte(s) dropped - the transcript is 4 KiB and this job said more", dropped));
+            }
+        }
+        let body = &p[10..];
+        if body.is_empty() {
+            return;
+        }
+        for line in body.split(|&c| c == b'\n') {
+            if !line.is_empty() {
+                ctx.console_writeln_fmt(format_args!("  {}", str_of(line)));
+            }
+        }
+        off += body.len() as u32;
+        if off >= total {
+            return;
+        }
+    }
+}
+
+/// `foreground <id>` - attach the console to a job again.
+fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let want: u32 = match arg.parse() {
+        Ok(v) => v,
+        Err(_) => { ctx.console_writeln("usage: foreground <job>"); return Err(ShellError::Unknown); }
+    };
+    refresh_jobs(ctx);
+    let (found, live, state, why) = {
+        let t = ctx.jobs.borrow();
+        match t.rows.iter().find(|r| r.used && r.id == want) {
+            Some(r) => (true, r.live, r.state, r.why),
+            None => (false, false, ST_IDLE, 0),
+        }
+    };
+    if !found {
+        ctx.console_writeln_fmt(format_args!("foreground: no job {}", want));
+        return Err(ShellError::Unknown);
+    }
+    if !live {
+        // A finished job still answers `foreground` with its outcome rather than an error: the
+        // operator asked what happened, and "no such job" would be false.
+        ctx.console_writeln_fmt(format_args!("job {} is {}", want, state_word(state)));
+        if state == ST_FAILED {
+            ctx.console_writeln_fmt(format_args!("  reason: {}", why_words(why)));
+        }
+        // ATTACHING TO A FINISHED JOB MEANS READING WHAT IT SAID. That is what makes a report-
+        // producing command detachable at all, and it is why no `jobs output <id>` verb exists:
+        // replaying a transcript IS attaching, so a second word for it would be a second way to
+        // say `foreground` (§26.2).
+        if is_newest(ctx, want) {
+            replay_transcript(ctx);
+        }
+        return Ok(());
+    }
+
+    ctx.console_writeln("[q] cancel   [b] background");
+    let mut shown = 101u32; // impossible, so the first sample always prints
+    loop {
+        if let Some(b) = ctx.try_console_read() {
+            if b == b'b' || b == b'B' {
+                ctx.console_writeln_fmt(format_args!("[backgrounded] job {}", want));
+                return Ok(());
+            }
+            if b == b'q' || b == b'Q' || b == 0x1b {
+                // `q` STOPS THE TASK, not just this view of it (conventions rule 11). Anything else
+                // would make the key mean two different things depending on what it is pressed in.
+                let _ = ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 8);
+                refresh_jobs(ctx);
+                ctx.console_writeln_fmt(format_args!("job {} stopped", want));
+                return Ok(());
+            }
+        }
+        refresh_jobs(ctx);
+        let (st, pct, why) = {
+            let t = ctx.jobs.borrow();
+            match t.rows.iter().find(|r| r.used && r.id == want) {
+                Some(r) => (r.state,
+                            if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 },
+                            r.why),
+                None => (ST_LOST, 0, 0),
+            }
+        };
+        if st != ST_RUNNING {
+            match st {
+                ST_DONE => ctx.console_writeln_fmt(format_args!("job {} done", want)),
+                ST_FAILED => {
+                    ctx.console_writeln_fmt(format_args!("job {} failed", want));
+                    ctx.console_writeln_fmt(format_args!("  reason: {}", why_words(why)));
+                }
+                ST_LOST => ctx.console_writeln_fmt(format_args!(
+                    "job {} lost - `copier` is gone and how far it got is unknown", want)),
+                _ => ctx.console_writeln_fmt(format_args!("job {} {}", want, state_word(st))),
+            }
+            return Ok(());
+        }
+        if pct != shown {
+            shown = pct;
+            ctx.console_writeln_fmt(format_args!("copying... {}%", pct));
+        }
+        ctx.yield_cpu();
+    }
+}
+
 /// `rename <path> <newname>` - rename an entry in place (not a move; newname is one
 /// component). fs edits the directory entry; no blocks are read or freed.
 fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
@@ -13212,7 +16273,7 @@ fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<()
         }
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
         Some(_) => { ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("rename: storage unavailable"); Err(ShellError::Unknown) }
+        None    => { fs_no_answer(ctx, "rename"); Err(ShellError::Unknown) }
     }
 }
 
@@ -13255,7 +16316,7 @@ fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
         Some(_) if recursive => { ctx.console_writeln("delete: failed (not found, or tree too deep?)"); Err(ShellError::Unknown) }
         Some(_) => { ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("delete: storage unavailable"); Err(ShellError::Unknown) }
+        None    => { fs_no_answer(ctx, "delete"); Err(ShellError::Unknown) }
     }
 }
 
@@ -13282,8 +16343,16 @@ fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
             Ok(())
         }
         Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) => { ctx.console_writeln("move: failed (not found, or dest exists?)"); Err(ShellError::Unknown) }
-        None    => { ctx.console_writeln("move: storage unavailable"); Err(ShellError::Unknown) }
+        Some(ref m) => {
+            match fs_err_reason(m) {
+                Some(why) if ctx.fs_unknown.get() =>
+                    ctx.console_writeln_fmt(format_args!("move: OUTCOME UNKNOWN - {}", why)),
+                Some(why) => ctx.console_writeln_fmt(format_args!("move: failed - {}", why)),
+                None      => ctx.console_writeln("move: failed (not found, or dest exists?)"),
+            }
+            Err(ShellError::Unknown)
+        }
+        None    => { fs_no_answer(ctx, "move"); Err(ShellError::Unknown) }
     }
 }
 
@@ -13306,26 +16375,30 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     // default is a plain substring match (so `find report` still finds `report-final.txt`).
     let is_glob = target.iter().any(|&b| b == b'*' || b == b'?');
     let mut matches = 0u32;
+    let mut short = false;
     let mut dir = [0u8; PATH_MAX];
     while let Some(dlen) = stack.pop(&mut dir) {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
             ReqOutcome::Reply(r) => r,
             ReqOutcome::Aborted => return Ok(()),
             ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        let count = p[1] as usize;
-        let mut i = 2usize;
+        // `break 'pages`, NOT `continue` - see the records `find`. This is the page loop now.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        let count = cur.take(p);
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() { break; }
             let nl = p[i] as usize;
             i += 1;
-            if i + nl + 1 + 8 > p.len() { break; }
+            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
             let name = &p[i..i + nl];
             let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8; // name_len + name + is_dir + size:u64
+            i += nl + 1 + 8 + 4 + 1; // name_len + name + is_dir + size:u64 + mtime:u32
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
                 let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
@@ -13339,10 +16412,16 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
                 }
             }
         }
+        }
+        if cur.cut() { short = true; }
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
+    }
+    if short {
+        ctx.console_writeln_fmt(format_args!(
+            "find: INCOMPLETE - a directory was too large to read fully ({} pages); some files were NOT searched", DIR_PAGE_MAX));
     }
     ctx.console_writeln_fmt(format_args!("find: {} match(es)", matches));
     Ok(()) // a search that finds nothing still succeeded (0 matches is not an error)
@@ -13378,6 +16457,8 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
     // a non-last ancestor draws a `│` continuation, a last one draws blank). The DFS finishes a
     // subtree before its siblings, so this stays valid for every descendant.
     let mut level_last = [false; TREE_MAX_DEPTH];
+    // Did the walk stop at its depth bound rather than at the end of the tree? See the push site.
+    let mut deep = false;
     let mut pre = [0u8; TREE_PREFIX_MAX];
     while let Some((plen, is_dir, depth, is_last)) = stack.pop(&mut buf) {
         let d = depth as usize;
@@ -13400,26 +16481,30 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         if !is_dir { files += 1; continue; }
         if d > 0 { dirs += 1; }
 
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &[]) {
+        let mut cur = DirCursor::new();
+        'pages: while let Some(from) = cur.next() {
+        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &from) {
             ReqOutcome::Reply(r) => r,
             ReqOutcome::Aborted => return Ok(()),
             ReqOutcome::Timeout => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
         };
         let p = reply.payload_bytes();
         if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        if p.first() != Some(&FS_OK) || p.len() < 2 { continue; }
-        // Record each child's offset, then push in REVERSE so they pop in directory order.
-        let count = p[1] as usize;
+        // `break 'pages`, NOT `continue` - see `find`. This is the page loop now.
+        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
+        // Record each child's offset, then push in REVERSE so they pop in directory order. Both
+        // halves stay INSIDE the page loop: the offsets point into THIS reply and do not outlive it.
+        let count = cur.take(p);
         let mut offs = [0usize; TREE_FANOUT];
         let mut nc = 0usize;
-        let mut i = 2usize;
+        let mut i = DIR_HDR;
         for _ in 0..count {
             if i >= p.len() || nc >= TREE_FANOUT { break; }
             let nl = p[i] as usize;
             if i + 1 + nl + 1 + 8 > p.len() { break; }
             offs[nc] = i;
             nc += 1;
-            i += 1 + nl + 1 + 8;
+            i += 1 + nl + 1 + 8 + 4 + 1;
         }
         for k in (0..nc).rev() {
             let off = offs[k];
@@ -13428,10 +16513,41 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
             let cdir = p[off + 1 + nl] != 0;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&buf[..plen], cname, &mut child) {
+                // STOPPING SILENTLY AT THE DEPTH BOUND IS A WRONG ANSWER SERVED AS A RIGHT ONE.
+                //
+                // The walk was already bounded, so a crafted directory that contains itself could
+                // not hang it (`osdev test fs-hostile`). But it printed twenty-odd levels of a
+                // structure that does not exist and then simply stopped, with nothing to say it had
+                // given up - so the output read as a complete tree. A bound that is not reported is
+                // indistinguishable from having reached the end (§26.7).
+                if depth as usize + 1 >= TREE_MAX_DEPTH {
+                    deep = true;
+                    continue;
+                }
                 // The last child read (forward order) is its parent's last → draws `└──`.
                 stack.push(&child[..clen], cdir, depth + 1, k == nc - 1);
+            } else {
+                // THE PATH GOT TOO LONG, AND THIS IS THE BOUND THAT ACTUALLY FIRES FIRST.
+                //
+                // `join_path` returns None when a child's full path will not fit `PATH_MAX`, and
+                // this arm used to be absent - the child was silently skipped. On an ordinary tree
+                // that is nearly invisible; on a directory that CONTAINS ITSELF it is what stops the
+                // walk, at about two dozen levels, saying nothing - so the output reads as a
+                // complete tree of a structure that does not exist.
+                //
+                // Measured rather than guessed: `osdev test fs-hostile` crafts exactly that disk,
+                // and the depth guard above never fired because this limit was reached first.
+                deep = true;
             }
         }
+        }
+        // A directory too large to read fully is the same class of answer as the depth bound: the
+        // tree drawn is not the tree on disk, and saying nothing makes it read as though it were.
+        if cur.cut() { deep = true; }
+    }
+    if deep {
+        ctx.console_writeln_fmt(format_args!(
+            "tree: stopped early - a LIMIT was reached (path length, {} levels of depth, or a directory larger than {} listing pages), not the end of the tree. Something is nested very deeply, or a directory contains itself.", TREE_MAX_DEPTH, DIR_PAGE_MAX));
     }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
@@ -14119,8 +17235,17 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
 /// `drives check` - fsck: walk the tree (the source of truth), rebuild the free bitmap + free
 /// count from it, and verify every block's CRC. Repairs allocation drift non-destructively;
 /// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
-/// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
+/// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64,
+/// stored_free_before:u64] - the last field is what the SUPERBLOCK claimed before the rebuild, so a
+/// repair that was NEEDED can be reported rather than only its result.
 fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
+    // POINT AT THE DETACHABLE FORM, because `[q] quit` is the only key this can honestly offer and
+    // an operator reasonably expects `[b] background` beside it (that pair is the premise job
+    // control was designed from). It cannot be offered HERE: a foreground check is the shell parked
+    // in ONE `fs` request, so there is no running state to hand to a service - `b` could only
+    // abandon the pass and start it again from scratch, queued behind the one `fs` is still doing.
+    // Saying where the real thing lives costs a line and does not lie about a key.
+    ctx.console_writeln("drives check - walking the tree   [q] quit   (detach it next time: background drives check)");
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {
@@ -14138,6 +17263,30 @@ fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
                 ctx.console_writeln_fmt(format_args!(
                     "check: {} files, {} dirs, {} bad; {} blocks used, {} free (bitmap + free count rebuilt from the tree)",
                     files, dirs, bad, used, free));
+                // SAY WHETHER A REPAIR WAS NEEDED, not just that one ran.
+                //
+                // fsck rebuilt the free count from the tree either way, so this line used to look
+                // identical on a healthy volume and on one whose accounting had drifted - and drift
+                // is evidence about something else (an interrupted write, a leaked extent) that was
+                // being repaired away unseen (26.7). The older reply has no such field, so a short
+                // one still prints the line above and simply says nothing more.
+                if p.len() >= 37 {
+                    let before = u64a(29);
+                    if before == free {
+                        ctx.console_writeln("check: the free count already agreed with the tree - nothing was repaired");
+                    } else {
+                        // THE COUNT, and only the count. `check` rebuilds the bitmap from the tree
+                        // unconditionally, so this says nothing about whether the bitmap was wrong -
+                        // and the two matter very differently. The allocator chooses blocks from the
+                        // BITMAP and never reads this number, so a count too high overstates free
+                        // space until the next check and costs nothing else.
+                        let (word, by) = if before > free { ("too much", before - free) }
+                                         else            { ("too little", free - before) };
+                        ctx.console_writeln_fmt(format_args!(
+                            "check: REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted {} free space, off by {}). The bitmap was rebuilt from the tree regardless.",
+                            before, free, word, by));
+                    }
+                }
                 if bad > 0 {
                     ctx.console_writeln_fmt(format_args!(
                         "check: WARNING - {} file(s)/dir(s) had unreadable (CRC-failed) blocks; see the log", bad));

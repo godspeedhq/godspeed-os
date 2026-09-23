@@ -101,6 +101,17 @@ def main():
     ap.add_argument("--pcap", default="",
                     help="with --net, dump every frame to this file so the wire can be read when the "
                          "guest disagrees with itself about what it sent")
+    ap.add_argument("--drive", default="",
+                    help="attach a raw disk image as a USB MASS-STORAGE stick behind an xHCI "
+                         "controller, so `block-driver` and `fs` can be exercised on this arch "
+                         "(`backlog/34`). USB rather than AHCI, and that is not a preference: "
+                         "`services/block-driver/build.rs` maps riscv64 to `storage_is_usb`, so "
+                         "`mod ahci` is not compiled on this port at all and an AHCI controller is "
+                         "a device nothing here looks at. Attaching one was tried first and the "
+                         "kernel dutifully granted `block-driver` an ABAR it would never read. "
+                         "The file is CREATED at --drive-mb if absent.")
+    ap.add_argument("--drive-mb", type=int, default=16,
+                    help="size in MiB of the image --drive creates when the file does not exist")
     ap.add_argument("--chardelay", type=float, default=0.02,
                     help="seconds between characters - slow enough not to outrun a 16-byte FIFO")
     a = ap.parse_args()
@@ -123,6 +134,21 @@ def main():
         cmd += ["-device", "e1000,netdev=n0", "-netdev", "user,id=n0"]
         if a.pcap:
             cmd += ["-object", "filter-dump,id=nicdump,netdev=n0,file=%s" % a.pcap]
+    if a.drive:
+        # A USB STICK BEHIND AN xHCI CONTROLLER - the topology this port actually has. `virt` has a
+        # real PCIe host bridge (the same one --net uses) but no USB bus of its own, so the
+        # controller is added explicitly; without it the `xhci` service reports "no controller MMIO
+        # granted - idling" and there is nowhere for a stick to appear.
+        img = a.drive if os.path.isabs(a.drive) else os.path.join(ROOT, a.drive)
+        if not os.path.exists(img):
+            os.makedirs(os.path.dirname(img), exist_ok=True)
+            with open(img, "wb") as fh:
+                fh.truncate(a.drive_mb * 1024 * 1024)
+            print("riscv-run: created %s (%d MiB, zeroed - `drives flash data` formats it)"
+                  % (img, a.drive_mb))
+        cmd += ["-device", "qemu-xhci,id=xhci0",
+                "-drive", "if=none,id=d0,format=raw,file=%s" % img.replace("\\", "/"),
+                "-device", "usb-storage,bus=xhci0.0,drive=d0"]
     print("> " + " ".join(cmd))
     os.makedirs(os.path.join(ROOT, os.path.dirname(a.log)), exist_ok=True)
 

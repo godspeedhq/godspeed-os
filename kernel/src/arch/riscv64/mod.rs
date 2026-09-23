@@ -1311,7 +1311,53 @@ fn emit_dec_lockfree(v: u64) {
     }
     serial_write_bytes_lockfree(&buf[i..]);
 }
-pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
+/// Restart the board, through the only mechanism this ISA has.
+///
+/// **This was `loop { spin_loop() }` - a stub that claimed a reset and delivered a hang.** Found on
+/// the VisionFive 2 on 2026-09-21: `reboot` printed `reboot: hardware reset`, hart 1 entered
+/// syscall 18 and never left it, and ten seconds later the liveness watchdog did its job:
+///
+///     reboot: hardware reset
+///     KERNEL PANIC: LIVENESS WEDGE: core 0 made NO progress for 40011360 counter ticks
+///     hart stages ... h1=8/60247/s18   (stage 8 = syscall, NR 18 = Reboot)
+///
+/// The panic was correct. The defect was underneath it, and the worst part was the printed line:
+/// the kernel announced an action it had no implementation for, which is invariant 12 broken at the
+/// point it is easiest to believe.
+///
+/// **Why a firmware call and not a register write.** x86 escalates through the 0xCF9 reset control
+/// register, the keyboard controller, and finally a triple fault, which the ISA guarantees. Both ARM
+/// ports write the SoC's own watchdog block directly. RISC-V has neither: no architectural
+/// instruction resets a machine, and the JH7110's reset controller is a SoC detail S-mode does not
+/// own. The reset belongs to M-mode firmware and is asked for through SBI SRST.
+///
+/// **Probed, not assumed** - the discipline `sbi.rs` states for itself. SRST is optional in the SBI
+/// specification; an older OpenSBI may not carry it, and issuing an unimplemented extension is how
+/// you get a silent nothing instead of an error.
+pub fn hardware_reset() -> ! {
+    // Reaching PAST this call at all means the reset did not happen - so name which way it failed,
+    // rather than falling through to a hang that looks identical to every other hang.
+    match sbi::system_reset() {
+        sbi::ResetRefusal::NoExtension => crate::kprintln!(
+            "reboot: this firmware implements no SBI SRST extension - it cannot restart the board"),
+        sbi::ResetRefusal::Both { warm, cold } => crate::kprintln!(
+            "reboot: SBI SRST refused BOTH reboot types (warm {}, cold {}) - the machine is NOT resetting",
+            warm, cold),
+    }
+
+    // NOTHING LEFT TO TRY, AND THAT IS THE HONEST END OF IT. There is no RISC-V equivalent of a
+    // triple fault, and inventing one by faulting deliberately would hand the operator a panic that
+    // names the wrong cause. The line above is the answer; this halt is what follows it.
+    //
+    // The liveness watchdog will notice this hart stop and panic in ~10 s. That is left deliberately
+    // in place: a machine asked to reboot and unable to is wedged, by definition, and the watchdog
+    // saying so is correct. What changed is that the reason now precedes the panic instead of the
+    // operator being handed a bare LIVENESS WEDGE with nothing to attach it to.
+    crate::kprintln!("reboot: power-cycle the board by hand");
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 // ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
 /// One byte, under the lock. Used for single characters; a whole message goes through the function

@@ -28,7 +28,7 @@ argue for looking harder rather than writing it off:
   the ones that reach hardware.
 
 Related, and a reason to be suspicious of a "flake" verdict here specifically: the kernel is known to
-SPLICE one log line into another under load (`project_serial_splice`), which produces both false FAILs
+SPLICE one log line into another under load (`backlog/04-serial-splice.md`), which produces both false FAILs
 and false PASSes in harness assertions that match on serial text. Whether these two assertions are
 matching text that a splice could corrupt has not been checked.
 

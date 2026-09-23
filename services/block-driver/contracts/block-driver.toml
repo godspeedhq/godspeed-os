@@ -65,7 +65,7 @@ log_write = true
 # moved to the supervisor the three-way `#[cfg]` behind it was flattened to match - which is correct
 # ONLY on the Pi 4. On the Pi 2 the driver then held a send cap to a service that does not exist
 # there and none to `dwc2`, so `request_with_reply` found no send slot and returned None instantly:
-# 0 sectors, no disk, `ls` broken, while dwc2 had the stick enumerated and bound the whole time.
+# 0 sectors, no disk, `dir` broken, while dwc2 had the stick enumerated and bound the whole time.
 # Every layer healthy in isolation, and the missing piece the edge between them - twice now, on two
 # different boards.
 # `events` - the observability sink: automatic IPC traces, plus the metric samples this service

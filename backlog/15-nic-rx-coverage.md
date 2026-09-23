@@ -1,6 +1,6 @@
 # 15. The NIC receive ring is only drained when somebody asks
 
-**Status:** open, recorded rather than closed (§26.7). Not a regression - it was always true, and it
+**Status: OPEN**, recorded rather than closed (§26.7). Not a regression - it was always true, and it
 became visible only once the packet loss ahead of it was fixed.
 
 ## What happens
@@ -37,4 +37,4 @@ surface) or from a device interrupt. `nic-driver` only ever serves - it makes no
 so unlike net-stack it has no reply-stealing hazard and a timed receive is safe here.
 
 The Pi 2 reached the same conclusion by a different route: coverage, not ring size, and the answer
-there was interrupt-driven receive (`project_arm_networking_hw`, 85% loss to 4%).
+there was interrupt-driven receive (the Pi 2 bring-up took 85% loss to 4%).

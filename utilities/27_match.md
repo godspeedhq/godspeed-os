@@ -70,8 +70,9 @@ isn't trying to be bash.
 ## 5. Implementation
 
 A shell built-in **filter**: input bytes → matching lines out (`match_lines`, sharing `find`'s
-`contains` + `glob_match`). In a pipe it consumes the previous stage's buffer (`is_filter_builtin`
-→ `run_filter_builtin` in `stage_filter`/`stage_sink`); as a built-in it runs **in-process**, so
+`contains` + `glob_match`). In a pipe it consumes the previous stage's buffer (`pipe_transform`
+dispatches the stage, and a text filter lands in `run_filter_builtin`); as a built-in it runs
+**in-process**, so
 it is **not** subject to the 4 KiB service-boundary cap and can filter a full 64 KiB stage
 buffer. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new `fs` surface.
 `match` is a FILTER, never a pipe producer: `match … /file | …` is refused (use `read /file |

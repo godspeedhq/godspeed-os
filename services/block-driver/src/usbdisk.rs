@@ -331,7 +331,7 @@ pub fn run(ctx: &ServiceContext, sectors: u64) -> ! {
             Some((t, rest)) => (*t, rest),
             None => (0, &p[..0]),
         };
-        serve(sectors, ctx, body, crate::Reply { cap, tag });
+        serve(sectors, ctx, body, crate::Reply::plain(cap, tag));
         ctx.remove_cap(cap);
     }
 }

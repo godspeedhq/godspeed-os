@@ -1,5 +1,9 @@
 # 6. No syscall exposes the kernel's 16 KiB log ring to userspace
 
+**Status: OPEN, re-verified 2026-09-20.** `drain_kernel_ring_buffer` is still a no-op whose body
+is two comments (`sdk/rust/src/service_context.rs`), so `events log` still begins when `events`
+does and everything logged before that is on serial alone.
+
 **Severity:** feature. A known, recorded gap - not a defect.
 
 ## What it costs today

@@ -42,8 +42,8 @@ window open once a second, forever. The tick was reverted; the window still exis
 talks to the driver while a client is active.
 
 **Precedent:** `fs` had exactly this and fixed it exactly this way. Its replies were matched by arrival
-order, which produced the "run `ls` twice and it is out of step" desync; the fix was a correlation byte
-at offset 0 of both request and reply (see `project_fs_reply_correlation`, and the `tag` handling in
+order, which produced the "run `dir` twice and it is out of step" desync; the fix was a correlation byte
+at offset 0 of both request and reply (see the `tag` handling in
 `services/fs/src/main.rs`). This spec is that pattern applied one layer down.
 
 > **Amendment 2026-08-22: the second endpoint EXISTS now, and the rejection below was right about the
@@ -305,7 +305,7 @@ cannot bound its own serve time, and it does not know the client's deadline.
 **Correlation on the CLIENT hop** - net-stack <-> its clients - which is a different hop from the one
 this whole document is about. The client tags its request, net-stack echoes the tag, and the client
 discards a reply to a question it is no longer asking. That is exactly what `fs` carries
-(`project_fs_reply_correlation`, and the shell's `drain_stale_fs_replies` / `reclaim_late_fs_reply`),
+(the shell's `drain_stale_fs_replies` / `reclaim_late_fs_reply`),
 and exactly what this hop does not.
 
 Until then, deferral is unsafe and dropping is correct: the client times out, retries, and exactly

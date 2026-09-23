@@ -14,6 +14,17 @@
 //! `kernel/src/clock.rs` and `kernel/src/wallclock.rs` held the epoch conversion, the plausibility
 //! window, the clock's provenance and its floor - 327 lines of policy in ring 0 (finding C1-6).
 //!
+//! **What actually moved, because the sentence above reads as a clean removal and it was partial**
+//! (Audit 7, 2026-09-23). `wallclock.rs` is DELETED: the provenance and the floor - which reading to
+//! believe, and what to refuse to go below - are POLICY, they are this service's, and they left.
+//! `kernel/src/clock.rs` REMAINS, holding `epoch_secs` (the packed-RTC-to-Unix conversion) and the
+//! 2020..2100 plausibility window, both pure functions over values the arch RTC reader already has.
+//! They stay because the kernel's own uptime accounting consumes them before any service exists, so
+//! moving them would make a kernel fact depend on a restartable service - the §11.4 argument, one
+//! layer along. They are arithmetic and constants rather than judgement, which is the line §26.10
+//! actually draws; but two of the four things this paragraph names are still in ring 0 and saying
+//! otherwise would be the tidier claim rather than the true one.
+//!
 //! **What the kernel keeps, and why.** The x86 CMOS RTC answers on port I/O (0x70/0x71), which a
 //! service cannot reach; on ARM the equivalent is an MMIO register the kernel already maps. So the
 //! kernel keeps the REGISTER READ - a hardware fact, like enumerating PCI - and this service owns what
@@ -169,6 +180,10 @@ const FS_OK: u8 = 0;
 ///
 /// Distinct from 0 on purpose: 0 is what a caller sends who has not thought about tags, and it is also
 /// `FS_OK`, a collision that has already hidden one bug in this file.
+/// Telling `fs` the wall clock: `[FS_CLOCK_PUSH, epoch:i64]`, one way, no reply capability.
+/// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
+const FS_CLOCK_PUSH: u8 = 0xC1;
+
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 /// How often to retry loading the floor while it has not been loaded yet.
@@ -413,6 +428,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // now that it maintains something. The moment a sync succeeded every condition went false, the
         // loop blocked on `recv`, and the next re-sync could only happen if somebody happened to ask
         // the time - which on an idle machine is never. A clock that maintains itself has to wake up.
+        // ---- TELL `fs` THE TIME, so a file can carry a date ----
+        //
+        // A PUSH, not an answer to a question, and the direction is the whole design. `fs` serves
+        // clients on the endpoint it would have to await a reply on, so a request/reply the other
+        // way could dequeue a client's request and mistake it for the answer (`backlog/31`, one
+        // service over, days of debugging). And this service already sends to `fs`, so a call back
+        // from `fs` would be the mutual-send shape §8.9 forbids.
+        //
+        // `try_send` with no reply capability: nothing is awaited, an `fs` that is busy or absent
+        // costs nothing, and the message is recognisable to `fs` precisely BECAUSE it carries no cap
+        // (its `FS_CLOCK_PUSH`). Sent on the ordinary loop tick - a stamp a few seconds stale is
+        // exactly as useful, and `fs` stops believing a reading it has carried too long anyway.
+        // NOT gated on being network-synced. A machine that has never seen the network still knows
+        // something: the floor adopted from `/clock.last`, which only ever moves forward. A file
+        // stamped from the floor carries an approximate but HONEST date, and that is strictly better
+        // than "unknown" - which is reserved for a machine that genuinely has no idea.
+        {
+            let now = clock.now(&ctx);
+            if now > 0 {
+                let mut push = [0u8; 9];
+                push[0] = FS_CLOCK_PUSH;
+                push[1..9].copy_from_slice(&now.to_le_bytes());
+                if ctx.try_send("fs", &Message::from_bytes(&push)).is_err() {
+                    // A stale cap after an `fs` restart presents as a failed send, not as silence
+                    // (§14.3). Reacquire and let the next tick carry it - never retry in a loop here.
+                    let _ = ctx.reacquire_by_name("fs");
+                }
+            }
+        }
         let wake_ms = if unsynced || !floor_settled || store_left > 0 {
             FLOOR_RETRY_MS
         } else {

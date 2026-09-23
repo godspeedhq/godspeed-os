@@ -110,8 +110,12 @@ the only two-boot test here - a setting that survives a reboot cannot be proved 
 
 ### `events log` - what was printed, after it has scrolled away
 
-A framebuffer console has no scrollback. Before this, a line that scrolled past was gone unless you
-had serial attached, which on a Pi wired to a TV you often do not.
+**This is not the console's scrollback, and the difference is the point.** The console retains lines
+that scroll off its screen (`docs/console-service.md` §10), but a SERVICE log never reaches the
+console at all: `ctx.log()` writes the kernel ring and serial directly (CLAUDE.md §11.4), which is
+what keeps logging alive when everything above the kernel is dead. So on a Pi wired to a TV, with no
+serial attached, `events log` is the only way to see what a service said - scrolled away or never
+displayed in the first place.
 
 ```text
 gsh> events log 4
@@ -577,7 +581,9 @@ A service that never declares itself reads `?`, which is the honest answer rathe
 than a printer plus a serialiser that drift apart:
 
 - **Console**: a grid, with a two-line legend above it.
-- **Taller than the screen**: it pages, with `help`'s keys (up/down, space, `g`/`G`, `q`). The pager
+- **Taller than the screen**: it pages, with the shared pager's keys (arrows, space, PgUp/PgDn,
+  Home/End, `q`). `g`/`G` and `j`/`k` are gone, and so is `b` - `[b] background` claims that letter.
+  The pager
   was `help`-shaped - it called `help_render_line` directly - and is now given a render closure, so
   the one screenful-at-a-time reader in the system is shared instead of copied.
 - **Piped**: `events ipc | to json`, `| to yaml`, `| where caller=fs`, `| where outcome=TIMEOUT`,

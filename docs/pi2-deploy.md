@@ -110,17 +110,22 @@ add `force`:
 drives flash 0 data force     <- overrides the foreign-disk guard; ERASES whatever is there
 ```
 
-After formatting, the stick is mounted and ready - `write`, `read`, `ls`, `selfcheck`, etc. all work,
+After formatting, the stick is mounted and ready - `write`, `read`, `dir`, `selfcheck`, etc. all work,
 no reboot.
 
 ### Durability caveat (this hardware)
 
 A USB mass-storage stick acknowledges a write when it has the data in its own buffer, not when it is on
-flash. Our stick **refuses SCSI SYNCHRONIZE CACHE**, so durability rides on **FUA** (force-unit-access
-on every write - `USE_FUA` in `services/dwc2`, formerly `arch/arm/dwc2.rs` before the USB stack left the
-kernel), which this stick honours. With FUA on, every
-acknowledged write is on the medium before the ack, so a power cut does not lose the tail of a write
-sequence. See `CLAUDE.md` §6.1 (the backend-conditional recovery amendment) for the full treatment.
+flash, so something has to force it to the medium. This section said our stick **refuses SCSI
+SYNCHRONIZE CACHE** and that durability therefore rode on **FUA** (`USE_FUA` in `services/dwc2`).
+
+**The refusal was never true.** Across seven sessions and three USB stacks the device has accepted
+`SYNCHRONIZE CACHE(10)`, and on 2026-09-23 an unassisted power cut on this board landed inside the
+journal's commit window and recovered in the strong form - `journal recovered 4 block(s)`, nothing
+torn, and the free count still matching a full tree rebuild. `fs` asks for the flush at each journal
+barrier and the stick honours it, which is what makes the ordering enforceable here.
+
+See `CLAUDE.md` §6.1, amendment 2026-09-23, for the full treatment and the evidence.
 
 ### If the stick misbehaves - it may be the stick
 

@@ -1,5 +1,8 @@
 # 9. Constrained targets: what actually blocks a microcontroller, and how the sizing should be tuned
 
+**Status: OPEN BY DECISION (26.2).** Unforced - nobody has the hardware. The measurements are
+here so the answer is not re-derived when someone does.
+
 **Severity:** design question, unforced. Nobody has the hardware; this exists so the answer is not
 re-derived from scratch when someone does.
 **Measured:** 2026-09-06, on the x86_64 release kernel.

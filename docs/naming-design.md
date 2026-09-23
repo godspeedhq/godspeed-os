@@ -48,7 +48,7 @@ microkernel rots. Removing naming removes the precedent.
 
 `chaos kill-storm` exposed that a client could not reacquire its `registry` cap after the registry
 restarted - you cannot look the namer up *in* the namer (the bootstrap chicken-and-egg, see
-`project_registry_bootstrap`). The shipped fix (merged `ea99322`) is a deliberate **stopgap**: in
+the registry-bootstrap investigation). The shipped fix (merged `ea99322`) is a deliberate **stopgap**: in
 `registry_lookup`, on a dead registry cap, fall back to the kernel name table via
 `reacquire_cap("registry")` (syscall 10) and retry. That stopgap re-embraces the very kernel path this
 spec deletes. **This work removes the stopgap** by giving clients a real, non-kernel bootstrap anchor.

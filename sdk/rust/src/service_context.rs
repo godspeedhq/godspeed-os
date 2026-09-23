@@ -1292,7 +1292,7 @@ impl ServiceContext {
         }
         // NO CLOCK READ HERE. `epoch_secs_monotonic` is a full CMOS RTC read: `wait_update_clear`
         // spins until the update-in-progress flag clears (up to ~1 ms), then seven port-I/O reads,
-        // repeated until two agree. Two of those per request/reply turned `ls`, `move`, `find` and tab
+        // repeated until two agree. Two of those per request/reply turned `dir`, `move`, `find` and tab
         // completion into TIMEOUTS, and cost the shell so much time inside the kernel that it stopped
         // draining the console and lost Enter keystrokes. Measured, not guessed: `osdev test files`
         // was 222/0 before, 213/9 with the clock read, 222/0 again without it.
@@ -1932,6 +1932,33 @@ impl ServiceContext {
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {
         let target = CapHandle(self.find_send_slot(peer)?);
+        // DRAIN ABANDONED REPLIES BEFORE ISSUING, FOR EVERY CALLER.
+        //
+        // `drain_stale_replies` documents this failure precisely and had exactly one caller - `fs` -
+        // so every OTHER service was one timeout away from being permanently broken. The shell was:
+        // a single scroll request that timed out left its reply queued, and from that moment every
+        // request waited out its full deadline and failed, for the rest of the boot. Observed on a
+        // Dell Wyse as `scrollback: the console did not answer` once a second, indefinitely, with the
+        // console sitting idle at `BlockRecv, queue 0` the whole time (`backlog/37`).
+        //
+        // **It is safe here for the reason that function already gives**, and that reason is exactly
+        // why this belongs in the SDK rather than at each call site: `request_with_reply*` enforces
+        // ONE OUTSTANDING REQUEST AT A TIME, so at the instant a new request is issued nothing
+        // legitimate can be waiting in the reply mailbox. Anything present is a reply this service
+        // stopped waiting for. Leaving it to each caller to remember means a caller that forgets is
+        // not slightly worse - it is permanently broken after its first timeout, silently.
+        //
+        // Cheap: a non-blocking `try_recv` that finds nothing in the healthy case, bounded by the
+        // endpoint depth.
+        let dropped = self.drain_stale_replies();
+        if dropped > 0 {
+            // LOUD, because it means a previous request was abandoned and this one would have
+            // inherited its reply. Silent self-repair is how the fs desync stayed invisible for so
+            // long (§26.7 - a recovery that hides what it recovered from is a silent fallback).
+            self.log_fmt(format_args!(
+                "sdk: discarded {} abandoned repl(y/ies) before a request to `{}` - an earlier request timed out",
+                dropped, peer));
+        }
         // Reply mailbox when the task has one, shared endpoint when it does not. The reply cap and the
         // endpoint waited on must name the SAME endpoint, or the kernel's reply-matched dequeue waits
         // for something that will never be delivered there.
@@ -2278,7 +2305,7 @@ impl ServiceContext {
     }
 
     /// Like [`Self::request_with_reply_abortable`], but if no reply has arrived after
-    /// `hint_after_secs` it invokes `on_linger` ONCE (e.g. to print a "(q to quit)" hint) and keeps
+    /// `hint_after_secs` it invokes `on_linger` ONCE (e.g. to print a "[q] quit" hint) and keeps
     /// waiting/aborting. A snappy reply never fires the hint, so a fast request stays silent and only
     /// a genuinely lingering wait tells the user they can bail. Abort semantics are identical to
     /// `request_with_reply_abortable` (q/Q/ESC -> `Aborted` immediately; the request is sent once and
@@ -2305,7 +2332,7 @@ impl ServiceContext {
         let mut on_linger = Some(on_linger);   // FnOnce, fired at most once when the wait lingers
         loop {
             // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
-            // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
+            // actually use (the "[q] quit" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
             if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
                 // DO NOT remove the reply cap on a REPLY. The send already removed it.
@@ -2802,6 +2829,76 @@ impl ServiceContext {
             ),
             _ => (0, 0),
         }
+    }
+
+    /// Move the console's scrolled-back view, returning `(lines back, most it can go back)`.
+    ///
+    /// `action` is one of the `SCROLL_*` values in `services/console/src/term.rs`: 0 live, 1 line
+    /// up, 2 line down, 3 page up, 4 page down, 5 oldest kept.
+    ///
+    /// The framebuffer console has no scrollback of its own - reaching the bottom of the screen used
+    /// to mean the top was gone permanently - and this is how a holder of the keyboard asks to look
+    /// back. The console does the arithmetic, because only it knows how many lines it is holding and
+    /// how tall the screen is; a second copy of either number here would be a second thing to drift.
+    ///
+    /// **THE SCROLL IS A REQUEST, NOT AN ESCAPE SEQUENCE.** Console output is untrusted content: a
+    /// file being `read` can hold any bytes, so a scroll expressed in the byte stream would let a
+    /// file scroll the view of the terminal showing it. A request carries a reply cap and output
+    /// does not, so the two channels are separated by construction.
+    ///
+    /// **`None` MEANS THE CONSOLE DID NOT ANSWER, and that is not the same as `(0, 0)`.**
+    ///
+    /// It returned `(0, 0)` for both "the view is at live" and "I could not reach the console",
+    /// and the caller could not tell them apart. On a Dell Wyse, 2026-09-18, that turned a timed-out
+    /// request into a plausible success: the shell believed it had scrolled back to live, left the
+    /// scrollback view, and returned to the prompt **while the screen was still showing history** -
+    /// the two disagreeing about what was on the display, with nothing said. A failure wearing a
+    /// valid value is the exact shape invariant 12 and 26.7 exist to forbid, and it is worth the
+    /// `Option` to make it unrepresentable.
+    ///
+    /// **ONE SECOND, AND NO RETRY - because this is a KEYSTROKE.** It used to be the same two
+    /// seconds plus a reacquire-and-retry that `console_dims` uses, which is right for a
+    /// once-per-command lookup and wrong here: it let a single press of an arrow key block the
+    /// shell for four seconds, which the operator experiences as the machine locking up. Nothing
+    /// above the kernel may hang on a peer (Commandment V); a scroll that cannot be served quickly
+    /// must FAIL quickly and say so.
+    ///
+    /// Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
+    /// console that has just restarted is rebuilding the screen anyway; the next `console_dims`
+        // `console_scroll` IS GONE, and it is the mechanism `backlog/37` was about.
+    //
+    // It asked the console to move its own view, and the console could not answer until it had
+    // repainted the framebuffer - `paint_view` + `present`, synchronously, inside the request. On a
+    // 3840x2160 panel that is the most expensive thing it does, and the caller gave it one second
+    // from the same core. That is why a scroll took "over two seconds to answer": nothing was lost
+    // or stuck, the work simply did not fit the deadline.
+    //
+    // `console_history` below replaced it by moving the WORK rather than tuning the number: the
+    // console hands over bytes, and the caller paints its own screen through ordinary output, which
+    // is a send and carries no deadline at all. Deleting this leaves no way to reintroduce the
+    // shape by accident.
+
+    /// Read a page of the console's scrollback AS DATA, starting at line `from` (0 = oldest KEPT).
+    ///
+    /// Returns `(lines, total retained, any line has aged out, bytes written)`. The payload after
+    /// the 4-byte header is `lines` records of `[len, bytes...]`; `bytes` is the whole reply so a
+    /// caller can bound its own walk.
+    ///
+    /// **The counterpart to `console_scroll`, and it exists because that one cannot be made cheap.**
+    /// Moving the terminal's own view forces a full repaint before the console can reply - on a
+    /// 3840x2160 panel the most expensive thing it does, paid inside the caller's blocking request,
+    /// from the same core (`backlog/37`). This asks for BYTES: the console copies out of its ring
+    /// and replies, and the caller paints its own screen through ordinary output, which is a send
+    /// rather than a call and carries no deadline at all.
+    ///
+    /// The history is BOUNDED (32 KiB / 512 lines). `aged` is how a view says "this is the oldest
+    /// line kept" rather than implying it is the start of the session (§26.7).
+    pub fn console_history(&self, from: u16, buf: &mut [u8]) -> Option<(usize, u16, bool, usize)> {
+        // Opcode 3 = REQ_HISTORY (`services/console/src/main.rs`).
+        let req = [3u8, from as u8, (from >> 8) as u8];
+        let k = self.request_with_reply_deadline_into("console", &req, buf, 1)?;
+        if k < 4 { return None; }
+        Some((buf[0] as usize, u16::from_le_bytes([buf[1], buf[2]]), buf[3] != 0, k))
     }
 
     /// Whether the input driver has reported setup complete (syscall 13, query 10).

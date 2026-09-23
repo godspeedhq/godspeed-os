@@ -217,6 +217,7 @@ static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
+static COPIER_ELF: &[u8] = include_bytes!(env!("SVC_COPIER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -338,6 +339,11 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // be alive and writing nothing while `status` said running.
     ("recorder", RECORDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      u32::MAX, &["events", "fs"], 0, 0, 0),
+    // NOT in the boot set either - the shell spawns it on `background copy` and it idles until
+    // told what to copy. Deliberately not restarted on death: a respawned copier would not know
+    // what it was copying, so it would be alive and copying nothing while `jobs` said running.
+    ("copier", COPIER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
+     u32::MAX, &["fs"], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.

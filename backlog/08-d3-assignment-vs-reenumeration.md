@@ -1,5 +1,8 @@
 # 8. D3: the assignment / re-enumeration split, and "cost 2"
 
+**Status: OPEN - a DECISION, not work.** The data gate is met and both walks agree on every
+machine available; what remains is the split below, which nobody has chosen between.
+
 **Severity:** design decision, blocking the D3 gate.
 **Status:** the DATA gate is met; what remains is a decision nobody has made.
 

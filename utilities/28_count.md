@@ -46,7 +46,7 @@ column is which.
 
 ## 4. Implementation
 
-A shell built-in FILTER (`is_filter_builtin`, alongside `match`): it runs **in-process**, so it
+A shell built-in FILTER (`run_filter_builtin`, alongside `match`): it runs **in-process**, so it
 is **not** subject to the 4 KiB pipe service-boundary cap and can count a full 64 KiB stage
 buffer. The pipe form consumes the previous stage's buffer (`write_count` in
 `run_filter_builtin`); the direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new

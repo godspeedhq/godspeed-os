@@ -140,6 +140,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         ("DWC2",       "dwc2"),
         ("EVENTS",     "events"),
         ("RECORDER",   "recorder"),
+        ("COPIER",     "copier"),
         ("CONSOLE",    "console"),
         ("TIME",       "time"),
         ("CONTROL",    "control"),
@@ -174,7 +175,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // for x86 hardware (PCI/AHCI/Realtek/xHCI) absent on the Pi 2, so they stay placeholders until real
     // Pi drivers (SD/EMMC, DWC2, LAN9514) exist. `probe` does not build for ARM (x86-only fault module).
     let arm_built: &[&str] = &[
-        "events", "recorder", "console", "ping", "pong", "supervisor", "shell",
+        "events", "recorder", "copier", "console", "ping", "pong", "supervisor", "shell",
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
@@ -234,14 +235,14 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // is the only way it learns the wall clock. `control` is inert on a board driven from its own
     // console, and is embedded so the service set does not differ per arch without a reason.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["events", "recorder", "console", "time", "control", "ping", "pong", "supervisor", "shell",
+        &["events", "recorder", "copier", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["events", "recorder", "console", "time", "control", "supervisor", "shell",
+        &["events", "recorder", "copier", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
@@ -261,10 +262,12 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // silently accepting the first turns the second into `LoadFailed(TooSmall)` at boot - which reads
     // like a corrupt image rather than a build-list omission.
     let riscv64_built: &[&str] = &["supervisor"];
+    // `release`, NOT `profile`: the cross-built userspace is always release (see `riscv_build.py`),
+    // so following the kernel's own profile looks in a directory nothing ever writes.
     let riscv64_dir = workspace
         .join("target")
         .join("riscv64imac-unknown-none-elf")
-        .join(&profile);
+        .join("release");
 
     for (env_name, bin_name) in services {
         let elf = if is_arm {
@@ -276,10 +279,21 @@ const ARM_ONLY: &[&str] = &["dwc2"];
             let a64_bin = aarch64_dir.join(bin_name);
             if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
         } else if is_riscv64 {
-            // The RISC-V supervisor if it has been built; otherwise the placeholder, so the kernel
-            // still links for the boundary test even when no userspace has been cross-compiled.
+            // Listed and present: the real binary. NOT listed: the placeholder, because the service
+            // is simply not ported to this arch. Listed and MISSING: stop the build - that is a
+            // build-list or build-order mistake, and letting it through ships a kernel that panics
+            // at `spawn_supervisor` with an error that reads like a corrupt image.
             let rv_bin = riscv64_dir.join(bin_name);
-            if riscv64_built.contains(bin_name) && rv_bin.exists() { rv_bin } else { placeholder.clone() }
+            if !riscv64_built.contains(bin_name) {
+                placeholder.clone()
+            } else if rv_bin.exists() {
+                rv_bin
+            } else {
+                panic!("riscv64: `{}` is in `riscv64_built` but {} does not exist. Build the \
+                        userspace first (scripts/riscv_build.py does this) - embedding the \
+                        placeholder here would boot to `LoadFailed(TooSmall)`.",
+                       bin_name, rv_bin.display());
+            }
         } else if use_placeholder {
             placeholder.clone()
         } else if ARM_ONLY.contains(bin_name) {

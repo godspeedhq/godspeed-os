@@ -129,7 +129,7 @@ identity-brutal 6/0, property-brutal 10/0. Both authority outliers are covered -
 | Raspberry Pi 4 B | AArch64 | 377/0 twice | 100 rounds, 568 kills | 0 / 0 |
 
 **2,233 real service kills, zero kernel panics, zero liveness wedges**, and every service-level panic
-came from the ONE designed site (`sdk/rust/src/service_context.rs:571` - `recv` panicking on
+came from the ONE designed site (`sdk/rust/src/service_context.rs`, `recv` panicking on
 `EndpointDead` so the supervisor restarts the service). A second panic site anywhere in that tally
 would have been the tell that something broke; there was none, on any port.
 

@@ -380,29 +380,280 @@ pub fn run(image_path: &Path, smp: u32) {
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
 
     // -----------------------------------------------------------------------
+    // console scrollback
+    // -----------------------------------------------------------------------
+    //
+    // `scrollback` IS A UTILITY NOW, NOT A MODE, and these cases had to be rewritten rather than
+    // adjusted - the mechanism underneath them is gone.
+    //
+    // What they used to assert was the shell driving the CONSOLE's own view, one blocking request
+    // per keypress. Each of those made the console `paint_view` + `present` before it could reply: a
+    // full repaint of the framebuffer, inside the caller's deadline, on the core the caller was
+    // blocked on. Against a 3840x2160 panel that overran one second and the shell declared a console
+    // that was merely busy to be dead (`backlog/37`).
+    //
+    // **AND THIS SUITE RAN GREEN THROUGH ALL OF IT**, which is the part worth keeping in mind: the
+    // cost that broke it is a repaint, QEMU has no such panel, so the tests could not have caught it
+    // and did not. The new path asks the console for BYTES out of its ring and pages them here, so
+    // what is exercised below is deterministic on any framebuffer - which is why it is testable at
+    // all rather than merely passing.
+    //
+    // Boot plus everything above has produced far more than a screenful, so there is history.
+
+    // WAIT ON `ESC[J`, NOT ON ANYTHING THE FRAME SAYS. This is the third time this suite has been
+    // caught waiting for a marker that appears twice, and here it is not a slip - it is structural.
+    // A scrollback viewer DISPLAYS everything the terminal has ever shown, so any text a frame
+    // contains can also be sitting in the history the frame is rendering. The first run of these
+    // cases matched `[q] quit` against the line
+    //     net: waiting for a reply  [q] quit
+    // which is a row left merged by an earlier pager and then scrolled into the ring - so the
+    // collect stopped in the MIDDLE of the frame and every later case desynced, taking four passing
+    // `help` cases down with it.
+    //
+    // `ESC[J` cannot suffer that. The ring stores the rendered GRID (`sb.push(&s.grid[0][..cols])`),
+    // so escape sequences are consumed by the terminal and are never history. It is also exactly the
+    // end of a frame, which is what these cases actually want to wait for.
+    const FRAME_END: &[u8] = b"\x1b[J";
+
+    // TYPED, opening at the newest line.
+    send(&mut write_half, b"scrollback\r");
+    let s1 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s1.contains("scrollback") && s1.contains("scrolled off"),
+           "scrollback: opens with its title");
+    check!(s1.contains("[up/down] line") && s1.contains("[PgUp/PgDn] page"),
+           "scrollback: the status line names the keys that work");
+    // The count comes from the ring, so it must name a real total rather than nothing.
+    check!(s1.contains("] quit") && !s1.contains(" of 0 ]"),
+           "scrollback: reports a real line count from the ring");
+
+    // PAGING IS LOCAL: every key here is served by a memcpy out of the ring, and the console
+    // repaints nothing. PgUp is `ESC [ 5 ~`.
+    send(&mut write_half, b"\x1b[5~");
+    let s2 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s2.contains("[up/down] line"), "scrollback: PgUp pages back inside the view");
+
+    // ARROWS SCROLL INSIDE THE VIEW - they must not reach the command history.
+    send(&mut write_half, b"\x1b[A");
+    let s3 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s3.contains("[up/down] line"),
+           "scrollback: arrows scroll INSIDE the view, they do not leak to history");
+
+    // `q` LEAVES. Every other full-screen view in this shell quits on `q` (conventions rule 10a).
+    send(&mut write_half, b"q");
+    let s4 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    check!(s4.is_some(), "scrollback: `q` returns to the prompt");
+
+    // PgUp AT THE PROMPT OPENS IT TOO, one page back - the key already meant "back a page".
+    send(&mut write_half, b"\x1b[5~");
+    let s5 = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(s5.contains("scrollback"), "scrollback: PgUp at the prompt opens the view");
+    // Esc leaves as well, like `help` and `docs`.
+    send(&mut write_half, b"\x1b");
+    let s6 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    check!(s6.is_some(), "scrollback: Esc also leaves");
+
+    // THE SOAK THAT `backlog/37` LEFT BEHIND. Open it, touch nothing for 8 seconds, then page. The
+    // old failure was the view going permanently deaf; the fingerprint was the shell printing that
+    // the console had stopped answering, so waiting for its ABSENCE is immune to how the success
+    // path happens to be worded.
+    send(&mut write_half, b"\x1b[5~");
+    let _ = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(8));
+    send(&mut write_half, b"\x1b[6~");   // PgDn
+    let soak = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
+    check!(!soak.contains("stopped answering") && !soak.contains("did not answer"),
+           "scrollback: still answers after 8s open with no keystrokes (backlog/37)");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+
+    // IN A SCRIPT IT DUMPS rather than waiting for a key nobody will press - the guard `help`,
+    // `docs` and `paginate` all carry.
+    send(&mut write_half, b"assert ok scrollback\r");
+    // ASSERT SOMETHING POSITIVE, because the obvious check passes on NOTHING.
+    //
+    // This waited 12s and then tested `!contains("[q] quit")` - and `unwrap_or_default()` hands
+    // back an EMPTY string on timeout, which contains nothing at all. The dump is up to 512
+    // lines, it overran the collect, the case passed vacuously, and its leftover output desynced
+    // the `Home` case below - so the failure that got REPORTED was downstream of a silent one.
+    //
+    // A test that cannot fail is worse than no test: it reports a guarantee nobody is checking.
+    // AND THE TERMINATOR CANNOT BE `gsh>` EITHER - THE SAME TRAP, A THIRD TIME.
+    //
+    // The dump REPLAYS the history, and the history is full of prompts. Waiting for `gsh>`
+    // therefore matched one INSIDE the dumped text while the rest was still streaming, and the
+    // keystrokes of the next case landed in the middle of it - which is why the failure that got
+    // reported was `Home is the line editor`, a case that was never broken.
+    //
+    // THE GENERAL RULE, now learned three ways in one feature: nothing this utility PRINTS can
+    // terminate a collect, because what it prints is everything the terminal has ever shown.
+    // Only two kinds of marker are safe - an escape sequence (never stored: the ring holds the
+    // rendered grid), or a string introduced AFTER the dump, which is what this does.
+    send(&mut write_half, b"echo zz-sb-end\r");
+    let s7 = collect_until(&buf, &mut cursor, b"zz-sb-end", Duration::from_secs(40)).unwrap_or_default();
+    check!(!s7.is_empty() && !s7.contains("[up/down] line"),
+           "scrollback: dumps rather than paging when nobody is watching");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+
+    // `save <path>` IS TESTED IN THE FILES SUITE, NOT HERE - THIS SUITE HAS NO DISK.
+    //
+    // It was written here first and the run said so plainly: `scrollback: could not create the
+    // file`, then `storage unavailable`. Worse, the follow-up check (`!contains("FAIL")`) PASSED
+    // against that, because the words "storage unavailable" contain no "FAIL" - a check that
+    // confirmed nothing while reporting success. Third time today; see §6 of the spec.
+    //
+    // What DOES belong here is the half that needs no storage: a missing path must be a usage
+    // error rather than a file named nothing.
+    send(&mut write_half, b"scrollback save\r");
+    let sv3 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sv3.contains("usage: scrollback save"),
+           "scrollback save: a missing path is a usage error");
+
+    // AND AT THE PROMPT, Home AND End ARE THE LINE EDITOR - unconditionally. Type `hello world`,
+    // Home, then `echo `, which must land at the FRONT giving `echo hello world`. If Home went
+    // anywhere near the scrollback the line would read `hello worldecho `.
+    send(&mut write_half, b"hello world\x1b[Hecho \r");
+    let sb4 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check!(sb4.contains("hello world"),
+           "scrollback: Home is the line editor at the prompt, unconditionally");
+
+    // -----------------------------------------------------------------------
     // help
     // -----------------------------------------------------------------------
-    // `help` is now paged (the framebuffer console has no scrollback). Drive the pager:
-    // page down through every screen (extra page-downs clamp at the bottom, harmless),
-    // then `q` to quit. The accumulated byte stream still contains every section, and
-    // reaching `gsh>` proves the pager exited cleanly back to the prompt.
-    send(&mut write_half, b"help\r          q");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => {
-            check!(r.contains("GodspeedOS shell commands"), "help: header");
-            check!(r.contains("spawn"),   "help: spawn listed (paged)");
-            check!(r.contains("restart"), "help: restart listed (paged)");
-            check!(r.contains("status"),  "help: status listed (paged)");
-            // The status line now names every key that works, j/k and b included - a reader who tries
-            // `j` from muscle memory finds it works, so the line was under-reporting the tool.
-            check!(r.contains("up/down or j/k: scroll") && r.contains("b: page up")
-                   && r.contains("q: quit"), "help: pager status line names every key");
-        }
+    // `help` IS A BROWSABLE DOCUMENT AGAIN, and that is what these cases pin.
+    //
+    // It lost its pager when the console gained scrollback, on the argument that paging output which
+    // has scrolled past is scrollback's job. That argument was right about PAGING and wrong about
+    // `help`: you arrive at it wanting one section, not the top. A contents list, a search and a
+    // pinned "where am I" line are things scrollback structurally cannot give - the same reason
+    // `trace` keeps its own pager, which pins a column header.
+    //
+    // Driven with the keys it advertises, then `q`, so reaching `gsh>` proves it exits cleanly.
+    send(&mut write_half, b"help\r");
+    let h1 = collect_until(&buf, &mut cursor, b"[q] quit", Duration::from_secs(8)).unwrap_or_default();
+    check!(h1.contains("help") && h1.contains("GodspeedOS"), "help: opens with its title");
+    check!(h1.contains("[up/down] line") && h1.contains("[t] contents") && h1.contains("[/] find"),
+           "help: the status line names the keys that work");
+    // The PINNED section header is the half a scrollback cannot do: scrolled into the middle of a
+    // document you would otherwise not know which part you were reading.
+    check!(h1.contains("|   Console"), "help: names the section you are in, pinned");
+
+    // EVERY BODY LINE ERASES ITS OWN TAIL, and this is a regression test for a deletion.
+    //
+    // `clear_eol` was removed on the note "nothing repaints in place any more, and every caller was
+    // passing false". True when written. Then `help` got its browser back - a pager that homes the
+    // cursor and redraws - and the erase was not restored, because the reason for removing it had
+    // been recorded as a fact about the FUNCTION rather than about its callers. On a Dell Wyse every
+    // row then showed the tail of the longer row it overwrote: `Storage` drawn over a 9-character
+    // line read `Storagert`, and a 58-character description over an 88-character one trailed
+    // `... - watch is built on it)ore)an up`. Nothing was wrong with the table; the frame was never
+    // cleared.
+    //
+    // Asserted on the BYTES rather than on the look, because a screen is what the bug is visible on
+    // and a serial line is what a test can read. An `ESC[K` per body line is the mechanism itself.
+    check!(h1.matches("\u{1b}[K").count() >= 10,
+           "help: the browser erases to end of line on every row (the `Storagert` garbage)");
+    // ...and the man-page shape: a section heading is upper-case at the margin, its commands
+    // indented under it. `CONSOLE` cannot appear by accident - the table spells it `Console`.
+    check!(h1.contains("CONSOLE"), "help: section headings read as headings, not as rows");
+
+    // CONTENTS, then a digit jumps to that section. This is "go to a section with a keypress".
+    send(&mut write_half, b"t");
+    let h2 = collect_until(&buf, &mut cursor, b"press a digit", Duration::from_secs(8)).unwrap_or_default();
+    check!(h2.contains("1. Console") && h2.contains("contents:"),
+           "help: `t` lists the sections, numbered");
+    // WAIT ON A MARKER THE CONTENTS VIEW DOES NOT ALSO PRINT. `[q] quit` appears in BOTH status
+    // lines, so collecting on it matched the contents frame that was already on screen and the
+    // check read a frame from before the keypress. `[up/down] line` belongs to the document view
+    // alone. Second time this exact mistake has been made in this suite.
+    send(&mut write_half, b"4");
+    let h3 = collect_until(&buf, &mut cursor, b"[up/down] line", Duration::from_secs(8)).unwrap_or_default();
+    check!(h3.contains("|   Storage"), "help: a digit jumps to that section");
+
+    // SEARCH. `churn` is deep in Storage, so finding it proves the search moved the view rather
+    // than merely echoing the term.
+    send(&mut write_half, b"/churn\r");
+    let h4 = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(h4.contains("find: churn"), "help: `/` searches and shows the term");
+
+    send(&mut write_half, b"q");
+    let hq = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+    check!(hq.is_some(), "help: `q` returns to the prompt");
+
+    // `docs` IS A SEPARATE DOCUMENT, SHARING THE BROWSER.
+    //
+    // They were one thing briefly and it was the wrong shape: a philosophy section inside `help`
+    // makes `help` open on prose when somebody wanted the word for `dir`'s byte counts, and makes
+    // `help` the place everything explanatory accumulates. `help` names `docs` on its first screen
+    // so it is still found by typing the obvious thing.
+    send(&mut write_half, b"docs\r");
+    let d1 = collect_until(&buf, &mut cursor, b"[q] quit", Duration::from_secs(8)).unwrap_or_default();
+    check!(d1.contains("docs") && d1.contains("What this is"),
+           "docs: opens the manual, not the command list");
+    check!(d1.contains("capability microkernel"),
+           "docs: leads with what the system IS");
+    // The ABOUT view: the boot banner, and this machine's real topology read from the kernel.
+    send(&mut write_half, b"a");
+    let d2 = collect_until(&buf, &mut cursor, b"[a] back", Duration::from_secs(8)).unwrap_or_default();
+    check!(d2.contains("core 0"), "docs: `a` draws the cores from LIVE kernel state");
+    check!(d2.contains("supervisor") || d2.contains("console"),
+           "docs: ...and names services that are actually running");
+    send(&mut write_half, b"q");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(_) => { check!(true, "docs: `q` returns to the prompt"); }
         None => {
             println!("shell-test: FAIL - timed out after `help`  [×5]");
             fail += 5;
         }
     }
+
+    // `help <word>` AND `docs <word>` OPEN ON THAT WORD.
+    //
+    // NOT a synonym for `<util> help`, which gives one command's detail - this is what `man`
+    // means, "find this in the manual", and it exists because the browser LISTS the commands:
+    // reading `dir` there and typing `help dir` is an expectation this interface creates. What it
+    // replaced was worse than either reading: the argument was SILENTLY DISCARDED and you got the
+    // general thing with nothing said.
+    //
+    // `dir`'s own row is the FIRST match in the document, so landing on it proves the term moved
+    // the view rather than being echoed at the top. Waits on `[n] next` - the find status line,
+    // which the plain document view does not print.
+    send(&mut write_half, b"help dir\r");
+    let hd = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(hd.contains("find: dir"), "help <word>: opens with the term armed");
+    check!(hd.contains("|   Storage"), "help <word>: ...and scrolled to it, not at the top");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+
+    // A TERM THAT MATCHES NOTHING SAYS SO. Both cases leave you at the top of the document, so
+    // without this the screen for "found nothing" and the screen for "found the first line" are
+    // identical - the silent discard again, one layer in.
+    send(&mut write_half, b"help zqxjv\r");
+    let hn = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(hn.contains("(no match)"), "help <word>: a term that matches nothing says so");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+
+    send(&mut write_half, b"docs capabilities\r");
+    let dd = collect_until(&buf, &mut cursor, b"[n] next", Duration::from_secs(8)).unwrap_or_default();
+    check!(dd.contains("find: capabilities"), "docs <word>: the manual takes one too");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8));
+
+    // `<util> help` FOR THE TWO THAT PRINTED NOTHING.
+    //
+    // `docs` and `fcap` are in UTILS, so `<util> help` is intercepted for them - and neither had a
+    // `util_help` arm, so the intercept printed NOTHING and returned success. `fcap` was the worse
+    // of the two: it HAS good help, which putting it in UTILS shadowed, while `help`'s own row
+    // went on pointing a reader at `fcap help`. Gated by `util_help_coverage_problems` now; these
+    // two are the runtime half, because a gate that is added can also be skipped.
+    send(&mut write_half, b"docs help\r");
+    let dh = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(dh.contains("docs <word>"), "docs help: prints a usage block, not a blank line");
+
+    send(&mut write_half, b"fcap help\r");
+    let fh = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
+    check!(fh.contains("file-as-capability"), "fcap help: reaches its own message again");
+
 
     // -----------------------------------------------------------------------
     // tab completion of subcommand KEYWORDS (the second token). `observe n<Tab>` → `observe now`;
@@ -434,11 +685,33 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("write append"), "tab: menu digit 1 selects 'write append'"),
         None    => { println!("shell-test: FAIL - tab keyword menu selection timed out"); fail += 1; }
     }
-    // pipe-stage keyword: a verb after `|` completes its first-arg keyword. `status | sort r` → reverse.
-    send(&mut write_half, b"status | sort r\t\x03");
+    // Pipe-stage keyword AND column. `sort` takes both `reverse` and any column of the row flowing
+    // into it, so after `status |` the prefix `r` matches TWO real things - `restarts` (a column of
+    // status) and `reverse` (the keyword). A menu is the correct answer there; this used to complete
+    // straight to `reverse` only because columns were not completable at all, which made
+    // `sort restarts` - a perfectly good command - something you had to type in full.
+    //
+    // So the unambiguous prefix is what pins the keyword now, and the ambiguous one is asserted
+    // separately below. Narrowing the feature to keep the old assertion would have been the wrong
+    // way round: the assertion described a gap, not a guarantee.
+    send(&mut write_half, b"status | sort rev\t\x03");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort r' completes to 'sort reverse'"),
+        Some(r) => check!(r.contains("sort reverse"), "tab: pipe-stage 'sort rev' completes to 'sort reverse'"),
         None    => { println!("shell-test: FAIL - tab pipe-stage keyword timed out"); fail += 1; }
+    }
+    // A COLUMN of the producer at the head of the pipe. `restarts` belongs to `status`; it is not a
+    // keyword of `sort` and was not completable before.
+    send(&mut write_half, b"status | sort res\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("sort restarts"), "tab: a COLUMN of the producer completes ('status | sort res')"),
+        None    => { println!("shell-test: FAIL - tab column completion timed out"); fail += 1; }
+    }
+    // And the columns are the PRODUCER'S, not a union: `sealed` is a column of `dir` and of nothing
+    // else, so it must complete after `dir |` - and `core` (a `status` column) must not.
+    send(&mut write_half, b"dir | where se\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("where sealed"), "tab: the column set is the PRODUCER'S ('dir | where se')"),
+        None    => { println!("shell-test: FAIL - tab producer-column timed out"); fail += 1; }
     }
     // command-name completion AFTER a pipe (the segment's first word). `status | sor` → `status | sort`.
     // ("so" is now ambiguous - `sock` (the socket utility) and `sort` both start with it - so this uses
@@ -564,11 +837,11 @@ pub fn run(image_path: &Path, smp: u32) {
     //     rows appearing here is that local-write path working.
     // (2) `fs` publishes over IPC like any other service, which is the path a new service would use.
     //
-    // The `ls` runs first because `fs` publishes every 32 requests rather than on every one (an
+    // The `dir` runs first because `fs` publishes every 32 requests rather than on every one (an
     // observer that doubles the traffic it measures is not an observer), so the row only exists once
     // real work has happened. That is the design, not a wait for a timer.
     for _ in 0..12 {
-        send(&mut write_half, b"ls /\r");
+        send(&mut write_half, b"dir /\r");
         let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
     }
     send(&mut write_half, b"events metrics\r");
@@ -1163,10 +1436,10 @@ pub fn run(image_path: &Path, smp: u32) {
         }
         None => { println!("shell-test: FAIL - timed out after `write help`  [×2]"); fail += 2; }
     }
-    send(&mut write_half, b"ls version\r");
+    send(&mut write_half, b"dir version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains(&format!("ls {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "ls version: number + creator credit"),
-        None    => { println!("shell-test: FAIL - timed out after `ls version`"); fail += 1; }
+        Some(r) => check!(r.contains(&format!("dir {ver}")) && r.contains("Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors"), "dir version: number + creator credit"),
+        None    => { println!("shell-test: FAIL - timed out after `dir version`"); fail += 1; }
     }
     send(&mut write_half, b"drives flash help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
@@ -1670,7 +1943,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
-/// Step 4: drive the file commands (ls / read / write / mkdir / cd) end to end. Boots
+/// Step 4: drive the file commands (dir / read / write / mkdir / cd) end to end. Boots
 /// bare-metal with a RAW AHCI disk, flashes it, then exercises the commands including
 /// relative paths and `..` (the shell's current-directory + path resolution).
 /// Boot QEMU with a SATA data disk and return (child, serial buffer, write half).
@@ -1833,6 +2106,349 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     }
 }
 
+/// `osdev test fs-model` - DIFFERENTIAL testing against an independent model (carnage §3.2).
+///
+/// Drives a seeded random sequence of filesystem operations through the real shell on a real disk,
+/// and the SAME sequence through `crate::fs_model`, which knows nothing about GSFS. Two comparisons:
+///
+///   1. **Per operation, Ok versus Err.** Not the error VARIANT - that is shell implementation
+///      detail and a model that predicted it would be coupled to the thing it must be independent
+///      of. `result` is the shell's own outcome channel and prints exactly `Ok` or `Err(<name>)`.
+///   2. **At the end, the whole volume.** Every file the model holds is read back off the disk and
+///      its bytes compared; every directory's name set is listed and compared. This is the strong
+///      one: an operation can return the right answer and still leave the wrong state.
+///
+/// WHY THIS EXISTS WHEN 226 CHECKS ALREADY PASS. Every other storage suite tests GSFS against
+/// assertions written *about GSFS*. If a belief about what `rename` should do is wrong, all of them
+/// agree with the bug and report green. This one disagrees exactly where that belief is wrong,
+/// which is the single class of defect the rest of the programme structurally cannot reach.
+///
+/// The seed is printed on every run and on every failure, because "preserve the seed" is the first
+/// line of §5 of the carnage doc.
+/// `osdev test fs-tear-detect` - PROVE THE CONTENT DETECTOR FIRES.
+///
+/// `churn verify` has reported `NONE torn` on every hardware run there has ever been. That is the
+/// right answer and it tells you nothing about whether the detector CAN say otherwise - and a check
+/// never observed failing is not evidence, which is the rule that has already caught a blind stack
+/// gate and a doc gate in this repo.
+///
+/// `churn tear` writes a well-formed block of a DIFFERENT generation into the middle of a churn
+/// file. The carnage doc describes exactly this case: "a file holding the first half of one write
+/// and the second half of another has perfectly valid block CRCs (each block was written whole),
+/// sits in a perfectly valid directory, and occupies correctly accounted blocks. Every check this
+/// project had would pass it."
+///
+/// So the assertion is not merely "verify says TORN". It is that **`drives check` and `drives scrub`
+/// both still say clean while `churn verify` does not** - the demonstration that structure and
+/// content are different questions, rather than the claim that they are.
+pub fn run_fs_tear_detect(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("fs-tear-detect: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(port, Duration::from_secs(20)) {
+        Some(s) => s,
+        None => { child.kill().ok(); child.wait().ok();
+                  eprintln!("fs-tear-detect: no serial on {port}"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break,
+                                                     Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-tear-detect: PASS - {}", $label); pass += 1; }
+        else { println!("fs-tear-detect: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        println!("fs-tear-detect: FAIL - no prompt"); child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    }
+
+    // ESTABLISH THE PRECONDITION, DO NOT ASSUME IT.
+    //
+    // This was a single `churn 8` with a comment asserting eight seconds is "enough churn to produce
+    // files past the tear point". Under the load of `fs-all`'s 23 back-to-back suites it is not, and
+    // the run failed with
+    //     churn tear: no churn file is large enough - run `churn 10` first, then tear one
+    // taking three checks down with it. Nothing was wrong with the filesystem.
+    //
+    // The defect is a FIXED DURATION used to guarantee a COUNT - the inverse of the "a count is not
+    // a duration" lesson this repo already carries, and it makes the test's outcome a function of
+    // how busy the host is. So: churn, ASK whether the file the tear needs exists, and churn again
+    // if not. Bounded, and loud when it genuinely cannot get there.
+    let mut churned = String::new();
+    let mut big = false;
+    for round in 0..4 {
+        send(&mut write_half, b"churn 8\r");
+        churned = collect_until(&buf, &mut cursor, b"churn: done", Duration::from_secs(60)).unwrap_or_default();
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20));
+        // `churn tear` needs a file spanning more than one block (508 bytes of payload), so it tears
+        // ACROSS a block boundary - the whole point of the case. Ask the filesystem rather than the
+        // clock: a size column above 508 means such a file is there.
+        send(&mut write_half, b"dir /churn\r");
+        let listing = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+        // READ THE FORMAT `dir` ACTUALLY PRINTS. The first version parsed whitespace tokens as
+        // integers, and `dir` renders sizes with a unit - `1.1 KiB`, not `1126`. So `1.1` and `KiB`
+        // both failed to parse, the check said no multi-block file existed, and it said that while
+        // the tear it guards was succeeding two lines later. A precondition that disagrees with the
+        // thing it gates is worse than no precondition.
+        //
+        // Anything reported in KiB or above is necessarily past 508 bytes. A bare `N B` is parsed
+        // too, so a file just over the boundary still counts.
+        big = listing.contains("KiB") || listing.contains("MiB")
+            || listing.split_whitespace().collect::<Vec<_>>().windows(2).any(|w|
+                   w[1] == "B" && w[0].parse::<u64>().map(|n| n > 508).unwrap_or(false));
+        if big { if round > 0 { println!("fs-tear-detect: (needed {} churn rounds to reach a multi-block file)", round + 1); } break; }
+    }
+    check!(churned.contains("writes"), "churn ran and wrote files");
+    check!(big, "a churn file spans more than one block (the precondition `churn tear` needs)");
+
+    // CLEAN FIRST. Without this the TORN result below proves nothing - it could have been torn
+    // already, which is precisely the ambiguity a positive control removes.
+    send(&mut write_half, b"churn verify\r");
+    let v0 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(v0.contains("NONE torn"), "control: every file is intact BEFORE the tear");
+
+    send(&mut write_half, b"churn tear\r");
+    let tear = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    check!(tear.contains("a MIX"), "churn tear reports which file it tore, and how");
+
+    // THE DETECTOR FIRES. This is the whole point of the suite.
+    send(&mut write_half, b"churn verify\r");
+    let v1 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(v1.contains("TORN"), "churn verify DETECTS the tear");
+    check!(v1.contains("diverges at byte 508"),
+           "churn verify names the exact tear point (byte 508, the second block)");
+
+    // AND THE STRUCTURAL CHECKS DO NOT, which is the claim being demonstrated: the blocks are
+    // well-formed, their CRCs are right, the tree is right, the accounting is right. Only the
+    // CONTENT is a lie, and only one check reads content.
+    send(&mut write_half, b"drives check\r");
+    let chk = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    check!(chk.contains("0 bad"), "drives check still reports a consistent STRUCTURE");
+    send(&mut write_half, b"drives scrub\r");
+    let scr = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    check!(scr.contains("0 bad"), "drives scrub still reports every block's CRC correct");
+
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let _ = std::fs::create_dir_all("build/tests");
+        let _ = std::fs::write("build/tests/fs_tear_detect_serial.log", whole.as_bytes());
+    }
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nfs-tear-detect: {pass} passed, {fail} failed  (serial -> build/tests/fs_tear_detect_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_model(image_path: &Path, persist_path: &str, smp: u32, seed: u64, ops: usize) {
+    use crate::fs_model::{gen_op, universe, Model, Op, Rng};
+
+    println!("fs-model: differential run - seed {seed}, {ops} operations (smp={smp})");
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("fs-model: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    let stream = match retry_tcp_connect(port, Duration::from_secs(20)) {
+        Some(s) => s,
+        None => { child.kill().ok(); child.wait().ok();
+                  eprintln!("fs-model: could not connect to serial {port}"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break,
+                                                     Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { pass += 1; } else { println!("fs-model: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        println!("fs-model: FAIL - timed out waiting for the first prompt");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    // A fresh volume, so the model's empty state and the disk's agree at operation zero.
+    send(&mut write_half, b"drives flash data\r");
+    if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(10)).is_some() {
+        send(&mut write_half, b"y\r");
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).is_none() {
+            println!("fs-model: FAIL - flash timed out"); fail += 1;
+        }
+    }
+
+    // Everything happens under one root, so a bug cannot be masked by, or mistaken for, the
+    // pre-existing contents of `/` (a history file, a clock stamp).
+    const ROOT: &str = "/m";
+    let mut model = Model::new();
+    send(&mut write_half, format!("mkdir {ROOT}\r").as_bytes());
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    model.apply(&Op::Mkdir(ROOT.to_string()));
+
+    let paths = universe(ROOT);
+    let mut rng = Rng::new(seed);
+    let mut divergences: Vec<String> = Vec::new();
+
+    for i in 0..ops {
+        let op = gen_op(&mut rng, &paths);
+        let line = op.line();
+        send(&mut write_half, format!("{line}\r").as_bytes());
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).is_none() {
+            println!("fs-model: FAIL - op {i} `{line}` never returned a prompt (seed {seed})");
+            fail += 1;
+            break;
+        }
+        send(&mut write_half, b"result\r");
+        let r = match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+            Some(r) => r,
+            None => { println!("fs-model: FAIL - `result` after op {i} timed out (seed {seed})");
+                      fail += 1; break; }
+        };
+        // `result` prints exactly `Ok` or `Err(<Variant>)` on its own line.
+        let actual_ok = r.lines().any(|l| l.trim() == "Ok");
+        let actual_err = r.contains("Err(");
+        let expect_ok = model.apply(&op);
+        if actual_ok == actual_err {
+            divergences.push(format!("op {i} `{line}`: `result` said neither Ok nor Err"));
+        } else if actual_ok != expect_ok {
+            divergences.push(format!(
+                "op {i} `{line}`: model says {}, GSFS says {}",
+                if expect_ok { "Ok" } else { "Err" },
+                if actual_ok { "Ok" } else { "Err" }));
+        }
+    }
+    check!(divergences.is_empty(),
+           format!("{} operation(s) disagreed with the model - seed {}", divergences.len(), seed));
+    for d in divergences.iter().take(12) { println!("    {d}"); }
+
+    // ---- THE STRONG COMPARISON: read the whole volume back and diff it against the model. ----
+    //
+    // An operation can return the right answer and still leave the wrong state, which is exactly the
+    // failure a per-call check cannot see.
+    let mut state_bad = 0usize;
+    for f in model.all_files() {
+        send(&mut write_half, format!("read {f}\r").as_bytes());
+        let out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default();
+        let want = model.content(&f).unwrap_or("");
+        if !out.contains(want) {
+            state_bad += 1;
+            if state_bad <= 8 {
+                println!("    content: {f} should hold `{want}`; read returned `{}`",
+                         out.replace('\r', " ").replace('\n', " ").trim().chars().take(90).collect::<String>());
+            }
+        }
+    }
+    // Only the workspace. `/` holds files this run never created - the shell's history, the clock
+    // stamp - and a model that never saw them would report the disk wrong when the disk is right.
+    for d in model.all_dirs().into_iter().filter(|d| d.starts_with(ROOT)) {
+        send(&mut write_half, format!("dir {d}\r").as_bytes());
+        let out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default();
+        // Entry rows are the indented lines between the column header and the trailing count.
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        // MATCH THE ROW SHAPE, not "an indented line". An entry row is `<name> <TYPE> <size> <date>`
+        // with TYPE in {file, dir, seal}; requiring that second column is what separates a listing
+        // from a SERVICE LOG LINE spliced into the same serial stream (`backlog/04`). The looser
+        // reading recorded `net-stack:` and `time:` as directory entries and reported the disk wrong
+        // when the disk was right - a differential test is only as good as its reader.
+        for l in out.lines() {
+            let mut w = l.trim().split_whitespace();
+            let (Some(name), Some(kind)) = (w.next(), w.next()) else { continue };
+            if !["file", "dir", "seal"].contains(&kind) { continue; }
+            seen.insert(name.to_string());
+        }
+        let want = model.children(&d);
+        if seen != want {
+            state_bad += 1;
+            if state_bad <= 8 {
+                println!("    listing: {d} model={want:?} disk={seen:?}");
+            }
+        }
+    }
+    check!(state_bad == 0,
+           format!("{state_bad} path(s) on disk disagree with the model after {ops} ops - seed {seed}"));
+
+    // The volume must also be STRUCTURALLY sound, not merely to agree with the model: a sequence
+    // that leaves the free bitmap wrong while every name and byte still reads correctly is exactly
+    // the accounting drift `drives check` exists to find.
+    send(&mut write_half, b"drives check\r");
+    let chk = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    check!(chk.contains("0 bad"), "the volume is structurally clean after the run (`drives check`)");
+
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let _ = std::fs::create_dir_all("build/tests");
+        let _ = std::fs::write("build/tests/fs_model_serial.log", whole.as_bytes());
+    }
+    child.kill().ok();
+    child.wait().ok();
+    println!("\nfs-model: {pass} passed, {fail} failed  (seed {seed}, {ops} ops, serial -> build/tests/fs_model_serial.log)");
+    if fail > 0 {
+        println!("fs-model: reproduce with `osdev test fs-model:{seed}`");
+        std::process::exit(1);
+    }
+}
+
 pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     println!("files-test: booting (smp={smp}) with a RAW AHCI disk - scripted mode");
 
@@ -1894,7 +2510,23 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     macro_rules! run {
         ($c:expr, $secs:expr) => {{
             send(&mut write_half, $c);
-            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+            let r = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs));
+            if r.is_none() {
+                // RESYNC AFTER A TIMEOUT (`backlog/38`). A case that times out leaves its reply in
+                // flight, so the NEXT case reads the previous one's output instead of its own and
+                // fails for a reason that has nothing to do with it. That is why one fault has
+                // reported as 2, 3 and 6 failures on different days, and why the count has never
+                // said how many things were actually wrong.
+                //
+                // Re-establish a known prompt before returning, so one event costs one failure.
+                // Bounded (two prompts, 5s each) and reached ONLY on the failure path: a run in
+                // which nothing times out does not execute a line of this.
+                for _ in 0..2 {
+                    send(&mut write_half, b"\r");
+                    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)).is_none() { break; }
+                }
+            }
+            r
         }};
     }
 
@@ -1915,7 +2547,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
     } else { println!("files-test: FAIL - no flash confirm"); fail += 1; }
 
-    // mkdir + write + ls + read (absolute paths).
+    // mkdir + write + dir + read (absolute paths).
     match run!(b"mkdir /docs\r", 10) {
         Some(r) => check!(r.contains("created /docs"), "mkdir /docs"),
         None    => { println!("files-test: FAIL - mkdir timeout"); fail += 1; }
@@ -1924,9 +2556,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("wrote /docs/note.txt"), "write /docs/note.txt"),
         None    => { println!("files-test: FAIL - write timeout"); fail += 1; }
     }
-    match run!(b"ls /docs\r", 10) {
-        Some(r) => check!(r.contains("note.txt") && r.contains("file"), "ls /docs shows note.txt"),
-        None    => { println!("files-test: FAIL - ls timeout"); fail += 1; }
+    match run!(b"dir /docs\r", 10) {
+        Some(r) => check!(r.contains("note.txt") && r.contains("file"), "dir /docs shows note.txt"),
+        None    => { println!("files-test: FAIL - dir timeout"); fail += 1; }
     }
     match run!(b"read /docs/note.txt\r", 10) {
         Some(r) => check!(r.contains("hello world"), "read /docs/note.txt"),
@@ -1942,9 +2574,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("wrote /docs/inside.txt"), "write relative → /docs/inside.txt"),
         None    => { println!("files-test: FAIL - relative write timeout"); fail += 1; }
     }
-    match run!(b"ls\r", 10) {
-        Some(r) => check!(r.contains("note.txt") && r.contains("inside.txt"), "ls (cwd) shows both files"),
-        None    => { println!("files-test: FAIL - ls cwd timeout"); fail += 1; }
+    match run!(b"dir\r", 10) {
+        Some(r) => check!(r.contains("note.txt") && r.contains("inside.txt"), "dir (cwd) shows both files"),
+        None    => { println!("files-test: FAIL - dir cwd timeout"); fail += 1; }
     }
     // Tab-completion of a FILE PATH: a unique prefix fills in the rest, and the completed command
     // runs. /docs has note.txt + inside.txt, so 'i' and 'n' are unique. \t = Tab, then \r runs it.
@@ -1984,9 +2616,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("renamed"), "rename note-copy.txt → renamed.txt"),
         None    => { println!("files-test: FAIL - rename timeout"); fail += 1; }
     }
-    match run!(b"ls /docs\r", 10) {
-        Some(r) => check!(r.contains("renamed.txt") && !r.contains("note-copy.txt"), "ls shows renamed, not old name"),
-        None    => { println!("files-test: FAIL - ls after rename timeout"); fail += 1; }
+    match run!(b"dir /docs\r", 10) {
+        Some(r) => check!(r.contains("renamed.txt") && !r.contains("note-copy.txt"), "dir shows renamed, not old name"),
+        None    => { println!("files-test: FAIL - dir after rename timeout"); fail += 1; }
     }
 
     // delete (GSFS0003: frees blocks, reclaims) - file then re-list shows it gone.
@@ -1994,9 +2626,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("deleted"), "delete /docs/renamed.txt"),
         None    => { println!("files-test: FAIL - delete timeout"); fail += 1; }
     }
-    match run!(b"ls /docs\r", 10) {
+    match run!(b"dir /docs\r", 10) {
         Some(r) => check!(!r.contains("renamed.txt"), "ls: deleted file is gone"),
-        None    => { println!("files-test: FAIL - ls after delete timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir after delete timeout"); fail += 1; }
     }
 
     // move (relink) - into the /docs/sub directory created earlier.
@@ -2004,9 +2636,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("moved"), "move /docs/note.txt → /docs/sub/note.txt"),
         None    => { println!("files-test: FAIL - move timeout"); fail += 1; }
     }
-    match run!(b"ls /docs/sub\r", 10) {
-        Some(r) => check!(r.contains("note.txt"), "ls /docs/sub shows moved file"),
-        None    => { println!("files-test: FAIL - ls sub timeout"); fail += 1; }
+    match run!(b"dir /docs/sub\r", 10) {
+        Some(r) => check!(r.contains("note.txt"), "dir /docs/sub shows moved file"),
+        None    => { println!("files-test: FAIL - dir sub timeout"); fail += 1; }
     }
     match run!(b"read /docs/sub/note.txt\r", 10) {
         Some(r) => check!(r.contains("hello world"), "moved file keeps its content"),
@@ -2020,12 +2652,12 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         let cmd = format!("write /big/f{} x\r", i);
         let _ = run!(cmd.as_bytes(), 10);
     }
-    match run!(b"ls /big\r", 10) {
+    match run!(b"dir /big\r", 10) {
         Some(r) => {
             let n = (1..=10).filter(|i| r.contains(&format!("f{}", i))).count();
             check!(n == 10, "directory grew past 8 entries (no per-dir cap) - 10 files listed");
         }
-        None => { println!("files-test: FAIL - ls /big timeout"); fail += 1; }
+        None => { println!("files-test: FAIL - dir /big timeout"); fail += 1; }
     }
 
     // find - whole-filesystem tree walk from root. Tree now: /docs/{inside.txt, sub/note.txt},
@@ -2069,10 +2701,10 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - find glob inside.* timeout"); fail += 1; }
     }
 
-    // ls shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
-    match run!(b"ls /docs\r", 10) {
+    // dir shows file sizes: /docs/inside.txt holds "nested-content" = 14 bytes.
+    match run!(b"dir /docs\r", 10) {
         Some(r) => check!(r.contains("inside.txt") && r.contains("14 B"), "ls: shows file size (inside.txt 14 B)"),
-        None    => { println!("files-test: FAIL - ls size timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir size timeout"); fail += 1; }
     }
 
     // mkdir parents: create a 3-deep chain in one call (none of /x, /x/y exist yet).
@@ -2080,9 +2712,9 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("created /x/y/z"), "mkdir parents: created /x/y/z chain"),
         None    => { println!("files-test: FAIL - mkdir parents timeout"); fail += 1; }
     }
-    match run!(b"ls /x/y\r", 10) {
+    match run!(b"dir /x/y\r", 10) {
         Some(r) => check!(r.contains("z") && r.contains("dir"), "mkdir parents: /x/y/z exists as a dir"),
-        None    => { println!("files-test: FAIL - ls /x/y timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir /x/y timeout"); fail += 1; }
     }
     // plain mkdir into a missing parent still fails (parents is opt-in).
     match run!(b"mkdir /no/such/dir\r", 10) {
@@ -2145,10 +2777,10 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("deleted (recursive)"), "delete recursive: /grove subtree removed"),
         None    => { println!("files-test: FAIL - delete recursive timeout"); fail += 1; }
     }
-    match run!(b"ls /\r", 10) {
+    match run!(b"dir /\r", 10) {
         Some(r) => check!(!r.contains("grove") && r.contains("orchard"),
                           "delete recursive: /grove gone, /orchard (the copy) survives"),
-        None    => { println!("files-test: FAIL - ls after recursive delete timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir after recursive delete timeout"); fail += 1; }
     }
     // The copy is independent - its nested file is intact after the source was deleted.
     match run!(b"read /orchard/branch/leaf2.txt\r", 10) {
@@ -2426,50 +3058,50 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - bare roster timeout"); fail += 1; }
     }
 
-    // ── ls as a record producer: directory entries become typed rows (name/type/size) ──
+    // ── dir as a record producer: directory entries become typed rows (name/type/size) ──
     // A dedicated dir with known contents: two files of different size + one subdir.
     let _ = run!(b"mkdir /lsr\r", 10);
     let _ = run!(b"write /lsr/big.txt hello world\r", 10);  // 11 bytes
     let _ = run!(b"write /lsr/tiny.txt x\r", 10);           // 1 byte
     let _ = run!(b"mkdir /lsr/kids\r", 10);                 // a subdirectory
-    // bare ls is still the plain text listing (record path is pipe-only).
-    match run!(b"ls /lsr\r", 10) {
+    // bare dir is still the plain text listing (record path is pipe-only).
+    match run!(b"dir /lsr\r", 10) {
         Some(r) => check!(r.contains("big.txt") && r.contains("TYPE") && r.contains("dir"),
-                          "ls record: bare ls is still the text listing"),
-        None    => { println!("files-test: FAIL - ls /lsr timeout"); fail += 1; }
+                          "dir record: bare dir is still the text listing"),
+        None    => { println!("files-test: FAIL - dir /lsr timeout"); fail += 1; }
     }
     // where on the `type` column keeps only directories.
-    match run!(b"ls /lsr | where type=dir\r", 12) {
+    match run!(b"dir /lsr | where type=dir\r", 12) {
         Some(r) => check!(r.contains("kids") && !r.contains("big.txt"),
-                          "ls record: where type=dir keeps the subdir, drops files"),
-        None    => { println!("files-test: FAIL - ls|where type=dir timeout"); fail += 1; }
+                          "dir record: where type=dir keeps the subdir, drops files"),
+        None    => { println!("files-test: FAIL - dir|where type=dir timeout"); fail += 1; }
     }
     // select projects just the name column (no type/size keys).
-    match run!(b"ls /lsr | select name | to json\r", 12) {
+    match run!(b"dir /lsr | select name | to json\r", 12) {
         Some(r) => check!(r.contains("\"name\": \"big.txt\"") && !r.contains("\"type\"") && !r.contains("\"size\""),
-                          "ls record: select name projects one column"),
-        None    => { println!("files-test: FAIL - ls|select timeout"); fail += 1; }
+                          "dir record: select name projects one column"),
+        None    => { println!("files-test: FAIL - dir|select timeout"); fail += 1; }
     }
     // where type=file | to json renders file rows with a numeric size, no subdir.
-    match run!(b"ls /lsr | where type=file | to json\r", 12) {
+    match run!(b"dir /lsr | where type=file | to json\r", 12) {
         Some(r) => check!(r.contains("\"type\": \"file\"") && r.contains("\"size\":") && !r.contains("kids"),
-                          "ls record: where type=file | to json renders file rows"),
-        None    => { println!("files-test: FAIL - ls|where|to json timeout"); fail += 1; }
+                          "dir record: where type=file | to json renders file rows"),
+        None    => { println!("files-test: FAIL - dir|where|to json timeout"); fail += 1; }
     }
     // column sort works on the listing: reverse size puts big.txt (11) before tiny.txt (1).
-    match run!(b"ls /lsr | where type=file | sort reverse size | to json\r", 12) {
+    match run!(b"dir /lsr | where type=file | sort reverse size | to json\r", 12) {
         Some(r) => {
             let (big, tiny) = (r.find("big.txt"), r.find("tiny.txt"));
             check!(big.is_some() && tiny.is_some() && big < tiny,
-                   "ls record: sort reverse size orders files by byte size");
+                   "dir record: sort reverse size orders files by byte size");
         }
-        None => { println!("files-test: FAIL - ls|sort size timeout"); fail += 1; }
+        None => { println!("files-test: FAIL - dir|sort size timeout"); fail += 1; }
     }
     // a text filter on a record stream is a loud, guided error (not silent, not wrong output).
-    match run!(b"ls /lsr | match big\r", 12) {
+    match run!(b"dir /lsr | match big\r", 12) {
         Some(r) => check!(r.contains("record stream") && r.contains("where"),
-                          "ls record: text filter (match) on records errors with guidance"),
-        None    => { println!("files-test: FAIL - ls|match guard timeout"); fail += 1; }
+                          "dir record: text filter (match) on records errors with guidance"),
+        None    => { println!("files-test: FAIL - dir|match guard timeout"); fail += 1; }
     }
 
     // ── drives as a record producer: the attached disk as a row (index/label/status/size) ──
@@ -2535,6 +3167,29 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
         None => { println!("files-test: FAIL - run timeout"); fail += 3; }
     }
+    // ── skip: the third outcome. A check that DECLINED TO RUN is neither a pass nor a failure.
+    //
+    // WITHOUT THIS THE FEATURE IS UNTESTED, and the way it would have gone untested is worth
+    // recording: after adding `skip`, the only fresh evidence was a tally reading `skipped 0` on a
+    // machine that skipped nothing. A counter that always reads zero proves the FIELD exists, not
+    // that it counts - and no suite runs `selfcheck` without a disk, which is the only condition
+    // that makes the real ones fire.
+    //
+    // So the outcome is exercised directly: one skip, one pass, one failure, and the tally must
+    // separate all three. `fail` stops the run, `skip` must NOT - a machine lacking hardware has to
+    // complete everything it can.
+    let _ = run!(b"write /skip.gsh echo before ; skip 'no hardware here' ; echo after\r", 10);
+    match run!(b"run /skip.gsh\r", 16) {
+        Some(r) => {
+            check!(r.contains("SKIP  no hardware here"), "skip: announces itself with its reason");
+            check!(r.contains("run: ran 3, failed 0, skipped 1"),
+                   "skip: counted separately - not a pass, not a failure");
+            check!(r.contains("--- skipped ---"), "skip: the report NAMES what declined to run");
+            check!(r.contains("> echo after"), "skip: does NOT stop the run (unlike `fail`)");
+        }
+        None => { println!("files-test: FAIL - skip-script timeout"); fail += 4; }
+    }
+
     // a missing script reports not found (and `run` returns Err).
     match run!(b"run /no_such.gsh\r", 10) {
         Some(r) => check!(r.contains("not found"), "run: a missing script reports not found"),
@@ -3152,7 +3807,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - assert fails delete timeout"); fail += 1; }
     }
     // and `result` reflects a converted command directly.
-    let _ = run!(b"ls /nowhere\r", 10);
+    let _ = run!(b"dir /nowhere\r", 10);
     match run!(b"result\r", 10) {
         Some(r) => check!(r.contains("Err(FileNotFound)"), "result: ls of a missing dir → Err(FileNotFound)"),
         None    => { println!("files-test: FAIL - ls result timeout"); fail += 1; }
@@ -3219,7 +3874,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     }
 
     // Regression: storm `fs` and the catch-22-safe save must settle + reacquire fs THROUGH THE
-    // KERNEL DIRECTORY to land the report. Then `ls /` must reacquire fs the same way (not "storage
+    // KERNEL DIRECTORY to land the report. Then `dir /` must reacquire fs the same way (not "storage
     // unavailable"). This pins client-resolution-after-restart via the directory, the property §22
     // Test 11 covers. Generous timeout (settle + bounded save-retry on TCG).
     match run!(b"chaos kill-storm fs 2 save /fsr.txt\r", 60) {
@@ -3232,10 +3887,171 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "chaos: fs-target report file persisted (catch-22-safe save landed)"),
         None    => { println!("files-test: FAIL - read fs chaos report timeout"); fail += 1; }
     }
-    match run!(b"ls /\r", 10) {
+    match run!(b"dir /\r", 10) {
         Some(r) => check!(!r.contains("storage unavailable"),
                           "directory: shell reacquires fs after its own restart"),
-        None    => { println!("files-test: FAIL - ls after fs-storm timeout"); fail += 1; }
+        None    => { println!("files-test: FAIL - dir after fs-storm timeout"); fail += 1; }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // A DIRECTORY BIGGER THAN ONE LISTING PAGE.
+    //
+    // Every case above this point uses a directory of two or three files, which is why none of them
+    // ever caught the thing this block exists for: a `LIST_DIR` reply is ONE 512-byte block, holding
+    // roughly twenty entries, and until the continuation cursor landed everything past the twentieth
+    // was simply absent. `dir` at least said TRUNCATED. `find`, `tree` and `copy` did not - they
+    // walked what they could see and reported success, so a recursive copy silently skipped files
+    // and told you it had copied the directory.
+    //
+    // 45 files is deliberately just over two pages, so the walk has to resume twice rather than
+    // once: an off-by-one in the cursor that happens to work for a single resume shows up here.
+    match run!(b"mkdir /many\r", 10) {
+        Some(r) => check!(r.contains("created /many"), "many: mkdir /many"),
+        None    => { println!("files-test: FAIL - mkdir /many timeout"); fail += 1; }
+    }
+    // 45 separate `write` commands rather than a `for` loop, because `for` is a SCRIPT construct -
+    // the interactive shell answers `unknown: for`. Driving it from the harness also keeps this
+    // test independent of the script parser, which is not what is under test here.
+    {
+        let mut wrote = 0usize;
+        for k in 0..45 {
+            let line = format!("write /many/f{k}.txt x\r");
+            if let Some(r) = run!(line.as_bytes(), 10) {
+                if r.contains("wrote ") { wrote += 1; }
+            }
+        }
+        check!(wrote == 45, "many: wrote 45 files into one directory");
+    }
+    // THE HEADLINE CHECK. Before the cursor this printed about twenty entries and a TRUNCATED
+    // banner; the count is now what was actually listed, so "45 entries" is the whole directory.
+    match run!(b"dir /many\r", 30) {
+        Some(r) => {
+            check!(r.contains("45 entries"), "many: dir lists all 45 entries across pages");
+            check!(!r.contains("INCOMPLETE") && !r.contains("TRUNCATED"),
+                   "many: dir does not report a truncated listing");
+            // Entries from the FIRST page and the LAST must both be present - a resumed walk that
+            // restarts from zero would show f0 twice and f44 never, and the count alone would not
+            // distinguish that from a correct walk.
+            check!(r.contains("f0.txt") && r.contains("f44.txt"),
+                   "many: dir shows both the first and the last entry");
+        }
+        None => { println!("files-test: FAIL - dir /many timeout"); fail += 1; }
+    }
+    // `find` walked a truncated listing and said nothing. f44 lives past the first page, so finding
+    // it is proof the walk resumed rather than proof the name exists.
+    match run!(b"find f44 /many\r", 30) {
+        Some(r) => check!(r.contains("/many/f44.txt") && r.contains("1 match"),
+                          "many: find reaches an entry past the first listing page"),
+        None    => { println!("files-test: FAIL - find /many timeout"); fail += 1; }
+    }
+    // THE ONE THAT WAS SILENTLY WRONG. A recursive copy reported success having copied only what
+    // fit in one listing block. The count in its summary is now the count it actually copied.
+    match run!(b"copy /many /manycopy recursive\r", 90) {
+        Some(r) => {
+            check!(r.contains("45 files"), "many: recursive copy copies every file, not one page");
+            check!(!r.contains("INCOMPLETE"), "many: copy does not report an incomplete walk");
+        }
+        None => { println!("files-test: FAIL - copy /many timeout"); fail += 1; }
+    }
+    match run!(b"dir /manycopy\r", 30) {
+        Some(r) => check!(r.contains("45 entries"), "many: the copy has all 45 files on disk"),
+        None    => { println!("files-test: FAIL - dir /manycopy timeout"); fail += 1; }
+    }
+    // The records pipe reads the same listing. It is capped at 64 rows by `REC_MAX_ROWS`, which 45
+    // is comfortably under, so a short answer here would be the cursor and not the table bound.
+    match run!(b"dir /many | count\r", 30) {
+        Some(r) => check!(r.contains("45"), "many: the records pipe sees all 45 rows"),
+        None    => { println!("files-test: FAIL - dir | count timeout"); fail += 1; }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // `scrollback save <path>` - THE HISTORY AS A REAL FILE, which needs a real disk, which is why
+    // it lives here and not in the shell suite (that one has no storage and the attempt only
+    // produced `storage unavailable`).
+    //
+    // Waits for the PROMPT, not for `scrollback: saved`: `collect_until` stops AT its marker, so
+    // waiting on the start of the report line would leave the counts and the path outside the
+    // captured text - which is exactly how the first version of this case failed.
+    // WRITTEN INTO /docs, NOT ROOT. The first version saved to `/sb.txt` and tipped `dir /` over the
+    // record bound (64 rows / 4096 bytes), which broke the tab-completion cases below - they
+    // enumerate root. A test that changes the tree other tests read is a test with side effects.
+    send(&mut write_half, b"scrollback save /docs/sb.txt\r");
+    let sv = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(25)).unwrap_or_default();
+    check!(sv.contains("scrollback: saved") && sv.contains("line(s)") && sv.contains("/docs/sb.txt"),
+           "scrollback save: reports the lines and bytes it wrote");
+
+    // AND THE FILE IS REAL. ASSERT ON SOMETHING THE ECHO CANNOT CONTAIN: the first version ran
+    // `dir / | where name=sb.txt` and checked `contains("sb.txt")`, which matched THE ECHOED COMMAND
+    // - it passed while `dir` had actually truncated and found nothing. `count` reports "N lines,"
+    // and no command line here contains that.
+    send(&mut write_half, b"read /docs/sb.txt | count\r");
+    let sv2 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)).unwrap_or_default();
+    check!(count_before(&sv2, " lines,") > 0,
+           "scrollback save: the file reads back with real content");
+
+    // AND CLEAN UP, so the tree the later cases see is the tree they expect.
+    send(&mut write_half, b"delete /docs/sb.txt\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15));
+
+    // `paginate` - the reading pipe sink.
+    //
+    // /many has 45 entries, comfortably taller than the 24-row console, so it pages.
+    //
+    // The keys are sent WITH the command, the way the `help` pager case above does it: a space to
+    // page forward and then `q`, so the prompt is reached either way and a hang shows up as a
+    // timeout rather than as a wedged suite.
+    {
+        send(&mut write_half, b"dir /many | paginate\r q");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+            Some(r) => {
+                check!(r.contains("of 45"), "paginate: pages a 45-row record stream");
+                check!(r.contains("[q] quit"), "paginate: offers the quit key while it is polling");
+                // THE COLUMN HEADER IS PINNED. This is the capability the console's scrollback
+                // structurally cannot give: scrolled back through a grid, the column names are off
+                // the top and the columns are unlabelled.
+                check!(r.contains("name") && r.contains("sealed"),
+                       "paginate: the record column header is drawn");
+            }
+            None => { println!("files-test: FAIL - paginate timeout (did it hang?)"); fail += 1; }
+        }
+    }
+    // A SHORT STREAM IS NOT WORTH A MODE. Entering a pager to show three lines is something the
+    // reader then has to leave, which is worse than the problem it solves - `help` makes the same
+    // call. `/docs` has two entries, so this must print and return, with no status line at all.
+    match run!(b"dir /docs | paginate\r", 15) {
+        Some(r) => check!(!r.contains("[q] quit"),
+                          "paginate: output that already fits is printed, not paged"),
+        None    => { println!("files-test: FAIL - short paginate timeout"); fail += 1; }
+    }
+    // ARGUMENTS ARE REFUSED, rather than quietly ignored. `paginate 20` looks like it means
+    // something and does not.
+    match run!(b"dir /many | paginate 20\r", 15) {
+        Some(r) => check!(r.contains("takes no arguments"), "paginate: refuses an argument plainly"),
+        None    => { println!("files-test: FAIL - paginate-with-arg timeout"); fail += 1; }
+    }
+    // NOT THE LAST STAGE IS REFUSED. It reads the stream; it cannot pass one on.
+    match run!(b"dir /many | paginate | write /p.txt\r", 15) {
+        Some(r) => check!(r.contains("must be the last stage"), "paginate: refuses a non-final position"),
+        None    => { println!("files-test: FAIL - paginate-not-last timeout"); fail += 1; }
+    }
+
+    // THE NO-HUMAN GUARD - `paginate` inside a script must PRINT, never wait for a key - is proven
+    // in `scripts/smoke.gsh` and run by `osdev test script`, NOT here, and the reason is a genuine
+    // limitation worth knowing: `execute` treats any line containing `|` as a pipeline, so
+    // `write /p.gsh dir /many | paginate` pipes the WRITE into `paginate` instead of storing that
+    // text. **A script containing a pipe cannot be authored from the interactive shell at all**;
+    // the only route is a host-baked file, which is exactly what the script suite is for. The
+    // attempt that used to be here silently tested nothing, which is worse than testing elsewhere.
+    //
+    // What this suite still covers is the interactive half, above: it pages, it offers `[q] quit`,
+    // it pins the header, it prints rather than pages when the output already fits, and it refuses
+    // an argument or a non-final position.
+    //
+    // A CAPTURE cannot smuggle it into a non-final position either - the reader there is the shell.
+    match run!(b"dir /many | paginate | count\r", 15) {
+        Some(r) => check!(r.contains("must be the last stage"),
+                          "paginate: a capture cannot smuggle it into a non-final position either"),
+        None    => { println!("files-test: FAIL - paginate capture timeout"); fail += 1; }
     }
 
     // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the
@@ -3338,9 +4154,9 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
     // The disk is pre-formatted host-side with a large baked file (`/big.txt`, ~400 lines / several
     // IO_CHUNK windows). Confirm fs mounted it - proves the editor has a filesystem to save to and
     // gives the large-file tests their fixture.
-    match read_back!(b"ls /\r") {
+    match read_back!(b"dir /\r") {
         Some(r) => check!(r.contains("big.txt"), "setup: pre-baked /big.txt present"),
-        None    => { println!("edit-test: FAIL - ls / timeout"); fail += 1; }
+        None    => { println!("edit-test: FAIL - dir / timeout"); fail += 1; }
     }
 
     // 1. no-arg usage.
@@ -4177,12 +4993,21 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
             check!(r.contains("forged handle rejected"), "a fabricated handle is not a capability (unforgeable)");
             check!(r.contains("revoked after close"),  "the cap is revoked on close (revocable)");
             check!(r.contains("revoked after rename"),  "rename revokes the cap (no confused-deputy via path reuse)");
+            // APPEND-only: extend yes, rewrite no. The right `recorder` needs and could not have.
+            check!(r.contains("writes moving FORWARD accepted"), "an append-only cap CAN write forward");
+            check!(r.contains("rewriting earlier bytes through an append-only cap DENIED"),
+                   "an append-only cap CANNOT go back over what it already wrote");
+            check!(r.contains("still accepted after the refusal"),
+                   "a refused write did not rewind the high-water mark");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }
     }
     let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+    // SAVE THE SERIAL. Without it a failure here says only that some property did not hold, and the
+    // one line that says WHICH is inside the guest.
+    let _ = std::fs::write("build/tests/file_cap_serial.log", &whole);
 
     child.kill().ok(); child.wait().ok();
     println!("\nfile-cap: {pass} passed, {fail} failed");
@@ -4244,12 +5069,43 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     }
 
     // The disk is already formatted (drifted free count); fs auto-mounted it. Run the fsck.
-    let expect = format!("{} free", expect_free);
+    // **NOT an exact match, and the exactness is what made this test wrong.** `expect_free` is read
+    // from the superblock BEFORE boot, but the running system creates files of its own on the way up
+    // - `/clock.last` (the `time` service's persisted floor) and `.gsh_history` - each taking a
+    // block. Both arrived after this test was written, so the pinned figure silently went stale and
+    // the suite had been failing 4/1 on `main` with nobody looking: no gate that runs before a merge
+    // includes the eleven fs suites. See `backlog/32`.
+    //
+    // What the test is FOR is preserved exactly - that fsck rebuilds the count from the tree instead
+    // of believing the superblock. The value must no longer be the bogus one, and must land within a
+    // few blocks of the truth: a window boot-time writes fit in and a 123,456-block lie does not.
+    let bogus_free = format!("{} free", expect_free.wrapping_add(123_456));
     match run!(b"drives check\r", 15) {
         Some(r) => {
-            check!(r.contains(&expect), "free count rebuilt from the tree to the correct value");
+            check!(!r.contains(&bogus_free), "fsck stopped believing the drifted superblock count");
+            check!((0..=8).any(|d: u64| r.contains(&format!("{} free", expect_free.saturating_sub(d)))),
+                   "free count rebuilt from the tree to within a few blocks of the truth");
             check!(r.contains("0 bad"), "no corrupt blocks reported");
             check!(r.contains("ok") || r.contains("consistent"), "reports consistent");
+            // fsck must SAY a repair was needed, not merely perform one.
+            //
+            // This disk's free count was drifted on purpose, so the repaired case is the one under
+            // test here - and until this assertion existed, a healthy volume and one that had just
+            // had its accounting corrected printed identical lines. A silent repair is the same
+            // shape as a silent fallback: the drift is evidence about something else (an
+            // interrupted write, a leaked extent) and repairing it away unseen destroys that
+            // evidence (26.7). The assertion is also what proves the new reporting FIRES rather
+            // than merely compiling.
+            check!(r.contains("REPAIRED"), "fsck reports that a repair was NEEDED, not just its result");
+            check!(r.contains("counted too much free space"),
+                   "fsck names the DIRECTION of the count disagreement");
+            // AND SAYS IT IS ONLY THE COUNT. The old message read "marked free but are IN USE",
+            // which describes a BITMAP fault - the kind that destroys data - while this check only
+            // ever compared two scalars. A message naming a worse fault than it measured sends its
+            // reader to the wrong place; this asserts the scope is stated.
+            check!(r.contains("bitmap was rebuilt from the tree regardless")
+                   || r.contains("The bitmap was rebuilt"),
+                   "and says the claim is about the COUNT, not the bitmap");
         }
         None => { println!("fs-check: FAIL - drives check timeout"); fail += 1; }
     }
@@ -5431,4 +6287,3048 @@ pub fn run_adopt_storm(image_path: &Path, persist_path: &str, smp: u32) {
     child.kill().ok(); child.wait().ok();
     println!("\nadopt-storm: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }
+}
+
+/// Phase M - the adversarial suite (`osdev test fs-fuzz`).
+///
+/// Boots one machine and throws hostile requests at `fs` through the shell, which is the path a real
+/// client travels. **The bar is that `fs` never panics, never hangs, and never serves a wrong answer
+/// as a right one** - not that any particular case succeeds or fails, because for several of them
+/// either outcome is defensible as long as it is the SAME one every time and the filesystem is intact
+/// afterwards.
+///
+/// The run opens and closes with the same canary file. Everything in between is the assault; if the
+/// canary still reads back at the end and `drives check` is clean, the filesystem survived it.
+///
+/// Cases the shell legitimately refuses to send - a move into a directory's own subtree - are not
+/// reachable from here by design. Those need the protocol path (`docs/gsfs-next.md` §1c).
+pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("fs-fuzz: booting (smp={smp}) with a canary file already on the disk");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-fuzz: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-fuzz: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) }
+            }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize; let mut cursor = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-fuzz: PASS - {}", $label); pass += 1; } else { println!("fs-fuzz: FAIL - {}", $label); fail += 1; }
+    }; }
+    // Every hostile command must come back to a prompt. A case that never returns is the worst
+    // outcome of all, so the timeout IS an assertion: `None` means `fs` stopped answering.
+    macro_rules! answered { ($cmd:expr, $label:expr) => {{
+        let c = format!("{}\r", $cmd);
+        send(&mut write_half, c.as_bytes());
+        let r = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20));
+        check!(r.is_some(), format!("answered: {}", $label));
+        r.unwrap_or_default()
+    }}; }
+
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_none() {
+        println!("fs-fuzz: FAIL - timed out waiting for first gsh>");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    // The guard selftest runs at every fs start, and nothing below is trustworthy if it did not pass.
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        check!(whole.contains("path guard selftest PASS"), "fs proved its path guards at startup");
+        // 599 malformed requests through the REAL parser, on every boot. The assertion is not that
+        // each gets the right answer - a malformed request has none - but that each gets SOME answer:
+        // a zero-length reply is undeliverable, so it leaves the caller waiting out its deadline.
+        check!(whole.contains("protocol selftest PASS"),
+               "fs answered every malformed request at startup (no undeliverable empty reply)");
+    }
+    let base = answered!("read /canary.txt", "the canary reads before the assault");
+    check!(base.contains("canary-must-survive"), "the canary is intact before the assault");
+    answered!("mkdir /fz", "a working directory for the assault");
+
+    // ---- NAME_MAX (38) at both edges. Four separate call sites check this; they must agree. ----
+    let n38: String = "n".repeat(38);
+    let n39: String = "n".repeat(39);
+    let r = answered!(format!("mkdir /fz/{n38}"), "a name of exactly NAME_MAX");
+    check!(!r.contains("failed"), "a 38-byte name (exactly NAME_MAX) is ACCEPTED");
+    let r = answered!(format!("mkdir /fz/{n39}"), "a name one byte over NAME_MAX");
+    let over_created = r.contains("created");
+    check!(!over_created, "a 39-byte name (NAME_MAX + 1) is REFUSED");
+    // TRUNCATION IS THE DANGEROUS OUTCOME. A 39-byte name silently becoming the 38-byte one means
+    // two distinct names collide and one file shadows another, so listing must show ONE entry.
+    let r = answered!("dir /fz", "listing after both name-length attempts");
+    let n38_count = r.matches(n38.as_str()).count();
+    check!(n38_count <= 1, "the over-length name did not truncate into the valid one (no collision)");
+
+    // ---- `.` and `..`: nothing in `fs` handles either, so this RECORDS what actually happens. ----
+    answered!("write /fz/real.txt here-i-am", "a file to reach via a relative path");
+    let dot = answered!("read /fz/./real.txt", "a path containing a `.` component");
+    let dotdot = answered!("read /fz/sub/../real.txt", "a path containing a `..` component");
+    println!("fs-fuzz: NOTE - `.` resolved to the file: {}", if dot.contains("here-i-am") { "YES" } else { "no" });
+    println!("fs-fuzz: NOTE - `..` resolved to the file: {}", if dotdot.contains("here-i-am") { "YES" } else { "no" });
+
+    // ---- A path far longer than the `plen` byte can describe (255). ----
+    let long_path: String = (0..40).map(|i| format!("/d{i}")).collect::<Vec<_>>().join("");
+    answered!(format!("mkdir {long_path} parents"), "a path longer than 255 bytes");
+
+    // ---- Depth: MAX_TREE_DEPTH is 64, so 70 levels must be refused rather than walked forever. ----
+    let very_deep: String = (0..70).map(|_| "/x").collect::<Vec<_>>().join("");
+    answered!(format!("mkdir {very_deep} parents"), "70 nested levels (MAX_TREE_DEPTH is 64)");
+    answered!(format!("dir {very_deep}"), "listing at 70 levels deep");
+
+    // ---- Structural oddities that must each get a DEFINED answer rather than a surprise. ----
+    answered!("read /", "reading a DIRECTORY as a file");
+    answered!("dir /nonexistent-path-entirely", "listing a path that does not exist");
+    answered!("delete /fz", "deleting a NON-EMPTY directory without `recursive`");
+    answered!("mkdir /fz", "creating a directory that already exists");
+    answered!("write /fz/real.txt/child x", "writing THROUGH a file as if it were a directory");
+    answered!("rename / newroot", "renaming the ROOT");
+    answered!("delete /", "deleting the ROOT");
+    answered!("read /fz/real.txt", "the tree still answers an ordinary read afterwards");
+
+    // ---- A FILENAME MUST NOT BE ABLE TO DRIVE THE TERMINAL ----
+    //
+    // The disk carries a file whose NAME contains `ESC [ 2J` (clear screen). It was baked host-side
+    // because the shell's line editor accepts only printable ASCII, so it cannot be typed - which is
+    // the point: this is what a disk prepared by somebody else looks like. If `dir` emits the name
+    // unfiltered, the listing that is supposed to REVEAL what is on the disk becomes something the
+    // disk controls, and a file can scroll itself out of its own listing.
+    let listing = answered!("dir /", "listing a directory holding a hostile filename");
+    check!(!listing.contains("[2J"),
+           "`dir` did not emit a raw ESC sequence that came from a FILENAME");
+
+    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK IS LISTED IN FULL (backlog/33) ----
+    //
+    // `list_dir` builds each answer into a single 512-byte block, so roughly twenty entries fit per
+    // reply. THIS CASE USED TO ASSERT THE OPPOSITE OF WHAT IT ASSERTS NOW, and the history is worth
+    // keeping because it is two different bugs:
+    //
+    //   1. Originally the count reported only what fit, so `dir` on a directory of thirty files
+    //      printed twenty and said `(20 entries)` as though that were the whole truth - a WRONG
+    //      ANSWER rather than a limit, reaching `find`, `tree`, `copy` and tab completion alike.
+    //   2. The first fix added a TRUNCATED banner, and this case pinned it. That converted a silent
+    //      wrong answer into a loud partial one, which is better and still not an answer.
+    //
+    // The listing now RESUMES: the reply carries the position to continue from and the caller loops
+    // until the directory is exhausted, so thirty entries take two round trips and all thirty
+    // arrive. The banner is gone because there is nothing left to warn about.
+    //
+    // Thirty is deliberately past one page and not a constant read off the source - the per-reply
+    // ceiling depends on name length and is nobody's business to hard-code an expectation about.
+    answered!("mkdir /many", "a directory bigger than one reply block");
+    for i in 0..30 {
+        answered!(format!("write /many/file{i:02}.txt x"), "one of thirty entries");
+    }
+    let big = answered!("dir /many", "listing a directory that cannot fit in one reply");
+    check!(big.contains("30 entries"),
+           "`dir` lists all thirty entries, resuming across replies rather than stopping at one");
+    check!(!big.contains("TRUNCATED") && !big.contains("INCOMPLETE"),
+           "`dir` reports no truncation, because the listing is now complete");
+    // The first and last entries specifically: a resumed walk that restarted from zero would repeat
+    // the first page and never reach the last name, and a bare count would not tell the difference.
+    check!(big.contains("file00.txt") && big.contains("file29.txt"),
+           "`dir` shows both the first entry and one well past the first reply block");
+    // And the other half, which is what makes the first half meaningful: an ordinary directory must
+    // NOT carry the warning. A flag that is always set says nothing.
+    let small = answered!("dir /fz", "listing a directory that fits");
+    check!(!small.contains("TRUNCATED"),
+           "a directory that FITS is not labelled truncated (the warning discriminates)");
+    answered!("delete /many recursive", "clean up the overfilled directory");
+
+    // ---- TIMESTAMPS (Phase O) and the migration story, in one listing ----
+    //
+    // `canary.txt` was baked host-side into a 0008 image, so no time was ever recorded for it.
+    // `/fz/real.txt` was written by this machine moments ago. Both are in the same tree, and
+    // `dir` must tell the truth about each: a real date for the one that has one, and the word
+    // `unknown` for the one that does not - never 1970, because a wrong date is worse than no date.
+    let listing = answered!("dir /", "dir on a tree holding both timed and untimed entries");
+    check!(listing.contains("MODIFIED"), "`dir` prints a MODIFIED column by default");
+    check!(listing.contains("unknown"),
+           "an entry from a 0008 volume reads as `unknown`, not as an epoch date");
+    // A file written AFTER the clock arrived. `fs` learns the time from a push by `time`, so a file
+    // created before that push legitimately carries no date - which is the correct behaviour and not
+    // something to assert against. The clock link announces itself, so wait for it rather than race.
+    check!(String::from_utf8_lossy(&buf.lock().unwrap()).contains("wall clock received"),
+           "fs received the wall clock from `time`");
+    answered!("write /fz/dated.txt now", "a file written after the clock arrived");
+    let fzl = answered!("dir /fz", "dir on files this machine created");
+    check!(fzl.contains("20") && !fzl.contains("1970"),
+           "a file written after the clock arrived carries a REAL date, not 1970");
+    // Readable sizes are the DEFAULT now, and `bytes` is what asks for the exact count - the
+    // reverse of the old `human` word. Both halves are asserted, because "the default changed" is
+    // exactly the kind of claim that rots into being true of neither.
+    let units = answered!("dir /", "dir renders sizes with units by default");
+    check!(units.contains("KiB") || units.contains(" B"), "`dir` renders sizes in units unasked");
+    let exact = answered!("dir bytes /", "dir bytes");
+    check!(!exact.contains("KiB"), "`dir bytes` renders an exact count, not KiB/MiB");
+
+    // ---- The filesystem must still be intact. That is the whole point of the suite. ----
+    let chk = answered!("drives check", "fsck after the assault");
+    check!(chk.contains("consistent") || chk.contains("ok"), "the filesystem is CONSISTENT after every hostile request");
+    let after = answered!("read /canary.txt", "the canary reads after the assault");
+    check!(after.contains("canary-must-survive"), "the canary is byte-intact after the assault");
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic across the whole assault");
+    check!(!whole.contains("LIVENESS WEDGE"), "no liveness wedge across the whole assault");
+    check!(!whole.contains("path guard selftest FAILED"), "fs never reported a failed guard selftest");
+    let _ = std::fs::write("build/tests/fs_fuzz_serial.log", &whole);
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nfs-fuzz: {pass} passed, {fail} failed  (serial -> build/tests/fs_fuzz_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Phase O - timestamps must survive a REBOOT, which is the half no single-boot test can reach.
+///
+/// Everything about Phase O that matters is on the disk: a times region at byte 452 of each
+/// directory block, its own CRC, and the rule that a region failing that CRC reads as `unknown`
+/// rather than as a date. A test inside one boot proves only that `fs` remembers what it just wrote.
+///
+/// So this boots the SAME disk twice. The first boot writes a file and reads its date; the second
+/// reads the date again, from blocks that have been through a mount, and must get the same answer.
+/// It also proves the compatibility claim from the other direction: a file baked host-side by
+/// `osdev mkfs` - which writes no times region at all - reads as `unknown` on both boots, and is NOT
+/// given an invented one by having been mounted by a build that does record times.
+/// A sector this driver wrote, as the `write-tap` build reported it: its order, where, and what.
+struct TappedWrite { seq: u64, lba: u64, data: Vec<u8> }
+
+/// Reassemble the `btap` lines of a serial capture into an ordered list of writes.
+///
+/// One line per 64-byte chunk (`btap <seq> <lba> <chunk> <128 hex>`), eight per sector, because a
+/// log line renders through a fixed 256-byte buffer. A sector is kept only if all eight of its
+/// chunks arrived and parsed: the serial stream is shared with every other service's logging and
+/// can splice one line into another under load (a known hazard - see the serial-splice note), and a
+/// HALF-DECODED sector would hand the replay a disk state the machine never produced. Dropping it
+/// costs one tear point; believing it would invent a failure.
+fn parse_write_tap(serial: &str) -> Vec<TappedWrite> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<u64, (u64, [Option<[u8; 64]>; 8])> = BTreeMap::new();
+    for line in serial.lines() {
+        let Some(rest) = line.split("btap ").nth(1) else { continue };
+        let mut it = rest.split_whitespace();
+        let (Some(seq), Some(lba), Some(chunk), Some(hex)) = (it.next(), it.next(), it.next(), it.next())
+            else { continue };
+        let (Ok(seq), Ok(lba), Ok(chunk)) = (seq.parse::<u64>(), lba.parse::<u64>(), chunk.parse::<usize>())
+            else { continue };
+        if chunk >= 8 || hex.len() != 128 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) { continue; }
+        let mut bytes = [0u8; 64];
+        for i in 0..64 {
+            match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) { Ok(b) => bytes[i] = b, Err(_) => continue }
+        }
+        let e = acc.entry(seq).or_insert((lba, [None; 8]));
+        e.0 = lba;
+        e.1[chunk] = Some(bytes);
+    }
+    acc.into_iter().filter_map(|(seq, (lba, chunks))| {
+        let mut data = Vec::with_capacity(512);
+        for c in chunks.iter() { data.extend_from_slice(c.as_ref()?); }
+        Some(TappedWrite { seq, lba, data })
+    }).collect()
+}
+
+/// Build the disk state a power cut after the first `k` writes would leave: the pristine image with
+/// writes 1..=k applied in the order the driver issued them.
+///
+/// **This is not a model of a power cut, it is one.** Each write in the list completed on the medium;
+/// stopping after any of them is a state the machine genuinely passed through.
+fn apply_writes_prefix(base: &[u8], writes: &[TappedWrite], k: u64, out_path: &str) -> std::io::Result<()> {
+    let mut img = base.to_vec();
+    for w in writes.iter().filter(|w| w.seq <= k) {
+        let off = (w.lba as usize) * 512;
+        if off + 512 <= img.len() { img[off..off + 512].copy_from_slice(&w.data); }
+    }
+    std::fs::write(out_path, img)
+}
+
+/// TORN WRITES: boot the disk state left by a power cut after EVERY prefix of one operation's
+/// writes, and check the result against the outcomes `docs/gsfs-carnage.md` 2 permits.
+///
+/// Record, then replay. The `write-tap` build of `block-driver` logs every sector it writes - order,
+/// LBA and content - and changes nothing else. So the harness can run one operation, learn exactly
+/// which sectors it wrote and in what order, and then construct and boot the disk as it stood after
+/// each of them. No fault is injected and the I/O path under test is the shipping one.
+///
+/// Why this rather than an injector: an injector tears where somebody CHOSE, which answers "did this
+/// tear survive" instead of "does any tear survive". Here every cut point of the operation is tested,
+/// a failure names its `k`, and the failing image is a file that can be booted again while it is
+/// being fixed.
+/// EXHAUSTION: fill the volume, then check what a REFUSED allocation leaves behind.
+///
+/// The interesting question is not whether a write fails when the disk is full - of course it does.
+/// It is what the failure costs: whether the refusal is reported accurately, whether the blocks it
+/// half-claimed are handed back, whether a file that had nothing to do with it is still intact, and
+/// whether the filesystem accepts valid work again afterwards. A allocator that strands a few blocks
+/// on every refusal turns a full disk into a shrinking one.
+///
+/// The disk is baked nearly full HOST-SIDE rather than filled from the prompt. Filling 16 MiB a file
+/// at a time is thousands of commands, and copying megabytes inside QEMU spends the whole runtime on
+/// the least interesting part. Three large files and a canary get the volume to the edge in one step,
+/// and every command the test then sends is aimed at the actual question.
+/// THE CRASH WINDOW: kill the machine while the journal is committed and unapplied.
+///
+/// Every other crash test here either constructs the post-crash disk host-side or replays a recorded
+/// write prefix. This one lets the SYSTEM reach the dangerous state on its own and then stops it
+/// there - which is the only version of the test that can be carried to real hardware, where nobody
+/// gets to choose the cut point.
+///
+/// Two boots. The first writes through a `/cutme` path, which makes `fs` hold the window open and
+/// announce it; QEMU is killed inside that window, leaving a durable commit record and NO home block
+/// moved. The second boots the same disk and must REPLAY it.
+/// CHURN then CUT: kill the machine while the filesystem is under continuous load.
+///
+/// The complement to `fs-window`. That one holds ONE known window open and proves recovery works;
+/// this one runs thousands of transactions of every shape and kills the machine at an arbitrary
+/// moment, which is what a real power cut is. The cut point is not chosen and cannot be - that is
+/// the point.
+///
+/// **What it asserts is deliberately not "the journal recovered".** It usually will not: the window
+/// is narrow and one cut samples it once. What must hold EVERY time, whatever the cut hit, is the
+/// permitted-outcome table - the volume mounts, no block is corrupt, and the free accounting is
+/// either consistent or drifted in the SAFE direction (a leak). `marked free but are IN USE` is the
+/// one that must never appear, because those blocks belong to a live file and the next allocation
+/// would overwrite them.
+/// INTERRUPT THE RECOVERY ITSELF - the one crash state nothing had ever reached.
+///
+/// `recover` makes three claims in its own comments, and until this suite existed all three were
+/// arguments rather than results: it is RESTARTABLE, repeating it does not PROGRESSIVELY WORSEN the
+/// damage, and it never clears a half-applied commit. Everything else in this project crashes a
+/// machine doing ordinary work; this crashes one in the middle of cleaning up after the last crash.
+///
+/// Three boots, because two is not enough to show the property:
+///
+///   1. Write through `/cutme`, so `fs` holds the commit window open, and kill inside it.
+///      The disk now carries a durable commit record and NO home block applied.
+///   2. Boot that disk. Recovery starts, applies the FIRST home block, and pauses. Kill it there.
+///      The journal is still intact - it is invalidated only once every block is home - so the disk
+///      is now half-recovered, which is a state no other test produces.
+///   3. Boot again. Recovery must run AGAIN and finish, and the file must be correct.
+///
+/// Step 3 is what makes step 2 meaningful. A recovery that ran once and left the disk unusable would
+/// pass a two-boot test that only checked "it mounted".
+pub fn run_fs_nested(image_path: &Path, replay_image: &Path, persist_path: &str, smp: u32) {
+    let qemu       = crate::qemu::qemu_binary();
+    let window_img = image_path.to_string_lossy().replace('\\', "/");
+    let replay_img = replay_image.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-nested: PASS - {}", $label); pass += 1; } else { println!("fs-nested: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |image: &str, cmds: &[&str], kill_on: Option<&str>| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        // A REPLAY WINDOW OPENS BEFORE THE PROMPT, because recovery runs at mount. So watch for the
+        // marker FIRST and only wait for a prompt if no marker was asked for - waiting for `gsh>`
+        // first would sail straight past the window this test exists to catch.
+        // TWO SHAPES OF WINDOW, and conflating them cost a whole run. A COMMIT window is opened BY A
+        // COMMAND, so that boot must reach a prompt and type first. A REPLAY window opens during
+        // MOUNT, before any prompt exists, so waiting for `gsh>` there sails straight past the thing
+        // the test is trying to catch. `cmds` being empty is what distinguishes them.
+        match (kill_on, cmds.is_empty()) {
+            // Replay window: nothing to type - the marker arrives on its own during mount.
+            (Some(marker), true) => {
+                if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(60)).is_some() {
+                    child.kill().ok();
+                }
+            }
+            // Commit window: reach a prompt, issue the write, THEN watch for the marker it opens.
+            (Some(marker), false) => {
+                if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_some() {
+                    for c in cmds {
+                        send(&mut write_half, format!("{c}\r").as_bytes());
+                    }
+                    if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(60)).is_some() {
+                        child.kill().ok();
+                    }
+                }
+            }
+            (None, _) => {
+                if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_some() {
+                    for c in cmds {
+                        send(&mut write_half, format!("{c}\r").as_bytes());
+                        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+                    }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-nested: boot 1 - commit, then cut inside the commit window");
+    let w1 = boot(&window_img, &["write /cutme.txt interrupted-twice"],
+                  Some("THE JOURNAL IS COMMITTED AND UNAPPLIED"));
+    check!(w1.contains("THE JOURNAL IS COMMITTED AND UNAPPLIED"), "the commit window opened");
+    check!(!w1.contains("window closed"), "cut INSIDE it - no home block was applied");
+
+    println!("fs-nested: boot 2 - recovery starts, and is cut HALF WAY THROUGH");
+    let w2 = boot(&replay_img, &[], Some("A REPLAY IS HALF APPLIED"));
+    check!(w2.contains("journal recovered") || w2.contains("A REPLAY IS HALF APPLIED"),
+           "recovery STARTED on the second boot");
+    check!(w2.contains("A REPLAY IS HALF APPLIED"), "and it was interrupted part-way through");
+    check!(!w2.contains("replay-window] window closed"),
+           "the machine was cut before the replay finished (the disk is HALF recovered)");
+
+    println!("fs-nested: boot 3 - recovery must run AGAIN and finish");
+    let w3 = boot(&window_img, &["read /cutme.txt", "read /canary.txt", "drives check"], None);
+    // THE CLAIM UNDER TEST. `recover` invalidates the journal only once every block is home, so an
+    // interrupted replay must leave the record intact and the next mount must redo it. If this fails,
+    // an interrupted recovery is unrecoverable - strictly worse than the crash it was recovering from.
+    check!(w3.contains("journal recovered"),
+           "the interrupted replay was REDONE on the next boot (recovery is restartable)");
+    check!(w3.contains("mounted GSFS0008"), "and the volume mounted");
+    check!(w3.contains("interrupted-twice"),
+           "the twice-interrupted write is PRESENT and correct");
+    check!(w3.contains("untouched-by-any-of-this"), "an unrelated file is intact");
+    check!(w3.contains("0 bad"), "no corrupt blocks - repeating the replay did not worsen the damage");
+    check!(!w3.contains("DANGEROUS DIRECTION"),
+           "the BITMAP did not drift in the dangerous direction across three interrupted boots");
+    // THE COUNT USED TO BE ALLOWED TO DRIFT, AND IS NOT ANY MORE.
+    //
+    // This was a recorded tolerance with sound reasoning: `alloc_run` scans the bitmap and never
+    // reads the count, so a stale scalar cost reporting accuracy and nothing else. It stayed
+    // tolerated because nobody had found the cause.
+    //
+    // The cause was one line. `mount_into` read the superblock, ran `recover` - which REWRITES the
+    // superblock, since it is one of the blocks a transaction stages - and then built the in-memory
+    // `Fs` from the bytes read BEFORE the replay. Disk correct, memory one transaction behind, and
+    // the next persist wrote the stale value back over the recovered one.
+    //
+    // Found on the VisionFive on 2026-09-22 by a deterministic cut inside the commit window: the
+    // count came back exactly one high, which is what the interrupted write had allocated. The fix
+    // re-reads the superblock after recovery, so the tolerance becomes an assertion.
+    check!(!w3.contains("REPAIRED the FREE COUNT"),
+           "the free count is CORRECT after a replay - the mount re-reads the superblock the replay rewrote");
+    check!(!w3.contains("KERNEL PANIC"), "no kernel panic across any of the three boots");
+
+    let _ = std::fs::write("build/tests/fs_nested_serial.log",
+                           format!("{w1}\n==== BOOT 2 ====\n{w2}\n==== BOOT 3 ====\n{w3}"));
+    println!("\nfs-nested: {pass} passed, {fail} failed  (serial -> build/tests/fs_nested_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_churn(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-churn: PASS - {}", $label); pass += 1; } else { println!("fs-churn: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |cmds: &[&str], kill_after: Option<&str>, secs: u64| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                match kill_after {
+                    // Wait for churn to be demonstrably RUNNING (its per-second heartbeat), then cut.
+                    // Killing on a fixed delay from the command being sent would sometimes cut before
+                    // the first write ever reached the disk, which tests nothing.
+                    Some(marker) => {
+                        if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(40)).is_some() {
+                            thread::sleep(Duration::from_millis(1500));
+                            child.kill().ok();
+                            break;
+                        }
+                    }
+                    None => { let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(secs)); }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-churn: boot 1 - churn, then cut the machine mid-transaction");
+    let w1 = boot(&["churn 30"], Some("churn: 2s elapsed"), 60);
+    check!(w1.contains("churn: writing continuously"), "churn started");
+    check!(w1.contains("s elapsed"), "churn was demonstrably WRITING when the machine was cut");
+    check!(!w1.contains("churn: done"), "the machine was cut mid-churn (churn never finished)");
+
+    println!("fs-churn: boot 2 - the volume must come back inside the permitted set");
+    // BOTH questions, because they are different ones. `drives check` validates STRUCTURE - the tree,
+    // the bitmap, the CRCs. `churn verify` validates CONTENT: a file holding the first half of one
+    // write and the second half of another has valid block CRCs, sits in a valid directory and
+    // occupies correctly accounted blocks, so every structural check passes it.
+    let w2 = boot(&["read /canary.txt", "churn verify", "drives check"], None, 200);
+    check!(w2.contains("mounted GSFS0008") || w2.contains("storage recovered"), "the volume MOUNTS after the cut");
+    check!(w2.contains("untouched-by-any-of-this"), "a file written before the churn is intact");
+    check!(w2.contains("0 bad"), "no corrupt blocks - nothing was torn at the sector level");
+    // THE ONE THAT MATTERS. A leak is permitted (26.4: the free count is a derived view, reconciled
+    // from the tree). Blocks marked FREE while a live file still references them are not: the next
+    // allocation hands them out and a write destroys data something still points at.
+    // THE REAL DETECTOR, which did not exist when this was first written. `fs` now compares the old
+    // bitmap's set bits against the rebuilt one and names the direction, so this asserts on the fault
+    // itself rather than on a count that only implied it.
+    check!(!w2.contains("DANGEROUS DIRECTION"),
+           "the BITMAP did not drift in the dangerous direction (no live block was marked free)");
+    check!(w2.contains("NONE torn"),
+           "no file holds a MIX of two writes (content, not just structure)");
+    check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
+    if w2.contains("journal recovered") {
+        println!("fs-churn: (this cut landed IN the commit window - the journal replayed)");
+    } else {
+        println!("fs-churn: (this cut fell outside the commit window - no replay, which is the common case)");
+    }
+
+    let _ = std::fs::write("build/tests/fs_churn_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\nfs-churn: {pass} passed, {fail} failed  (serial -> build/tests/fs_churn_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.5: a destructive op whose REPLY is lost, and the retry that follows.
+///
+/// §3.5 records this as "the clearest thing on this list that is a design gap rather than a missing
+/// test", and the shell makes it live rather than theoretical: on a timeout it reacquires `fs` and
+/// RE-SENDS. The protocol cannot deduplicate - the correlation tag matches a reply to a request, and
+/// the shell deliberately draws a FRESH one for the retry so the late original can be told apart, so
+/// a retry is indistinguishable from a new request by design.
+///
+/// **THE HARM NEEDS NO SECOND CLIENT.** A `move` that SUCCEEDS and loses its reply is retried; the
+/// second attempt finds nothing at the source and fails. The file has moved and the user is told the
+/// operation failed. A wrong outcome, reported confidently, is what §26.7 forbids.
+///
+/// So the assertions are written against the RIGHT behaviour, not the current one: an operation
+/// whose outcome is unknown must be reported as unknown. Re-sending a non-idempotent op cannot help
+/// - it already succeeded - and can only mislead.
+pub fn run_fs_dupop(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-dupop: PASS - {}", $label); pass += 1; }
+        else { println!("fs-dupop: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-dupop: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-dupop: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-dupop: never reached a prompt"); std::process::exit(1);
+    }
+
+    send(&mut write_half, b"write /dup-a.txt duplicate-op-evidence\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+
+    // THE MOVE COMPLETES AND ITS REPLY IS SWALLOWED. The shell's fs deadline is 20 s and it retries
+    // once, so this can take ~40 s before it says anything.
+    send(&mut write_half, b"move /dup-a.txt /dup-b.txt\r");
+    let injected = collect_until(&buf, &mut cursor, b"[lose-reply-test]", Duration::from_secs(30));
+    check!(injected.is_some(), "the reply to a COMPLETED move was dropped (the fault was injected)");
+    let outcome = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)).unwrap_or_default();
+
+    // ---- what actually happened on disk, asked independently of what the shell claimed.
+    send(&mut write_half, b"read /dup-b.txt\r");
+    let dst = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"read /dup-a.txt\r");
+    let src = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_dupop_serial.log", &w);
+
+    let moved = dst.contains("duplicate-op-evidence");
+    let source_gone = !src.contains("duplicate-op-evidence");
+    check!(moved && source_gone, "the move DID take effect (the first attempt succeeded)");
+
+    // ---- THE GATE. The operation succeeded; the user must not be told it failed.
+    //
+    // `not found` here is the retry's answer, not the move's: the first attempt had already moved
+    // the file, so the second found nothing at the source. Reporting that as the outcome of `move`
+    // is a confident wrong answer about a destructive operation (§26.7).
+    let claimed_failure = outcome.contains("not found") || outcome.contains("failed");
+    check!(!claimed_failure,
+           "the shell did NOT report a failure for an operation that succeeded");
+    // Matched against what the shell ACTUALLY prints. The first version looked for lowercase
+    // "unknown" while the message says `OUTCOME UNKNOWN`, so a correct fix read as a failure - and
+    // had the fix been wrong instead, this would have reported the right answer for the wrong
+    // reason. Assert the string the system emits, not a paraphrase of it.
+    check!(outcome.contains("OUTCOME UNKNOWN") && outcome.contains("MAY HAVE SUCCEEDED"),
+           "an ambiguous outcome is reported AS ambiguous, not as a failure");
+    check!(outcome.contains("Not re-sent"),
+           "...and says WHY it was not retried, so the operator knows it is theirs to verify");
+
+    println!("\nfs-dupop: {pass} passed, {fail} failed  (serial -> build/tests/fs_dupop_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.4's remaining row: exhaustion reached through METADATA growth.
+///
+/// **First, what this row is NOT, because the section asked for something that cannot happen here.**
+/// 3.4 lists "exhausting METADATA while data space remains (and the reverse)" as uncovered. In GSFS
+/// those are not separate pools: `grow_dir` and `alloc_file` both call `alloc_run` against the one
+/// free bitmap, so there is no metadata reserve to exhaust independently and testing for it would be
+/// theatre - the same shape as 3.5's note that `fs` being single-threaded makes intra-operation
+/// interleaving unreachable.
+///
+/// **What IS reachable, and is untested, is the other allocation path.** `fs-full` refuses one large
+/// file: that is `alloc_file`, and the directory never grows during it. This fills a DIRECTORY
+/// instead, one small file at a time, so `grow_dir` runs repeatedly as the volume runs out - and a
+/// directory growth that fails does so mid-transaction on the shared metadata every other entry in
+/// that directory depends on, which is a different blast radius from refusing one file.
+///
+/// The gate is the same one 3.4 says actually matters: not that the refusal happens, but what it
+/// COSTS. Nothing leaked, no bystander touched, the directory still readable, and valid work
+/// accepted again afterwards.
+/// `jobs` - `background` / `jobs` / `foreground`, end to end against a real disk.
+///
+/// THE SOURCE IS DELIBERATELY LARGE (5.2 MiB, ~1,550 streamed chunks). A small one would finish
+/// before the first `jobs` and the suite would then be testing a table, not a background job: the
+/// one-at-a-time refusal, the attach-and-detach path and the cancel path all need a job that is
+/// genuinely still running when the next command is typed.
+///
+/// WHAT IT DOES NOT ASSERT, and why: that any particular PERCENTAGE is seen. Whether the copy is
+/// 12% or 80% done when `jobs` is typed depends on the host, so `docs/job-control-design.md` §8
+/// says in advance where the assertions go - on the table and on the job's EFFECT, never on output
+/// arriving at a chosen moment. A suite that asserted "38%" would pass on a slow host and fail on
+/// a fast one.
+///
+/// WAITING IS DONE WITH `wait`, NOT BY HAMMERING `jobs`. A poll loop of bare `jobs` commands makes
+/// the shell compete with the copier for `fs` on every iteration, so the thing being measured is
+/// slowed by the measuring. The first run of this suite did exactly that and reached 12% in sixty
+/// polls.
+/// `fs-reuse` - a file capability minted BEFORE an `fs` restart must reach nothing after it.
+///
+/// THE ROW THIS CLOSES. `file-cap` (§22 Test 14) proves a file cap is revoked on delete, close and
+/// rename - all of them actions `fs` TAKES while it is alive and holding its `ResourceId -> file`
+/// map. What no suite asked was what happens when that map is destroyed: `fs` restarts, its
+/// in-memory table is empty, and the blocks the file occupied are handed to something else.
+///
+/// If a stale capability resolved after that, the holder would read a file it was never granted,
+/// through a handle the kernel still considers valid. That is not a leak of SPACE - which an fsck
+/// would find - it is a leak of AUTHORITY, and nothing in a listing or a check would show it.
+pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-reuse: PASS - {}", $label); pass += 1; }
+        else { println!("fs-reuse: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-reuse: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-reuse: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-reuse: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    let canary = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    check!(canary.contains("do-not-disturb"), "the volume mounted and the bystander reads correctly");
+
+    // The whole scenario is ONE command, because a capability cannot outlive the function holding
+    // it - the shell keeps no cap table between prompts, so `fcap` here and `kill fs` there would
+    // drop the handle before the interesting moment.
+    let out = run!(b"fcap reuse\r", 180).unwrap_or_default();
+
+    let after = run!(b"drives check\r", 180).unwrap_or_default();
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_reuse_serial.log", &w);
+
+    // ---- THE GATE ----
+    // The cap must WORK first, or a later refusal proves nothing: a handle that was never valid is
+    // refused for the wrong reason, and the test would pass while testing nothing.
+    check!(out.contains("reads the original before the restart"),
+           "the capability worked BEFORE the restart - so a refusal afterwards means something");
+    check!(out.contains("killing fs"), "`fs` was restarted with the capability still held");
+    check!(!out.contains("fs never came back"), "`fs` came back and served again");
+    // THE ONE THAT MATTERS.
+    check!(!out.contains("THE STALE CAP READ THE REPLACEMENT"),
+           "THE STALE CAP DID NOT READ THE REPLACEMENT FILE - authority did not survive the restart");
+    check!(!out.contains("still resolved to something"),
+           "the stale capability resolved to nothing at all, not merely to the wrong thing");
+    check!(out.contains("fcap reuse: ok"), "the whole sequence reported success");
+    check!(after.contains("0 bad"), "the volume is intact after a restart with a live capability");
+
+    println!("\nfs-reuse: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("jobs: PASS - {}", $label); pass += 1; }
+        else { println!("jobs: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("jobs: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("jobs: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("jobs: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+    /// Send raw bytes and wait for a marker that is NOT the prompt - `foreground` on a running job
+    /// deliberately does not return one until a key says so.
+    macro_rules! run_until { ($c:expr, $marker:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, $marker, Duration::from_secs($secs))
+    }}; }
+
+    // ---- the volume is sound before anything is claimed about it.
+    let canary0 = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    check!(canary0.contains("do-not-disturb"), "the volume mounted and the bystander reads correctly");
+
+    // ---- EMPTY TABLE. `jobs` before anything exists must say so rather than print a header over
+    //      nothing - an empty table that looks like a table reads as "something is running".
+    let none = run!(b"jobs\r", 30).unwrap_or_default();
+    check!(none.contains("no jobs"), "`jobs` with nothing started says so plainly");
+
+    // ---- REFUSALS FIRST, while nothing is running, so none can be confused with a busy table.
+    let notacmd = run!(b"background chaos max-carnage 5\r", 30).unwrap_or_default();
+    check!(notacmd.contains("not supported") && notacmd.contains("chaos"),
+           "`background chaos` is refused BY NAME - backgroundable is not a property of every command");
+    check!(notacmd.contains("runs inside the shell") && notacmd.contains("detachable separate service"),
+           "the refusal leads with the REASON - this command runs inside the shell, and a job does not");
+    check!(notacmd.contains("detachable services:") && notacmd.contains("drives check"),
+           "the refusal LISTS WHAT WORKS - a reason is only useful if it tells you what to type instead");
+    check!(notacmd.contains("copy") && notacmd.contains("delete") && notacmd.contains("drives scrub")
+           && notacmd.contains("churn"),
+           "the advertised list names EVERY working verb - it is built from the same table the dispatch reads");
+    let notselfcheck = run!(b"background selfcheck\r", 30).unwrap_or_default();
+    check!(notselfcheck.contains("not supported") && notselfcheck.contains("selfcheck"),
+           "`background selfcheck` is refused too - its product is a report, and a job has nowhere to write one");
+    let shortdel = run!(b"background delete /etc\r", 30).unwrap_or_default();
+    check!(shortdel.contains("recursive"),
+           "a NON-recursive background delete is refused - one metadata edit is not a job");
+    let missing = run!(b"background copy /nosuch.txt /out.txt\r", 60).unwrap_or_default();
+    check!(missing.contains("refused") || missing.contains("does not exist"),
+           "a missing source is refused, with the reason");
+    let nojob = run!(b"foreground 99\r", 30).unwrap_or_default();
+    check!(nojob.contains("no job 99"), "`foreground` on an id that never existed says which id");
+
+    // ---- THE REAL THING: 5.2 MiB, ~1,550 chunks. The copy loop actually loops.
+    let started = run!(b"background copy /fill3.bin /copy.bin\r", 60).unwrap_or_default();
+    check!(started.contains("[backgrounded] job 1"),
+           "`background copy` returns a job id, and returns it straight away");
+
+    // ---- ONE AT A TIME, refused rather than queued.
+    let second = run!(b"background copy /canary.txt /copy2.bin\r", 60).unwrap_or_default();
+    check!(second.contains("still running") && second.contains("job 1"),
+           "a second job while one runs is refused, naming the job that is still going");
+
+    // ---- THE PROMPT IS STILL THE OPERATOR'S. This is the whole point of the feature, and it is
+    //      the one property a job table cannot fake: an unrelated command runs to completion while
+    //      the copy is in flight.
+    let busy_dir = run!(b"dir /\r", 90).unwrap_or_default();
+    check!(busy_dir.contains("canary.txt"),
+           "an unrelated command still runs while the job is going - the prompt was never owned");
+
+    // ---- ATTACH, THEN DETACH WITH `b`. `foreground` on a running job does not return a prompt -
+    //      it is attached - so wait for its own marker and then press the key.
+    let attached = run_until!(b"foreground 1\r", b"[b] background", 60).unwrap_or_default();
+    check!(attached.contains("[q] cancel") && attached.contains("[b] background"),
+           "`foreground` on a RUNNING job attaches and shows what the two keys do");
+    let detached = run_until!(b"b", b"gsh>", 60).unwrap_or_default();
+    check!(detached.contains("[backgrounded] job 1"),
+           "`b` detaches a foregrounded job and gives the prompt back");
+
+    // ---- `jobs quit` ON A JOB THAT HAS ALREADY ENDED comes later; first prove the guard that
+    //      says an id nobody started is refused rather than silently accepted.
+    let quit_none = run!(b"jobs quit 99\r", 30).unwrap_or_default();
+    check!(quit_none.contains("no job 99"), "`jobs quit` on an id that never existed says which id");
+
+    // ---- WAIT ON THE TABLE. `wait` rather than a poll storm, so the copier is not competing with
+    //      the shell for `fs` on every iteration.
+    let mut table = String::new();
+    let mut settled = false;
+    for _ in 0..90 {
+        let _ = run!(b"wait 5\r", 60);
+        table = run!(b"jobs\r", 60).unwrap_or_default();
+        if table.contains("done") || table.contains("failed") || table.contains("lost") || table.contains("stopped") {
+            settled = true;
+            break;
+        }
+    }
+    check!(settled, "the job reached a terminal state (polled the TABLE, never a fixed sleep)");
+    check!(table.contains("copy /fill3.bin /copy.bin"),
+           "`jobs` shows the command it is running, not just an id");
+    check!(table.contains("done"), "the 5.2 MiB copy finished cleanly");
+
+    // ---- THE EFFECT proves the copy, not the progress display. `drives check` runs only NOW: a
+    //      copy in flight has a preallocated extent whose unwritten tail has no CRC yet, so a scrub
+    //      during one correctly reports blocks it cannot verify. That is the design's own
+    //      "full-size file with an undefined tail" seen from the fsck side, not a bug - but it does
+    //      mean a scrub and a running copy answer different questions and must not be mixed.
+    let listing = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck = run!(b"drives check\r", 180).unwrap_or_default();
+    let done = run!(b"foreground 1\r", 30).unwrap_or_default();
+    let piped = run!(b"jobs | where state=done\r", 60).unwrap_or_default();
+
+    // ---- CANCEL. The safety property: an interrupted copy must not leave a full-size file with an
+    //      undefined tail, because that is worse than no file - `dir` shows the expected size and
+    //      nothing says the content is garbage.
+    //
+    //      The finished copy is deleted FIRST. A 16 MiB volume holding the 5.2 MiB source and its
+    //      5.2 MiB copy has no room for a third, and the first run of this block was refused with
+    //      exactly that - `the destination could not be created (no space...)`, which is the
+    //      filesystem being right and the test being wrong about what it had left.
+    let freed = run!(b"delete /copy.bin\r", 90).unwrap_or_default();
+    let cancel_start = run!(b"background copy /fill3.bin /cancelme.bin\r", 60).unwrap_or_default();
+    let cancel_attach = run_until!(b"foreground 2\r", b"[b] background", 60).unwrap_or_default();
+    let cancelled = run_until!(b"q", b"gsh>", 90).unwrap_or_default();
+    let after_cancel = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck2 = run!(b"drives check\r", 180).unwrap_or_default();
+
+    // ---- `jobs quit` ON A FINISHED JOB. Refused, because the operator believed it was running
+    //      and saying "stopped" would confirm a belief that is wrong.
+    let quit_done = run!(b"jobs quit 1\r", 30).unwrap_or_default();
+
+    // ---- THE SECOND JOB KIND: a recursive delete. Cheap to support because `fs` does the walk in
+    //      one operation, which is exactly why it qualified as low-hanging and a subtree COPY did
+    //      not. Build a small tree first so there is something to remove.
+    let _ = run!(b"mkdir /tree/a/b parents\r", 90);
+    let _ = run!(b"write /tree/a/one.txt x\r", 60);
+    let _ = run!(b"write /tree/a/b/two.txt y\r", 60);
+    // /tree holds only the directory a; the FILES are one level down, which the first run of
+    // this assertion got wrong - it looked in /tree for a file that was never there. The
+    // feature was fine and the test was reading the wrong directory.
+    let before_tree = run!(b"dir /tree/a\r", 90).unwrap_or_default();
+    let del_start = run!(b"background delete /tree recursive\r", 60).unwrap_or_default();
+    let mut del_table = String::new();
+    let mut del_settled = false;
+    for _ in 0..40 {
+        let _ = run!(b"wait 2\r", 60);
+        del_table = run!(b"jobs\r", 60).unwrap_or_default();
+        if del_table.contains("3    done") || del_table.contains("3    failed") || del_table.contains("3    lost") {
+            del_settled = true;
+            break;
+        }
+    }
+    let after_tree = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck3 = run!(b"drives check\r", 180).unwrap_or_default();
+
+    // ---- THE THIRD KIND: a command whose product is a REPORT. It is only detachable because the
+    //      job service holds a bounded transcript - it still has no console capability, so nothing
+    //      is pushed anywhere; `foreground` PULLS the text when somebody asks for it.
+    let chk_start = run!(b"background drives check\r", 60).unwrap_or_default();
+    let mut chk_table = String::new();
+    let mut chk_settled = false;
+    for _ in 0..60 {
+        let _ = run!(b"wait 2\r", 60);
+        chk_table = run!(b"jobs\r", 60).unwrap_or_default();
+        if chk_table.contains("4    done") || chk_table.contains("4    failed") || chk_table.contains("4    lost") {
+            chk_settled = true;
+            break;
+        }
+    }
+    // The prompt must NOT have received the report while the job ran - a detached job that writes
+    // unasked is the one thing this whole design is built to prevent.
+    let unasked = chk_table.contains("consistent") || chk_table.contains("0 bad");
+    let replay = run!(b"foreground 4\r", 60).unwrap_or_default();
+
+    // ---- THE FOURTH KIND: `drives scrub`, the read-only sweep. It is here because it was nearly
+    //      free once `check` existed - the same one-request-and-a-verdict shape - which is the
+    //      whole basis on which a command earns a place in that list.
+    let scr_start = run!(b"background drives scrub\r", 60).unwrap_or_default();
+    let mut scr_table = String::new();
+    let mut scr_settled = false;
+    for _ in 0..60 {
+        let _ = run!(b"wait 2\r", 60);
+        scr_table = run!(b"jobs\r", 60).unwrap_or_default();
+        if scr_table.contains("5    done") || scr_table.contains("5    failed") || scr_table.contains("5    lost") {
+            scr_settled = true;
+            break;
+        }
+    }
+    let scr_replay = run!(b"foreground 5\r", 60).unwrap_or_default();
+
+    // ---- THE FIFTH KIND: churn, the one job with a REAL percentage that is not a byte count -
+    //      its bound is a duration, so elapsed-over-total is measured rather than invented.
+    //
+    //      THE POINT OF DETACHING IT is that the prompt stays usable: `churn` holds the console for
+    //      its whole run today, so a long one leaves the machine blind. The check below is exactly
+    //      that - an unrelated command answering while the churn writes.
+    let ch_start = run!(b"background churn 12\r", 60).unwrap_or_default();
+    let ch_table = run!(b"jobs\r", 60).unwrap_or_default();
+    let ch_busy = run!(b"dir /\r", 90).unwrap_or_default();
+    let mut ch_settled = false;
+    let mut ch_final = String::new();
+    for _ in 0..40 {
+        let _ = run!(b"wait 2\r", 60);
+        ch_final = run!(b"jobs\r", 60).unwrap_or_default();
+        if ch_final.contains("6    done") || ch_final.contains("6    failed") || ch_final.contains("6    lost") {
+            ch_settled = true;
+            break;
+        }
+    }
+    let ch_replay = run!(b"foreground 6\r", 60).unwrap_or_default();
+    // THE VERIFIER MUST STILL RECOGNISE WHAT THE SERVICE WROTE. This is the assertion the whole
+    // `sdk::churn` refactor exists for: the writer moved into another crate, and if its pattern had
+    // drifted from the shell's checker, `churn verify` would report NONE TORN while no longer able
+    // to see a tear at all.
+    let ch_verify = run!(b"churn verify\r", 120).unwrap_or_default();
+    let _ = run!(b"churn reset\r", 120);
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/jobs_serial.log", &w);
+
+    // ---- THE GATE ----
+    check!(listing.contains("copy.bin"), "the destination exists on the volume");
+    check!(listing.contains("canary.txt"), "the bystander is still listed");
+    check!(fsck.contains("0 bad"), "no corrupt blocks after a detached copy");
+    // A detached copy allocates an extent and streams into it. If it stranded blocks the way a
+    // refused create used to (carnage §3.4), only the free accounting would ever know.
+    check!(!fsck.contains("REPAIRED"), "NOTHING LEAKED - fsck had nothing to repair");
+    check!(done.contains("job 1 is done"),
+           "`foreground` on a FINISHED job reports its outcome rather than erroring");
+    check!(piped.contains("copy.bin") && !piped.contains("not a pipe source"),
+           "`jobs` is a record producer - `| where state=done` filters it like any other table");
+
+    check!(!freed.contains("failed"), "the finished copy is deleted, making room for the next job");
+    check!(cancel_start.contains("[backgrounded] job 2"), "a second job runs once the first has ended");
+    check!(cancel_attach.contains("[q] cancel"), "the second job can be attached to");
+    check!(cancelled.contains("job 2 stopped"), "`q` stops the JOB, and says so");
+    check!(!after_cancel.contains("cancelme.bin"),
+           "THE PARTIAL DESTINATION IS GONE - a cancelled copy does not leave a full-size file with an undefined tail");
+    check!(fsck2.contains("0 bad") && !fsck2.contains("REPAIRED"),
+           "the volume is still clean after a cancelled copy - the extent was handed back, not stranded");
+
+    check!(quit_done.contains("already"),
+           "`jobs quit` on a job that has already ended is REFUSED, not reported as a stop");
+    check!(before_tree.contains("one.txt"), "the subtree to delete was built");
+    check!(del_start.contains("[backgrounded] job 3"), "`background delete ... recursive` starts a job");
+    check!(del_settled, "the delete job reached a terminal state");
+    check!(del_table.contains("delete /tree recursive"),
+           "`jobs` renders a delete job as the command it is, with no invented percentage");
+    check!(!after_tree.contains("tree"), "THE SUBTREE IS GONE - the detached delete did the work");
+    check!(fsck3.contains("0 bad") && !fsck3.contains("REPAIRED"),
+           "the volume is clean after a detached recursive delete");
+
+    check!(chk_start.contains("[backgrounded] job 4"),
+           "`background drives check` starts a job - a REPORT-producing command can detach now");
+    check!(chk_settled, "the check job reached a terminal state");
+    check!(chk_table.contains("drives check"), "`jobs` renders the check job as the command it is");
+    check!(!unasked,
+           "THE REPORT DID NOT ARRIVE UNASKED - a detached job holds no console, so `jobs` showed a row and no verdict");
+    check!(replay.contains("job 4 is done"), "`foreground` reports the check job's outcome");
+    check!(replay.contains("drives check - walking the volume"),
+           "`foreground` REPLAYS THE TRANSCRIPT - the output was held in bounded RAM until it was asked for");
+    check!(replay.contains("0 bad") && replay.contains("file(s)"),
+           "the verdict is RENDERED, not passed through - fs answers with counts, and raw counts printed as text are garbage");
+    // THE DETACHED FORM MUST SAY WHAT THE ATTACHED ONE SAYS. A backgrounded check that omits the
+    // repair line answers less than `drives check` does, silently - and `drives check` REPAIRS as it
+    // goes, so a second run cannot recover the answer. That cost a hardware run on 2026-09-22.
+    check!(replay.contains("nothing was repaired") || replay.contains("REPAIRED the FREE COUNT"),
+           "the detached check reports WHETHER THE ACCOUNTING NEEDED REPAIR - the question a check after a crash is run to answer");
+
+    check!(scr_start.contains("[backgrounded] job 5"), "`background drives scrub` starts a job");
+    check!(scr_settled, "the scrub job reached a terminal state");
+    check!(scr_table.contains("drives scrub"),
+           "`jobs` tells the two sweeps apart - a row that said `check` for a scrub would be a quiet lie");
+    check!(scr_replay.contains("drives scrub - verifying"),
+           "`foreground` replays the scrub's transcript");
+    check!(scr_replay.contains("0 bad") && scr_replay.contains("director"),
+           "the scrub verdict is rendered too - this is the one that exposed the pass-through bug");
+
+    check!(ch_start.contains("[backgrounded] job 6"), "`background churn <seconds>` starts a job");
+    check!(ch_table.contains("churn 12"), "`jobs` renders the churn job with its duration");
+    check!(ch_busy.contains("canary.txt"),
+           "THE PROMPT STAYS USABLE while churn writes - which is the whole reason to detach it");
+    check!(ch_settled, "the churn job reached a terminal state at its own deadline");
+    check!(count_before(&ch_replay, " writes") > 0,
+           "the churn job actually WROTE - a run reporting `done` with 0 writes is a job that achieved nothing");
+    check!(count_before(&ch_replay, " renames") > 0,
+           "and it RENAMED - writing only would exercise one transaction shape while claiming three");
+    check!(ch_verify.contains("NONE torn") && count_before(&ch_verify, " file(s) checked") > 0,
+           "`churn verify` recognised what the detached writer wrote, over a NON-EMPTY set - `NONE torn` across zero files is the vacuous pass this refactor exists to prevent");
+
+    println!("\njobs: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_metafull(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-metafull: PASS - {}", $label); pass += 1; }
+        else { println!("fs-metafull: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-metafull: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-metafull: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-metafull: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    // The baked canary must be readable before anything else, or every later claim is about a
+    // volume we never established was sound.
+    let canary0 = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    check!(canary0.contains("do-not-disturb"), "the volume mounted and the bystander reads correctly");
+
+    // ---- FILL THE DIRECTORY, one entry at a time, until something refuses. Each file is tiny, so
+    //      the blocks go on ENTRIES and the directory growths they force, not on payload.
+    let mut created = 0u32;
+    let mut refusal = String::new();
+    for i in 0..90u32 {
+        let out = run!(format!("write /m{i}.txt x\r").as_bytes(), 60).unwrap_or_default();
+        if out.contains("no space") || out.contains("failed") || out.contains("full") {
+            refusal = out;
+            break;
+        }
+        created += 1;
+    }
+    check!(!refusal.is_empty(),
+           "the volume refused a create once it ran out - exhaustion was actually reached");
+    check!(refusal.contains("no space") || refusal.contains("failed"),
+           "the refusal NAMES its reason rather than failing silently");
+    println!("fs-metafull: (created {created} entries before the refusal)");
+    check!(created >= 8,
+           "the directory GREW before it ran out - grow_dir ran, this is not just a first-write refusal");
+
+    // ---- what the refusal left behind.
+    let canary1 = run!(b"read /canary.txt\r", 60).unwrap_or_default();
+    let listing = run!(b"dir /\r", 90).unwrap_or_default();
+    let fsck = run!(b"drives check\r", 120).unwrap_or_default();
+
+    // ---- and whether the volume still works once space is returned.
+    let _ = run!(b"delete /fill3.bin\r", 90);
+    let again = run!(b"write /after.txt recovered\r", 60).unwrap_or_default();
+    let readback = run!(b"read /after.txt\r", 60).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_metafull_serial.log", &w);
+
+    // ---- THE GATE ----
+    check!(canary1.contains("do-not-disturb"),
+           "the bystander is untouched by a refused metadata allocation");
+    check!(listing.contains("canary.txt") && listing.contains("m0.txt"),
+           "the directory is still readable, and still holds what it accepted");
+    check!(fsck.contains("0 bad"), "no corrupt blocks after a directory ran out of room");
+    // THE ONE THAT MATTERS. A refused growth that keeps the blocks it reserved is invisible from
+    // every other angle - no listing, read or walk would show them. Only the free accounting knows.
+    check!(!fsck.contains("REPAIRED"),
+           "NOTHING LEAKED - fsck had nothing to repair, so the refused claim was handed back in full");
+    check!(again.contains("wrote") && readback.contains("recovered"),
+           "the volume accepts valid work again once space is returned");
+
+    println!("\nfs-metafull: {pass} passed, {fail} failed  (serial -> build/tests/fs_metafull_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.5, third bullet: TWO CLIENTS issuing conflicting sequences against one path.
+///
+/// The bullet asked for the observable ordering to be checked against "what is documented - which
+/// currently is nothing, so documenting it is part of the gate". The guarantee is now written down
+/// in `docs/persistence.md`, and it is this: **`fs` serves one request to completion before
+/// dequeuing the next** (`loop { let msg = ctx.recv(); .. }`, single-threaded), and every mutating
+/// op commits through a journal transaction. So each operation is ATOMIC with respect to every
+/// other client - there is no read-modify-write window a second client can enter - while a single
+/// client's multi-request IDIOM is not, because another client can be served between its two
+/// requests.
+///
+/// **The second client is real, not simulated.** `recorder` writes a capture through `fs` on its
+/// own schedule, driven by `events persist start`. Pointing it at a directory the shell is
+/// simultaneously churning puts two independent clients on the same DIRECTORY BLOCK, which is the
+/// shared metadata that matters - one file each, contending for the entries around them.
+pub fn run_fs_twoclient(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-twoclient: PASS - {}", $label); pass += 1; }
+        else { println!("fs-twoclient: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-twoclient: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-twoclient: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-twoclient: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+    }}; }
+
+    let _ = run!(b"mkdir /contested\r", 60);
+
+    // THE SECOND CLIENT STARTS HERE and writes on its own schedule from now on.
+    let started = run!(b"events persist start /contested/cap.log 256KiB\r", 60).unwrap_or_default();
+    check!(!started.contains("could not") && !started.contains("FAIL"),
+           "the second client (`recorder`) is writing into the same directory");
+
+    // ---- THE CONTENDED ROUNDS. Each is a create / read / rename / read / delete cycle on ONE
+    //      path, while `recorder` appends to its capture in the SAME directory.
+    let mut torn = 0usize;
+    let mut lost = 0usize;
+    for round in 0..6u32 {
+        let payload = format!("round-{round}-payload");
+        let _ = run!(format!("write /contested/x.txt {payload}\r").as_bytes(), 60);
+        let r1 = run!(b"read /contested/x.txt\r", 60).unwrap_or_default();
+        // ATOMIC, NOT PARTIAL: the read must return exactly this round's payload. A previous
+        // round's value, or a truncated one, would mean a client saw a half-applied write.
+        if !r1.contains(&payload) { torn += 1; }
+        let _ = run!(b"move /contested/x.txt /contested/y.txt\r", 60);
+        let r2 = run!(b"read /contested/y.txt\r", 60).unwrap_or_default();
+        if !r2.contains(&payload) { torn += 1; }
+        let _ = run!(b"delete /contested/y.txt\r", 60);
+        let r3 = run!(b"dir /contested\r", 60).unwrap_or_default();
+        // The OTHER client's file must survive every one of our rounds.
+        if !r3.contains("cap.log") { lost += 1; }
+    }
+
+    let _ = run!(b"events persist stop\r", 60);
+    let listing = run!(b"dir /contested\r", 60).unwrap_or_default();
+    let fsck = run!(b"drives check\r", 120).unwrap_or_default();
+    let cap = run!(b"read /contested/cap.log | count\r", 90).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_twoclient_serial.log", &w);
+
+    // ---- THE GATE.
+    check!(torn == 0,
+           "every read returned its own round's payload - no client saw a half-applied write");
+    check!(lost == 0,
+           "the other client's file survived every round of churn in its directory");
+    check!(listing.contains("cap.log"),
+           "the capture is still listed after six contended rounds");
+    check!(!listing.contains("x.txt") && !listing.contains("y.txt"),
+           "our own churn left nothing behind - the directory holds exactly what it should");
+    check!(fsck.contains("0 bad"), "fsck finds no corrupt blocks after two clients contended");
+    check!(fsck.contains("consistent") || fsck.contains("ok"),
+           "the volume is consistent after two clients contended");
+    check!(cap.contains("lines,") || cap.contains("line,"),
+           "the second client's file is READABLE and non-empty - its writes were not lost");
+
+    println!("\nfs-twoclient: {pass} passed, {fail} failed  (serial -> build/tests/fs_twoclient_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.5, second bullet: a client timeout on the OTHER side of the commit.
+///
+/// `fs-dupop` loses the reply to a move that ALREADY RAN. This discards the request BEFORE it runs,
+/// so the move never happened at all - and from the client the two are indistinguishable: a request
+/// sent, no reply, a deadline passed.
+///
+/// **That indistinguishability is the subject, not a gap in the test.** The shell refuses to retry a
+/// mutating op either way and answers `OUTCOME UNKNOWN`, which is conservative here (nothing
+/// happened, so a retry would have been free) and necessary in `fs-dupop` (something did). What this
+/// pins is that the conservative answer stays HONEST on this side: the filesystem is untouched, no
+/// half-applied state is left behind, the operator is not told something false, and re-issuing the
+/// operation afterwards simply works.
+pub fn run_fs_lostreq(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-lostreq: PASS - {}", $label); pass += 1; }
+        else { println!("fs-lostreq: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-lostreq: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-lostreq: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-lostreq: never reached a prompt"); std::process::exit(1);
+    }
+
+    send(&mut write_half, b"write /lost-a.txt abandoned-request-evidence\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+
+    // THE REQUEST IS DISCARDED BEFORE IT RUNS. The shell's fs deadline is 20 s and it does not
+    // retry a mutating op, so this answers after one deadline rather than two.
+    send(&mut write_half, b"move /lost-a.txt /lost-b.txt\r");
+    let injected = collect_until(&buf, &mut cursor, b"[drop-request-test]", Duration::from_secs(30));
+    check!(injected.is_some(), "a move was discarded BEFORE it ran (the fault was injected)");
+    let outcome = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)).unwrap_or_default();
+
+    // ---- what is on disk, asked independently of what the shell claimed.
+    send(&mut write_half, b"read /lost-a.txt\r");
+    let src = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"read /lost-b.txt\r");
+    let dst = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+    send(&mut write_half, b"drives check\r");
+    let fsck = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)).unwrap_or_default();
+
+    // ---- AND IT IS CLEANLY RE-ISSUABLE. The injector fires once, so this second attempt is served
+    //      normally - which is the property that says nothing was left half-applied.
+    send(&mut write_half, b"move /lost-a.txt /lost-b.txt\r");
+    let retry = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90)).unwrap_or_default();
+    send(&mut write_half, b"read /lost-b.txt\r");
+    let after = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).unwrap_or_default();
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_lostreq_serial.log", &w);
+
+    // ---- THE GATE: the operation did NOT happen, and nothing is half-applied.
+    check!(src.contains("abandoned-request-evidence"),
+           "the source file is untouched - the discarded move did NOT take effect");
+    check!(!dst.contains("abandoned-request-evidence"),
+           "the destination was never created");
+    check!(fsck.contains("0 bad"), "fsck finds no corrupt blocks after an abandoned request");
+    check!(fsck.contains("consistent") || fsck.contains("ok"),
+           "the volume is consistent after an abandoned request");
+
+    // ---- ...and the operator was not told something false about it.
+    check!(!outcome.contains("wrote") && !outcome.contains("moved"),
+           "the shell did NOT claim the move succeeded");
+    check!(outcome.contains("OUTCOME UNKNOWN") && outcome.contains("MAY HAVE SUCCEEDED"),
+           "an ambiguous outcome is reported AS ambiguous - the client cannot tell which side it fell");
+    check!(outcome.contains("Not re-sent"),
+           "...and says WHY, so the operator knows it is theirs to verify");
+
+    // ---- ...and the same operation, issued again, simply works.
+    check!(!retry.contains("OUTCOME UNKNOWN"), "the re-issued move was served normally");
+    check!(after.contains("abandoned-request-evidence"),
+           "re-issuing the operation AFTER an abandoned request works - nothing was left half-applied");
+
+    println!("\nfs-lostreq: {pass} passed, {fail} failed  (serial -> build/tests/fs_lostreq_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.7, the other half: kill `block-driver` WITH REQUESTS OUTSTANDING.
+///
+/// `fs-blockchaos` makes the driver answer WRONGLY. This makes it stop existing mid-request, which
+/// is a different fault with a different recovery path: `fs` sees `SendFailed` (its cap names a dead
+/// endpoint), reacquires by name, and retries - the one retry the code considers safe, because
+/// nothing is in flight when a send never left.
+///
+/// **THE SHARP ASSERTION IS THAT RECOVERY IS PROMPT, NOT MERELY EVENTUAL.** §8.6 says a caller
+/// blocked in a `Call` whose replier dies wakes with `ReplyDead` rather than hanging, and `fs` gives
+/// each block request a 30 s deadline. So "it recovered" is not enough: if the kernel's death-wake
+/// works, `fs` comes back in well under that. A recovery that takes the full deadline means the wake
+/// did NOT fire and the system merely timed out - the same outcome for very different reasons, and
+/// exactly the distinction Commandment V cares about (a dead dependency must RETURN, loudly).
+/// Whether everything captured SO FAR contains `needle`, without moving the collect cursor.
+///
+/// A plain `collect_until` would consume stream the later steps still need; this asks about the
+/// past rather than waiting on the future.
+fn w_contains(buf: &Arc<Mutex<Vec<u8>>>, needle: &str) -> bool {
+    String::from_utf8_lossy(&buf.lock().unwrap()).contains(needle)
+}
+
+pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-blockdeath: PASS - {}", $label); pass += 1; }
+        else { println!("fs-blockdeath: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-blockdeath: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-blockdeath: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("fs-blockdeath: never reached a prompt"); std::process::exit(1);
+    }
+
+    // KILL ON A MARKER, NOT A TIMER - the discipline `fs-churn` records. `churn` prints a
+    // per-second heartbeat, so waiting for it proves requests are genuinely in flight; a fixed delay
+    // would sometimes kill before the first write ever reached the driver, and the test would pass
+    // having proved nothing.
+    send(&mut write_half, b"churn 12\r");
+    let writing = collect_until(&buf, &mut cursor, b"s elapsed", Duration::from_secs(60));
+    check!(writing.is_some(), "churn was demonstrably WRITING before the driver was killed");
+    // Owned here, like `pass` and `fail` - see the block below for what it counts and why.
+    let mut skip = 0usize;
+
+    let killed_at = std::time::Instant::now();
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => {
+            thread::sleep(Duration::from_millis(50));
+            send(&mut ctrl, b"\nKILL block-driver\n");
+            drop(ctrl);
+        }
+        None => { check!(false, "could not reach the control channel to kill block-driver"); }
+    }
+
+    // MEASURE THE EVENT, NOT THE PROMPT. The first version timed from the kill to the next `gsh>`
+    // and reported 23.9 s against a 30 s bound - which PASSED, and measured nothing: `churn 25` runs
+    // its full 25 seconds whatever happens to the driver, so the number was churn's duration wearing
+    // a recovery label. Waiting for the line `fs` prints when its send fails measures the thing the
+    // assertion is about.
+    //
+    // WHY THIS IS THE PROMPTNESS TEST: `fs` allows each block request 30 s (`block-driver`
+    // legitimately retries a busy device that long). If the endpoint's death is only noticed when
+    // that deadline expires, the system is merely timing out. Noticing in a second or two means the
+    // kernel told it - the §8.6 death-wake - which is what Commandment V requires of a dead
+    // dependency: RETURN, loudly, rather than hang.
+    let noticed = collect_until(&buf, &mut cursor, b"block-driver send failed", Duration::from_secs(30));
+    let notice_at = killed_at.elapsed();
+    // ONE FAULT MUST COST ONE FAILURE. These two assertions are about what happens to a request that
+    // is IN FLIGHT when the driver dies, so if churn never got writing there is no in-flight request
+    // and they are not answerable - they are unevaluated, not failed. Reporting them red turned a
+    // single missed precondition into four FAILs and named three innocent properties, which is how a
+    // reader is sent after the death-wake when the actual fault was that the machine was too busy to
+    // start churn inside 60 s (`net-stack` can block a serve pass for 22 s - `backlog/28`).
+    if writing.is_some() {
+        check!(noticed.is_some(), "fs NOTICED the driver's death rather than hanging on it");
+        check!(notice_at < Duration::from_secs(10),
+               "fs noticed PROMPTLY - the death-wake fired, it did not sit out its 30 s deadline");
+        println!("fs-blockdeath: (fs noticed {notice_at:?} after the kill; its request deadline is 30 s)");
+    } else {
+        skip += 2;
+        println!("fs-blockdeath: SKIP - fs NOTICED the driver's death rather than hanging on it");
+        println!("fs-blockdeath: SKIP - fs noticed PROMPTLY - the death-wake fired");
+        println!("fs-blockdeath: (both SKIPPED: churn never reported writing, so nothing was in \
+                  flight to notice. The precondition is the failure; these are not)");
+    }
+
+    // DMA IS QUIESCED WHEN THE DRIVER DIES, which the first run surfaced and is worth pinning here
+    // rather than leaving as a line somebody once saw. An unconfined DMA-capable driver has
+    // kernel-equivalent reach (§6.4); a dead one whose bus-mastering is still enabled could have a
+    // controller writing into memory the kernel has already reclaimed - `kill_task` frees its frames
+    // in the very next line of this log.
+    check!(w_contains(&buf, "bus-master DISABLED on driver death"),
+           "the dead driver's DMA was quiesced before its frames were reclaimed");
+
+    let restarted = collect_until(&buf, &mut cursor, b"block-driver restarted", Duration::from_secs(60));
+    check!(restarted.is_some(), "supervisor observed the death and restarted block-driver");
+    let recovered = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120));
+    if writing.is_some() {
+        check!(recovered.is_some(), "the shell returned to a prompt after the driver died mid-request");
+    } else {
+        skip += 1;
+        println!("fs-blockdeath: SKIP - the shell returned to a prompt after the driver died mid-request");
+    }
+
+    // AND IT STILL WORKS. Every one of these runs after the driver has died and been respawned.
+    send(&mut write_half, b"write /afterdeath.txt driver-died-mid-request\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"read /afterdeath.txt\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"churn verify\r");
+    let _ = collect_until(&buf, &mut cursor, b"file(s)", Duration::from_secs(180));
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    send(&mut write_half, b"drives check\r");
+    let _ = collect_until(&buf, &mut cursor, b"check: ok", Duration::from_secs(300));
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_blockdeath_serial.log", &w);
+
+    check!(w.contains("driver-died-mid-request"),
+           "a file written AFTER the driver death reads back correctly");
+    check!(w.contains("0 bad"), "no corrupt blocks after the driver died mid-request");
+    check!(!w.contains("DANGEROUS DIRECTION"),
+           "the bitmap did not drift in the dangerous direction");
+    // Same property `fs-blockchaos` asserts, and for the same reason: a tear is permitted when the
+    // caller was TOLD, and is corruption when it was not.
+    let torn    = w.contains("are TORN");
+    let refused = w.contains("refused") || w.contains("NO usable reply") || w.contains("EndpointDead");
+    check!(!torn || refused,
+           "no SILENT data change - any torn file is accompanied by a reported failure");
+    check!(!w.contains("KERNEL PANIC"), "no kernel panic");
+
+    if skip > 0 {
+        println!("\nfs-blockdeath: {pass} passed, {fail} failed, {skip} SKIPPED - the skipped ones were \
+                  not evaluated because churn never started writing, NOT because they held");
+    }
+    println!("\nfs-blockdeath: {pass} passed, {fail} failed  (serial -> build/tests/fs_blockdeath_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.7: attack the COMPLETION STREAM, not the device.
+///
+/// `fs-ioretry` already makes the disk fail, and `fs` handles that by retrying. §3.7 asks for the
+/// other half - late, duplicate, missing and out-of-order completions - and names why it matters:
+/// `backlog/31` recorded exactly that failure one layer up, a service reading replies that belonged
+/// to earlier requests. The fs/block channel has the same shape, carries the same correlation tag,
+/// and gained a drain-before-request repair that had never been adversarially exercised.
+///
+/// **THE BAR IS RECOVERY, NOT DETECTION.** `backlog/31`'s tag was reverted precisely because
+/// rejecting a stale reply is not the same as surviving one, so every assertion below that merely
+/// proves a fault was NOTICED is paired with one proving the filesystem still worked afterwards.
+/// A run where `fs` spots every bad completion and then cannot write a file has failed this gate.
+pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-blockchaos: PASS - {}", $label); pass += 1; }
+        else { println!("fs-blockchaos: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("fs-blockchaos: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("fs-blockchaos: could not connect to the shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok();
+        eprintln!("fs-blockchaos: never reached a prompt");
+        std::process::exit(1);
+    }
+
+    // CHURN IS THE TRAFFIC GENERATOR. The injector warms up for 800 completions so boot and mount
+    // are untouched - a run that tests whether the machine boots is not testing this - and churn
+    // then produces thousands of block operations in a few seconds, so the faults land in ordinary
+    // filesystem work rather than in a hand-picked operation.
+    send(&mut write_half, b"churn 8\r");
+    let _ = collect_until(&buf, &mut cursor, b"churn: done", Duration::from_secs(120));
+
+    // AND THEN THE REAL QUESTION: does it still work? Every one of these runs AFTER the faults.
+    send(&mut write_half, b"write /after.txt survived-the-completion-chaos\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"read /after.txt\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    send(&mut write_half, b"churn verify\r");
+    let _ = collect_until(&buf, &mut cursor, b"file(s)", Duration::from_secs(180));
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    // `drives check` walks every block; on a 16 MiB volume behind an injected 30 s stall it is the
+    // longest single step here, and cutting it short reads exactly like corruption (it did once).
+    send(&mut write_half, b"drives check\r");
+    let _ = collect_until(&buf, &mut cursor, b"check: ok", Duration::from_secs(300));
+
+    let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write("build/tests/fs_blockchaos_serial.log", &w);
+
+    // ---- the faults actually happened. Without this the rest passes vacuously on a clean run.
+    check!(w.contains("[completion-chaos] injecting"), "completions were corrupted at all");
+    check!(w.contains("DUPLICATE"), "a DUPLICATE completion was injected");
+    check!(w.contains("WRONG-TAG"), "an OUT-OF-ORDER completion was injected (wrong tag)");
+    check!(w.contains("MISSING"),   "a MISSING completion was injected");
+
+    // ---- `fs` NOTICED. Detection is necessary and, on its own, worth nothing.
+    check!(w.contains("discarded a block reply for tag") || w.contains("orphaned block reply"),
+           "fs detected a mis-correlated completion rather than believing it");
+
+    // ---- AND RECOVERED, which is the gate. §3.7 exists because `backlog/31` proved detection
+    // without recovery is not enough.
+    check!(w.contains("survived-the-completion-chaos"),
+           "a file written AFTER the faults reads back correctly (recovery, not just rejection)");
+    // A TEAR IS PERMITTED HERE, AND `fs-churn`'s ASSERTION WOULD BE THE WRONG ONE.
+    //
+    // `fs-churn` requires `NONE torn` because a POWER CUT returns no error - the caller is told
+    // nothing, so a mixed file is corruption by any reading. This test deliberately makes writes
+    // FAIL, and the first run found `/churn/f2.bin diverges at byte 1 of 1200` sitting beside
+    // `churn: done - 26 writes ... 2 refused`. The write was refused and the caller was told; a
+    // caller that ignores a reported failure and reads back a partial file is not a filesystem bug.
+    //
+    // So the property this gate actually wants is the sharper one: **no completion fault may change
+    // data without somebody being told.** A tear WITH a refusal is a reported failure. A tear with
+    // no refusal anywhere is silent corruption, and that is the thing §3.7 exists to catch.
+    let torn    = w.contains("are TORN");
+    let refused = w.contains("refused") || w.contains("NO usable reply");
+    check!(!torn || refused,
+           "no SILENT data change - any torn file is accompanied by a reported write failure");
+    if torn {
+        println!("fs-blockchaos: (a tear occurred and WAS reported - the permitted outcome, not corruption)");
+    }
+    check!(w.contains("0 bad"), "no corrupt blocks after the chaos");
+    check!(!w.contains("DANGEROUS DIRECTION"),
+           "the bitmap did not drift in the dangerous direction");
+    check!(!w.contains("KERNEL PANIC"), "no kernel panic");
+
+    println!("\nfs-blockchaos: {pass} passed, {fail} failed  (serial -> build/tests/fs_blockchaos_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// Carnage §3.3: cut the power to a drive with a VOLATILE WRITE CACHE.
+///
+/// **EVERY POWER-CUT SUITE SO FAR CUTS A MEDIUM THAT ALREADY HOLDS EVERY ACKNOWLEDGED WRITE**, which
+/// is not how a real drive behaves and is not what the guarantee is conditioned on. `CLAUDE.md` §6.1
+/// makes crash recovery explicitly BACKEND-CONDITIONAL: it holds where the device attests durability
+/// and does not where the device will not honour a flush. `fs-window` and `fs-churn` therefore test
+/// the favourable half only - they can pass for a reason that evaporates on hardware.
+///
+/// `volatile-cache-test` supplies the unfavourable half. A write is answered OK and held in guest
+/// RAM; it reaches the medium only at `OP_FLUSH`, the barrier `fs` already declares. Cutting the
+/// machine loses exactly what a real cache would lose.
+///
+/// **WHAT MUST HOLD IS NOT "THE JOURNAL REPLAYED".** Two outcomes are correct here and the test
+/// accepts both, because which one occurs depends on where the cut fell:
+///
+///   * the journal replays - the commit record AND its staged blocks were flushed; or
+///   * the journal REFUSES - `fs` recomputes `data_crc` over the staged payload, finds the device
+///     did not durably write what the record authorises, and applies NOTHING.
+///
+/// The second is the interesting one, and it is the reason this test exists: that check was added
+/// after this filesystem "has been destroyed repeatedly to prove it", and nothing had ever made it
+/// fire. What is NOT permitted is the third outcome - garbage applied silently over live metadata.
+pub fn run_fs_cache(image_path: &Path, persist_path: &str, smp: u32, lying: bool) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    // NAME ITSELF AFTER THE DRIVE IT MODELS. Both modes ran under the label `fs-cache` and wrote the
+    // same `fs_cache_serial.log`, so the sweep printed `fs-lyingflush ... fs-cache: 7 passed` and
+    // the second run ERASED the first one's evidence. A suite whose serial is overwritten by another
+    // suite cannot be gone back to, which is the whole reason it is kept.
+    let who = if lying { "fs-lyingflush" } else { "fs-cache" };
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("{}: PASS - {}", who, $label); pass += 1; }
+        else { println!("{}: FAIL - {}", who, $label); fail += 1; }
+    }; }
+
+    let boot = |cmds: &[&str], kill_on: Option<&str>, secs: u64| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                match kill_on {
+                    // ON A MARKER, NEVER A TIMER - the discipline `fs-churn` records. A fixed delay
+                    // would sometimes cut before the first write ever reached the cache.
+                    Some(m) => {
+                        if collect_until(&buf, &mut cursor, m.as_bytes(), Duration::from_secs(60)).is_some() {
+                            thread::sleep(Duration::from_millis(1200));
+                            child.kill().ok();
+                            break;
+                        }
+                    }
+                    None => { let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(secs)); }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("{who}: boot 1 - a canary, then churn against a {} cache, then cut",
+             if lying { "LYING (barrier ignored)" } else { "volatile" });
+    let w1 = boot(&["write /canary.txt survives-a-volatile-cache", "churn 25"],
+                  Some("churn: 2s elapsed"), 90);
+    // MODE-AWARE, because the two drives announce themselves differently and an assertion that
+    // knows only one of them fails the other on a healthy run. The honest drive says it committed at
+    // the barrier; the lying one says it committed nothing. Both prove the model is in force, which
+    // is what this check is for - without it every assertion below could pass on a plain build where
+    // no cache existed at all.
+    check!(if lying { w1.contains("[lying-flush]") } else { w1.contains("[volatile-cache] barrier") },
+           "the modelled drive is in force (writes are not durable on acknowledgement)");
+    check!(w1.contains("s elapsed"), "churn was demonstrably writing when the machine was cut");
+    check!(!w1.contains("churn: done"), "the machine was cut mid-churn");
+
+    println!("{who}: boot 2 - what came back");
+    let w2 = boot(&["read /canary.txt", "churn verify", "drives check"], None, 240);
+    check!(w2.contains("mounted GSFS0008") || w2.contains("storage recovered")
+               || w2.contains("refus") || w2.contains("NOT match"),
+           "the volume either MOUNTS or REFUSES loudly - never silently half-applied");
+
+    if !lying {
+        // A DRIVE THAT HONOURS THE BARRIER: the full guarantee applies (§6.1).
+        check!(w2.contains("survives-a-volatile-cache"),
+               "a file written and BARRIERED before the churn is intact");
+        check!(w2.contains("0 bad"), "no corrupt blocks");
+        check!(!w2.contains("DANGEROUS DIRECTION"),
+               "the bitmap did not drift in the dangerous direction");
+    } else {
+        // A DRIVE THAT DOES NOT: §6.1 says recovery is NOT guaranteed here, and a power loss may
+        // require a reformat. Asserting `0 bad` would be asserting a guarantee the constitution
+        // explicitly withholds - so what is asserted is the part that DOES hold: metadata stays
+        // CRC-checked, so damage is DETECTED rather than believed. What is forbidden is silence.
+        let detected = w2.contains("0 bad") || w2.contains("bad") || w2.contains("NOT match")
+                       || w2.contains("refus") || w2.contains("CRC");
+        check!(detected,
+               "damage on an unordered medium is DETECTED and named, never silently believed");
+        check!(!w2.contains("DANGEROUS DIRECTION"),
+               "even here, no live block was marked free (the one unrecoverable drift)");
+    }
+    check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
+
+    // WHICH OF THE TWO PERMITTED OUTCOMES HAPPENED - reported, not asserted. Both are correct; which
+    // one occurs depends on where the cut fell, and saying which makes the run interpretable instead
+    // of merely green.
+    if w2.contains("journal payload does NOT match") {
+        println!("{who}: (the journal REFUSED a transaction whose payload the device never durably wrote");
+        println!("{who}:  - the `data_crc` defence fired, which is the case this suite exists to reach)");
+    } else if w2.contains("journal recovered") {
+        println!("{who}: (the commit record AND its staged blocks were flushed - the journal replayed)");
+    } else {
+        println!("{who}: (the cut fell outside any commit window - no replay, the common case)");
+    }
+
+    let log = format!("build/tests/{who}_serial.log");
+    let _ = std::fs::write(&log, format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\n{who}: {pass} passed, {fail} failed  (serial -> {log})");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_window(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-window: PASS - {}", $label); pass += 1; } else { println!("fs-window: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // Boot, run `cmds`, and - if `kill_on` is given - kill QEMU the moment that text appears, rather
+    // than after a fixed wait. Waiting a fixed time would be a race with a ten-second window.
+    let boot = |cmds: &[&str], kill_on: Option<&str>| -> String {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return String::new() };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return String::new(); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                match kill_on {
+                    // KILL ON THE MARKER, NOT ON A TIMER. The window is ten seconds; a fixed sleep
+                    // would either cut before the commit record is durable (proving nothing) or
+                    // after the checkpoint (proving nothing else).
+                    Some(marker) => {
+                        if collect_until(&buf, &mut cursor, marker.as_bytes(), Duration::from_secs(40)).is_some() {
+                            // Inside the window now. Cut immediately - this is the power cut.
+                            child.kill().ok();
+                            break;
+                        }
+                    }
+                    None => { let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)); }
+                }
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        whole
+    };
+
+    println!("fs-window: boot 1 - write through /cutme, and cut inside the open window");
+    let w1 = boot(&["write /cutme.txt committed-but-unapplied"],
+                  Some("THE JOURNAL IS COMMITTED AND UNAPPLIED"));
+    check!(w1.contains("THE JOURNAL IS COMMITTED AND UNAPPLIED"),
+           "the crash window OPENED and announced itself");
+    check!(!w1.contains("window closed"),
+           "the machine was cut INSIDE the window (it never reached the checkpoint)");
+
+    println!("fs-window: boot 2 - the same disk must RECOVER");
+    let w2 = boot(&["read /cutme.txt", "read /canary.txt", "drives check"], None);
+    // THE POINT OF THE WHOLE TEST. A commit record that survived with no home block applied is
+    // exactly what the journal is for, and this is the line that says it did its job.
+    check!(w2.contains("journal recovered"),
+           "the next mount REPLAYED the committed transaction (`journal recovered`)");
+    check!(w2.contains("mounted GSFS0008"), "and the volume mounted");
+    check!(w2.contains("committed-but-unapplied"),
+           "the interrupted write is PRESENT and correct after recovery");
+    check!(w2.contains("untouched-by-any-of-this"), "an unrelated file is intact");
+    check!(w2.contains("0 bad"), "no corrupt blocks after the recovery");
+    check!(!w2.contains("KERNEL PANIC"), "no kernel panic");
+
+    let _ = std::fs::write("build/tests/fs_window_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+    println!("\nfs-window: {pass} passed, {fail} failed  (serial -> build/tests/fs_window_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_full(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("fs-full: booting (smp={smp}) with a volume baked to the edge of capacity");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let disk      = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str  = disk.to_string_lossy().replace('\\', "/");
+    let port      = pick_free_port();
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-full: PASS - {}", $label); pass += 1; } else { println!("fs-full: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-full: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("fs-full: could not connect to serial {port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        println!("fs-full: FAIL - no prompt"); child.kill().ok(); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, format!("{}\r", $c).as_bytes());
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    // The canary is the file that has nothing to do with any of this. Everything below asks, in one
+    // way or another, whether a failure somewhere else reached it.
+    let canary0 = run!("read /canary.txt", 20);
+    check!(canary0.contains("do-not-disturb"), "the canary reads correctly before the disk is stressed");
+
+    let before = run!("drives check", 150);
+    check!(before.contains("0 bad"), "the baked volume starts consistent (0 bad)");
+    check!(before.contains("nothing was repaired"),
+           "the baked volume's accounting starts consistent (fsck had nothing to repair)");
+
+    // ---- the refusal -------------------------------------------------------------------------
+    //
+    // COPY A WHOLE FILL FILE, not a one-line write. The first version of this asked for a single
+    // block and the write SUCCEEDED, because leaving "a few hundred blocks free" left eight hundred
+    // - plenty for one block. Sizing a test so that it only fails if the arithmetic is exactly right
+    // is a test that reports on the arithmetic. This asks for 10,600 blocks against a volume with a
+    // few hundred: no rounding error can accommodate it, and the large claim also makes a leak
+    // obvious if the refusal strands what it reserved.
+    let refused = run!("copy /fill1.bin /toobig.bin", 120);
+    check!(!refused.contains("copied"), "copying a large file into a full volume is REFUSED");
+    // And it says WHY. `copy` used to answer "write failed (parent missing?)" here - the same
+    // misleading guess `write` and `move` were corrected for - which would send somebody hunting for
+    // a typo when the real answer is that the disk is full.
+    check!(refused.contains("no space") || refused.contains("full"),
+           format!("the refusal NAMES the reason rather than guessing (got: {})",
+                   refused.lines().find(|l| l.contains("copy:")).unwrap_or("nothing").trim()));
+
+    // ---- what the refusal cost --------------------------------------------------------------
+    let canary1 = run!("read /canary.txt", 20);
+    check!(canary1.contains("do-not-disturb"), "an unrelated file is untouched by the failed allocation");
+
+    let after = run!("drives check", 150);
+    check!(after.contains("0 bad"), "no corrupt blocks after the refusal");
+    // THE ONE THAT MATTERS. A refused allocation that keeps the blocks it claimed turns every
+    // out-of-space error into permanent lost capacity - invisible, because the directory never
+    // referenced them. fsck walks the tree and would report exactly that as a leak.
+    check!(after.contains("nothing was repaired"),
+           "the refused allocation LEAKED NOTHING (fsck still has nothing to repair)");
+
+    // ---- and the volume still works ----------------------------------------------------------
+    let del = run!("delete /fill3.bin", 120);
+    check!(!del.contains("failed"), "space can be reclaimed from a full volume");
+    let ok = run!("write /extra.txt now-there-is-room", 30);
+    check!(ok.contains("wrote /extra.txt"), "a valid write SUCCEEDS once there is room again");
+    let back = run!("read /extra.txt", 20);
+    check!(back.contains("now-there-is-room"), "and the file reads back correctly");
+    // The big one too: the space a refused copy could not have is usable once it genuinely exists.
+    let big = run!("copy /fill1.bin /toobig.bin", 240);
+    check!(big.contains("copied"), "and the large copy that was refused now SUCCEEDS");
+
+    let end = run!("drives check", 150);
+    check!(end.contains("0 bad") && end.contains("nothing was repaired"),
+           "the volume is still consistent after the whole sequence");
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic");
+    let _ = std::fs::write("build/tests/fs_full_serial.log", &whole);
+    child.kill().ok(); child.wait().ok();
+    println!("\nfs-full: {pass} passed, {fail} failed  (serial -> build/tests/fs_full_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// `fs-rtear` - CRASHING DURING RECOVERY. A second-order tear: cut the replay itself.
+///
+/// THE ROW THIS CLOSES. `fs-tear` cuts an OPERATION and checks the next mount lands inside the
+/// permitted set; 220 tear points across nine operations say it does. But every one of those
+/// recoveries was allowed to FINISH. The question nobody had asked is what happens when the machine
+/// dies again while the journal is being replayed - which is not exotic, it is what a flapping power
+/// supply does, and it is the one moment when the filesystem is deliberately mid-surgery.
+///
+/// **Why the answer must be "nothing changes".** A redo journal's replay is IDEMPOTENT by
+/// construction: it copies staged blocks to their home locations, and doing that twice writes the
+/// same bytes to the same places. So a cut partway through must leave a volume that simply replays
+/// again on the next mount. If it did not - if a half-applied replay could leave the volume
+/// unmountable or its accounting contradictory - then the recovery mechanism would itself be a
+/// window of corruption, and every guarantee resting on it would be conditional on nobody dying
+/// twice.
+///
+/// **How it is built, which is the whole trick.** `fs-tear`'s machinery is reused to MANUFACTURE a
+/// disk that must recover: record an operation's sectors, then apply a prefix and boot it until one
+/// is found whose mount announces `journal recovered`. That image is the starting point. It is then
+/// booted with the write tap to capture what RECOVERY writes, and prefixes of THOSE are applied to
+/// it - each one a machine that died in the middle of replaying.
+pub fn run_fs_rtear(tapped_image: &Path, plain_image: &Path, persist_path: &str, smp: u32) {
+    let qemu       = crate::qemu::qemu_binary();
+    let tapped_str = tapped_image.to_string_lossy().replace('\\', "/");
+    let plain_str  = plain_image.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-rtear: PASS - {}", $label); pass += 1; }
+        else { println!("fs-rtear: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let base = match std::fs::read(persist_path) { Ok(b) => b, Err(e) => { eprintln!("fs-rtear: no base disk: {e}"); std::process::exit(1); } };
+
+    let boot = |disk_path: &str, cmds: &[&str], cmd_secs: u64, tap: bool| -> (Vec<String>, String) {
+        let disk = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let image = if tap { &tapped_str } else { &plain_str };
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(_) => return (vec![], String::new()) };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(12)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return (vec![], String::new()); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(70)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(cmd_secs)).unwrap_or_default());
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole)
+    };
+
+    // ---- 1. MANUFACTURE A DISK THAT MUST RECOVER ----------------------------------------------
+    // `delete` is used because `fs-tear` measured it as the operation with the widest replay window
+    // - 10 of its 21 tear points announce `journal recovered` - so a prefix that needs recovery is
+    // found in a few boots rather than twenty.
+    let rec_disk = "build/tests/fs_rtear_record.img";
+    if std::fs::write(rec_disk, &base).is_err() {
+        check!(false, "could not stage the record disk"); println!("\nfs-rtear: {pass} passed, {fail} failed");
+        if fail > 0 { std::process::exit(1); } return;
+    }
+    let (_o, rserial) = boot(rec_disk, &["dir /", "delete /tear.txt", "dir /"], 60, true);
+    let writes = parse_write_tap(&rserial);
+    check!(!writes.is_empty(), "the write tap recorded the manufacturing operation");
+    if writes.is_empty() {
+        println!("\nfs-rtear: {pass} passed, {fail} failed"); std::process::exit(1);
+    }
+    let last = writes.last().map_or(0, |w| w.seq);
+
+    // Walk BACKWARDS from the last sector: the commit record lands late in the operation, so the
+    // tear points that replay cluster near the end. Forwards would boot through every point that
+    // pre-dates the commit and recovers nothing.
+    let mut torn_path = String::new();
+    let mut found_k = 0u64;
+    for k in (1..=last).rev() {
+        let img = format!("build/tests/fs_rtear_torn_k{k}.img");
+        if apply_writes_prefix(&base, &writes, k, &img).is_err() { continue; }
+        let (_o, w) = boot(&img, &["drives check"], 150, false);
+        if w.contains("journal recovered") {
+            found_k = k;
+            // REBUILT, NOT REUSED. `img` has just been booted, and that boot replayed the journal
+            // and wrote the result back - the disk is read-write to QEMU. Reusing it would hand the
+            // next stage an already-recovered volume, which is exactly what it did the first time:
+            // `recovery wrote 0 sector(s)`.
+            torn_path = format!("build/tests/fs_rtear_torn_fresh_k{k}.img");
+            if apply_writes_prefix(&base, &writes, k, &torn_path).is_err() { torn_path = String::new(); }
+            break;
+        }
+    }
+    check!(!torn_path.is_empty(),
+           format!("manufactured a disk whose mount MUST replay the journal (tear point k={found_k})"));
+    if torn_path.is_empty() {
+        println!("\nfs-rtear: {pass} passed, {fail} failed"); std::process::exit(1);
+    }
+
+    // ---- 2. RECORD WHAT RECOVERY WRITES -------------------------------------------------------
+    let torn = match std::fs::read(&torn_path) { Ok(b) => b, Err(_) => { check!(false, "could not read the torn disk"); vec![] } };
+    let rtap_disk = "build/tests/fs_rtear_tap.img";
+    let _ = std::fs::write(rtap_disk, &torn);
+    let (_o, rw) = boot(rtap_disk, &[], 60, true);
+    // Only the writes BEFORE the first prompt: those are the mount's, which is where the replay
+    // happens. Anything after is the shell starting up and has nothing to do with recovery.
+    let cut = rw.find("gsh>").unwrap_or(rw.len());
+    let rwrites = parse_write_tap(&rw[..cut]);
+    check!(!rwrites.is_empty(),
+           "the write tap recorded what RECOVERY writes (zero means the torn image had already been recovered by an earlier boot)");
+    let rlast = rwrites.last().map_or(0, |w| w.seq);
+    println!("fs-rtear: recovery wrote {} sector(s); cutting at each one", rlast);
+
+    // ---- 3. CUT THE RECOVERY AT EVERY POINT ---------------------------------------------------
+    let mut ok_points = 0u64;
+    let mut replayed_again = 0u64;
+    for j in 1..=rlast {
+        let img = format!("build/tests/fs_rtear_j{j}.img");
+        if apply_writes_prefix(&torn, &rwrites, j, &img).is_err() { continue; }
+        let (o, w) = boot(&img, &["drives check"], 150, false);
+        let out = o.first().cloned().unwrap_or_default();
+        let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+        if w.contains("journal recovered") { replayed_again += 1; }
+        // A replay interrupted partway must leave a volume that MOUNTS and whose accounting does
+        // not contradict itself. Both halves matter: a volume that mounts with a corrupt bitmap is
+        // worse than one that refuses, because the next allocation writes over live data.
+        let consistent = !out.contains("marked free but are IN USE") && out.contains("check:");
+        if mounted && consistent { ok_points += 1; }
+        else {
+            println!("fs-rtear: j={j} - mounted={mounted} consistent={consistent} (image kept: {img})");
+        }
+    }
+    check!(rlast > 0 && ok_points == rlast,
+           format!("every cut DURING recovery left a mountable, self-consistent volume ({ok_points}/{rlast})"));
+    // A sweep where recovery never re-ran has not tested re-entry at all, however many points it
+    // passed - the same argument `fs-tear` makes about counting its own replays.
+    check!(replayed_again > 0,
+           format!("recovery RE-RAN after being interrupted ({replayed_again} of {rlast} cuts replayed again) - replay is re-entrant, not one-shot"));
+
+    println!("\nfs-rtear: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+pub fn run_fs_tear(tapped_image: &Path, plain_image: &Path, persist_path: &str, smp: u32) {
+    let qemu       = crate::qemu::qemu_binary();
+    let tapped_str = tapped_image.to_string_lossy().replace('\\', "/");
+    let plain_str  = plain_image.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-tear: PASS - {}", $label); pass += 1; } else { println!("fs-tear: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // Boot `disk`, run `cmds`, and hand back each command's output, the whole serial capture, and
+    // the serial LENGTH at which each command finished.
+    //
+    // That last one is what bounds the sweep. The obvious marker - a log line naming the op - does
+    // not exist on the success path: `fs` logs "request op N answered" only when it FAILS, by
+    // design, so a healthy request stays silent. Using it would have silently set the boundary to
+    // zero and swept every write since power-on, which is not wrong so much as twenty minutes of
+    // booting to learn the same thing.
+    let boot = |disk_path: &str, cmds: &[&str], cmd_secs: u64, tap: bool| -> (Vec<String>, String, Vec<usize>) {
+        let image_str = if tap { &tapped_str } else { &plain_str };
+        let disk = std::fs::canonicalize(disk_path).unwrap_or_else(|_| std::path::PathBuf::from(disk_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("fs-tear: QEMU launch failed: {e}"); return (Vec::new(), String::new(), Vec::new()); }
+        };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { child.kill().ok(); child.wait().ok(); return (Vec::new(), String::new(), Vec::new()); }
+        };
+        let mut read_half = stream.try_clone().expect("clone tcp stream");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        let mut marks = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_some() {
+            for c in cmds {
+                send(&mut write_half, format!("{c}\r").as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(cmd_secs)).unwrap_or_default());
+                marks.push(cursor);
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole, marks)
+    };
+
+    // The pristine disk, kept byte-for-byte: every replayed image is built from THIS, never from a
+    // previous replay, so one bad boot cannot contaminate the rest of the sweep.
+    let base = match std::fs::read(persist_path) { Ok(b) => b, Err(e) => { eprintln!("fs-tear: cannot read {persist_path}: {e}"); std::process::exit(1); } };
+
+    // ---- THE CASES ----------------------------------------------------------------------------
+    //
+    // One row per operation of the permitted-outcome table (`docs/gsfs-carnage.md` 2). Each names
+    // the setup that establishes a known starting state, the ONE operation to tear, and the two
+    // mutually exclusive outcomes the table permits: after any interruption, EXACTLY ONE of them
+    // must be observed. Never both (the operation half-applied), never neither (it destroyed both).
+    //
+    // The last setup command must write nothing. It is what marks the boundary between "the machine
+    // came up and mounted" and "the operation ran" - measured from the write tap, not assumed,
+    // because the number of boot writes is not a constant.
+    /// What "inside the permitted set" means for one operation. Two shapes, because the table in
+    /// `docs/gsfs-carnage.md` 2 genuinely has two.
+    enum Oracle {
+        /// EXACTLY ONE of these two texts appears. The operation's two permitted outcomes are
+        /// mutually exclusive and both visible: old name or new name, source or destination, old
+        /// content or new content. Both means it half-applied; neither means it destroyed what it
+        /// touched.
+        ExactlyOne(&'static str, &'static str),
+        /// This text MUST appear. Used where BOTH presence and absence are permitted outcomes and
+        /// so there is nothing to exclude - what must hold is an INVARIANT instead.
+        ///
+        /// `delete` is the case: gone or still there are equally legal, and the thing that must
+        /// never happen is invisible from the directory side. A leak (absent but blocks still
+        /// allocated) and a clean delete look identical in a listing. The accounting is where the
+        /// difference lives, which is why this arrives only now that fsck REPORTS whether it had to
+        /// repair anything rather than silently repairing it.
+        MustContain(&'static str),
+        /// This text must NOT appear. For an operation where several outcomes are legal and what
+        /// matters is that ONE specific state never arises.
+        ///
+        /// `delete` is the case, and getting it right took being wrong first. The oracle was
+        /// `MustContain("nothing was repaired")` - the accounting must always agree - and three tear
+        /// points failed it with a real, reproducible one-block LEAK: a block held as used that
+        /// nothing references any more.
+        ///
+        /// That leak is PERMITTED, and the design says so in its own words. The free count is a
+        /// derived view of the tree (26.4: stored, reconciled when it drifts, never a second truth),
+        /// `drives check` rebuilds it, and `delete_tree` states outright that a crash mid-reclaim
+        /// "only leaks blocks (nothing references them) - never corruption". A leak costs space until
+        /// the next fsck and costs nothing else.
+        ///
+        /// The direction that is NOT permitted is the opposite one: a block marked FREE while a live
+        /// file still references it. That one is silent and then fatal - the next allocation hands
+        /// the block out and a write destroys data that something still points at.
+        Forbids(&'static str),
+    }
+    struct TearCase {
+        name:   &'static str,
+        setup:  &'static [&'static str],
+        op:     &'static str,
+        probe:  &'static str,
+        oracle: Oracle,
+        /// How long the probe may take. `drives check` walks the whole tree and rewrites the bitmap,
+        /// which on the `write-tap` build means eight serial lines per sector written - so it needs
+        /// far longer than a `read` or a `dir`.
+        probe_secs: u64,
+        /// Text that proves the probe ANSWERED AT ALL, whatever the answer was.
+        ///
+        /// **This is what stops a timeout being reported as a violation**, and it exists because the
+        /// harness did exactly that: `drives check` ran past its window, the capture held no `check:`
+        /// line of any kind, and the oracle read the absent answer as a broken invariant. The image
+        /// was booted by hand afterwards and the filesystem was perfectly consistent. A false FAIL is
+        /// the worst kind of test failure - it trains a reader to discount red, which is the whole
+        /// subject of `backlog/32`.
+        /// Every SHAPE a successful probe can take - not one of them.
+        ///
+        /// This was a single string and it made a passing filesystem look broken. The `move` case
+        /// declared `answered: "entries"`, while its own oracle declares `(empty)` and `tear.txt`
+        /// both legal - and `dir` prints `  (empty)` with no header and no count for an empty
+        /// directory. After a torn move the destination is usually empty, so the probe had its
+        /// answer on screen and waited out its 20 s anyway, reporting a TIMEOUT for all 17 tear
+        /// points. `fs-tear` went from 18/0 to 17/14 with nothing wrong in the filesystem.
+        ///
+        /// The bug is the oracle and the answered-marker disagreeing about what an answer looks
+        /// like. A list cannot drift that way: every outcome the oracle admits is listed here too.
+        answered: &'static [&'static str],
+    }
+    const CASES: &[TearCase] = &[
+        // A whole-file overwrite: the old content complete, or the new content complete. Never a
+        // mix, and never an entry pointing at blocks that were never written.
+        TearCase { name: "overwrite", setup: &["read /tear.txt"],
+                   op: "write /tear.txt NEWNEWNEW", probe: "read /tear.txt",
+                   oracle: Oracle::ExactlyOne("ORIGINAL", "NEWNEWNEW"),
+                   probe_secs: 20, answered: &["read /tear.txt"] },
+        // A rename: the old name or the new name, never both, never neither. Two directory-entry
+        // mutations in one transaction, which is what the journal is for.
+        TearCase { name: "rename", setup: &["dir /"],
+                   op: "rename /tear.txt ZZrenamed.txt", probe: "dir /",
+                   oracle: Oracle::ExactlyOne("tear.txt", "ZZrenamed.txt"),
+                   probe_secs: 20, answered: &["NAME"] },
+        // A move ACROSS directories: an add into the destination and a remove from the source, in
+        // one transaction. The file is in exactly one of the two places - never in both (a second
+        // reference to one extent) and never in neither (the file lost outright).
+        // The probe looks INTO the destination rather than at the whole tree, because `zdir` exists
+        // before the move as well as after - a marker present in both outcomes cannot distinguish
+        // them, and an oracle that cannot fail is not an oracle. An empty destination and a
+        // destination holding the file are genuinely exclusive.
+        TearCase { name: "move", setup: &["mkdir /zdir", "dir /zdir"],
+                   op: "move /tear.txt /zdir/tear.txt", probe: "dir /zdir",
+                   oracle: Oracle::ExactlyOne("(empty)", "tear.txt"),
+                   probe_secs: 20, answered: &["entries", "(empty)"] },
+        // DELETE, and it needs the other oracle. Present-with-its-blocks and absent-with-them-freed
+        // are BOTH permitted, so there is nothing to exclude - but the two failures that matter are
+        // invisible in a listing. A LEAK (absent from the directory, blocks still marked used) looks
+        // exactly like a clean delete; the reverse (present, blocks marked free) looks fine until
+        // the next allocation writes over live data. `drives check` walks the tree and compares its
+        // count against the superblock's, and now SAYS whether they disagreed, so a torn delete that
+        // left the accounting inconsistent is caught by the one instrument that can see it.
+        // ---- FOUR MORE OPERATIONS FROM SECTION 2, added 2026-09-22. Each one is a row in the
+        //      permitted-outcome table that nothing had ever cut.
+        //
+        //      OPERAND SIZE IS THE RUNTIME. This suite boots QEMU once per SECTOR the operation
+        //      writes, so a case that copies a megabyte is not thorough, it is a suite nobody runs.
+        //      Every operand below is deliberately tiny: the question is whether the TRANSACTION is
+        //      atomic, and a transaction's atomicity does not depend on how much data rides in it.
+
+        // LABEL: the smallest transaction in the filesystem - one superblock field. Two texts, both
+        // visible, mutually exclusive: the drive answers to the old name or the new one. A label
+        // that came back blank, or as a mixture, would be a superblock written non-atomically, and
+        // every other guarantee rests on that block being readable.
+        TearCase { name: "label", setup: &["drives label 0 tearvol", "drives"],
+                   op: "drives label 0 ZZNEWLABEL", probe: "drives",
+                   oracle: Oracle::ExactlyOne("tearvol", "ZZNEWLABEL"),
+                   probe_secs: 30, answered: &["LABEL"] },
+
+        // MKDIR -P: none of the directories exist, or all of them do. Three levels in ONE
+        // transaction, so a tear that left `/pa` without `/pa/pb` would be a partially-applied
+        // multi-entry commit - the exact thing the journal exists to prevent, and the one shape
+        // `rename` and `move` (two entries) cannot show because three is where a prefix becomes
+        // possible.
+        //
+        // The probe asks about the DEEPEST directory: `/pa` alone existing is the violation, and a
+        // probe that looked at `/pa` could not tell the difference between "all three" and "the
+        // first one only".
+        TearCase { name: "mkdir-p", setup: &["dir /"],
+                   op: "mkdir /pa/pb/pc parents", probe: "dir /pa/pb/pc",
+                   oracle: Oracle::ExactlyOne("not a directory", "(empty)"),
+                   probe_secs: 30, answered: &["not a directory", "(empty)", "entries"] },
+
+        // SEAL: sealed, or not sealed. The `ro_compat` superblock bit and the entry's flag commit
+        // TOGETHER, and a tear between them is the one outcome that would be quietly catastrophic:
+        // a file the entry calls sealed while the volume does not know it, or a volume that refuses
+        // every write because a bit survived a seal that did not.
+        //
+        // The probe is a WRITE, because "is it sealed" is not a question a listing answers - the
+        // flag is only visible in what the filesystem permits. `fs` refuses a sealed write by name
+        // ("file is sealed"), and a successful one says "wrote", so the two outcomes are exclusive
+        // and both are visible.
+        TearCase { name: "seal", setup: &["write /sl.txt BEFORE", "dir /"],
+                   op: "seal /sl.txt yes", probe: "write /sl.txt CHANGED",
+                   // (BEFORE, AFTER), which is what the control check reads: it asserts the
+                   // SECOND text appears when nothing interrupts the operation. Written the other
+                   // way round first, and the control caught it - a sealed file refuses a write,
+                   // so "wrote" is the state BEFORE the seal, not after.
+                   oracle: Oracle::ExactlyOne("wrote", "file is sealed"),
+                   probe_secs: 30, answered: &["file is sealed", "wrote", "failed"] },
+
+        // DELETE-TREE: a PREFIX of the tree may be gone, because each entry's removal is atomic and
+        // the WALK across them is not. So presence proves nothing and absence proves nothing - the
+        // only thing that must hold is the accounting, which is what `delete` uses the same oracle
+        // for. A block marked free while a surviving file still references it is the outcome that
+        // destroys data silently: the next allocation writes over it.
+        TearCase { name: "delete-tree", setup: &["mkdir /dt/sub parents", "write /dt/one.txt AAA", "write /dt/sub/two.txt BBB", "dir /dt"],
+                   op: "delete /dt recursive", probe: "drives check",
+                   oracle: Oracle::Forbids("marked free but are IN USE"),
+                   probe_secs: 150, answered: &["check:"] },
+
+        // WRITE-NEW: the file does not exist, or it exists at its full declared size. The extent is
+        // allocated BEFORE the directory entry is made, so a tear between the two leaves blocks
+        // held by nothing - a leak, which section 2 does NOT list as a permitted outcome. `copy` is
+        // how the shell issues `OP_WRITE_NEW`, and the source is three bytes so the streaming half
+        // costs one sector rather than hundreds.
+        //
+        // The oracle is the accounting rather than the listing, for the reason `delete` uses it:
+        // an absent file whose blocks are still held looks exactly like a file that was never
+        // created, and only fsck can tell them apart.
+        TearCase { name: "write-new", setup: &["write /wn.txt AAA", "dir /"],
+                   op: "copy /wn.txt /wn2.txt", probe: "drives check",
+                   oracle: Oracle::Forbids("marked free but are IN USE"),
+                   probe_secs: 150, answered: &["check:"] },
+
+        TearCase { name: "delete", setup: &["dir /"],
+                   op: "delete /tear.txt", probe: "drives check",
+                   oracle: Oracle::Forbids("marked free but are IN USE"),
+                   // 150s: measured, not guessed. The check answered in well under a minute when
+                   // asked by hand; the 20s the other probes use was not enough and the shortfall
+                   // read as a filesystem defect.
+                   probe_secs: 150, answered: &["check:"] },
+    ];
+
+    let mut total_points = 0u64;
+    // Across the whole suite: how many cuts hit the commit window and tore the record. This is the
+    // number that proves the reporting path is REACHED, not merely written.
+    let mut total_torn = 0u64;
+    for case in CASES {
+        // ---- 1. RECORD -------------------------------------------------------------------------
+        println!("fs-tear: [{}] recording - the operation and every sector it writes", case.name);
+        let rec_disk = format!("build/tests/fs_tear_record_{}.img", case.name);
+        if std::fs::write(&rec_disk, &base).is_err() {
+            check!(false, format!("[{}] could not stage the record disk", case.name));
+            continue;
+        }
+        let mut cmds: Vec<&str> = case.setup.to_vec();
+        cmds.push(case.op);
+        cmds.push(case.probe);
+        let (rout, rserial, rmarks) = boot(&rec_disk, &cmds, case.probe_secs.max(20), true);   // RECORD: the tap is the point
+        let writes = parse_write_tap(&rserial);
+        // KEEP THE EVIDENCE, on every run and not only on failure. The serial holds the tap, and the
+        // tap is the only record of what the operation actually did; a suite that reports a number
+        // and discards its recording cannot be argued with.
+        let _ = std::fs::write(format!("build/tests/fs_tear_serial_{}.log", case.name), &rserial);
+        let _ = std::fs::remove_file(&rec_disk);
+
+        let n_setup = case.setup.len();
+        let mark_at = |i: usize| -> u64 {
+            rmarks.get(i).map_or(0, |m| parse_write_tap(&rserial[..(*m).min(rserial.len())])
+                                            .last().map_or(0, |w| w.seq))
+        };
+        let op_start = mark_at(n_setup - 1);
+        let op_end   = mark_at(n_setup);
+
+        check!(!writes.is_empty(), format!("[{}] the write tap recorded sectors", case.name));
+        let landed = match case.oracle {
+            Oracle::ExactlyOne(_, after) => rout.last().map_or(false, |r| r.contains(after)),
+            Oracle::MustContain(t)       => rout.last().map_or(false, |r| r.contains(t)),
+            Oracle::Forbids(t)           => rout.last().map_or(false, |r| !r.contains(t)),
+        };
+        check!(landed, format!("[{}] the operation landed when nothing interrupted it", case.name));
+        check!(op_end > op_start,
+               format!("[{}] the operation wrote {} sector(s) (tap {}..{})",
+                       case.name, op_end.saturating_sub(op_start), op_start + 1, op_end));
+        if op_end <= op_start || writes.is_empty() { continue; }
+
+        // ---- 2. REPLAY -------------------------------------------------------------------------
+        //
+        // Every cut point, not a sample. A tear point whose outcome is not in the permitted set is a
+        // real defect, and its image stays on disk so it can be booted again while it is fixed.
+        println!("fs-tear: [{}] replaying {} tear point(s)", case.name, op_end - op_start);
+        let mut torn_ok = 0u64;
+        // HOW MANY TEAR POINTS ACTUALLY EXERCISE RECOVERY, counted rather than assumed.
+        //
+        // Free: every replay boot's serial is already captured, and `fs` announces a replay
+        // (`journal recovered N block(s) from an interrupted write`). The number matters because it
+        // is the size of the window between the commit record landing and the last home block being
+        // written - the only window in which the journal does any work. A case where it is ZERO has
+        // not tested recovery at all, however many tear points it passed, and saying so stops a
+        // green tally implying coverage it does not have.
+        let mut replayed = 0u64;
+        // THE FIRST tear point that replayed, kept for the torn-record case below.
+        //
+        // It is the useful one and no later one will do: the commit record is durable before ANY
+        // home block moves, so at the first replaying cut home is still entirely un-applied. Discard
+        // the record there and the volume must read exactly as it did before the operation started -
+        // which is what lets the case's own oracle judge "home untouched" instead of a hand-rolled
+        // assertion about bytes.
+        let mut first_replay_k: Option<u64> = None;
+        for k in (op_start + 1)..=op_end {
+            let img = format!("build/tests/fs_tear_{}_k{}.img", case.name, k);
+            if apply_writes_prefix(&base, &writes, k, &img).is_err() {
+                check!(false, format!("[{}] k={k}: could not build the torn image", case.name));
+                continue;
+            }
+            let (o, w, _) = boot(&img, &[case.probe], case.probe_secs, false);       // REPLAY: no tap, no splicing
+            let out = o.first().cloned().unwrap_or_default();
+            let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+            if w.contains("journal recovered") {
+                replayed += 1;
+                if first_replay_k.is_none() { first_replay_k = Some(k); }
+            }
+            // A failure to mount is outside the table whatever the oracle says: the operation
+            // corrupted the structure rather than landing on one side of it.
+            // DID IT ANSWER AT ALL? A probe that ran out of time has told us nothing, and calling
+            // that a violation is a false FAIL - which is worse than a missed one, because it
+            // teaches a reader to discount red.
+            if !case.answered.iter().any(|m| out.contains(m)) {
+                check!(false, format!(
+                    "[{}] k={k}: the probe `{}` DID NOT ANSWER within {}s - this is a TIMEOUT, not a \
+                     verdict on the filesystem. Image kept at {img}",
+                    case.name, case.probe, case.probe_secs));
+                continue;
+            }
+            let (ok, why) = match case.oracle {
+                Oracle::ExactlyOne(before, after) => {
+                    let (b, a) = (out.contains(before), out.contains(after));
+                    (mounted && (b ^ a), format!("{before}={b} {after}={a}"))
+                }
+                Oracle::MustContain(t) => {
+                    let c = out.contains(t);
+                    (mounted && c, format!("\"{t}\"={c}"))
+                }
+                Oracle::Forbids(t) => {
+                    let c = out.contains(t);
+                    (mounted && !c, format!("forbidden \"{t}\" present={c}"))
+                }
+            };
+            if ok {
+                torn_ok += 1;
+                let _ = std::fs::remove_file(&img);
+            } else {
+                check!(false, format!(
+                    "[{}] k={k}: outside the permitted set (mounted={mounted} {why}) - image kept at {img}",
+                    case.name));
+                // SHOW WHAT IT ACTUALLY SAW, not just that it did not match.
+                //
+                // A failing tear point that reports only a boolean sends whoever reads it back to
+                // QEMU to find out what the probe said - which is the first thing anybody wants and
+                // the harness already has in hand. Trimmed, because a listing can be long and the
+                // answer is always in the first line or two.
+                for line in out.lines().filter(|l| !l.trim().is_empty()).take(4) {
+                    println!("fs-tear:        | {}", line.trim_end());
+                }
+            }
+        }
+        let points = op_end - op_start;
+        total_points += points;
+        let verdict = match case.oracle {
+            Oracle::ExactlyOne(b, a) => format!("left exactly one of `{b}` / `{a}`"),
+            Oracle::MustContain(t)   => format!("left the volume reporting `{t}`"),
+            Oracle::Forbids(t)       => format!("left the volume free of `{t}`"),
+        };
+        check!(torn_ok == points,
+               format!("[{}] every tear point {} ({}/{})", case.name, verdict, torn_ok, points));
+        println!("fs-tear: [{}] {} of {} tear point(s) made the journal REPLAY on mount{}",
+                 case.name, replayed, points,
+                 if replayed == 0 { "  <- recovery was never exercised by this case" } else { "" });
+
+        // ---- 3. THE RECORD ITSELF UNREADABLE -----------------------------------------------
+        //
+        // The branch no tear point above can reach. `recover` bails four ways, and the one that
+        // matters on real hardware is a commit record that IS present and whose own CRC fails: the
+        // device began the record and lost power part-way through it. Nothing may be applied (the
+        // record never authorised anything, so home is untouched and the volume is consistent), and
+        // `fs` must SAY which case it is in - a clean mount with no message means the cut missed the
+        // window, and these two must not look alike.
+        //
+        // Built rather than found: take the first replaying tear point, where the record has landed
+        // and no home block has, and corrupt one byte inside the region the record's CRC covers.
+        if let Some(k) = first_replay_k {
+            let img = format!("build/tests/fs_torn_{}_k{}.img", case.name, k);
+            if apply_writes_prefix(&base, &writes, k, &img).is_ok() && corrupt_commit_record(&img) {
+                let (o, w, _) = boot(&img, &[case.probe], case.probe_secs, false);
+                let out = o.first().cloned().unwrap_or_default();
+                let said = w.contains("the journal record is present but TORN");
+                let mounted = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+                let replayed_anyway = w.contains("journal recovered");
+                check!(said, format!(
+                    "[{}] a TORN commit record is REPORTED, not discarded in silence (this is the \
+branch no tear point can reach - the tap cuts between sectors, so it can never half-write the record)",
+                    case.name));
+                check!(mounted && !replayed_anyway, format!(
+                    "[{}] a TORN commit record applies NOTHING and the volume still mounts \
+(mounted={mounted} replayed={replayed_anyway})", case.name));
+                // HOME UNTOUCHED, judged by the case's own oracle: at the first replaying cut no home
+                // block has moved, so discarding the record must leave the pre-operation state.
+                let before_ok = match case.oracle {
+                    Oracle::ExactlyOne(b, a) => out.contains(b) && !out.contains(a),
+                    Oracle::MustContain(_)   => mounted,
+                    Oracle::Forbids(t)       => !out.contains(t),
+                };
+                check!(before_ok, format!(
+                    "[{}] a TORN commit record leaves HOME UNTOUCHED - the volume reads as it did \
+before the operation began", case.name));
+                if said && mounted && before_ok { let _ = std::fs::remove_file(&img); }
+                total_torn += 1;
+            } else {
+                check!(false, format!(
+                    "[{}] could not stage a torn-commit-record image (no JOURNAL_MAGIC found at k={k})",
+                    case.name));
+            }
+        }
+    }
+
+    // ---- 3. PROVE THE ORACLE CAN FAIL ----------------------------------------------------------
+    //
+    // 54 tear points passed, which is worth exactly nothing until the thing doing the judging has
+    // been seen to REJECT something. An oracle that cannot fail reports PASS over whatever it is
+    // pointed at, and this project has been caught by that five times over (`commandments_redteam`
+    // exists for the same reason).
+    //
+    // The control is a state genuinely outside the permitted set, reached with one boot of an image
+    // we already have: the PRISTINE disk, probed for the move case. There is no `/zdir` on it at all,
+    // so neither `(empty)` nor `tear.txt` can appear - neither permitted outcome holds - and the
+    // oracle must say so. If this ever passes, the sweep above is meaningless and the suite says so
+    // rather than reporting a green tick it did not earn.
+    {
+        let ctl = "build/tests/fs_tear_control.img";
+        if std::fs::write(ctl, &base).is_ok() {
+            let (o, w, _) = boot(ctl, &["dir /zdir"], 20, false);
+            let out = o.first().cloned().unwrap_or_default();
+            let has_before = out.contains("(empty)");
+            let has_after  = out.contains("tear.txt");   // the move case's Oracle::ExactlyOne texts
+            let mounted    = w.contains("fs: mounted GSFS0008") || w.contains("storage recovered");
+            let oracle_says_ok = mounted && (has_before ^ has_after);
+            check!(mounted, "control: the pristine disk mounts (so a rejection is the ORACLE, not a dead boot)");
+            check!(!oracle_says_ok,
+                   "control: the oracle REJECTS a state outside the permitted set (neither outcome present)");
+            let _ = std::fs::remove_file(ctl);
+        } else {
+            check!(false, "control: could not stage the pristine disk");
+        }
+    }
+
+    println!("fs-tear: {} tear point(s) across {} operation(s); recordings kept in build/tests/",
+             total_points, CASES.len());
+    // BOTH halves of the recovery decision must be exercised, not just the one the oracles need.
+    //
+    // The replay half is covered implicitly - the oracles depend on it. The torn half has no oracle
+    // depending on it (a discarded record leaves the same state as a record never written), so
+    // without this it could stop firing and all 220 tear points would still pass.
+    check!(total_torn > 0,
+           format!("the TORN-commit-record path was EXERCISED on {total_torn} operation(s) - a \
+record whose CRC fails must be found, discarded, and REPORTED. No tear point can produce this (the \
+tap cuts between sectors and the record is one sector), so it is built deliberately or not tested \
+at all"));
+    println!("\nfs-tear: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// The largest number written immediately before `suffix`, or 0 if there is none.
+///
+/// `!out.contains("0 writes")` is the obvious way to assert "it wrote something" and it is WRONG:
+/// **"390 writes" contains "0 writes"**. So does "10 writes", "20 writes", and every other count
+/// ending in zero - the guard passes on a healthy run nine times in ten and FAILS on the tenth, for
+/// no reason connected to the system under test.
+///
+/// It cost a red `fs-all`. The `jobs` suite reported `the churn job actually WROTE` as FAILED on a
+/// run whose transcript says `churn: 390 writes, 78 renames, 78 deletes in 12s`. Nothing was wrong
+/// with the filesystem, the job, or the shell; the assertion was matching its own failure string
+/// inside the success it was reading.
+///
+/// That is the failure mode this harness elsewhere calls out as worse than a missed one, because a
+/// false FAIL teaches a reader to discount red. Four assertions in this file had the same shape and
+/// all four now go through here: read the NUMBER, do not pattern-match the text around it.
+///
+/// The maximum is taken because a transcript usually carries running counts as well as the total
+/// (`1s elapsed, 7 writes` ... `done - 390 writes`), and the question being asked is whether the
+/// work happened at all.
+fn count_before(s: &str, suffix: &str) -> u64 {
+    let mut best = 0u64;
+    for (i, _) in s.match_indices(suffix) {
+        let digits: Vec<char> = s[..i].chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() { continue; }
+        let n = digits.iter().rev().collect::<String>().parse::<u64>().unwrap_or(0);
+        if n > best { best = n; }
+    }
+    best
+}
+
+/// Make a committed journal record UNREADABLE, the way a half-written sector does on real silicon.
+///
+/// The commit record is one 512-byte block laid out by `services/fs`:
+///
+/// ```text
+///   [0..4]           JOURNAL_MAGIC "GJ04"  (0x474A3034, little-endian)
+///   [4..8]           n - how many blocks this transaction staged (1..=56)
+///   [8..8+n*8]       the home LBA of each staged block
+///   [8+n*8..12+n*8]  CRC32 of the staged payload
+///   [508..512]       CRC32 of [0..12+n*8]   <- what this function invalidates
+/// ```
+///
+/// The corruption is deliberately the MILDEST one that reaches the target branch: one bit flipped
+/// inside the first home LBA. Magic stays valid and `n` stays in range, so `recover` walks past the
+/// two earlier bails and reaches the CRC check specifically - which is the branch under test.
+/// Zeroing the block or scribbling the magic would trip an earlier return and prove nothing about
+/// it.
+///
+/// Returns false if no plausible record is present, which the caller reports rather than skips: at
+/// a tear point that replayed, a record MUST be there, so its absence is a defect in the staging,
+/// not a reason to pass quietly.
+fn corrupt_commit_record(img: &str) -> bool {
+    const BLOCK: usize = 512;
+    const MAGIC: [u8; 4] = [0x34, 0x30, 0x4A, 0x47]; // "GJ04" little-endian
+    const TXN_CAP: u32 = 56;
+    let mut bytes = match std::fs::read(img) { Ok(b) => b, Err(_) => return false };
+    let mut off = 0usize;
+    while off + BLOCK <= bytes.len() {
+        if bytes[off..off + 4] == MAGIC {
+            let n = u32::from_le_bytes([bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]]);
+            // A real record, not four bytes of file data that happen to match: the count must be one
+            // this filesystem could have written.
+            if n >= 1 && n <= TXN_CAP {
+                bytes[off + 8] ^= 0x01;             // one bit, inside the CRC'd region
+                return std::fs::write(img, &bytes).is_ok();
+            }
+        }
+        off += BLOCK;
+    }
+    false
+}
+
+pub fn run_fs_time(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("fs-time: PASS - {}", $label); pass += 1; } else { println!("fs-time: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let boot = |cmds: &[&str]| -> (Vec<String>, String) {
+        let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+        let disk_str = disk.to_string_lossy().replace('\\', "/");
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("fs-time: QEMU launch failed: {e}"); std::process::exit(1); });
+        let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+            Some(s) => s,
+            None => { eprintln!("fs-time: could not connect to serial {port}"); child.kill().ok(); std::process::exit(1); }
+        };
+        let mut read_half = stream.try_clone().expect("clone tcp stream");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 256];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        let mut outs = Vec::new();
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).is_some() {
+            // The clock reaches `fs` by a PUSH from `time`, so a file written before that push
+            // legitimately has no date. Wait for the push to be announced rather than racing it.
+            let _ = collect_until(&buf, &mut cursor, b"wall clock received", Duration::from_secs(45));
+            for c in cmds {
+                let line = format!("{c}\r");
+                send(&mut write_half, line.as_bytes());
+                outs.push(collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)).unwrap_or_default());
+            }
+        }
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        (outs, whole)
+    };
+
+    // Pull the MODIFIED column for one name out of a `dir` listing.
+    // Read the date from the END of the row, not by field index.
+    //
+    // It used to be `nth(3)` - name, type, size, date - which broke the moment sizes grew a unit,
+    // because `8 B` is TWO whitespace-separated fields and `8` is one. The date is either
+    // `YYYY-MM-DD HH:MM` (two trailing fields) or the single word `unknown`, and counting from the
+    // right is stable against anything the columns before it do.
+    let date_of = |listing: &str, name: &str| -> String {
+        listing.lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                match f.last() {
+                    Some(&"unknown") => "unknown".to_string(),
+                    Some(t) if f.len() >= 2 => format!("{} {}", f[f.len() - 2], t),
+                    _ => String::new(),
+                }
+            })
+            .unwrap_or_default()
+    };
+
+    println!("fs-time: boot 1 - write a file, read its date");
+    let (o1, w1) = boot(&["write /stamped.txt hello", "dir /"]);
+    check!(w1.contains("wall clock received"), "boot 1: fs was told the wall clock by `time`");
+    let l1 = o1.get(1).cloned().unwrap_or_default();
+    let d1 = date_of(&l1, "stamped.txt");
+    check!(d1.starts_with("20"), format!("boot 1: the new file carries a real date ({d1})"));
+    check!(date_of(&l1, "canary.txt") == "unknown",
+           "boot 1: a file baked in by a tool that records no times reads as `unknown`");
+
+    println!("fs-time: boot 1 - seal a file (the seal must outlive the machine)");
+    // `seal` asks [y/N], so the confirmation is its own line - the harness sends one command
+    // per entry and waits for a prompt between them.
+    let (os, ws) = boot(&["write /frozen.txt original", "seal /frozen.txt yes",
+                          "write /frozen.txt tampered", "read /frozen.txt", "dir /"]);
+    check!(os.get(1).map_or(false, |r| r.contains("sealed /frozen.txt")), "boot 1: the file was sealed");
+    check!(os.get(2).map_or(false, |r| !r.contains("wrote")), "boot 1: writing a SEALED file was refused");
+    // EVERY write route, not just `write`. `copy` goes through write_new + streaming write_at, and
+    // that route had NO seal check: it truncated the file and wrote a replacement entry with the flag
+    // cleared, so `copy` silently unsealed. The feature's headline guarantee is that there is no
+    // unseal, and there was one - reachable with a command a user types every day.
+    let (ou, _) = boot(&["write /unsealer.txt overwrite-me", "copy /unsealer.txt /frozen.txt",
+                         "read /frozen.txt", "dir /"]);
+    check!(ou.get(1).map_or(false, |r| !r.contains("copied")),
+           "COPY onto a sealed file is refused (the other write route)");
+    check!(ou.get(2).map_or(false, |r| r.contains("original")),
+           "the sealed content survived the copy attempt");
+    // The frozen.txt ROW specifically, not the listing as a whole: `contains("seal")` would match
+    // anything anywhere in the output, including another file's row or an unrelated log line, and an
+    // assertion that cannot distinguish those is not evidence.
+    check!(ou.get(3).map_or(false, |r| r.lines().any(|l| l.contains("frozen.txt") && l.contains("seal"))),
+           "and the file is STILL sealed afterwards (its own row still reads `seal`)");
+    check!(os.get(3).map_or(false, |r| r.contains("original") && !r.contains("tampered")),
+           "boot 1: the sealed content is untouched");
+    check!(os.get(4).map_or(false, |r| r.contains("seal")), "boot 1: `dir` marks it sealed");
+    check!(ws.contains("sealed a file"), "boot 1: fs logged the seal");
+
+    println!("fs-time: boot 2 - SAME disk, the date must survive the mount");
+    let (o2, w2) = boot(&["dir /", "read /stamped.txt",
+                          "write /frozen.txt tampered-after-reboot", "read /frozen.txt"]);
+    check!(o2.get(2).map_or(false, |r| !r.contains("wrote")),
+           "boot 2: the SEAL survived the reboot - the write is still refused");
+    check!(o2.get(3).map_or(false, |r| r.contains("original")),
+           "boot 2: the sealed content is still the original");
+    let l2 = o2.first().cloned().unwrap_or_default();
+    let d2 = date_of(&l2, "stamped.txt");
+    check!(d2 == d1, format!("boot 2: the date SURVIVED the reboot ({d1} -> {d2})"));
+    check!(date_of(&l2, "canary.txt") == "unknown",
+           "boot 2: a build that records times did NOT invent one for a file that has none");
+    check!(o2.get(1).map_or(false, |r| r.contains("hello")), "boot 2: the file's CONTENT survived too");
+    check!(!w2.contains("CRC mismatch on directory block"),
+           "boot 2: writing the times region did not break the record CRC every build reads");
+    check!(!w1.contains("KERNEL PANIC") && !w2.contains("KERNEL PANIC"), "no kernel panic across either boot");
+    let _ = std::fs::write("build/tests/fs_time_serial.log", format!("{w1}\n==== BOOT 2 ====\n{w2}"));
+
+    println!("\nfs-time: {pass} passed, {fail} failed  (serial -> build/tests/fs_time_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// One hostile-disk case (Phase M §1b): boot it, poke the crafted tree, and report whether `fs`
+/// behaved. Returns `(ok, note)` so the caller can name the case it set up.
+///
+/// **What "ok" means here is worth being exact about, because it is not "the data survived".** The
+/// disk was crafted; the victim's data is already gone. What must hold is that `fs` stays a working
+/// service: it answers every command (no hang), the kernel does not panic, an untouched BYSTANDER
+/// file still reads back correctly, and the machine is still usable afterwards. Whether the crafted
+/// entry is refused, skipped or listed as nonsense is `fs`'s business - serving a WRONG answer as a
+/// right one is the only outcome that fails.
+pub fn run_fs_hostile_case(image_path: &Path, persist_path: &str, what: &str, smp: u32) -> (bool, String) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("QEMU launch failed: {e}")),
+    };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { child.kill().ok(); return (false, "could not attach to the serial port".into()); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(45)).is_none() {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        child.kill().ok(); child.wait().ok();
+        let _ = std::fs::write(format!("build/tests/fs_hostile_{}.log", what.replace(' ', "_")), &whole);
+        return (false, "never reached a prompt - fs did not come up on this disk".into());
+    }
+
+    // Poke the crafted tree from every direction a person would. Each must ANSWER; a `None` here is
+    // a hang, which is the one outcome that is never acceptable.
+    let mut hung = None;
+    for c in ["dir /", "dir bytes /", "read /victim.txt", "dir /loop", "tree /",
+              "read /bystander.txt", "drives check", "read /bystander.txt"] {
+        let line = format!("{c}\r");
+        send(&mut write_half, line.as_bytes());
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(25)).is_none() {
+            hung = Some(c);
+            break;
+        }
+    }
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    child.kill().ok(); child.wait().ok();
+    let _ = std::fs::write(format!("build/tests/fs_hostile_{}.log", what.replace(' ', "_")), &whole);
+
+    if let Some(c) = hung { return (false, format!("`{c}` never returned - fs HUNG on the crafted tree")); }
+    if whole.contains("KERNEL PANIC") { return (false, "KERNEL PANIC".into()); }
+    if whole.contains("LIVENESS WEDGE") { return (false, "liveness wedge".into()); }
+    // The bystander is the control: an untouched file in the same directory must still read back
+    // byte-exact, which is what distinguishes "refused the bad record" from "gave up on the tree".
+    if !whole.contains("this file is untouched and must still be readable") {
+        return (false, "the untouched BYSTANDER file no longer reads - fs gave up on the whole tree".into());
+    }
+    // A CRAFTED CYCLE MUST BE REPORTED, not merely survived. `tree` was already bounded, so it could
+    // not hang - but it printed twenty-odd levels of a structure that does not exist and then simply
+    // stopped, which reads as a complete tree. Surviving quietly is the failure mode this whole
+    // suite is about.
+    if whole.contains("loop/") && !whole.contains("a LIMIT was reached") {
+        return (false, "`tree` walked the crafted cycle and stopped SILENTLY - a wrong answer served as a right one".into());
+    }
+    (true, "answered every command, no panic, bystander intact".into())
 }

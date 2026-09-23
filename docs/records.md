@@ -6,7 +6,7 @@
 
 ## Why
 
-POSIX pipes carry **text**. So `ls` flattens its structured data - name, size, type, date - to
+POSIX pipes carry **text**. So `dir` flattens its structured data - name, size, type, date - to
 a formatted string, and then `grep`/`awk`/`cut`/`sed` exist to *re-parse* that string and claw
 the structure back out by counting columns. The whole `awk`/`sed`/`cut` zoo is compensation for
 a lossy serialize-to-text step.
@@ -39,7 +39,7 @@ is therefore a **typed value**, with text/JSON as *renderings* of it - never the
 
 The canonical value is a **table**: static column names + rows of typed `Value`
 (`Str` interned in a byte arena, `Int`, …). Most introspection output is naturally tabular
-(`status`, `ls`, `find`, `caps` are all uniform rows), so a table covers the realistic cases and
+(`status`, `dir`, `find`, `caps` are all uniform rows), so a table covers the realistic cases and
 is simpler than arbitrary records. It is **bounded** (§26.6): `REC_MAX_COLS`, `REC_MAX_ROWS`, a
 fixed `REC_ARENA` - all on the stack, no heap, loud on overflow. Heterogeneous (differently
 shaped) records are a future generalization.
@@ -66,7 +66,7 @@ grammar is deliberately **terse and code-like**, not an English sentence:
 
 The text filters (`match`/`count`/`sort`/`first`/`last`) stay - for genuinely-text streams like
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
-producer (`is_record_producer` - `status`, `ls`, `caps`, `drives`, `find`, `observe now`), else
+producer (`is_record_producer` - `status`, `dir`, `caps`, `drives`, `find`, `observe now`), else
 the **byte** path. They coexist; the default rendering (no `to`) is the table grid. A *text*
 filter applied to a record stream (e.g. `ls | match foo`) is a loud, guided error - use
 `where`/`select`/`sort <col>`, or `to json` to drop back to text first.
@@ -143,10 +143,10 @@ pair.
 
 ## What's built vs next
 
-- **Built:** the `Table` model (owned column names + arena); `render_table` (default, full
-  string cells - no clipping), `render_json`, `render_yaml`; the compact `where`, `select`,
-  `sort [reverse] <col>`; **six shell-side record producers - `status` (task roster),
-  `ls` (`name`/`type`/`size`), `caps` (`resource`/`rights`), `drives`
+- **Built:** the `Table` model (owned column names + arena); `to_grid` (default, full
+  string cells - no clipping), `to_json`, `to_yaml`; the compact `where`, `select`,
+  `sort [reverse] <col>`; **the shell-side record producers - `status` (task roster),
+  `dir` (`name`/`type`/`size`/`sealed`), `caps` (`resource`/`rights`), `drives`
   (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`), and
   `observe now` (the roster + a `ticks` cumulative-cpu-time column - the native "top",
   `observe now | sort reverse ticks`)**; **`from json`** (text → records); and the **unified

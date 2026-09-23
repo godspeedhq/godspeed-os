@@ -37,6 +37,7 @@
 mod crc32;
 mod disk_image;
 mod qemu;
+mod fs_model;
 mod shell_test;
 mod validator;
 
@@ -391,6 +392,11 @@ const EXTRA_CHECKS: &[&str] = &[
     "scripts/arch_boundary_check.py",
     "scripts/arch_seam_check.py",
     "scripts/contract_check.py",
+    // A doc that names a FUNCTION must name one that exists. `doc_refs.py` checks the other half
+    // (paths), and a RENAME breaks this half silently because the prose still reads correctly -
+    // four had rotted when this was written, including one in CLAUDE.md pointing at a file an
+    // amendment in the same document had deleted.
+    "scripts/doc_symbols_check.py",
     // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/26). x86 does not
     // use extlinux, but this path is where an image is built on the machine that PRODUCES the CRLF,
     // and the rule above is the whole reason this list exists: a checker on one build path is a
@@ -445,11 +451,13 @@ pub fn cmd_build() {
     // anything failing.
     //
     // `cmd_build_bare_metal` had this right already (a `non_supervisor` list, supervisor built after).
-    let service_crates = [
-        "events", "recorder", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder",
-        "supervisor",   // LAST: it embeds every name above it
-    ];
-    for crate_name in &service_crates {
+    // `SERVICE_CRATES` plus the supervisor LAST, because it embeds every name before it.
+    //
+    // This used to be its own literal, and it had silently lost `console`, `control`, `time` and
+    // `hw-enumerator` - so `osdev build` relinked the supervisor around whatever stale copies of
+    // those were lying in the target directory. An edit to the console never reached the image, and
+    // nothing said so: a stale binary is not a missing one, so the embed guard stayed quiet.
+    for crate_name in SERVICE_CRATES.iter().chain(core::iter::once(&"supervisor")) {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -461,6 +469,7 @@ pub fn cmd_build() {
         }
         println!("build: {} OK", crate_name);
     }
+    stack_fit_check(SERVICE_CRATES);
 
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
@@ -515,12 +524,57 @@ fn identity_kernel_feature_args() -> Vec<String> {
     a
 }
 
+/// Refuse to finish a build whose service frames cannot fit the 256 KiB user stack.
+///
+/// Called AFTER the services are compiled, because it reads their ELFs. `arm_build.py` and
+/// `pi4_build.py` have done this for their boards since a debug `fs` crash-looped on a 503 KiB
+/// frame; x86 had no such gate at all, which is the same "enforced on one path, therefore on none"
+/// shape those scripts already record - and it let `console::Term::new` reach a 180 KiB frame
+/// unnoticed, because the checker was additionally BLIND to x86 prologues until it was taught them.
+///
+/// 256 KiB = `USER_STACK_PAGES` in `kernel/src/task/mod.rs`. A checker that cannot RUN is not a
+/// checker that passed, so a missing python fails the build, exactly as `commandment_check` does.
+fn stack_fit_check(services: &[&str]) {
+    let mut cmd = std::process::Command::new("python");
+    cmd.args(["scripts/stack_fit_check.py", "x86_64-unknown-none", "release", "262144"]);
+    cmd.args(services);
+    match cmd.status() {
+        Ok(st) if st.success() => {}
+        Ok(_) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("osdev: cannot run scripts/stack_fit_check.py ({e}). Refusing to build - a checker that cannot run is not a checker that passed.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Every service crate `supervisor` embeds, in build order. **The supervisor is NOT here** - it is
+/// built last, separately, because `services/supervisor/build.rs` reads these binaries off disk and
+/// embeds them, so one that is newer than the supervisor is one the supervisor does not carry.
+///
+/// **ONE LIST, because five copies of it had already drifted.** `cmd_build` - plain `osdev build` -
+/// was missing `console`, `control`, `time` and `hw-enumerator`, so it relinked the supervisor around
+/// whatever stale binaries happened to be in the target directory. Editing the console and running
+/// `osdev build` produced an image with the OLD console in it, silently, and the only tell was a
+/// timestamp nobody looks at. The four image/test builders had the right list; the one command a
+/// person types by hand did not.
+///
+/// That is the same failure the arch-conditional USB list in `services/supervisor/build.rs` already
+/// records: a MISSING binary is caught by a guard, and a STALE one is not, because a stale file is
+/// not missing. `scripts/embed_order_check.py` catches the ordering; nothing caught the omission.
+const SERVICE_CRATES: &[&str] = &[
+    "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
+    "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
+    "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
+    "resource-server", "holder",
+];
+
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -564,8 +618,8 @@ pub fn cmd_build_bare_metal() {
 /// (plain `bare-metal`) so its per-tick disk writes are test-only.
 pub fn cmd_build_counter() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -609,8 +663,8 @@ pub fn cmd_build_counter() {
 /// round-trip. Kept out of the daily-driver image (plain `bare-metal`) so the per-tick RPC is test-only.
 pub fn cmd_build_reply() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -655,8 +709,8 @@ pub fn cmd_build_reply() {
 /// Kept out of the daily-driver image (plain `bare-metal`) so the per-boot mint/grant is test-only.
 pub fn cmd_build_resource() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -699,8 +753,8 @@ pub fn cmd_build_resource() {
 /// Bar: no panic, no resource leak after 24 hours.
 pub fn cmd_build_idle() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -743,8 +797,8 @@ pub fn cmd_build_idle() {
 pub fn cmd_build_identity() {
     clean_supervisor();
     // Build every service crate except supervisor first.
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -791,8 +845,8 @@ pub fn cmd_build_identity() {
 /// maximum headroom before its timeout fires.
 pub fn cmd_build_perf() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -834,8 +888,8 @@ pub fn cmd_build_perf() {
 /// internally - no QEMU control port required.
 pub fn cmd_build_stress() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -880,8 +934,8 @@ pub fn cmd_build_stress() {
 /// "fuzz: F* pass" line and never "KERNEL PANIC".
 pub fn cmd_build_fuzz() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -922,8 +976,8 @@ pub fn cmd_build_fuzz() {
 /// hardware chaos run (C2-C7). C1 and C4 use bare-metal + hardware reconfiguration.
 pub fn cmd_build_chaos() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -965,8 +1019,8 @@ pub fn cmd_build_chaos() {
 /// that triggers the Goldmont+ BSP IPI delivery quirk on the blocking round-trip.
 pub fn cmd_build_b2_only() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1010,8 +1064,8 @@ pub fn cmd_build_b2_only() {
 /// probes - for clean, uncontended per-op latency on hardware. `feature` is the
 /// supervisor sub-feature, e.g. "iso-bp5".
 pub fn cmd_build_perf_iso(feature: &str) {
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1052,8 +1106,8 @@ pub fn cmd_build_perf_iso(feature: &str) {
 
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1095,8 +1149,8 @@ pub fn cmd_build_bp2_only() {
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1137,8 +1191,8 @@ pub fn cmd_build_adv() {
 /// benchmark suite (BP1-BP10).
 pub fn cmd_build_brutal_perf() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name,
                    "--target", "x86_64-unknown-none"])
@@ -1388,9 +1442,36 @@ fn cmd_test(suite: &str) {
         "resource-server" => run_resource_server_test(),
         "fs-check"     => run_fs_check_test(),
         "fs-scrub"     => run_fs_scrub_test(),
+        "fs-fuzz"      => run_fs_fuzz_test(),
+        "fs-time"      => run_fs_time_test(),
+        "fs-hostile"   => run_fs_hostile_test(),
+        "fs-all"       => run_fs_all_tests(),
         "fs-compat"    => run_fs_compat_test(),
         "file-cap"     => run_fs_filecap_test(),
         "fs-ioretry"   => run_fs_ioretry_test(),
+        "fs-tear"      => run_fs_tear_test(),
+        "fs-full"      => run_fs_full_test(),
+        "fs-window"    => run_fs_window_test(),
+        "fs-churn"     => run_fs_churn_test(),
+        "fs-tear-detect" => run_fs_tear_detect_test(),
+        "fs-blockchaos"  => run_fs_blockchaos_test(),
+        "fs-blockdeath"  => run_fs_blockdeath_test(),
+        "fs-dupop"       => run_fs_dupop_test(),
+        "fs-lostreq"     => run_fs_lostreq_test(),
+        "fs-twoclient"   => run_fs_twoclient_test(),
+        "fs-rtear"       => run_fs_rtear_test(),
+        "fs-reuse"       => run_fs_reuse_test(),
+        "jobs"           => run_jobs_test(),
+        "fs-metafull"    => run_fs_metafull_test(),
+        "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
+        "cross-isa"      => run_cross_isa_test(),
+        "fs-cache"       => run_fs_cache_test(),
+        "fs-lyingflush"  => run_fs_lyingflush_test(),
+        // `fs-model`, `fs-model:<seed>`, `fs-model:<seed>:<ops>` - the same shape `perf:<ID>` uses,
+        // because `osdev test` takes exactly one argument and widening that for one suite would be
+        // the wrong trade.
+        s if s == "fs-model" || s.starts_with("fs-model:") => run_fs_model_test(s),
+        "fs-nested"    => run_fs_nested_test(),
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
@@ -1430,8 +1511,8 @@ fn cmd_shell(smp: u32) {
 /// §22 Test 12 / H1 §6.4.
 fn cmd_build_iommu_fault() {
     clean_supervisor();
-    let non_supervisor = ["events", "recorder", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder"];
-    for crate_name in &non_supervisor {
+    let non_supervisor = SERVICE_CRATES;
+    for crate_name in non_supervisor {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"])
             .status()
@@ -1823,7 +1904,18 @@ fn run_fs_corruption_test() {
     println!("fs: case 2 - corrupt root directory block, boot (~25s) …");
     let log2 = boot_ahci_qemu(&img_str, &dir_disk, "build/tests/fs_corrupt_dir.log", 25);
     let dir_mounted = log2.contains("fs: mounted GSFS");                 // superblock OK
-    let dir_caught = log2.contains("directory block CRC mismatch");      // loud
+    // MATCH THE BEHAVIOUR, NOT ONE SENTENCE. This asked for the literal phrase "directory block CRC
+    // mismatch", which is the wording of the NON-ROOT path (`fs: directory block CRC mismatch at lba
+    // N - refusing`). This case corrupts the ROOT block, which takes its own path and says something
+    // else entirely: "CRC mismatch on directory block lba N ..." followed by a ROOT-specific refusal
+    // explaining that no redundancy exists for it. `fs` was loud and correct the whole time and the
+    // assertion was looking for the wrong string, so the suite sat red on `main` (see `backlog/32`).
+    //
+    // Both wordings are accepted now, because what is being asserted is that the mismatch was
+    // REPORTED - not which of two correct sentences reported it.
+    let dir_caught = log2.contains("CRC mismatch on directory block")
+        || log2.contains("directory block CRC mismatch")
+        || log2.contains("failed its CRC");                              // loud
     let dir_no_garbage = !log2.contains("round-trip OK (greeting)");     // never silently succeeded
     let dir_no_panic = !log2.contains("KERNEL PANIC");
 
@@ -2214,7 +2306,7 @@ fn run_sticky_test() {
 }
 
 fn run_files_test() {
-    println!("\n=== files 4: ls / read / write / mkdir / cd (RAW AHCI disk) ===");
+    println!("\n=== files 4: dir / read / write / mkdir / cd (RAW AHCI disk) ===");
     cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -2683,6 +2775,591 @@ fn run_fs_check_test() {
 /// bad block (`1 bad`) without panicking, leave the disk UNCHANGED (a second scrub still reports
 /// `1 bad` - read-only, no repair), and the clean file must still read back. Proves a routine,
 /// non-destructive integrity sweep that detects bit-rot.
+/// Phase M - the adversarial suite. `fs` takes client-supplied paths, offsets, sizes and names over
+/// IPC and had no red-team coverage, while every other subsystem has some (§22 F1-F8, A1-A15).
+///
+/// **The bar is not that a hostile request succeeds or fails in some particular way. It is that
+/// `fs` NEVER panics, NEVER hangs, and never serves a wrong answer as a right one** - and that
+/// afterwards the filesystem is still consistent, which the run proves by ending with `drives check`
+/// and a read of a file that was there before the assault started.
+///
+/// This boots ONE machine and drives the hostile cases through the shell, so every request travels
+/// the path a real client travels. Cases the shell legitimately refuses to send (a move into a
+/// directory's own subtree) are not reachable here by design; those need the protocol path
+/// (`docs/gsfs-next.md` §1c).
+/// Phase O - timestamps must survive a REBOOT, which no single-boot test can prove. Boots the SAME
+/// disk twice: the first boot writes a file and reads its date, the second reads it again from
+/// blocks that have been through a mount. Also proves the `compat` claim from the other side - a
+/// file baked into a 0008 image reads `unknown` on BOTH boots and is never given an invented date.
+/// Phase M §1b - a disk that is WRONG BUT CRC-VALID, which is what a hostile disk actually is.
+///
+/// `fs-corrupt` already covers bit-rot: flip a byte, the CRC fails, `fs` refuses loudly. That is the
+/// accident case, and it is well handled. **This is the deliberate case, and it is the harder one:**
+/// somebody who crafts a disk re-stamps the CRC, so every check `fs` currently performs passes and
+/// the metadata is still nonsense. A record can name a first block past the end of the device, a
+/// block count of 2^64, a name longer than any name may be, or a directory that contains ITSELF.
+///
+/// The bar is the same as the rest of the suite and it is not "the data survives" - the data is
+/// already gone, somebody wrote over it. It is that **`fs` never panics, never hangs, and never
+/// serves a wrong answer as a right one.** A machine that refuses a corrupt tree is working; a
+/// machine that walks a crafted cycle forever, or reads a block outside the disk, is not.
+/// Every `fs` suite, one command, one tally - `backlog/32`.
+///
+/// **This exists because two of them were RED on `main` and nobody noticed.** The storage stack is
+/// the one subsystem whose failure mode is losing the user's data, it has the deepest test coverage
+/// in the project, and none of it runs in any gate before a merge. The suites were run by hand when
+/// somebody was working on storage, and rotted quietly in between: `fs-check` had been pinning a
+/// free-block count that two later features invalidated, and `fs-corrupt` had been matching one of
+/// two correct log sentences. Neither was a filesystem bug. Both were red for months.
+///
+/// A meta-suite does not make anything automatic, and that is the honest limit of it - the gate
+/// question is still open in `backlog/32`. What it does is remove the excuse: running all fourteen
+/// is now one command rather than fourteen, and a person or a workflow has a single thing to call.
+///
+/// **Each suite runs as a SUBPROCESS, deliberately.** They call `std::process::exit` on failure, so
+/// calling them in-process would let the first failure kill the run and hide every suite after it -
+/// which is the exact shape of problem this is meant to end. Isolated, one failure costs one line
+/// and the rest still report.
+/// Carnage §3.11: one GSFS volume carried x86-64 -> riscv64 -> x86-64.
+///
+/// **It builds its own x86 image first, and that is not boilerplate.** `build/os.img` is rebuilt by
+/// nearly every `fs` suite with whatever fault-injection feature it needs, so inside `fs-all` this
+/// one would inherit the previous suite's `fs`. It did: run straight after `fs-twoclient` it came
+/// back 6/6, with riscv64 mounting a volume that was formatted but EMPTY - leg 1 had written files
+/// that never reached the backing file. The script already builds the riscv64 kernel it needs for
+/// exactly this reason (a board-linked kernel boots nothing on `virt`); this is the same rule
+/// applied to the other machine. A suite that trusts what is lying in `build/` is a suite whose
+/// result depends on what ran before it.
+fn run_cross_isa_test() {
+    build_blockdev_fs("", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    run_python_suite("fs: one volume across two architectures (§3.11)", "cross_isa.py");
+}
+
+/// Run a suite that lives in `scripts/` rather than in this binary.
+///
+/// TWO SUITES DRIVE A NON-x86 MACHINE, and that is why they are Python. `cross_isa.py` boots x86-64
+/// AND riscv64 over one raw image; `fs_unplug.py` needs riscv64 because QEMU's AHCI refuses
+/// `device_del` ("Bus 'ahci.0' does not support hotplugging") so only a USB bus can be unplugged.
+/// The riscv64 launch, its kernel build and its board-vs-QEMU load address already live in
+/// `scripts/`, and re-implementing them in Rust to keep every suite in one language would be
+/// duplicating the thing most likely to drift.
+///
+/// What matters is that `osdev test <name>` remains the ONE way to run a suite, so `fs-all` needs
+/// no special case and nobody has to remember that two of them are different.
+fn run_python_suite(name: &str, script: &str) {
+    println!("\n=== {name} (scripts/{script}) ===");
+    match std::process::Command::new("python").args([&format!("scripts/{script}")]).status() {
+        Ok(st) if st.success() => {}
+        Ok(_) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("osdev: cannot run scripts/{script} ({e}). A suite that cannot run is not a suite that passed.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_fs_all_tests() {
+    // Ordered cheapest-first so a broken build or a broken mount is reported in a minute rather than
+    // at the end of a long run.
+    const SUITES: &[&str] = &[
+        "fs-restart", "fs-check", "fs-scrub", "fs-corrupt", "fs-compat",
+        "fs-journal", "fs-djournal", "fs-ioretry", "fs-frag", "fs-large",
+        "file-cap", "fs-fuzz", "fs-hostile", "fs-time",
+        // LAST, and by far the longest: `fs-tear` boots QEMU once per tear point, 75 of them plus a
+        // recording boot per operation and a negative control. It roughly doubles this run. It is in
+        // the list anyway, because a suite that exists outside "every fs suite" is precisely the rot
+        // `backlog/32` is about - the two suites that sat RED on `main` did so because nothing swept
+        // them. Cheapest-first ordering means a broken build still reports in a minute.
+        // The DIFFERENTIAL gate. Cheap (one boot, ~200 shell round trips) and it attacks something
+        // no other suite here can: every one of them tests GSFS against assertions written about
+        // GSFS, so a wrong BELIEF passes all of them. A fixed seed, so a green result means the same
+        // thing every run - explore with `fs-model:<seed>:<ops>`.
+        "fs-model",
+        // Proves the CONTENT detector can fire at all, and that it sees something the structural
+        // checks truthfully do not. One boot.
+        "fs-tear-detect",
+        "fs-tear",
+        "fs-full",
+        // The two power-cut suites. `fs-window` aims at ONE known window and proves recovery runs;
+        // `fs-churn` cuts at a moment nobody chose and checks the permitted-outcome table holds
+        // whatever the cut hit. A proof and a search - they answer different questions.
+        "fs-window",
+        "fs-churn",
+        // §3.7. The other two attack the DEVICE (a power cut, an I/O error); this one attacks the
+        // COMPLETION STREAM - duplicate, missing and out-of-order replies - which is the failure
+        // `backlog/31` recorded one layer up and which no suite reached until now.
+        "fs-blockchaos",
+        // ...and the driver dying mid-request, which is a different recovery path: `SendFailed`
+        // plus a reacquire, rather than a wrong answer that has to be detected.
+        "fs-blockdeath",
+        // §3.5. Not a device fault at all - a DESTRUCTIVE op whose reply is lost, and what the
+        // client does next. It found a real gap and the fix is in the shell, not the filesystem.
+        "fs-dupop",
+        // §3.5, the same fault on the OTHER side of the commit: the request is discarded BEFORE it
+        // runs, so the move never happened. Indistinguishable from `fs-dupop` at the client, which
+        // is why both exist - one proves the conservative answer is necessary, this one proves it
+        // stays honest when nothing happened, and that an abandoned request leaves no partial state.
+        "fs-lostreq",
+        // §3.5, the third bullet: TWO REAL CLIENTS on one directory. `recorder` writes a capture
+        // through `fs` on its own schedule while the shell churns a path beside it, so the
+        // contention is on a shared directory block rather than simulated. Pins the guarantee
+        // written down in `docs/persistence.md` 6.18.
+        "fs-twoclient",
+        "fs-metafull",
+        "fs-reuse",
+        "fs-rtear",
+        // Job control. It lives in this sweep rather than beside the shell suites because it
+        // is disk-backed - it copies 5.2 MiB, deletes a subtree, and its real assertions are
+        // filesystem ones: fsck finds nothing to repair after a copy, after a CANCELLED copy,
+        // and after a detached recursive delete. A suite that sits outside "every fs suite" is
+        // precisely the rot `backlog/32` is about.
+        "jobs",
+        // §3.7 and §3.11, and the two that are NOT x86: both drive riscv64, so both live in
+        // `scripts/`. Last because each builds a second kernel before it boots anything.
+        "fs-unplug",
+        "cross-isa",
+        // §3.3. The only suite that cuts a drive which had NOT yet committed what it acknowledged.
+        "fs-cache",
+        "fs-lyingflush",
+    ];
+    println!("\n=== fs: EVERY storage suite, one tally (backlog/32) ===");
+    println!("fs-all: {} suites, each in its own process\n", SUITES.len());
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => { eprintln!("fs-all: cannot find my own binary: {e}"); std::process::exit(1); }
+    };
+    let started = std::time::Instant::now();
+    let mut failed: Vec<&str> = Vec::new();
+
+    for (i, name) in SUITES.iter().enumerate() {
+        print!("fs-all: [{:>2}/{}] {:<12} ", i + 1, SUITES.len(), name);
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let t0 = std::time::Instant::now();
+        let log = format!("build/tests/fs_all_{name}.log");
+        let out = std::process::Command::new(&exe).args(["test", name]).output();
+        let secs = t0.elapsed().as_secs();
+        match out {
+            Ok(o) => {
+                // The full output goes to a file either way: a PASS nobody reads still carries the
+                // numbers somebody will want when the next one fails.
+                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+                let _ = std::fs::write(&log, &text);
+                // Report the suite's OWN tally where it has one, rather than just "ok" - the number
+                // is what tells you a suite silently stopped asserting.
+                let tally = text.lines().rev()
+                    .find(|l| l.contains(" passed, ") || l.contains(" passed "))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
+                if o.status.success() {
+                    println!("PASS  {:>3}s   {}", secs, tally);
+                } else {
+                    println!("FAIL  {:>3}s   {}  -> {}", secs, tally, log);
+                    failed.push(name);
+                }
+            }
+            Err(e) => { println!("FAIL  {:>3}s   could not run: {e}", secs); failed.push(name); }
+        }
+    }
+
+    let mins = started.elapsed().as_secs() / 60;
+    println!("\nfs-all: {} of {} suites passed in ~{} min",
+             SUITES.len() - failed.len(), SUITES.len(), mins);
+    if !failed.is_empty() {
+        println!("fs-all: FAILED - {}", failed.join(", "));
+        println!("fs-all: each failing suite's full output is in build/tests/fs_all_<name>.log");
+        std::process::exit(1);
+    }
+    println!("fs-all: the storage stack is green");
+}
+
+fn run_fs_hostile_test() {
+    println!("\n=== fs: a CRC-VALID but hostile disk - crafted metadata, not bit-rot (Phase M 1b) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    // Find a named record in the root block and hand it to `edit`, then RE-STAMP the CRC so the
+    // block still validates. That re-stamp is the whole point: without it this would just be
+    // `fs-corrupt` again.
+    let craft = |path: &str, name: &[u8], edit: &dyn Fn(&mut [u8])| {
+        let mut d = std::fs::read(path).unwrap();
+        let root = u64::from_le_bytes(d[48..56].try_into().unwrap()) as usize;
+        let base = root * 512;
+        let mut found = false;
+        for slot in 0..FS_RECS_PER_BLOCK {
+            let r = base + slot * 64;
+            let nl = d[r + 1] as usize;
+            if d[r] != 0 && nl <= 38 && &d[r + 2..r + 2 + nl] == name {
+                edit(&mut d[r..r + 64]);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not find the record to craft");
+        let mut blk = [0u8; 512];
+        blk.copy_from_slice(&d[base..base + 512]);
+        fs_dir_stamp_crc(&mut blk);
+        d[base..base + 512].copy_from_slice(&blk);
+        std::fs::write(path, &d).unwrap();
+    };
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+
+    // Each case gets its OWN disk, because the point is what `fs` does with one crafted record - not
+    // what it does with four at once, where the first refusal would mask the rest.
+    let cases: &[(&str, &dyn Fn(&mut [u8]), &str)] = &[
+        ("first_block past the end of the device",
+         &|r: &mut [u8]| r[48..56].copy_from_slice(&0xFFFF_FFFFu64.to_le_bytes()),
+         "reading it must be refused, not attempted"),
+        ("block_count of 2^64 - 1",
+         &|r: &mut [u8]| r[56..64].copy_from_slice(&u64::MAX.to_le_bytes()),
+         "no loop may be bounded by this number"),
+        ("size larger than the whole disk",
+         &|r: &mut [u8]| r[40..48].copy_from_slice(&(1u64 << 40).to_le_bytes()),
+         "a read must not trust it"),
+        ("an itype no build defines",
+         &|r: &mut [u8]| r[0] = 0x5A,
+         "an unknown kind is neither a file nor a directory"),
+        ("name_len claiming 255 in a 38-byte field",
+         &|r: &mut [u8]| r[1] = 0xFF,
+         "the name must not be read past its field"),
+    ];
+
+    for (what, edit, why) in cases {
+        let disk = format!("build/tests/persist_fs_hostile_{}.img",
+                           what.split_whitespace().next().unwrap_or("x"));
+        std::fs::write(&disk, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+        format_superblock(&disk);
+        gsfs_add_file(&disk, "victim.txt", b"the record naming this file is about to be crafted");
+        gsfs_add_file(&disk, "bystander.txt", b"this file is untouched and must still be readable");
+        craft(&disk, b"victim.txt", *edit);
+        println!("\nfs-hostile: {what} - {why}");
+        let (ok, note) = crate::shell_test::run_fs_hostile_case(&image_path, &disk, what, 4);
+        if ok { println!("fs-hostile: PASS - {what}: {note}"); pass += 1; }
+        else   { println!("fs-hostile: FAIL - {what}: {note}"); fail += 1; }
+    }
+
+    // A DIRECTORY THAT CONTAINS ITSELF. Crafted separately because it needs a directory rather than
+    // a file: the record for `loop` is pointed at the ROOT's own first block, so walking into it
+    // arrives back where it started. `MAX_TREE_DEPTH` is what must stop this, and a tree walk that
+    // trusted the disk instead would run until something else broke.
+    {
+        let disk = "build/tests/persist_fs_hostile_cycle.img";
+        std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+        format_superblock(disk);
+        gsfs_add_file(disk, "bystander.txt", b"this file is untouched and must still be readable");
+        let mut d = std::fs::read(disk).unwrap();
+        let root = u64::from_le_bytes(d[48..56].try_into().unwrap());
+        let base = root as usize * 512;
+        // Take the first free slot and make it a directory pointing at the root itself.
+        for slot in 0..FS_RECS_PER_BLOCK {
+            let r = base + slot * 64;
+            if d[r] == 0 {
+                d[r] = 2;                                   // ITYPE_DIR
+                d[r + 1] = 4;
+                d[r + 2..r + 6].copy_from_slice(b"loop");
+                d[r + 40..r + 48].copy_from_slice(&0u64.to_le_bytes());
+                d[r + 48..r + 56].copy_from_slice(&root.to_le_bytes());   // <- itself
+                d[r + 56..r + 64].copy_from_slice(&1u64.to_le_bytes());
+                break;
+            }
+        }
+        let mut blk = [0u8; 512];
+        blk.copy_from_slice(&d[base..base + 512]);
+        fs_dir_stamp_crc(&mut blk);
+        d[base..base + 512].copy_from_slice(&blk);
+        std::fs::write(disk, &d).unwrap();
+        println!("\nfs-hostile: a directory that CONTAINS ITSELF - the walk must be bounded");
+        let (ok, note) = crate::shell_test::run_fs_hostile_case(&image_path, disk, "self-referential directory", 4);
+        if ok { println!("fs-hostile: PASS - self-referential directory: {note}"); pass += 1; }
+        else   { println!("fs-hostile: FAIL - self-referential directory: {note}"); fail += 1; }
+    }
+
+    println!("\nfs-hostile: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
+fn run_fs_time_test() {
+    println!("
+=== fs: timestamps survive a reboot, and a 0008 file is never given a date (Phase O) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_time.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // Baked host-side, so it carries no time at all - the 0008 case, which must stay `unknown`.
+    gsfs_add_file(persist, "canary.txt", b"a file that predates timestamps");
+
+    crate::shell_test::run_fs_time(&image_path, persist, 4);
+}
+
+fn run_fs_nested_test() {
+    println!("\n=== fs: INTERRUPT THE RECOVERY ITSELF - is it restartable? (carnage 3.8) ===");
+    // TWO images, because the two pauses must never fire in one boot. The `crash-window` build holds
+    // the COMMIT window open (boots 1 and 3); the `crash-window-replay` build holds a REPLAY open
+    // (boot 2). A single build carrying both would pause twice and the test could not tell which
+    // window it had cut.
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    let limine_dir = std::path::Path::new("tools/limine");
+    let _ = std::fs::create_dir_all("build/tests");
+
+    build_blockdev_fs("selftest,crash-window", "");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let window_img = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-cw.img"));
+    disk_image::install_bootloader(limine_dir, &window_img);
+
+    build_blockdev_fs("selftest,crash-window-replay", "");
+    let replay_img = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-cwr.img"));
+    disk_image::install_bootloader(limine_dir, &replay_img);
+
+    let persist = "build/tests/persist_fs_nested.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
+
+    crate::shell_test::run_fs_nested(&window_img, &replay_img, persist, 4);
+}
+
+/// `osdev test fs-model[:seed[:ops]]` - the independent-oracle gate (carnage §3.2).
+fn run_fs_model_test(suite: &str) {
+    println!("\n=== fs: DIFFERENTIAL - GSFS against a model that knows nothing about it ===");
+    // A SHIPPING BUILD, no test feature. The model compares what a user would see, so anything that
+    // changed `fs` for the benefit of the test would be comparing against the wrong thing.
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_model.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+
+    // A FIXED DEFAULT SEED, not a random one. A suite that picks a new sequence every run is a
+    // suite whose green result means something different each time and whose red result may not
+    // reproduce - the opposite of what a gate is for. Pass a seed to explore; the default is what
+    // CI and `fs-all` run, and a failure found by exploring becomes a second fixed entry here.
+    // `osdev test fs-model:<seed>:<ops>` - both optional.
+    let extra: Vec<&str> = suite.split(":").skip(1).collect();
+    let seed = extra.first().and_then(|a| a.parse::<u64>().ok()).unwrap_or(0x5EED_0001);
+    let ops = extra.get(1).and_then(|a| a.parse::<usize>().ok()).unwrap_or(120);
+
+    crate::shell_test::run_fs_model(&image_path, persist, 4, seed, ops);
+}
+
+/// `osdev test fs-tear-detect` - prove the CONTENT detector fires (carnage 3.9 / 5).
+fn run_fs_tear_detect_test() {
+    println!("
+=== fs: TEAR then DETECT - a file whose blocks are perfect and whose content lies ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_tear_detect.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_tear_detect(&image_path, persist, 4);
+}
+
+fn run_fs_churn_test() {
+    println!("\n=== fs: CHURN then CUT - a power cut at a moment nobody chose ===");
+    // NO test feature on `fs`. `churn` is an ordinary shell command on a shipping build, and that is
+    // the point of it: a fault that only appears in a build nobody ships is a fault about that build.
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_churn.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
+
+    crate::shell_test::run_fs_churn(&image_path, persist, 4);
+}
+
+fn run_fs_window_test() {
+    println!("\n=== fs: the CRASH WINDOW - kill inside it, and the journal must recover ===");
+    // The `crash-window` build holds the commit-to-checkpoint window open for ten seconds when a
+    // path begins `/cutme`. It exists so an operator with a power cable can aim at a window that is
+    // normally sub-millisecond - three real cuts on a Dell Wyse produced three clean mounts and not
+    // one recovery. This proves the mechanism works before anybody carries it to a board.
+    build_blockdev_fs("selftest,crash-window", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_window.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"untouched-by-any-of-this");
+
+    crate::shell_test::run_fs_window(&image_path, persist, 4);
+}
+
+fn run_fs_full_test() {
+    println!("\n=== fs: EXHAUSTION - what a refused allocation leaves behind (carnage 3.4) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_full.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // The canary goes in FIRST, so it sits low in the data region and the big files are allocated
+    // around it. A file written after everything else would be a weaker control: what is being asked
+    // is whether a failure reaches a bystander, and a bystander in the middle is a better test.
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    // Three large files take the volume to the edge. 16 MiB is 32768 blocks; ~138 are the superblock,
+    // bitmap, journal and root, so about 32630 remain. Three files of 10,600 blocks each leave a few
+    // hundred blocks free - enough that the volume is healthy and mountable, too few for another file.
+    let filler = vec![0xA5u8; 10_600 * 508];
+    for name in ["fill1.bin", "fill2.bin", "fill3.bin"] {
+        gsfs_add_file(persist, name, &filler);
+    }
+
+    crate::shell_test::run_fs_full(&image_path, persist, 4);
+}
+
+fn run_fs_tear_test() {
+    println!("\n=== fs: TORN WRITES - every prefix of one operation's writes, booted (carnage 3.1) ===");
+    // TWO IMAGES, and the reason is that one of them was corrupting its own measurement.
+    //
+    // `write-tap` logs every sector written - eight lines of serial per sector - which is exactly
+    // what the RECORDING boot needs and pure noise during the REPLAYS. It is not harmless noise:
+    // under that load the kernel splices one log line into another (a known defect), so a
+    // `drives check` verdict came back with a `btap` line spliced INTO the middle of it and the
+    // oracle's phrase match failed. Three tear points were reported as filesystem defects when the
+    // filesystem was correct and the instrument had mangled its own evidence.
+    //
+    // `services/fs` states the principle this broke, about its own metrics: "an observer that
+    // changes the thing it observes is not an observer".
+    //
+    // So: a TAPPED image to record with, and a PLAIN one to replay on. The replays are faster for
+    // it too, which is most of the suite's wall clock.
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    let limine_dir = std::path::Path::new("tools/limine");
+    let _ = std::fs::create_dir_all("build/tests");
+
+    build_blockdev_fs("selftest", "write-tap");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let tapped = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-tapped.img"));
+    disk_image::install_bootloader(limine_dir, &tapped);
+
+    build_blockdev_fs("selftest", "");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let persist = "build/tests/persist_fs_tear.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // The file the operation overwrites. Baked host-side so its OLD content is known exactly, which
+    // is what makes "wholly old or wholly new" a decidable question rather than a judgement.
+    gsfs_add_file(persist, "tear.txt", b"ORIGINAL");
+
+    crate::shell_test::run_fs_tear(&tapped, &image_path, persist, 4);
+}
+
+fn run_fs_rtear_test() {
+    println!("\n=== fs: CRASHING DURING RECOVERY - cut the replay itself (carnage 3.8)"); println!("=== (was: TORN WRITES - every prefix of one operation's writes, booted (carnage 3.1) ===");
+    // TWO IMAGES, and the reason is that one of them was corrupting its own measurement.
+    //
+    // `write-tap` logs every sector written - eight lines of serial per sector - which is exactly
+    // what the RECORDING boot needs and pure noise during the REPLAYS. It is not harmless noise:
+    // under that load the kernel splices one log line into another (a known defect), so a
+    // `drives check` verdict came back with a `btap` line spliced INTO the middle of it and the
+    // oracle's phrase match failed. Three tear points were reported as filesystem defects when the
+    // filesystem was correct and the instrument had mangled its own evidence.
+    //
+    // `services/fs` states the principle this broke, about its own metrics: "an observer that
+    // changes the thing it observes is not an observer".
+    //
+    // So: a TAPPED image to record with, and a PLAIN one to replay on. The replays are faster for
+    // it too, which is most of the suite's wall clock.
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    let limine_dir = std::path::Path::new("tools/limine");
+    let _ = std::fs::create_dir_all("build/tests");
+
+    build_blockdev_fs("selftest", "write-tap");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let tapped = disk_image::create_at(kernel_elf, limine_dir, std::path::Path::new("build/os-tapped.img"));
+    disk_image::install_bootloader(limine_dir, &tapped);
+
+    build_blockdev_fs("selftest", "");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+
+    let persist = "build/tests/persist_fs_rtear.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // The file the operation overwrites. Baked host-side so its OLD content is known exactly, which
+    // is what makes "wholly old or wholly new" a decidable question rather than a judgement.
+    gsfs_add_file(persist, "tear.txt", b"ORIGINAL");
+
+    crate::shell_test::run_fs_rtear(&tapped, &image_path, persist, 4);
+}
+
+fn run_fs_fuzz_test() {
+    println!("
+=== fs: adversarial - hostile paths, names, and limits (Phase M) ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+
+    let persist = "build/tests/persist_fs_fuzz.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // A CANARY that predates the assault. Every hostile case runs after this, and the run ends by
+    // reading it back: if the filesystem were damaged along the way, this is what notices.
+    gsfs_add_file(persist, "canary.txt", b"canary-must-survive-every-hostile-request");
+    // A HOSTILE FILENAME, baked host-side because the shell's line editor accepts only printable
+    // ASCII (`main.rs` input loop) so this cannot be typed. That is exactly the threat: the name
+    // arrives on a disk somebody else prepared. `ESC [ 2J` is "clear the screen" - if `dir` prints a
+    // name unfiltered, listing a directory lets the DISK drive the terminal, and a file can hide
+    // itself (or anything after it) from the listing that is supposed to reveal it.
+    gsfs_add_file(persist, "a[2Jb.txt", b"a filename must not be able to drive the terminal");
+
+    crate::shell_test::run_fs_fuzz(&image_path, persist, 4);
+}
+
 fn run_fs_scrub_test() {
     println!("\n=== fs: drives scrub (read-only integrity sweep) - detect bit-rot, change nothing (Phase K) ===");
     cmd_build_bare_metal();
@@ -2790,6 +3467,192 @@ fn run_fs_compat_test() {
 /// transient error (the boot self-test read still succeeds) - and that normal operation is
 /// unaffected (fs mounts + round-trips). QEMU never fails a real disk read, so the fault must
 /// be injected.
+/// Carnage §3.3: a power cut against a drive with a VOLATILE WRITE CACHE.
+fn run_fs_cache_test() {
+    println!("\n=== fs: power cut with a VOLATILE WRITE CACHE - acknowledged is not durable (§3.3) ===");
+    build_blockdev_fs("", "volatile-cache-test");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_cache.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_cache(&image_path, persist, 4, false);
+}
+
+/// Carnage §3.3: the drive that ACCEPTS the barrier and commits nothing.
+///
+/// `CLAUDE.md` §6.1 withholds the recovery guarantee for exactly this medium, so this suite asserts
+/// what still holds rather than what does not: damage is DETECTED and named, never silently
+/// believed, and no live block is marked free.
+fn run_fs_lyingflush_test() {
+    println!("\n=== fs: the drive that ACCEPTS the barrier and does nothing (§3.3, §6.1) ===");
+    build_blockdev_fs("", "lying-flush-test");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_lyingflush.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_cache(&image_path, persist, 4, true);
+}
+
+/// Carnage §3.4: exhaustion reached through DIRECTORY GROWTH rather than one large file.
+fn run_fs_reuse_test() {
+    println!("\n=== fs: a file capability across an `fs` RESTART (stale-handle / block reuse) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_reuse.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    crate::shell_test::run_fs_reuse(&image_path, persist, 4);
+}
+
+fn run_jobs_test() {
+    println!("\n=== shell: background / jobs / foreground, against a real disk ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_jobs.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    // ONE large file and room to copy it. 32768 blocks, ~138 for superblock/bitmap/journal/root:
+    // a 10,865-block source plus its copy is about 21,730, which leaves the volume comfortable.
+    // The size matters for what it proves - the copy streams in 3556-byte chunks, so this is
+    // roughly 1,550 round trips rather than one.
+    let filler = vec![0xA5u8; 10_865 * 508];
+    gsfs_add_file(persist, "fill3.bin", &filler);
+    crate::shell_test::run_jobs(&image_path, persist, 4);
+}
+
+fn run_fs_metafull_test() {
+    println!("\n=== fs: a DIRECTORY that runs out of room (§3.4) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_metafull.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
+    // Tighter than `fs-full` on purpose. That suite leaves a few HUNDRED blocks so one large
+    // copy is refused; this leaves a few DOZEN so a stream of tiny files runs the volume down
+    // through the directory growths they force. 32768 blocks, ~138 for superblock/bitmap/
+    // journal/root, three fills of 10,830 -> roughly 50 free.
+    let filler = vec![0xA5u8; 10_865 * 508];
+    for name in ["fill1.bin", "fill2.bin", "fill3.bin"] {
+        gsfs_add_file(persist, name, &filler);
+    }
+    crate::shell_test::run_fs_metafull(&image_path, persist, 4);
+}
+
+/// Carnage §3.5, third bullet: two clients, one directory.
+fn run_fs_twoclient_test() {
+    println!("\n=== fs: TWO CLIENTS contending on one directory (§3.5) ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_twoclient.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_twoclient(&image_path, persist, 4);
+}
+
+/// Carnage §3.5, second bullet: a request discarded BEFORE it runs - the other side of the commit.
+fn run_fs_lostreq_test() {
+    println!("\n=== fs: a move DISCARDED before it ran - what does the client do? (§3.5) ===");
+    build_blockdev_fs("drop-request-test", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_lostreq.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_lostreq(&image_path, persist, 4);
+}
+
+/// Carnage §3.5: a destructive op whose reply is lost, and the retry that follows.
+fn run_fs_dupop_test() {
+    println!("\n=== fs: a COMPLETED move loses its reply - what does the client do? (§3.5) ===");
+    build_blockdev_fs("lose-reply-test", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_dupop.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_dupop(&image_path, persist, 4);
+}
+
+/// Carnage §3.7, the other half: kill `block-driver` with requests outstanding.
+///
+/// No test feature at all - the driver is killed over the control channel on a SHIPPING build, so a
+/// fault found here is a fault about the system rather than about a build nobody runs.
+fn run_fs_blockdeath_test() {
+    println!("\n=== fs: block-driver killed WITH REQUESTS OUTSTANDING (§3.7) ===");
+    build_blockdev_fs("", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_blockdeath.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_blockdeath(&image_path, persist, 4);
+}
+
+/// Carnage §3.7: corrupt the COMPLETION STREAM and require the filesystem to survive it.
+///
+/// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/31` warned about:
+/// duplicate, missing and out-of-order completions, injected into ordinary churn traffic. See
+/// `run_fs_blockchaos` for why every detection assertion is paired with a recovery one.
+fn run_fs_blockchaos_test() {
+    println!("\n=== fs: completion-stream chaos - duplicate / missing / out-of-order replies (§3.7) ===");
+    build_blockdev_fs("", "completion-chaos");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_fs_blockchaos.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_fs_blockchaos(&image_path, persist, 4);
+}
+
 fn run_fs_ioretry_test() {
     println!("\n=== fs: block I/O retry - transient failure retried + recovered (Phase H) ===");
     build_blockdev_fs("selftest", "io-error-test");

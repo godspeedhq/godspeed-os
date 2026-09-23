@@ -655,7 +655,7 @@ fn hires_timer_selftest() {
 /// `send_ipi_to_lapic` was an empty stub on this port, and nothing noticed for the port's entire
 /// life, because every service that talks to another service was pinned to core 0. A wake that goes
 /// nowhere is invisible until something depends on it, and then it presents as sluggishness rather
-/// than as a missing feature - which is how it was eventually found: an operator reporting that `ls`
+/// than as a missing feature - which is how it was eventually found: an operator reporting that `dir`
 /// felt slow after services were spread across cores.
 ///
 /// So this rings each AP and waits for that core's OWN handler to count it. It exercises the whole

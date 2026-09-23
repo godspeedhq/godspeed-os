@@ -35,10 +35,10 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   `docs/console-service.md` §9.
 - **Interactive shell:** a supervisor-spawned `gsh>` prompt over serial. Verified utilities in QEMU:
   `help`, `version` (`GodspeedOS 0.10.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
-  (`status | count` -> `3`), and graceful degradation (`ls` -> `ls: storage unavailable`).
+  (`status | count` -> `3`), and graceful degradation (`dir` -> `ls: storage unavailable`).
 - **Persistence (USB stick -> fs):** `block-driver` reaches a **USB mass-storage stick** through the
   `dwc2` SERVICE over the block IPC protocol, and `fs` mounts on top. `drives flash` formats GSFS, files
-  write + read and **survive a reboot**, which unblocks the file utilities (`ls`, `read`, `write`, `edit`,
+  write + read and **survive a reboot**, which unblocks the file utilities (`dir`, `read`, `write`, `edit`,
   `drives`, ...). Needs `--release` (see below).
 
   > **The SD/EMMC card is the boot medium and is NEVER written.** An earlier version of this document
@@ -315,7 +315,7 @@ the cause was never identified. Recording it so the next attempt does not repeat
    `syscall/CLAUDE.md`: ungated are 0,3,9,10,11,12,13), so it is gated on INTROSPECT. Check what that
    syscall does on ARM from the shell's context before assuming it is harmless; caching the value once
    at startup instead of per-sleep would sidestep it entirely and is the cheapest thing to try.
-2. The shell is known to run near its 64 KiB user-stack ceiling (`project_shell_stack_pipe`); two extra
+2. The shell is known to run near its 64 KiB user-stack ceiling (measured: `pipe_run` sits near that ceiling and reports a high-water mark when it moves); two extra
    frames in `service_main`'s loop are not obviously safe on this port.
 3. Unrelated but found while tracing, and worth fixing on its own: `shell`'s `ESC_WAIT_CYCLES =
    200_000_000` is "~100 ms at ~2 GHz" in **`read_tsc` cycles**, and `read_tsc` on the Pi is the ~1 MHz

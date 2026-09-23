@@ -1,5 +1,8 @@
 # 7. `events persist start <url>` - ship a capture off-box
 
+**Status: OPEN BY DECISION - a deferral, not debt (26.2).** Nothing is waiting on it and nothing
+is degraded by its absence. Recorded so the design is not re-derived from scratch.
+
 **Severity:** feature, deliberately deferred.
 **Origin:** raised while designing `events persist`; recorded in `docs/observability.md`.
 

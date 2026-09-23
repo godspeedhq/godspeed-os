@@ -1,6 +1,27 @@
 # 31. net-stack blocked 48 s waiting on a nic-driver that was ALIVE
 
-**Status: OPEN, and the CAUSE IS NOW CONFIRMED** (2026-09-16, see the section at the end).
+**Status: FIXED 2026-09-17, and the 48 in the title is now explained arithmetically.** net-stack
+bounded a DNS resolve by a COUNT - `DNS_RX_TRIES` (12) polls of `DANCE_SECS` (2) - and the serve site
+tried TWO servers, so one `net resolve` could occupy the service for **12 x 2 x 2 = 48 seconds** while
+its client waited 8. The client always gave up first, so the answer landed as a STALE reply, the next
+request received the previous one's answer, the correlation tag rejected it, and the stream never
+caught up. That is why a `kill net-stack` cleared it and nothing else did.
+
+**The fix is that the budget now comes from the CLIENT.** Every request already carries its caller's
+patience on the wire (byte 1), and this service already read it to age out stashed requests - it
+simply never used it to bound its own work. The resolve now gives up at that deadline, minus a margin
+for the reply to travel back, split across the two servers. A loud "no DNS answer" inside the window
+beats a correct answer outside it, because outside it nobody is listening and the damage outlives the
+request.
+
+Reproduced on a Dell Wyse the same day (`ran 484, failed 1`, same failure line, same eight stash
+drops), which is what led to the arithmetic. Gated by `scripts/facts_check.py`, which now compares the
+shell's `NET_RESOLVE_SECS` against net-stack's own belief about it - two constants in different crates
+that nothing had ever compared.
+
+ORIGINAL ENTRY BELOW, kept because the reasoning that did NOT find it is part of the record: a
+correlation tag was built, proved the fault, and was reverted because rejecting a stale reply is not
+the same as recovering from one. That was correct - the tag is a detector, and the cause was a budget.
 The fix is not: a correlation tag was built, proved the fault, and was REVERTED because rejecting a
 stale reply is not the same as recovering from one. Found on a Dell Wyse 5070, 2026-09-16, by the slow-pass
 instrument added in `backlog/29`. A restart of `net-stack` cleared it.
@@ -32,7 +53,7 @@ both: the next run was `ran 461, failed 0` and ping worked.
 client request for all of it, doing `nic-driver` round trips that timed out.
 
 **`nic-driver` never died.** It started once at 20:47:06 and was still `Ready` at 20:51:23 with four
-minutes of uptime, so this is NOT the stale-peer-cap case (`project_stale_peer_cap_reacquire`), where
+minutes of uptime, so this is NOT the stale-peer-cap case, where
 the peer respawned and the cached cap went stale. The driver was alive and not answering.
 
 ## What is NOT established

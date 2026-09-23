@@ -1,5 +1,8 @@
 # 10. IPC cost - the lever is fewer ROUND TRIPS, not a tighter protocol
 
+**Status: OPEN BY DECISION.** Analysed, not built, and nothing is broken today. This file owns
+the status; `docs/ipc-efficiency.md` owns the reasoning.
+
 **Severity:** performance. Nothing here is broken; this is about what to do when a hot path needs it.
 **Status:** analysed, not built. The full treatment is [`docs/ipc-efficiency.md`](../docs/ipc-efficiency.md)
 - that document owns the reasoning, this file owns the status.

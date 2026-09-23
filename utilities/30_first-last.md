@@ -49,7 +49,7 @@ Both consume input; neither is a pipe *producer*. Being filters they compose:
 
 ## 4. Implementation
 
-Shell built-in FILTERS (`is_filter_builtin`, with `match`/`count`/`sort`): they run
+Shell built-in FILTERS (`run_filter_builtin`, with `match`/`count`/`sort`): they run
 **in-process**, so they are **not** subject to the 4 KiB pipe service-boundary cap and can take
 from a full 64 KiB stage buffer. `cmd_take(last: bool)` serves both verbs; the pipe path routes
 through `run_filter_builtin`. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) -

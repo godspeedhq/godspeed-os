@@ -576,11 +576,16 @@ pub fn serve(
             1
         }
         OP_FLUSH => {
-            // SYNCHRONIZE CACHE(10). This board's stick REFUSES it outright (CLAUDE.md §6.1,
-            // amendment 2026-07-25), and that refusal is a FACT ABOUT THE DEVICE rather than an
-            // error: reporting it as failure would make `fs` treat every flush as a fault. It is
-            // answered honestly - the constitution's crash-recovery guarantee is backend-conditional
-            // precisely because of this device.
+            // SYNCHRONIZE CACHE(10). This comment used to say the stick REFUSES it outright and
+            // that the constitution's backend-conditional guarantee existed "precisely because of
+            // this device". Both were wrong: seven sessions across three USB stacks show the device
+            // ACCEPTING the flush, and on 2026-09-23 an unassisted power cut on this board landed in
+            // the commit window and the journal replayed (CLAUDE.md §6.1, amendment 2026-09-23).
+            //
+            // THE CODE NEVER DEPENDED ON THE PREMISE, which is why it was right throughout: it
+            // issues the CDB and reports what the device answers. Answering honestly is correct
+            // whichever way the device goes - a refusal is a fact about the device rather than an
+            // error, and `fs` decides what a refusal means. Nothing here changes; the belief does.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             out[0] = if bot(ctx, mmio, dma, t, disk, &cdb, false, 0).is_some() { STATUS_OK } else { STATUS_ERR };
             1

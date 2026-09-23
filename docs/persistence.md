@@ -187,6 +187,21 @@ completion (a later optimization, not a correctness need).
 
 ## 6. Filesystem - on-disk format
 
+> **READ THIS FIRST: §6 IS THE ORIGINAL DESIGN, AND THE SHIPPED FORMAT IS NOT IT.** What follows
+> describes a flat name-to-blob store with 4 KiB blocks and a fixed 256-entry table. GSFS has been
+> **GSFS0008** for a long time: **512-byte** blocks, real directories as a tree (§6.2), a free
+> **bitmap** rather than an entry table (§6.4), self-describing 64-byte records seven to a block with
+> a CRC trailer (§6.6), extent lists for fragmented files (§6.4), and a metadata redo-journal (§6.8).
+> Every one of those numbers below is superseded by the section named beside it.
+>
+> It is kept because §1's rule holds here as in the constitution - the history of how a format
+> reached its present shape is worth more than a tidy document - but it was NOT marked, and a reader
+> arriving at "§6. Filesystem - on-disk format" reasonably takes the section with that title as the
+> format. That is the §26.7 failure in its documentation form: a claim left standing because it is
+> labelled "proposed" and nearly true, relied on by whoever trusts the document. The label was doing
+> less work than it looked: "Final numbers set in Phase 1" was written before Phase 1, and Phase 1
+> finished several formats ago.
+
 A flat **name → blob** store. Proposed geometry (concrete but tunable in Phase 1):
 
 ```text
@@ -218,6 +233,11 @@ require relocation; both are acceptable Phase 1 and revisited only if a real nee
 **Proposed bounds** (in the spirit of queue-depth-16, MAX_ENDPOINTS - bounded everything,
 §26.6): `BLOCK_SIZE = 4096`, `NAME_MAX = 64`, `MAX_FILES = 256`. Final numbers set in
 Phase 1; the point is they are *fixed and stated*, not elastic.
+
+> **SUPERSEDED.** The shipped numbers are `BLOCK = 512` and `NAME_MAX = 38` (`services/fs/src/main.rs`),
+> and `MAX_FILES` does not exist at all - a directory is a tree of record blocks, so there is no
+> global file ceiling to state. Only the *principle* in that last sentence survived; all three numbers
+> did not.
 
 ### 6.1 Why bulk data is chunked and copied (a constitution consequence)
 
@@ -290,7 +310,7 @@ format's birth, and never revisit the ceiling.
   finding `a` → its inode, reading that directory, finding `b`, … Each component is
   one directory lookup. Bounded path depth + entries-per-directory (§26.6).
 - **Operations:** `mkdir` (allocate a dir inode + add an entry to the parent),
-  create/`write` (allocate a file inode + entry), `ls` (read a directory's entries),
+  create/`write` (allocate a file inode + entry), `dir` (read a directory's entries),
   `read` (walk to the file inode, read its extent), `cd` (resolve a directory,
   update the session's current-directory inode).
 - **Still bounded & loud:** fixed inode count, fixed name length, contiguous extents
@@ -374,7 +394,7 @@ remain the historical record.
   drops the half that didn't - *node*.)
 
 **Why it's deferred.** The three GSFS0003 structures already serve every *current*
-operation: mount (superblock + bitmap), path lookup (walk the path), `ls` (one directory),
+operation: mount (superblock + bitmap), path lookup (walk the path), `dir` (one directory),
 free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration -
 a `find`, a global search, an "every file" view - which GodspeedOS does not have yet. So by
 §26.2 it is built the day such a command pulls it into existence, not before.
@@ -436,6 +456,8 @@ that snaps on when search arrives.
    directory read (`dir_read`) and stamped on every write (`dir_write`), so corruption in
    the metadata that *defines the tree* surfaces loudly instead of returning garbage
    records. The `file_record` layout is otherwise unchanged - **names stay 38 bytes**.
+   *(The other 60 trailer bytes, 452..512, went unused until Phase O put timestamps there -
+   past this CRC and under one of their own, so nothing above is invalidated. See §6.17.)*
 3. **Reserved journal region** - `journal_start`/`journal_blocks` (u64 @108/@116) carve a
    fixed 64-block (32 KiB) region between the bitmap and the data region. **Empty and
    unused in Phase A**; it is where Phase C's crash-consistency redo-journal lives. Baking
@@ -525,11 +547,18 @@ means a committed-but-unfinished transaction → replay its blocks to their home
 nothing. So a crash *before* the commit record is discarded (home untouched); a crash *after*
 it is completed. There is no third outcome **on a backend that attests durability** (see the note below).
 
-**Backends that cannot be ordered (2026-07-25).** What follows is true of `ahci` and SD/EMMC, and is
-BACKEND-specific rather than architectural. The ARM USB mass-storage backend issues no per-write flush
-and the device refuses `SYNCHRONIZE CACHE`, so the journal-data -> commit -> checkpoint ordering is NOT
-enforced there; `commit_txn` now asks explicitly (three barriers) and `fs` warns once per mount when the
-answer is no. `CLAUDE.md` §6.1 (amendment 2026-07-25) carries the constitutional form.
+**Backends that cannot be ordered (2026-07-25, corrected 2026-09-23).** The rule is BACKEND-specific
+rather than architectural: a device that refuses or lies about a flush cannot enforce the journal-data
+-> commit -> checkpoint ordering, so `commit_txn` asks explicitly (three barriers) and `fs` warns once
+per mount when the answer is no.
+
+**The ARM USB backend was named here as the example, and it is not one.** That claim was never tested
+when it was written; when it finally was, the device accepted `SYNCHRONIZE CACHE` across seven sessions
+and an unassisted power cut on the Pi 2 landed inside the commit window and REPLAYED - `journal
+recovered 4 block(s)`, nothing torn, nothing repaired. So no board in this project is currently known
+to be an unorderable backend. The rule stands and is worth keeping; the example is withdrawn.
+`CLAUDE.md` §6.1 (amendments 2026-07-25 and 2026-09-23) carries the constitutional form, and
+`fs-lyingflush` models an unorderable device in QEMU so the case stays tested without one.
 
 **Why ordered durability is free.** `block-driver` flushes every sector write to the medium
 before replying (`FLUSH EXT`), and `fs` serializes requests, so the journal-data → commit →
@@ -863,6 +892,10 @@ This is *more* honest than the old scheme, not less: an old build meeting a newe
 precise reason (refuse / read-only / fine) instead of a version mismatch indistinguishable from a
 foreign disk.
 
+**The bits defined so far.** `compat` bit 0 = a backup superblock exists (Phase F). `incompat`
+bit 0 = some file is fragmented, so an extent list must be read to find its blocks (Phase I).
+`ro_compat` bit 0 = some file on this volume is SEALED (Phase O, §6.17).
+
 **Features earn forward-compatibility by being lazy.** The bit is set only when the feature is
 exercised. Extent lists (Phase I) are an `incompat` feature, but the `FEAT_INCOMPAT_EXTENTS` bit is
 set **the first time a file actually fragments** - a freshly-formatted disk that never fragments
@@ -926,6 +959,133 @@ timed out; see the loop's own note) - but only on the truth of *success*. Teachi
 a truth is what closes the wedge. Verified: `osdev test identity` 24/0 (Test 13 fs-restart and the whole
 file suite stay green); the live CI-stuck self-heal is T630-only (QEMU's emulated AHCI never raises the
 CI-stuck condition).
+
+### 6.17 Timestamps and SEALED - the first two features added under the frozen magic (Phase O)
+
+> **Built 2026-09-17.** The first change to the on-disk format since §6.15 froze the magic, and
+> therefore the first test of whether that policy actually works. It does: **`SB_MAGIC` is still
+> `b"GSFS0008"`**, no volume needs reformatting, and the two features arrive by the two routes §6.15
+> prescribes - one additive and invisible to an older build, one behind a `ro_compat` bit.
+
+**Timestamps, in the 60 bytes every directory block already wasted.** A 64-byte record is FULL -
+type @0, name_len @1, name[38] @2, size @40, first_block @48, block_count @56 - so times could not go
+inside it without shrinking `NAME_MAX` or halving how many entries a directory block holds. They did
+not have to: seven 64-byte records are 448 bytes and the record CRC is a u32 at 448, so bytes
+**452..512 have been unused since the format was written**. Two `u32` epoch times for each of seven
+records is 56 of them, and their own CRC32 is the four at 508.
+
+```
+Directory block (512 B):  records [0..448)  |  record CRC32 @448  |  7 x (mtime:u32, ctime:u32) @452  |  times CRC32 @508
+```
+
+- **`mtime`** - when the content last changed. **`ctime`** - when the record last changed (rename,
+  move, size), which is what distinguishes "the file changed" from "the file was moved".
+- **No `atime`**: recording a read turns every read into a write, and on a journaled filesystem into
+  a transaction. The cost is real, the value is low, and it is refused on purpose.
+- **`u32` epoch seconds**, good to 2106. Four bytes rather than eight is what let both times fit
+  beside a CRC in 60 bytes.
+
+**Why this needs no feature bit at all.** The record CRC still covers exactly `[0..448)` and still
+lives at 448, so a build that predates times reads the directory perfectly and never looks past the
+CRC it knows about - it will also overwrite the times region without stamping its CRC, which is
+precisely why the times carry their own. A build that knows times, reading a volume that has none,
+finds the mismatch and reports **`unknown`** rather than inventing 1970: a wrong date is worse than an
+absent one, because a date you can see is a date you will act on. **No migration pass runs and nothing
+back-fills a missing time** - the first write to an old directory block stamps a valid CRC over zeros,
+and zero *is* `TIME_UNKNOWN`, so old entries keep reading as unknown while new ones carry real times.
+
+The clock behind it is the `time` service, which owns the wall clock, sets it from SNTP and persists a
+floor across reboots (`/clock.last`); a file stamped on a machine that has never seen the network gets
+the floor rather than zero, and the floor only moves forward.
+
+**SEALED - content frozen, permanently.** A sealed file can be read, listed, renamed, moved and
+deleted; its bytes can never change again, and **there is no unseal** (a seal a holder can lift is a
+request, not a guarantee). It freezes CONTENT, not existence: refusing deletion would make a sealed
+file unremovable, so a disk could be filled with rubbish nobody is permitted to clear - a denial of
+service bought with a guarantee nobody asked for.
+
+The record had no spare bit either, so the flag rides **the top bit of the 64-bit size** - room no
+file can reach, since 2^63 bytes is eight exabytes. Every size read goes through an accessor that
+masks it off, which is correctness rather than tidiness: `write_at` bounds a fragmented file's extent
+by its size, so the flag leaking into that arithmetic would let a write run past the file's own blocks.
+
+Three refusals enforce it, and the first is the one that matters:
+
+1. **`fs` will not mint a writable capability to a sealed file** - refused at `open`, not per write,
+   because a capability that looks writable and fails on use is a worse answer than a plain refusal,
+   and §7.3 says rights narrow, so a capability that cannot be honoured should never exist.
+2. Every write path (`write`, the streaming `write_at`, the journaled variant) refuses, because the
+   seal is carried on the `Entry` each of them already walks. A write route added later cannot forget
+   to ask.
+3. The volume sets **`ro_compat` bit 0** the first time anything is sealed, so a build that does not
+   know the bit mounts the whole volume **READ-ONLY** (§6.15) instead of writing through a flag it
+   cannot see. Not `incompat`: refusing to mount a volume because one file is read-only forever is a
+   punishment out of proportion to the risk, and read-only is exactly the honest middle the mask
+   policy exists to express. The one thing such a build gets wrong is cosmetic - a nonsense SIZE for
+   a sealed entry - on a mount that can change nothing.
+
+**The version number this work does NOT have.** During the build these two features were repeatedly
+called "GSFS0009", in this branch's scope note, in code comments and in commit messages. That was
+wrong and is corrected: §6.15 froze the magic and states that every later feature is additive under
+the masks - *"GSFS00014 never happens"*. Nothing here mints a new magic, and there is no `GSFS0009` on
+any disk. Recorded rather than quietly renamed, because a version a reader could build against is
+exactly the kind of claim §26.7 says to write down instead of papering over.
+
+Verified by `osdev test fs-time` (15/0), which stamps a file, **reboots the machine**, and proves the
+date survived, that a file with no time is still `unknown` afterwards rather than given an invented
+one, that the write to the times region did not break the record CRC every build reads, and that a
+seal survives the reboot with the write still refused and the content still original.
+
+### 6.18 What TWO CLIENTS see - the ordering guarantee, stated
+
+Written down because it was not. `docs/gsfs-carnage.md` §3.5 asked for two clients'
+observable ordering to be checked "against what is documented - which currently is nothing, so
+documenting it is part of the gate". This is that.
+
+**The guarantee, in one sentence: every `fs` operation is atomic with respect to every other
+client.**
+
+It falls out of two facts rather than any locking:
+
+1. **`fs` is single-threaded and serves one request to completion before dequeuing the next.** The
+   serve loop is `loop { let msg = ctx.recv(); ... }` - there is no second thread, because nothing
+   in this system has one (§9: a task is a service). A request is received, served, replied to, and
+   only then is the next taken.
+2. **Every mutating op commits through the redo-journal** (§6.8). Its blocks are staged, the commit
+   record is made durable, and only then does any home block move. A reader either sees the state
+   before the transaction or the state after it.
+
+So there is **no read-modify-write window a second client can enter**. Two clients cannot interleave
+*inside* one operation, because there is no inside to reach: the operation is the unit `fs` serves.
+
+**What is NOT atomic, and this is the part worth knowing.** A single client's multi-request IDIOM is
+not a transaction. Between a client's two requests, `fs` may serve another client. So:
+
+```
+client A:  write /x.txt  ......................  move /x.txt /y.txt
+client B:  ..................  delete /x.txt  ...
+```
+
+is a legal ordering, and A's `move` will correctly report that its source is gone. Each of the three
+operations was atomic; the SEQUENCE was not, and nothing promises otherwise. A client that needs a
+compound operation to be indivisible does not have one available - that would be a transaction API,
+and none exists (nothing has needed it: §26.2).
+
+**Ordering between clients is arrival order at `fs`'s endpoint**, which is the kernel's per-endpoint
+queue - FIFO, depth 16 (§8.3, §8.5). Not priority, not fairness: whoever's message is dequeued first is
+served first. A client whose queue slot is taken while `fs` is busy blocks in `send` until space
+frees (§8.2), which is backpressure rather than loss.
+
+**What this is NOT a claim about.** Nothing here says two clients cannot produce a surprising
+RESULT - B deleting the file A is about to move is surprising and entirely legal. The guarantee is
+about state, not about outcomes being agreeable: the filesystem is never left half-applied, and no
+client ever observes a partial operation.
+
+**Pinned by `osdev test fs-twoclient`** (8/0), which puts `recorder` and the shell on the same
+directory - a genuine second client writing a capture on its own schedule - and churns one path
+through create / read / rename / read / delete for six rounds while it does. Every read returns its
+own round's payload, the other client's file survives every round, and `drives check` reports the
+volume consistent with no corrupt blocks.
 
 ## 7. File = capability (the north star)
 

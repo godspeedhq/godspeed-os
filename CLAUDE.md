@@ -247,14 +247,33 @@ These are the laws that bound every design choice. Any change that violates an i
     ▲ syscall             ▲ syscall       ▲ syscall
 ```
 
-### 4.3 Kernel Scope (Strict)
+### 4.3 Kernel Scope (Strict) - **MISCIS**
+
+The six, and the mnemonic for them - **MISCIS**, said like "misses": **M**emory isolation, **I**PC,
+**S**cheduling, **C**apabilities, **I**nterrupts, **S**MP routing.
 
 - Memory isolation (per-service address spaces, page tables)
-- Scheduling (per-core run queues, round-robin with timer preemption)
 - IPC (synchronous message passing, bounded queues, cross-core routing)
+- Scheduling (per-core run queues, round-robin with timer preemption)
 - Capability enforcement (validation on every privileged syscall, generation check)
 - Interrupt routing (delivery to userspace driver services)
 - SMP routing (EndpointId → CoreId map, IPI wakeup)
+
+> **Leave these six bullets as plain text.** `scripts/commandments.py` parses each line up to the
+> `(` as the responsibility's NAME, so bolding the mnemonic letters inside them - `**M**emory
+> isolation` - turned every name into something it did not recognise and failed six modules at once.
+> Caught in seconds by the gate that reads this list, which is the argument for deriving it from here
+> rather than copying it into config.
+
+"Do not expand MISCIS" is therefore the short form of §4.4: a seventh responsibility is a change to
+what this kernel IS, not a feature. `scripts/commandments.py` (`I-responsibilities`) derives the six
+from this very list and fails on a module that serves something outside it, so the acronym and the
+gate read the same source.
+
+> **The list is ordered to spell the word.** It previously ran memory / scheduling / IPC / ... which
+> spells MSICIS, and the order carries no meaning - the checker builds a SET from these bullets and
+> does not care. A mnemonic that does not match the list it names is a small trap, so the list moved
+> rather than the mnemonic.
 
 ### 4.4 Kernel Anti-Scope
 
@@ -324,7 +343,7 @@ os/
     naming-design.md     #   name resolution out of the kernel (Path C)
     persistence.md       #   block driver + filesystem, file-as-capability
     console-service.md   #   the terminal, and the kernel's boot/panic floor
-    ...                  #   (~30 files; the index lists them all)
+    ...                  #   the index lists them all
 
   audits/                # append-only EVIDENCE, not documentation
     unsafe-audit.md      #   every unsafe block; CI checks it matches source
@@ -357,20 +376,31 @@ os/
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
                          #   kernel file breaks none of them, so five ran green over exactly that
     dash_check.py        #   no em/en dashes anywhere (§21)
+    line_ref_check.py    #   a `path.rs:NNN` citation still points at what it claims. A line
+                         #   number rots on the next edit above it, and fifteen checkers
+                         #   looked at none: Audit 7 found 7 of 11 wrong, four documents
+                         #   citing ONE dead line. `audits/` is exempt - dated evidence
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds
     stack_fit_check.py   #   a service's frames fit the stack it is given (§26.6.1)
     test_report.py       #   collate a suite run into a report
-    arm_build.py  pi4_build.py  arm_run.py  pi4_run.py
+    board.py             #   ONE way to build a bootable image for any port:
+                         #   `py scripts/board.py pi2|pi4|visionfive|x86 [--crash-window]`.
+                         #   Owns the POLICY the four ports used to state differently - a
+                         #   board image is ALWAYS release, every port takes the same flags,
+                         #   every build ends by naming the artifact and what to copy where
+                         #   (including the per-port RENAMES). The per-port scripts below do
+                         #   the work and stay callable
+    arm_build.py  pi4_build.py  riscv_build.py  arm_run.py  pi4_run.py  riscv_run.py
 
-  utilities/             # the SPEC for every shell utility, one file each (48)
+  utilities/             # the SPEC for every shell utility, one file each, plus 0_conventions
     0_conventions.md     #   the 13 rules every utility obeys
   website/               # the published book (mdBook); pages `{{#include}}` the
                          #   sources above, so a doc and its page cannot drift
   backlog/               # open items - recorded rather than closed (§26.7)
   boot/                  # per-board boot config (pi2/, pi4/)
   contracts/schema/      # the JSON Schema a service contract is validated against
-  examples/              # 12 worked services
+  examples/              # 14 worked services
   milestones/            # what was achieved and when; ALMANAC.md is the chronicle
   bugs/                  # long-form investigations of four specific hardware bugs
   editors/               # syntax files for the gsh shell language
@@ -445,7 +475,10 @@ os/
 >   holds, `fs` recovers to a consistent state on mount, and the Phase D TCB claim stands unchanged.
 > - **A backend that cannot** does not. The Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, and
 >   FUA - which the drive does honour - costs more time per write than the driver's command budget can
->   give it (`USE_FUA`, `arch/arm/dwc2.rs`). With no barrier available, a power cut can lose the tail of
+>   give it (`USE_FUA`, then in the in-kernel `arch/arm/dwc2.rs`; that file was DELETED by the
+>   2026-08-17 amendment below and the driver is `services/dwc2` now - the DEVICE's refusal is what
+>   this paragraph turns on, and it is unchanged by where the driver lives). With no barrier
+>   available, a power cut can lose the tail of
 >   a write sequence, and `fs` says so **once per mount** rather than implying a guarantee it cannot
 >   deliver. Metadata is still CRC-verified, so the failure is DETECTED loudly on read; what is lost is
 >   automatic *recovery*, not the ability to notice.
@@ -455,6 +488,73 @@ os/
 > supervisor restart, never a reboot - §6.2 is untouched) and a *power loss* may require a reformat.
 > Recorded rather than closed, per §26.7: the fix is a block path that can wait out a busy device
 > without holding the core, which is real work and not a constant.
+
+> **Amendment 2026-09-23 (hardware): the amendment above is RIGHT about the rule and WRONG about its
+> only example. The Pi 2 is not a backend that cannot be ordered - it was never tested, and when it
+> finally was, it recovered.** The 2026-07-25 amendment names the Raspberry Pi 2's USB stick as the
+> worked case of a device that "refuses `SYNCHRONIZE CACHE` outright", and concludes that on that
+> board a power loss may require a reformat. Both halves are contradicted by the machine.
+>
+> **The refusal.** Seven sessions across three USB stacks - `dwc2` on the Pi 2, `xhci` on the Pi 4,
+> `xhci` on the VisionFive 2, one physical stick - and `fs` has printed no durability warning on any
+> of them. That warning fires at both journal barriers whenever the flush comes back false, so on
+> every run where writes committed it ran and stayed silent: the device answered `SYNCHRONIZE
+> CACHE(10)` and accepted it. **The only local evidence for the refusal was an instrument that could
+> not tell a refusing device from a dead driver** - it fired twice in `build/pi2a.log` immediately
+> after `block-driver died, restarting`, blaming the stick for a flush nobody was there to answer.
+> That is fixed (`Durable` / `Refused` / `NoAnswer`), and three of the seven sessions ran with the
+> corrected instrument.
+>
+> **The consequence.** On 2026-09-23 a power cut 17 s into `churn 30`, on a PLAIN image with no
+> crash-window, at a moment nobody chose, landed inside the commit-to-checkpoint window:
+>
+> ```
+> fs: journal recovered 4 block(s) from an interrupted write
+> churn verify: 7 file(s) checked, 0 empty, NONE torn
+> check: 13 files, 2 dirs, 0 bad; the free count already agreed with the tree - nothing was repaired
+> ```
+>
+> A replay of 4 blocks means the commit record was durable BEFORE any home block moved. That
+> ordering is the whole of the guarantee, and this device enforced it. It took three attempts, which
+> is ordinary variance.
+>
+> **Corrected the same day, in this amendment rather than around it:** the paragraph above first read
+> "at the ~2% per-cut odds the window's sub-millisecond life implies". That figure was wrong. It took
+> `fs`'s own "normally lasts under a millisecond" comment - written about the Dell Wyse, an AHCI SSD -
+> and applied it to a USB stick. The window IS the checkpoint, the interval between the commit record
+> becoming durable and the last home block landing, and those writes are slow on a stick, so there it
+> is a large fraction of each transaction rather than a sliver of it. **Measured across every
+> unassisted cut: six hits in twelve** (T630 two of two, Pi 2 third of three, Pi 4 first,
+> VisionFive first, Wyse one of five). At 2% that outcome is about 1 in 10^8, so the estimate is
+> refuted rather than imprecise. All five boards have been cut on the same current build. Nothing else in this
+> amendment depends on it - the evidence for the Pi 2 is the replay itself, not how many tries it
+> took - but the number was acted on, so it is corrected where it was stated rather than left for a
+> reader to trip over.
+>
+> **What does NOT change, and is the reason this is an amendment rather than a retraction.** The
+> guarantee stays **backend-conditional**. That reasoning is sound and untouched: a redo journal is
+> pure ordering, ordering can only be enforced by a device that attests durability, and a device that
+> refuses or LIES about a flush cannot carry the guarantee. `fs-lyingflush` models exactly that case
+> in QEMU and it stays. The honest form of the Phase D claim - `fs` is restartable everywhere, and
+> crash-recoverable on a backend that can be ordered - is correct as written.
+>
+> **What changes is that the claim is about a CLASS of device, not about this board.** The Pi 2 was
+> the one named instance and it does not belong in it; the sentence naming it stands above as ratified
+> history, and this amendment is the canonical state (§1). No board in this project is currently known
+> to refuse the barrier. If one is found, it belongs here with the evidence that put it here - which
+> is the standard the Pi 2 was held to only after the fact, and the point of recording this at all.
+>
+> **The FUA half is untouched and still true**: the stick does honour FUA, and FUA costs more per
+> write than the driver's command budget can give it. That was never the load-bearing claim - the
+> flush is - but it is not contradicted by anything here.
+>
+> Five boards, four ISAs, three storage backends, **power cut 5 of 5 recovered in the strong form,
+> and ALL FIVE cut UNASSISTED** - Wyse, T630, Pi 2, Pi 4 and VisionFive 2, each landing in the commit
+> window with no held-open pause helping the device. The Pi 4 and VisionFive also had `crash-window`
+> cuts a day earlier; those are superseded, so no result this amendment rests on depends on a window
+> held open for the device's convenience. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
+> investigation, including the two earlier Pi 2 cuts that missed the window and what they did and did
+> not measure.
 
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
@@ -577,7 +677,7 @@ official, not the runtime behaviour.
 > **What confinement actually covers today, stated as fact rather than intent:**
 > - **`xhci` is the only confined driver in the system.** `ehci` and `block-driver` keep a stale
 >   firmware DMA pointer that confinement would fault, so both run in deliberate passthrough
->   (`kernel/src/task/mod.rs:593`); `nic-driver` is spawned `confine=false`.
+>   (`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``); `nic-driver` is spawned `confine=false`.
 > - **AMD-Vi is x86-only.** Every `iommu::` entry point on `arm`, `aarch64` and `riscv64` is a stub and
 >   `confine_device` returns `false`. Three of the four shipping ports are therefore entirely in the
 >   "without an IOMMU" case, with no confined driver at all.

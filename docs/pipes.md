@@ -25,7 +25,7 @@ A pipeline is **one producer, zero or more filters, one sink**:
  PRODUCER  |    FILTER | FILTER  |     SINK
 ```
 
-- **PRODUCER** - emits text (or records), ignores input. Built-ins: `read`, `echo`, `ls`, `tree`,
+- **PRODUCER** - emits text (or records), ignores input. Built-ins: `read`, `echo`, `dir`, `tree`,
   `find`, the system-info commands `about` / `mem` / `cores` / `date` / `help`, and the introspection
   producers `status` / `caps` / `drives` / `observe now`. Services: `greet` (text),
   `roster` (records). *(There is no `cat`: `read` is the one file reader - `utilities/18_read.md`,
@@ -59,7 +59,7 @@ The governing idea is simple: **anything that displays information can be saved.
 pipe source iff its job is to *emit data*. That splits the command set three ways:
 
 - **Data / display commands → pipe sources.** Anything whose purpose is to show you something:
-  `about`, `mem`, `cores`, `date`, `help`, `status`, `ls`, `caps`, `drives`, `find`, `tree`,
+  `about`, `mem`, `cores`, `date`, `help`, `status`, `dir`, `caps`, `drives`, `find`, `tree`,
   `read`, `echo`, `observe now`. Each renders through an `Out` target that is the console when run
   bare and a capture buffer when piped - so `about` prints, and `about | write /f` saves, the same
   bytes. No new authority: a built-in already held these capabilities; the pipe just redirects its
@@ -151,7 +151,7 @@ the pipeline (§3.12) - it never silently passes garbage through:
 
 ```
 about | to json   → "to: input is text, not records (parse with 'from json' first)"
-ls | to xml        → "to: unknown format (try: to json | to yaml)"
+dir | to xml        → "to: unknown format (try: to json | to yaml)"
 status | match x   → "match: this is a record stream - use 'where'/'select'/'sort', or 'to json'"
 ```
 

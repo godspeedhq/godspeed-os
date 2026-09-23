@@ -300,7 +300,7 @@ pay it once per peer rather than once per request. Not built, because nothing ye
 recorded so the next person reading a 1.5-second `tcp` does not go looking for it in the protocol.
 
 The VisionFive is the sharpest of the three as evidence, because its networking has a history of
-board-specific trouble (`project_riscv64_dwmac_unicast_loss`) and this needed none of it.
+board-specific trouble (the VisionFive's dwmac unicast-loss repair) and this needed none of it.
 
 Both boards were verified the same way - the board's log and the peer's log showing the same exchange,
 which is worth more than either alone.
@@ -503,7 +503,7 @@ timeout the Pi 4 exposed.
 
 Worth noting for this board specifically: every ping reply and every TCP segment here is UNICAST, and
 this is the hardware whose dwmac driver once dropped 60% of unicast frames
-(`project_riscv64_dwmac_unicast_loss`). 8/8 and two clean transfers say that repair is holding under
+(the dwmac unicast-loss repair). 8/8 and two clean transfers say that repair is holding under
 a protocol that did not exist when it was made.
 
 ### The same protocol work, three drivers

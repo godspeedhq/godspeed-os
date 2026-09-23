@@ -13,7 +13,7 @@ kernel itself.
 
 ## Where to start
 
-This site is a rendered view of the project's own documents. Seventy-two of its seventy-six pages -
+This site is a rendered view of the project's own documents. Seventy-eight of its eighty-two pages -
 including every one linked below - are a two-line stub that pulls the real file straight from the
 repository, so they cannot drift from the source (that is [Commandment III](commandments.md) applied
 to the docs themselves). The four exceptions are written for the site because they have no file to be

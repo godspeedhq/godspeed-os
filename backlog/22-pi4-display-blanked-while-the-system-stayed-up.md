@@ -65,7 +65,7 @@ status                                               # console's queue depth
 `console msgs.received` is already published (seen at 2368 then 2432 in this very log). If it CLIMBS
 while the screen is black, console is alive and painting and the fault is downstream of this system.
 If it is FROZEN, console stopped serving - and `status`'s queue column says whether it is jammed at
-16/16, which is the shape `project_console_service_perf` records.
+16/16, which is the shape the console-service performance work records.
 
 So: **next time the screen goes black, run those two before power-cycling.** One occurrence with that
 pair of readings settles which half of the system to look in; without it, any change is a guess.

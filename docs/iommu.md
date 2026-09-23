@@ -15,7 +15,7 @@
 >    Three of the four shipping ports are in the "without an IOMMU" case.
 > 2. **`xhci` is the only confined driver, even on x86.** `ehci` and `block-driver`
 >    keep a stale firmware DMA pointer that confinement would fault, so both run in
->    passthrough by design (`kernel/src/task/mod.rs:593`), and `nic-driver` is
+>    passthrough by design (`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``), and `nic-driver` is
 >    spawned `confine=false`. "Confinement is applied per driver" (§6.4) is doing
 >    more work in that sentence than it looks: today it selects exactly one.
 

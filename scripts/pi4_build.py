@@ -129,6 +129,7 @@ if "--features" in sys.argv:
 # arm32 (Pi 2) is unaffected: no PCIe and no device-IRQ routing to userspace, so its USB stack is
 # still in the kernel - see arch/arm/CLAUDE.md.
 EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
+CRASH_WINDOW = "--crash-window" in sys.argv
 
 rel = ["--release"] if PROFILE == "release" else []
 
@@ -154,6 +155,11 @@ for svc in _ORDERED:
     # only; it kills mem-pressure on every boot by design.
     if svc == "net-stack" and EL0_FAULT_TEST:
         feats = ["--features", "el0-fault-test"]
+    # CRASH-WINDOW, so this port can take a DETERMINISTIC power cut like the other three. `fs` holds
+    # the commit-to-checkpoint window open for 10 s when a transaction touches a /cutme... path, so
+    # one cut lands inside it rather than one in four.
+    if svc == "fs" and CRASH_WINDOW:
+        feats = ["--features", "crash-window"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
 # Every service's frames must fit the 256 KiB user stack (USER_STACK_PAGES in kernel/src/task/mod.rs).

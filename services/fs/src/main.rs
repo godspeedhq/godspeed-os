@@ -65,7 +65,17 @@ const SB_CRC_OFF: usize = 136;         // u32 CRC32 over [0..136) - moved from @
 const FEAT_COMPAT_BACKUP_SB: u32 = 0x1; // a backup superblock sits at the last LBA (Phase F)
 const FEAT_INCOMPAT_EXTENTS: u32 = 0x1; // some file is fragmented (extent list, Phase I) - needed to read it
 const KNOWN_COMPAT: u32 = FEAT_COMPAT_BACKUP_SB;
-const KNOWN_RO_COMPAT: u32 = 0;
+/// Some file on this volume is SEALED (Phase O). `ro_compat`, deliberately: a build that does not
+/// know this bit mounts READ-ONLY (§6.15, Phase L), so it cannot write to a sealed file, cannot
+/// unseal one, and cannot allocate over the bit's storage. The one thing it would get wrong is
+/// cosmetic - it would report a nonsense SIZE for a sealed entry, because the flag rides the size
+/// field's top bit - and it would do that on a mount that cannot change anything.
+///
+/// Not `incompat`: refusing to mount a whole volume because one file is read-only forever is a
+/// punishment out of all proportion to the risk, and read-only is the honest middle the feature-flag
+/// policy was built to express.
+const FEAT_RO_COMPAT_SEALED: u32 = 0x1;
+const KNOWN_RO_COMPAT: u32 = FEAT_RO_COMPAT_SEALED;
 const KNOWN_INCOMPAT: u32 = FEAT_INCOMPAT_EXTENTS;
 
 // Extent lists (GSFS0008). A file is normally a single contiguous extent (`ITYPE_FILE`:
@@ -92,8 +102,83 @@ const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 - u32 CRC32 of the 508-byte pay
 // region). The record layout itself is unchanged from GSFS0003 - names stay 38 bytes.
 const REC_SIZE: usize = 64;
 const RECS_PER_BLOCK: usize = 7; // 7×64 = 448 bytes of records + a 64-byte CRC trailer
+
+/// Bytes of header on a `LIST_DIR` reply, before the first entry: `[FS_OK, count, more, next:u32]`.
+/// Named because nine call sites in the shell used to open with a bare `let mut i = 3usize`, and a
+/// wire format whose size is a literal in ten places is a wire format that changes in nine.
+const DIR_HDR: usize = 7;
 const DIR_REC_REGION: usize = RECS_PER_BLOCK * REC_SIZE; // 448 - CRC covers [0..448)
 const DIR_CRC_OFF: usize = DIR_REC_REGION; // 448 - u32 CRC32 of the record region
+
+// ---- TIMESTAMPS (Phase O), in the 60 bytes every directory block already wasted ----
+//
+// A 64-byte record is FULL: type @0, name_len @1, name[38] @2, size @40, first @48, count @56.
+// There is not one spare byte in it, so times could not go there without shrinking `NAME_MAX` or
+// doubling the record and halving how many entries a directory block holds.
+//
+// They did not have to. Seven 64-byte records are 448 bytes and the CRC is a u32 at 448, so a
+// 512-byte directory block has carried **60 unused bytes at 452 since the format was written**.
+// Two u32 times for each of seven records is 56 of them.
+//
+// **The placement is what makes this additive rather than a reformat, and it needs no feature bit
+// at all.** The record CRC still covers exactly `[0..448)` and still lives at 448, so a build that
+// predates times reads the directory perfectly and never looks past the CRC it knows about. The
+// times get their OWN CRC, so a build that DOES know them, reading a volume that has none, sees the
+// mismatch and reports the times as UNKNOWN rather than inventing 1970 - a wrong date being worse
+// than an absent one. The magic stays `GSFS0008` (§6.15): this is not a version, and there is no
+// `GSFS0009` on any disk.
+//
+// u32 epoch seconds: good to 2106, four bytes instead of eight, and the difference is what let both
+// times fit beside a CRC. Recorded rather than left to be discovered.
+const DIR_TIMES_OFF: usize = 452;      // 7 x (mtime:u32, ctime:u32)
+const DIR_TIME_PAIR: usize = 8;
+const DIR_TIMES_REGION: usize = RECS_PER_BLOCK * DIR_TIME_PAIR; // 56
+const DIR_TIMES_CRC_OFF: usize = DIR_TIMES_OFF + DIR_TIMES_REGION; // 508
+const _: () = assert!(DIR_TIMES_CRC_OFF + 4 <= BLOCK,
+    "the times region and its CRC must fit inside one block");
+const _: () = assert!(DIR_TIMES_OFF >= DIR_CRC_OFF + 4,
+    "the times region must start after the record CRC, or it would corrupt what 0008 reads");
+
+/// `time` telling `fs` what the wall clock says: `[FS_CLOCK_PUSH, epoch:i64]`, ONE WAY.
+///
+/// **`fs` must never ASK for the clock, and this is why it is a push.** Two independent reasons, and
+/// either alone would settle it:
+///
+/// 1. `time` already sends to `fs` (it persists `/clock.last`). A synchronous call the other way is
+///    the mutual-send shape §8.9 forbids, which the kernel will neither detect nor recover.
+/// 2. `fs` serves its clients on the very endpoint it would have to await the reply on, so a
+///    request/reply wait here could DEQUEUE A CLIENT'S REQUEST and mistake it for the answer. That
+///    is not hypothetical - it is `backlog/31`, one service over, and it cost days.
+///
+/// A push has neither problem: nothing is awaited, so nothing can be eaten and nothing can block.
+/// It arrives with no reply capability, which is what distinguishes it from every real request and
+/// is the same shape `net-stack` already uses for `time`'s sync nudge.
+const FS_CLOCK_PUSH: u8 = 0xC1;
+
+/// How long a pushed clock reading is carried forward on the monotonic counter before `fs` stops
+/// trusting it. `time` pushes far more often than this; the bound exists so that a `time` which has
+/// died cannot leave `fs` stamping files from an ever-staler reading forever.
+const CLOCK_MAX_AGE_S: i64 = 300;
+
+/// SEALED rides the top bit of a record's 64-bit `size`.
+///
+/// **The record is full - there was no spare byte, and each obvious candidate was worse.** A high bit
+/// in `name_len` makes readers skip the entry (`nl > NAME_MAX`), so a sealed file would VANISH from
+/// its own listing. A high bit in `itype` matches neither `ITYPE_FILE` nor `ITYPE_DIR`, so the entry
+/// becomes unclassifiable. Growing the record to 128 bytes would halve how many entries a directory
+/// block holds, for one bit.
+///
+/// The size field has room that no file can ever reach: 2^63 bytes is eight exabytes. The cost is
+/// that a build which does not know this feature would display a nonsense size - which is why the
+/// volume also carries `FEAT_RO_COMPAT_SEALED`, so such a build mounts READ-ONLY and can neither act
+/// on that wrong number nor change anything.
+///
+/// Every read of a size goes through `rec_size`, which masks it off, so the flag cannot leak into
+/// arithmetic. That is the whole reason these are functions rather than an inline `& !BIT`.
+const REC_SEALED_BIT: u64 = 1 << 63;
+
+/// A time this volume does not record. Displayed as "unknown", never as an epoch date.
+const TIME_UNKNOWN: u32 = 0;
 const NAME_MAX: usize = 38; // entry: type u8 @0, name_len u8 @1, name[38] @2, size @40, first @48, count @56
 
 // Crash-consistency journal region (GSFS0008 geometry). Fixed size, bounded (§26.6): a
@@ -108,6 +193,11 @@ const COMMIT_CRC_OFF: usize = 508; // commit record: CRC32 of [0..8+n*8] lives a
 // `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
 // limit - a too-deep tree is refused loudly rather than risking the service stack.
 const MAX_TREE_DEPTH: u32 = 64;
+
+/// How long the `crash-window` build holds the commit-to-checkpoint window open, in seconds.
+/// Long enough to reach for a plug and short enough that an accidental arm is not a wedge.
+#[cfg(feature = "crash-window")]
+const CRASH_WINDOW_SECS: u64 = 10;
 const LABEL_MAX: usize = 31; // superblock: label_len u8 @76, label[31] @77
 
 const ITYPE_FREE: u8 = 0;
@@ -170,12 +260,44 @@ const OP_WRITE_AT_J: u8 = 28; // [op, plen, path, offset:u64, chunk…] - like W
 const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep - walk the tree, verify
                              // every block's CRC, report → [FS_OK, files:u32, dirs:u32, bad:u32,
                              // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
+/// Seal a file: `[op, plen, path]`. Content frozen permanently - see `Fs::seal`.
+const OP_SEAL: u8 = 31;
 const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
                              // delegated resource for the file, reply [FS_OK] + the embedded FILE CAP.
                              // The client then operates the file by INVOKING that cap (no fs name in
                              // hand), the kernel badges the request with the resource id + right.
 const FS_OK: u8 = 0;
 const FS_ERR: u8 = 1;
+/// How much of a failure's REASON rides back with `FS_ERR` (see `send_res!`). Bounded (§26.6):
+/// every reason is a `&'static str` in this file, and the longest is well under this.
+const FS_ERR_REASON_MAX: usize = 64;
+
+/// Reply `FS_OK`, or `FS_ERR` **with the reason**: `send_res!(send, expr)`.
+///
+/// `fs` has always known why a mutating op failed - "file is sealed", "no space", "path is a
+/// directory" - and has always thrown it away at the reply, sending a bare `FS_ERR`. The client then
+/// guessed, and the guess was often wrong in the way that costs the most time: writing to a file you
+/// had just sealed answered `write: failed (bad path, or parent missing?)`, sending the operator
+/// hunting for a typo in a path that was perfectly correct. A failure that MISDIRECTS is worse than
+/// one that says nothing (§26.7, invariant 12), and the reason was already in hand.
+///
+/// `[FS_ERR, reason bytes...]`, so this is purely additive: byte 0 is unchanged and every existing
+/// consumer reads the same answer it always did. The reply closure is passed in because each serve
+/// function owns its own.
+macro_rules! send_res {
+    ($send:expr, $r:expr) => {{
+        match $r {
+            Ok(()) => $send(&[FS_OK]),
+            Err(e) => {
+                let mut eb = [0u8; 1 + FS_ERR_REASON_MAX];
+                eb[0] = FS_ERR;
+                let n = e.len().min(FS_ERR_REASON_MAX);
+                eb[1..1 + n].copy_from_slice(&e.as_bytes()[..n]);
+                $send(&eb[..1 + n]);
+            }
+        }
+    }};
+}
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact),
@@ -226,6 +348,36 @@ const FOP_CLOSE: u8 = 4; // [FOP_CLOSE]  → [FS_OK]; revoke the resource + free
 // Capability right bits - MUST match the kernel `Rights` bitfield (§7.4) and the SDK `RIGHT_*`.
 const RIGHT_READ: u8 = 1 << 0;
 const RIGHT_WRITE: u8 = 1 << 1;
+/// Ask for an APPEND-ONLY capability. **A flag in the `fs` OPEN protocol, not a kernel right.**
+///
+/// The kernel's rights are fixed (`capability/rights.rs`): bits 0-5 are READ, WRITE, SEND, RECV,
+/// GRANT and REVOKE. There is no spare bit meaning "append", and taking one would be worse than
+/// useless - bit 2 is SEND, so a capability minted with it asks the kernel for something else
+/// entirely. (Measured: minting APPEND as `1 << 2` made every invoke fail, including the one that
+/// should have succeeded.)
+///
+/// So append-only is expressed where it belongs: as a property of the RESOURCE, which §7.10 puts in
+/// the hands of the service that owns it. `fs` mints an ordinary WRITE capability - the kernel
+/// validates it exactly as it validates any other - and records against that `ResourceId` that
+/// writes through it may only EXTEND. A holder cannot escape the restriction by any route, because
+/// the capability only ever reaches the file through `fs`, and `fs` is what is enforcing it.
+///
+/// **What the restriction actually is: a HIGH-WATER MARK, not `offset == size`.** The obvious rule -
+/// only write at the end of the file - cannot be expressed here, because `write_at` demands
+/// block-aligned offsets and `write_new` pre-allocates the whole extent, so a streamed file is its
+/// final size from the first moment. `fs` therefore records the furthest offset written through the
+/// resource and refuses anything at or below it: writes may only move FORWARD.
+///
+/// **`recorder` is the shape this is for**, though it does not yet ask for it. It streams a capture
+/// file holding full `WRITE` - the authority to go back over and rewrite the very history it is
+/// recording - so a capture's integrity rests on `recorder` being well-behaved rather than on what
+/// it can do. A capability that cannot write backwards makes the log unrewritable by construction
+/// (§7.3: rights narrow and never widen). Exercised today by the shell's `fcap` self-check, which
+/// streams exactly as `recorder` does.
+///
+/// This bit never reaches the kernel: it is masked off before the mint.
+const OPEN_APPEND_ONLY: u8 = 1 << 6;
+
 const RIGHT_GRANT: u8 = 1 << 4;
 
 // Open-file table (file-as-capability): maps a delegated `ResourceId` → the file path it names, so
@@ -243,6 +395,11 @@ const OPEN_PATH_MAX: usize = 96;
 struct OpenFile {
     rid: u64, // 0 = free slot
     plen: u8,
+    /// Writes through this resource may only move FORWARD - see `OPEN_APPEND_ONLY`.
+    append_only: bool,
+    /// The high-water mark: one byte past the furthest write made through this resource. An
+    /// append-only holder may not write below it, which is what makes the log unrewritable.
+    write_hwm: u64,
     path: [u8; OPEN_PATH_MAX],
 }
 
@@ -321,6 +478,10 @@ struct Fs {
     /// RATIO of the two is what matters, and a ratio needs no cycles-per-second - which is why it is
     /// measured this way on a board whose TSC calibration is not trustworthy.
     blk_cycles: core::cell::Cell<u64>,
+    /// The cached wall clock: `(epoch_seconds, the monotonic second it was read)`. `Cell` because
+    /// stamping happens on `&self` paths, and owned by `Fs` rather than a static (invariant 9).
+    /// See `now_epoch` and `CLOCK_REFRESH_S`.
+    clock: core::cell::Cell<(u32, i64)>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
     /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
@@ -346,6 +507,9 @@ struct Fs {
     // `commit_txn` right after the commit record is durable but before the checkpoint, to
     // simulate a power loss at the worst moment. Always false in production.
     crash_after_commit: bool,
+    /// `crash-window` build: this transaction touches a `/cutme…` path, so hold the
+    /// commit-to-checkpoint window open. Set by the op dispatch, cleared when the window closes.
+    crash_window_armed: bool,
     // Open-file table (file-as-capability, §7.10): delegated ResourceId → file path. `rid == 0`
     // is a free slot. Reset on mount (an fs restart invalidates all outstanding file caps).
     open_files: [OpenFile; MAX_OPEN],
@@ -377,6 +541,10 @@ const _: () = assert!(
 #[derive(Clone, Copy)]
 struct Entry {
     itype: u8,
+    /// Content frozen permanently (`REC_SEALED_BIT`). Carried on the Entry so that EVERY path which
+    /// walks to a file - and every write path does - has the answer already, and no write route can
+    /// be added later that forgets to ask.
+    sealed: bool,
     size: u64,
     first_block: u64,
     block_count: u64,
@@ -425,6 +593,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // block-driver requests carry a correlation tag at byte 0 (`treq[0] = tag`), opcode at byte 1.
     ctx.trace_op_at("block-driver", 1);
     ctx.log("fs: starting");
+    guard_selftest(&ctx);
+    protocol_selftest(&ctx);
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
     // None only while block-driver is not answering yet - still registering, or our cached cap went
@@ -503,6 +673,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut storage_unreadable = false;
     // Replies that could not be delivered; owned here so no global state is needed (Commandment VI).
     let mut reply_fails = 0u32;
+    // Owned here and threaded, exactly like `reply_fails` above (Commandment VI). Zero-sized unless
+    // `lose-reply-test` is built in, so a shipping build cannot lose a reply.
+    let mut lose = LoseReply::new();
+    // Owned here and threaded exactly like `lose` above (Commandment VI). Zero-sized unless
+    // `drop-request-test` is built in, so a shipping build cannot discard a request.
+    let mut dropreq = DropRequest::new();
     // ONE `Fs`, DECLARED FIRST AND FILLED IN PLACE.
     //
     // This was an `if/else` EXPRESSION whose else-branch built the volume in a local called `mounted`
@@ -534,7 +710,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Establish durability AT MOUNT, so the warning (if any) sits in the boot log
                     // beside the mount line. It was previously emitted by the first transaction to
                     // ask, which on a fresh prompt is the shell recording its history - so an
-                    // operator's first `ls` answered with two lines about journal ordering before it
+                    // operator's first `dir` answered with two lines about journal ordering before it
                     // answered with the directory. The fact is about the medium, not the command.
                     let _ = f.durable_or_warn(&ctx);
                     break;
@@ -603,6 +779,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (Commandment VIII). The mount above already self-reconciled on block-driver's truth, so we
     // come up either mounted or on a genuinely raw/unreadable disk; if block-driver restarts at run
     // time, `serve` reacquires it by name and the client retries (§14.3).
+    let mut clock_push_seen = false;
     ctx.log("fs: serving file API");
     // PUBLISHED EVERY 32 REQUESTS, not every one. A metric that costs an IPC send per request would
     // double this service's traffic to measure it, and an observer that changes the thing it observes
@@ -706,13 +883,72 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         let reply = match ctx.take_pending_cap() {
             Some(c) => c,
-            None => continue,
+            None => {
+                // NO REPLY CAPABILITY. A real request always carries one, so this is either the
+                // clock `time` pushes (see `FS_CLOCK_PUSH`) or something that cannot be answered.
+                let pl = msg.payload_bytes();
+                if pl.len() >= 9 && pl[0] == FS_CLOCK_PUSH {
+                    // SAY IT ONCE. Before this line there was no way to tell "the clock link works"
+                    // from "every file is stamped unknown and nobody knows why" - and a file written
+                    // before the first push legitimately HAS no date, so an operator needs to know
+                    // when the link came up to read a listing correctly.
+                    if !clock_push_seen {
+                        clock_push_seen = true;
+                        ctx.log("fs: wall clock received from `time` - entries written from now on carry a date");
+                    }
+                    if let Some(f) = fs.as_ref() {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&pl[1..9]);
+                        f.clock_push(&ctx, i64::from_le_bytes(b));
+                    }
+                }
+                continue;
+            }
         };
+        // DISCARD BEFORE SERVING, when the injector is built in. Placed here rather than inside
+        // `serve` so the operation genuinely never runs - dropping the reply afterwards is what
+        // `LoseReply` already does, and the whole point of this one is the other side of the commit.
+        {
+            let p = msg.payload_bytes();
+            // Byte 0 is the correlation tag, byte 1 is the op - the split `serve` makes below.
+            let op = if p.len() >= 2 { p[1] } else { 255 };
+            if dropreq.discard(&ctx, op) { continue; }
+        }
+        // A CAPACITY THAT ARRIVES LATE. `capacity` is what block-driver reported when this service
+        // mounted, and it was never asked again - so a stick that finishes enumerating AFTER `fs`
+        // starts leaves it 0 forever, and `drives flash` then refuses a disk that is present and
+        // serving. Measured on riscv64 (`backlog/34`), where the USB stack binds the stick after we
+        // are already up:
+        //     fs: drives-info - capacity 32768 sectors, mounted false
+        //     fs: flash requested (capacity 0 sectors, forced false)
+        //     fs: flash REFUSED - block-driver reports 0 capacity
+        // Two of our own statements disagreeing four lines apart, because `OP_DRIVES_INFO` re-derives
+        // and nothing else does.
+        //
+        // ONLY WHILE WE BELIEVE THERE IS NO DISK. Once a real capacity is known this costs nothing,
+        // and read/write never pay an extra round trip for a question already answered.
+        //
+        // AND IT IS DONE HERE, AT THE CALLER, NOT INSIDE THE ARMS THAT NEED IT - which is the whole
+        // reason this comment is long. `protocol_selftest` walks EVERY opcode 0..=255 through
+        // `serve_once`, and 21 is `OP_FLASH`, 149 is `OP_FLASH | 0x80` (forced) and 23 is `OP_RESET`.
+        // The only thing that stops that selftest formatting the live disk on every boot is the
+        // `capacity = 0` it passes in. Re-deriving inside those arms overrides the injected zero and
+        // the selftest wipes the machine's storage before the prompt appears - measured, twice per
+        // boot, and it took `fs-all` from 25 of 25 to 2 of 25 with no suite ever typing `flash`.
+        if capacity == 0 {
+            if let Some(n) = block_capacity(&ctx) {
+                if n > 0 {
+                    ctx.log_fmt(format_args!(
+                        "fs: block-driver now reports {} sectors (it reported none at mount) - adopting it", n));
+                    capacity = n;
+                }
+            }
+        }
         match badge {
             Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable,
                                                 msg.payload_bytes(), reply, &mut reply_fails),
             None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply,
-                          &mut reply_fails),
+                          &mut reply_fails, &mut lose),
         }
         ctx.remove_cap(reply);
     }
@@ -1005,8 +1241,8 @@ fn op_is_read_only(op: u8) -> bool {
 ///
 /// `fs` already re-mounts when it has seen an I/O error - but it did so at the TOP of the serve loop,
 /// which means the request that DISCOVERS the error is always the one that fails, and only the next one
-/// benefits. That is exactly the "I have to run `ls` twice" the operator hit after replugging the USB
-/// stick: the first `ls` finds the stale mount, dies, and repairs it for the second. §26.7 says a
+/// benefits. That is exactly the "I have to run `dir` twice" the operator hit after replugging the USB
+/// stick: the first `dir` finds the stale mount, dies, and repairs it for the second. §26.7 says a
 /// recovery that leaves the triggering operation failed is only half a recovery, so the repair now
 /// happens INSIDE the request: attempt, and if the device errored and a re-mount succeeds, attempt again
 /// before replying. The caller sees one answer, and for a read-only op that answer is the right one.
@@ -1039,6 +1275,87 @@ fn op_is_read_only(op: u8) -> bool {
 /// The drop is REPORTED, not swallowed (§26.7): without this a caller timing out looks like a slow disk
 /// rather than an answer its queue had no room for. Rate-limited on the first and every 64th, because a
 /// full queue is a burst - a dead caller would otherwise log once per request.
+/// Carnage §3.5: swallow the reply to the first destructive op, once.
+///
+/// **THIS PROVES A GAP THE CARNAGE DOC ALREADY NAMES, RATHER THAN HUNTING FOR ONE.** §3.5 records
+/// that "a duplicate request can repeat a destructive operation, and nothing stops it today", and
+/// the shell makes it live rather than theoretical: on a timeout it reacquires `fs` and RE-SENDS.
+///
+/// The protocol cannot deduplicate. The correlation tag matches a reply to a request - the shell
+/// deliberately draws a FRESH one for the retry (`next_fs_tag`) so the late original can be told
+/// apart - so a retry is indistinguishable from a new request by design, not by oversight.
+///
+/// The harm needs no second client. A `move` that SUCCEEDS and loses its reply is retried; the
+/// second attempt finds nothing at the source and fails, so the user is told an operation failed
+/// that actually worked. A wrong outcome reported confidently is exactly what §26.7 forbids.
+///
+/// State is owned by `service_main` and threaded, like `reply_fails` beside it - Commandment VI
+/// refuses a static, and it was right to (`fs-blockchaos` learned that the hard way).
+#[cfg(feature = "lose-reply-test")]
+pub struct LoseReply { armed: bool }
+#[cfg(not(feature = "lose-reply-test"))]
+pub struct LoseReply;
+
+impl LoseReply {
+    #[cfg(feature = "lose-reply-test")]
+    pub fn new() -> Self { LoseReply { armed: true } }
+    #[cfg(not(feature = "lose-reply-test"))]
+    pub fn new() -> Self { LoseReply }
+
+    /// True if this reply should be swallowed. Fires once, for one op, and never on a shipping build.
+    #[cfg(feature = "lose-reply-test")]
+    pub fn swallow(&mut self, ctx: &ServiceContext, op: u8) -> bool {
+        if !self.armed || op != OP_MOVE { return false; }
+        self.armed = false;
+        ctx.log("fs: [lose-reply-test] the MOVE completed - dropping its reply so the client retries");
+        true
+    }
+    #[cfg(not(feature = "lose-reply-test"))]
+    #[inline(always)]
+    pub fn swallow(&mut self, _ctx: &ServiceContext, _op: u8) -> bool { false }
+}
+
+/// The OTHER side of a lost reply, and the one `lose-reply-test` cannot reach.
+///
+/// `LoseReply` drops a reply AFTER the operation committed: the move happened, the client never
+/// heard, and re-sending would repeat a destructive op. This drops the REQUEST BEFORE it is served:
+/// the move never happened at all, and re-sending would be free.
+///
+/// **The client cannot tell these apart, and that is the finding rather than a gap.** Both look
+/// identical from the caller - a request sent, no reply, a deadline passed. So the shell refuses to
+/// retry a mutating op in BOTH cases and says `OUTCOME UNKNOWN`, which is conservative in this one
+/// (nothing happened) and correct in the other (something did). What this injector tests is that
+/// the conservative answer is still HONEST: the filesystem is consistent, the operator is not told
+/// something false, and `dir` settles it.
+///
+/// Carnage 3.5, second bullet: "client timeouts injected immediately before and after a commit,
+/// then retried, with the outcome inspected."
+#[cfg(feature = "drop-request-test")]
+pub struct DropRequest { armed: bool }
+#[cfg(not(feature = "drop-request-test"))]
+pub struct DropRequest;
+
+impl DropRequest {
+    #[cfg(feature = "drop-request-test")]
+    pub fn new() -> Self { DropRequest { armed: true } }
+    #[cfg(not(feature = "drop-request-test"))]
+    pub fn new() -> Self { DropRequest }
+
+    /// True if this REQUEST should be discarded unserved. Fires once, for one op, and never on a
+    /// shipping build - the same shape and the same guarantee as `LoseReply::swallow`.
+    #[cfg(feature = "drop-request-test")]
+    pub fn discard(&mut self, ctx: &ServiceContext, op: u8) -> bool {
+        if !self.armed || op != OP_MOVE { return false; }
+        self.armed = false;
+        ctx.log("fs: [drop-request-test] discarding a MOVE BEFORE it runs - the client will time out \
+                 on an operation that never happened");
+        true
+    }
+    #[cfg(not(feature = "drop-request-test"))]
+    #[inline(always)]
+    pub fn discard(&mut self, _ctx: &ServiceContext, _op: u8) -> bool { false }
+}
+
 fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
     if r.is_err() {
         *fails = fails.saturating_add(1);
@@ -1050,7 +1367,7 @@ fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32)
 }
 
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle,
-         reply_fails: &mut u32) {
+         reply_fails: &mut u32, lose: &mut LoseReply) {
     // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
     // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
     // from an answer to an earlier one. Everything after it is the request exactly as every opcode arm
@@ -1099,7 +1416,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         }
     }
     if len != REPLY_SENT_DIRECTLY {
-        // A FAILING reply must be able to say why. `ls` came back as "storage error" after a stick
+        // A FAILING reply must be able to say why. `dir` came back as "storage error" after a stick
         // replug with nothing anywhere explaining it - no block-read failure, no re-mount, no I/O error
         // at all - which left the operator (and me) guessing from the outside for several rounds. That is
         // precisely the unexplained failure §26.7 exists to prevent, and the fix is not another sweep of
@@ -1118,6 +1435,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         // malformed one and reports something misleading. Never send one - say ERR properly.
         if len == 0 { out[1] = FS_ERR; len = 1; }
         // +1 for the tag at out[0]
+        if lose.swallow(ctx, p.first().copied().unwrap_or(0) & 0x7F) { return; }
         reply_nonblocking(ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
     }
 
@@ -1155,6 +1473,17 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// minted file capability in its reply, and a capability transfer is not bytes - it moves authority
 /// through the kernel (§8.5). That arm sends for itself and sets `out_len` to [`REPLY_SENT_DIRECTLY`]
 /// so the caller does not then send a second, empty reply on top of it.
+/// `capacity` IS AN INJECTION POINT, NOT JUST A NUMBER - do not re-derive it inside an arm.
+///
+/// `protocol_selftest` drives this function with every opcode from 0 to 255, and three of those are
+/// destructive: 21 `OP_FLASH`, 149 `OP_FLASH | 0x80` (forced) and 23 `OP_RESET`. What makes that
+/// safe is the `capacity = 0` the selftest passes, which every destructive arm refuses on. An arm
+/// that asks `block_capacity()` for itself ignores that zero, and the selftest then formats the
+/// machine's real disk during boot, before any prompt exists to object.
+///
+/// That is not hypothetical: it was done on 2026-09-20 and took `fs-all` from 25 of 25 to 2 of 25,
+/// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
+/// (see the serve loop), where the selftest is not involved.
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
               tag: u8, reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
     let mut send = |bytes: &[u8]| {
@@ -1302,7 +1631,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 Some(f) => {
                     f.begin_txn();
                     let r = f.relabel(ctx, label);
-                    send(&[match f.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+                    send_res!(send, f.end_txn(ctx, r));
                 }
                 None => send(&[nofs]),
             }
@@ -1344,14 +1673,18 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                     send(&[FS_ERR]);
                 }
                 Some(f) => match f.check(ctx) {
-                    Ok((files, dirs, bad, used)) => {
-                        let mut out = [0u8; 29];
+                    Ok((files, dirs, bad, used, stored_before)) => {
+                        // 37 bytes now, not 29: the trailing u64 is what the SUPERBLOCK said before
+                        // the rebuild, so a client can report that a repair was needed rather than
+                        // only its result. Appended, so a client reading the first 29 is unaffected.
+                        let mut out = [0u8; 37];
                         out[0] = FS_OK;
                         out[1..5].copy_from_slice(&files.to_le_bytes());
                         out[5..9].copy_from_slice(&dirs.to_le_bytes());
                         out[9..13].copy_from_slice(&bad.to_le_bytes());
                         out[13..21].copy_from_slice(&used.to_le_bytes());
                         out[21..29].copy_from_slice(&f.free_blocks.to_le_bytes());
+                        out[29..37].copy_from_slice(&stored_before.to_le_bytes());
                         send(&out);
                     }
                     Err(_) => send(&[FS_ERR]),
@@ -1395,7 +1728,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     // than silently dropping the write. Reads (STAT/READ/READ_AT/LIST) pass through.
     if fs.read_only && op_is_mutating(op) {
         ctx.log("fs: write refused - filesystem mounted READ-ONLY (unsupported ro_compat feature)");
-        send(&[FS_ERR]);
+        send_res!(send, Err::<(), &str>("filesystem is mounted READ-ONLY (unsupported feature)"));
         return;
     }
     let plen = p[1] as usize;
@@ -1406,11 +1739,17 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     // commit them through the journal (`end_txn`). A crash before the commit record leaves the
     // fs unchanged; after it, the op is replayed on the next mount. (delete_tree manages its
     // own transactions; write_at writes only data, so neither is wrapped here.)
+    // ARM THE CRASH WINDOW when the path says so (`crash-window` build only; compiled out
+    // otherwise). `/cutme...` is the operator saying "hold the journal open on this one" without a
+    // protocol op or a shell verb existing to say it.
+    #[cfg(feature = "crash-window")]
+    { fs.crash_window_armed = path.starts_with(b"/cutme"); }
+
     macro_rules! txn {
         ($e:expr) => {{
             fs.begin_txn();
             let r = $e;
-            send(&[match fs.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, fs.end_txn(ctx, r));
         }};
     }
     match op {
@@ -1438,7 +1777,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             let offset = u64_at(tail, 0);
             let chunk = &tail[8..];
             // Direct (not journaled): no transaction - the fast streaming path (§6.8 data model).
-            send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, fs.write_at(ctx, path, offset, chunk, false));
         }
         OP_WRITE_AT_J => {
             if tail.len() < 8 { send(&[FS_ERR]); return; }
@@ -1448,7 +1787,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // atomically (crash → replayed or discarded, never torn). Bounded to one chunk.
             fs.begin_txn();
             let r = fs.write_at(ctx, path, offset, chunk, true);
-            send(&[match fs.end_txn(ctx, r) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            send_res!(send, fs.end_txn(ctx, r));
         }
         OP_READ_AT => {
             if tail.len() < 12 { send(&[FS_ERR]); return; }
@@ -1479,23 +1818,42 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             }
             send(&out);
         }
+        OP_SEAL => txn!(fs.seal(ctx, path)),
         OP_MKDIR => txn!(fs.mkdir(ctx, path)),
         OP_MKDIR_P => txn!(fs.mkdir_parents(ctx, path)),
-        OP_LIST_DIR => match fs.list_dir(ctx, path) {
-            Some(out) => send(&out),
-            None => send(&[FS_NOTFOUND]),
-        },
+        // [op, plen, path, from:u32 LE] - an absent or short tail means "start at the beginning",
+        // so a caller that does not page is unchanged and needs to know nothing about the cursor.
+        OP_LIST_DIR => {
+            let from = if tail.len() >= 4 {
+                u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]])
+            } else { 0 };
+            match fs.list_dir(ctx, path, from) {
+                Some(out) => send(&out),
+                None => send(&[FS_NOTFOUND]),
+            }
+        }
         OP_RENAME => txn!(fs.rename(ctx, path, tail)),
         OP_DELETE => txn!(fs.delete(ctx, path)),
         // delete_tree manages its own transactions (unlink + batched frees) - not wrapped.
-        OP_DELETE_TREE => send(&[match fs.delete_tree(ctx, path) { Ok(()) => FS_OK, Err(_) => FS_ERR }]),
+        OP_DELETE_TREE => send_res!(send, fs.delete_tree(ctx, path)),
         OP_MOVE => txn!(fs.move_path(ctx, path, tail)),
         OP_OPEN => {
             // [op, plen, path, rights:u8] → mint a delegated resource for the file and reply
             // [FS_OK] with the FILE CAP embedded; the client then operates the file by invoking
             // that cap (§7.10). `open_file` sends its own reply (it must embed the cap), so we
             // only send FS_ERR if it failed before replying.
-            let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE) };
+            let mut want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE | OPEN_APPEND_ONLY) };
+            // A SEALED file yields no writable capability. Refused HERE rather than at each write,
+            // because handing out a cap that looks writable and fails on use is a worse answer than
+            // refusing plainly - and because §7.3 says rights narrow, so a capability that cannot be
+            // honoured should never be minted in the first place.
+            if want & (RIGHT_WRITE | OPEN_APPEND_ONLY) != 0
+                && fs.walk(ctx, path).map_or(false, |e| e.sealed)
+            {
+                ctx.log("fs: refusing a writable capability to a SEALED file (read-only is available)");
+                want &= RIGHT_READ;
+                if want == 0 { send(&[FS_DENIED]); return; }
+            }
             if fs.open_file(ctx, path, want, tag, reply).is_err() { send(&[FS_ERR]); }
             else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
         }
@@ -1553,12 +1911,46 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
             }
         }
         FOP_WRITE => {
-            if right & RIGHT_WRITE == 0 { send(&[FS_DENIED]); return; } // ← non-escalation: a READ cap can't write
+            // WRITE may put bytes anywhere. APPEND may only ADD them.
+            //
+            // Checked against the file's CURRENT size at the moment of the write, which is what makes
+            // it an enforcement rather than an honour system: a holder cannot read the size, decide
+            // to overwrite, and send the old offset, because the offset is compared here and now.
+            // A short write elsewhere in the file is refused identically to a write by a READ-only
+            // cap - `FS_DENIED`, the same non-escalation answer (§7.3).
+            if right & RIGHT_WRITE == 0 { send(&[FS_DENIED]); return; } // non-escalation: a READ cap can't write
             if fs.read_only { send(&[FS_ERR]); return; }
             if p.len() < 9 { send(&[FS_ERR]); return; }
             let offset = u64_at(p, 1);
+            if fs.open_is_append_only(rid) {
+                // FORWARD ONLY. The rule is against this resource's own HIGH-WATER MARK, not against
+                // the file's size, and that is what makes it fit how a log is actually written:
+                // `write_new` allocates the whole extent up front, so `size` is the FINAL size from
+                // the first moment and an end-of-file test would refuse every write. `write_at` also
+                // demands block-aligned offsets, so "exactly at the end" is not expressible anyway.
+                //
+                // What this guarantees, stated exactly: **within the life of this capability, a
+                // holder can never write below anything it has already written.** A log cannot be
+                // gone back over and edited, which is the property `recorder` needs.
+                //
+                // What it does NOT guarantee, recorded so it is not over-read: the first write may
+                // land anywhere, so this does not protect content that existed BEFORE the capability
+                // was minted, and closing and re-opening starts a fresh mark. Both are bounded by who
+                // can call OPEN at all, which is a separate authority.
+                let hwm = fs.open_hwm(rid);
+                if offset < hwm {
+                    ctx.log_fmt(format_args!(
+                        "fs: APPEND-only capability refused a write at offset {} - it has already                          written up to {}, and may not go back over it", offset, hwm));
+                    send(&[FS_DENIED]);
+                    return;
+                }
+            }
             let chunk = &p[9..];
-            send(&[match fs.write_at(ctx, path, offset, chunk, false) { Ok(()) => FS_OK, Err(_) => FS_ERR }]);
+            let r = fs.write_at(ctx, path, offset, chunk, false);
+            // Advance the mark only on a write that actually landed, so a refused or failed write
+            // cannot move it and lock the holder out of ground it never covered.
+            if r.is_ok() { fs.open_bump_hwm(rid, offset + chunk.len() as u64); }
+            send_res!(send, r);
         }
         FOP_STAT => {
             if right & RIGHT_READ == 0 { send(&[FS_DENIED]); return; }
@@ -1678,6 +2070,10 @@ impl Fs {
         // read-only mount still recovers: replaying an already-committed write is not a new write,
         // and leaving the fs torn would be worse - see §6.15.)
         Fs::recover(ctx, u64_at(&sb, 108));
+        // The replay may have rewritten the superblock - see the note above this function. Read it
+        // again, and fall back to the pre-replay copy if that read fails, because a mount that got
+        // this far on the first read must not be lost to a transient failure on the second.
+        let sb = Self::read_superblock(ctx).unwrap_or(sb);
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
@@ -1703,6 +2099,7 @@ impl Fs {
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
+            clock: core::cell::Cell::new((0, 0)),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -1713,7 +2110,8 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
-            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
+            crash_window_armed: false,
+            open_files: [OpenFile { rid: 0, plen: 0, append_only: false, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         });
         Ok(())
     }
@@ -1783,7 +2181,7 @@ impl Fs {
     /// **A CRC mismatch is re-read ONCE before it is believed.** On the Pi's USB backend the first
     /// tree read after a device revival was observed returning garbage that the transport accepted as
     /// a complete transfer - the root block "failed its CRC", the operator was told the tree was
-    /// unreadable and to reformat, and the very next read of the same block was clean (an `ls` through
+    /// unreadable and to reformat, and the very next read of the same block was clean (an `dir` through
     /// the root PASSED seconds later). The medium was fine; the READ lied once. Declaring permanent
     /// corruption - whose stated remedy is `drives flash`, i.e. destroying the tree - on a single
     /// read's evidence turns a transient into data loss by prescription. One bounded re-read separates
@@ -1860,10 +2258,11 @@ impl Fs {
         Some(blk)
     }
 
-    /// Directory-block write: stamp the CRC trailer, then stage/through via `tb_write`.
+    /// Directory-block write: stamp both CRC trailers, then stage/through via `tb_write`.
     fn td_write(&mut self, ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
         let c = crc32(&blk[..DIR_REC_REGION]);
         blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+        dir_times_stamp(blk);
         self.tb_write(ctx, lba, blk)
     }
 
@@ -1889,12 +2288,21 @@ impl Fs {
 
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
         let t_blk = self.blk_begin(ctx);
-        let flushed = block_flush(ctx);
+        let outcome = block_flush_outcome(ctx);
         self.blk_end(ctx, t_blk);
-        if flushed { return true; }
+        if matches!(outcome, FlushOutcome::Durable) { return true; }
         if !self.flush_warned.get() {
             self.flush_warned.set(true);
-            ctx.log("fs: durability NOT attested by this drive - it accepts no cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25).");
+            match outcome {
+                // THE DEVICE ANSWERED AND SAID NO. This is the case CLAUDE.md 6.1 describes, and the
+                // only one that is evidence about the drive.
+                FlushOutcome::Refused => ctx.log("fs: durability NOT attested - this drive ANSWERED and refused the cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25)."),
+                // NOBODY ANSWERED. The barrier did not happen, so the same risk applies to THIS
+                // transaction - but it says nothing about the device, and must not be read as though
+                // it did. `build/pi2a.log` is what happens otherwise: this fired twice during a chaos
+                // run, right after `block-driver died, restarting`, reading as a verdict on the stick.
+                _ => ctx.log("fs: durability NOT attested - the block driver did not answer the flush (dead, restarting, or slow). The barrier did not happen for this transaction; this says NOTHING about whether the drive supports a cache flush."),
+            }
         }
         false
     }
@@ -1925,6 +2333,28 @@ impl Fs {
             _ => self.io_error_seen.set(true),
         }
     }
+
+    /// Hold the commit-to-checkpoint window open for `CRASH_WINDOW_SECS` (test builds only).
+    ///
+    /// Compiled to nothing without the feature, and even then it does nothing unless this
+    /// transaction was armed by a `/cutme…` path. Announced loudly and counted down, because a
+    /// window nobody can see is no more aimable than one that lasts a microsecond.
+    #[cfg(feature = "crash-window")]
+    fn crash_window(&mut self, ctx: &ServiceContext) {
+        if !self.crash_window_armed { return; }
+        self.crash_window_armed = false;
+        ctx.log_fmt(format_args!(
+            "fs: [crash-window] THE JOURNAL IS COMMITTED AND UNAPPLIED - CUT THE POWER NOW ({}s)",
+            CRASH_WINDOW_SECS));
+        for left in (1..=CRASH_WINDOW_SECS).rev() {
+            ctx.log_fmt(format_args!("fs: [crash-window] {}...", left));
+            ctx.sleep(ctx.duration_cycles(1000));
+        }
+        ctx.log("fs: [crash-window] window closed - applying the checkpoint normally. \
+                 A boot after a cut inside it must say `journal recovered`.");
+    }
+    #[cfg(not(feature = "crash-window"))]
+    fn crash_window(&mut self, _ctx: &ServiceContext) {}
 
     fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
         if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
@@ -1987,6 +2417,19 @@ impl Fs {
         let _ = self.durable_or_warn(ctx); // advisory: see BARRIER 3
         // Test-only: simulate a power loss right here - commit record durable, home not yet
         // updated. The next mount must replay this transaction. (Never set in production.)
+        // HOLD THE WINDOW OPEN so a human can aim at it (`crash-window` build only).
+        //
+        // The commit record is durable and NO home block has moved yet. That is precisely the state
+        // the journal exists to recover from, and it normally lasts under a millisecond - which is
+        // why three real power cuts on a Dell Wyse produced three clean mounts and not one
+        // `journal recovered` line. The recovery path is exercised 35 times in every QEMU tear
+        // sweep and has never once run on silicon.
+        //
+        // Armed by the PATH rather than by a command: any write whose path begins `/cutme` opens the
+        // window. That keeps the whole feature out of the protocol and out of the shell's
+        // vocabulary - the trigger is data, not surface - and makes it obvious at the prompt what
+        // is about to happen.
+        self.crash_window(ctx);
         if self.crash_after_commit {
             ctx.log("fs: [journal-crash-test] commit record durable - halting before checkpoint (simulated crash)");
             loop { ctx.yield_cpu(); }
@@ -2049,11 +2492,39 @@ impl Fs {
     /// Replay a committed-but-unfinished transaction at mount (idempotent). Called with the
     /// journal geometry from the just-validated superblock, before serving any request.
     fn recover(ctx: &ServiceContext, journal_start: u64) {
-        let commit = match block_read(ctx, journal_start) { Some(b) => b, None => return };
+        let commit = match block_read(ctx, journal_start) {
+            Some(b) => b,
+            None => {
+                ctx.log("fs: could not READ the journal block at mount - recovery did not run. This says nothing about whether a journal is there; the tree is not known consistent, so run `drives check`.");
+                return;
+            }
+        };
+        // NO MAGIC = NO JOURNAL. The one genuinely uneventful case, and the only silent one: this is
+        // what an ordinary clean shutdown leaves behind.
         if u32_at(&commit, 0) != JOURNAL_MAGIC { return; }
+        // PAST HERE A RECORD EXISTS. Every remaining bail is a decision about a real journal and says
+        // so, because "nothing was printed" must mean ONE thing, not two.
         let n = u32_at(&commit, 4) as usize;
-        if n == 0 || n > TXN_CAP || 12 + n * 8 > COMMIT_CRC_OFF { return; }
-        if crc32(&commit[..12 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        if n == 0 || n > TXN_CAP || 12 + n * 8 > COMMIT_CRC_OFF {
+            ctx.log_fmt(format_args!("fs: the journal record is present but its BLOCK COUNT is impossible ({} of at most {}) - it was torn mid-write or is not a record at all. Applying NOTHING, which is correct: a count this size was never durably written, so the transaction was never committed and home is untouched.", n, TXN_CAP));
+            return;
+        }
+        if crc32(&commit[..12 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) {
+            // THE CUT LANDED INSIDE THE COMMIT WINDOW AND THE RECORD DID NOT SURVIVE IT.
+            //
+            // Correct outcome, and worth being precise about: `commit_txn` writes this record only
+            // after every staged block is durable, and no home block moves until it is durable in
+            // turn. A record whose own CRC fails therefore never authorised anything - the
+            // transaction was not committed, home is untouched, and the filesystem is consistent.
+            // Discarding is the design, not a fallback.
+            //
+            // It is reported because it is EVIDENCE. A clean mount with no message means the cut
+            // missed the window; this message means it hit the window and the device did not finish
+            // the record. Those are different facts about the hardware, and 6.1's backend-conditional
+            // guarantee turns on exactly which one a given board produces.
+            ctx.log_fmt(format_args!("fs: the journal record is present but TORN - its own CRC does not match ({} block(s) claimed). Applying NOTHING, which is correct: the record was never durably written, so the transaction was never committed and HOME IS UNTOUCHED. What this tells you is that the power was lost INSIDE the commit window rather than outside it.", n));
+            return;
+        }
         // VERIFY THE PAYLOAD BEFORE APPLYING ANY OF IT. Read every staged block first and check it
         // against the checksum the commit recorded. A transaction whose blocks do not match is one the
         // device never durably wrote - replaying it would copy garbage over live metadata, which is
@@ -2110,6 +2581,17 @@ impl Fs {
                         return;
                     }
                     if !block_write(ctx, lba, &blk) { replayed_ok = false; }
+                    // PAUSE PART-WAY THROUGH THE REPLAY (`crash-window-replay` build only).
+                    //
+                    // After the FIRST home block has landed and before the rest have: the journal is
+                    // still intact (it is invalidated only once every block is home), so a machine
+                    // killed here must recover again on the next boot and finish the job. That is the
+                    // "recovery is restartable" claim, and until this existed it was a comment.
+                    //
+                    // Deliberately after the first write rather than before any: pausing before the
+                    // loop does anything is just the `crash-window` case again, and would prove the
+                    // same thing twice.
+                    if i == 0 { Self::replay_window(ctx); }
                 }
                 None => replayed_ok = false,
             }
@@ -2127,7 +2609,23 @@ impl Fs {
         }
     }
 
-    /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
+    /// Hold a journal REPLAY open part-way through (`crash-window-replay` build only).
+///
+/// Unconditional in that build, because `recover` runs before a mount exists and so has no per-request
+/// state to arm from. That is acceptable for a test build and would not be for any other.
+#[cfg(feature = "crash-window-replay")]
+fn replay_window(ctx: &ServiceContext) {
+    ctx.log("fs: [replay-window] A REPLAY IS HALF APPLIED - CUT THE POWER NOW (8s). The journal is still intact, so the next boot must finish it.");
+    for left in (1..=8u64).rev() {
+        ctx.log_fmt(format_args!("fs: [replay-window] {}...", left));
+        ctx.sleep(ctx.duration_cycles(1000));
+    }
+    ctx.log("fs: [replay-window] window closed - finishing the replay normally.");
+}
+#[cfg(not(feature = "crash-window-replay"))]
+fn replay_window(_ctx: &ServiceContext) {}
+
+/// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
     /// Format, constructing into `out` for the reason `mount_into` documents: `Fs` is 36 KiB and a
     /// by-value return costs a copy of it in every caller that stores the result.
@@ -2257,6 +2755,7 @@ impl Fs {
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
+            clock: core::cell::Cell::new((0, 0)),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -2267,7 +2766,8 @@ impl Fs {
             txn_lba: [0; TXN_CAP],
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
-            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
+            crash_window_armed: false,
+            open_files: [OpenFile { rid: 0, plen: 0, append_only: false, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
         });
         Ok(())
     }
@@ -2573,7 +3073,7 @@ impl Fs {
 
     // ── directory tree (self-describing entries) ──────────────────────────────
     fn root_entry(&self) -> Entry {
-        Entry { itype: ITYPE_DIR, size: 0, first_block: self.root_first_block, block_count: self.root_block_count, loc: None }
+        Entry { itype: ITYPE_DIR, sealed: false, size: 0, first_block: self.root_first_block, block_count: self.root_block_count, loc: None }
     }
 
     /// Find `name` among a directory's entries; returns the child (with its on-disk loc).
@@ -2589,7 +3089,8 @@ impl Fs {
                 if &blk[o + 2..o + 2 + nl] == name {
                     return Some(Entry {
                         itype: blk[o],
-                        size: u64_at(&blk, o + 40),
+                        size: rec_size(&blk, o),
+                        sealed: rec_is_sealed(&blk, o),
                         first_block: u64_at(&blk, o + 48),
                         block_count: u64_at(&blk, o + 56),
                         loc: Some(Loc { block, slot }),
@@ -2632,6 +3133,11 @@ impl Fs {
             for slot in 0..RECS_PER_BLOCK {
                 if blk[slot * REC_SIZE] == ITYPE_FREE {
                     encode_rec(&mut blk, slot, itype, name, size, first, count);
+                    // A new entry is modified and created at the same instant, so both times are
+                    // the same now. A clock that cannot be reached yields TIME_UNKNOWN and the
+                    // entry simply carries no date - never an invented one.
+                    let now = self.now_epoch(ctx);
+                    dir_times_set(&mut blk, slot, now, now);
                     if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
                     return Ok(());
                 }
@@ -2642,6 +3148,8 @@ impl Fs {
         let block = dir.first_block + dir.block_count - 1;
         let mut blk = self.td_read(ctx, block).ok_or("dir read failed")?;
         encode_rec(&mut blk, 0, itype, name, size, first, count);
+        let now = self.now_epoch(ctx);
+        dir_times_set(&mut blk, 0, now, now);
         if !self.td_write(ctx, block, &mut blk) { return Err("dir write failed"); }
         Ok(())
     }
@@ -2676,7 +3184,18 @@ impl Fs {
             Some(loc) => {
                 let mut blk = self.td_read(ctx, loc.block).ok_or("record read failed")?;
                 let o = loc.slot * REC_SIZE;
-                blk[o + 40..o + 48].copy_from_slice(&e.size.to_le_bytes());
+                // THE OLD SIZE IS ALREADY IN HAND, so the two times can be told apart precisely
+                // rather than coarsely. A changed size is a change to the CONTENT (mtime and ctime);
+                // a changed extent alone - a directory growing, a file relocating - is a change to
+                // the RECORD (ctime only). That distinction is the whole reason `ctime` is recorded
+                // separately: it answers "was this file edited, or just moved about?", which a backup
+                // and `drives check` both care about and a single timestamp cannot express.
+                let old_size = rec_size(&blk, o);
+                let (old_m, _) = dir_times_get(&blk, loc.slot);
+                let now = self.now_epoch(ctx);
+                let mtime = if e.size != old_size { now } else { old_m };
+                dir_times_set(&mut blk, loc.slot, mtime, now);
+                rec_set_size(&mut blk, o, e.size);   // preserves the seal
                 blk[o + 48..o + 56].copy_from_slice(&e.first_block.to_le_bytes());
                 blk[o + 56..o + 64].copy_from_slice(&e.block_count.to_le_bytes());
                 if !self.td_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
@@ -2754,6 +3273,9 @@ impl Fs {
         if parent.itype != ITYPE_DIR { return Err("parent is not a directory"); }
         if !valid_name(name) { return Err("bad name"); }
         let existing = self.dir_find(ctx, &parent, name);
+        // A sealed file is frozen: overwriting it here would be a new extent under the same name,
+        // which is exactly the rewrite the seal exists to refuse.
+        if existing.as_ref().map_or(false, |e| e.sealed) { return Err("file is sealed - its content cannot be changed"); }
         if let Some(ref e) = existing {
             if !is_file(e.itype) { return Err("path is a directory"); }
         }
@@ -2772,7 +3294,7 @@ impl Fs {
                 if !data_write(ctx, first + i as u64, payload) { return Err("block write failed"); }
             }
         } else {
-            let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+            let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
             let (exts, ne) = self.ext_of(ctx, &frag_e).ok_or("extent block read failed")?;
             let mut produced = 0usize;
             'fill: for ei in 0..ne {
@@ -2789,11 +3311,38 @@ impl Fs {
         }
         match existing {
             Some(e) => {
-                let ne = Entry { itype, size: data.len() as u64, first_block: first, block_count: count, loc: e.loc };
+                let ne = Entry { itype, sealed: false, size: data.len() as u64, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)?;
             }
-            None => self.dir_add(ctx, &mut parent, name, itype, data.len() as u64, first, count)?,
+            // HAND THE EXTENT BACK IF THE ENTRY CANNOT BE MADE. `alloc_file` above has already
+            // taken the blocks; if `dir_add` then fails - and on a full volume it fails inside
+            // `grow_dir` -> `alloc_run`, finding no room for one more directory block - the error
+            // used to propagate with those blocks still reserved. Nothing referenced them
+            // afterwards: not the directory, not a listing, not a walk. Only the free accounting
+            // knew, and it had one block fewer to give out for the life of the volume.
+            //
+            // Measured by `fs-metafull`, filling a directory until a create is refused:
+            //
+            //     check: REPAIRED the FREE COUNT - the superblock claimed 12 free, the tree says 13
+            //            (counted too little free space, off by 1)
+            //
+            // with a control stopping short of exhaustion reporting `ok` and nothing repaired, so
+            // the strand belongs to the REFUSAL rather than to the writing.
+            //
+            // The `Some(e)` branch above already reasons about this ordering - "alloc the new file
+            // first, free the old extent only after the record points at the new one" - and this
+            // branch had no rollback at all. A failed rollback must not mask the failure that
+            // caused it, so the ORIGINAL error is what the caller gets either way (26.7).
+            None => match self.dir_add(ctx, &mut parent, name, itype, data.len() as u64, first, count) {
+                Ok(()) => {}
+                Err(why) => {
+                    let orphan = Entry { itype, sealed: false, size: data.len() as u64,
+                                         first_block: first, block_count: count, loc: None };
+                    let _ = self.free_file(ctx, &orphan);
+                    return Err(why);
+                }
+            },
         }
         Ok(())
     }
@@ -2835,16 +3384,66 @@ impl Fs {
         let existing = self.dir_find(ctx, &parent, name);
         if let Some(ref e) = existing {
             if !is_file(e.itype) { return Err("path is a directory"); }
+            // A SEALED FILE IS FROZEN HERE TOO, and this check was missing.
+            //
+            // `write_path` and `write_at` both refuse a sealed entry; this route did not, and it is
+            // the one that does the most damage: it truncates the file, allocates a fresh extent and
+            // writes a REPLACEMENT entry - which was constructed with `sealed: false`. So
+            // `copy <anything> <sealed file>` silently UNSEALED it. The headline guarantee of the
+            // whole feature is that there is no unseal, and there was one.
+            //
+            // The reasoning that missed it is worth recording because it sounded sufficient: the
+            // seal is carried on the `Entry` that each write route walks to, so a new route "cannot
+            // forget to ask". But this route does not READ the entry it replaces - it overwrites it -
+            // so there was nothing to forget. Carrying a flag on a record only protects the paths
+            // that consult that record.
+            if e.sealed { return Err("file is sealed - its content cannot be changed"); }
         }
         let blocks = ((total + DATA_PAYLOAD as u64 - 1) / DATA_PAYLOAD as u64).max(1);
         let (itype, first, count) = self.alloc_file(ctx, blocks)?;
         match existing {
             Some(e) => {
-                let ne = Entry { itype, size: total, first_block: first, block_count: count, loc: e.loc };
+                // `sealed: false` is correct ONLY because the guard above proved it was not sealed.
+                let ne = Entry { itype, sealed: false, size: total, first_block: first, block_count: count, loc: e.loc };
                 self.persist_entry(ctx, &ne)?;
                 self.free_file(ctx, &e)
             }
-            None => self.dir_add(ctx, &mut parent, name, itype, total, first, count),
+            None => {
+                // HAND THE EXTENT BACK IF THE ENTRY CANNOT BE MADE.
+                //
+                // `alloc_file` above has already taken the blocks. If `dir_add` then fails - and the
+                // way it fails on a full volume is `grow_dir` -> `alloc_run` finding no space for one
+                // more directory block - the error propagated with those blocks still reserved.
+                // Nothing referenced them afterwards: not the directory, not any listing, not a walk.
+                // Only the free accounting knew, and it simply had one block fewer to give out, for
+                // the life of the volume.
+                //
+                // Measured by `fs-metafull`, which fills a directory until a create is refused:
+                //
+                //     check: REPAIRED the FREE COUNT - the superblock claimed 12 free, the tree says
+                //            13 (counted too little free space, off by 1)
+                //
+                // and its control, stopping 29 creates short of exhaustion, reports `ok` with nothing
+                // repaired. So the strand is the REFUSAL, not the writing. One block per refused
+                // create is the shape 3.4 of the carnage document warns about: "an allocator that
+                // strands a few blocks on every refusal turns a full disk into a shrinking one, and
+                // nothing in a listing would ever show it".
+                //
+                // The overwrite branch above already reasons about exactly this ordering ("alloc the
+                // new file first ... free the old extent only after the record points at the new
+                // one"); this branch had no rollback at all.
+                match self.dir_add(ctx, &mut parent, name, itype, total, first, count) {
+                    Ok(()) => Ok(()),
+                    Err(why) => {
+                        // Best effort, and the ORIGINAL error is what the caller gets either way: a
+                        // failed rollback must not mask the failure that caused it (26.7).
+                        let orphan = Entry { itype, sealed: false, size: total,
+                                             first_block: first, block_count: count, loc: None };
+                        let _ = self.free_file(ctx, &orphan);
+                        Err(why)
+                    }
+                }
+            }
         }
     }
 
@@ -2861,6 +3460,7 @@ impl Fs {
     fn write_at(&mut self, ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8], journal: bool) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if !is_file(e.itype) { return Err("not a file"); }
+        if e.sealed { return Err("file is sealed - its content cannot be changed"); }
         if offset % DATA_PAYLOAD as u64 != 0 { return Err("unaligned offset"); }
         // The file's data-block count: a contiguous file's `block_count`, else the extents'
         // total (a fragmented file's `block_count` counts only the extent block).
@@ -2925,32 +3525,107 @@ impl Fs {
         Some(n)
     }
 
-    /// Reply: `[FS_OK, count:u8, {name_len:u8, name, is_dir:u8, size:u64}…]`, one block.
-    fn list_dir(&self, ctx: &ServiceContext, path: &[u8]) -> Option<[u8; BLOCK]> {
+    /// Reply: `[FS_OK, count:u8, more:u8, {name_len:u8, name, is_dir:u8, size:u64, mtime:u32, flags:u8}…]`.
+    ///
+    /// **`more` is 1 when entries did not fit, and it exists because this used to LIE.** The reply is
+    /// one 512-byte block, so roughly 20 entries fit; a directory with more than that was listed
+    /// incompletely and `count` reported only what fit. `dir` on a directory of thirty files printed
+    /// twenty and said `(20 entries)` as though that were the whole truth, with nothing in the reply
+    /// a client could have used to tell the difference. That is not a ceiling, it is a WRONG ANSWER,
+    /// and it reached `find`, `tree`, `delete recursive` and tab completion alike (`backlog/33`).
+    ///
+    /// The flag does not remove the ceiling - a continuation cursor is what does that, and it is
+    /// recorded rather than done. It converts a silent wrong answer into a loud partial one, which
+    /// is the difference between a limitation and a defect (invariant 12, §26.7).
+    ///
+    /// `flags` bit 0 is SEALED. A SEPARATE byte rather than a spare bit of `is_dir`, deliberately: a
+    /// consumer that missed the change would then read a sealed FILE as a DIRECTORY, which is a
+    /// silent wrong answer. Getting the stride wrong instead produces visible garbage, and a loud
+    /// failure is the one to choose when a mistake is possible (§26.7).
+    ///
+    /// The `mtime` is Phase O's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
+    /// client renders that as "unknown" rather than as a date. Four bytes per entry is the cost, out
+    /// of a one-block reply: a listing that used to fit ~30 entries fits ~26, and a directory with
+    /// more than that was already being truncated by this bound. `backlog/33` records that ceiling,
+    /// which predates this change and is not made materially worse by it.
+    /// List a directory, RESUMABLY. One reply block carries roughly twenty entries; `from` says
+    /// which entry to start at, and the reply says where to ask next.
+    ///
+    /// **This used to stop at one block and set a `more` flag, which made a long directory a
+    /// question nobody could finish asking** (`backlog/33`). The flag turned a silent wrong answer
+    /// into a loud partial one; it did not make the listing obtainable. It is obtainable now: a
+    /// caller loops until `more` is 0.
+    ///
+    /// THE CURSOR IS A POSITION, NOT A HANDLE. It is an ordinal into the directory's record slots -
+    /// `block_index * RECS_PER_BLOCK + slot` - encoded in the request and returned in the reply.
+    /// `fs` therefore keeps NO per-client iteration state: nothing to allocate, nothing to evict,
+    /// nothing to invalidate when a client dies mid-walk, and no way for one client's cursor to be
+    /// disturbed by another's (§26.6 - a bound you can read off the source). A server-side iterator
+    /// handle would have needed all four, and `fs` is single-threaded, so a handle would also have
+    /// had to survive an arbitrary gap between pages.
+    ///
+    /// WHAT A MULTI-PAGE WALK ACTUALLY GUARANTEES, stated because a caller will otherwise assume
+    /// the stronger thing (§26.4 - what guarantees exist must be answerable):
+    ///
+    ///   - An entry present and unmoved for the whole walk is returned EXACTLY ONCE.
+    ///   - A record never moves between slots once written - `delete` marks its slot `ITYPE_FREE`
+    ///     in place and does not compact - so a cursor cannot skip an untouched entry, which is
+    ///     what makes the guarantee above hold at all.
+    ///   - An entry DELETED mid-walk appears if its slot was already passed, and not otherwise.
+    ///   - An entry CREATED mid-walk appears only if it lands at or after the cursor. `mkdir` and
+    ///     `write` fill the first free slot, which may be a hole BEHIND the cursor, so a file
+    ///     created during a walk can be missed entirely.
+    ///
+    /// That is the same guarantee POSIX `readdir` gives across a directory being modified, and it
+    /// is the honest one: a snapshot would need either a lock held across client round trips (which
+    /// would let a dead client wedge the filesystem) or a copy of the directory (unbounded).
+    fn list_dir(&self, ctx: &ServiceContext, path: &[u8], from: u32) -> Option<[u8; BLOCK]> {
         let d = self.walk(ctx, path)?;
         if d.itype != ITYPE_DIR { return None; }
         let mut out = [0u8; BLOCK];
         out[0] = FS_OK;
         let mut count = 0u8;
-        let mut w = 2usize;
-        for bi in 0..d.block_count {
+        let mut more = false;
+        let mut next = 0u32;
+        let mut w = DIR_HDR;   // [FS_OK, count, more, next:u32] - entries start at DIR_HDR
+        let rpb = RECS_PER_BLOCK as u64;
+        let start_bi = from as u64 / rpb;
+        let start_slot = (from as u64 % rpb) as usize;
+        'blocks: for bi in start_bi..d.block_count {
             let blk = self.td_read(ctx, d.first_block + bi)?;
-            for slot in 0..RECS_PER_BLOCK {
+            let first = if bi == start_bi { start_slot } else { 0 };
+            for slot in first..RECS_PER_BLOCK {
                 let o = slot * REC_SIZE;
                 let t = blk[o];
                 if t == ITYPE_FREE { continue; }
                 let nl = blk[o + 1] as usize;
                 if nl == 0 || nl > NAME_MAX { continue; }
-                if w + 1 + nl + 1 + 8 > BLOCK { break; }
+                // Out of room. Record WHERE WE STOPPED and stop - labelled, because the old `break`
+                // left only the slot loop and the walk carried on reading every remaining directory
+                // block to re-discover it had no room, once per entry.
+                //
+                // `next` names the entry that did NOT fit, so the following page starts exactly
+                // here. Off by one in either direction is a duplicated or a dropped entry, and a
+                // dropped one is the bug this whole change exists to remove.
+                if w + 1 + nl + 1 + 8 + 4 + 1 > BLOCK || count == u8::MAX {
+                    more = true;
+                    next = (bi * rpb + slot as u64) as u32;
+                    break 'blocks;
+                }
                 out[w] = nl as u8;
                 out[w + 1..w + 1 + nl].copy_from_slice(&blk[o + 2..o + 2 + nl]);
                 out[w + 1 + nl] = (t == ITYPE_DIR) as u8;
-                out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&blk[o + 40..o + 48]); // size:u64
-                w += 1 + nl + 1 + 8;
+                out[w + 2 + nl..w + 2 + nl + 8].copy_from_slice(&rec_size(&blk, o).to_le_bytes()); // size:u64
+                let (mtime, _) = dir_times_get(&blk, slot);
+                out[w + 10 + nl..w + 14 + nl].copy_from_slice(&mtime.to_le_bytes());
+                out[w + 14 + nl] = u8::from(rec_is_sealed(&blk, o));   // flags bit 0 = SEALED
+                w += 1 + nl + 1 + 8 + 4 + 1;
                 count += 1;
             }
         }
         out[1] = count;
+        out[2] = u8::from(more);
+        out[3..7].copy_from_slice(&next.to_le_bytes());
         Some(out)
     }
 
@@ -2996,8 +3671,15 @@ impl Fs {
         if !is_file(e.itype) { return Err("not a file"); }
         if path.len() > OPEN_PATH_MAX { return Err("path too long"); }
         let slot = self.open_files.iter().position(|o| o.rid == 0).ok_or("too many open files")?;
-        let (rid, cap) = ctx.resource_mint(want | RIGHT_GRANT).ok_or("mint failed")?;
-        let mut of = OpenFile { rid, plen: path.len() as u8, path: [0u8; OPEN_PATH_MAX] };
+        // APPEND-ONLY is a property of the RESOURCE, recorded here, and the bit never reaches the
+        // kernel - see `OPEN_APPEND_ONLY`. The minted capability carries ordinary WRITE so the
+        // kernel validates a write invoke exactly as it does any other; what narrows it is this
+        // service, which is the only thing that can act on the resource at all (§7.10).
+        let append_only = want & OPEN_APPEND_ONLY != 0;
+        let kernel_rights = (want & (RIGHT_READ | RIGHT_WRITE))
+            | if append_only { RIGHT_WRITE } else { 0 };
+        let (rid, cap) = ctx.resource_mint(kernel_rights | RIGHT_GRANT).ok_or("mint failed")?;
+        let mut of = OpenFile { rid, plen: path.len() as u8, append_only, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] };
         of.path[..path.len()].copy_from_slice(path);
         self.open_files[slot] = of;
         // Hand a derived copy to the client; drop fs's original either way.
@@ -3035,6 +3717,74 @@ impl Fs {
     }
 
     /// Resolve a delegated resource id → its file path (copied out so `self` can be reborrowed).
+    /// The wall clock NOW, as epoch seconds, for stamping a record. See `CLOCK_REFRESH_S`.
+    ///
+    /// Never blocks and never fails: a clock that cannot be reached yields `TIME_UNKNOWN`, and a
+    /// record stamped with it reads back as "unknown" rather than as 1970.
+    fn now_epoch(&self, ctx: &ServiceContext) -> u32 {
+        let (epoch, at) = self.clock.get();
+        if epoch == 0 { return TIME_UNKNOWN; }          // nobody has told us the time yet
+        let age = ctx.epoch_secs_monotonic().saturating_sub(at);
+        if age < 0 || age > CLOCK_MAX_AGE_S { return TIME_UNKNOWN; }
+        epoch.saturating_add(age as u32)
+    }
+
+    /// Accept a clock reading pushed by `time`. See `FS_CLOCK_PUSH`.
+    fn clock_push(&self, ctx: &ServiceContext, epoch: i64) {
+        // Refuse a value that cannot be a date. A clock this service cannot believe leaves the cache
+        // alone, so files keep reading "unknown" rather than acquiring a nonsense stamp.
+        if epoch <= 0 || epoch >= u32::MAX as i64 { return; }
+        self.clock.set((epoch as u32, ctx.epoch_secs_monotonic()));
+    }
+
+    /// Seal a file: its content can never change again.
+    ///
+    /// **There is no unseal, and that is the feature.** A seal a holder can lift is a request; the
+    /// value here is that nothing short of deleting the file undoes it.
+    ///
+    /// **What it does NOT claim.** The file can still be renamed, moved and DELETED - a seal freezes
+    /// CONTENT, not existence, and deleting needs authority over the parent directory rather than
+    /// over the file. Refusing deletion would make a sealed file unremovable, so a filesystem could
+    /// be filled with rubbish nobody is permitted to clear: a denial of service bought with a
+    /// guarantee nobody asked for. Overclaiming here would be worse than the narrower promise.
+    fn seal(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
+        let e = self.walk(ctx, path).ok_or("not found")?;
+        if !is_file(e.itype) { return Err("only a file can be sealed"); }
+        let loc = e.loc.ok_or("cannot seal the root")?;
+        if e.sealed { return Ok(()); }                       // idempotent: already frozen
+        // Record the FEATURE before the seal. A volume carrying a sealed file must announce it, so a
+        // build that does not know the bit mounts read-only (§6.15) instead of writing through a
+        // flag it cannot see. Doing it in this order means a crash between the two leaves a volume
+        // that is merely cautious, never one with an invisible seal.
+        if self.feat_ro_compat & FEAT_RO_COMPAT_SEALED == 0 {
+            self.feat_ro_compat |= FEAT_RO_COMPAT_SEALED;
+            self.persist_super(ctx)?;
+        }
+        let mut blk = self.td_read(ctx, loc.block).ok_or("record read failed")?;
+        rec_seal(&mut blk, loc.slot * REC_SIZE);
+        if !self.td_write(ctx, loc.block, &mut blk) { return Err("record write failed"); }
+        ctx.log_fmt(format_args!("fs: sealed a file ({} bytes) - its content can no longer change", e.size));
+        Ok(())
+    }
+
+    /// Was this resource opened APPEND-ONLY? See `OPEN_APPEND_ONLY`.
+    fn open_is_append_only(&self, rid: u64) -> bool {
+        self.open_files.iter().any(|o| o.rid != 0 && o.rid == rid && o.append_only)
+    }
+
+    /// How far this resource has already written. See `OpenFile::write_hwm`.
+    fn open_hwm(&self, rid: u64) -> u64 {
+        self.open_files.iter().find(|o| o.rid != 0 && o.rid == rid).map_or(0, |o| o.write_hwm)
+    }
+
+    /// Move the high-water mark forward. Never backward: `max`, not assignment, so an out-of-order
+    /// write by a holder that is ALLOWED to seek cannot rewind the mark for one that is not.
+    fn open_bump_hwm(&mut self, rid: u64, to: u64) {
+        if let Some(o) = self.open_files.iter_mut().find(|o| o.rid != 0 && o.rid == rid) {
+            if to > o.write_hwm { o.write_hwm = to; }
+        }
+    }
+
     fn open_path(&self, rid: u64) -> Option<([u8; OPEN_PATH_MAX], usize)> {
         self.open_files.iter()
             .find(|o| o.rid != 0 && o.rid == rid)
@@ -3170,7 +3920,7 @@ impl Fs {
             }
         } else if itype == ITYPE_FILE_FRAG {
             // Free the scattered data runs (each its own bounded txn) before the extent block.
-            let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+            let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
             if let Some((exts, ne)) = self.ext_of(ctx, &frag_e) {
                 for i in 0..ne { let (s, l) = exts[i]; self.free_run_txn(ctx, s, l)?; }
             }
@@ -3188,10 +3938,41 @@ impl Fs {
 
     /// Walk the filesystem from root, rebuild the bitmap + free count, verify CRCs. Returns
     /// `(files, dirs, bad, used)`.
-    fn check(&mut self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64), &'static str> {
-        // Start from an all-free bitmap (fast batched zero), then mark what is actually used.
-        // The bitmap region is [bitmap_start, journal_start).
+    /// fsck: rebuild the free bitmap and the free count from the tree, which is the truth (26.4).
+    ///
+    /// Returns `(files, dirs, bad, used, stored_free_before)`. **That last one is the point, and it
+    /// used to be thrown away.** This overwrote `self.free_blocks` with the recomputed value and
+    /// persisted it, so a volume whose stored free count had DRIFTED was silently corrected and
+    /// nobody ever learned it had been wrong. A repair that reports nothing is the same shape as a
+    /// silent fallback: the operator cannot tell a healthy disk from one that just had an
+    /// inconsistency repaired underneath them, and an inconsistency is evidence about something else
+    /// (an interrupted write, a leaked extent) that is then lost (26.7).
+    ///
+    /// The repair itself is unchanged and still happens. What is added is that the disagreement is
+    /// REPORTED, loudly in the log and back to the caller.
+    fn check(&mut self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64, u64), &'static str> {
+        // COUNT THE OLD BITMAP'S SET BITS BEFORE DESTROYING IT.
+        //
+        // Until this existed, the one filesystem fault that actually destroys data had NO DETECTOR.
+        // `check` zeroes the bitmap and rebuilds it from the tree, so a bit that was CLEAR for a
+        // block a live file uses - which is what makes the allocator hand that block out and a write
+        // overwrite the file - was gone before anything could notice it. The free-count comparison
+        // below cannot see it either: that compares two scalars, and `alloc_run` never reads the
+        // count. Proven by measuring an image offline after a journal replay: the count was off by
+        // one and the bitmap was bit-for-bit correct, which is a completely different severity from
+        // what the old message implied.
+        //
+        // One extra read pass over the bitmap region, once per `drives check`. On a 16 MiB volume
+        // that is 9 blocks; on a 30 GB disk it is 15,332, which roughly doubles the walk. That is a
+        // real cost, paid by an occasional operator-invoked command, to detect the failure whose
+        // signature is otherwise a file quietly becoming someone else's data.
         let bitmap_blocks = self.journal_start - self.bitmap_start;
+        let mut old_set: u64 = 0;
+        for b in 0..bitmap_blocks {
+            if let Some(blk) = block_read(ctx, self.bitmap_start + b) {
+                for byte in blk.iter() { old_set += byte.count_ones() as u64; }
+            }
+        }
         if !block_write_zeros(ctx, self.bitmap_start, bitmap_blocks) { return Err("bitmap zero failed"); }
         // System blocks [0, data_start): superblock + bitmap + journal. Plus the backup block.
         self.bm_set_range(ctx, 0, self.data_start, true)?;
@@ -3201,9 +3982,55 @@ impl Fs {
         self.check_subtree(ctx, root.itype, root.first_block, root.block_count, 0, &mut st)?;
         // Recompute the free count from what the tree actually uses, and persist BOTH superblock
         // copies (heals a drifted free count + refreshes the backup).
+        // What the rebuilt bitmap says, so the two can be compared. `st.3` is the block count the
+        // tree walk marked used, which is exactly the number of bits now set.
+        let new_set = st.3;
+        if old_set != new_set {
+            if old_set < new_set {
+                // THE ONE THAT DESTROYS DATA. Bits were clear for blocks the tree uses, so
+                // `alloc_run` - which chooses by scanning these bits - would have handed one out and
+                // the next write would have overwritten a live file.
+                ctx.log_fmt(format_args!(
+                    "fs: check - THE BITMAP WAS WRONG IN THE DANGEROUS DIRECTION: {} block(s) that the tree USES had their bit CLEAR, so the allocator could have handed them out and a write would have destroyed live data. Rebuilt from the tree. Anything written since the bitmap drifted should be verified.",
+                    new_set - old_set));
+            } else {
+                // Bits set for blocks nothing references: wasted space, reclaimed by this rebuild.
+                ctx.log_fmt(format_args!(
+                    "fs: check - the bitmap held {} block(s) as used that nothing references (a leak). Rebuilt from the tree; the space is back.",
+                    old_set - new_set));
+            }
+        }
+        let stored_before = self.free_blocks;
         self.free_blocks = self.total_blocks - st.3;
+        if stored_before != self.free_blocks {
+            // SAY IT. The numbers disagreeing means the superblock's accounting did not match the
+            // tree, and the tree is the truth - so the repair is right, and the fact that a repair
+            // was NEEDED is a finding about this volume that the operator must not have to infer.
+            // SAY WHAT WAS MEASURED, WHICH IS THE COUNT - NOT THE BITMAP.
+            //
+            // This used to read "N block(s) were marked free but are in use", which describes a
+            // BITMAP fault: a live file's block available for reallocation, the one failure that
+            // destroys data. This check cannot see that. It compares two SCALARS - the count the
+            // superblock stored against the count the tree walk just produced - and the bitmap is
+            // zeroed and rebuilt before anything could compare its bits.
+            //
+            // The distinction is not pedantic: `alloc_run` chooses blocks by scanning the BITMAP and
+            // never reads this count, so a count that is too high costs accurate reporting and
+            // nothing else, while a stale bitmap bit costs a file. Measured offline on an image left
+            // by a journal replay: count drifted by one, bitmap bit-for-bit correct.
+            //
+            // A message that names the worse fault when it measured the milder one sends its reader
+            // to the wrong place, and cost exactly that here - a test assertion inherited the wording
+            // and reported a data-loss risk that the evidence did not support.
+            ctx.log_fmt(format_args!(
+                "fs: check - the FREE COUNT disagreed with the tree: superblock said {} free, the tree says {} (off by {}, {}). The bitmap is rebuilt from the tree either way; this line is about the count only. Repaired.",
+                stored_before, self.free_blocks,
+                stored_before.abs_diff(self.free_blocks),
+                if stored_before > self.free_blocks { "counted too much free space" }
+                else { "counted too little" }));
+        }
         self.persist_super(ctx)?;
-        Ok((st.0, st.1, st.2, st.3))
+        Ok((st.0, st.1, st.2, st.3, stored_before))
     }
 
     /// Mark a node's extent used, recurse into directories, verify file/dir CRCs. `st` is
@@ -3243,7 +4070,7 @@ impl Fs {
             // marked used regardless - the entry references them; freeing would risk reuse.
             if itype == ITYPE_FILE_FRAG {
                 // `first` (already marked above) is the extent block; its runs hold the data.
-                let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+                let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
                 match self.ext_of(ctx, &frag_e) {
                     Some((exts, ne)) => {
                         let mut ok = true;
@@ -3367,7 +4194,7 @@ impl Fs {
             st.0 += 1;
             if itype == ITYPE_FILE_FRAG {
                 st.3 += count; // the extent block (count == 1), read + CRC-verified by ext_of
-                let frag_e = Entry { itype, size: 0, first_block: first, block_count: count, loc: None };
+                let frag_e = Entry { itype, sealed: false, size: 0, first_block: first, block_count: count, loc: None };
                 match self.ext_of(ctx, &frag_e) {
                     Some((exts, ne)) => {
                         let mut ok = true;
@@ -3403,6 +4230,28 @@ impl Fs {
     fn move_path(&mut self, ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, src).ok_or("source not found")?;
         if e.loc.is_none() { return Err("cannot move root"); }
+        // ---- THE TREE MUST STAY A TREE, AND THIS SERVICE IS WHAT ENFORCES THAT ----
+        //
+        // Moving a directory INTO ITSELF or into its own descendant would write an entry inside the
+        // subtree pointing at the subtree, then unlink the subtree from its parent: a cycle, no
+        // longer reachable from the root.
+        //
+        // The damage that does is not a tidy error. `drives check` rebuilds the free bitmap BY
+        // WALKING THE TREE (docs/persistence.md 6.11, Phase G), so blocks that are still occupied
+        // but no longer reachable are marked FREE and handed to the next allocation, which
+        // overwrites live data. `MAX_TREE_DEPTH` keeps a walk from hanging on such a cycle, so it
+        // would present as a leak that becomes corruption rather than as a wedge.
+        //
+        // **The shell already refuses this, and that is not a substitute.** `cmd_move` guards both
+        // cases before it ever sends the request, and it stays - catching it at the prompt gives a
+        // better message than a service error. But a check in the CALLER is a convention and a check
+        // in the OWNER is an enforcement: this service owns the tree, and owns the bitmap rebuild
+        // that depends on the tree being acyclic. Leaving the invariant to a client means the next
+        // client - a script, another service, a refactor of this one - inherits an obligation it was
+        // never told about, which is authority and enforcement in different places (invariant 1).
+        if path_is_ancestor(src, dst) {
+            return Err("cannot move a directory into itself or its own subtree");
+        }
         let (mut dparent, dname) = self.walk_parent(ctx, dst).ok_or("dest path not found")?;
         if dparent.itype != ITYPE_DIR { return Err("dest not a directory"); }
         if !valid_name(dname) { return Err("bad dest name"); }
@@ -3427,8 +4276,254 @@ fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty())
 }
 
+/// Phase M §1c - run MALFORMED REQUESTS through the real request parser, on every boot.
+///
+/// The shell cannot send these. It builds well-formed requests by construction, and where it can
+/// express something dangerous it refuses first - `move /a /a/b` never leaves it. So the hostile
+/// shapes that a non-shell client could send had no coverage at all.
+///
+/// This needs no second client and no new authority, because **`serve_once` writes its reply into a
+/// BUFFER rather than sending it**. The crafted payload goes through the same dispatch, the same tag
+/// strip and the same length arithmetic a real request does, and the answer is inspected in memory.
+/// No IPC, no test-only command in a shipping shell, no way for this to become a back door.
+///
+/// It runs BEFORE the volume is mounted, deliberately. With no filesystem every path-addressed op
+/// short-circuits to a one-byte "no filesystem", so a thousand crafted requests cannot touch a disk -
+/// and what is being tested here is the PARSER, not the operations. The operations are covered by
+/// `fs-fuzz` and `fs-hostile`, against real disks.
+///
+/// **The assertion is that every request produces a non-empty answer.** Not the right answer - a
+/// malformed request has no right answer - but SOME answer. A zero-length reply is undeliverable
+/// (the kernel refuses a zero-length send), so a request that produces one leaves its caller waiting
+/// out a deadline for a reply that can never arrive. This project has shipped that bug before, on a
+/// different service, and it cost a day.
+///
+/// `#[inline(never)]`: the buffers below are a frame this service does not otherwise carry.
+#[inline(never)]
+fn protocol_selftest(ctx: &ServiceContext) {
+    let mut vol: Option<Fs> = None;
+    let mut out = [0u8; 4096];
+    let mut checked = 0u32;
+    let mut empty = 0u32;
+    let mut worst = 0u8;
+
+    let mut run = |vol: &mut Option<Fs>, p: &[u8], out: &mut [u8; 4096], checked: &mut u32,
+                   empty: &mut u32, worst: &mut u8| {
+        let mut len = 0usize;
+        // A capability handle that names nothing. Safe because no arm can reach a mint or a send
+        // without a mounted volume, and every one of those is behind the `None => no filesystem`
+        // guard this runs under.
+        serve_once(ctx, vol, 0, false, p, 0, CapHandle(0), &mut out[..], &mut len);
+        *checked += 1;
+        if len == 0 {
+            *empty += 1;
+            *worst = p.first().copied().unwrap_or(0);
+        }
+    };
+
+    // 1. Nothing at all, and a lone opcode - the shapes with no arguments where one is expected.
+    run(&mut vol, &[], &mut out, &mut checked, &mut empty, &mut worst);
+    for op in 0u8..=255 {
+        run(&mut vol, &[op], &mut out, &mut checked, &mut empty, &mut worst);
+    }
+
+    // 2. A `plen` that overruns the message. Every path-addressed op reads `[op, plen, path…]`, so a
+    //    length byte claiming far more than arrived is the classic way to walk off the end of a
+    //    buffer - and the classic way a service is made to read somebody else's memory.
+    for op in 0u8..=40 {
+        run(&mut vol, &[op, 255], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &[op, 255, b'x'], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &[op, 0], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &[op, 1], &mut out, &mut checked, &mut empty, &mut worst);
+    }
+
+    // 3. A plausible path followed by a TRUNCATED argument: the ops that read a u64 or u32 after the
+    //    path (`read_at`, `write_at`, `write_new`) must not read past what arrived.
+    let mut buf = [0u8; 64];
+    for op in 0u8..=40 {
+        for extra in [0usize, 1, 3, 7] {
+            buf[0] = op;
+            buf[1] = 4;
+            buf[2..6].copy_from_slice(b"/abc");
+            let n = 6 + extra;
+            run(&mut vol, &buf[..n], &mut out, &mut checked, &mut empty, &mut worst);
+        }
+    }
+
+    // 4. A path length that is exactly the whole message, and one byte beyond it - the off-by-one
+    //    either side of the boundary, which is where a bounds check is right or wrong.
+    for plen in [0u8, 1, 2, 3, 250, 254, 255] {
+        buf[0] = OP_READ_FILE;
+        buf[1] = plen;
+        run(&mut vol, &buf[..2], &mut out, &mut checked, &mut empty, &mut worst);
+        run(&mut vol, &buf[..3], &mut out, &mut checked, &mut empty, &mut worst);
+    }
+
+    if empty == 0 {
+        ctx.log_fmt(format_args!(
+            "fs: protocol selftest PASS - {} malformed requests, every one answered", checked));
+    } else {
+        // LOUD, because the failure is invisible from the other end: the caller does not see a bad
+        // reply, it sees NO reply, and waits out its whole deadline for one that cannot arrive.
+        ctx.log_fmt(format_args!(
+            "fs: protocol selftest FAILED - {} of {} malformed requests produced a ZERO-LENGTH reply \
+             (undeliverable; the caller would wait out its deadline). Last opcode: {}",
+            empty, checked, worst));
+    }
+}
+
+/// Prove the path guards on EVERY boot, on every board, before a disk is touched.
+///
+/// Both functions are pure and the whole suite is a few dozen byte comparisons, so this costs
+/// nothing and runs unconditionally rather than behind `--features selftest`. That is the point:
+/// `path_is_ancestor` is what keeps the directory tree a TREE, and a guard nobody has watched run
+/// is not evidence that it works. The same argument `tcp::selftest` is built on.
+///
+/// `#[inline(never)]`: its arrays are a frame this service does not otherwise carry.
+#[inline(never)]
+fn guard_selftest(ctx: &ServiceContext) {
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    let mut check = |ok: bool, what: &str, p: &mut u32, f: &mut u32| {
+        if ok { *p += 1; } else { *f += 1; ctx.log_fmt(format_args!("fs selftest: FAIL - {}", what)); }
+    };
+
+    // ---- path_is_ancestor: the cases that must be REFUSED ----
+    check(path_is_ancestor(b"/a", b"/a"), "a path is its own ancestor (move onto itself)", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/a", b"/a/b"), "a child is beneath its parent", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/a", b"/a/b/c/d"), "a deep descendant is still beneath it", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/", b"/anything"), "everything is beneath the root", &mut pass, &mut fail);
+    check(path_is_ancestor(b"/", b"/"), "the root is its own ancestor", &mut pass, &mut fail);
+
+    // ---- and the cases that must be ALLOWED, which is where a sloppy prefix test fails ----
+    check(!path_is_ancestor(b"/a", b"/ab"), "a SIBLING sharing a prefix is not a descendant (/ab under /a)",
+          &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/a", b"/abc/d"), "nor is a deeper path under that sibling", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/a/b", b"/a"), "a parent is not beneath its own child", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/a/b", b"/a/c"), "two siblings are unrelated", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/abc", b"/ab"), "a shorter path is never beneath a longer one", &mut pass, &mut fail);
+    check(!path_is_ancestor(b"/x", b"/y/x"), "sharing a LAST component is not being beneath it", &mut pass, &mut fail);
+
+    // ---- valid_name: the limits, at both edges ----
+    check(valid_name(b"a"), "a one-character name is valid", &mut pass, &mut fail);
+    check(!valid_name(b""), "an empty name is refused", &mut pass, &mut fail);
+    check(!valid_name(b"a/b"), "a name containing a separator is refused", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x1b, b'b']),
+          "a name containing ESC is refused (it would drive the terminal)", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x00, b'b']), "a name containing NUL is refused", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x0a, b'b']), "a name containing a newline is refused", &mut pass, &mut fail);
+    check(!valid_name(&[b'a', 0x7f, b'b']), "a name containing DEL is refused", &mut pass, &mut fail);
+    check(valid_name(&[b'c', b'a', b'f', 0xc3, 0xa9]),
+          "a UTF-8 name is still valid (only C0 and DEL are barred)", &mut pass, &mut fail);
+    let at_max = [b'n'; NAME_MAX];
+    let over_max = [b'n'; NAME_MAX + 1];
+    check(valid_name(&at_max), "a name of exactly NAME_MAX is valid", &mut pass, &mut fail);
+    check(!valid_name(&over_max), "a name one byte over NAME_MAX is refused", &mut pass, &mut fail);
+
+    if fail == 0 {
+        ctx.log_fmt(format_args!("fs: path guard selftest PASS - {} checks", pass));
+    } else {
+        ctx.log_fmt(format_args!("fs: path guard selftest FAILED - {} of {} checks", fail, pass + fail));
+    }
+}
+
+/// A record's true size, with the SEALED flag masked off.
+///
+/// Every size read goes through here. An unmasked read would be a file eight exabytes long, and the
+/// damage is not cosmetic: `write_at` bounds a fragmented file's extent by `size`, so the flag
+/// leaking into that arithmetic would let a write run past the file's blocks.
+fn rec_size(blk: &[u8; BLOCK], o: usize) -> u64 {
+    u64_at(blk, o + 40) & !REC_SEALED_BIT
+}
+
+/// Is this record sealed - content frozen, permanently?
+fn rec_is_sealed(blk: &[u8; BLOCK], o: usize) -> bool {
+    u64_at(blk, o + 40) & REC_SEALED_BIT != 0
+}
+
+/// Write a size back, preserving the seal.
+fn rec_set_size(blk: &mut [u8; BLOCK], o: usize, size: u64) {
+    let sealed = u64_at(blk, o + 40) & REC_SEALED_BIT;
+    blk[o + 40..o + 48].copy_from_slice(&((size & !REC_SEALED_BIT) | sealed).to_le_bytes());
+}
+
+/// Seal a record. There is deliberately no unseal: a seal a holder can lift is a request, not a
+/// guarantee, and the whole value of this flag is that nothing short of deleting the file undoes it.
+fn rec_seal(blk: &mut [u8; BLOCK], o: usize) {
+    let v = u64_at(blk, o + 40) | REC_SEALED_BIT;
+    blk[o + 40..o + 48].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Stamp the times region's own CRC. Called by every directory-block write.
+///
+/// **A GSFS0008 volume is upgraded in place by this, and harmlessly.** Its times region is all
+/// zeros, so the first write stamps a valid CRC over zeros - and zero IS `TIME_UNKNOWN`, so every
+/// pre-existing entry keeps reading back as "unknown" while entries written from now on carry real
+/// times. No migration pass, no reformat, and no date invented for a file whose date nobody knows.
+fn dir_times_stamp(blk: &mut [u8; BLOCK]) {
+    let c = crc32(&blk[DIR_TIMES_OFF..DIR_TIMES_CRC_OFF]);
+    blk[DIR_TIMES_CRC_OFF..DIR_TIMES_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+}
+
+/// A slot's `(mtime, ctime)`, or `TIME_UNKNOWN` for a volume that does not record them.
+///
+/// The times carry their own CRC precisely so this question has an honest answer: a region that
+/// fails it is not believed, and "unknown" is reported instead of a date read out of noise.
+fn dir_times_get(blk: &[u8; BLOCK], slot: usize) -> (u32, u32) {
+    if slot >= RECS_PER_BLOCK { return (TIME_UNKNOWN, TIME_UNKNOWN); }
+    if u32_at(blk, DIR_TIMES_CRC_OFF) != crc32(&blk[DIR_TIMES_OFF..DIR_TIMES_CRC_OFF]) {
+        return (TIME_UNKNOWN, TIME_UNKNOWN);
+    }
+    let o = DIR_TIMES_OFF + slot * DIR_TIME_PAIR;
+    (u32_at(blk, o), u32_at(blk, o + 4))
+}
+
+/// Set a slot's times. The CRC is stamped by the write path, not here, so a caller cannot forget it.
+fn dir_times_set(blk: &mut [u8; BLOCK], slot: usize, mtime: u32, ctime: u32) {
+    if slot >= RECS_PER_BLOCK { return; }
+    let o = DIR_TIMES_OFF + slot * DIR_TIME_PAIR;
+    blk[o..o + 4].copy_from_slice(&mtime.to_le_bytes());
+    blk[o + 4..o + 8].copy_from_slice(&ctime.to_le_bytes());
+}
+
+/// Does `dst` name `src` itself, or something beneath it?
+///
+/// Pure, so it is exhaustively testable without a disk - which is why the guard is expressed this
+/// way rather than as a walk up the tree. Both paths arrive already absolute and normalised by the
+/// caller; this compares them as byte strings.
+///
+/// The `/` test is what stops `/ab` reading as a child of `/a`: a descendant's path is the
+/// ancestor's path followed by a SEPARATOR, never by more name.
+fn path_is_ancestor(src: &[u8], dst: &[u8]) -> bool {
+    if dst.len() < src.len() { return false; }
+    if dst[..src.len()] != *src { return false; }
+    // Same path: moving a thing onto itself.
+    if dst.len() == src.len() { return true; }
+    // `src` is the root ("/"), so everything is beneath it and the separator is already counted.
+    if src == b"/" { return true; }
+    dst[src.len()] == b'/'
+}
+
+/// May a new entry be called this?
+///
+/// **Control bytes are refused, and that is a security rule rather than a tidiness one.** A name is
+/// DISPLAYED - by `dir`, by `tree`, by `find` - and a terminal acts on the bytes it is handed. A name
+/// carrying `ESC [ 2J` clears the screen when it is listed, so a file can scroll itself, and
+/// everything after it, out of the very listing meant to reveal it. Found by `osdev test fs-fuzz`
+/// against a disk baked with exactly that name (`docs/gsfs-next.md` §1a).
+///
+/// This is only half the fix and is the half that stops it SPREADING. A disk prepared elsewhere
+/// already carries whatever names it likes, and this service must still let you list and delete
+/// them - so `valid_name` guards CREATE and RENAME only (`mkdir`, `write_path`, `write_new`,
+/// `rename`, and the destination of a move), never lookup. The other half is the shell rendering any
+/// name safely whatever it says, because a name that already exists has to be survivable.
+///
+/// Bytes at or above 0x80 are allowed: they are UTF-8 continuation bytes, and refusing them would
+/// bar every non-ASCII filename to defend against a class of attack that C0 controls already cover.
 fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= NAME_MAX && !name.iter().any(|&b| b == b'/')
+    !name.is_empty()
+        && name.len() <= NAME_MAX
+        && !name.iter().any(|&b| b == b'/' || b < 0x20 || b == 0x7f)
 }
 
 /// A regular file, contiguous (`ITYPE_FILE`) or fragmented (`ITYPE_FILE_FRAG`). Both store
@@ -3465,7 +4560,7 @@ fn encode_rec(blk: &mut [u8], slot: usize, itype: u8, name: &[u8], size: u64, fi
     let nl = name.len().min(NAME_MAX);
     blk[o + 1] = nl as u8;
     blk[o + 2..o + 2 + nl].copy_from_slice(&name[..nl]);
-    blk[o + 40..o + 48].copy_from_slice(&size.to_le_bytes());
+    blk[o + 40..o + 48].copy_from_slice(&(size & !REC_SEALED_BIT).to_le_bytes());
     blk[o + 48..o + 56].copy_from_slice(&first.to_le_bytes());
     blk[o + 56..o + 64].copy_from_slice(&count.to_le_bytes());
 }
@@ -3864,11 +4959,27 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
 ///
 /// So durability is requested explicitly, at the points that promise it, and the answer is checked -
 /// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
-fn block_flush(ctx: &ServiceContext) -> bool {
+enum FlushOutcome {
+    /// The device made its cache durable.
+    Durable,
+    /// The device ANSWERED and refused. This - and only this - is evidence about the DEVICE.
+    Refused,
+    /// Nobody answered: the driver is dead, restarting, or too slow. Says nothing about the drive.
+    NoAnswer,
+}
+
+fn block_flush_outcome(ctx: &ServiceContext) -> FlushOutcome {
     match block_rpc(ctx, &[OP_FLUSH]) {
-        Some(reply) => reply.body().first() == Some(&BLK_OK),
-        None => false,
+        Some(reply) => {
+            if reply.body().first() == Some(&BLK_OK) { FlushOutcome::Durable }
+            else { FlushOutcome::Refused }
+        }
+        None => FlushOutcome::NoAnswer,
     }
+}
+
+fn block_flush(ctx: &ServiceContext) -> bool {
+    matches!(block_flush_outcome(ctx), FlushOutcome::Durable)
 }
 
 /// Stamp a **directory block**'s CRC trailer over its record region and write it (raw, no
@@ -3877,6 +4988,7 @@ fn block_flush(ctx: &ServiceContext) -> bool {
 fn dir_write(ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
     let c = crc32(&blk[..DIR_REC_REGION]);
     blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
+    dir_times_stamp(blk);
     block_write(ctx, lba, blk)
 }
 

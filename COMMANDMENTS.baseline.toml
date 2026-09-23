@@ -651,6 +651,7 @@ SpawnImage               = 52
 "chaos" = ["peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "console" = ["hw:FRAMEBUFFER", "peer:events"]
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+"copier" = ["peer:fs"]
 "counter" = ["peer:fs"]
 "dwc2" = ["hw:DWC2", "hw:PCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
 "ehci" = ["hw:EHCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
@@ -702,4 +703,8 @@ pci_cfg = "PCI_CFG"
 #   31_records.md      titled "`where` / `select` / `to` / `from` - the record-pipe verbs"
 [kernel.utility_spec_aliases]
 first-last = ["first", "last"]
+# One spec for three names: `background`, `jobs` and `foreground` are one mechanism with
+# three surfaces (a way in, a table, a way back), and a state model described in three
+# files drifts.
+background = ["background", "jobs", "foreground"]
 records = ["where", "select", "to", "from"]

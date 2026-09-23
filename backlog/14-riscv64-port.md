@@ -1,5 +1,10 @@
 # 14. RISC-V 64 port - what exists, what it runs on, and what is next
 
+**Status: OPEN TAILS ONLY - the port SHIPPED (v0.16.0) and is hardware-verified on the StarFive
+VisionFive 2 Lite.** What is left is scaffold parity for `riscv32` and the hardware notes at the
+end; the port itself is not open work.
+
+
 > **HARDWARE BOOT ACHIEVED 2026-09-07.** GodspeedOS runs on the StarFive VisionFive 2 Lite:
 > `Starting kernel ...` from U-Boot, then our own banner out of the JH7110's 16550. Fourth
 > architecture, real silicon.

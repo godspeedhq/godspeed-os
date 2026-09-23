@@ -215,7 +215,7 @@ A real multi-part feature, layered:
   addressing; drives API = `list` / `flash` / `label` / `mount` / `use` / `use default`.
 - **block-driver:** enumerate *all* SATA disks; the block IPC gains a **drive index**;
   a **capacity** request so a flash sizes the filesystem to the disk.
-- **shell:** `drives` (+ subcommands) and the file commands (`ls` / `read` / `write` /
+- **shell:** `drives` (+ subcommands) and the file commands (`dir` / `read` / `write` /
   `cd` / `mkdir`) with `[N:]label/path` addressing.
 
 ## 8. Suggested order
@@ -224,7 +224,7 @@ A real multi-part feature, layered:
    (the foundation the rest needs). `persistence.md`.
 2. **Single-drive `drives`** - `flash` / `use` / `use default` + boot auto-mount of
    the default (one disk; proves the format/mount/default loop).
-3. **File commands** - `ls` / `read` / `write` / `cd` / `mkdir` on the current drive.
+3. **File commands** - `dir` / `read` / `write` / `cd` / `mkdir` on the current drive.
 4. **Labels** - name a drive at flash/`label`; address + select by label.
 5. **Multi-drive** - enumerate all disks; per-drive block IPC; `mount` vs `use`;
    `[N:]label/path` cross-drive addressing; bounded mounted-drive slots; duplicate

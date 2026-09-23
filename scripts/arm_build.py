@@ -111,6 +111,18 @@ def main():
     ap.add_argument("--feature", default="arm-supervisor",
                     help="kernel boot-path feature (arm-supervisor)")
     ap.add_argument("--release", action="store_true")
+    # A DETERMINISTIC POWER CUT, and this board is the one that needs it most.
+    #
+    # §6.1 records `fs` on the Pi 2 as restartable but NOT crash-recoverable: its USB stick refuses
+    # `SYNCHRONIZE CACHE`, so the journal's ordering barriers cannot be enforced. That claim has
+    # never been put to a machine, and a PROBABILISTIC cut cannot test it - a run that fails to
+    # recover would be ambiguous between "recovery is impossible here, as recorded" and "we missed
+    # the ten-millisecond window". Holding the window open for ten seconds removes the second
+    # reading, so whatever happens means something.
+    ap.add_argument("--crash-window", action="store_true",
+                    help="build `fs` with the crash-window feature: a transaction touching /cutme... "
+                         "holds the commit-to-checkpoint window open for 10 s, so a power cut is "
+                         "guaranteed to land inside it")
     ap.add_argument("--qemu", action="store_true",
                     help="target QEMU emulation (identity DWC2 DMA in services/dwc2); "
                          "default is real-Pi hardware (VideoCore bus alias)")
@@ -169,7 +181,18 @@ def main():
             feats = ["--features", "bare-metal"]
         elif svc == "dwc2" and args.qemu:
             feats = ["--features", "qemu"]
+        elif svc == "fs" and args.crash_window:
+            feats = ["--features", "crash-window"]
         run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
+
+    if args.crash_window:
+        print("")
+        print("*** THIS IS A CRASH-WINDOW IMAGE - NOT A NORMAL ONE. ***")
+        print("    `fs` holds the commit-to-checkpoint window open for 10 s whenever a transaction")
+        print("    touches a path beginning /cutme. Write to /cutme.txt, then pull the power within")
+        print("    ten seconds: the cut is GUARANTEED to land inside the window.")
+        print("    Reflash a normal image afterwards - this one deliberately stalls those writes.")
+        print("")
 
     # 1a2. THE SUPERVISOR MUST BE NEWER THAN EVERYTHING IT EMBEDS - ordering made enforceable.
     sys.path.insert(0, os.path.join(ROOT, "scripts"))

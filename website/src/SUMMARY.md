@@ -28,8 +28,9 @@
   - [`restart`](utilities/restart.md)
   - [`reboot`](utilities/reboot.md)
   - [`poweroff`](utilities/poweroff.md)
+  - [`background`](utilities/background.md)
   - [`drives`](utilities/drives.md)
-  - [`ls`](utilities/ls.md)
+  - [`dir`](utilities/dir.md)
   - [`cd`](utilities/cd.md)
   - [`read`](utilities/read.md)
   - [`write`](utilities/write.md)
@@ -61,6 +62,10 @@
   - [`whatis`](utilities/whatis.md)
   - [`trace`](utilities/trace.md)
   - [`events`](utilities/events.md)
+  - [`churn`](utilities/churn.md)
+  - [`docs`](utilities/docs.md)
+  - [`paginate`](utilities/paginate.md)
+  - [`scrollback`](utilities/scrollback.md)
 
 # The gsh Language
 

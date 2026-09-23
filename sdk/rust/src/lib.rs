@@ -57,6 +57,7 @@
 
 pub mod adversarial;
 pub mod capability;
+pub mod churn;
 pub mod dma;
 pub mod hid;
 pub mod ipc;

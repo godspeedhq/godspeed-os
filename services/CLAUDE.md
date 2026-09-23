@@ -59,6 +59,7 @@ not individually watched; a supervisor respawn re-runs its boot sequence and re-
 | Service | Notes |
 |---------|-------|
 | `recorder/` | Drains the `events` log to a file (`events persist`). The shell spawns it on demand; it is absent from the boot set AND from the kernel's managed-service lists, which is what keeps the whole persistence feature free of a kernel change. It is not restarted on death **on purpose**: a respawned recorder would not know its target path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The capture file opens with a header and closes with a footer, so one without a footer says it died. See `services/recorder/CLAUDE.md` |
+| `copier/` | The service behind `background` (`utilities/55_background.md`). The shell spawns it on `background copy ...` or `background delete ... recursive` and it idles until told what to do; it holds `fs` and its log and **no console capability**, which is what stops a detached job writing over a prompt somebody is typing at. Not restarted on death for the recorder's reason: a respawned copier would not know what it was copying, so it would be alive and doing nothing while `jobs` said `running`. The shell reports that death as the job being `lost`. See `services/copier/CLAUDE.md` |
 
 ## Supervisor spawn order
 

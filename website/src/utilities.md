@@ -37,7 +37,7 @@ fails.
 
 | | |
 |---|---|
-| [`ls`](utilities/ls.md) | list a directory |
+| [`dir`](utilities/dir.md) | list a directory |
 | [`cd`](utilities/cd.md) | change current location |
 | [`read`](utilities/read.md) | print a file's contents |
 | [`write`](utilities/write.md) | create, overwrite, append, or prepend a file |
@@ -46,6 +46,8 @@ fails.
 | [`move`](utilities/move.md) | relocate a file |
 | [`rename`](utilities/rename.md) | rename a file or directory in place |
 | [`delete`](utilities/delete.md) | remove a file, directory, or whole subtree |
+| [`seal`](utilities/seal.md) | freeze a file's content, permanently (no unseal) |
+| [`churn`](utilities/churn.md) | hammer the filesystem for N seconds so a power cut lands somewhere |
 | [`find`](utilities/find.md) | search the tree for a name |
 | [`tree`](utilities/tree.md) | print the directory hierarchy |
 | [`edit`](utilities/edit.md) | the full-screen editor (a bounded piece table - any file size) |
@@ -57,6 +59,9 @@ fails.
 | | |
 |---|---|
 | [`echo`](utilities/echo.md) | write text |
+| [`docs`](utilities/docs.md) | the manual: what the system is, and what you can rely on |
+| [`paginate`](utilities/paginate.md) | read long output a screenful at a time (pipe stage) |
+| [`scrollback`](utilities/scrollback.md) | read back what has scrolled off the screen (also: PgUp) |
 | [`match`](utilities/match.md) | keep the lines that match (the grep-equivalent) |
 | [`count`](utilities/count.md) | how many lines, words, and bytes |
 | [`sort`](utilities/sort.md) | order the lines |
@@ -91,6 +96,7 @@ fails.
 | [`chaos`](utilities/chaos.md) | kill things deliberately, and see what survives |
 | [`reboot`](utilities/reboot.md) | restart the machine |
 | [`poweroff`](utilities/poweroff.md) | **not provided** - and the page says why |
+| [`background`](utilities/background.md) | run long work as a job, so the prompt stays usable |
 
 ### Networking
 

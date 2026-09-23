@@ -220,7 +220,7 @@ A **condition** is either a *comparison* (its first token starts with `$`, `"`, 
 ```
 if read /sc/a.txt {
     echo "exists"
-} else if ls /sc {
+} else if dir /sc {
     echo "dir but no file"
 } else {
     echo "nothing"
@@ -503,9 +503,9 @@ stream); the column reducers are record-only:
 
 ```
 let rows  = $(roster | count)            # row count
-let files = $(ls /work | count)          # entries in a directory
+let files = $(dir /work | count)          # entries in a directory
 let used  = $(status | sum mem)          # sum a numeric column
-let big   = $(ls /work | max size)       # largest file
+let big   = $(dir /work | max size)       # largest file
 let avgq  = $(status | avg queue)        # average a column
 ```
 

@@ -78,9 +78,52 @@ const SEQ_MATCH_WINDOW: u16 = 4;
 // A few tries per step: on a LIVE network the first frame back can be a background broadcast, so a step
 // retries past stray frames (each retry is fast - a frame is already waiting) to find its real reply.
 const DANCE_TRIES: u32 = 6;
-// DNS collects frames after ONE query TX (the [4] RX-only path): up to this many frames pulled without
+// DNS collects frames after ONE query TX (the [4] RX-only path): frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
+//
+// KEPT ONLY AS A RUNAWAY BACKSTOP. The binding limit is `DNS_BUDGET_SECS` below, because a COUNT IS
+// NOT A DURATION: twelve tries meant twelve times whatever a poll happened to cost, which on a Dell
+// Wyse with a slow lookup was 24 seconds - three times longer than the client waiting for the answer.
 const DNS_RX_TRIES: u32 = 12;
+
+/// The shortest deadline any CLIENT gives a single net-stack request.
+///
+/// The shell's `net resolve` is the one: `ns_query(ctx, &req, 8)`. It is restated here because this
+/// service cannot see that constant and the relationship between them is load-bearing.
+const CLIENT_MIN_DEADLINE_SECS: i64 = 8;
+
+/// Time reserved, out of the client's patience, for the answer to travel back and be read.
+///
+/// Without it a budget equal to the client's deadline is still too long: this service would finish at
+/// the exact moment the caller gives up, and the reply would land stale anyway.
+const DNS_REPLY_MARGIN_SECS: i64 = 2;
+
+/// The DEFAULT budget for one DNS resolve, used when a request carries no patience byte (a background
+/// lookup, or an older client). A request that states its own patience overrides this.
+///
+/// **THIS MUST BE LESS THAN THE CLIENT'S DEADLINE, and that is the whole point.** When this service
+/// can spend longer on a request than its caller will wait, the caller ALWAYS gives up first and the
+/// answer lands afterwards as a stale reply - which does not merely waste the work, it DESYNCS the
+/// stream. The next request then receives the previous one's answer, is rejected by the correlation
+/// tag, times out, and the gap never closes. Observed on the Wyse:
+///
+/// ```text
+/// net: resolving ...
+/// net-stack: a client request met mid-question to nic-driver was dropped ... (drop #1 .. #8)
+/// net: net-stack did not answer the resolve
+/// shell: discarded a net-stack reply for tag 4 while awaiting 6 (overtaken)
+/// ```
+///
+/// Answering "no DNS reply" in four seconds is strictly better than answering correctly in
+/// twenty-four, because at twenty-four nobody is listening and the damage outlives the request
+/// (§26.7: a visible timeout beats indefinite waiting; Commandment V, one layer up).
+///
+/// This is the same ordering `backlog/28` established for the stash budgets
+/// (`POLL_BUDGET_MS < HOLD_MS < shortest client deadline`) - DNS was simply never brought into it.
+const DNS_BUDGET_SECS: i64 = 4;
+const _: () = assert!(DNS_BUDGET_SECS < CLIENT_MIN_DEADLINE_SECS,
+    "net-stack must answer a DNS request - even to say it failed - BEFORE its client stops waiting, \
+     or every late answer desyncs the reply stream");
 // (PING_RX_TRIES removed: the "look past a stray broadcast" retry loop is replaced by nic-driver's [9]
 // BATCH RX drain - one bounded round-trip that returns several frames for `ping` to scan, instead of N
 // slow per-frame re-queries. See `ping` and the BATCH_MAX doc in services/nic-driver.)
@@ -972,7 +1015,19 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
 /// standard A-record query, sends it THROUGH nic-driver, and parses the first A answer. Returns the
 /// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
 /// slirp forwards to, so a failure here is a real "no answer", not a bug).
-fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
+/// Resolve `hostname`, giving up at `deadline` (absolute TSC) whatever state it is in.
+///
+/// **The deadline comes from the CLIENT, not from a constant here.** Every request carries its
+/// caller's patience on the wire (`ns_build` puts it at byte 1), and this service already reads it to
+/// age out stashed requests - it just never used it to bound its OWN work. It could therefore spend
+/// far longer on a lookup than the caller would wait: twelve polls of two seconds, twice (once per
+/// DNS server), is 48 seconds against a client waiting 8. That is the 48 in `backlog/31`'s title.
+///
+/// Why a late answer is worse than no answer: the caller has already given up, so the reply lands as
+/// a STALE one. The next request receives the previous one's answer, the correlation tag rejects it,
+/// and the stream never catches up - one slow lookup desyncs the channel until `net-stack` restarts.
+fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, deadline: u64,
+               hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
                our_mac: &[u8; 6], dns_server: &[u8; 4], got_reply: &mut bool,
                frames: &mut u16, udp: &mut u16, timeouts: &mut u16) -> Option<[u8; 4]> {
     // frames/udp/timeouts accumulate a DIAGNOSTIC: non-empty frames collected, how many were UDP, and how
@@ -1038,9 +1093,21 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, hostname: &[u8], g
     // send itself; `nic-driver` no longer couples a receive to a transmit, so asking for it is now the
     // only way to get it - and a send that fails is reported rather than discarded, which is what a
     // caller waiting on a reply needs to know.
-    if nic_req(ctx, pending, &req, DANCE_SECS).is_none() { *timeouts += 1; }
-    let mut reply = nic_req(ctx, pending, &rx_only, DANCE_SECS);
+    if nic_req(ctx, pending, &req, LINK_SECS).is_none() { *timeouts += 1; }
+    let mut reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
+    // BOUNDED BY THE CLOCK, with the try count kept only as a runaway backstop - the same shape the
+    // `fs` mount loop settled on for the same reason. `LINK_SECS` rather than `DANCE_SECS` per poll
+    // so one silent poll cannot eat half the budget on its own.
+    let dns_deadline = deadline;
     for _ in 0..DNS_RX_TRIES {
+        // `wrapping_sub` compared against the sign bit: the idiom used everywhere else here for a
+        // deadline that may have been set before a TSC wrap.
+        if ctx.read_tsc().wrapping_sub(dns_deadline) < (1u64 << 63) {
+            ctx.log_fmt(format_args!(
+                "net-stack: DNS gave up after {}s - answering the client rather than letting it time out \
+                 (a late answer would desync its reply stream)", DNS_BUDGET_SECS));
+            return None;
+        }
         let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
             if !f.is_empty() {
@@ -1111,7 +1178,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, hostname: &[u8], g
         // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
         // not make the answer arrive sooner.
         ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
-        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
+        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, LINK_SECS);
     }
     None
 }
@@ -1652,7 +1719,11 @@ fn sntp_sync(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState) -> Op
     // recovery that hides the failure it recovered from is a silent fallback (§26.7): without this line an
     // operator cannot tell a resolved pool address from a broken resolver.
     let (mut gf, mut fr, mut ud, mut to) = (false, 0u16, 0u16, 0u16);
-    let ntp_ip = match dns_resolve(ctx, pending, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac,
+    // Background work, so it gets the default budget rather than a client's - nobody is waiting on a
+    // reply, but it must still not block the serve loop for longer than a client would tolerate.
+    let sntp_dns_deadline = ctx.read_tsc()
+        .wrapping_add(ctx.duration_cycles(((CLIENT_MIN_DEADLINE_SECS - DNS_REPLY_MARGIN_SECS).max(1) as u64) * 1000));
+    let ntp_ip = match dns_resolve(ctx, pending, sntp_dns_deadline, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac,
                                    &st.dns_server, &mut gf, &mut fr, &mut ud, &mut to) {
         Some(ip) => ip,
         None => {
@@ -3403,9 +3474,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut udp = 0u16;       //   ... how many were UDP
             let mut timeouts = 0u16;  //   ... how many nic-driver requests timed out (deadline vs poll)
             if gw_known {
+                // THE CLIENT'S OWN PATIENCE, halved, because this tries TWO servers.
+                //
+                // Byte 1 of every request is the caller's deadline in seconds. Reserve `DNS_REPLY_MARGIN_SECS`
+                // so the answer still has time to travel back, then split what is left between the two
+                // attempts - otherwise the first server's timeout consumes the whole window and the
+                // second is asked a question nobody is waiting for.
+                let patience = pl.get(1).copied().filter(|p| *p > 0)
+                                 .map(|p| p as i64).unwrap_or(CLIENT_MIN_DEADLINE_SECS);
+                let usable = (patience - DNS_REPLY_MARGIN_SECS).max(1);
+                let per_server_ms = ((usable * 1000) / 2).max(500) as u64;
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
-                    ip = dns_resolve(&ctx, pending, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,
+                    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(per_server_ms));
+                    ip = dns_resolve(&ctx, pending, deadline, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,
                                      &mut frames, &mut udp, &mut timeouts);
                     any_reply |= got;
                     if ip.is_some() { break; }

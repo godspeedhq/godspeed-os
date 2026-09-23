@@ -1208,12 +1208,15 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result
     use core::sync::atomic::{AtomicU32, Ordering};
     static RR: AtomicU32 = AtomicU32::new(0);
     match core_override {
-        // An explicitly-requested core (contract `placement.core`, or the supervisor's `spawn_on`) is
-        // STRICT (§9.2): if it is not ready, REJECT with PlacementInvalid rather than silently placing
-        // the service on a core no scheduler runs (which would strand it). On a multi-core machine the
-        // requested core is ready, so this always passes and nothing changes; on a single-core machine
-        // (the Pi 2, APs parked) it is what makes the supervisor's `spawn_on(x, 1)` fall back to core 0
-        // instead of stranding `x` on the parked core.
+        // A core requested with SPAWN_FLAG_CORE_STRICT - an operator's `--core N`, or a restart's
+        // placement_override - is STRICT (§9.2): if it is not ready, REJECT with PlacementInvalid
+        // rather than placing the service on a core no scheduler runs (which would strand it).
+        //
+        // NOT this arm: a CONTRACT's `placement.core`. That arrives as `preferred_core` (see
+        // `SPAWN_FLAG_CORE_STRICT` in syscall/dispatch.rs) and is rerouted, not rejected - which is
+        // what §9.2 and §13.2 forbid in the strictest language the constitution uses. That gap is
+        // backlog/01 and is a CLAUDE.md decision, not an implementation one. What the arm below
+        // does guarantee is that the reroute is LOUD.
         Some(n) if crate::smp::core::is_ready(n) => Ok(n),
         Some(_) => Err(SpawnError::PlacementInvalid),
         None if preferred_core == u32::MAX => {
@@ -1224,8 +1227,15 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result
             if crate::smp::core::is_ready(preferred_core) {
                 Ok(preferred_core)
             } else {
+                // A PREFERENCE that could not be honoured is reported (invariant 12). It stays a
+                // reroute - §11.3 needs a machine with fewer ready cores to come up - but a silent
+                // reroute is the exact failure backlog/01 opened on, and saying so costs nothing.
                 let count = crate::smp::core::ready_count() as u32;
-                Ok(RR.fetch_add(1, Ordering::Relaxed) % count.max(1))
+                let chosen = RR.fetch_add(1, Ordering::Relaxed) % count.max(1);
+                crate::kprintln!(
+                    "task: preferred core {} is not ready - placing on core {} instead (§9.2 preference)",
+                    preferred_core, chosen);
+                Ok(chosen)
             }
         }
     }

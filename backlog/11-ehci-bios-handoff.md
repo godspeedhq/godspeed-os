@@ -1,5 +1,9 @@
 # 11. `ehci` resets a controller the BIOS still owns - no USBLEGSUP handoff
 
+**Status: CLOSED 2026-09-21 - EXECUTED ON THE HP T630, and it hit the hard case.** The firmware
+held the controller and REFUSED to release it, so ownership was taken as the code says it will. The
+keyboard behind the hub still works afterwards, which was the stated fear. Evidence at the end.
+
 **Severity:** latent defect on EVERY machine; FATAL on a single core.
 **Root-caused:** 2026-09-06, T630, by instrumenting the fatal window after four theories failed.
 
@@ -128,3 +132,65 @@ rule the project set on purpose. That is a decision, not an implementation detai
 
 Option 2 is the only one that is free, and it is the one that costs functionality. There is no cheap
 correct answer here, which is why this is written down rather than guessed at.
+
+
+---
+
+## Closed 2026-09-21 - the first time this code has ever run
+
+The status line above said it plainly for a fortnight: implemented, wired, argued, and **never
+executed on any machine**. QEMU has no EHCI, and the Dell Wyse - the other x86 box - prints
+`supervisor: no EHCI controller (PCI scan) - not starting ehci (frees a core)`. Only the T630 has
+one. It booted today:
+
+```
+pci: EHCI at 00:12.0 vendor=0x1022 MMIO=0xfeb6c000 IRQ=11
+xhci-handoff: USBLEGSUP@0x500 OS-owned, BIOS released=1 (was 0x00010401)
+ehci-handoff: USBLEGSUP@0xa0 OS-owned, BIOS released=0 (was 0x00010001) - FORCED after timeout
+```
+
+**`was 0x00010001` is the whole entry in one number.** Bit 16 is HC BIOS Owned: the firmware held
+this controller at the moment we asked for it, exactly as the measurement on 2026-09-06 said it did.
+`released=0` means it then declined to hand it over when the OS-Owned semaphore was set - which is
+what the fix predicted would happen once `USBLEGCTLSTS` had been zeroed and the firmware could no
+longer be notified by SMI. Ownership was taken by clearing bit 16 directly, which is what a host OS
+does at that point.
+
+**The xHCI line is the control, and it arrived free.** Same procedure, same boot, different
+controller: `released=1`. That firmware cooperated. So the FORCED path is not the code failing to
+negotiate - negotiation demonstrably works on this machine when the other side answers.
+
+### The fear in "Options, honestly" did not materialise
+
+Option 2 was rejected because refusing to reset a running controller "likely disables the back-panel
+USB ports on machines where the firmware holds the controller". The worry about option 1 was the
+mirror of it: take the controller and lose the keyboard. Neither happened:
+
+```
+ehci: controller reset
+ehci: controller running
+ehci: port 1 after reset: PORTSC=0x00001007 enabled=1 -> HIGH-SPEED (hub or HS device on EHCI;
+      keyboard is behind a hub) -> E3b enumerates it
+ehci: DEVICE DESCRIPTOR class=0x09 proto=1 (TT type) VID=0x0438 PID=0x7900
+ehci: port 4 HID iface=0 class=0x3 protocol=1 (1=kbd 2=mouse) int_ep=0x81 interval=10
+ehci: keyboard configured (addr 2, cfg 1, boot protocol)
+```
+
+The HCRESET that used to reset a controller its owner was actively using now runs on one nobody else
+holds, the hub enumerates, and the keyboard behind it is configured and usable - `selfcheck` was
+typed twice on it, `ran 502, failed 0, skipped 0` both times.
+
+### What this does and does not prove
+
+**Does:** the handoff executes, negotiates, handles a refusing firmware, and leaves a working USB
+tree. Co-ownership - which this entry establishes "was never safe, it was survivable" - is ended on
+the machine that demonstrated the danger.
+
+**Does not:** reproduce the original SINGLE-CORE platform reset. That symptom needs a one-core boot,
+and the build flag that produced one was removed when `backlog/02` closed. It is also no longer the
+interesting test: the reset happened *because* the firmware took an SMI over a controller it still
+owned, and it no longer owns one. The fix removes the cause rather than surviving the effect.
+
+**Unchanged and pre-existing:** `ehci: a HID report arrived with no interrupt - polling input at the
+10ms tick`. The EHCI's legacy INTx does not reach the kernel on this board, so input is polled. That
+is recorded in `services/ehci/src/main.rs` and is not related to the handoff.

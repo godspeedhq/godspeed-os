@@ -40,20 +40,127 @@ use godspeed_sdk::Framebuffer;
 use crate::render;
 use crate::render::{CELL_H, CELL_W};
 
-/// Char-grid shadow bounds. **Sized from the font-scale rule, not from a raw pixel count.**
+/// End - jump to the NEWEST line and STAY in the view. Distinct from `SCROLL_LIVE`, which leaves.
 ///
-/// The old bounds (448 x 128) assumed 4K edge-to-edge at a 1x cell. That case cannot occur:
-/// `render::cell_scale` upscales at 1200 px and above, so a panel wide enough for 427 columns is always
-/// rendering at 2x or 3x and gets far fewer. Taking the scale into account, the widest real grid is at
-/// **1920x1080** - just under the 1200 px step, so still 1x - which after the 5% safe-area inset gives
-/// 1728/9 = 192 columns and 972/20 = 48 rows. Every denser panel scales up and lands lower (3840x2160 at
-/// 3x is 128 x 32; 2560x1440 at 2x is 128 x 32), and every smaller one is smaller.
+/// They were the same action, and that was wrong: `End` took you to the bottom and dropped you out,
+/// so the only way to reach the newest line and keep looking was to not press the key named "End".
+/// Leaving is `Esc`'s job. "The view is at offset 0" and "there is no view" are different states and
+/// now have different actions.
+
+pub(crate) const SB_BYTES: usize = 32 * 1024;
+
+/// Most lines retained, whatever their length. A screen of blank lines must not be able to evict a
+/// screen of real ones, so there is a ceiling on COUNT as well as on bytes.
+pub(crate) const SB_LINES: usize = 512;
+
+/// Lines that have scrolled off the top, kept so they can be scrolled back to.
 ///
-/// This matters here in a way it did not in the kernel: the grid and its attribute plane are now a
-/// **stack-resident** part of the terminal state, and the old bounds were 64 KiB of a 256 KiB service
-/// stack (§26.6.1 - the bound must be one you can read off the source and afford). 208 x 64 keeps a
-/// margin over the worst real case at about 15 KiB. A larger display than this clamps its text area, as
-/// it always did; nothing overruns.
+/// **WHY THIS IS HERE AND NOT IN THE KERNEL.** §11.4's boot/panic floor deliberately has no
+/// scrollback - reaching the bottom of the screen clears it and starts again, because a panic must
+/// not depend on a data structure that could itself be corrupt. This is the `console` SERVICE, which
+/// owns the terminal model, and history is exactly that.
+///
+/// **THE BYTE RING IS ADDRESSED MONOTONICALLY.** `wpos` counts every byte ever written and never
+/// wraps; the storage index is `wpos % SB_BYTES`. That turns "has this line been overwritten yet?"
+/// into one comparison - `line.pos + SB_BYTES <= wpos` - instead of an interval-overlap test against
+/// a wrapped region, which is where a ring like this usually goes wrong. A line may straddle the end
+/// of the buffer; readers copy it in two pieces.
+///
+/// **ATTRIBUTES ARE NOT RETAINED, and that is a stated limitation rather than an oversight.** The
+/// shadow grid carries one reverse-video bit per cell; scrollback keeps characters only, halving the
+/// memory. A reverse-video line scrolled back to therefore shows as plain text. Full-screen apps
+/// (`edit`, `observe`, the pager) are where reverse video actually lives, and those OWN the screen -
+/// their output is not scrollback material in the first place.
+pub(crate) struct Scrollback {
+    buf: [u8; SB_BYTES],
+    /// Monotonic write position of each retained line, oldest-first as a ring over `SB_LINES`.
+    pos: [u64; SB_LINES],
+    len: [u16; SB_LINES],
+    /// Slot the next line will be written to.
+    head: usize,
+    /// Lines currently retained.
+    count: usize,
+    /// Total bytes ever written. Never wraps; `% SB_BYTES` gives the storage index.
+    wpos: u64,
+    /// Lines that have aged out of the ring.
+    ///
+    /// This is what lets the view say "the oldest line KEPT" rather than implying it is the start of
+    /// the session. A scrollback that silently begins in the middle of history, presented as the
+    /// beginning, is the same class of wrong answer as a truncated directory listing (§26.7).
+    aged: u64,
+}
+
+impl Scrollback {
+    pub(crate) const fn new() -> Self {
+        Scrollback {
+            buf: [b' '; SB_BYTES],
+            pos: [0; SB_LINES],
+            len: [0; SB_LINES],
+            head: 0,
+            count: 0,
+            wpos: 0,
+            aged: 0,
+        }
+    }
+
+    /// Lines retained right now.
+    pub(crate) fn len(&self) -> usize { self.count }
+
+    /// Lines that have aged out - history that existed and is gone.
+    pub(crate) fn aged(&self) -> u64 { self.aged }
+
+    /// Bytes of history currently held, for a status report. Not `SB_BYTES` until the ring wraps.
+    pub(crate) fn bytes(&self) -> u64 { self.wpos.min(SB_BYTES as u64) }
+
+    /// Push one line that has just left the top of the screen.
+    ///
+    /// Trailing blanks are dropped: the shadow grid is space-filled to its full width, so storing it
+    /// verbatim would spend 208 bytes on every line regardless of content and cut what fits by an
+    /// order of magnitude.
+    pub(crate) fn push(&mut self, line: &[u8]) {
+        let mut n = line.len();
+        while n > 0 && line[n - 1] == b' ' { n -= 1; }
+        let n = n.min(u16::MAX as usize).min(SB_BYTES);
+        let start = self.wpos;
+        for (k, &c) in line[..n].iter().enumerate() {
+            self.buf[((start + k as u64) % SB_BYTES as u64) as usize] = c;
+        }
+        self.wpos = start + n as u64;
+        // EVICT WHAT THIS WRITE OVERWROTE, before recording the new line. A line survives while any
+        // of its bytes are still inside the last SB_BYTES written.
+        while self.count > 0 {
+            let oldest = (self.head + SB_LINES - self.count) % SB_LINES;
+            if self.pos[oldest] + SB_BYTES as u64 > self.wpos { break; }
+            self.count -= 1;
+            self.aged += 1;
+        }
+        // And evict on COUNT, so a flood of blank lines cannot push out everything.
+        if self.count == SB_LINES {
+            self.count -= 1;
+            self.aged += 1;
+        }
+        self.pos[self.head] = start;
+        self.len[self.head] = n as u16;
+        self.head = (self.head + 1) % SB_LINES;
+        self.count += 1;
+    }
+
+    /// Copy retained line `i` (0 = oldest kept) into `out`, returning how many bytes it holds.
+    ///
+    /// Out of range yields 0 rather than panicking: a view clamps its own indices, and a rendering
+    /// routine is the wrong place to discover that it did not.
+    pub(crate) fn line(&self, i: usize, out: &mut [u8]) -> usize {
+        if i >= self.count { return 0; }
+        let slot = (self.head + SB_LINES - self.count + i) % SB_LINES;
+        let n = (self.len[slot] as usize).min(out.len());
+        let start = self.pos[slot];
+        for k in 0..n {
+            out[k] = self.buf[((start + k as u64) % SB_BYTES as u64) as usize];
+        }
+        n
+    }
+}
+
 pub(crate) const MAX_COLS: usize = 208;
 pub(crate) const MAX_ROWS: usize = 64;
 
@@ -144,6 +251,24 @@ pub(crate) struct Fb {
     pub(crate) grid: [[u8; MAX_COLS]; MAX_ROWS],
     pub(crate) attr: [[u8; ATTR_STRIDE]; MAX_ROWS],
 
+    // --- Scrollback ---
+    // Lines that have left the top of the screen, kept so they can be scrolled back to. See
+    // `Scrollback`: the framebuffer console has NO scrollback of its own, so without this the top of
+    // any output taller than the screen is gone permanently - which is why `help` and `trace` grew
+    // pagers, and why they can stop needing them.
+    pub(crate) sb: Scrollback,
+
+
+
+    /// Lines the view is scrolled back from live. 0 means the screen shows the live grid, which is
+    /// every moment except while somebody is reading history.
+    ///
+    /// The shadow grid is NOT disturbed while scrolled - the scrolled view is painted straight to
+    /// the framebuffer from the ring and the grid, and returning to live is an ordinary
+    /// `repaint_all` from the grid that was there all along. Keeping a second copy of the live
+    /// screen to restore from would be another 15 KiB on a stack that has already been the problem
+    /// once in this file.
+
     // Precomputed foreground-blend LUT: blend_lut[intensity] = the glyph-pixel colour for that
     // antialiasing intensity, composed in the device layout. Lets an antialiased glyph edge blit as a
     // table read instead of a per-pixel multiply/divide.
@@ -156,14 +281,22 @@ pub struct Term {
 }
 
 impl Term {
-    /// Build the terminal over the granted framebuffer and clear it.
+    /// A blank terminal, attached to nothing.
     ///
-    /// Constructed **in place** through `&mut self` rather than returned by value: `Fb` carries the
-    /// shadow grid and its attribute plane, about 15 KiB, and returning it by value would put a second
-    /// copy on a 256 KiB service stack during the move (§26.6.1 - the same by-value trap that cost five
-    /// `fs` stack overflows). `service_main` therefore zero-initialises one and hands out a reference.
-    pub fn new(fb: Framebuffer) -> Self {
-        let mut t = Term {
+    /// **THIS IS A `const fn` RETURNING A LITERAL, AND THAT IS THE WHOLE POINT.** It used to be
+    /// `new(fb)`: build a local `Term`, run `init` on it, return it by value. The doc comment on it
+    /// claimed construction happened "in place through `&mut self`" and warned that returning by
+    /// value "would put a second copy on a 256 KiB service stack" - describing precisely what the
+    /// code underneath it did. Measured: `Term::new` held a **180 KiB** frame (the local plus the
+    /// return slot) and was called from a 118 KiB `service_main`, so the pair wanted 299 KiB of a
+    /// 256 KiB stack. It had been survivable only because `Fb` was small; adding scrollback made it
+    /// fatal, and nothing noticed because the stack gate was blind on x86 (§26.6.1).
+    ///
+    /// A const literal has no such temporary: the caller materialises it directly into its own
+    /// local. `attach` then does the `init` work through `&mut self`, which is what the old comment
+    /// said all along.
+    pub const fn blank() -> Self {
+        Term {
             s: Fb {
                 repaint_pending: false,
                 mem: None,
@@ -191,11 +324,26 @@ impl Term {
                 cur_row: 0,
                 grid: [[b' '; MAX_COLS]; MAX_ROWS],
                 attr: [[0; ATTR_STRIDE]; MAX_ROWS],
+                sb: Scrollback::new(),
                 blend_lut: [0; 256],
             },
-        };
-        init(&mut t.s, fb);
-        t
+        }
+    }
+
+    /// Attach the granted framebuffer and clear the screen. Separate from `blank` so the terminal is
+    /// built once, in the caller's own storage, and never copied (see `blank`).
+    pub fn attach(&mut self, fb: Framebuffer) {
+        init(&mut self.s, fb);
+    }
+
+    /// Scrollback state: lines retained, lines aged out, bytes held.
+    ///
+    /// `aged` is the honest half. A view that reaches the oldest RETAINED line and calls it the
+    /// beginning is claiming to show history it discarded, which is the same shape of wrong answer
+    /// as a truncated directory listing reported as a total (§26.7). This is the number that lets
+    /// the top of the view say "oldest kept" rather than "start".
+    pub fn scrollback(&self) -> (usize, u64, u64) {
+        (self.s.sb.len(), self.s.sb.aged(), self.s.sb.bytes())
     }
 
     /// Terminal geometry as `(rows, cols)`. **The single source of truth** - the kernel no longer
@@ -207,9 +355,51 @@ impl Term {
 
     /// Write a byte sequence to the terminal.
     pub fn put_bytes(&mut self, bytes: &[u8]) {
+        // OUTPUT SNAPS THE VIEW BACK TO LIVE, and this is the whole of the rule "any key that is not
+        // a scroll key returns you to the bottom" - it falls out rather than being implemented,
+        // because a keystroke at the prompt is echoed by the shell and an echo is output.
+        //
+        // The alternative - hold the reader's position and let the backlog grow behind them, as a
+        // desktop terminal does - needs the glyph path to update the shadow grid WITHOUT touching
+        // the framebuffer, which is a suppression flag threaded through every draw. It is also worth
+        // much less here than it looks: service logs go to the kernel ring and serial (§11.4), not
+        // to this service, so on a framebuffer the only writer is whoever the operator just ran.
+        // Output arrives because you asked for it. Recorded as the deliberate simplification it is.
+        // Output ends the VIEW, not merely its offset: the reader is doing something else now.
         for &b in bytes {
             process_byte(&mut self.s, b);
         }
+    }
+
+    /// Copy history lines from `from` onward into `out` as `[len, bytes...]` records.
+    ///
+    /// Returns `(lines written, bytes used, lines retained, any line has aged out)`.
+    ///
+    /// **THIS PAINTS NOTHING, AND THAT IS THE ENTIRE POINT OF IT.** `scroll_view` moves the terminal's
+    /// own view, and to do that it must `paint_view` + `present` BEFORE it can return - a full
+    /// repaint of the framebuffer, synchronously, inside the caller's blocking request. On a
+    /// 3840x2160 panel that is the most expensive thing this service ever does, and the caller was
+    /// giving it one second while sitting on the same core (`backlog/37`). Reading the ring is a
+    /// bounded memcpy: it cannot take a framebuffer's worth of time because it never touches one.
+    ///
+    /// The caller pages the result itself, so a keypress costs no repaint here at all.
+    pub fn history_into(&self, from: usize, out: &mut [u8]) -> (usize, usize, usize, bool) {
+        let total = self.s.sb.len();
+        let aged  = self.s.sb.aged() > 0;
+        let (mut n, mut used, mut i) = (0usize, 0usize, from);
+        let mut line = [0u8; MAX_COLS];
+        while i < total && n < 255 {
+            let ln = self.s.sb.line(i, &mut line);
+            // Stop on the record that would not fit whole. A truncated line is a wrong answer that
+            // looks like a right one; the caller asks again from here (§26.7).
+            if used + 1 + ln > out.len() { break; }
+            out[used] = ln as u8;
+            out[used + 1..used + 1 + ln].copy_from_slice(&line[..ln]);
+            used += 1 + ln;
+            n += 1;
+            i += 1;
+        }
+        (n, used, total, aged)
     }
 
     /// Show everything written since the last flush.
@@ -694,6 +884,11 @@ fn scroll(s: &mut Fb) {
     if rows == 0 {
         return;
     }
+    // THE ONE CAPTURE POINT. Row 0 is about to be overwritten by row 1, so this is the exact and
+    // only moment a line leaves the screen - every other path that changes the display either stays
+    // on screen or clears it deliberately. Retaining it here means scrollback cannot miss output,
+    // whatever produced it, without any producer knowing scrollback exists.
+    s.sb.push(&s.grid[0][..cols]);
     // Shift the shadow up one row in RAM; blank the freed bottom row.
     for r in 0..rows - 1 {
         for c in 0..cols {

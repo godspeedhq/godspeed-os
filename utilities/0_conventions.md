@@ -22,6 +22,17 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    aliases. A tolerated-but-undocumented synonym would itself be a hidden, unsaid
    rule - the silent behaviour the system forbids (§26.4, §26.5). `-h` is simply
    `unknown:`, and that response *teaches* the real word.
+
+   **`help <word>` and `docs <word>` are not an exception to this**, and the
+   distinction is worth stating because it looks like one. `<util> help` gives one
+   command's detail and remains the only way to ask for that. `help dir` does
+   something else: it opens the browsable list already scrolled to `dir`, which is
+   what `man` actually means - *find this in the manual*. It exists because the
+   browser LISTS the commands, so reading `dir` there and typing `help dir` is an
+   expectation this interface creates; and because the alternative was worse than
+   either reading, since the argument used to be discarded in silence. A word that
+   matches nothing says `(no match)` rather than sitting at the top looking like a
+   hit.
 4. **Subcommands are words, never single-letter flags.** `observe now`, not
    `observe -n`. A word means the same thing across every utility; flag letters
    collide and drift (`-n` = "now" here, "number" there). This is the `ls -Sslah`
@@ -56,7 +67,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    positions does *nothing* instead of offering unrelated files. (The bug this prevents:
    `chaos max-carnage all-services <tab>`, landing on the rounds argument, listed the root
    directory and offered `/.gsh_history`.) The default is path completion; **opting out is
-   explicit and per-command** - a path-taking utility (`ls`, `read`, `write`, `mkdir`, `find`,
+   explicit and per-command** - a path-taking utility (`dir`, `read`, `write`, `mkdir`, `find`,
    `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
    when you add a utility: if its args are paths, do nothing; if they are not, add it to
    `NO_PATH_CMDS`.
@@ -71,15 +82,39 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    listing. So a new utility is exactly one of: a **path** command (in neither list), a **keyword**
    command with specific subcommands (`SUBCMD_FIRST` + `NO_PATH_CMDS`), or an **info** command
    (`INFO_CMDS`). Pick one; `version`/`help` come along in every case.
+10a. **A bare letter is a control ONLY where letters are not text.** Full-screen surfaces divide
+    cleanly in two, and the apparent inconsistency between them is forced rather than an oversight:
+
+    - **Read-only views** - `help`, `docs`, `paginate`, the console's scrollback - take `q` and
+      `Esc` to leave, because nothing there is typing and a letter is free to mean something.
+    - **Typing surfaces** - `edit` - cannot. A bare `q` must insert the letter `q`, so leaving and
+      saving need a modifier: `^Q` and `^S`.
+
+    **NAVIGATION IS THE SAME EVERYWHERE, and that is the part that must not drift**: arrows move a
+    line, PgUp/PgDn a page, Home/End the ends.
+
+    **Name the two keys that work, not the cluster.** A status line reading `[arrows]` claims all
+    four when only up and down do anything, and left/right are free to mean something else later.
+    It reads `[up/down]`.
+
+    **In WORDS, because the console cannot draw the symbols.** `render::cell_for_codepoint` passes
+    ASCII through and maps eleven box-drawing characters; everything else becomes a literal `?`
+    (deliberately - visible, never silently dropped). So `\u2191` and `\u2193` would print as `??` on a
+    framebuffer while rendering correctly over serial, which is worse than either. Words also match
+    rule 4: a word means the same thing everywhere, and symbols are what that rule exists to avoid. `edit` already matches `help`, `docs`, `paginate` and
+    the scrollback view key for key on all five. Somebody "fixing" `edit` to quit on `q` would break
+    the only rule that actually distinguishes them, so the rule is written down rather than left to
+    be inferred from two examples that look contradictory.
+
 10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
-    to the prompt, and a wait of more than a moment advertises `(press q to abort)`. A command
+    to the prompt, and a wait of more than a moment advertises `[q] quit`. A command
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer
-    that can be slow. The **fs-backed** interactive commands (`ls`/`cd`/`read`/`find`/`tree` and the
+    that can be slow. The **fs-backed** interactive commands (`dir`/`cd`/`read`/`find`/`tree` and the
     file-reading filters `match`/`count`/`sort`) use the delayed-hint variant `fs_request_q` (SDK
-    `request_with_reply_qhint`): silent on a fast reply, it advertises `(q to quit)` only once the wait
+    `request_with_reply_qhint`): silent on a fast reply, it advertises `[q] quit` only once the wait
     lingers past ~2s - the just-in-time form of the advertisement above, so a snappy op stays quiet.
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an

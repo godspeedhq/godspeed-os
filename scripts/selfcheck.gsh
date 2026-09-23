@@ -18,7 +18,7 @@
 #     (a line with '|' is a pipeline; the trailing `assert` is its sink instead).
 #   - `<producer> | … | assert contains|lacks|empty <text>` is the CONTENT form.
 #   - match/count/first/last are byte filters; where/select/sort/to/from work on records.
-#   - exhaustive operator coverage runs on FREE producers (status, ls, json) to avoid
+#   - exhaustive operator coverage runs on FREE producers (status, dir, json) to avoid
 #     spawning a service per line; roster/greet/upper lines are kept lean.
 
 # ##########################################################################
@@ -40,7 +40,7 @@
 version
 echo ''
 echo '#################### gsh LANGUAGE TOUR ####################'
-if ls /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
+if dir /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
 mkdir /tour                              # a scratch directory for the tour's files
 
 echo ''
@@ -89,6 +89,29 @@ echo got:$phrase | assert contains got:hi
 fn greeting who { echo hello-$who }      # $(fn): capture a FUNCTION's output (bounded 4 KiB, no heap)
 let g = $(greeting Ada)
 echo capfn:$g | assert contains capfn:hello-Ada
+# A SKIP IS NOT A PASS - and two of these lines said it was.
+#
+# Every conditional section announces itself when it declines to run: the clock on a machine that
+# cannot know the time, PCI on a Pi 2 that has none, DHCP with nothing serving it, DNS with no
+# internet, churn with no disk. That was always right - a silent skip is a test that has quietly
+# stopped testing.
+#
+# Five of them said `SKIP`. Two said `PASS  ... - skipped`, which claims a check succeeded when it
+# never ran. That is an unearned claim, and on a machine whose disk is raw or absent it is not a
+# small one: the storage sections are a large part of this suite, and a reader scanning for PASS
+# would conclude the filesystem had been exercised. The inconsistency is the tell - the wording
+# drifted where nobody was comparing the two.
+#
+# All seven are `skip` STATEMENTS now, not echoes - which is the part that makes the difference
+# countable. `skip` is the counterpart to `fail` the language was missing: `fail` says a check did
+# not hold, `skip` says it was never in a position to run, and neither is a pass. The run ends with
+#
+#     --- skipped ---
+#     SKIP  skip 'churn - no storage to churn on this machine; not a failure'
+#     run: ran 492, failed 0, skipped 3
+#
+# so a machine with a raw or absent disk reports 0 FAILURES and says plainly how much it did not do.
+# An echo could never do that: it printed a word into a wall of output and the tally never saw it.
 
 echo ''
 echo '===== 6. FOR LOOPS - words, range, mutable accumulation, and lines of a producer ====='
@@ -118,7 +141,7 @@ if write /sc_fl.txt oneline {
     for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
     if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
 } else {
-    echo 'SKIP for-line: no writable storage on this machine'
+    skip 'for-line: no writable storage on this machine'
 }
 delete /sc_fl.txt
 
@@ -169,7 +192,7 @@ fn build_thing {
     read /tour/work/out | assert contains done
 }                                        # <-- the deferred delete fires HERE, on return
 build_thing
-ls /tour | assert lacks work             # proof the defer ran: /tour/work is gone
+dir /tour | assert lacks work             # proof the defer ran: /tour/work is gone
 
 echo ''
 echo '===== 10. RECORD AGGREGATORS - count / sum / min / max / avg ====='
@@ -191,7 +214,7 @@ echo '  import /lib/math.gsh                             (all of a libs function
 echo ''
 echo '===== tour cleanup - leave nothing behind ====='
 delete /tour recursive
-assert fails ls /tour                    # the tour dir is gone
+assert fails dir /tour                    # the tour dir is gone
 
 echo ''
 echo '#################### gsh LANGUAGE TOUR complete ####################'
@@ -217,7 +240,7 @@ assert ok status help
 assert ok read help
 assert ok assert help
 assert ok mem help
-assert ok ls help
+assert ok dir help
 assert ok run help
 assert ok roster help
 assert ok find version
@@ -243,8 +266,8 @@ assert fails wait 99999
 assert ok wait help
 assert ok wait version
 # whatis: a name's kind + origin (the honest which - no $PATH here, so kind IS the answer)
-assert ok whatis ls
-whatis ls | assert contains built-in
+assert ok whatis dir
+whatis dir | assert contains built-in
 whatis fs | assert contains service
 whatis where | assert contains pipe
 assert fails whatis banana
@@ -283,7 +306,7 @@ for line in (date epoch) { if $line > 0 { clockset = 1 } }
 if $clockset > 0 {
     date | assert contains :
 } else {
-    echo 'SKIP  date - the clock is not set on this machine (no RTC, no network); not a failure'
+    skip 'date - the clock is not set on this machine (no RTC, no network); not a failure'
 }
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
@@ -406,7 +429,7 @@ if $hwe > 0 {
     caps hw-enumerator | assert lacks reboot
     caps hw-enumerator | assert lacks image_spawn
 } else {
-    echo 'SKIP  hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
+    skip 'hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
 }
 
 # `caps` must NAME a well-known resource, never print it as an anonymous number.
@@ -545,7 +568,7 @@ events log | to yaml | assert contains owner
 # there on hardware and a bare `mkdir` fails - which is the single failure this suite reported on an
 # otherwise clean Pi 4 run. QEMU never showed it, because its test disk is formatted fresh every time:
 # a suite that is only ever run against a new disk cannot see the state a real machine keeps.
-if ls /sc { delete /sc recursive }
+if dir /sc { delete /sc recursive }
 mkdir /sc
 events log | write /sc/evt.log
 read /sc/evt.log | assert contains owner
@@ -568,10 +591,32 @@ assert ok events persist status
 assert ok events persist start /sc/cap.log 256KiB
 # THE CAPTURE PREPARES BEFORE IT RECORDS. `start` answers at once and the extent is made readable in
 # the recorder's own loop, so nothing blocks the prompt on device I/O - which is what broke on the Pi 4,
-# where filling 4 MiB over USB took longer than the caller was willing to wait. On slow storage this
-# takes a moment, so wait for readiness rather than assuming it.
-wait 3
-events persist status | assert contains recording
+# where filling 4 MiB over USB took longer than the caller was willing to wait.
+#
+# SO WAIT ON THE TRUTH, NOT ON A CLOCK (Commandment VIII). This was `wait 3` racing a variable
+# pre-fill and it lost intermittently - `backlog/36` has the post-mortem. Staged through a file
+# because gsh refuses to capture a pipeline (see the hw-enumerator probe above); `count` counts DATA
+# rows, so a match is 1 and no match is 0.
+let mut capready = 0
+for i in range 30 {
+    if $capready < 1 {
+        events persist status | where state=recording | count | write /sc/pr.txt
+        for line in (read /sc/pr.txt) { if $line > 0 { capready = 1 } }
+        if $capready < 1 { wait 1 }
+    }
+}
+delete /sc/pr.txt
+if $capready > 0 {
+    events persist status | assert contains recording
+} else {
+    fail 'events persist: the capture never reached `recording` in 30s - the extent pre-fill did not finish'
+}
+# THE RECORDER IS ALIVE - assert it before trusting anything below (`backlog/23`). Every assertion
+# from here to `capacity` reads the SHELL's rendering of a status line, and that rendering does not
+# need `recorder` to exist. On the Pi 4 it crashed mid-section and four of them passed over the
+# corpse, so `ran 461, failed 0` slept through a service fault. Same pattern as hw-enumerator above.
+status | where name contains recorder | assert contains recorder
+status | where name contains recorder | assert lacks Dead
 # BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
 # allocates a file's whole extent up front, so the size is fixed when the capture starts and total
 # disk use is twice that, no matter how long it runs. A forgotten capture cannot fill a disk.
@@ -589,7 +634,7 @@ events persist status | assert contains kib_day
 # token without a unit is unambiguously a service name.
 assert fails events persist start /sc/bad.log 64MB
 events persist status | to json | assert contains capacity
-ls /sc | assert contains cap.log
+dir /sc | assert contains cap.log
 # STICKY: recorded in a plain-text marker the shell reads at the next boot. Plain text on purpose -
 # `read /persist.conf` shows exactly what will happen, which is the difference between a setting and a
 # surprise. A capture that resumed silently forever because someone forgot is the hazard here.
@@ -674,9 +719,9 @@ echo '===== files: create / read / overwrite / append / empty / quoted ====='
 # make the suite re-runnable was itself the one failure in every otherwise-perfect run: 350/1 four
 # times over, caused by the cleanup rather than anything under test. A condition is evaluated for its
 # truth and never tallied, which is exactly the semantics wanted here: delete it IF it is there.
-if ls /sc { delete /sc recursive }
+if dir /sc { delete /sc recursive }
 mkdir /sc
-assert ok ls /sc
+assert ok dir /sc
 assert fails mkdir /sc
 write /sc/a.txt hello
 read /sc/a.txt | assert contains hello
@@ -746,9 +791,9 @@ echo ''
 echo '===== directories: mkdir (parents) + delete guard ====='
 assert fails mkdir /sc/x/y/z
 mkdir /sc/x/y/z parents
-assert ok ls /sc/x/y/z
+assert ok dir /sc/x/y/z
 mkdir /sc/x/y2 parents
-assert ok ls /sc/x/y2
+assert ok dir /sc/x/y2
 mkdir /sc/d1
 write /sc/d1/f.txt data
 assert fails delete /sc/d1
@@ -777,23 +822,23 @@ echo ''
 echo '===== cd: absolute / relative / parent / negative ====='
 cd /sc
 assert ok read a.txt
-ls | assert contains a.txt
+dir | assert contains a.txt
 cd /sc/d1
 cd ..
-ls | assert contains a.txt
+dir | assert contains a.txt
 cd -
 assert ok read /sc/a.txt
 assert fails cd /sc/a.txt
 cd /
 
-# ===== ls / find / tree as record producers (still referencing d1/d2) =====
+# ===== dir / find / tree as record producers (still referencing d1/d2) =====
 echo ''
-echo '===== ls / find / tree as record producers (still referencing d1/d2) ====='
-ls /sc | where type=file | assert contains a.txt
-ls /sc | where type=dir | assert contains d1
-ls /sc | where type=file | assert lacks d1
-ls /sc | select name | assert contains a.txt
-ls / | where type=dir | assert contains sc
+echo '===== dir / find / tree as record producers (still referencing d1/d2) ====='
+dir /sc | where type=file | assert contains a.txt
+dir /sc | where type=dir | assert contains d1
+dir /sc | where type=file | assert lacks d1
+dir /sc | select name | assert contains a.txt
+dir / | where type=dir | assert contains sc
 find a.txt /sc | assert contains /sc/a.txt
 find f.txt /sc | where type=file | assert contains /sc/d1/f.txt
 find fresh.txt | assert contains /sc/fresh.txt
@@ -812,6 +857,67 @@ assert fails read /sc/d2/f.txt
 rename /sc/d1 dd1
 assert ok read /sc/dd1/f.txt
 assert fails read /sc/d1/f.txt
+
+# A directory may not be moved INTO ITSELF or into its own subtree. Either would unlink the
+# subtree from its parent while an entry inside it still points at it - a cycle, unreachable
+# from the root. `drives check` rebuilds the free bitmap by WALKING the tree, so those blocks
+# would be marked free and handed to the next allocation: a leak that becomes data loss.
+#
+# Guarded twice on purpose, and both are asserted here because they fail differently. The shell
+# refuses it before sending (a better message, at the prompt). `fs` refuses it too, because a
+# check in the caller is a convention and only a check in the OWNER is an enforcement - the tree
+# and the bitmap rebuild that depends on it both belong to `fs`.
+assert fails move /sc/dd1 /sc/dd1
+assert fails move /sc/dd1 /sc/dd1/inner
+assert fails move /sc/dd1 /sc/dd1/a/b/c
+# ...while a SIBLING that merely shares a prefix is a perfectly good destination, which is the
+# case a sloppy prefix test gets wrong.
+mkdir /sc/dd1x
+move /sc/dd1x /sc/dd1y
+assert ok dir /sc/dd1y
+assert fails dir /sc/dd1x
+delete /sc/dd1y recursive
+
+# ===== seal: content frozen, permanently =====
+echo ''
+echo '===== seal: a sealed file cannot be rewritten ====='
+write /sc/frozen.txt original
+# `yes` skips the [y/N] prompt: a confirm reads the console, which a script cannot answer.
+seal /sc/frozen.txt yes
+read /sc/frozen.txt | assert contains original
+# Every write route must refuse it, and the content must be untouched afterwards.
+assert fails write /sc/frozen.txt tampered
+read /sc/frozen.txt | assert contains original
+read /sc/frozen.txt | assert lacks tampered
+# In a PIPE `dir` emits records, so the seal is a COLUMN rather than text: a separate `sealed`
+# column, not a new `type` value, so existing `where type=file` queries keep their meaning.
+dir /sc | where sealed=true | assert contains frozen.txt
+dir /sc | where sealed=false | assert lacks frozen.txt
+# EVERY WRITE ROUTE, not just `write`. `copy` goes through a DIFFERENT one (write_new + streaming
+# write_at), and on 2026-09-18 that route had no seal check at all: it truncated the file and wrote a
+# replacement entry with the flag CLEARED, so `copy` silently unsealed. Proving one route refuses does
+# not prove the others, which is the whole reason this line exists.
+write /sc/replacement.txt replacement-content
+assert fails copy /sc/replacement.txt /sc/frozen.txt
+read /sc/frozen.txt | assert contains original
+read /sc/frozen.txt | assert lacks replacement-content
+delete /sc/replacement.txt
+# A sealed file is still a FILE to a query. If sealing changed an entry's type, every `where
+# type=file` anyone has already written would silently stop matching it.
+dir /sc | where type=file | assert contains frozen.txt
+# Only a FILE can be sealed - a directory is refused, which is what keeps TYPE single-valued (there
+# is no dir+sealed state to render).
+assert fails seal /sc yes
+assert fails seal /sc/no-such-file.txt yes
+# `seal help` must answer (conventions rule 1). It did NOT until 2026-09-17 - the command was
+# dispatched from a block that registered no help block, and the vocabulary checker caught it.
+assert ok seal help
+# A seal freezes CONTENT, not existence: renaming and deleting still work, and that is deliberate
+# (see utilities/50_seal.md - an unremovable file is a denial of service, not a guarantee).
+rename /sc/frozen.txt frozen2.txt
+assert ok read /sc/frozen2.txt
+delete /sc/frozen2.txt
+assert fails read /sc/frozen2.txt
 
 # ===== byte pipes: producers + filters (each line spawns a service; kept lean) =====
 echo ''
@@ -882,13 +988,62 @@ if result == Ok { echo fmt-ok | assert contains fmt-ok } else { fail "fmt: not c
 read /sc_fmt.gsh | assert contains bbb   # semantics-preserving: the content survived the format
 delete /sc_fmt.gsh
 
+# ===== churn: sustained writes, and the evidence a POWER CUT leaves behind =====
+#
+# THE FIRST BLOCK IS THE IMPORTANT ONE, and it is why churn belongs in here at all.
+#
+# `churn` exists to be INTERRUPTED. The commit-to-checkpoint window is sub-millisecond, so the only
+# way a human ever lands in it is to write thousands of transactions and pull the cord. When that
+# happens the machine reboots with `/churn` still on disk, holding the only evidence of whether
+# recovery held - and that evidence is destroyed by the next churn that overwrites it.
+#
+# So: if a previous run is still there, VERIFY IT BEFORE STARTING A NEW ONE. After a cut the whole
+# post-mortem becomes one command - boot, run selfcheck, and it tells you whether any file holds a
+# mix of two generations. Forgetting to run `churn verify` before the next churn is how that answer
+# gets lost, and it is an easy thing to forget at a bench with the lid off.
+#
+# What selfcheck CANNOT do is the cut itself. No self-test can pull its own power, so a deliberate
+# recovery test is still `churn <seconds>` and a hand on the cord - this automates the verdict, not
+# the fault.
+echo '===== churn: sustained writes, and any evidence left by an earlier power cut ====='
+if dir /churn {
+    echo 'selfcheck: an earlier churn is still on disk - verifying it BEFORE it is overwritten'
+    if churn verify {
+        echo 'PASS  churn - the earlier run holds no torn file (if it was cut, recovery held)'
+    } else {
+        fail 'churn: a file from the earlier run holds a MIX of two generations - DATA INTEGRITY, report the serial'
+    }
+}
+# ...then a short fresh run, as an ordinary exercise of the write path under sustained load.
+# Deliberately brief: this is the integrity half, and a long churn here would make every selfcheck
+# slow for a test whose interesting half needs a human anyway.
+if churn 4 {
+    if churn verify {
+        echo 'PASS  churn - thousands of transactions, every file holds one generation end to end'
+    } else {
+        fail 'churn: a file was torn by an UNINTERRUPTED run - that is a write-path fault, not a power cut'
+    }
+    churn reset
+} else {
+    skip 'churn - no storage to churn on this machine; not a failure'
+}
+
+# ===== job control (utilities/55_background.md; backlog/40 on why this is short) =====
+echo ''
+echo '===== job control: background / jobs / foreground ====='
+assert fails background selfcheck
+assert fails foreground 99
+assert fails jobs quit 99
+background drives scrub
+jobs | assert contains 'drives scrub'
+
 # ===== cleanup: proves delete + delete recursive =====
 echo ''
 echo '===== cleanup: proves delete + delete recursive ====='
 delete /sc/a.txt
 assert fails read /sc/a.txt
 delete /sc recursive
-assert fails ls /sc
+assert fails dir /sc
 
 # ---- network: RECEIVE must work, checked without sending anything ----------------------------
 #
@@ -942,8 +1097,8 @@ if $leaseok > 0 {
     # not a verdict. The check regains its teeth the moment it can ask the stack how many frames it
     # has RECEIVED - zero frames with a live link is unambiguously ours - and that wants a counter in
     # net-stack's status reply, which is real work and not a constant (26.7).
-    echo 'SKIP  net - link is up but no lease in 20s: either nothing is serving DHCP, or our receive'
-    echo 'SKIP  net - path is broken. This check cannot tell those apart - re-run where a server exists.'
+    skip 'net - link is up but no lease in 20s: either nothing is serving DHCP, or our receive'
+    skip 'net - path is broken. This check cannot tell those apart - re-run where a server exists.'
 }
 
 # ---- network: NAME RESOLUTION, asserted only where it can be OUR fault -----------------------
@@ -977,5 +1132,5 @@ if ping count 2 8.8.8.8 {
         fail 'dns: ICMP to 8.8.8.8 works but no name resolves - the UDP request/reply path is broken'
     }
 } else {
-    echo 'PASS  dns - skipped, no internet to resolve through (not a fault of this system)'
+    skip 'dns - no internet to resolve through; not a failure'
 }

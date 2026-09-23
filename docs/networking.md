@@ -115,7 +115,7 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
   trust claim. `nic-driver` is spawned `hwclass::pci(0x02_00_00, BAR_AUTO, false)` - the third argument
   is `confine`, and it is `false` (`services/supervisor/src/main.rs:383`). **`xhci` is the only confined
   driver in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
-  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs:593`). So the
+  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``). So the
   NIC driver's DMA is unconfined: a *buggy* one is bounded by the arena it was granted, but a
   *compromised* one can point the controller anywhere in RAM, which is kernel-equivalent reach by
   §6.4's own rule. It is restartable, and it is **in the TCB on every machine today**. All `unsafe`
@@ -345,7 +345,7 @@ link transition as a first-class, *observable* event, never a silent error (§26
 - **`ping` rides an unplug/replug.** A running `ping` does not die when the cable is pulled - it reports
   the link down and **resumes** when the cable returns and the lease re-acquires, with an instant `q`
   abort throughout (the utility never blocks un-abortably on a dead link - Commandment VIII, and the
-  "press q to abort" utility convention).
+  "[q] quit" utility convention).
 - **`net` reflects the *live* link.** `net` reads carrier + lease state at call time, so it never shows a
   stale "up" for a cable that is out.
 - **`net renew` recovers in place.** A link that came up mis-configured, or a lease that expired, is

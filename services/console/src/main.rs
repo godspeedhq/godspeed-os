@@ -59,6 +59,52 @@ use term::Term;
 /// live here - so this is the only party that can answer, and there is one source of truth for it.
 const REQ_DIMS: u8 = 1;
 
+// `REQ_SCROLL` IS GONE - it is the mechanism `backlog/37` was about.
+//
+// It moved this terminal's own view, and to answer it the service had to `paint_view` + `present`
+// BEFORE the reply could be computed: a full repaint of the framebuffer, synchronously, inside the
+// caller's request. On a 3840x2160 panel that is the most expensive thing here, the caller allowed
+// one second, and the two ran on the same core. A scroll "taking over two seconds to answer" was
+// never a lost message - the work did not fit the deadline.
+//
+// `REQ_HISTORY` replaced it by moving the WORK, not by widening the number. Deleted rather than
+// left dead so the shape cannot be reintroduced by a future caller finding it in the header.
+
+/// Request byte: READ the scrollback as data. `[REQ_HISTORY, from_lo, from_hi]`, where `from` is a
+/// line index with 0 = the oldest line still KEPT. The reply is
+/// `[n, total_lo, total_hi, aged]` followed by `n` records of `[len, bytes...]`.
+///
+/// **The difference from `REQ_SCROLL` is which side does the work, and it is the whole reason this
+/// exists.** `REQ_SCROLL` moves this terminal's view, which forces a full repaint before the reply
+/// can be computed - on a 4K panel that is the most expensive operation here, and the caller waits
+/// on it with a deadline from the same core (`backlog/37`). This hands the caller BYTES and lets it
+/// paint its own screen, so the cost on this side is a bounded memcpy out of the ring.
+///
+/// `aged` is a flag rather than a count because only its truth matters to a reader: the history is
+/// BOUNDED (32 KiB / 512 lines), and a view that begins in the middle of a session while presenting
+/// itself as the beginning is the same wrong answer as a truncated directory listing (§26.7).
+const REQ_HISTORY: u8 = 3;
+
+/// Reply buffer for one `REQ_HISTORY`. Under the 4 KiB message ceiling (§8.5).
+///
+/// **A POWER OF TWO, AND THAT IS A HARD REQUIREMENT OF THE CALL PATH, not a round number.**
+/// `call_deadline_into` cannot spare a whole length field for the caller's buffer size, so it
+/// encodes it as a 4-bit power-of-two CLASS, rounded DOWN. A caller with a 3584-byte buffer
+/// therefore declares 2048, and the kernel refuses any reply larger than that.
+///
+/// This was 3584 for one image, chosen so a screenful arrived in one request. The Dell Wyse printed
+///     call: reply of 3568 bytes exceeds the caller's 2048-byte buffer - refused (not truncated)
+/// on every keypress and `scrollback` reported no history at all. The buffer was genuinely 3584; it
+/// was the DECLARATION that rounded down. Loud and conservative, exactly as that encoding intends -
+/// a refusal rather than a smashed frame (§26.7).
+///
+/// Two requests per screen is the cost, and it is small: both go out in the fetch phase with no
+/// console writes between them, which is what actually fixed the latency (`54_scrollback.md` §4a).
+const HISTORY_MAX: usize = 2048;
+
+/// `[n, total_lo, total_hi, aged]`.
+const HISTORY_HDR: usize = 4;
+
 ///
 /// Present because the first hardware boot left a question plain observation could not settle: the
 /// terminal's queue sat full at 16/16 while it reported ~0% CPU, which is the signature of BOTH "too
@@ -95,7 +141,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Build the terminal and clear the screen. From here the kernel's boot floor stops writing - it
     // releases the framebuffer the first time it successfully delivers console output to us, which is
     // strictly after this point, so there is never a window with two writers or with none.
-    let mut term = Term::new(fb);
+    // Built in the caller's own storage and then attached, NEVER returned by value: `Term` carries
+    // the shadow grid, its attribute plane and the scrollback ring, and a by-value return
+    // materialises all of it twice during the move. See `Term::blank`.
+    let mut term = Term::blank();
+    term.attach(fb);
     let (rows, cols) = term.dims();
     ctx.log_fmt(format_args!("console: terminal {} cols x {} rows", cols, rows));
     ctx.log("console: serving the display");
@@ -103,6 +153,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Passes completed, for context in the diagnostics below.
     let mut passes: u64 = 0;
+    // Said once, the first time the scrollback ring evicts anything. See the report in the loop.
+    let mut sb_wrapped = false;
+    // Passes that ran long enough to starve a request. See the report in the loop.
+    let mut long_passes: u64 = 0;
     // PAINT CADENCE. A pass drains for at most this long before painting and returning to a blocking
     // `recv`. 16 ms is about one frame; a display that repaints that often reads as smooth.
     //
@@ -230,7 +284,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // for pixels it is not asking about.
                 Some(reply_cap) => {
                     term.flush();
-                    reply_dims(&ctx, reply_cap, &term, msg.payload_bytes());
+                    serve_request(&ctx, reply_cap, &mut term, msg.payload_bytes());
                 }
                 None => {
                     let body = msg.payload_bytes();
@@ -271,6 +325,40 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // without flooding the log through the very console that is misbehaving. A sequence
         // legitimately spanning a message boundary shows up here once and then clears; a stranded
         // one never clears.
+        // SCROLLBACK, SAID ONCE WHEN IT FIRST WRAPS. The ring is the only part of this service that
+        // silently discards anything, and the moment it starts doing so is the one worth knowing:
+        // before it, `Home` reaches the start of the session; after it, `Home` reaches the oldest
+        // line KEPT, which is a different claim. One line, not a counter - a report that repeats is
+        // a report nobody reads, and this one cannot recur because the condition cannot un-happen.
+        if !sb_wrapped {
+            let (kept, aged, bytes) = term.scrollback();
+            if aged > 0 {
+                sb_wrapped = true;
+                ctx.log_fmt(format_args!(
+                    "console: scrollback full at {} lines / {} bytes - older lines now age out",
+                    kept, bytes));
+            }
+        }
+        // HOW LONG A WHOLE PASS TOOK, reported only when it is long enough to be the reason a client
+        // gave up. `backlog/37`: on a Dell Wyse a scroll request timed out against a 1 s deadline
+        // while this service reported no slow paint at all - so either the request waited in the
+        // queue behind work, or a pass ran long for a reason nothing here measures. A pass is
+        // drain + paint, which is everything between two blocking `recv`s, so a pass over the
+        // deadline IS a window in which no request could be answered.
+        //
+        // Quiet by construction: only over 250 ms, and only the first few plus every 32nd, so a
+        // healthy display prints nothing and a sick one cannot flood the log it is struggling with.
+        if per_us > 1 {
+            let pass_us = ctx.read_tsc().wrapping_sub(t_pass0) / per_us;
+            if pass_us > 250_000 {
+                long_passes += 1;
+                if long_passes <= 3 || long_passes % 32 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "console: pass {} took {} ms ({} messages) - no client could be answered during it, {} so far",
+                        passes, pass_us / 1000, drained, long_passes));
+                }
+            }
+        }
         let esc = term.esc_state();
         if esc != 0 {
             stranded += 1;
@@ -324,15 +412,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// to be non-blocking or a slow caller can wedge the terminal for everyone. A failure is reported rather
 /// than swallowed - the caller is blocked on this reply, and dropping it silently would leave it to time
 /// out with no idea why (§26.7).
-fn reply_dims(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term: &Term, req: &[u8]) {
-    if req.first() != Some(&REQ_DIMS) {
-        ctx.log("console: request with an unknown opcode - dropping it");
-        ctx.remove_cap(reply_cap);
-        return;
-    }
-    let (rows, cols) = term.dims();
-    let reply = Message::from_bytes(&[rows as u8, (rows >> 8) as u8, cols as u8, (cols >> 8) as u8]);
+fn serve_request(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term: &mut Term, req: &[u8]) {
+    let reply = match req.first() {
+        Some(&REQ_DIMS) => {
+            let (rows, cols) = term.dims();
+            [rows as u8, (rows >> 8) as u8, cols as u8, (cols >> 8) as u8]
+        }
+        Some(&REQ_HISTORY) => {
+            let from = u16::from_le_bytes([req.get(1).copied().unwrap_or(0),
+                                           req.get(2).copied().unwrap_or(0)]) as usize;
+            let mut out = [0u8; HISTORY_MAX];
+            let (n, used, total, aged) = term.history_into(from, &mut out[HISTORY_HDR..]);
+            out[0] = n as u8;
+            out[1] = total as u8;
+            out[2] = (total >> 8) as u8;
+            out[3] = u8::from(aged);
+            let msg = Message::from_bytes(&out[..HISTORY_HDR + used]);
+            if ctx.try_send_by_handle(reply_cap, &msg).is_err() {
+                ctx.log("console: could not reply to a history request - the caller will see it as unavailable");
+            }
+            return;
+        }
+        _ => {
+            ctx.log("console: request with an unknown opcode - dropping it");
+            ctx.remove_cap(reply_cap);
+            return;
+        }
+    };
+    let reply = Message::from_bytes(&reply);
     if ctx.try_send_by_handle(reply_cap, &reply).is_err() {
-        ctx.log("console: could not reply to a dims request - the caller will see it as unavailable");
+        ctx.log("console: could not reply to a request - the caller will see it as unavailable");
     }
 }

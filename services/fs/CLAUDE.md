@@ -118,9 +118,12 @@ extent nothing references until the transaction commits). On **mount**, `recover
 committed-but-unfinished transaction (valid commit magic + CRC) and discards a torn one - so a
 single power loss leaves the filesystem either entirely unchanged or fully applied, never
 half-updated - **on a backend that attests durability** (`ahci` flushes after every write; SD/EMMC
-completes only after the card releases its busy line). A backend that cannot be ordered - the ARM USB
-stick, which refuses SYNCHRONIZE CACHE - cannot provide that, and `fs` warns once per mount rather
-than implying it (`CLAUDE.md` §6.1, amendment 2026-07-25). Metadata stays CRC-verified either way, so
+completes only after the card releases its busy line). A backend that cannot be ordered cannot provide
+that, and `fs` warns once per mount rather than implying it (`CLAUDE.md` §6.1). **No board in this
+project is currently known to be such a backend**: the ARM USB stick was named as the example until
+2026-09-23, when it accepted the flush across seven sessions and recovered an unassisted power cut in
+the strong form (§6.1, amendment 2026-09-23). The rule is about a CLASS of device - one that refuses
+or lies about a flush, which `fs-lyingflush` models - not about a board. Metadata stays CRC-verified either way, so
 a torn write is DETECTED loudly on read; what is lost there is automatic recovery, not the ability to
 notice. A transaction stages ≤ `TXN_CAP` (56) blocks (loud failure past that);
 `delete_tree` commits the unlink atomically then reclaims the subtree in bounded per-extent

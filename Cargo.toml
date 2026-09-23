@@ -5,6 +5,7 @@ members = [
     "services/supervisor",
     "services/events",
     "services/recorder",
+    "services/copier",
     "services/console",
     "services/time",
     "services/hw-enumerator",

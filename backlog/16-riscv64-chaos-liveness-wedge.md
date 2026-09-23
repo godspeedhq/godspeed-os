@@ -31,7 +31,7 @@ KERNEL PANIC: LIVENESS WEDGE: core 1 made NO progress for 40020514 counter ticks
 - **Not a dead hart.** Core 1 is `h2`, and it has taken **94726 timer interrupts - more than any
   other hart** (h1 93628, h3 76119, h4 95404). The timer is firing and the trap handler is running.
 - **Not a lost timer wakeup.** That was the standing suspicion by analogy with x86 audit A8-1 and
-  `project_x86_idle_lost_wakeup`. A hart that is being interrupted 94726 times is not asleep on a
+  the x86 idle lost-wakeup investigation. A hart that is being interrupted 94726 times is not asleep on a
   consumed deadline.
 - **Not a location that "varies".** Earlier runs recorded stages 1, 5 and 12 and I read that as lock
   contention. Stage 5 is `neutral-sched`, which is stamped BEFORE the switch, so every healthy hart
@@ -73,7 +73,7 @@ Add to the wedge report: the NAME of the task in the offending slot, and the off
 queue depth. Those two turn "no progress" into either a real wedge or a false positive, and neither
 needs a guess. Fix the panic serialisation at the same time, since it is in the same report path.
 
-Reproduce in QEMU first (`scripts/riscv_run.py --cmd`) - `project_riscv64_chaos_wedge` records that
+Reproduce in QEMU first (`scripts/riscv_run.py --cmd`) - the chaos-wedge investigation found that
 the board was being used as a debugger and should not be again.
 
 ---
