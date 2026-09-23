@@ -15,11 +15,25 @@
 *.py     text
 *.ld     text
 *.conf   text
-*.gsh    text
-*.gs     text
 
 # ─── Scripts that MUST stay LF even on a Windows checkout ─────────────────────
 *.sh     text eol=lf
+
+# gsh scripts are BAKED INTO THE SHELL BINARY and their SIZE is asserted at compile time:
+#
+#     const _: () = assert!(SELFCHECK_GS.len() < 65536, "selfcheck.gsh exceeds the ... ceiling");
+#
+# so their byte count must not depend on which machine checked the repository out. `*.gsh text`
+# alone normalizes to LF in the REPO and converts to native on checkout - CRLF on Windows - which
+# adds one byte per line. `selfcheck.gsh` is 65139 bytes as stored and 66275 with CRLF, so the
+# Windows checkout crossed a ceiling the Linux one cleared, and the v0.19.0 release build failed
+# on a machine where nothing was wrong with the source.
+#
+# The ceiling is not decoration: `prescan_fns` uses u16 offsets, so a script past 64 KiB makes the
+# interpreter dispatch the WRONG FUNCTION BODY silently. The assert exists because the failure it
+# replaces is invisible (`backlog/40`).
+*.gsh    text eol=lf
+*.gs     text eol=lf
 
 # ─── BOOT CONFIGS, read by a BOOTLOADER rather than by this machine ───────────
 #

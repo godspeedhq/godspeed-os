@@ -4,6 +4,29 @@
 toward this for as long as checks have been added to it. What is new is that somebody finally hit it
 and measured the remaining space.
 
+## It has now BITTEN, and the ceiling is platform-dependent (2026-09-23)
+
+The v0.19.0 release build failed on `assert!(SELFCHECK_GS.len() < 65536)`. Nothing was wrong with
+the source: the file is **65139 bytes as stored** and clears the ceiling with 397 bytes to spare.
+
+`.gitattributes` had `*.gsh text`, which normalizes to LF in the REPO and converts to NATIVE on
+checkout. Native on Windows is CRLF, which adds one byte per line - 1136 lines, so **66275 bytes on
+a Windows checkout**. The CI runner is Windows. The same repository builds on Linux and fails on
+Windows, and `git diff` reports the working tree clean throughout, because the `text` attribute
+normalizes on comparison.
+
+**A file whose SIZE is asserted must have deterministic bytes on every platform.** Fixed with
+`*.gsh text eol=lf` (and `*.gs`), the rule `*.sh` and `boot/**` already carry - the latter for the
+same class of bug, where a trailing CR became part of a U-Boot filename (`backlog/26`).
+`line_ending_check.py` only inspects files under an `eol=lf` rule, so `*.gsh` was invisible to it
+and is now covered.
+
+**This does not close this entry - it sharpens it.** The headroom is 397 bytes on LF and was
+NEGATIVE on the platform the release is built on. The next section added to `selfcheck.gsh` will
+fail the build again, and the failure will be a compile-time assert rather than the silent
+wrong-function dispatch it exists to prevent, which is the system working. The room still has to
+come from somewhere.
+
 ## The number
 
 ```
