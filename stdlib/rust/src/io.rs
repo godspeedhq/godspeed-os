@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Writing to the screen.
 //!
+//! # Every function here needs `console_push`
+//!
+//! Including [`report`]. All of them reach the screen through the same path, so a program whose
+//! contract omits `console_push = true` runs, prints NOTHING, and reports no error - its failures
+//! included.
+//!
+//! **`log_write` is a different capability for a different destination.** It grants `ctx.log()`,
+//! which writes the kernel log ring and the serial console; nothing in this module uses it. A
+//! program that declares only `log_write` and calls anything here is mute, and a reader who assumes
+//! "the errors will at least be in the log" will go looking in a log that was never written.
+//!
+//! A Stranger Test run made exactly that inference from the name `report`, and concluded that
+//! errors would survive a missing `console_push`. They do not.
+//!
 //! The thinnest module here, and deliberately so. `ServiceContext` already has a clean console
 //! surface; this exists to give it the name a programmer reaches for first, and to put the
 //! authority note somewhere they will read it.
@@ -22,11 +36,13 @@ use godspeed_sdk::service_context::ServiceContext;
 ///
 /// **Does not block** in any sense a caller needs to plan for: it hands bytes to the console
 /// service and returns. **Authority:** `console_push`.
+/// **Needs `console_push`.**
 pub fn println(ctx: &ServiceContext, s: &str) {
     ctx.console_writeln(s);
 }
 
 /// Write without a trailing newline.
+/// **Needs `console_push`.**
 pub fn print(ctx: &ServiceContext, s: &str) {
     ctx.console_write(s);
 }
@@ -40,11 +56,13 @@ pub fn print(ctx: &ServiceContext, s: &str) {
 /// ```ignore
 /// io::println_fmt(ctx, format_args!("read {} bytes from {}", n, path));
 /// ```
+/// **Needs `console_push`.**
 pub fn println_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
     ctx.console_writeln_fmt(args);
 }
 
 /// Write a formatted fragment, without the newline.
+/// **Needs `console_push`.**
 pub fn print_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
     ctx.console_write_fmt(args);
 }
@@ -55,6 +73,7 @@ pub fn print_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
 /// error rather than a string so the phrasing stays in one place and stays honest - in particular
 /// [`crate::Error::OutcomeUnknown`] prints as a warning that the operation MAY have happened,
 /// which is the fact a user most needs and the one a hand-written message usually drops.
+/// **Needs `console_push`** - this writes to the SCREEN, not to the kernel log.
 pub fn report(ctx: &ServiceContext, what: &str, e: crate::Error) {
     ctx.console_writeln_fmt(format_args!("{}: {}", what, e.as_str()));
 }

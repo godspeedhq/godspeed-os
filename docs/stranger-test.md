@@ -365,3 +365,75 @@ retry test. Run 3 found that the contract I added to fix run 1 was itself incomp
 
 That is the instrument working. It is also the reason to keep running it rather than declare the
 interface finished: three strangers, three defects, none of which a review by the author had caught.
+
+---
+
+**RUN 4: 2026-09-23.** A CLEAN ROOM, and one question: **can a stranger derive a contract from the
+documentation alone?** Run 3 could not answer it, because that run read an example it was told not to
+and copied its capabilities.
+
+This time isolation was physical rather than instructed. The published `stdlib.md` and the rendered
+`/api` were copied into a scratch directory outside the repository; the stranger was given a program
+and those documents and nothing else. It could not have read an example, because there was none.
+
+### The fix from run 3 is CONFIRMED, by someone other than its author
+
+```toml
+[capabilities]
+ipc_send     = ["fs", "net-stack"]
+ipc_receive  = ["reporter"]
+console_push = true
+log_write    = true
+```
+
+`console_push` is there, and it was found by reading: the stranger quoted the warning added after run
+3 back as its justification. **Run 3 got this wrong and run 4 gets it right, from the documentation,
+with no example to copy.** That is the fix validated rather than assumed.
+
+It also derived the two service names from the docs, and reasoned about its own service name from the
+program's output prefix.
+
+### But its REASONING about `io::report` was wrong, and that is a defect
+
+> `log_write = true` | Line 15: `io::report(...)` | stdlib.md explains that `io::report` writes to
+> "the kernel log ring and serial (`ctx.log`)", which requires the `log_write` capability.
+
+`report` does no such thing - it calls `ctx.console_writeln_fmt`, so it needs `console_push` like
+everything else in that module. **The name invites the inference and nothing in the documentation
+contradicted it.**
+
+The consequence is not academic. Its own failure analysis concluded that without `console_push`,
+"line 15's `io::report()` still works, so the kernel log contains the error messages". It does not: a
+program missing `console_push` is silent INCLUDING its errors, and a reader holding that belief would
+go looking in a log that was never written.
+
+**Fixed**: every function in `gs::io` now names the capability it needs, and the module says it once
+at the top - including that `log_write` is a different capability for a different destination which
+this module never uses.
+
+### And it caught me over-granting in the same breath
+
+The contract it was shown by example declared `log_write = true`, so it declared it too. The
+published program never calls `ctx.log`. **My example asked for a capability it did not use, two
+lines above prose telling the reader to "ask for what you use and nothing more".** Removed, with a
+note saying when to add it back.
+
+### Scored
+
+| # | Point | Run 3 | Run 4 |
+|---|---|---|---|
+| 3 | Use only the authority available | **FAIL** | **PASS** - `console_push` derived from the docs |
+| - | Isolation honoured | violated (read another example) | enforced physically |
+
+Run 4 tested only the contract, so the other points do not apply: there was no compiler and no
+program to write.
+
+### The pattern, four runs in
+
+Every run has found a real defect, and **each was in the fix for the previous one**. Run 1: no
+program shell, no contract on the page. Run 2: confirmed, and passed the retry test. Run 3: the
+contract added to fix run 1 omitted `console_push`. Run 4: confirmed THAT fix, and found that the
+same contract over-granted `log_write` while `io::report`'s true requirement was undocumented.
+
+Four strangers, four defects, none caught by review beforehand. The interface is better than it was
+this morning and is not finished, and those are the same sentence.
