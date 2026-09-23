@@ -520,9 +520,9 @@ os/
 > and applied it to a USB stick. The window IS the checkpoint, the interval between the commit record
 > becoming durable and the last home block landing, and those writes are slow on a stick, so there it
 > is a large fraction of each transaction rather than a sliver of it. **Measured across every
-> unassisted cut: five hits in ten** (Wyse fourth attempt, T630 first, Pi 2 third, Pi 4 first,
-> VisionFive first). At 2% that outcome is about 1 in 10^7, so the estimate is refuted rather than
-> imprecise. Nothing else in this
+> unassisted cut: five hits in eleven** (Wyse fourth attempt of five, T630 first, Pi 2 third, Pi 4
+> first, VisionFive first). At 2% that outcome is about 1 in 10^7, so the estimate is refuted
+> rather than imprecise. Nothing else in this
 > amendment depends on it - the evidence for the Pi 2 is the replay itself, not how many tries it
 > took - but the number was acted on, so it is corrected where it was stated rather than left for a
 > reader to trip over.

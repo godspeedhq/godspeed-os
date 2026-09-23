@@ -219,14 +219,14 @@ Measured, across every unassisted cut on this branch:
 
 | board | backend | unassisted cuts | hits |
 |---|---|---|---|
-| Dell Wyse 5070 | AHCI | 4 | 1 (fourth) |
+| Dell Wyse 5070 | AHCI | 5 | 1 (fourth; a fifth on 2026-09-23 missed) |
 | HP T630 | AHCI | 1 | 1 (first) |
 | Raspberry Pi 2 | USB / dwc2 | 3 | 1 (third) |
 | Raspberry Pi 4 | USB / xhci | 1 | 1 (first) |
 | VisionFive 2 | USB / xhci, riscv64 | 1 | 1 (first) |
-| **total** | | **10** | **5** |
+| **total** | | **11** | **5** |
 
-Five hits in ten. At p = 0.02 that outcome has probability around 1 in 10^7, so the estimate is
+Five hits in eleven. At p = 0.02 that outcome has probability around 1 in 10^7, so the estimate is
 refuted rather than merely imprecise. The Pi 2's two misses were ordinary variance at a rate near a
 half, not the 1-in-35 luck the bad number implied - which is why its third attempt succeeded rather
 than its thirty-fifth.
