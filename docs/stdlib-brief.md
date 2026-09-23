@@ -98,9 +98,11 @@ are suggestions only. Do not create empty modules.** Every abstraction must corr
 demonstrated application need. Prefer small stable primitives plus composable helpers over a large
 speculative framework.
 
-> **STATUS: shipped `error`, `call`, `fs`, `io`. `net` is in progress at the operator's direction.**
-> `task`, `time` and `cap` were left out: no repeated plumbing was found for the first two, and `cap`
-> is recorded as the best next candidate rather than built, because it has one real consumer so far.
+> **STATUS: shipped - `error`, `call`, `fs`, `io`, `net`, `cap`, `addr`, and a private `resource`.**
+> 51 public functions. `cap` was recorded as "not built" for a day and then built: the blocker was
+> that the file-capability protocol carried no correlation tag, which is a protocol property and was
+> fixed in userspace. `task` and `time` are still left out - no repeated plumbing was found for
+> either, and inventing some would be the speculative abstraction 26.2 forbids.
 
 ## Rust model
 
@@ -175,8 +177,13 @@ creating giant convenience APIs.
 > plumbing from 22 sites to 2; its `fs_call` from 55 lines to 15 and, more importantly, from `bool`
 > to `Result` - it used to discard the difference between a write that timed out and one that never
 > left. The migration also DROVE the API: `recorder` needed `create_sized`, `write_at` and `rename`,
-> which were added as typed operations rather than behind an opcode escape hatch. The network
-> migration follows `gs::net`.
+> which were added as typed operations rather than behind an opcode escape hatch.
+>
+> **Five migrations now**, and each one found something review had not: `recorder` (filesystem and
+> console), the shell's `tcp` (which exposed a lossy merge of the user's own abort into "outcome
+> unknown"), `dir` (which taught the LIBRARY about page caps and partial listings), `fcap` (which
+> caught the library reading a reply one byte off), and `sock` (which found a report that had been
+> claiming a response nobody sent, and two deadlines shorter than the service they waited on).
 
 ## First program test
 
@@ -206,8 +213,17 @@ pass.**
 > model, including that `retry_is_safe` is false for `OutcomeUnknown`. Host coverage stops there
 > because `godspeed_sdk` owns the `panic_handler` and so does `std`, so a dependent crate's host test build
 > hits `duplicate lang item`; the pure/SDK split follows the pattern `kernel/src/clock.rs` documents.
-> **Service-restart and unavailability tests belong on the target and are NOT yet written** - that is
-> the largest outstanding item against this section.
+> **The target-side tests exist now.** `osdev test fs-reuse` holds a `gs::cap::File` across a real
+> `fs` kill and asserts the stale capability is refused with a NAMED error rather than a hang, a
+> silent success or a wrong answer (12 cases, was 8). `osdev test files` exercises `gs::fs` across a
+> real `chaos kill-storm fs 2` and now requires a real listing rather than merely the absence of an
+> error string - the guard it replaced passed on silence. `osdev test file-cap` covers `gs::cap`
+> end to end (15 cases, was 13).
+>
+> Writing them found two things: `Error::service_answered()` can never be true for a stale
+> capability, because the kernel refuses it before the owning service is reached; and the library was
+> reporting a REVOKED capability as "could not be reached", which named the wrong fault. `Error::
+> Revoked` exists because of that test.
 
 ## Documentation
 

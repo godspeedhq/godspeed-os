@@ -45,6 +45,46 @@ use godspeed_sdk::service_context::ServiceContext;
 use crate::call;
 use crate::error::{from_fs_status, Error};
 
+/// How long to wait for a whole-volume sweep ([`Fs::check`] or [`Fs::scrub`]).
+///
+/// **Far longer than an ordinary call, and that is the point.** These walk every referenced block on
+/// the volume; a chunk write and a full scrub are each one request and one reply, and only one of
+/// them can be expected back in seconds. A deadline shorter than the operation turns a slow success
+/// into [`Error::OutcomeUnknown`], which is worse than waiting because it forbids the retry that
+/// would have fixed it.
+pub const SWEEP_SECS: i64 = 120;
+
+/// What [`Fs::check`] repaired, and what it found.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Check {
+    /// Files reachable from the root.
+    pub files: u32,
+    /// Directories reachable from the root.
+    pub dirs: u32,
+    /// Entries whose CRC did not verify. **Not repaired** - reported, so somebody decides.
+    pub bad: u32,
+    /// Blocks the rebuilt bitmap says are in use.
+    pub used: u64,
+    /// Blocks now free.
+    pub free: u64,
+    /// What the superblock claimed was free BEFORE the rebuild. Compare it with `free`: equal means
+    /// nothing needed repairing, and different means the count had drifted and now has not.
+    pub free_before: u64,
+}
+
+/// What [`Fs::scrub`] found. Read-only: it changes nothing on disk.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Scrub {
+    /// Files reachable from the root.
+    pub files: u32,
+    /// Directories reachable from the root.
+    pub dirs: u32,
+    /// Entries whose CRC did not verify.
+    pub bad: u32,
+    /// Blocks read and verified.
+    pub scanned: u64,
+}
+
 /// The longest path `services/fs` accepts. A longer one is [`Error::InvalidInput`] and is never
 /// sent, rather than being silently truncated into a request for a DIFFERENT file.
 pub const PATH_MAX: usize = 120;
@@ -61,6 +101,8 @@ const OP_MOVE: u8 = 17;
 const OP_MKDIR_P: u8 = 18;
 const OP_DELETE_TREE: u8 = 19;
 const OP_OPEN: u8 = 30;
+const OP_CHECK: u8 = 27;
+const OP_SCRUB: u8 = 29;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
 const OP_DELETE: u8 = 16;
@@ -510,6 +552,58 @@ impl<'a> Fs<'a> {
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
         Ok(crate::cap::File::new(self, ctx, cap, rights))
+    }
+
+    /// Rebuild the free-space bitmap from the file tree, and report what was found.
+    ///
+    /// This is `fsck`. It WRITES - the bitmap is rebuilt from the tree, which is the irreducible
+    /// source (26.4: the bitmap and free count are derived views, and this is their repair path).
+    /// A read-only mount refuses it.
+    ///
+    /// **Blocks** up to [`SWEEP_SECS`]. It walks the whole volume.
+    ///
+    /// # Errors
+    /// [`Error::Failed`] on a read-only mount, with [`reason`](Fs::reason) saying so;
+    /// [`Error::NoFilesystem`] if nothing is mounted. Rebuilding is idempotent - it derives the
+    /// bitmap from the tree either way - so a repeat is safe, though it costs another full sweep.
+    pub fn check(&mut self) -> Result<Check, Error> {
+        let r = self.call(OP_CHECK, &[], &[], SWEEP_SECS)?;
+        let b = r.body();
+        if b.len() < 36 {
+            return Err(Error::Malformed);
+        }
+        Ok(Check {
+            files: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            dirs: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            bad: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            used: u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]),
+            free: u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]),
+            free_before: u64::from_le_bytes([b[28], b[29], b[30], b[31], b[32], b[33], b[34], b[35]]),
+        })
+    }
+
+    /// Verify every referenced block's CRC and report. **Changes nothing.**
+    ///
+    /// The read-only twin of [`check`](Fs::check): that one repairs the bitmap, this one reads the
+    /// data and says what does not verify. Safe on a read-only mount, and safe to run at any time.
+    ///
+    /// **Blocks** up to [`SWEEP_SECS`]. It reads the whole volume.
+    ///
+    /// # Errors
+    /// [`Error::NoFilesystem`] if nothing is mounted. A scrub writes nothing, so every no-answer
+    /// error here is safe to retry.
+    pub fn scrub(&mut self) -> Result<Scrub, Error> {
+        let r = self.call(OP_SCRUB, &[], &[], SWEEP_SECS)?;
+        let b = r.body();
+        if b.len() < 20 {
+            return Err(Error::Malformed);
+        }
+        Ok(Scrub {
+            files: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            dirs: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            bad: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            scanned: u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]),
+        })
     }
 
     /// Ask whether a path exists, and what it is.
