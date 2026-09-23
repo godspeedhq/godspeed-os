@@ -950,11 +950,9 @@ Broken twice in this branch:
    find. There is a `TCP_SECS` now, and the shell's timeout message names the constant it actually
    waits on rather than a different one.
 
-**`SOCKET_SECS` is 30, and that number is measured rather than derived.** The documented retry budget
-is 6 x 2 = 12 seconds, so 15 should have been ample; in QEMU it was not, and both 10 and 15 produced
-intermittent unknown-outcome reports where 30 is stable. Something in that path costs more than the
-retry budget accounts for, and I have not root-caused it. Recorded rather than rounded up silently,
-because a constant chosen by experiment should say so.
+**`SOCKET_SECS` is 30, and it is DERIVED - see section 19, which root-causes it.** It was recorded
+here as "measured, not derived" and that gap is now closed: the retry budget is not 6 x 2 = 12, it is
+6 x (2 + 1) = up to 18, because the waits are bounded by whole-second arithmetic.
 
 ### The assertion that had been hiding it
 
@@ -1056,3 +1054,53 @@ PermissionDenied and a malformed reply into one word while `fs` had said which (
 `osdev test files` **245 passed, 0 failed**, including a real 45-file directory tree copied through
 the library (`copied /many -> /manycopy (1 dirs, 45 files)`). `file-cap` 15/0 and `fs-reuse` 12/0
 confirm the byte-path change disturbed nothing. 13 of 13 gates; host tests 7/7.
+
+## 19. Root cause: whole-second deadlines carry a hidden +1
+
+Section 17 left `SOCKET_SECS = 30` recorded as "measured, not derived - something in that path costs
+more than the retry budget accounts for, and I have not root-caused it". Here is the cause, and it is
+worth more than the constant.
+
+`udp_roundtrip` retries `DANCE_TRIES` (6) times at `DANCE_SECS` (2) apiece, which reads as a
+12-second budget. Each of those waits is `request_with_reply_deadline_sifted`, and its bound is:
+
+```rust
+let t0 = self.epoch_secs_monotonic();
+...
+if self.epoch_secs_monotonic() - t0 >= max_secs { return DeadlineOutcome::Timeout }
+```
+
+The deadline does NOT restart per sifted message - `t0` is taken once, which was my first hypothesis
+and was wrong. What it does instead is arithmetic in **whole seconds**: `epoch_secs_monotonic`
+returns an integer count, so a "2 second" deadline elapses when the COUNTER advances by two. That is
+anywhere between just over 1s and just under 3s of real time, depending where in the second `t0`
+fell. The worst case per wait is `max_secs + 1`.
+
+```text
+6 tries x (2 + 1) = up to 18 seconds, not 12
+```
+
+Which explains the behaviour exactly: 10 and 15 both sit below 18 and produced intermittent
+[`Error::OutcomeUnknown`]; 30 sits above it and is stable. The constant is derived now, with margin,
+and the doc says how it was arrived at.
+
+### The rule, which is the useful part
+
+**A deadline built from whole-second differences carries up to +1s of slop, so N chained waits of S
+seconds bound at N x (S + 1), never N x S.**
+
+Any budget computed the obvious way is short. And short is not a small error here: it converts a slow
+SUCCESS into an unknown outcome, which is the one error that forbids the retry that would have fixed
+it. That is the same failure mode as the three deadline bugs in sections 17 and 18 - this is their
+cause rather than a fourth instance.
+
+**What is NOT affected**, checked rather than assumed: `tcp_transact` takes a MILLISECOND budget
+(8000), so it does not chain second-granularity waits, and `TCP_SECS` at 20 has real margin over 8.
+`SWEEP_SECS` at 120 is a single wait on one whole-volume operation, not a chain, and `services/copier`
+arrived at the same 120 independently for its own version.
+
+### Worth knowing beyond this library
+
+This is a property of every deadline in the system built on `epoch_secs_monotonic` differences, not
+of the standard library. Anyone sizing a budget out of a retry count and a per-try timeout is
+computing N x S and getting a number that is up to N seconds short.

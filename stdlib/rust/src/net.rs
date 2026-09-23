@@ -71,12 +71,28 @@ pub const NET_SECS: i64 = 10;
 /// client waiting ten gives up while the service is still working and reports
 /// [`Error::OutcomeUnknown`] about a request that was about to succeed.
 ///
-/// **This number is MEASURED, not derived, and the gap is not fully explained.** The documented
-/// retry budget is 6 x 2 = 12 seconds, so 15 should have been ample; in QEMU it was not, and 10 and
-/// 15 both produced intermittent unknown-outcome reports where 30 is stable. Something in that path
-/// costs more than the retry budget accounts for. Recorded here rather than rounded up silently,
-/// because a constant chosen by experiment should say so - the next person to tighten it needs to
-/// know it was not calculated.
+/// **Why 30 and not 12.** The retry budget reads as 6 x 2 = 12 seconds. It is not: each of those
+/// waits bounds itself with
+///
+/// ```ignore
+/// let t0 = self.epoch_secs_monotonic();
+/// if self.epoch_secs_monotonic() - t0 >= max_secs { return Timeout }
+/// ```
+///
+/// and `epoch_secs_monotonic` returns WHOLE SECONDS. A "2 second" deadline therefore elapses when
+/// the second COUNTER advances by two - anywhere between just over 1s and just under 3s of real
+/// time, depending where in the second `t0` fell. The worst case per try is `max_secs + 1`:
+///
+/// ```text
+/// 6 tries x (2 + 1) = up to 18 seconds
+/// ```
+///
+/// which is why 10 and 15 both produced intermittent [`Error::OutcomeUnknown`] and 30 is stable.
+///
+/// **The general rule, which matters more than this constant: a deadline built from whole-second
+/// differences carries up to +1s of slop, so N chained waits of S seconds bound at N x (S + 1).**
+/// A budget computed as N x S is short, and being short turns a slow SUCCESS into an unknown
+/// outcome - the one error that forbids the retry which would have fixed it.
 ///
 /// That is the worst available false report: `OutcomeUnknown` tells a caller the operation MAY have
 /// happened and must not be retried. A deadline shorter than the service's own bound does not bound
