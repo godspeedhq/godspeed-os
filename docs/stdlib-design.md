@@ -547,3 +547,39 @@ baseline entry could be dropped as a result.
 **Still owed, unchanged:** target-side tests against a service that really restarts, and `gs::cap`.
 Newly recorded: `backlog/45`, the published book has no standard-library section, which blocks the
 Stranger Test from an honest first run.
+
+## 12. `gs::cap` is NOT built, and the reason is a gap in the kernel surface
+
+Section 10 named `gs::cap` - delegated resource capabilities, the mechanism behind "a file is a
+capability" (7.10) - as the best next candidate. Reading the path before writing it turned up a
+blocker, so it is recorded rather than built. `backlog/46` is the full entry.
+
+**`resource_invoke` (syscall 31) is a SEND.** It embeds a reply cap and returns on delivery; the
+caller then waits with a plain `recv`. That is exactly the shape `CLAUDE.md` 8.2's `CallDeadline`
+amendment condemns:
+
+> a service that SERVES clients on the endpoint it awaits replies on would therefore consume an
+> unrelated client request, fail to match it, and drop it
+
+That amendment fixed the NAMED-PEER path - `request_with_reply_call` matches the reply by its sender
+- and left the RESOURCE path on the primitive it had just condemned. There is no `CallDeadline` form
+of `resource_invoke`.
+
+**The one existing caller is exempt by accident, not by design.** `services/shell` opens every
+file-cap invocation with `while ctx.try_recv().is_some() {}`, draining whatever is queued. That is
+safe only because the shell serves nobody on that endpoint. In a service that does, the same line
+discards live client requests - so the shell working is not evidence the pattern is sound.
+
+**A library cannot do either thing.** It cannot drain, because it does not know whether its caller
+serves clients; and without draining it inherits a wait that can eat a message. `gs::cap` is meant
+for ordinary services - a facility only usable by a task with no clients is not the public interface
+22.7 measures - so it is not started.
+
+The fix is a `ResourceInvokeDeadline`: the same deadline machinery, matching the reply to the
+embedded reply cap. Arguably it is the 8.2 amendment finishing its job. But a new syscall is a new
+kernel responsibility, Commandment I pins that surface, and the enforcement layer will refuse it
+until 8.2 is amended to record it - which is the operator's gate and not a library author's.
+
+Writing it anyway with the hazard in a doc comment would be shipping the defect with a warning label
+attached, which is the papering-over 26.7 forbids. So: recorded, with the three options in
+`backlog/46`, and the library stops here until the gate is decided.
