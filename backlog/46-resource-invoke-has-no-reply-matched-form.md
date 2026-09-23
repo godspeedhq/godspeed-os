@@ -4,6 +4,12 @@
 **Status:** OPEN - architectural question RECORDED, deliberately not acted on
 **Found by:** designing `gs::cap` on `feat/stdlib`, before writing it.
 
+> **`feat/stdlib` CONTAINS NO KERNEL CHANGE, and none is proposed for it.** Verified rather than
+> asserted: `git diff main...HEAD -- kernel/` and `-- sdk/` are both empty. This entry is a finding
+> about an existing mechanism, written down so that a future branch can pick it up with the analysis
+> already done. It is not a design for this one. Anything acting on it belongs in its own branch,
+> with its own review and its own hardware re-verification.
+
 > **This entry was rewritten the day it was opened.** The first version concluded "a new syscall is
 > a new kernel responsibility, so this is the operator's gate". That reasoning was wrong and the
 > operator corrected it: **syscall count is not responsibility count.** A primitive that completes
