@@ -1368,29 +1368,24 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let mut w = 0usize;
     let mut hits = [PathHit { off: 0, len: 0, is_dir: false }; 32];
     let mut n = 0usize;
-    let mut cur = DirCursor::new();
-    while let Some(from) = cur.next() {
-        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &from) { Some(r) => r, None => return };
-        let pb = reply.payload_bytes();
-        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
-        let count = cur.take(pb);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= pb.len() { break; }
-            let nl = pb[i] as usize; i += 1;
-            if i + nl + 14 > pb.len() { break; }      // entry = name_len, name, is_dir, size:u64, mtime:u32
-            let is_dir = pb[i + nl] != 0;
-            if pb[i..i + nl].starts_with(leaf) && n < hits.len() && w + nl <= rbuf.len() {
-                rbuf[w..w + nl].copy_from_slice(&pb[i..i + nl]);
-                hits[n] = PathHit { off: w, len: nl, is_dir };
-                w += nl; n += 1;
-            }
-            i += nl + 14;
+    // `list_dir` walks the pages and decodes the entries; completion keeps only the decision about
+    // which names it can offer. A failed listing means no menu - there is nothing useful to say at a
+    // half-typed prompt, and a completion that interrupts to complain is worse than one that does
+    // nothing.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let walked = g.list_dir(dirpath, |e| {
+        if e.name.starts_with(leaf) && n < hits.len() && w + e.name.len() <= rbuf.len() {
+            rbuf[w..w + e.name.len()].copy_from_slice(e.name);
+            hits[n] = PathHit { off: w, len: e.name.len(), is_dir: e.is_dir };
+            w += e.name.len();
+            n += 1;
         }
-        // Enough candidates to fill the menu, or no room left to keep them. More pages cannot
-        // change what is offered, so stop asking.
-        if n >= hits.len() { break; }
-    }
+        // Enough candidates to fill the menu, or no room left to keep them. More entries cannot
+        // change what is offered, so stop the walk here.
+        n < hits.len()
+    });
+    ctx.fs_tag.set(g.tag());
+    if walked.is_err() { return; }
     if n == 0 { return; }
     let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
 
@@ -8032,44 +8027,33 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     // change of meaning in queries people have already written. A separate column adds an answer
     // without moving an existing one.
     let mut t = Table::new(&["name", "type", "size", "sealed"]);
-    let mut cur = DirCursor::new();
-    while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return None,
-            ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return None; }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return None; }
-        if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
-            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
-            return None;
-        }
-        let count = cur.take(p);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() { break; }
-            let nl = p[i] as usize;
-            i += 1;
-            // Phase O: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
-            // four bytes wider than the layout before it. Every consumer of this reply must step by the same
-            // stride or it reads the NEXT entry's name out of this one's timestamp.
-            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-            let name = t.intern(&p[i..i + nl]);
-            let is_dir = p[i + nl] != 0;
-            let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-            let sealed = p[i + nl + 13] & 1 != 0;      // flags bit 0
-            i += nl + 1 + 8 + 4 + 1;
-            let kind = t.intern(if is_dir { b"dir" } else { b"file" });
-            let sz = if is_dir { Value::Empty } else { Value::Int(size) };
-            let sl = t.intern(if sealed { b"true" } else { b"false" });
-            t.add_row(&[name, kind, sz, sl]);
-        }
-        // The table is full (64 rows, or the string arena). Further pages have nowhere to go, and
+    // `list_dir` owns the page walk and the 15-byte entry stride the comment above used to warn
+    // about; this keeps only the mapping from an entry to a row.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let walked = g.list_dir(path, |e| {
+        let name = t.intern(e.name);
+        let kind = t.intern(if e.is_dir { b"dir" } else { b"file" });
+        let sz = if e.is_dir { Value::Empty } else { Value::Int(e.size) };
+        let sl = t.intern(if e.sealed { b"true" } else { b"false" });
+        t.add_row(&[name, kind, sz, sl]);
+        // The table is full (64 rows, or the string arena). Further entries have nowhere to go, and
         // `t.overflow()` already tells the reader the answer is short - so stop paying for them.
-        if t.overflow() { break; }
+        !t.overflow()
+    });
+    ctx.fs_tag.set(g.tag());
+    match walked {
+        Ok(_) => Some(t),
+        Err(gs::Error::Cancelled) => None,
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
+            None
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            None
+        }
+        Err(_) => { ctx.console_writeln("dir: storage unavailable"); None }
     }
-    Some(t)
 }
 
 /// `caps` as a record producer: one row per held capability - `resource` (the target,
@@ -8226,49 +8210,38 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut short = false;
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
+    let mut cancelled = false;
     while let Some(dlen) = stack.pop(&mut dir) {
-        let mut cur = DirCursor::new();
-        'pages: while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return None,
-            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return None; }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return None; }
-        // `break 'pages`, NOT `continue`: this loop is now the PAGE loop, and a bare `continue`
-        // would re-ask the same unreadable directory forever instead of moving to the next one.
-        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
-        let count = cur.take(p);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() { break; }
-            let nl = p[i] as usize;
-            i += 1;
-            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-            let name = &p[i..i + nl];
-            let is_dir = p[i + nl] != 0;
-            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout `dir` reads
-            i += nl + 1 + 8 + 4 + 1;
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let walked = g.list_dir(&dir[..dlen], |e| {
             let mut child = [0u8; PATH_MAX];
-            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
-                let hit = if is_glob { glob_match(tb, name) } else { contains(name, tb) };
+            if let Some(clen) = join_path(&dir[..dlen], e.name, &mut child) {
+                let hit = if is_glob { glob_match(tb, e.name) } else { contains(e.name, tb) };
                 if hit {
-                    let nv = t.intern(name);
-                    let tv = t.intern(if is_dir { b"dir" } else { b"file" });
+                    let nv = t.intern(e.name);
+                    let tv = t.intern(if e.is_dir { b"dir" } else { b"file" });
                     let pv = t.intern(&child[..clen]);
                     // Files carry their byte size (`find * | where size>1000`, the library's `size`
                     // sum); a dir's row leaves it Empty, exactly as `dir`'s records do.
-                    let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+                    let sz = if e.is_dir { Value::Empty } else { Value::Int(e.size) };
                     t.add_row(&[nv, tv, pv, sz]);
                 }
-                if is_dir { stack.push(&child[..clen]); }
+                if e.is_dir { stack.push(&child[..clen]); }
             }
+            !t.overflow()
+        });
+        ctx.fs_tag.set(g.tag());
+        match walked {
+            // A table that filled up stops the walk, and `t.overflow()` already says the answer is
+            // short - so that is NOT the "a directory was too large to read" report.
+            Ok(l) => { if !l.complete && !t.overflow() { short = true; } }
+            Err(gs::Error::Cancelled) => { cancelled = true; break; }
+            // An unreadable directory ends THIS directory, not the search. `find /` over a tree with
+            // one bad entry should still report every other match.
+            Err(_) => { short = true; }
         }
-        if t.overflow() { break 'pages; }
-        }
-        if cur.cut() { short = true; }
     }
+    if cancelled { return None; }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
@@ -16772,44 +16745,33 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     let mut matches = 0u32;
     let mut short = false;
     let mut dir = [0u8; PATH_MAX];
+    let mut cancelled = false;
     while let Some(dlen) = stack.pop(&mut dir) {
-        let mut cur = DirCursor::new();
-        'pages: while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return Ok(()),
-            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        // `break 'pages`, NOT `continue` - see the records `find`. This is the page loop now.
-        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
-        let count = cur.take(p);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() { break; }
-            let nl = p[i] as usize;
-            i += 1;
-            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-            let name = &p[i..i + nl];
-            let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8 + 4 + 1; // name_len + name + is_dir + size:u64 + mtime:u32
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let walked = g.list_dir(&dir[..dlen], |e| {
             let mut child = [0u8; PATH_MAX];
-            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
-                let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
+            if let Some(clen) = join_path(&dir[..dlen], e.name, &mut child) {
+                let hit = if is_glob { glob_match(target, e.name) } else { contains(e.name, target) };
                 if hit {
                     // The matched paths are the pipe data; the summary below is metadata.
                     out.line(ctx, str_of(&child[..clen]));
                     matches += 1;
                 }
-                if is_dir {
+                if e.is_dir {
                     stack.push(&child[..clen]);
                 }
             }
+            true
+        });
+        ctx.fs_tag.set(g.tag());
+        match walked {
+            Ok(l) => { if !l.complete { short = true; } }
+            Err(gs::Error::Cancelled) => { cancelled = true; break; }
+            // An unreadable directory ends THIS directory, not the search.
+            Err(_) => { short = true; }
         }
-        }
-        if cur.cut() { short = true; }
     }
+    if cancelled { return Ok(()); }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
@@ -16876,36 +16838,25 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         if !is_dir { files += 1; continue; }
         if d > 0 { dirs += 1; }
 
-        let mut cur = DirCursor::new();
-        'pages: while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return Ok(()),
-            ReqOutcome::Timeout => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        // `break 'pages`, NOT `continue` - see `find`. This is the page loop now.
-        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
-        // Record each child's offset, then push in REVERSE so they pop in directory order. Both
-        // halves stay INSIDE the page loop: the offsets point into THIS reply and do not outlive it.
-        let count = cur.take(p);
-        let mut offs = [0usize; TREE_FANOUT];
+        // PUSH FORWARD, THEN REVERSE THE RANGE. The stack is LIFO, so children have to go on
+        // backwards to pop in directory order - and doing that one PAGE at a time (which is what the
+        // page loop here used to do) listed a large directory's second page before its first.
+        // Reversing once, after the whole directory, is both correct across pages and free of a
+        // second buffer: the entries are already on the stack.
+        let base = stack.top;
         let mut nc = 0usize;
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() || nc >= TREE_FANOUT { break; }
-            let nl = p[i] as usize;
-            if i + 1 + nl + 1 + 8 > p.len() { break; }
-            offs[nc] = i;
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let walked = g.list_dir(&buf[..plen], |e| {
+            // THE FAN-OUT CAP IS REPORTED NOW. It used to stop at 64 children of a page and say
+            // nothing, so a wide directory was drawn short and read as complete - the same class of
+            // wrong answer the depth bound below has a report for.
+            if nc >= TREE_FANOUT {
+                deep = true;
+                return false;
+            }
             nc += 1;
-            i += 1 + nl + 1 + 8 + 4 + 1;
-        }
-        for k in (0..nc).rev() {
-            let off = offs[k];
-            let nl = p[off] as usize;
-            let cname = &p[off + 1..off + 1 + nl];
-            let cdir = p[off + 1 + nl] != 0;
+            let cname = e.name;
+            let cdir = e.is_dir;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&buf[..plen], cname, &mut child) {
                 // STOPPING SILENTLY AT THE DEPTH BOUND IS A WRONG ANSWER SERVED AS A RIGHT ONE.
@@ -16917,10 +16868,11 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
                 // indistinguishable from having reached the end (§26.7).
                 if depth as usize + 1 >= TREE_MAX_DEPTH {
                     deep = true;
-                    continue;
+                    return true;
                 }
-                // The last child read (forward order) is its parent's last → draws `└──`.
-                stack.push(&child[..clen], cdir, depth + 1, k == nc - 1);
+                // `is_last` is stamped on the final child AFTER the walk - which one that is cannot
+                // be known while it is still running.
+                stack.push(&child[..clen], cdir, depth + 1, false);
             } else {
                 // THE PATH GOT TOO LONG, AND THIS IS THE BOUND THAT ACTUALLY FIRES FIRST.
                 //
@@ -16934,11 +16886,17 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
                 // and the depth guard above never fired because this limit was reached first.
                 deep = true;
             }
-        }
-        }
+            true
+        });
+        ctx.fs_tag.set(g.tag());
         // A directory too large to read fully is the same class of answer as the depth bound: the
         // tree drawn is not the tree on disk, and saying nothing makes it read as though it were.
-        if cur.cut() { deep = true; }
+        match walked {
+            Ok(l) => { if !l.complete && nc < TREE_FANOUT { deep = true; } }
+            Err(gs::Error::Cancelled) => return Ok(()),
+            Err(_) => deep = true,
+        }
+        stack.mark_last_and_reverse(base);
     }
     if deep {
         ctx.console_writeln_fmt(format_args!(
@@ -16978,6 +16936,29 @@ struct TreeStack {
     overflow: bool,
 }
 impl TreeStack {
+    /// Finish a directory's children: mark the last one pushed as its parent's last child (so it
+    /// draws `└──`), then reverse the range so a LIFO pop yields them in directory order.
+    ///
+    /// Swapping in place rather than buffering the names elsewhere: they are already here, and a
+    /// second copy of a directory's worth of paths is the kind of working set 26.6.1 asks you to
+    /// change the representation to avoid rather than to find room for.
+    fn mark_last_and_reverse(&mut self, base: usize) {
+        if self.top <= base {
+            return;
+        }
+        self.is_last[self.top - 1] = true;
+        let (mut i, mut j) = (base, self.top - 1);
+        while i < j {
+            self.buf.swap(i, j);
+            self.len.swap(i, j);
+            self.is_dir.swap(i, j);
+            self.depth.swap(i, j);
+            self.is_last.swap(i, j);
+            i += 1;
+            j -= 1;
+        }
+    }
+
     fn new() -> Self {
         TreeStack {
             buf: [[0u8; PATH_MAX]; TREE_CAP], len: [0; TREE_CAP],
