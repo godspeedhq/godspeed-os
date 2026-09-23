@@ -768,3 +768,82 @@ remains wherever else a delegated resource cap is invoked:
 - **`examples/holder`** still does a bare `ctx.recv()` and hangs forever if its owner dies - hole 2,
   the missing `ReplyDead`, which a tag does NOT fix. That one is genuinely about the mechanism, not
   the protocol, and is left recorded rather than papered over.
+
+## 15. The target-side tests, and the error the restart found
+
+Section 7 recorded target-side tests as owed, and section 9 repeated it. They exist now, and the
+first one turned up a defect that no amount of reading would have.
+
+### `gs::fs` across a real restart was already covered - by a vacuous assertion
+
+`osdev test files` kills `fs` twice (`chaos kill-storm fs 2`) and then runs `dir /`. Since `cmd_dir`
+walks `gs::fs::list_dir`, that has been exercising the library against a genuinely dead-and-respawned
+service all along. The assertion, though, was:
+
+```rust
+check!(!r.contains("storage unavailable"), "shell reacquires fs after its own restart")
+```
+
+**That passes on silence.** A hang, a dropped reply, an empty listing, a command that quietly gave up
+- all of them contain no error string. It is the same vacuous shape that let `"390 writes"` satisfy a
+guard looking for `"0 writes"` earlier in this branch. It now requires a real listing (the trailing
+count) and the absence of both error lines, which makes it an assertion rather than a hope.
+
+### `gs::cap` across a real restart: `fcap gsreuse`
+
+A new command holds a `gs::cap::File` across a real `fs` kill and reads through it afterwards.
+Pinned by four named assertions in `osdev test fs-reuse`, which went from 8 cases to 12.
+
+**Scope, stated rather than quietly narrowed.** `fcap reuse` additionally deletes the original and
+writes a same-length replacement into the freed blocks, proving the stale cap cannot read the
+REPLACEMENT. This test does not, and the reason is the library's own design: `File` borrows
+`&mut Fs`, so while the capability is held the handle cannot write the replacement - and dropping the
+`File` to free the handle CLOSES the capability, which is the thing under test. The borrow is
+deliberate (it makes a second tag counter unspellable), so the constraint is real. What is pinned
+here is the half that is the library's to get right: a stale capability yields a NAMED error rather
+than a hang, a silent success, or a wrong answer. The block-reuse case stays pinned by `fcap reuse`
+against the same kernel and the same `fs`.
+
+### Two things the test found that review did not
+
+**1. `service_answered()` can never be true for a stale capability.** My first probe waited for `fs`
+to come back by invoking the held capability and watching for `service_answered()`. It never fires:
+**the kernel rejects a stale cap on the generation check BEFORE routing**, so the owning service is
+never reached and never answers. The error model was right and the instrument was wrong. The probe
+moved to `inspect_endpoint_generation`, a kernel query needing no `fs` request and therefore no tag -
+which matters because the handle is borrowed for the whole scope.
+
+**2. The library named the wrong cause.** The refusal printed:
+
+```text
+fcap gsreuse: the stale cap was refused - the service could not be reached (nothing happened)
+```
+
+`fs` was up and serving. What happened is that the capability was REVOKED when its issuer died (7.5).
+"Could not be reached" names a different fault and sends an operator to check a service that is
+running perfectly - precisely the complaint this branch wrote into `cmd_tcp` two sections ago.
+
+**The information was there and I was discarding it.** `resource_invoke` returns
+`IpcError::CapError(CapError)`, and `CapError` separates `CapRevoked` and `EndpointDead` from
+`CapInsufficientRights`. My `invoke` collapsed all of them by GUESSING from the rights mask instead
+of reading the error. It now reads it, and `Error::Revoked` exists:
+
+```text
+the capability was revoked - re-open it (nothing happened)
+```
+
+**`retry_is_safe` is FALSE for it, for the less obvious of the two reasons.** Retrying cannot
+double-apply anything - the kernel refused before routing - so it is harmless. It also cannot ever
+succeed, and a caller looping on that predicate would spin forever. The question the predicate
+answers is "should I retry", and the honest answer is no: re-open. The host test says so in those
+words, because the next person to add a variant will face the same choice.
+
+### Verified
+
+- `osdev test fs-reuse`: **12 passed, 0 failed** (was 8).
+- `osdev test file-cap`: 15 passed, 0 failed.
+- `osdev test files`: 245 passed, 0 failed.
+- 13 of 13 gates green; `cargo test -p godspeed` 7/7.
+
+Still owed, and now the only owed item from section 7: nothing. The remaining open work is
+`backlog/46`'s hole 2 and the `net-stack` socket caps, neither of which is a library gap.

@@ -51,8 +51,8 @@
 //!
 //! A program that serves nobody (most programs) can ignore all of this: nothing will ever be held.
 
-use godspeed_sdk::capability::CapHandle;
-use godspeed_sdk::ipc::Message;
+use godspeed_sdk::capability::{CapError, CapHandle};
+use godspeed_sdk::ipc::{IpcError, Message};
 use godspeed_sdk::service_context::{ReqOutcome, ServiceContext};
 
 use crate::call;
@@ -254,18 +254,28 @@ impl<'f, 'a: 'f> File<'f, 'a> {
         // The reply cap is one-shot and derived per invocation: the kernel takes it on delivery.
         let self_grant = self.ctx.self_grant_handle().ok_or(Error::Unreachable)?;
         let reply_cap = self.ctx.derive_cap(self_grant).ok_or(Error::Busy)?;
-        if self
-            .ctx
-            .resource_invoke(self.cap, right, reply_cap, &Message::from_bytes(&req[..1 + body.len()]))
-            .is_err()
+        if let Err(e) = self.ctx.resource_invoke(
+            self.cap, right, reply_cap, &Message::from_bytes(&req[..1 + body.len()]))
         {
-            // The kernel refused: the cap lacks the right, or it is stale. It did NOT consume our
-            // reply cap, so reclaim the slot rather than leaking it (8.5).
+            // The kernel refused before routing. It did NOT consume our reply cap, so reclaim the
+            // slot rather than leaking it (8.5).
             self.ctx.remove_cap(reply_cap);
-            return Err(if right & self.right != right {
-                Error::PermissionDenied
-            } else {
-                Error::Unreachable
+            // READ THE ERROR, DO NOT INFER IT. An earlier cut guessed from the rights mask, so a
+            // REVOKED capability was reported as "the service could not be reached" - a different
+            // fault, which sends an operator to check a service that is running perfectly. Found by
+            // `fcap gsreuse` against a real `fs` restart, not by review.
+            return Err(match e {
+                IpcError::CapError(CapError::CapInsufficientRights)
+                | IpcError::CapError(CapError::CapNotGrantable)
+                | IpcError::CapError(CapError::CapWrongScope) => Error::PermissionDenied,
+                // Revoked, or the issuer died and was replaced. One meaning to a holder: this
+                // capability is finished, and the answer is to re-open rather than to retry.
+                IpcError::CapError(CapError::CapRevoked)
+                | IpcError::CapError(CapError::CapNotHeld)
+                | IpcError::CapError(CapError::EndpointDead)
+                | IpcError::EndpointDead
+                | IpcError::ReplyDead => Error::Revoked,
+                _ => Error::Unreachable,
             });
         }
 

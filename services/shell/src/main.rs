@@ -14445,8 +14445,99 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     }
 }
 
+/// `fcap gsreuse` - the same question as `fcap reuse`, asked of the STANDARD LIBRARY.
+///
+/// A `gs::cap::File` minted before `fs` dies must reach nothing after it comes back, and must say so
+/// in words rather than hanging or quietly succeeding. Everything here goes through `gs::fs` and
+/// `gs::cap` so there is ONE tag counter for the whole sequence.
+///
+/// See `build/gscap_reuse2.py` and `docs/stdlib-design.md` for what this deliberately does NOT cover
+/// (the block-reuse confused-deputy case, which `fcap reuse` pins).
+fn cmd_fcap_gsreuse(ctx: &ShellCtx) -> Result<(), ShellError> {
+    const OLDP: &str = "/gsru_old.txt";
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let _ = gfs.delete(OLDP);
+    let created = gfs.write(OLDP, b"OLDDATA").is_ok();
+    // Recorded BEFORE the kill: the generation `fs` is serving on now. A restart bumps it (14.2),
+    // and that is what "came back" will be tested against.
+    let gen_before = ctx.inspect_endpoint_generation("fs");
+
+    // Everything that touches the `File` lives in here, because the handle is borrowed for as long
+    // as the capability is. The tag is synced back exactly once, after this ends.
+    let verdict: Result<(), &'static str> = if !created {
+        Err("could not create the original")
+    } else {
+        match gfs.open(OLDP, gs::cap::READ) {
+            Err(_) => Err("could not open the original as a cap"),
+            Ok(mut f) => {
+                let mut buf = [0u8; 16];
+                let readable = matches!(f.read_at(0, &mut buf), Ok(n) if n >= 7 && &buf[..7] == b"OLDDATA");
+                if !readable {
+                    // It must WORK first, or a later refusal proves nothing: a handle that was never
+                    // valid is refused for the wrong reason and the test passes while testing nothing.
+                    Err("the cap did not read the original")
+                } else {
+                    ctx.console_writeln("fcap gsreuse: the cap reads the original before the restart");
+                    ctx.console_writeln("fcap gsreuse: killing fs with the gs::cap file still held");
+                    if ctx.kill("fs").is_err() {
+                        Err("could not kill fs")
+                    } else {
+                        // WAIT ON TRUTH, FROM OUTSIDE THE FS CHANNEL.
+                        //
+                        // The obvious probe - invoke the held capability and wait for
+                        // `Error::service_answered()` - CANNOT WORK, and the reason is worth
+                        // knowing: a stale resource cap is rejected by the KERNEL on the generation
+                        // check, before the message is routed. `fs` is never reached, so `fs` never
+                        // answers, and `service_answered()` is permanently false for a stale cap.
+                        // That is the right answer from the error model and the wrong instrument
+                        // for this question.
+                        //
+                        // `inspect_endpoint_generation` is a kernel query, so it needs no `fs`
+                        // request and no tag - which matters because the `Fs` handle is borrowed by
+                        // the `File` for this whole scope, and a second handle would mean a second
+                        // tag counter on one endpoint.
+                        let mut back = false;
+                        for _ in 0..200 {
+                            let _ = ctx.reacquire_by_name("fs");
+                            if ctx.inspect_endpoint_generation("fs") > gen_before { back = true; break; }
+                            ctx.yield_cpu();
+                        }
+                        if !back {
+                            Err("fs never came back")
+                        } else {
+                            // THE QUESTION.
+                            let mut after = [0u8; 16];
+                            match f.read_at(0, &mut after) {
+                                Ok(_) => Err("the stale cap still resolved to something"),
+                                Err(e) => {
+                                    ctx.console_writeln_fmt(format_args!(
+                                        "fcap gsreuse: the stale cap was refused - {}", e.as_str()));
+                                    Ok(())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    ctx.fs_tag.set(gfs.tag());
+
+    match verdict {
+        Ok(()) => {
+            ctx.console_writeln("fcap gsreuse: ok - a gs::cap file minted before the restart reaches nothing after it");
+            Ok(())
+        }
+        Err(why) => {
+            ctx.console_writeln_fmt(format_args!("fcap gsreuse: FAIL - {}", why));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
 fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim() == "reuse" { return cmd_fcap_reuse(ctx); }
+    if arg.trim() == "gsreuse" { return cmd_fcap_gsreuse(ctx); }
     if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
     if !arg.trim().is_empty() {
         ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");

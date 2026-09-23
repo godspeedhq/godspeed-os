@@ -3888,8 +3888,16 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - read fs chaos report timeout"); fail += 1; }
     }
     match run!(b"dir /\r", 10) {
-        Some(r) => check!(!r.contains("storage unavailable"),
-                          "directory: shell reacquires fs after its own restart"),
+        // MUST SHOW A LISTING, not merely fail to complain. This checked only that the words
+        // "storage unavailable" were absent, which an EMPTY reply satisfies - a hang, a dropped
+        // answer or a command that gave up all passed. And this is the one test in the repository
+        // that exercises the standard library against a service that really died and came back
+        // (`dir` walks `gs::fs::list_dir`), so a vacuous pass here is a vacuous pass for the whole
+        // reacquisition claim.
+        Some(r) => check!(!r.contains("storage unavailable")
+                          && !r.contains("could not read")
+                          && (r.contains("entries") || r.contains("(empty)")),
+                          "directory: shell reacquires fs after its own restart AND lists it"),
         None    => { println!("files-test: FAIL - dir after fs-storm timeout"); fail += 1; }
     }
 
@@ -7072,6 +7080,11 @@ pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
     // it - the shell keeps no cap table between prompts, so `fcap` here and `kill fs` there would
     // drop the handle before the interesting moment.
     let out = run!(b"fcap reuse\r", 180).unwrap_or_default();
+    // THE SAME QUESTION, ASKED OF THE STANDARD LIBRARY. A second real `fs` death, with a
+    // `gs::cap::File` held across it. This is the only place the library meets a service that
+    // genuinely dies and comes back - which a host test structurally cannot reach, and which
+    // `docs/stdlib-design.md` has recorded as owed since section 7.
+    let gsout = run!(b"fcap gsreuse\r", 180).unwrap_or_default();
 
     let after = run!(b"drives check\r", 180).unwrap_or_default();
     let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
@@ -7091,6 +7104,18 @@ pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!out.contains("still resolved to something"),
            "the stale capability resolved to nothing at all, not merely to the wrong thing");
     check!(out.contains("fcap reuse: ok"), "the whole sequence reported success");
+    // ---- THE STANDARD LIBRARY, ACROSS A REAL RESTART ----
+    check!(gsout.contains("reads the original before the restart"),
+           "gs::cap: the capability worked BEFORE the restart");
+    check!(!gsout.contains("still resolved to something"),
+           "gs::cap: the stale capability reached NOTHING after the restart");
+    // The library's job is not merely to fail - it is to fail IN WORDS. A hang times out above
+    // and a silent success is caught by the check before this; this one pins that the operator
+    // is TOLD, which is the whole reason the error model exists.
+    check!(gsout.contains("the stale cap was refused - "),
+           "gs::cap: the refusal is NAMED, not a hang and not a silent failure");
+    check!(gsout.contains("fcap gsreuse: ok"),
+           "gs::cap: the whole library sequence reported success");
     check!(after.contains("0 bad"), "the volume is intact after a restart with a live capability");
 
     println!("\nfs-reuse: {pass} passed, {fail} failed");

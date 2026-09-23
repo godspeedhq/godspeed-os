@@ -86,6 +86,21 @@ pub enum Error {
     ///
     /// It is still not safe to retry blindly. The request may already have been delivered and acted
     /// on; cancelling only means this caller stopped listening.
+    /// The capability is no longer valid: whatever issued it revoked it, or died and was
+    /// replaced (7.5 - a generation bump invalidates every outstanding cap).
+    ///
+    /// **The kernel refused this before the owning service was reached**, so nothing happened and
+    /// nothing was asked of anyone. Distinct from [`Error::Unreachable`] on purpose: the service is
+    /// very likely up and well. Reporting this as "could not be reached" sends an operator to check
+    /// a service that is running perfectly.
+    ///
+    /// [`retry_is_safe`](Error::retry_is_safe) is **false** here, and for the less obvious of its
+    /// two reasons: a repeat cannot double-apply anything (the kernel refused before routing), but
+    /// it can never succeed either, and a caller looping on that predicate would spin forever.
+    ///
+    /// **Re-open the resource** - and remember that a capability obtained from a service's PREVIOUS
+    /// instance is stale even after you reacquire that service by name (14.3).
+    Revoked,
     Cancelled,
 
     /// The caller's buffer is too small for the answer. Nothing was consumed; call again with room.
@@ -130,6 +145,7 @@ impl Error {
             Error::Unreachable      => "the service could not be reached (nothing happened)",
             Error::Busy             => "the service is busy (nothing happened)",
             Error::OutcomeUnknown   => "no answer before the deadline - THE OUTCOME IS UNKNOWN",
+            Error::Revoked          => "the capability was revoked - re-open it (nothing happened)",
             Error::Cancelled        => "cancelled",
             Error::Malformed        => "the service sent a reply this library could not parse",
             Error::BufferTooSmall   => "the buffer is too small for the answer",
@@ -202,6 +218,17 @@ mod tests {
         assert!(!Error::OutcomeUnknown.service_answered());
         assert!(!Error::Busy.service_answered());
         assert!(!Error::Cancelled.service_answered(), "nobody answered - we stopped asking");
+        // A revoked capability is refused by the KERNEL on the generation check, before the
+        // owning service is reached. So nothing answered - and a caller must not read this as
+        // evidence about whether that service is healthy. It very likely is.
+        assert!(!Error::Revoked.service_answered(),
+                "the kernel refused it; the service was never asked");
+        // FALSE, and for the less obvious of the two reasons. Retrying a revoked capability cannot
+        // double-apply anything - the kernel refused it before routing - so it is harmless. It also
+        // cannot ever succeed, and a caller looping on `retry_is_safe` would spin forever. The
+        // question this answers is "should I retry", and the honest answer is no: re-open.
+        assert!(!Error::Revoked.retry_is_safe(),
+                "retrying a revoked capability can never succeed - re-open it instead");
     }
 
     /// The phrasing is user-facing, so it is pinned: no trailing full stop, and the one that matters
@@ -210,7 +237,7 @@ mod tests {
     fn messages_are_house_style() {
         for e in [Error::NotFound, Error::Unreachable, Error::OutcomeUnknown, Error::Busy,
                   Error::Failed, Error::Malformed, Error::BufferTooSmall, Error::InvalidInput,
-                  Error::Cancelled] {
+                  Error::Cancelled, Error::Revoked] {
             let s = e.as_str();
             assert!(!s.is_empty());
             assert!(!s.ends_with('.'), "{s:?} ends with a full stop");
