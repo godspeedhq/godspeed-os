@@ -13481,32 +13481,19 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
 fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
-    let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
-        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r.ok().map(|st| (st.size, st.is_dir))
 }
 
 /// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
 /// (0 at EOF). One message - the building block for streaming a large file.
 fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
-    let mut tail = [0u8; 12];
-    tail[..8].copy_from_slice(&offset.to_le_bytes());
-    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
-    let reply = fs_request(ctx, OP_READ_AT, path, &tail)?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        let n = end - 5;
-        out[..n].copy_from_slice(&p[5..end]);
-        Some(n)
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.read_at(path, offset, out);
+    ctx.fs_tag.set(g.tag());
+    r.ok()
 }
 
 /// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
@@ -15755,14 +15742,18 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
 
 /// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
 fn stat_kind(ctx: &ShellCtx, path: &[u8]) -> Option<bool> {
-    let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 { Some(p[10] != 0) } else { None }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r.ok().map(|st| st.is_dir)
 }
 
 /// `mkdir <path>` via fs, treating success as true. Used by recursive copy to recreate dirs.
 fn mkdir_at(ctx: &ShellCtx, path: &[u8]) -> bool {
-    matches!(fs_request(ctx, OP_MKDIR, path, &[]), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.create_dir(path).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
 }
 
 /// Stream-copy a file `src`→`dst` of any size: stat the size, allocate `dst`, then chunk
