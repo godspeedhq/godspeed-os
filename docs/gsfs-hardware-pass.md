@@ -5,7 +5,13 @@ in the strong form.** `selfcheck` is clean on all five. The unassisted cuts, in 
 (AHCI, 2026-09-18, mid-`selfcheck`, fourth cut), HP T630 (AHCI, 2026-09-22, first), then on
 2026-09-23 the Raspberry Pi 2 (USB/dwc2, third), Raspberry Pi 4 (USB/xhci, first) and VisionFive 2
 (USB/xhci riscv64, first). The Pi 4 and VisionFive had `crash-window` cuts on 2026-09-22 as well;
-those are superseded, so nothing here rests on a window held open for the device. This is the
+those are superseded, so nothing here rests on a window held open for the device.
+
+**Three code states, not one.** Only the 2026-09-23 boards ran the current build. The T630's cut
+predates the loud recovery path, and the Wyse's predates the stale-superblock fix as well - so the
+Wyse's `nothing repaired` is unearned (its cut did not move the free count, leaving stale and fresh
+identical). Both AHCI results stand as recoveries; neither has been RE-verified on the code shipping
+today, and `build/os-usb.img` is built and waiting for whenever that is worth doing. This is the
 checklist for the five, written while the QEMU work was fresh so that the reasons behind each step
 are recorded rather than reconstructed later.
 
