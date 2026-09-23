@@ -131,6 +131,19 @@ or explained, and that alone is worth the investigation.
 
 ---
 
+## The governing constraint, and what it settles
+
+> The stdlib's job is to make existing Godspeed functionality pleasant and safe to consume. It isn't
+> supposed to create functionality that the OS doesn't already possess. - the operator
+
+Under that rule this entry's conclusion is short: **`gs::cap` correctly does not exist, because the
+OS does not currently possess safe general resource invocation.** A standard library cannot offer a
+guarantee the system underneath it does not make. The library's job ended when the gap was found;
+filling it would have been the library manufacturing a capability rather than re-serving one.
+
+Everything below is therefore a NOTE FOR WHOEVER PICKS UP THE MECHANISM, not a plan. Its value is
+that it rules out the cheap rungs with evidence, so the search is not repeated.
+
 ## Triage against the operator's ladder (2026-09-23)
 
 The operator supplied a five-rung ladder: A stdlib abstraction wrong, B userspace composed wrong,

@@ -616,3 +616,59 @@ test, and what a future investigation should settle - including the entirely acc
 **The useful thing here is not a feature.** No code shipped from this section. What it produced is a
 hidden assumption made visible - that resource invocation is safe only from a task whose endpoint is
 otherwise idle, a contract nothing states and one published example does not honour.
+
+## 13. The governing constraint: the library CONSUMES capability, it never CREATES it
+
+Stated by the operator, and it is the rule the rest of this report should have been written against
+from the start:
+
+> The stdlib's job is to make existing Godspeed functionality pleasant and safe to consume. It isn't
+> supposed to create functionality that the OS doesn't already possess.
+>
+> So if implementing a stdlib API apparently requires
+> `stdlib API -> new syscall -> kernel modification`,
+> that is a reason to stop and question the stdlib/SDK composition, not an invitation to modify the
+> kernel.
+
+### What this does to the `gs::cap` conclusion
+
+Section 12 and the `backlog/46` triage answered "is the mechanism incomplete, and how expensive is
+the remedy" - and concluded rung D with a remedy cheaper than first thought. **That framing was
+subtly wrong, because it is not the library's question.** Under this constraint the answer is
+shorter and firmer:
+
+**`gs::cap` correctly does not exist, because the OS does not currently possess safe general
+resource invocation.** A standard library cannot offer a guarantee the system underneath it does not
+make. The work ended the moment the gap was identified; filling it would have been the library
+manufacturing a capability rather than re-serving one.
+
+The triage in `backlog/46` keeps its value - it rules out B and C with evidence, so a future branch
+does not repeat the search - but it is a note for whoever picks the mechanism up, not a plan for
+this branch. `feat/stdlib` touches neither `kernel/` nor `sdk/`: both diffs against `main` are
+empty, and that is now stated at the top of the backlog entry so the analysis cannot be misread as a
+proposal.
+
+### The constraint is STRUCTURAL now, not a promise
+
+The property that enforces this is `#![deny(unsafe_code)]` on the crate. Without `unsafe` the
+library cannot issue a syscall, so it is confined to the SDK's safe surface and can only ever
+re-serve what already exists. A stdlib able to reach the raw ABI could quietly grow a capability the
+system does not have.
+
+The attribute was present from the first commit. **Nothing was checking it**, and the check that
+should have was broken in two independent ways, both found by adding the root and then deliberately
+deleting the attribute to watch the gate fire:
+
+1. **`unsafe_check.py`'s `DENY_ROOTS` was `("services", "examples", "osdev")`** - the stdlib was not
+   scanned at all. The same gap class as `doc_symbols_check.py` not scanning `stdlib/rust/src`,
+   found the same day. A new top-level crate is invisible to every gate whose roots are a hand-kept
+   list, and being invisible reads exactly like passing.
+2. **The presence test was satisfiable by a COMMENT.** It asked `DENY_ATTR not in text` against the
+   raw file, and `stdlib/rust/src/lib.rs` explains the attribute in its module documentation five
+   lines above declaring it. Deleting the real attribute left the gate green. The `#[allow]` scan in
+   the same function already strips `//` before matching, for exactly this reason - the lesson had
+   been learned for one half of the function and not the other.
+
+Both fixed, and the guard now fires on a deleted attribute. Worth stating plainly: **for the whole
+of this branch, the one property making "the library cannot manufacture capability" structural
+rather than aspirational was resting on nobody deleting a line by accident.**
