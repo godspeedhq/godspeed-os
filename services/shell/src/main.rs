@@ -3672,12 +3672,12 @@ fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32)
     let temp = forlines_temp(id, &mut tb);
     let mut rbuf = [0u8; IO_CHUNK];
     let n = fs_read_at(ctx, temp, off as u64, &mut rbuf).unwrap_or(0);
-    if n == 0 { let _ = fs_request(ctx, OP_DELETE, temp, &[]); return None; } // exhausted -> clean up
+    if n == 0 { let _ = sh_delete(ctx, temp); return None; } // exhausted -> clean up
     let mut k = 0usize;
     while k < n && rbuf[k] != b'\n' { k += 1; }
     let (line_end, next_off) = if k < n { (k, off + k as u32 + 1) } else { (n, off + n as u32) };
     if vars.set_slot(var, &rbuf[..line_end]).is_err() {
-        let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+        let _ = sh_delete(ctx, temp);
         return None;
     }
     Some(ForIter::FileLines { off: next_off, id })
@@ -3689,7 +3689,7 @@ fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32)
 /// producer (run_captured said why), an over-16-KiB output, or a write failure.
 #[inline(never)]
 fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
-    let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+    let _ = sh_delete(ctx, temp);
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(()); }
@@ -3701,7 +3701,7 @@ fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Resu
     while w < data.len() {
         let m = (data.len() - w).min(IO_CHUNK); // IO_CHUNK is 508-aligned, so each offset is block-aligned
         if !fs_write_at(ctx, temp, w as u64, &data[w..w + m]) {
-            let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+            let _ = sh_delete(ctx, temp);
             ctx.console_writeln("gsh: for line: capture write failed");
             return Err(());
         }
@@ -4217,7 +4217,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                             if let ForIter::FileLines { id, .. } = it {
                                 let mut tb = [0u8; 24];
                                 let t = forlines_temp(id, &mut tb);
-                                let _ = fs_request(ctx, OP_DELETE, t, &[]);
+                                let _ = sh_delete(ctx, t);
                             }
                             sp = i; pos = body_end + 1;               // pop loop + inner frames, exit past `}`
                         } else { sp = i + 1; pos = body_end; }        // keep loop; jump to `}` -> next iteration
@@ -10306,7 +10306,7 @@ fn sticky_write(ctx: &ShellCtx, budget: u64, filter: &str, path: &str) -> bool {
 /// Forget a sticky capture. Called on `stop`, so an explicit stop stays stopped across a reboot -
 /// otherwise the one command that means "enough" would be the one that did not take.
 fn sticky_clear(ctx: &ShellCtx) {
-    let _ = fs_request(ctx, OP_DELETE, STICKY_PATH, &[]);
+    let _ = sh_delete(ctx, STICKY_PATH);
 }
 
 /// True if a sticky capture is recorded.
@@ -11534,7 +11534,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
         if !fs_write_at(ctx, WRITE_TMP, off as u64, &chunk[..n]) { return false; }
         off += n;
     }
-    let _ = fs_request(ctx, OP_DELETE, p, &[]);
+    let _ = sh_delete(ctx, p);
     matches!(fs_request(ctx, OP_MOVE, WRITE_TMP, p).as_ref()
         .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)))
 }
@@ -12805,6 +12805,22 @@ fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
     match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) }
 }
 
+/// Delete a path through `gs::fs`, borrowing the shell's one correlation-tag counter.
+///
+/// For the fire-and-forget cleanups scattered through this file - temp files, test fixtures, a
+/// stale sticky note. Returns whether it went, which most callers discard and a few check.
+///
+/// **It borrows `ctx.fs_tag` rather than keeping its own.** The shell has one endpoint, so it must
+/// have one tag sequence; a helper that started a second could mint a tag already in flight, and a
+/// colliding tag is not rejected loudly - it lets a stale reply be accepted as the current answer.
+/// That is the bug this branch fixed in `services/copier`, which had a CONSTANT tag.
+fn sh_delete(ctx: &ShellCtx, path: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.delete(path).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
 fn next_fs_tag(ctx: &ShellCtx) -> u8 {
     // C6-1: this counter used to be `static FS_TAG: AtomicU8` - unowned global mutable state
     // (Invariant 9) wearing a thread-safe type. Nothing here is concurrent; the shell is one task on
@@ -13871,7 +13887,11 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     // allocator takes different paths for each, and a one-size churn would only ever exercise one.
     const SIZES: [usize; 4] = [64, 500, 1200, 3000];
 
-    let _ = fs_request(ctx, OP_MKDIR, DIR, &[]);
+    // ONE handle for the whole run. The correlation tag then advances across thousands of
+    // transactions instead of restarting at each call, which is the property that lets a late reply
+    // be recognised rather than believed.
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let _ = gfs.create_dir(DIR);
     out.line_fmt(ctx, format_args!(
         "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
 
@@ -13913,9 +13933,10 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         path[pl] = b'0' + slot as u8; pl += 1;
         path[pl..pl + 4].copy_from_slice(b".bin"); pl += 4;
 
-        match fs_request(ctx, OP_WRITE_FILE, &path[..pl], &buf[..n]).as_ref()
-                 .map(|r| r.payload_bytes().first().copied()) {
-            Some(Some(FS_OK)) => { writes += 1; bytes += n as u64; }
+        match gfs.write(&path[..pl], &buf[..n]) {
+            Ok(()) => { writes += 1; bytes += n as u64; }
+            // Counted as refused, INCLUDING an unknown outcome. That is the honest reading for a
+            // load generator: it does not know whether the write landed, so it must not claim it.
             _ => failures += 1,
         }
 
@@ -13936,11 +13957,9 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
             // writes" would have hidden this indefinitely, which is the argument for a tool
             // reporting what it DID rather than that it ran.
             let name_at = DIR.len() + 1;
-            if matches!(fs_request(ctx, OP_RENAME, &path[..pl], &np[name_at..pl]).as_ref()
-                          .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+            if gfs.rename(&path[..pl], &np[name_at..pl]).is_ok() {
                 renames += 1;
-                if matches!(fs_request(ctx, OP_DELETE, &np[..pl], &[]).as_ref()
-                              .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+                if gfs.delete(&np[..pl]).is_ok() {
                     deletes += 1;
                 }
             }
@@ -13953,6 +13972,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         writes, renames, deletes, bytes, failures));
     out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
     out.line(ctx, "churn: /churn is left in place (it is the evidence); `churn reset` removes it");
+    ctx.fs_tag.set(gfs.tag());
     Ok(())
 }
 
@@ -14309,8 +14329,8 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     const NEWP: &[u8] = b"/ru_new.txt";
     let mut ok = true;
 
-    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
-    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    let _ = sh_delete(ctx, OLDP);
+    let _ = sh_delete(ctx, NEWP);
     if !matches!(fs_request(ctx, OP_WRITE_FILE, OLDP, b"OLDDATA").as_ref()
                    .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
         ctx.console_writeln("fcap reuse: FAIL - could not create the original");
@@ -14354,7 +14374,7 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
 
     // FREE THE BLOCKS, THEN PUT SOMETHING ELSE IN THEM. Same length, so the allocator is offered
     // the extent it just reclaimed.
-    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
+    let _ = sh_delete(ctx, OLDP);
     if !matches!(fs_request(ctx, OP_WRITE_FILE, NEWP, b"NEWDATA").as_ref()
                    .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
         ctx.console_writeln("fcap reuse: FAIL - could not write the replacement");
@@ -14381,7 +14401,7 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     }
 
     ctx.remove_cap(held);
-    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    let _ = sh_delete(ctx, NEWP);
     if ok {
         ctx.console_writeln("fcap reuse: ok - a capability minted before the restart reaches nothing after it");
         Ok(())
@@ -14504,7 +14524,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // 1. Open the file as a capability (fs mints a delegated resource + hands us the cap).
     let rw = match fc_open(ctx, path, RIGHT_READ | RIGHT_WRITE) {
         Some(c) => { ctx.console_writeln("fcap: opened rw (file cap)"); c }
-        None    => { ctx.console_writeln("fcap: FAIL open rw"); let _ = fs_request(ctx, OP_DELETE, path, &[]); return Err(ShellError::Unknown); }
+        None    => { ctx.console_writeln("fcap: FAIL open rw"); let _ = sh_delete(ctx, path); return Err(ShellError::Unknown); }
     };
 
     // 2. Write THROUGH the cap (FOP_WRITE needs WRITE, which rw holds).
@@ -14529,7 +14549,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // 4. Open a READ-ONLY cap to the same file.
     let ro = match fc_open(ctx, path, RIGHT_READ) {
         Some(c) => c,
-        None    => { fail(ctx, "fcap: FAIL open ro"); ctx.remove_cap(rw); let _ = fs_request(ctx, OP_DELETE, path, &[]); return Err(ShellError::Unknown); }
+        None    => { fail(ctx, "fcap: FAIL open ro"); ctx.remove_cap(rw); let _ = sh_delete(ctx, path); return Err(ShellError::Unknown); }
     };
 
     // 5. Non-escalation, kernel layer: invoking the RO cap declaring WRITE is rejected by the
@@ -14591,7 +14611,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // size from the first moment.
     const APPEND_PATH: &[u8] = b"/.fcap_append";
     const BLK: u64 = 508;   // DATA_PAYLOAD - `write_at` demands block-aligned offsets
-    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
+    let _ = sh_delete(ctx, APPEND_PATH);
     let mut newreq = [0u8; 8];
     newreq[..8].copy_from_slice(&(3 * BLK).to_le_bytes());
     if !matches!(fs_request(ctx, OP_WRITE_NEW, APPEND_PATH, &newreq).as_ref().map(|r| r.payload_bytes().first().copied()),
@@ -14632,14 +14652,14 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         fail(ctx, "fcap: FAIL open append-only");
         ok = false;
     }
-    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
+    let _ = sh_delete(ctx, APPEND_PATH);
 
     // Cleanup so `fcap` is leak-free and re-runnable (e.g. in selfcheck): drop both shell handles
     // (rw revoked at close, ro revoked at rename) and delete the throwaway file (now at the renamed
     // path). Otherwise each run orphans cap-table slots and leaves a stray file behind.
     ctx.remove_cap(ro);
     ctx.remove_cap(rw);
-    let _ = fs_request(ctx, OP_DELETE, FCAP_TMP_RENAMED, &[]);
+    let _ = sh_delete(ctx, FCAP_TMP_RENAMED);
 
     // ---- THE SAME PROPERTY, THROUGH THE STANDARD LIBRARY -------------------------------------
     //
@@ -15139,7 +15159,7 @@ fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
             off += got;
         }
         // Atomic-ish replace: delete the target (ignore "not found" on a first save), move temp in.
-        let _ = fs_request(ctx, OP_DELETE, path, &[]);
+        let _ = sh_delete(ctx, path);
         let moved = matches!(fs_request(ctx, OP_MOVE, EDIT_TMP, path)
             .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
         if !moved { return false; }
@@ -15395,7 +15415,7 @@ fn fmt_to_temp(ctx: &ShellCtx, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
         let mut count = |bytes: &[u8]| -> bool { total += bytes.len() as u64; true };
         fmt_stream_pass(ctx, src, &mut count)?; // no temp exists yet - safe to `?`
     }
-    let _ = fs_request(ctx, OP_DELETE, tmp, &[]); // clear any stale temp
+    let _ = sh_delete(ctx, tmp); // clear any stale temp
     if !fs_write_new(ctx, tmp, total) { return Err(FmtErr::Write); }
     let mut wlen = 0usize;
     let mut woff = 0u64;
@@ -15419,8 +15439,8 @@ fn fmt_to_temp(ctx: &ShellCtx, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
         if !werr && wlen > 0 && !fs_write_at(ctx, tmp, woff, &wbuf[..wlen]) { werr = true; } // final flush
         rr
     };
-    if let Err(e) = r { let _ = fs_request(ctx, OP_DELETE, tmp, &[]); return Err(e); }
-    if werr { let _ = fs_request(ctx, OP_DELETE, tmp, &[]); return Err(FmtErr::Write); }
+    if let Err(e) = r { let _ = sh_delete(ctx, tmp); return Err(e); }
+    if werr { let _ = sh_delete(ctx, tmp); return Err(FmtErr::Write); }
     Ok(total)
 }
 
@@ -15493,7 +15513,7 @@ fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), 
         // Compare the freshly-formatted temp against the original (two DIFFERENT files, read
         // sequentially), then discard the temp. `check` never modifies the file.
         let canonical = fmt_compare_files(ctx, tmp, p);
-        let _ = fs_request(ctx, OP_DELETE, tmp, &[]);
+        let _ = sh_delete(ctx, tmp);
         if canonical { return Ok(()); } // silent Ok
         ctx.console_writeln_fmt(format_args!("fmt: {} is not canonical (run: fmt {})", str_of(p), str_of(p)));
         return Err(ShellError::Unknown);
@@ -15503,7 +15523,7 @@ fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), 
     let mut bstart = 0usize;
     for (i, &c) in p.iter().enumerate() { if c == b'/' { bstart = i + 1; } }
     let base = &p[bstart..];
-    let _ = fs_request(ctx, OP_DELETE, p, &[]);
+    let _ = sh_delete(ctx, p);
     if matches!(fs_request(ctx, OP_RENAME, tmp, base), Some(r) if r.payload_bytes().first() == Some(&FS_OK)) {
         ctx.console_writeln_fmt(format_args!("fmt {} ({} bytes)", str_of(p), total));
         Ok(())
