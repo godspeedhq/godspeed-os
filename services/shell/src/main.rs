@@ -11451,13 +11451,27 @@ fn read_file_exact_bounded(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u
 /// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
 fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
     if data.len() <= IO_CHUNK {
-        match fs_request(ctx, OP_WRITE_FILE, p, data) {
-            Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
-                ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p))),
-            Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-            Some(_) => ctx.console_writeln("pipe: write failed (bad path, or parent missing?)"),
-            None    => ctx.console_writeln("pipe: storage unavailable"),
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let r = g.write(p, data);
+        match r {
+            Ok(()) => ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p))),
+            // A LOST REPLY IS NOT A FAILED WRITE. The bytes may be on the disk; saying the write
+            // failed would send the operator to re-run a pipe that already ran.
+            Err(gs::Error::OutcomeUnknown) =>
+                ctx.console_writeln("pipe: OUTCOME UNKNOWN - the reply was lost; the write MAY HAVE LANDED. Check with `read`"),
+            Err(gs::Error::NoFilesystem) => ctx.console_writeln("no filesystem - run 'drives flash' first"),
+            Err(gs::Error::Unavailable) =>
+                ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)"),
+            Err(_) => {
+                let why = g.reason();
+                if why.is_empty() {
+                    ctx.console_writeln("pipe: write failed (bad path, or parent missing?)");
+                } else {
+                    ctx.console_writeln_fmt(format_args!("pipe: write failed - {}", why));
+                }
+            }
         }
+        ctx.fs_tag.set(g.tag());
         return;
     }
     if !fs_write_new(ctx, p, data.len() as u64) {
@@ -11494,7 +11508,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
     // genuinely absent, no reply at all says `fs` could not answer.
     let old_size = match fs_stat(ctx, p) {
         Some((sz, _)) => sz as usize,
-        None if fs_request(ctx, OP_STAT_FILE, p, &[]).is_some() => 0,
+        None if sh_fs_answered(ctx, p) => 0,
         None => {
             ctx.console_writeln("write: cannot stat the target - ABORTING, nothing was changed");
             return false;
@@ -11502,8 +11516,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
     };
     let total = old_size + new.len();
     if total == 0 {
-        return matches!(fs_request(ctx, OP_WRITE_FILE, p, &[]).as_ref()
-            .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+        return sh_write(ctx, p, &[]);
     }
     if !fs_write_new(ctx, WRITE_TMP, total as u64) { return false; }
     // Ordered segments: prepend = [new (mem) | old (disk)]; append = [old (disk) | new (mem)].
@@ -11535,8 +11548,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
         off += n;
     }
     let _ = sh_delete(ctx, p);
-    matches!(fs_request(ctx, OP_MOVE, WRITE_TMP, p).as_ref()
-        .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)))
+    sh_move(ctx, WRITE_TMP, p)
 }
 
 /// The `write` pipe sink: `… | write [append|prepend] <path>`. Parses the mode (plain overwrites),
@@ -12814,6 +12826,50 @@ fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
 /// have one tag sequence; a helper that started a second could mint a tag already in flight, and a
 /// colliding tag is not rejected loudly - it lets a stale reply be accepted as the current answer.
 /// That is the bug this branch fixed in `services/copier`, which had a CONSTANT tag.
+/// Write a whole (small) file, borrowing the shell's one tag counter. `true` if it went.
+fn sh_write(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.write(path, data).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Move a path, borrowing the shell's one tag counter. `true` if it went.
+fn sh_move(ctx: &ShellCtx, from: &[u8], to: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.move_to(from, to).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Rename within a directory, borrowing the shell's one tag counter. `true` if it went.
+fn sh_rename(ctx: &ShellCtx, path: &[u8], newname: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.rename(path, newname).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Whether `fs` ANSWERED a stat of `path` - which is not the same as the path existing.
+///
+/// The distinction is load-bearing and cost a regression to learn. `write append` to a MISSING file
+/// must create it, so the question at that call site is "is the filesystem answering me", not "is
+/// the file there": a definite "no such file" is a perfectly good answer and means proceed with a
+/// zero-length original. Only a transport failure - nobody answered - means abort without touching
+/// anything.
+///
+/// The old code asked it as `fs_request(..).is_some()`, which is true for a NOTFOUND reply too.
+/// `Error::service_answered` is that question with a name.
+fn sh_fs_answered(ctx: &ShellCtx, path: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let answered = match g.stat(path) {
+        Ok(_) => true,
+        Err(e) => e.service_answered(),
+    };
+    ctx.fs_tag.set(g.tag());
+    answered
+}
+
 fn sh_delete(ctx: &ShellCtx, path: &[u8]) -> bool {
     let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
     let ok = g.delete(path).is_ok();
@@ -15156,8 +15212,7 @@ fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
 
     if total == 0 {
         // Empty document → write an empty file directly (one message).
-        if !matches!(fs_request(ctx, OP_WRITE_FILE, path, &[])
-            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+        if !sh_write(ctx, path, &[]) {
             return false;
         }
     } else {
@@ -15173,9 +15228,7 @@ fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
         }
         // Atomic-ish replace: delete the target (ignore "not found" on a first save), move temp in.
         let _ = sh_delete(ctx, path);
-        let moved = matches!(fs_request(ctx, OP_MOVE, EDIT_TMP, path)
-            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
-        if !moved { return false; }
+        if !sh_move(ctx, EDIT_TMP, path) { return false; }
     }
 
     // Reset the budget: the saved file is now the original; one Orig span over it, add buffer empty.
@@ -15537,7 +15590,7 @@ fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), 
     for (i, &c) in p.iter().enumerate() { if c == b'/' { bstart = i + 1; } }
     let base = &p[bstart..];
     let _ = sh_delete(ctx, p);
-    if matches!(fs_request(ctx, OP_RENAME, tmp, base), Some(r) if r.payload_bytes().first() == Some(&FS_OK)) {
+    if sh_rename(ctx, tmp, base) {
         ctx.console_writeln_fmt(format_args!("fmt {} ({} bytes)", str_of(p), total));
         Ok(())
     } else {
