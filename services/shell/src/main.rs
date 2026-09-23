@@ -13536,6 +13536,13 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
+fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r
+}
+
 fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
     let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
     let r = g.stat(path);
@@ -14135,18 +14142,38 @@ fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// The set is bounded at eight files anyway, rewritten in place, so nothing accumulates however many
 /// times it runs. This is for when you want the directory gone, not for hygiene it does not need.
 fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    match fs_request(ctx, OP_DELETE_TREE, b"/churn", &[]).as_ref()
-             .map(|r| r.payload_bytes().first().copied()) {
-        Some(Some(FS_OK))       => { out.line(ctx, "churn: /churn removed"); Ok(()) }
-        Some(Some(FS_NOTFOUND)) => { out.line(ctx, "churn: nothing to remove - /churn does not exist"); Ok(()) }
-        other => {
-            match other.flatten() {
-                Some(_) => out.line(ctx, "churn: could not remove /churn - see fs's log"),
-                None    => out.line(ctx, "churn: storage unavailable"),
-            }
+    // `delete_all` carries the SWEEP budget itself - removing a subtree walks it, and the ordinary
+    // request deadline is shorter than that walk on a full directory.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.delete_all(b"/churn");
+    let why = g.reason();
+    let answer = match r {
+        Ok(()) => { out.line(ctx, "churn: /churn removed"); Ok(()) }
+        Err(gs::Error::NotFound) => {
+            out.line(ctx, "churn: nothing to remove - /churn does not exist");
+            Ok(())
+        }
+        // A TREE DELETE IS NOT ONE MUTATION. It frees in batches, so a lost reply can leave the
+        // directory PARTLY removed. "Could not remove" would claim nothing happened.
+        Err(gs::Error::OutcomeUnknown) => {
+            out.line(ctx, "churn: OUTCOME UNKNOWN - /churn may be partly removed. Check with `dir /churn`");
             Err(ShellError::Unknown)
         }
-    }
+        Err(gs::Error::Unavailable) | Err(gs::Error::NoFilesystem) => {
+            out.line(ctx, "churn: storage unavailable");
+            Err(ShellError::Unknown)
+        }
+        Err(_) if !why.is_empty() => {
+            out.line_fmt(ctx, format_args!("churn: could not remove /churn - {}", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            out.line(ctx, "churn: could not remove /churn - see fs's log");
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(g.tag());
+    answer
 }
 
 /// `churn verify` - is any file in `/churn` a MIX of two generations?
@@ -15307,22 +15334,21 @@ fn cmd_edit(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
 
     // Stat first (existence / kind / size). A directory is refused; a missing file opens empty
     // (created on first save); a file of ANY size opens - it's read in windows, never up front.
-    let mut orig_size = 0usize;
-    if let Some(stat) = fs_request(ctx, OP_STAT_FILE, path, &[]) {
-        let sp = stat.payload_bytes();
-        if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
-        let exists = sp.first() == Some(&FS_OK) && sp.len() >= 11 && sp[1] == 1;
-        if exists {
-            if sp[10] == 1 {
-                ctx.console_writeln_fmt(format_args!("edit: {} is a directory", str_of(path)));
-                return Err(ShellError::Unknown);
-            }
-            orig_size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]) as usize;
+    let orig_size = match fs_stat_r(ctx, path) {
+        Ok(st) if st.is_dir => {
+            ctx.console_writeln_fmt(format_args!("edit: {} is a directory", str_of(path)));
+            return Err(ShellError::Unknown);
         }
-    } else {
-        ctx.console_writeln("edit: storage unavailable");
-        return Err(ShellError::Unknown);
-    }
+        Ok(st) => st.size as usize,
+        // A missing file is not an error here - `edit` opens it empty and creates it on first save.
+        Err(gs::Error::NotFound) => 0,
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(_) => { ctx.console_writeln("edit: storage unavailable"); return Err(ShellError::Unknown); }
+    };
 
     let (rd, cd) = ctx.console_dims();
     let rows = if rd == 0 { 24 } else { rd as usize };
@@ -15365,20 +15391,19 @@ fn cmd_read(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
     // via read_at - so a file far larger than one IPC message reads back correctly without a
     // big buffer here.
-    let stat = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
+    let size = match fs_stat_r(ctx, path) {
+        Ok(st) if !st.is_dir => st.size,
+        Ok(_) | Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(_) => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
     };
-    let sp = stat.payload_bytes();
-    if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
-    let exists = sp.first() == Some(&FS_OK) && sp.len() >= 11 && sp[1] == 1;
-    let is_dir = exists && sp[10] == 1;
-    if !exists || is_dir {
-        ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
-        return Err(ShellError::FileNotFound);
-    }
-    let size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]);
     let mut chunk = [0u8; IO_CHUNK];
     let mut off = 0u64;
     let mut last = b'\n';
@@ -15655,26 +15680,31 @@ fn cmd_cd(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
         ctx.console_writeln("/");
         return Ok(());
     }
-    let reply = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    // STAT reply: [FS_OK, exists, size:u64, is_dir].
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
-        if p[10] == 1 {
+    match fs_stat_r(ctx, path) {
+        Ok(st) if st.is_dir => {
             cwd.set(path);
             ctx.console_writeln(cwd.as_str());
             Ok(())
-        } else {
+        }
+        Ok(_) => {
             ctx.console_writeln_fmt(format_args!("cd: not a directory: {}", str_of(path)));
             Err(ShellError::Unknown)
         }
-    } else {
-        ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
-        Err(ShellError::FileNotFound)
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
+            Err(ShellError::FileNotFound)
+        }
+        // The operator's own `q`. Nothing failed, so nothing is reported - and the working
+        // directory is left where it was.
+        Err(gs::Error::Cancelled) => Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            ctx.console_writeln("cd: storage unavailable");
+            Err(ShellError::Unknown)
+        }
     }
 }
 
@@ -15688,22 +15718,27 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
     let sl = spath.len();
     sp[..sl].copy_from_slice(spath);
     // Check the source exists and is a file (also surfaces the "no filesystem" hint).
-    let stat = match fs_request(ctx, OP_STAT_FILE, &sp[..sl], &[]) {
-        Some(r) => r,
-        None => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
+    let stat_src = match fs_stat_r(ctx, &sp[..sl]) {
+        Ok(st) => Some(st),
+        Err(gs::Error::NotFound) => None,
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(_) => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
     };
-    let stp = stat.payload_bytes();
-    if no_fs(ctx, stp) { return Err(ShellError::Unknown); }
-    let exists = stp.first() == Some(&FS_OK) && stp.len() >= 11 && stp[1] == 1;
-    if !exists {
-        ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
-        return Err(ShellError::FileNotFound);
-    }
-    if stp[10] == 1 {
+    let st = match stat_src {
+        Some(st) => st,
+        None => {
+            ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
+            return Err(ShellError::FileNotFound);
+        }
+    };
+    if st.is_dir {
         ctx.console_writeln("copy: source is a directory (use 'copy <src> <dst> recursive')");
         return Err(ShellError::Unknown);
     }
-    drop(stat);
 
     let mut dbuf = [0u8; PATH_MAX];
     let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
