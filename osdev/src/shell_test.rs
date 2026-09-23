@@ -74,7 +74,11 @@ pub fn run(image_path: &Path, smp: u32) {
         // Networking Phase 0: an e1000 NIC so the kernel's PCI scan prints it (docs/networking.md).
         // Confirms the detection works in QEMU + that the NIC doesn't disturb boot (the rest of the suite).
         "-device",  "e1000,netdev=n0",
-        "-netdev",  "user,id=n0",
+        // HOSTFWD, so the harness can be a TCP CLIENT of the guest. SLIRP only restricts the
+        // guest reaching OUTWARD (its only peer is the gateway); inbound is exactly what this is
+        // for, and it is what makes `serve` - and ACCEPT's embedded connection capability - testable
+        // at all.
+        "-netdev",  "user,id=n0,hostfwd=tcp:127.0.0.1:18080-:8080",
         // Phase 1 step 3: dump every frame on the NIC backend to a pcap, so we can confirm
         // nic-driver's TX frame actually left the card, not just that the NIC set DD.
         "-object",  "filter-dump,id=nicdump,netdev=n0,file=build/net-tx.pcap",
@@ -403,6 +407,45 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(sock_out.contains("sock: UDP socket cap - sent")
            || sock_out.contains("THE OUTCOME IS UNKNOWN"),
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
+
+    // serve (utilities/42_serve.md): a TCP LISTENER as a capability, exercised by a real client.
+    //
+    // The strongest test of the socket-capability path in this repository, because ACCEPT returns an
+    // EMBEDDED CONNECTION CAPABILITY - the one part of the tagging on this branch that nothing else
+    // reaches. A reply believed on a mismatched tag would hand the shell a capability to the wrong
+    // connection; here the bytes have to come back to the host or the test fails.
+    send(&mut write_half, b"serve 8080 25s\r");
+    let listening = collect_until(&buf, &mut cursor, b"answering connections",
+                                  Duration::from_secs(20)).unwrap_or_default();
+    check!(listening.contains("listening on"),
+           "serve: the guest is listening on a TCP port (listener = capability, §7.10)");
+
+    // Now be the client. Retry briefly: the guest has printed that it is listening, but the
+    // forwarded port is the HOST's view and may take a moment to accept.
+    let mut echoed = Vec::new();
+    for _ in 0..24 {
+        if let Ok(mut c) = TcpStream::connect("127.0.0.1:18080") {
+            let _ = c.set_read_timeout(Some(Duration::from_secs(12)));
+            send(&mut c, b"stranger-knocks");
+            let mut b = [0u8; 512];
+            if let Ok(n) = c.read(&mut b) {
+                echoed.extend_from_slice(&b[..n]);
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let echoed_s = String::from_utf8_lossy(&echoed).into_owned();
+    check!(echoed_s.contains("stranger-knocks"),
+           "serve: a HOST TCP client sent bytes into the guest and got them back");
+
+    // Stop it rather than waiting out the 25s, then let the prompt come back.
+    send(&mut write_half, b"q");
+    let served = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(served.contains("accepted a connection"),
+           "serve: the guest accepted the connection through ACCEPT's embedded capability");
+
+
 
     // -----------------------------------------------------------------------
     // console scrollback
