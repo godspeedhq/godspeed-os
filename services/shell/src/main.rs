@@ -26,6 +26,7 @@
 //! streaming in `IO_CHUNK` pieces. And the shell is restartable like everything else - a crash gives a
 //! fresh prompt, losing the in-flight command but not the session (§6.2).
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
@@ -7518,23 +7519,26 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
         _ => { out.line(ctx, "tcp: second argument must be a port, 1 to 65535"); return Err(ShellError::Unknown); }
     };
 
-    let mut payload = [0u8; 512];
-    payload[0] = 21;
-    payload[1..5].copy_from_slice(&ip);
-    payload[5] = (port >> 8) as u8;
-    payload[6] = port as u8;
-    let mut n = 7;
+    // The request body. The OPCODE, the address packing and the two header bytes net-stack strips
+    // are the library's business now - this assembles the text and says what it wants.
+    let mut req = [0u8; 400];
+    let mut n = 0usize;
     for (k, a) in args.iter().enumerate().skip(3) {
-        if k > 3 && n < payload.len() { payload[n] = b' '; n += 1; }
+        if k > 3 && n < req.len() { req[n] = b' '; n += 1; }
         let b = a.as_bytes();
-        let take = b.len().min(payload.len() - n);
-        payload[n..n + take].copy_from_slice(&b[..take]);
+        let take = b.len().min(req.len() - n);
+        req[n..n + take].copy_from_slice(&b[..take]);
         n += take;
     }
 
-    match netstack_request(ctx, &payload[..n]) {
-        ReqOutcome::Reply(r) => {
-            let got = r.payload_bytes();
+    // `[q] quit` while it lingers. The library fires this and knows nothing else about it: the
+    // callback takes nothing and returns nothing, so the console stays entirely on this side.
+    let notice = || ctx.console_writeln("  [q] quit");
+    let mut buf = [0u8; 512];
+    let mut net = gs::net::Net::with_notice(&*ctx, &notice);
+    match net.tcp(gs::net::Ipv4(ip), port, &req[..n], &mut buf) {
+        Ok(got_n) => {
+            let got = &buf[..got_n];
             if got.is_empty() {
                 // NOT "no reply". net-stack answered; the connection produced nothing, and it has
                 // already logged why. Saying which of the two happened is the difference between a
@@ -7553,14 +7557,25 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
             }
             Ok(())
         }
+        // net-stack answered, and the connection produced nothing. Its own log says why.
+        Err(gs::Error::Failed) => {
+            out.line(ctx, "tcp: connected to nothing - net-stack answered with no data (see its log for the reason)");
+            Ok(())
+        }
         // The user's own `q` is NOT a fault. Reporting it as one teaches the operator to distrust
-        // the error line, which is the thing they most need to trust.
-        ReqOutcome::Aborted => { out.line(ctx, "tcp: aborted"); Ok(()) }
+        // the error line, which is the thing they most need to trust. This stayed a separate arm
+        // only because `gs::Error::Cancelled` exists - the first cut of the library folded it into
+        // the timeout, which would have turned a deliberate keypress into an error message.
+        Err(gs::Error::Cancelled) => { out.line(ctx, "tcp: aborted"); Ok(()) }
         // NAME THE BOUND. "did not answer" alone reads as a refusal, which is a different thing
         // and sends the reader to the wrong log. Saying how long it waited says which it was.
-        ReqOutcome::Timeout => {
+        Err(gs::Error::OutcomeUnknown) => {
             out.line_fmt(ctx, format_args!(
-                "tcp: net-stack did not answer within {}s - see its log", NET_TXN_SECS));
+                "tcp: net-stack did not answer within {}s - see its log", gs::net::NET_SECS));
+            Err(ShellError::Unknown)
+        }
+        Err(e) => {
+            out.line_fmt(ctx, format_args!("tcp: {}", e.as_str()));
             Err(ShellError::Unknown)
         }
     }

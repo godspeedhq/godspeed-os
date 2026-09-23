@@ -39,7 +39,7 @@
 //! `Unreachable`, the same as any other peer this task cannot reach - it does not acquire one.
 
 use godspeed_sdk::ipc::Message;
-use godspeed_sdk::service_context::{DeadlineOutcome, ServiceContext};
+use godspeed_sdk::service_context::{DeadlineOutcome, ReqOutcome, ServiceContext};
 
 use crate::error::Error;
 
@@ -75,6 +75,47 @@ pub const DEFAULT_SECS: i64 = 5;
 /// See [`request_within`]; this is that, with the common deadline.
 pub fn request(ctx: &ServiceContext, peer: &str, msg: &Message) -> Result<Message, Error> {
     request_within(ctx, peer, msg, DEFAULT_SECS)
+}
+
+/// How long a wait must last before the caller is told it is lasting.
+///
+/// Two seconds is the shell's own figure. Short enough that a person does not decide the machine is
+/// dead; long enough that an ordinary answer never triggers it.
+pub const NOTICE_AFTER_SECS: i64 = 2;
+
+/// [`request_within`], plus a callback fired once if the wait drags on.
+///
+/// # Why this exists, given the rest of this module is about not being clever
+///
+/// `services/shell` prints `[q] quit` when a network request lingers, so a person waiting on an
+/// unreachable host can stop it rather than wonder. That is an interactive affordance and it is
+/// exactly the sort of thing a standard library should NOT own - which is why the callback takes no
+/// arguments and returns nothing. It means only **"you have been waiting a while"**. What to do
+/// about it - print, poll a key, set a flag - stays entirely with the caller, and this module keeps
+/// knowing nothing about consoles.
+///
+/// Without it the shell cannot move onto this library without losing that affordance, which would
+/// have been a real regression dressed up as a migration.
+pub fn request_within_notice(
+    ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, notice: Option<&dyn Fn()>,
+) -> Result<Message, Error> {
+    let notice = match notice {
+        None => return request_within(ctx, peer, msg, secs),
+        Some(f) => f,
+    };
+    match ctx.request_with_reply_qhint(peer, msg, NOTICE_AFTER_SECS, secs, || notice()) {
+        ReqOutcome::Reply(r) => Ok(r),
+        // `ReqOutcome` does not separate a failed send from a passed deadline the way
+        // `DeadlineOutcome` does, so the retry `request_within` performs cannot be done safely here:
+        // retrying a timeout is the one thing this module refuses. Reported as unknown, which is the
+        // honest reading of the coarser answer.
+        ReqOutcome::Timeout => Err(Error::OutcomeUnknown),
+        // The caller stopped waiting. Reported as ITSELF, not folded into the timeout: a person
+        // pressing `q` and a service going silent are different facts and a caller will say
+        // different things about them. Collapsing those two would be the same mistake this module
+        // exists to stop the SDK's `Option` making.
+        ReqOutcome::Aborted => Err(Error::Cancelled),
+    }
 }
 
 /// Ask `peer` for something and wait up to `secs` for the answer.

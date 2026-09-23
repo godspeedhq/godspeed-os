@@ -290,7 +290,7 @@ no check. The fix has two halves:
 
 Commandments went 20 checks to 21, red-team probes 73 to 75, both new probes firing.
 
-**Host tests cover the error model only, and deliberately.** `godspeed_sdk` provides `panic_impl`
+**Host tests cover the error model only, and deliberately.** `godspeed_sdk` provides the `panic_handler`
 and so does `std`, so any dependent crate's host test build hits `duplicate lang item`. The split
 follows the pattern `kernel/src/clock.rs` documents: the pure logic - which is most of the semantics
 worth testing - has no SDK import and is unit-tested on the host; anything that talks to a service is
@@ -396,3 +396,57 @@ draft immediately below it.
   is the next commit, not a design problem.
 - **Target-side tests**, for the same reason as §7: the interesting failures are a service that
   restarts and a deadline that passes, and neither is reachable on the host.
+
+## 10. The network dogfood: `cmd_tcp`, and the result that went the wrong way
+
+The migration §9 said was next is done. The shell's `tcp` command no longer knows the wire format.
+
+**`ServiceContext` was not private after all.** §9 recorded that this needed "a small accessor rather
+than a rewrite". Wrong: `ShellCtx` has a `Deref` impl, so `&*ctx` yields `&ServiceContext` and the
+migration needed no shell change at all beyond the call site. Recorded because the previous entry
+sent the next reader after work that did not exist.
+
+**The line count went UP, and that is the honest result.** `recorder` shrank 680 lines to 627. This
+did the opposite:
+
+| | before | after |
+|---|---|---|
+| lines, comments included | 61 | 75 |
+| lines, comments excluded | 50 | 57 |
+| sites naming the wire format (`payload[..]`, opcode `21`, `>> 8`, `ReqOutcome`) | 10 | **0** |
+
+So the plumbing did disappear - all ten sites of it - and the function still grew seven code lines.
+The growth is entirely in the outcome arms: `ReqOutcome` has three variants and `Error` has thirteen,
+so what was three arms is now four plus a catch-all. That is not overhead, it is the honest cost of a
+richer failure model: the old code could not distinguish "connected to nothing" from "net-stack
+refused" because the SDK had no way to say it. **A library that makes the error model finer will make
+some call sites longer, and reporting only the case that shrank would be choosing the flattering
+instrument.**
+
+**`Error::Cancelled` exists because of this migration, and it caught me making the exact mistake the
+library exists to prevent.** The shell is explicit that the user's own `q` is not a fault. My first
+cut of `request_within_notice` folded `ReqOutcome::Aborted` into `OutcomeUnknown` - collapsing "you
+pressed a key" into "we do not know what happened to your request", which would have taught the
+operator that a deliberate keypress produces an error line. That is the same lossy merge §7 records
+the SDK making with `DeadlineOutcome`, committed by the library built to stop it, one branch later.
+It survived a compile and every gate; what caught it was reading the three arms it had to preserve.
+
+**`Net::with_notice` exists for the same reason.** `ns_request` always passed an `on_linger` callback
+printing `[q] quit`, so a migration that ignored it would have silently deleted an affordance. The
+callback takes nothing and returns nothing - it means only "you have been waiting a while" - so the
+console stays entirely on the shell's side and the library learns nothing about terminals.
+
+**The wire format was wrong in the first draft, and only the dogfood found it.** `gs::net` sent
+`[opcode, ..]`. `net-stack` strips TWO bytes from any request of two bytes or more and echoes the tag
+at reply byte 0, so a request must be `[tag, patience, opcode, ..]`. Everything except `status()`
+dispatched on garbage - and `status()` worked *by accident*, because a one-byte request falls below
+the strip threshold and reaches a default arm that answers status anyway. **A single passing call
+concealed a module-wide framing error.** Fixed at the header, with the echoed tag now checked on
+return (a mismatched tag is `Error::Malformed`, never read as this call's answer).
+
+**No `net-stack` change was needed, or made.** `git diff main...HEAD -- services/net-stack/` is empty.
+The format was always net-stack's; the library was taught to speak it. So this migration owes no
+hardware re-test of the protocol - what it owes is the same target-side testing §7 and §9 already
+record.
+
+**Still owed, unchanged:** target-side tests against a service that really restarts, and `gs::cap`.

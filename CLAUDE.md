@@ -404,7 +404,7 @@ os/
   backlog/               # open items - recorded rather than closed (§26.7)
   boot/                  # per-board boot config (pi2/, pi4/)
   contracts/schema/      # the JSON Schema a service contract is validated against
-  examples/              # 14 worked services
+  examples/              # 15 worked services
   milestones/            # what was achieved and when; ALMANAC.md is the chronicle
   bugs/                  # long-form investigations of four specific hardware bugs
   editors/               # syntax files for the gsh shell language

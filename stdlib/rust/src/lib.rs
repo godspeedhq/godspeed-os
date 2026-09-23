@@ -63,7 +63,7 @@ pub mod error;
 
 // THE SDK-DEPENDENT HALF, and why it is not in the host test build.
 //
-// `godspeed_sdk` provides `panic_impl`, and so does `std`. Any crate that depends on the SDK and is
+// `godspeed_sdk` provides the `panic_handler`, and so does `std`. Any crate that depends on the SDK and is
 // then built for the host with `std` hits `duplicate lang item`. The SDK itself sidesteps this with
 // `cfg_attr(not(test), no_std)`, which only helps the crate being tested.
 //

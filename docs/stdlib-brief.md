@@ -204,7 +204,7 @@ pass.**
 
 > **STATUS: partial, and the gap is stated rather than hidden.** Four host unit tests cover the error
 > model, including that `retry_is_safe` is false for `OutcomeUnknown`. Host coverage stops there
-> because `godspeed_sdk` owns `panic_impl` and so does `std`, so a dependent crate's host test build
+> because `godspeed_sdk` owns the `panic_handler` and so does `std`, so a dependent crate's host test build
 > hits `duplicate lang item`; the pure/SDK split follows the pattern `kernel/src/clock.rs` documents.
 > **Service-restart and unavailability tests belong on the target and are NOT yet written** - that is
 > the largest outstanding item against this section.

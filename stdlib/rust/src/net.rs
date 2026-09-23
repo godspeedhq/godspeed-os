@@ -100,12 +100,29 @@ impl Status {
 pub struct Net<'a> {
     ctx: &'a ServiceContext,
     tag: u8,
+    /// Fired once when a request lingers. See [`Net::with_notice`].
+    notice: Option<&'a dyn Fn()>,
 }
 
 impl<'a> Net<'a> {
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
     pub fn new(ctx: &'a ServiceContext) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE }
+        Net { ctx, tag: TAG_BASE, notice: None }
+    }
+
+    /// A network handle that tells you when a call is taking a while.
+    ///
+    /// `notice` is fired once, after a couple of seconds, if a request has not been answered. It
+    /// takes nothing and returns nothing: it means only "this is lasting". An interactive program
+    /// prints `[q] quit` and starts watching the keyboard; a daemon might log it; most programs do
+    /// not need it at all.
+    ///
+    /// This exists because `services/shell` could not otherwise move onto this library without
+    /// dropping that affordance on exactly the calls where a person needs it - a `tcp` to an
+    /// unreachable host waits the full deadline in silence. Losing that would have been a
+    /// regression dressed up as a migration.
+    pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Net<'a> {
+        Net { ctx, tag: TAG_BASE, notice: Some(notice) }
     }
 
     /// Send `[tag, patience, body..]` and return the reply with the tag checked and stripped.
@@ -129,8 +146,8 @@ impl<'a> Net<'a> {
         req[0] = tag;
         req[1] = secs.clamp(0, 255) as u8;
         req[2..2 + body.len()].copy_from_slice(body);
-        let r = call::request_within(
-            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs)?;
+        let r = call::request_within_notice(
+            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs, self.notice)?;
         // A reply whose tag does not match is the answer to a request we already gave up on. Reading
         // it as this one's is how a channel goes "out of step" and every later exchange answers the
         // question before.

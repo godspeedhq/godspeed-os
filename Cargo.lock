@@ -1473,6 +1473,7 @@ dependencies = [
 name = "shell"
 version = "0.19.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 

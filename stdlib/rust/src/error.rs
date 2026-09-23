@@ -77,6 +77,17 @@ pub enum Error {
     /// than guessed past, because guessing is how a wrong byte index becomes a wrong answer.
     Malformed,
 
+    /// **The caller stopped waiting** - a person pressed `q`, or the program gave up on purpose.
+    ///
+    /// Not a fault, and the distinction is load-bearing: `services/shell` says it plainly, that "the
+    /// user's own `q` is NOT a fault - reporting it as one teaches the operator to distrust the error
+    /// line, which is the thing they most need to trust". A cancelled operation should be reported as
+    /// cancelled, never as a failure.
+    ///
+    /// It is still not safe to retry blindly. The request may already have been delivered and acted
+    /// on; cancelling only means this caller stopped listening.
+    Cancelled,
+
     /// The caller's buffer is too small for the answer. Nothing was consumed; call again with room.
     BufferTooSmall,
 
@@ -119,6 +130,7 @@ impl Error {
             Error::Unreachable      => "the service could not be reached (nothing happened)",
             Error::Busy             => "the service is busy (nothing happened)",
             Error::OutcomeUnknown   => "no answer before the deadline - THE OUTCOME IS UNKNOWN",
+            Error::Cancelled        => "cancelled",
             Error::Malformed        => "the service sent a reply this library could not parse",
             Error::BufferTooSmall   => "the buffer is too small for the answer",
             Error::InvalidInput     => "the request was not valid and was never sent",
@@ -156,6 +168,8 @@ mod tests {
         assert!(Error::Unreachable.retry_is_safe(), "the send never left");
         assert!(Error::Busy.retry_is_safe(), "the queue was full; nothing left either");
         assert!(!Error::OutcomeUnknown.retry_is_safe(), "IT MAY HAVE COMMITTED");
+        assert!(!Error::Cancelled.retry_is_safe(),
+                "cancelling stops this caller listening; it does not un-send the request");
 
         // A service that answered told us what happened; there is nothing to retry into.
         for e in [Error::NotFound, Error::PermissionDenied, Error::Failed,
@@ -187,6 +201,7 @@ mod tests {
         assert!(!Error::Unreachable.service_answered());
         assert!(!Error::OutcomeUnknown.service_answered());
         assert!(!Error::Busy.service_answered());
+        assert!(!Error::Cancelled.service_answered(), "nobody answered - we stopped asking");
     }
 
     /// The phrasing is user-facing, so it is pinned: no trailing full stop, and the one that matters
@@ -194,7 +209,8 @@ mod tests {
     #[test]
     fn messages_are_house_style() {
         for e in [Error::NotFound, Error::Unreachable, Error::OutcomeUnknown, Error::Busy,
-                  Error::Failed, Error::Malformed, Error::BufferTooSmall, Error::InvalidInput] {
+                  Error::Failed, Error::Malformed, Error::BufferTooSmall, Error::InvalidInput,
+                  Error::Cancelled] {
             let s = e.as_str();
             assert!(!s.is_empty());
             assert!(!s.ends_with('.'), "{s:?} ends with a full stop");
