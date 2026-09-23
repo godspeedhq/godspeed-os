@@ -1,10 +1,10 @@
 [package]
-name = "recorder"
+name = "stdlib-hello"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "recorder"
+name = "stdlib-hello"
 path = "src/main.rs"
 
 [dependencies]

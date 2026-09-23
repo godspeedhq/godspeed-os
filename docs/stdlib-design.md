@@ -1,10 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # A native standard library for GodspeedOS - Phase 1 design report
 
-**Status: REPORT ONLY. No code written, no crate created, nothing implemented.** This is step 2 of
-the deliverable process, and step 7 is "WAIT FOR REVIEW". What follows is what the repository
-actually contains, what it says about the shape of a standard library, and the one finding that has
-to be settled before a single line is written.
+**Status: Phase 1 report, REVIEWED AND APPROVED 2026-09-23. The first slice is implemented** on
+`feat/stdlib` - `stdlib/rust` with `error`, `call`, `fs`, `io`; `examples/stdlib-hello`;
+`services/recorder` migrated. Option A was taken (services only, no kernel change); the terminating
+task of §1 remains open and unimplemented, which is the point of recording it here.
+
+What follows is the report as written before any code, kept as it was argued. §7 at the end records
+what building it changed.
 
 ---
 
@@ -249,3 +252,50 @@ a heap.
    `net-stack` first and propose it separately than guess at a socket API now.
 
 Nothing will be implemented until these are answered.
+
+---
+
+## 7. What building it changed
+
+The design above is kept as argued. This records where reality differed.
+
+**The migration drove the API, which is what it was for.** `services/recorder` needed three
+operations the proposed surface did not have - `create_sized` (allocate an extent), `write_at`
+(positional write) and `rename`. The tempting shortcut was a `raw_op(opcode, ..)` escape hatch,
+which would have leaked the opcodes straight back out and defeated the module's whole purpose. They
+were added as typed operations instead.
+
+**Measured result on `recorder`:** 680 lines to 627, and raw fs/IPC plumbing from 22 sites to 2. The
+two that remain are a protocol tag constant of its own and a comment. Its `fs_call` went from 55
+lines to 15 - but the line count is the least of it: **it used to return `bool`**, so a write that
+hit the deadline (and may therefore have landed) was indistinguishable from one that never left.
+Eleven lines of comment explained that difference and the signature discarded it. It returns
+`Result` now.
+
+**A Commandment check broke, and it was right to.** Moving reacquisition into `gs::call` made it
+invisible to `IX-peer-reacquire`, which looks for a reacquisition API in the SERVICE's own source.
+It reported `recorder` as having no recovery path.
+
+That is the real architectural friction in this work, and it generalises: **a standard library that
+absorbs a Commandment-enforced behaviour makes that behaviour unverifiable where the checker looks
+for it.** Baselining an exemption would have been the wrong answer - a weakened check is worse than
+no check. The fix has two halves:
+
+1. `reacquire_api` now credits `gs::call`, so a service routing through it gets the path it has.
+2. **`IX-stdlib-delegates` is a new check** asserting that `stdlib/rust/src/call.rs` really does
+   reacquire, and does it on `SendFailed` rather than on a deadline. Without it, half 1 is a hole:
+   a service would pass IX for calling a library that had quietly stopped doing the work, and the
+   property would decay from "this service can recover" into "this service calls something that
+   used to".
+
+Commandments went 20 checks to 21, red-team probes 73 to 75, both new probes firing.
+
+**Host tests cover the error model only, and deliberately.** `godspeed_sdk` provides `panic_impl`
+and so does `std`, so any dependent crate's host test build hits `duplicate lang item`. The split
+follows the pattern `kernel/src/clock.rs` documents: the pure logic - which is most of the semantics
+worth testing - has no SDK import and is unit-tested on the host; anything that talks to a service is
+for the target, where it can meet a filesystem that can really be restarted. A mock would only prove
+this library agrees with a mock.
+
+**Still open, unchanged:** the terminating task (§1), `net` (needs `net-stack` inspected properly),
+and target-side suites for `fs`/`call` against a real service restart.

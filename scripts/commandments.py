@@ -930,6 +930,49 @@ def check_peer_reacquire(check, pins):
 
 
 # --------------------------------------------------------------------------------------------------
+# Commandment IX, second half - the library a service DELEGATES recovery to must actually recover
+# --------------------------------------------------------------------------------------------------
+
+def check_stdlib_delegates_reacquire(pins):
+    """`reacquire_api` credits `gs::call` with being a reacquisition path. Prove it still is.
+
+    WHY THIS EXISTS. When `services/recorder` moved onto the standard library, its hand-written
+    reacquire-and-retry loop went away and the IX check stopped finding one - correctly, from where
+    it was looking. The fix is to credit the library; the danger is that crediting it makes the
+    guarantee unfalsifiable, because nothing then checks the library itself. A service would be
+    passing IX on the strength of calling a function that could have stopped reacquiring years ago.
+
+    So this reads `stdlib/rust/src/call.rs` and requires that it reaches a real reacquisition API,
+    and that it does so on the SEND-FAILED path rather than on a deadline - which is the distinction
+    the commandment's own wording insists on ("never on `Ok(None)`, which is a deadline, not a dead
+    peer").
+    """
+    path = os.path.join(ROOT, "stdlib", "rust", "src", "call.rs")
+    if not os.path.exists(path):
+        # No standard library in this tree: nothing is being credited, so nothing to prove.
+        return []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    out = []
+    apis = [a for a in (pins.get("reacquire_api", []) or []) if not a.startswith(("gs::", "call::"))]
+    if not any(api in text for api in apis):
+        out.append(Violation(
+            "stdlib/rust/src/call.rs", 0,
+            "the standard library is listed in `reacquire_api`, so services are credited with a "
+            "recovery path for calling it - and it no longer reaches any reacquisition API. Either "
+            "restore the reacquire, or remove `gs::call::*` from `reacquire_api` so the services "
+            "that rely on it are held to IX themselves. A credit nothing verifies is worse than no "
+            "credit."))
+    if "DeadlineOutcome::SendFailed" not in text:
+        out.append(Violation(
+            "stdlib/rust/src/call.rs", 0,
+            "the standard library must reacquire on SendFailed specifically. IX is explicit that a "
+            "reacquire driven by a DEADLINE is a different bug: a slow peer is a live peer, and "
+            "re-sending to it turns one request into two."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 # Commandment VII - thou shalt not introduce ambient authority
 # --------------------------------------------------------------------------------------------------
 
@@ -1467,6 +1510,20 @@ CHECKS = [
              dict(why="a contract claiming authority it is not granted must be caught",
                   pins={"contract_privileges": {"log_write": "SERVICE_CONTROL"}}, expect=True),
              dict(why="the real map against the real tree must pass", pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="IX-stdlib-delegates", commandment="IX",
+         title="the library a service delegates recovery to must actually recover",
+         kind="custom", fn=lambda check, pins: check_stdlib_delegates_reacquire(pins),
+         scope="stdlib/rust/src/call.rs, whenever `reacquire_api` credits it",
+         proves="that crediting the standard library with a reacquisition path is not a hole. "
+                "`IX-peer-reacquire` passes a service for CALLING `gs::call`; this is what makes "
+                "that credit mean something, by holding the callee to the same rule",
+         does_not_prove="that the retry is reached on every path a caller might take, nor that the "
+                        "caller handles the error it gets back",
+         probes=[
+             dict(why="the real library against the real tree must pass", pins=None, expect=False),
+             dict(why="a library that stopped reacquiring must be caught",
+                  pins={"reacquire_api": ["nothing_that_appears_in_the_file"]}, expect=True),
          ]),
     dict(nature="rule", id="IX-peer-reacquire", commandment="IX",
          title="a service that sends to a peer can reacquire it after the peer restarts",

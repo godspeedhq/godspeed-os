@@ -267,6 +267,12 @@ contract_authority_debt = [
 reacquire_api = [
   "reacquire_by_name", "reacquire_cap", "reacquire_cap_detail",
   "acquire_send_cap", "acquire_send_grant_cap",
+  # The standard library reacquires on the caller's behalf, so a service that routes through it HAS
+  # a recovery path even though the loop is not in its own source. That is not taken on trust:
+  # `IX-stdlib-delegates` below asserts that `stdlib/rust/src/call.rs` really does reacquire, so the
+  # credit given here is verified rather than assumed. Without that second half this list would be a
+  # hole - "calls something that used to recover" is not the property IX is about.
+  "gs::call::request", "call::request_within", "gs::fs::Fs",
 ]
 
 # Services that send to a peer and have NO reacquisition path, as of 2026-09-14. SHRINK ONLY, and a
