@@ -15,19 +15,61 @@ ordinary program should not have to.
 
 ## Start here
 
+A whole program - every line of it, because the parts around your code are not guessable:
+
 ```rust
-use godspeed as gs;
+#![no_std]                  // no operating system underneath this one
+#![no_main]                 // the entry point is `service_main`, not `main`
+#![deny(unsafe_code)]       // required of every program; see the note below
 
-let mut fs = gs::fs::Fs::new(ctx);
+use godspeed::{fs, io, Error, ServiceContext};
 
-// There is no `read_to_string`. GodspeedOS has no heap (CLAUDE.md 26.6.1), so the CALLER owns the
-// buffer and the bound is visible in the source.
-let mut buf = [0u8; 4096];
-let n = fs.read_into("/data/message.txt", &mut buf)?;
-gs::io::println(ctx, core::str::from_utf8(&buf[..n]).unwrap_or("<not utf-8>"));
+// `#[no_mangle]` is itself covered by the `unsafe_code` lint (an exported symbol can collide), and
+// the entry symbol must be exported because the linker looks for `service_main` by name. So this
+// ONE `#[allow]` is expected on this ONE item. Anywhere else it is rejected.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    let mut fs = fs::Fs::new(&ctx);
+
+    // There is no `read_to_string`. GodspeedOS has no heap (CLAUDE.md 26.6.1), so the CALLER owns
+    // the buffer and the bound is visible in the source.
+    let mut buf = [0u8; 4096];
+    match fs.read_into("/data/message.txt", &mut buf) {
+        Ok(n) => io::println(&ctx, core::str::from_utf8(&buf[..n]).unwrap_or("<not utf-8>")),
+        Err(e) => io::report(&ctx, "read", e),
+    }
+
+    // A program does not return. There is no `exit`: every runnable thing here is a service, and a
+    // service that has finished its work waits to be stopped.
+    loop { ctx.yield_cpu(); }
+}
 ```
 
-`examples/stdlib-hello` is the same program as a complete, buildable service.
+### And a contract, or it reaches nothing
+
+Authority is granted, never assumed. A program with no contract entry for `fs` gets
+`Error::Unreachable` from its first call - not a crash, and not a silent nothing. Put this beside
+your `Cargo.toml`, in `contracts/<name>.toml`:
+
+```toml
+name    = "hello"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+ipc_send    = ["fs"]     # talk to the filesystem. Drop this and `read_into` returns Unreachable
+ipc_receive = ["hello"]  # your own endpoint, named after you
+log_write   = true
+```
+
+Ask for what you use and nothing more: the contract is the reviewable statement of what your program
+may do (CLAUDE.md 26.9).
+
+`examples/stdlib-hello` is this same program, complete and buildable.
 
 ## The one thing to get right
 

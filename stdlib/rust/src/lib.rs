@@ -80,6 +80,18 @@ pub mod error;
 
 pub use error::Error;
 
+/// The service context, re-exported so an ordinary program never has to name `godspeed_sdk`.
+///
+/// Every program's entry point takes one, and this library said "you should not need the SDK" while
+/// requiring the SDK for the first line of every program. The Stranger Test caught that: a weak
+/// model given only the published documentation wrote `use godspeed_sdk::ServiceContext;` and
+/// recorded it as the single thing most likely to stop its program compiling.
+///
+/// It is a re-export rather than a wrapper on purpose - it is the SAME type, so a program that does
+/// reach for the SDK later is not holding two different things with one name.
+#[cfg(not(test))]
+pub use godspeed_sdk::service_context::ServiceContext;
+
 /// Everything a small program usually wants, in one `use`.
 ///
 /// Deliberately tiny. A prelude that pulls in a framework is how a standard library stops being one.
@@ -90,4 +102,5 @@ pub mod prelude {
     pub use crate::fs::Fs;
     pub use crate::net::Net;
     pub use crate::io;
+    pub use godspeed_sdk::service_context::ServiceContext;
 }

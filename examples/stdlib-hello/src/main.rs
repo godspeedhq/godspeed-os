@@ -24,8 +24,11 @@
 #![no_std]
 #![no_main]
 
-use godspeed::{fs, io, Error};
-use godspeed_sdk::ServiceContext;
+// ONE import line, and it does not name the SDK. It used to: `ServiceContext` was reachable only
+// from `godspeed_sdk`, while the documentation told an ordinary program it would not need that
+// crate. The Stranger Test caught the contradiction - a weak model guessed the SDK path and flagged
+// it as the thing most likely to stop its program compiling - so the library re-exports it now.
+use godspeed::{fs, io, Error, ServiceContext};
 
 /// Where the text comes from. `selfcheck` writes this file, so the program has something to find
 /// on a running machine.

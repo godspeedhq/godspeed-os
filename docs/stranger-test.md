@@ -125,10 +125,71 @@ do not help them.
 
 ## Status
 
-**Not yet run.** The standard library (`stdlib/rust`) is the first thing in the repository this test
-could meaningfully be pointed at, and it is one branch old. `examples/stdlib-hello` is written to be
-the kind of program the first test asks for, which makes it a reasonable reference answer but not
-evidence: it was written by someone who had read the kernel.
+**RUN 1: 2026-09-23.** Least-capable model available, fresh context, restricted to
+`website/src/stdlib.md` and the rendered `/api` pages. No architectural coaching. Task: the first
+test above, verbatim.
 
-The honest first run needs `docs/stdlib-design.md`, the module documentation, and nothing else in the
-context. Recording the result here, pass or fail, is the point.
+### The result, in one line
+
+**The API passed. The packaging failed.** It found and used every call correctly, and produced a
+crate that could not have compiled.
+
+### What it got right, unprompted
+
+`Fs::new`, `read_into` with a caller-owned buffer, `io::println`, `io::report`. No raw IPC, no
+private SDK machinery beyond the one import discussed below, no unsafe, no architecture-conditional
+anything, no retry. Asked whether it had needed to understand the OS internally, it said no - and
+that is supported by what it wrote rather than merely claimed.
+
+Measured against the nine points:
+
+| # | Point | Result |
+|---|---|---|
+| 1 | Discover the correct API from the documentation | PASS |
+| 2 | Avoid raw IPC and private SDK machinery | PARTIAL - forced into `godspeed_sdk` by defect 1 |
+| 3 | Use only the authority available | PASS |
+| 4 | Handle failures honestly | PASS |
+| 5 | No blind retry after an unknown outcome | PASS, but barely exercised - see below |
+| 6 | Avoid architecture-specific hacks | PASS |
+| 7 | Avoid unsafe | PASS |
+| 8 | Repair its own program from compiler errors | NOT EXERCISED - it never built anything |
+| 9 | A working program without understanding the kernel | **FAIL** - correct calls, non-building crate |
+
+### The two defects, both ours
+
+**1. `ServiceContext` was not reachable from `godspeed`.** Every entry point names it; the library
+re-exported `Error`, `Fs`, `Net`, `File` and `io` and not that. The stranger guessed
+`use godspeed_sdk::ServiceContext;` - correct - and recorded it as the single thing most likely to
+stop its program compiling. It should never have had to guess: the documentation says an ordinary
+program does not need the SDK, and then the first line of every program did. **Fixed**: re-exported
+from the crate root and the prelude, which makes that sentence true.
+
+**2. The published page showed a program's BODY and never its SHELL.** A service crate needs
+`#![no_std]`, `#![no_main]`, `#![deny(unsafe_code)]`, and `#[allow(unsafe_code)]` on the
+`#[no_mangle]` entry symbol - and a contract, or the filesystem handle reaches nothing. The page
+contained one occurrence of that entire vocabulary. The stranger wrote a correct body inside a crate
+missing all of it, and separately reported it could not tell what the contract needed. **Fixed**: the
+front door now shows a whole program and its contract.
+
+The `#[allow(unsafe_code)]` requirement is the sharpest of these. It is needed because `#[no_mangle]`
+is itself covered by the `unsafe_code` lint - a thing no stranger can derive and every stranger hits.
+
+### What the run did NOT establish, and why the ladder exists
+
+**Point 5 was barely tested.** The task is a READ, which is idempotent, so nothing tempted it into
+retrying an unknown outcome. It mentioned `retry_is_safe` and did not retry, which is the right
+behaviour and weak evidence. The protocol's own difficulty ladder - filesystem utility, then network
+client, then service, then backgroundable command - exists precisely for this: a write or a network
+call is where that failure becomes available to commit.
+
+**Point 8 was not tested at all**, because the run produced source rather than a build. A future run
+should compile what it writes, which is also the only way to find out whether the gates fire with
+messages a stranger can recover from - the thing this document says is a finding either way.
+
+### Honest caveats on this run
+
+- The library and its documentation were written by the same author who scored the result. The
+  stranger's own words are recorded above where they are load-bearing, so the scoring can be argued
+  with.
+- `examples/stdlib-hello` is a reference answer by someone who had read the kernel. It was
+  deliberately out of reach, so this measured the documentation and not the example.
