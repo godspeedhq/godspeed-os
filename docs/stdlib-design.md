@@ -349,3 +349,50 @@ consumer today, and a second would settle the shape. **Recorded, not started.**
 A second substantive client. If `time` ever needs more than one byte, or an application wants a
 socket, the repeated plumbing appears and `gs::net` earns its place - most likely on top of `gs::cap`
 rather than beside it.
+
+---
+
+## 9. `net` built, and the dogfood earned its keep
+
+Built at the operator's direction, overruling §8's "not yet". The surface is `status`, `resolve`,
+`ping`, `arp`, `tcp` and `renew`, plus a pure `addr::Ipv4`.
+
+**Two deliberate boundaries**, stated in the module rather than left to be discovered: UDP sockets
+and TCP listeners are NOT included, because those are delegated resource capabilities and need
+machinery shared with file capabilities - half-building that twice is how it goes wrong. And `ping`
+returns `Ok(false)` for silence rather than an error, because a diagnostic tool that conflates "no
+answer" with "the request failed" lies about which half is broken.
+
+### The bug the migration found, which is the point of migrating
+
+The first draft sent `[opcode, ..]`. The real framing is `[tag, patience_secs, opcode, ..]`:
+
+```rust
+// services/net-stack
+None => match (pl_raw.first(), pl_raw.len()) {
+    (Some(t), n) if n >= 2 => (&pl_raw[2..], Reply { tag: Some(*t) }),
+    _                      => (pl_raw,      Reply { tag: None }),
+}
+```
+
+Any request of two bytes or more has its first two bytes eaten. So `status()` - one byte, below the
+strip threshold - worked by accident, while `resolve("example.com")` had its opcode taken as a tag
+and dispatched on `'x'`. Every call but one was wrong, and all of them compiled.
+
+It was found by reading `services/shell`'s own client while looking for something to migrate, which
+is exactly what the brief predicts: *"the migration is part of the test."* Nothing short of a target
+run would otherwise have caught it, because the failure mode is a machine quietly talking to the
+wrong thing.
+
+The module header had already warned that `net-stack`'s protocol moved 34 times in three releases and
+that the cost of being wrong here is not a compile error. That warning turned out to be about the
+draft immediately below it.
+
+### What is still owed
+
+- **The network migration itself.** `gs::net` is written and correct against the protocol, but no
+  utility has been moved onto it yet: the shell's net client lives behind `ShellCtx`, whose
+  `ServiceContext` is private, so the migration needs a small accessor rather than a rewrite. That
+  is the next commit, not a design problem.
+- **Target-side tests**, for the same reason as §7: the interesting failures are a service that
+  restarts and a deadline that passes, and neither is reachable on the host.

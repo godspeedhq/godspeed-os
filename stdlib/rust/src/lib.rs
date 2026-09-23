@@ -58,6 +58,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
+pub mod addr;
 pub mod error;
 
 // THE SDK-DEPENDENT HALF, and why it is not in the host test build.
