@@ -51,13 +51,14 @@
 //!
 //! A program that serves nobody (most programs) can ignore all of this: nothing will ever be held.
 
-use godspeed_sdk::capability::{CapError, CapHandle};
-use godspeed_sdk::ipc::{IpcError, Message};
-use godspeed_sdk::service_context::{ReqOutcome, ServiceContext};
+use godspeed_sdk::capability::CapHandle;
+use godspeed_sdk::ipc::Message;
+use godspeed_sdk::service_context::ServiceContext;
 
 use crate::call;
 use crate::error::{from_fs_status, Error};
 use crate::fs::Fs;
+use crate::resource::{self, Held};
 
 /// Read the file's contents.
 pub const READ: u8 = 1 << 0;
@@ -80,11 +81,9 @@ pub const IO_CHUNK: usize = crate::fs::IO_CHUNK;
 
 /// How many messages that are NOT our reply a [`File`] will hold before it stops taking them.
 ///
-/// Two, and the number is small on purpose: a held message is a full 4 KiB `Message`, and this
-/// library keeps its footprint readable from its source (26.6.1). Two covers the realistic case - a
-/// client or two arriving during one round trip - and beyond it the operation stops rather than
-/// silently dropping anything. See [`File::take_held`].
-pub const HELD_MAX: usize = 2;
+/// See [`File::take_held`]. The bound and the reason for it live in the shared resource-invocation
+/// module, because sockets need exactly the same thing.
+pub const HELD_MAX: usize = resource::HELD_MAX;
 
 /// An open file, held as a capability.
 ///
@@ -104,14 +103,13 @@ pub struct File<'f, 'a: 'f> {
     cap: CapHandle,
     right: u8,
     /// Messages that arrived while we were waiting and are NOT ours. Never dropped.
-    held: [Option<Message>; HELD_MAX],
-    held_n: usize,
+    held: Held,
     closed: bool,
 }
 
 impl<'f, 'a: 'f> File<'f, 'a> {
     pub(crate) fn new(fs: &'f mut Fs<'a>, ctx: &'a ServiceContext, cap: CapHandle, right: u8) -> Self {
-        File { fs, ctx, cap, right, held: [None, None], held_n: 0, closed: false }
+        File { fs, ctx, cap, right, held: Held::new(), closed: false }
     }
 
     /// The rights this capability actually carries.
@@ -131,17 +129,7 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     ///
     /// Returns `None` for a task that serves nobody, always.
     pub fn take_held(&mut self) -> Option<Message> {
-        if self.held_n == 0 {
-            return None;
-        }
-        // FIFO: hand them back in the order they arrived, or a client's two requests get answered
-        // backwards.
-        let first = self.held[0].take();
-        for i in 1..HELD_MAX {
-            self.held[i - 1] = self.held[i].take();
-        }
-        self.held_n -= 1;
-        first
+        self.held.take()
     }
 
     /// Read from the file through the capability.
@@ -235,75 +223,19 @@ impl<'f, 'a: 'f> File<'f, 'a> {
         r
     }
 
-    /// One invocation: send `[tag, body..]` through the capability, and wait for the reply with
-    /// that tag.
+    /// One invocation, through the shared resource-capability path, then the fs status byte.
     ///
-    /// Anything else that arrives is HELD, never discarded. If there is no room left to hold, we
-    /// stop receiving rather than drop: what we already took is handed back by
-    /// [`take_held`](File::take_held), and what we have not taken is still in the kernel queue.
-    /// The operation's outcome is then genuinely unknown, and says so.
+    /// The generic half - reply-cap lifetime, holding a message that is not ours, reading the
+    /// kernel's refusal - is `crate::resource`. What is specific to a file is the status byte at
+    /// index 1 of the reply, which this maps to an [`Error`].
     fn invoke(&mut self, right: u8, body: &[u8]) -> Result<Message, Error> {
-        if body.len() + 1 > 16 + IO_CHUNK {
-            return Err(Error::InvalidInput);
-        }
         let tag = self.fs.next_tag_pub();
-        let mut req = [0u8; 16 + IO_CHUNK];
-        req[0] = tag;
-        req[1..1 + body.len()].copy_from_slice(body);
-
-        // The reply cap is one-shot and derived per invocation: the kernel takes it on delivery.
-        let self_grant = self.ctx.self_grant_handle().ok_or(Error::Unreachable)?;
-        let reply_cap = self.ctx.derive_cap(self_grant).ok_or(Error::Busy)?;
-        if let Err(e) = self.ctx.resource_invoke(
-            self.cap, right, reply_cap, &Message::from_bytes(&req[..1 + body.len()]))
-        {
-            // The kernel refused before routing. It did NOT consume our reply cap, so reclaim the
-            // slot rather than leaking it (8.5).
-            self.ctx.remove_cap(reply_cap);
-            // READ THE ERROR, DO NOT INFER IT. An earlier cut guessed from the rights mask, so a
-            // REVOKED capability was reported as "the service could not be reached" - a different
-            // fault, which sends an operator to check a service that is running perfectly. Found by
-            // `fcap gsreuse` against a real `fs` restart, not by review.
-            return Err(match e {
-                IpcError::CapError(CapError::CapInsufficientRights)
-                | IpcError::CapError(CapError::CapNotGrantable)
-                | IpcError::CapError(CapError::CapWrongScope) => Error::PermissionDenied,
-                // Revoked, or the issuer died and was replaced. One meaning to a holder: this
-                // capability is finished, and the answer is to re-open rather than to retry.
-                IpcError::CapError(CapError::CapRevoked)
-                | IpcError::CapError(CapError::CapNotHeld)
-                | IpcError::CapError(CapError::EndpointDead)
-                | IpcError::EndpointDead
-                | IpcError::ReplyDead => Error::Revoked,
-                _ => Error::Unreachable,
-            });
-        }
-
-        loop {
-            match self.ctx.recv_abortable_deadline(call::DEFAULT_SECS) {
-                ReqOutcome::Reply(m) => {
-                    if m.payload_bytes().first() == Some(&tag) {
-                        let b = m.payload_bytes();
-                        let status = *b.get(1).ok_or(Error::Malformed)?;
-                        from_fs_status(status)?;
-                        return Ok(m);
-                    }
-                    // NOT OURS. Hold it - it is somebody's real request, and this library refusing
-                    // to lose it is the entire reason it can be handed to a service that serves.
-                    if self.held_n == HELD_MAX {
-                        // No room. Stop taking, so the rest stays queued for the caller. We do not
-                        // know whether the operation completed - say exactly that.
-                        return Err(Error::OutcomeUnknown);
-                    }
-                    self.held[self.held_n] = Some(m);
-                    self.held_n += 1;
-                }
-                // The caller's own abort. Not a fault; the reply cap was never consumed.
-                ReqOutcome::Aborted => return Err(Error::Cancelled),
-                // The deadline passed. The request LEFT, so it may have been performed.
-                ReqOutcome::Timeout => return Err(Error::OutcomeUnknown),
-            }
-        }
+        let m = resource::invoke(self.ctx, self.cap, right, tag, body, call::DEFAULT_SECS,
+                                 &mut self.held)?;
+        // `[tag, status, ..]`. The tag is verified and LEFT IN PLACE, so a body starts at index 2.
+        let status = *m.payload_bytes().get(1).ok_or(Error::Malformed)?;
+        from_fs_status(status)?;
+        Ok(m)
     }
 }
 

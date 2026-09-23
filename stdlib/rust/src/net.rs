@@ -24,11 +24,13 @@
 //! operations with a demonstrated caller - because the cost of this module being wrong is not a
 //! compile error, it is a machine that quietly talks to the wrong port.
 
+use godspeed_sdk::capability::{CapHandle, RIGHT_WRITE};
 use godspeed_sdk::ipc::Message;
 use godspeed_sdk::service_context::ServiceContext;
 
 use crate::call;
 use crate::error::Error;
+use crate::resource::{self, Held};
 pub use crate::addr::Ipv4;
 
 // The opcodes, as `services/net-stack` dispatches them (its `pl.first() == Some(&N)` arms).
@@ -48,6 +50,9 @@ const OP_STATUS: u8 = 0;
 /// the two channels are independent and a tag only has to be unique against its own.
 const TAG_BASE: u8 = 0x80;
 
+/// Open a UDP socket, as `net-stack` numbers its operations.
+const OP_OPEN_SOCKET: u8 = 2;
+
 /// Everything after the echoed tag.
 fn body(m: &Message) -> &[u8] {
     let b = m.payload_bytes();
@@ -58,6 +63,34 @@ fn body(m: &Message) -> &[u8] {
 /// `net-stack` bounds a DNS resolve by the CLIENT's patience rather than by an attempt count (its
 /// own words, and a fix on this branch), which means the number here IS the policy.
 pub const NET_SECS: i64 = 10;
+
+/// How long to wait for a datagram sent through a [`Socket`].
+///
+/// **Longer than `net-stack`'s own worst case for the operation, and that is the whole point.** It
+/// retries a datagram `DANCE_TRIES` (6) times at `DANCE_SECS` (2) apiece before answering - so a
+/// client waiting ten gives up while the service is still working and reports
+/// [`Error::OutcomeUnknown`] about a request that was about to succeed.
+///
+/// **This number is MEASURED, not derived, and the gap is not fully explained.** The documented
+/// retry budget is 6 x 2 = 12 seconds, so 15 should have been ample; in QEMU it was not, and 10 and
+/// 15 both produced intermittent unknown-outcome reports where 30 is stable. Something in that path
+/// costs more than the retry budget accounts for. Recorded here rather than rounded up silently,
+/// because a constant chosen by experiment should say so - the next person to tighten it needs to
+/// know it was not calculated.
+///
+/// That is the worst available false report: `OutcomeUnknown` tells a caller the operation MAY have
+/// happened and must not be retried. A deadline shorter than the service's own bound does not bound
+/// anything useful - it converts a slow success into an unknown outcome, which is strictly worse
+/// than waiting.
+pub const SOCKET_SECS: i64 = 30;
+
+/// How long to wait for a TCP transaction through [`Net::tcp`].
+///
+/// A connect, a request and a response to a host that may be far away and may be slow. `services/
+/// shell` used twenty seconds for exactly this before it moved onto this library, and the move to
+/// [`NET_SECS`] halved it by accident - which nothing in QEMU is slow enough to notice, and a real
+/// site on real hardware certainly is. Restored, and named so it cannot drift again.
+pub const TCP_SECS: i64 = 20;
 
 /// What the machine currently believes about the network.
 ///
@@ -105,6 +138,39 @@ pub struct Net<'a> {
 }
 
 impl<'a> Net<'a> {
+    /// Open a UDP socket and receive a CAPABILITY to it (7.10).
+    ///
+    /// The returned [`Socket`] is the authority to send through one source port. It is minted by
+    /// `net-stack`, validated by the kernel on every use, and revoked when `net-stack` restarts -
+    /// at which point operations return [`Error::Revoked`] and you open another.
+    ///
+    /// **Blocks** up to [`NET_SECS`]. **Authority:** the caller's existing `net-stack` capability;
+    /// opening a socket grants nothing the contract did not already grant.
+    ///
+    /// # Errors
+    /// - [`Error::Unavailable`] - `net-stack` would not open one. Usually no usable NIC.
+    /// - [`Error::Failed`] - it answered without a capability.
+    /// - Opening is idempotent from the caller's side, so a no-answer error is safe to retry -
+    ///   though it may leave a socket behind in `net-stack`.
+    pub fn socket<'n>(&'n mut self) -> Result<Socket<'n, 'a>, Error> {
+        let ctx = self.ctx;
+        let r = self.call(&[OP_OPEN_SOCKET], NET_SECS)?;
+        if body(&r).first() != Some(&1) {
+            return Err(Error::Unavailable);
+        }
+        // The capability rode the reply as an EMBEDDED cap; the kernel placed it in our table on
+        // receipt and it is ours to claim or leak.
+        let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
+        Ok(Socket { net: self, ctx, cap, held: Held::new() })
+    }
+
+    /// The next tag, for the socket capability - which speaks to the SAME service on the SAME
+    /// endpoint and must therefore draw from THIS counter rather than start a second one.
+    pub(crate) fn next_tag_pub(&mut self) -> u8 {
+        self.tag = TAG_BASE.wrapping_add(self.tag.wrapping_sub(TAG_BASE).wrapping_add(1) & 0x3F);
+        self.tag
+    }
+
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
     pub fn new(ctx: &'a ServiceContext) -> Net<'a> {
         Net { ctx, tag: TAG_BASE, notice: None }
@@ -252,7 +318,7 @@ impl<'a> Net<'a> {
         req[5] = (port >> 8) as u8;
         req[6] = port as u8;
         req[head..head + request.len()].copy_from_slice(request);
-        let r = self.call(&req[..head + request.len()], NET_SECS)?;
+        let r = self.call(&req[..head + request.len()], TCP_SECS)?;
         let b = body(&r);
         // `net-stack` answers an unreachable peer with nothing at all, and the shell's own `tcp`
         // command reads that as "connected to nothing". Reported as a failure rather than as an
@@ -278,5 +344,102 @@ impl<'a> Net<'a> {
     pub fn renew(&mut self) -> Result<(), Error> {
         self.call(&[OP_RENEW], NET_SECS)?;
         Ok(())
+    }
+}
+
+/// A UDP socket, held as a capability.
+///
+/// Minted by `net-stack` and validated by the kernel on every use, exactly as a file capability is
+/// (7.10). Holding one is the authority to send through it and nothing else: it names one source
+/// port, it cannot be widened, and it stops working the moment `net-stack` revokes it or dies.
+///
+/// # Why it borrows the [`Net`] handle
+///
+/// The same reason [`File`](crate::cap::File) borrows its `Fs`: both speak to one service over one
+/// endpoint and must share ONE correlation-tag counter. Two counters can mint the same tag for two
+/// exchanges in flight, and the result is not a loud rejection but a stale reply silently accepted
+/// as the current answer. The borrow makes that unspellable.
+pub struct Socket<'n, 'a: 'n> {
+    net: &'n mut Net<'a>,
+    ctx: &'a ServiceContext,
+    cap: CapHandle,
+    held: Held,
+}
+
+impl<'n, 'a: 'n> Socket<'n, 'a> {
+    /// Send a datagram and return what came back, in `buf`.
+    ///
+    /// Returns how many bytes of response landed in `buf`. **Zero means nothing answered** - which
+    /// is an ordinary outcome for UDP, not an error, and is why this is `Ok(0)` rather than an
+    /// `Err`. Nothing is retried on your behalf.
+    ///
+    /// **Blocks** up to [`SOCKET_SECS`], because the round trip happens inside `net-stack` - it
+    /// sends, retries, and waits for the response before replying to us at all.
+    ///
+    /// **Authority:** this capability's `WRITE` right, checked by the KERNEL before `net-stack` is
+    /// reached.
+    ///
+    /// # The ambiguity, stated
+    ///
+    /// `net-stack` answers "nothing came back" with a single zero byte, which is byte-identical to a
+    /// genuine one-byte response of `0x00`. This reports both as `Ok(0)`. The protocol makes them the
+    /// same bytes, so no reading of it can tell them apart; recording that is better than choosing
+    /// one and being quietly wrong for the other. (`services/shell` reports the sentinel as one byte
+    /// of DATA, which is how `sock` says "received 1 bytes back" about a query nobody answered.)
+    ///
+    /// # Errors
+    /// - [`Error::PermissionDenied`] - this capability does not carry `WRITE`.
+    /// - [`Error::Revoked`] - `net-stack` revoked it, or died and was replaced. Open a new one.
+    /// - [`Error::BufferTooSmall`] - the response does not fit. **Nothing is retried**; the datagram
+    ///   was already sent, so call again only if the peer tolerates a repeat.
+    /// - **A send MUTATES the world.** On [`Error::OutcomeUnknown`] the datagram may have left; see
+    ///   [`Error::retry_is_safe`], which says no.
+    pub fn send_to(&mut self, ip: Ipv4, port: u16, data: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
+        let mut body = [0u8; 6 + 1024];
+        if 6 + data.len() > body.len() {
+            return Err(Error::InvalidInput);
+        }
+        body[..4].copy_from_slice(&ip.0);
+        body[4] = (port >> 8) as u8;
+        body[5] = port as u8;
+        body[6..6 + data.len()].copy_from_slice(data);
+
+        let tag = self.net.next_tag_pub();
+        let m = resource::invoke(self.ctx, self.cap, RIGHT_WRITE, tag, &body[..6 + data.len()],
+                                 SOCKET_SECS, &mut self.held)?;
+        // `[tag, response..]` - the tag is verified and left in place, so the body starts at 1.
+        let b = m.payload_bytes();
+        let resp = if b.len() > 1 { &b[1..] } else { &[][..] };
+        // The sentinel. See the ambiguity note above.
+        if resp.len() <= 1 && resp.first().copied().unwrap_or(0) == 0 {
+            return Ok(0);
+        }
+        if resp.len() > buf.len() {
+            return Err(Error::BufferTooSmall);
+        }
+        buf[..resp.len()].copy_from_slice(resp);
+        Ok(resp.len())
+    }
+
+    /// Take one message that arrived during an operation and was NOT the reply.
+    ///
+    /// Drain this in a loop after every operation if your task serves clients - they are real
+    /// requests, held rather than dropped, and only you can answer them. A program that serves
+    /// nobody always gets `None`.
+    pub fn take_held(&mut self) -> Option<Message> {
+        self.held.take()
+    }
+}
+
+impl<'n, 'a: 'n> Drop for Socket<'n, 'a> {
+    /// Drops our handle to the capability.
+    ///
+    /// **There is no close operation for a UDP socket** - `net-stack` exposes send and nothing else
+    /// on this capability - so this releases the local cap-table slot and cannot tell the service
+    /// anything. The socket is reclaimed when `net-stack` revokes it or restarts. Recorded rather
+    /// than hidden: a reader comparing this with [`File`](crate::cap::File), which does close, would
+    /// otherwise assume an omission.
+    fn drop(&mut self) {
+        self.ctx.remove_cap(self.cap);
     }
 }

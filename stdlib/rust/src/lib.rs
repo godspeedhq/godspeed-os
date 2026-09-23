@@ -77,6 +77,7 @@ pub mod error;
 #[cfg(not(test))] pub mod fs;
 #[cfg(not(test))] pub mod io;
 #[cfg(not(test))] pub mod net;
+#[cfg(not(test))] mod resource;
 
 pub use error::Error;
 

@@ -7432,16 +7432,6 @@ fn netstack_request(ctx: &ShellCtx, payload: &[u8]) -> ReqOutcome {
     ns_request(ctx, payload)
 }
 
-/// Open a UDP socket: net-stack mints a socket cap and grants it to us (mirrors `fc_open`).
-fn sock_open(ctx: &ShellCtx) -> Option<CapHandle> {
-    let r = match netstack_request(ctx, &[2]) {
-        ReqOutcome::Reply(r) => r,
-        // Both failures are already visible: `q` echoed the hint, and a timeout is the caller's line.
-        ReqOutcome::Aborted | ReqOutcome::Timeout => return None,
-    };
-    if r.payload_bytes().first() == Some(&1) { ctx.take_pending_cap() } else { None }
-}
-
 /// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
 fn sock_invoke(ctx: &ShellCtx, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
     // Clear any stale late-reply a prior aborted invoke left behind - AND RECLAIM ITS CAPABILITY.
@@ -7596,7 +7586,7 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
         // and sends the reader to the wrong log. Saying how long it waited says which it was.
         Err(gs::Error::OutcomeUnknown) => {
             out.line_fmt(ctx, format_args!(
-                "tcp: net-stack did not answer within {}s - see its log", gs::net::NET_SECS));
+                "tcp: net-stack did not answer within {}s - see its log", gs::net::TCP_SECS));
             Err(ShellError::Unknown)
         }
         Err(e) => {
@@ -7867,25 +7857,38 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
 }
 
 fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    let sock = match sock_open(ctx) {
-        Some(c) => c,
-        None => { ctx.console_writeln("sock: net-stack would not open a socket (no NIC?)"); return Err(ShellError::Unknown); }
-    };
-    // Send a datagram through the socket cap to the DNS server (a DNS query is just data that gets a
-    // reply); we report the round-trip, which proves the cap does real UDP I/O.
+    // Through the standard library: the opcode, the address packing and the capability's lifetime
+    // are `gs::net`'s business now. What stays here is what `sock` MEANS by a round trip.
     let mut query = [0u8; 64];
     let qlen = dns_query_bytes("example.com", &mut query);
-    let mut payload = [0u8; 96];
-    payload[0] = 10; payload[1] = 0; payload[2] = 2; payload[3] = 3;   // dest ip 10.0.2.3
-    payload[4] = 0; payload[5] = 53;                                    // dest port 53
-    payload[6..6 + qlen].copy_from_slice(&query[..qlen]);
-    match sock_invoke(ctx, sock, RIGHT_WRITE, &payload[..6 + qlen]) {
-        Some(resp) => out.line_fmt(ctx, format_args!(
+    let mut resp = [0u8; 512];
+
+    let mut gnet = gs::net::Net::new(&**ctx);
+    let r = match gnet.socket() {
+        Ok(mut s) => s.send_to(gs::net::Ipv4([10, 0, 2, 3]), 53, &query[..qlen], &mut resp),
+        Err(e) => {
+            ctx.console_writeln_fmt(format_args!(
+                "sock: net-stack would not open a socket - {} (no NIC?)", e.as_str()));
+            return Err(ShellError::Unknown);
+        }
+    };
+    match r {
+        // ZERO IS NOT AN ERROR AND IS NOT DATA. `net-stack` answers "nothing came back" with a
+        // single zero byte, and this command used to print the reply's LENGTH - so a query nobody
+        // answered read as "received 1 bytes back". It said so under QEMU every time.
+        Ok(0) => out.line_fmt(ctx, format_args!(
+            "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, nothing came back (the send went through the capability; the peer did not answer)",
+            qlen)),
+        Ok(n) => out.line_fmt(ctx, format_args!(
             "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, received {} bytes back (a round-trip through a capability)",
-            qlen, resp.payload_bytes().len())),
-        None => out.line(ctx, "sock: socket cap invocation returned nothing (no NIC, or nothing answered)"),
+            qlen, n)),
+        // The user's own `q` is not a fault.
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(e) => {
+            out.line_fmt(ctx, format_args!("sock: socket cap invocation failed - {}", e.as_str()));
+            return Err(ShellError::Unknown);
+        }
     }
-    ctx.remove_cap(sock);
     Ok(())
 }
 

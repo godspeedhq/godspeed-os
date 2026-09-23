@@ -910,3 +910,71 @@ the UDP test does exercise the framing that `serve` relies on. What is untested 
 behaviour - and no op arm was modified. The residual risk is concentrated in one place: the
 mismatch branch of `sock_invoke`, which reclaims embedded capabilities, and which only an ACCEPT
 exercises. That wants a real listener, which means hardware.
+
+## 17. `gs::net::Socket`, and two deadline bugs the dogfood found
+
+A UDP socket is a delegated resource capability exactly as a file is (7.10), so `Socket` and
+`cap::File` now share one invocation path: `crate::resource`. The parts that are easy to get subtly
+wrong - the one-shot reply cap's lifetime, holding a message that is not ours rather than dropping
+it, reading the kernel's refusal instead of inferring it - live in one place, because two copies of a
+subtle rule is how they diverge.
+
+`cmd_sock` walks it, and the migration deleted `sock_open` outright.
+
+### A report that had been wrong the whole time
+
+`net-stack` answers "nothing came back" with a single zero byte, and `cmd_sock` printed
+`received {} bytes back` from the reply LENGTH. So a query nobody answered read as **"received 1
+bytes back"** - and under QEMU that is exactly what happens, every run. The line had been claiming a
+response that never arrived.
+
+`send_to` returns `Ok(0)` for the sentinel, and the command now says so. The residual ambiguity is
+the protocol's and is documented rather than hidden: a genuine one-byte `0x00` response is
+byte-identical to the sentinel, so no reading of it can tell them apart.
+
+### The rule this cost me twice
+
+**A client's deadline must be LONGER than the worst case of the operation it waits on.** A deadline
+shorter than the service's own bound does not bound anything useful - it converts a slow success into
+[`Error::OutcomeUnknown`], which is strictly worse than waiting, because an unknown outcome forbids
+the retry that would have fixed it.
+
+Broken twice in this branch:
+
+1. **`send_to` waited `NET_SECS` (10s)** while `net-stack` retries a datagram six times at two
+   seconds apiece. Intermittent: one run said "nothing came back", the next said "THE OUTCOME IS
+   UNKNOWN", from identical code.
+2. **`cmd_tcp` lost half its patience in the migration**, silently. It waited `NET_TXN_SECS` (20s)
+   before moving onto `gs::net`, and the move put it on `NET_SECS` (10s). Nothing in QEMU is slow
+   enough to notice; a real site on real hardware is, which is where it would have cost the most to
+   find. There is a `TCP_SECS` now, and the shell's timeout message names the constant it actually
+   waits on rather than a different one.
+
+**`SOCKET_SECS` is 30, and that number is measured rather than derived.** The documented retry budget
+is 6 x 2 = 12 seconds, so 15 should have been ample; in QEMU it was not, and both 10 and 15 produced
+intermittent unknown-outcome reports where 30 is stable. Something in that path costs more than the
+retry budget accounts for, and I have not root-caused it. Recorded rather than rounded up silently,
+because a constant chosen by experiment should say so.
+
+### The assertion that had been hiding it
+
+This was a PRE-EXISTING intermittent failure, and the reason nobody saw it is the guard:
+
+```rust
+check!(out.contains("sock: UDP socket cap - sent") || out.contains("socket cap invocation returned nothing"), ..)
+```
+
+The old path waited five seconds - shorter still - and printed "returned nothing" on timeout, which
+that second string accepted. **The guard for the socket-capability mechanism accepted the mechanism
+timing out.** Tightening it in section 16 is what turned a silent intermittent into a visible one,
+and then into a fixed one. A run that goes 203/0, then 199/4, then 203/0 again is worth stopping for
+rather than re-running until green.
+
+### Verified
+
+- `osdev test shell`: **203 passed, 0 failed** - with the honest line, `sock: UDP socket cap - sent
+  29 bytes to 10.0.2.3:53, nothing came back`.
+- `osdev test file-cap`: 15 passed, 0 failed - the `cap::File` refactor onto `resource` is
+  regression-tested by the suite that pins 22 Test 14.
+- `osdev test fs-reuse`: 12 passed, 0 failed.
+- 13 of 13 gates green; `cargo test -p godspeed` 7/7. Still no `kernel/` or `sdk/` change.
