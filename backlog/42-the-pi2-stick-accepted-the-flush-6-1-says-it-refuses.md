@@ -169,7 +169,8 @@ its kind could have been.
 
 Verified rather than assumed: zero crash-window lines in the log, the banner reads `CUT THE POWER AT
 ANY POINT` rather than `NOW`, and the recovery line falls after the post-cut boot banner, not before
-it. Three attempts at under 2% each is ordinary luck.
+it. Three attempts is ordinary variance at the rate since measured (3 hits in 5 unassisted
+cuts across three boards), not the long-odds run an earlier revision of this entry claimed.
 
 **This answers the half the earlier runs could not.** The commit record was durable BEFORE any home
 block moved - that is what a replay of 4 blocks means - so the ordering the journal rests on was
@@ -203,27 +204,34 @@ editing it; the operator sets that, not me. What is recorded here is that the ev
 This entry previously called the unassisted cut "the one run that would settle 6.1 either way". That
 was wrong, and it sent two plug-pulls after an answer they could not return.
 
-**The commit-to-checkpoint window lasts under a millisecond.** `services/fs/src/main.rs` says so at
-the crash-window feature itself, and gives the same evidence: *"it normally lasts under a
-millisecond - which is why three real power cuts on a Dell Wyse produced three clean mounts and not
-one `journal recovered` line."* The feature exists BECAUSE the window cannot be hit by aiming.
+**That claim rested on a number I extrapolated wrongly, and the hardware has since refuted it.**
+`services/fs/src/main.rs` says the window *"normally lasts under a millisecond - which is why three
+real power cuts on a Dell Wyse produced three clean mounts and not one `journal recovered` line."*
+That sentence is about the **Dell Wyse, an AHCI SSD**. I applied it to a USB stick without checking,
+computed a per-cut hit probability under 2%, and concluded ~35 attempts were needed for even odds.
 
-On the Pi 2 a transaction takes about 52 ms (churn sustains ~19 operations/second on this stick), so
-an unaimed cut lands in the window with probability under 2%:
+**The window IS the checkpoint** - the interval between the commit record becoming durable and the
+last home block landing. Those home writes are slow on a USB stick, so on that backend the window is
+a LARGE fraction of each transaction, not a sub-millisecond sliver. The two flushes I reasoned about
+sit outside it, but they do not shrink it.
 
-| attempts | chance of at least one hit |
-|---|---|
-| 2 (what was run) | ~4% |
-| 35 | ~50% |
-| 115 | ~90% |
+Measured, across every unassisted cut on this branch:
 
-Two misses is the expected result, not bad luck. The T630 hitting on its first attempt was luck, and
-plausible only because an SSD transaction is short enough that a sub-millisecond window is a
-respectable fraction of it. The same cut on a USB stick spends nearly all of its time in the two
-flushes, and both of those sit OUTSIDE the window.
+| board | unassisted cuts | hits |
+|---|---|---|
+| HP T630 (AHCI) | 1 | 1 (first attempt) |
+| Raspberry Pi 2 (USB/dwc2) | 3 | 1 (third attempt) |
+| Raspberry Pi 4 (USB/xhci) | 1 | 1 (first attempt) |
+| **total** | **5** | **3** |
 
-So: this board will not answer the ordering question by aiming at it, in any number of attempts a
-person will actually do.
+Three hits in five. At p = 0.02 that outcome has probability about 1 in 10^4, so the estimate is
+refuted rather than merely imprecise. The Pi 2's two misses were ordinary variance, not the
+1-in-35 luck the bad number implied - which is also why the third attempt succeeded rather than the
+thirty-fifth.
+
+**Recorded because the wrong number was acted on**: it went into this entry, the carnage matrix and
+the hardware-pass doc, and it told the operator a test was infeasible when two more plug-pulls would
+do. A figure lifted from a comment about different hardware is a guess wearing a citation.
 
 ## What the unassisted cuts DID measure, which is not nothing
 

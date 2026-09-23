@@ -511,8 +511,20 @@ os/
 > ```
 >
 > A replay of 4 blocks means the commit record was durable BEFORE any home block moved. That
-> ordering is the whole of the guarantee, and this device enforced it. Third attempt, at the ~2%
-> per-cut odds the window's sub-millisecond life implies - ordinary luck, not a fluke reading.
+> ordering is the whole of the guarantee, and this device enforced it. It took three attempts, which
+> is ordinary variance.
+>
+> **Corrected the same day, in this amendment rather than around it:** the paragraph above first read
+> "at the ~2% per-cut odds the window's sub-millisecond life implies". That figure was wrong. It took
+> `fs`'s own "normally lasts under a millisecond" comment - written about the Dell Wyse, an AHCI SSD -
+> and applied it to a USB stick. The window IS the checkpoint, the interval between the commit record
+> becoming durable and the last home block landing, and those writes are slow on a stick, so there it
+> is a large fraction of each transaction rather than a sliver of it. **Measured across every
+> unassisted cut: three hits in five** (T630 first attempt, Pi 2 third, Pi 4 first). At 2% that
+> outcome is about 1 in 10,000, so the estimate is refuted rather than imprecise. Nothing else in this
+> amendment depends on it - the evidence for the Pi 2 is the replay itself, not how many tries it
+> took - but the number was acted on, so it is corrected where it was stated rather than left for a
+> reader to trip over.
 >
 > **What does NOT change, and is the reason this is an amendment rather than a retraction.** The
 > guarantee stays **backend-conditional**. That reasoning is sound and untouched: a redo journal is
@@ -532,7 +544,8 @@ os/
 > flush is - but it is not contradicted by anything here.
 >
 > Five boards, four ISAs, three storage backends, **power cut 5 of 5 recovered in the strong form**,
-> two of them unassisted. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
+> and **three of them cut UNASSISTED** - T630, Pi 2 and Pi 4, each landing in the commit window with
+> no held-open pause helping the device. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
 > investigation, including the two earlier Pi 2 cuts that missed the window and what they did and did
 > not measure.
 

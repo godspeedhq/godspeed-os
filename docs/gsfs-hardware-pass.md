@@ -23,11 +23,12 @@ held on a device 6.1 said could not be ordered. **6.1 is amended (2026-09-23)** 
 backend-conditional, the Pi 2 stops being the worked example, and no board here is now known to be an
 unorderable backend.
 
-**It took three cuts, and that is arithmetic rather than luck running out.** The
-commit-to-checkpoint window lasts under a millisecond against a ~52 ms transaction on a USB stick, so
-an unaimed cut reaches it with probability under 2%. Two misses then a hit is an ordinary sequence at
-those odds. The T630's first-attempt hit was the lucky one, on hardware where the whole transaction
-is short enough for a sub-millisecond window to be a real fraction of it.
+**It took three cuts, and that is ordinary variance.** An earlier revision of this document put the
+per-cut hit rate under 2% and called three attempts long odds. That was wrong: it extrapolated `fs`'s
+own "under a millisecond" comment, written about an AHCI SSD, to USB. The window IS the checkpoint,
+and home-block writes are slow on a stick, so there it is a large fraction of each transaction.
+Measured since: **three hits in five unassisted cuts** across the T630 (first attempt), the Pi 2
+(third) and the Pi 4 (first). Two misses then a hit is unremarkable at that rate.
 
 What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: home blocks reaching
 the medium before the commit record, which leaves torn metadata with no record to replay from. That
