@@ -376,6 +376,10 @@ os/
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
                          #   kernel file breaks none of them, so five ran green over exactly that
     dash_check.py        #   no em/en dashes anywhere (§21)
+    line_ref_check.py    #   a `path.rs:NNN` citation still points at what it claims. A line
+                         #   number rots on the next edit above it, and fifteen checkers
+                         #   looked at none: Audit 7 found 7 of 11 wrong, four documents
+                         #   citing ONE dead line. `audits/` is exempt - dated evidence
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds
     stack_fit_check.py   #   a service's frames fit the stack it is given (§26.6.1)
@@ -673,7 +677,7 @@ official, not the runtime behaviour.
 > **What confinement actually covers today, stated as fact rather than intent:**
 > - **`xhci` is the only confined driver in the system.** `ehci` and `block-driver` keep a stale
 >   firmware DMA pointer that confinement would fault, so both run in deliberate passthrough
->   (`kernel/src/task/mod.rs:593`); `nic-driver` is spawned `confine=false`.
+>   (`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``); `nic-driver` is spawned `confine=false`.
 > - **AMD-Vi is x86-only.** Every `iommu::` entry point on `arm`, `aarch64` and `riscv64` is a stub and
 >   `confine_device` returns `false`. Three of the four shipping ports are therefore entirely in the
 >   "without an IOMMU" case, with no confined driver at all.

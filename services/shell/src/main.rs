@@ -15700,8 +15700,16 @@ const WHY_READ: u8 = 3;
 const WHY_WRITE: u8 = 4;
 const WHY_UNANSWERED: u8 = 5;
 
-/// Eight rows, fixed. `background` on a full table refuses and says so; it does not grow, queue, or
-/// evict a row somebody has not read (§26.6, and §6 of the design note).
+/// Eight rows, fixed. The table does not GROW and does not QUEUE (§26.6, and §6 of the design
+/// note); a ninth job takes the row of the OLDEST FINISHED one, and is refused outright only when
+/// all eight are still live.
+///
+/// This used to say it would never "evict a row somebody has not read", which was the behaviour
+/// before eviction existed and was contradicted 240 lines below by the allocation site's own
+/// comment. Keeping a finished row forever is not a bound, it is a leak with a friendly name: the
+/// ninth `background` of a session was refused permanently, and the row it was protecting had in
+/// most cases already been read. Oldest-finished-first is the compromise - a record may be lost,
+/// the one least likely to still be wanted, and never a RUNNING job.
 const JOBS_MAX: usize = 8;
 
 #[derive(Clone, Copy)]

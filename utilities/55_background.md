@@ -252,8 +252,11 @@ reported too - a failed recovery is still a failure (§26.7).
 
 ## 7. Bounds
 
-- **Eight rows**, fixed. A ninth `background` is refused with the reason; the table does not grow,
-  queue, or evict a row nobody has read (§26.6).
+- **Eight rows**, fixed. The table does not grow and does not queue (§26.6). With all eight rows
+  live a ninth `background` is refused, naming what is running. Otherwise the ninth takes the row of
+  the **oldest finished** job, which is a record that may not have been read - deliberately, because
+  keeping finished rows forever is not a bound but a leak: it refused the ninth job of a session
+  permanently to protect a row that had usually already been read. A LIVE row is never taken.
 - **One job at a time.** A second `background copy` while one runs is refused, naming the job that
   is still going. A queue is unbounded growth wearing a small word.
 - **Finished rows are kept** so a job that ended while nobody was looking is still reportable.

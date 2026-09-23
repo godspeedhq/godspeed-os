@@ -42,7 +42,7 @@ drivers follow (docs/iommu.md).
 T630's BIOS hands the SATA controller over carrying a stale firmware DMA pointer, and
 confining the device makes the controller's first access fault - the same quirk that
 keeps `ehci` in passthrough. The kernel states it at the policy site:
-`kernel/src/task/mod.rs:593`, *"ehci + block-driver keep a stale firmware DMA pointer
+`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``, *"ehci + block-driver keep a stale firmware DMA pointer
 that confinement would fault, so they stay in passthrough"*. **`xhci` is the only
 confined driver in the system.** So `block-driver` is trust-critical on every machine,
 IOMMU or not, exactly as §6.4 says an unconfined DMA driver must be.
@@ -74,7 +74,7 @@ once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
   (the `ahci` cargo feature is gone; ATA PIO + the `hw_pio` capability + the IDE probe are
   retired - the T630's SSD is AHCI-only). The confinement half of this step was **not**
   completed and is not pending: block-driver is spawned `hwclass::pci(0x01_06_01, 5, false)`
-  (`services/supervisor/src/main.rs:338`) and stays in IOMMU passthrough for the firmware
+  (the `block-driver` row of the supervisor spawn table) and stays in IOMMU passthrough for the firmware
   stale-pointer reason in §3. Its DMA is arena-resident in practice, but nothing enforces
   that, so block-driver stays trust-critical on every machine (§6.4).
   Verified: `osdev test blockdev` 3/3 + identity 23/23; unsafe audit back to 413/27

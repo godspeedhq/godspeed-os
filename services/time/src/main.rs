@@ -14,6 +14,17 @@
 //! `kernel/src/clock.rs` and `kernel/src/wallclock.rs` held the epoch conversion, the plausibility
 //! window, the clock's provenance and its floor - 327 lines of policy in ring 0 (finding C1-6).
 //!
+//! **What actually moved, because the sentence above reads as a clean removal and it was partial**
+//! (Audit 7, 2026-09-23). `wallclock.rs` is DELETED: the provenance and the floor - which reading to
+//! believe, and what to refuse to go below - are POLICY, they are this service's, and they left.
+//! `kernel/src/clock.rs` REMAINS, holding `epoch_secs` (the packed-RTC-to-Unix conversion) and the
+//! 2020..2100 plausibility window, both pure functions over values the arch RTC reader already has.
+//! They stay because the kernel's own uptime accounting consumes them before any service exists, so
+//! moving them would make a kernel fact depend on a restartable service - the §11.4 argument, one
+//! layer along. They are arithmetic and constants rather than judgement, which is the line §26.10
+//! actually draws; but two of the four things this paragraph names are still in ring 0 and saying
+//! otherwise would be the tidier claim rather than the true one.
+//!
 //! **What the kernel keeps, and why.** The x86 CMOS RTC answers on port I/O (0x70/0x71), which a
 //! service cannot reach; on ARM the equivalent is an MMIO register the kernel already maps. So the
 //! kernel keeps the REGISTER READ - a hardware fact, like enumerating PCI - and this service owns what

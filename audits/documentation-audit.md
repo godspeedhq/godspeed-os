@@ -8,6 +8,101 @@
 > First audit: 2026-07-15.
 
 
+## Audit 7 - the `feat/gsfs` branch: does the prose match what shipped? (2026-09-23)
+
+**Scope:** `feat/gsfs` against `main` - 145 files, +19,879 lines. The filesystem carnage program, the
+new `background`/`jobs`/`foreground` job control and its `copier` service, the `board.py` build front
+door, and the hardware pass across five boards. Docs, per-directory `CLAUDE.md` files, utility specs
+and CODE COMMENTS, which are where this audit found the most.
+
+**Verdict: 2 HIGH, 2 MED, 1 LOW. All five fixed.** No Commandment violations in the range.
+
+### The shape worth naming: a fix lands in the code and nothing tells the three documents
+
+Audit 6's lesson was prose outliving a mechanism across a rewrite. This branch's is narrower and
+more common: **a behaviour is CHANGED to fix a real bug, the change is right, and every description
+of the old behaviour stays put** - including, twice, in the same file as the new code.
+
+The job table (A7-1) is the clean case. It used to keep finished rows forever, so the ninth
+`background` of a session was refused permanently; the fix evicts the oldest FINISHED row. Three
+places describe that table and all three still described the old rule - one of them 240 lines above
+the new code, in the same file, denying precisely what the allocation site's own comment explains.
+Nothing failed. Nothing could: no test asserts on a sentence, and `commandments.py` reconciles
+utility VOCABULARY, not semantics.
+
+The `copier` charter (A7-2) is the same shape with higher stakes, because a charter is what a
+contributor reasons from. It stated the rule for what may become a job - "is the command's value its
+EFFECT or its OUTPUT" - and named `drives check` as ruled out by it. `KIND_CHECK` had since been
+built. The rule was not merely out of date, it was WRONG in a way the code had already discovered:
+the premise (this service holds no `console_push`) is true, the conclusion does not follow, and the
+bounded transcript is where a job's output survives until somebody asks. The service's own doc
+described neither the transcript nor `render_verdict`.
+
+### Findings
+
+**A7-1 (HIGH) - the job table evicts; three documents say it does not, and one file says both.**
+`services/shell/src/main.rs` line ~15703 (the struct doc, first thing a reader meets) said the table
+"does not grow, queue, or evict a row somebody has not read". The allocation site 240 lines below
+takes "the OLDEST FINISHED one" and comments that "a finished row is a record somebody may not have
+read - which is why the oldest goes first". `utilities/55_background.md` §7 and
+`docs/job-control-design.md` §6 both carried the old rule; §6 additionally contradicted itself
+inside two sentences, denying eviction and then saying a finished row is kept "until it is read or a
+new job needs the slot", which is eviction described while being denied. FIXED at all three sites,
+with the reason recorded: keeping finished rows unconditionally is not a bound, it is a leak with a
+friendly name.
+
+**A7-2 (HIGH) - `services/copier/CLAUDE.md` rules out the command its own code implements.** The doc
+said "Two kinds of job" and tabled `KIND_COPY` and `KIND_DELETE_TREE`; the code has five, the three
+new ones added on this branch. Its stated test for adding a kind named `drives check` as excluded,
+and `KIND_CHECK` is now a row in that table. FIXED: the table lists five, the superseded test is
+replaced by the one that holds (bounded sequence of `fs` requests, describable in a fixed row and a
+4 KiB transcript), and the reasoning is kept rather than deleted because the old premise was true
+and only the inference was wrong - which is the part worth reading.
+
+**A7-3 (MED) - 7 of 11 live `path:line` citations were wrong, and fifteen checkers looked at none of
+them.** `CLAUDE.md` §6.4 cited `kernel/src/task/mod.rs:593` for the IOMMU passthrough claim; that
+line had become a closing brace, the comment having moved to 596. `docs/ahci.md`, `docs/iommu.md`
+and `docs/networking.md` cited the same dead line - the citation had been copied between documents,
+never re-checked. `docs/ahci.md` also cited a supervisor spawn row that had moved,
+`docs/probe-params-design.md` an SDK site, `backlog/20` an ARM guard. FIXED by re-pointing, and
+mostly by citing the NAME instead (`the `confine` flag on `DeviceSpec::Pci`", "the `block-driver`
+row of the supervisor spawn table") - a name greps and does not drift. **Gated**:
+`scripts/line_ref_check.py` is new and now the sixteenth checker. `audits/`, `milestones/` and
+`bugs/` are exempt by design: their line numbers are dated evidence of what was seen, and correcting
+them later would destroy the record.
+
+**A7-4 (MED) - `services/time` claims four things left ring 0; two did not.** Its header explains the
+service's existence by naming "the epoch conversion, the plausibility window, the clock's provenance
+and its floor - 327 lines of policy in ring 0". `wallclock.rs` is indeed deleted and took the
+provenance and the floor with it. `kernel/src/clock.rs` remains, holding `epoch_secs` and the
+2020..2100 window. FIXED by stating what actually moved and why the remainder stays (the kernel's
+own uptime accounting consumes them before any service exists - the §11.4 argument one layer along)
+rather than by quietly narrowing the sentence. They are arithmetic and constants rather than
+judgement, which is the line §26.10 draws; but two of the four named items are still in ring 0 and
+the tidier claim would not have been the true one.
+
+**A7-5 (LOW) - `docs/job-control-design.md` §9 records what building changed, but not the set
+growing.** §9 exists precisely to record where reality differed from the design, and does so well for
+the capability argument. It does not mention that the detachable set went from the two commands the
+document argues from to five; `drives scrub` and `churn` appear nowhere in it. Nothing in the
+document became false - its examples are illustrative, and §7's exclusions all still hold - but a
+reader counting commands from it would be two short. FIXED in §9.
+
+### What this audit did not find
+
+No claim in `docs/gsfs-carnage.md`, `docs/gsfs-hardware-pass.md` or `backlog/40-43` was wrong at the
+time of audit - they had been corrected repeatedly during the session that produced them, three
+times by hardware contradicting a number. `utilities/55_background.md` was accurate on every
+detachable command and every refusal, which is what `commandments.py` Commandment X buys. The 33
+suite counts, the tear-point counts and the porting tree all reconcile, which is `facts_check.py`.
+
+The pattern across all five findings is the same and worth stating plainly: **every one of them sat
+in prose that no gate reads.** The enforcement layer is strong on numbers a file owns, paths that
+must resolve, and vocabulary two files must share. It says nothing about whether a sentence is still
+true. That is not a gap that can be closed mechanically in general - but `line_ref_check.py` closes
+the one sub-case that is purely mechanical, and it was worth 90 lines to stop four documents citing
+the same dead line.
+
 ## Audit 6 - the hardening session: does the prose match what the hardware proved? (2026-08-25)
 
 **Scope:** the 40 commits of `feat/pi2-arm32-hardening` from `28d363eb` to `a028faf7` - the console

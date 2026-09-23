@@ -143,9 +143,16 @@ to whoever is typing at it. 2 and 3 compose; 1 is the fallback when neither is a
 ## 6. The job table is BOUNDED, and says so
 
 A fixed number of slots - 8 is a guess, and the right number is whatever a real session needs.
-`background` on a full table refuses and says so; it does not grow, queue, or evict (26.6). A job
-that has finished keeps its row until it is read or a new job needs the slot, so a job that failed
-while nobody was looking is still reportable - the same reason `LastWriteErr` keeps its text.
+The table does not grow and does not queue (26.6). A job that has finished keeps its row, so a job
+that failed while nobody was looking is still reportable - the same reason `LastWriteErr` keeps its
+text.
+
+**These two sentences used to be in tension and the code settled it.** This section said the table
+"does not evict" and then that a finished row is kept "until it is read or a new job needs the
+slot", which is eviction described in the act of being denied. What shipped is the second reading:
+a ninth job takes the OLDEST FINISHED row, and is refused only when all eight are live. Keeping
+finished rows unconditionally is not a bound - it refused the ninth `background` of a session
+forever, to protect records that had usually been read. A live row is never taken.
 
 States: `running`, `done`, `failed`, `stopped`. Four words, no abbreviations, and `failed` carries
 the reason when asked for.
@@ -173,6 +180,14 @@ which is the trap `54_scrollback.md` 6 records, in a different disguise.
 
 The design above is kept as it was argued. This section records where reality differed, so a reader
 can see which parts survived contact and which did not.
+
+**The detachable set is FIVE commands, not the two this document argues from.** It was written
+around `copy` and `delete <path> recursive`; `drives check`, `drives scrub` and `churn <seconds>`
+were added while building, and the shell's `DETACHABLE` table is the list that governs. The examples
+above are illustrative rather than an enumeration, so nothing here became false - but a reader
+counting commands from this document would be two short, and `drives check` in particular is worth
+naming because `services/copier/CLAUDE.md` had ruled it out by name on an argument that did not
+survive (its charter is corrected in the same audit).
 
 **§4's choice was right and its capability argument was overstated.** A background job IS a spawned
 service (`services/copier`), and the three mechanical reasons hold exactly as written: `q` is a

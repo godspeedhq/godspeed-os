@@ -7,17 +7,30 @@ The service behind `background` (`utilities/55_background.md`, `docs/job-control
 A job runner for work that must outlive the prompt. The shell spawns it on `background <cmd>`, sends
 it one job, and stops thinking about it; `jobs` and `foreground` ask it where it has got to.
 
-Two kinds of job, and the test for adding a third is **not** "is the command slow":
+Five kinds of job, and the test for adding a sixth is **not** "is the command slow":
 
 | kind | work |
 |---|---|
 | `KIND_COPY` | stream one file `src` to `dst` in `IO_CHUNK` (3556-byte) pieces |
 | `KIND_DELETE_TREE` | one `OP_DELETE_TREE` request; `fs` does the whole walk |
+| `KIND_CHECK` | one `OP_CHECK` sweep; the verdict is RENDERED here, not passed through |
+| `KIND_SCRUB` | one `OP_SCRUB` sweep, same shape, whole-volume deadline |
+| `KIND_CHURN` | sustained write traffic for N seconds, so a power cut has something to land in |
 
-The test is **is the command's value its EFFECT or its OUTPUT.** This service holds no
-`console_push` capability, so a command whose product is a report has nowhere to write it. That is
-what rules out `selfcheck`, `chaos`, `find`, `run` and `drives check` - not a policy, a fact about
-what a job can reach.
+**The original test was "is the command's value its EFFECT or its OUTPUT", and it was wrong - this
+file named `drives check` as ruled out and `KIND_CHECK` is now the third row above.** The reasoning
+was that the service holds no `console_push` capability, so a command whose product is a report has
+nowhere to write it. The premise is true and the conclusion did not follow: a job does not need to
+REACH the console, it needs its output to survive until somebody asks. The bounded transcript
+(`CP_OP_OUTPUT`, replayed by `foreground`) is where it survives, and `render_verdict` turns the
+counts `fs` answers with into the sentence a person reads - because passing the raw reply through
+printed binary at the prompt, which is the bug that produced the transcript in the first place.
+
+**The test that actually holds** is whether the work is a BOUNDED sequence of `fs` requests this
+service can describe in a fixed-size row and a 4 KiB transcript. That still rules out `selfcheck`
+(its product is a 500-line report and it drives other commands), `chaos` (it kills services, which
+is authority this contract does not grant and should not), `find` and `run` - not a policy, a fact
+about what a job can reach and hold.
 
 ## Why it is a service at all
 

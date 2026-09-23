@@ -124,7 +124,7 @@ running.
 
 ## 5. Dead `if` with a comment describing hooks that no longer exist
 
-`kernel/src/arch/arm/mod.rs:2113` guards an **empty body** with
+`kernel/src/arch/arm/mod.rs` (the RX_HEAD/RX_TAIL guard) guards an **empty body** with
 `if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() { }`, under a comment about advancing USB
 enumeration one transaction per tick. There are no periodic hooks; the MPIDR read is dead work on every
 tick. Comment-only fixes could not touch it because deleting the `if` is a code change.
