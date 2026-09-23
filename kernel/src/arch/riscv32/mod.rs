@@ -34,8 +34,8 @@ pub unsafe extern "C" fn _start() -> ! {
         "la   t1, __bss_end",
         "1:",
         "bgeu t0, t1, 2f",
-        "sd   zero, 0(t0)",
-        "addi t0, t0, 8",
+        "sw   zero, 0(t0)",
+        "addi t0, t0, 4",
         "j    1b",
         "2:",
         "call {main}",
@@ -149,7 +149,7 @@ pub fn usb_disk_absent() -> bool { true }
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
 pub fn net_info() -> Option<([u8; 6], bool)> { None }
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
@@ -382,6 +382,8 @@ pub mod interrupts {
     pub fn hires_release(_slot: u32) {}
 
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
 
     /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
     /// does not exist here.
@@ -468,9 +470,43 @@ pub mod rtc {
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
 
+/// Publish the bootstrap core's LAPIC ID to the system. A no-op on this arch (no APIC).
+pub fn publish_bsp_lapic_id() {}
+
+/// Note that an IRQ was serviced. A counting hook for per-core IRQ accounting.
+pub fn note_irq(_vector: u8) {}
+
+/// Per-core IRQ counter and the last-seen source. (count, source)
+pub fn core_irq_debug(_core_id: u32) -> (u64, u64) { (0, 0) }
+
+/// Bytes emitted by the panic-path serial writer that bypasses the lock.
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
+/// PCI configuration space read, gated by privilege.
+pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+
+/// Is a driver's DMA arena mapped uncached? No - DMA on this arch is cache-coherent.
+pub const DMA_ARENA_UNCACHED: bool = false;
+
+/// Virtual base at which a driver's DMA arena is mapped.
+pub const DRIVER_DMA_VA: u64 = 0x7000_0000;
+
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
+
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+
+    pub const MAX_DEVICES: usize = 32;
 
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
@@ -498,6 +534,10 @@ pub mod pci {
     pub fn program_xhci_msi() -> bool { false }
     pub fn program_ehci_msi() -> bool { false }
     pub fn route_ehci_intx() {}
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
 }
 
 // ---------------------------------------------------------------------------

@@ -110,6 +110,11 @@ fn main() {
     if target == "loongarch64-unknown-none-softfloat" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_loongarch64.display());
     }
+    let kernel_ld_riscv32 = workspace.join("kernel").join("kernel-riscv32.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_riscv32.display());
+    if target == "riscv32imac-unknown-none-elf" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv32.display());
+    }
     let profile   = std::env::var("PROFILE").unwrap(); // "debug" or "release"
 
     let target_dir = workspace
