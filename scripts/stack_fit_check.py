@@ -223,11 +223,77 @@ def enforce(objdump, root, target, profile, services, stack_limit):
 # went unnoticed until it was measured by hand.
 #
 #   python scripts/stack_fit_check.py <target> <profile> <stack-bytes> <service>...
+#
+# ...AND WITH NO ARGUMENTS AT ALL, which is how the release workflow calls it and how every other
+# checker in `scripts/` is run. That form checks every target that has been BUILT.
+#
+# It has to exist, and the reason is worth keeping. `.github/workflows/release.yml` has run
+# `python3 scripts/stack_fit_check.py` with no arguments since the CI was written - and until this
+# branch added the command line above, this file had no `__main__` block, so that invocation did
+# nothing and exited 0. The step passed every release for its whole life without measuring one
+# frame. Adding the CLI turned a silent no-op into a usage error, which is the only reason anybody
+# noticed (v0.19.0, 2026-09-23).
+#
+# So the no-arg form is not a convenience. It is the check the workflow always believed it was
+# running, and a checker that cannot be run the way every other checker is run will be run wrongly.
+USER_STACK_BYTES = 64 * 4096   # USER_STACK_PAGES * PAGE_SIZE, kernel/src/task/mod.rs
+
+
+def check_everything_built(objdump=None):
+    """Every service binary under every BUILT target. Returns an exit code.
+
+    Targets that were not built are SKIPPED and said so - a release job builds all four, a laptop
+    usually has one, and silently reporting OK for a target with no binaries is the "measured
+    nothing, said nothing" failure the `check` function above refuses by name.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tdir = os.path.join(root, "target")
+    if not os.path.isdir(tdir):
+        print("stack-fit: nothing is built - no `target/` directory. Build first; this is a SKIP,")
+        print("           not a pass, because a checker that measured nothing has not passed.")
+        return 0
+    seen, checked_any = [], False
+    for target in sorted(os.listdir(tdir)):
+        rel = os.path.join(tdir, target, "release")
+        if not os.path.isdir(rel):
+            continue
+        # A service binary is an extension-less file here; `.d`, `.rlib` and the build dirs are not.
+        services = sorted(
+            f for f in os.listdir(rel)
+            if os.path.isfile(os.path.join(rel, f)) and "." not in f)
+        if not services:
+            continue
+        checked_any = True
+        over = check(objdump or os.environ.get("OBJDUMP", "objdump"),
+                     root, target, "release", services, USER_STACK_BYTES)
+        if over:
+            print()
+            for svc, name, size in over:
+                print("  %-14s %s: frame %d bytes > %d byte stack (over by %d)"
+                      % (svc, name, size, USER_STACK_BYTES, size - USER_STACK_BYTES))
+            print()
+            print("BUILD REFUSED: the function(s) above cannot fit the user stack. Each faults on")
+            print("the first store of its own prologue, and a service that does that crash-loops")
+            print("forever under the supervisor. Shrink the frame (CLAUDE.md 26.6.1: change the")
+            print("data shape - stream it, refer to it by span, or give it a bounded arena).")
+            return 1
+        seen.append("%s (%d service%s)" % (target, len(services), "" if len(services) == 1 else "s"))
+    if not checked_any:
+        print("stack-fit: no built service binaries found under `target/*/release/`. SKIP, not a")
+        print("           pass - build a target first.")
+        return 0
+    print("stack-fit: every frame fits the %d-byte user stack: %s" % (USER_STACK_BYTES, ", ".join(seen)))
+    return 0
+
+
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) == 1:
+        raise SystemExit(check_everything_built())
     if len(sys.argv) < 5:
         raise SystemExit(
-            "usage: stack_fit_check.py <target> <profile> <stack-bytes> <service>...")
+            "usage: stack_fit_check.py [<target> <profile> <stack-bytes> <service>...]\n"
+            "       with NO arguments, checks every target that has been built.")
     _target, _profile, _limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     enforce(os.environ.get("OBJDUMP", "objdump"), _root, _target, _profile, sys.argv[4:], _limit)
