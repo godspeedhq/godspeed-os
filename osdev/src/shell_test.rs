@@ -376,7 +376,16 @@ pub fn run(image_path: &Path, smp: u32) {
     // the open + invoke (the cap mechanism itself) must succeed - "would not open" would be a failure.
     send(&mut write_half, b"sock\r");
     let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
-    check!(sock_out.contains("sock: UDP socket cap - sent") || sock_out.contains("socket cap invocation returned nothing"),
+    // REQUIRES THE SUCCESS LINE. This also accepted "socket cap invocation returned nothing", which
+    // the shell prints on exactly one condition - `sock_invoke` returned `None` - i.e. the
+    // capability invocation FAILED. The guard for the socket-capability mechanism accepted the
+    // mechanism being broken, which matters now that the request is framed with a correlation tag:
+    // a mis-framed request produces precisely that line.
+    //
+    // No tolerance is lost. The success line carries a COUNT ("received {n} bytes back") and `n` may
+    // be 0, so a silent external peer already passes through it. The `None` branch was never the
+    // external case - it is the local one.
+    check!(sock_out.contains("sock: UDP socket cap - sent"),
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
 
     // -----------------------------------------------------------------------

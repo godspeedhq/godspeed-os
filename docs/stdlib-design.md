@@ -847,3 +847,66 @@ words, because the next person to add a variant will face the same choice.
 
 Still owed, and now the only owed item from section 7: nothing. The remaining open work is
 `backlog/46`'s hole 2 and the `net-stack` socket caps, neither of which is a library gap.
+
+## 16. The socket capabilities, and a comment that had the problem backwards
+
+`backlog/46`'s hole 1 is now closed for every delegated-resource issuer in the system. `net-stack`'s
+socket, listener and connection capabilities carry a correlation tag, as `fs`'s file capabilities
+already do.
+
+**The machinery was already there and deliberately switched off.** `net-stack` has carried
+`Reply { tag: Option<u8> }` - stripped in one place, echoed in one place - since the named protocol
+was tagged. The badged path opted out, with a comment:
+
+> A BADGED request is untagged: it is a socket capability invoking its owner, the badge already names
+> the socket, and the client holds no ambiguity to resolve.
+
+**That has the direction of the problem backwards.** The badge names the socket FOR THE SERVICE. It
+does nothing for the CLIENT, which waits on its own single endpoint and cannot tell this reply from
+any other message landing there. The client is the only party with an ambiguity, and it was the one
+left without the means to resolve it.
+
+The cost was visible two functions away, in the shell's `sock_invoke`: a queue drain, plus a
+capability-reclaim the drain made necessary (SEC-35 - an ACCEPT reply carries an embedded CONNECTION
+CAPABILITY, and a discarded reply leaves it in the pending FIFO for the next open to receive by
+mistake). Safe only because the shell serves nobody.
+
+A badged request needs ONE header byte, not the two a named request carries: the tag to echo.
+Patience is the stash's business and a badged request does not go through the stash.
+
+**The drain stays**, for the SEC-35 reason rather than the correlation one - an aborted invoke can
+still leave a reply whose embedded capability must be reclaimed. What changed is that correctness no
+longer RESTS on it. And a tag mismatch now reclaims any capability that arrived with the wrong reply
+before discarding it, which is SEC-35's own failure approached from the other side: believing the
+wrong reply would hand the caller a capability to the wrong connection.
+
+### A guard that accepted the failure it was guarding against
+
+The QEMU assertion for `sock` read:
+
+```rust
+check!(out.contains("sock: UDP socket cap - sent") || out.contains("socket cap invocation returned nothing"), ..)
+```
+
+The second string is printed on exactly one condition: `sock_invoke` returned `None` - the capability
+invocation failed. **The guard for the socket-capability mechanism accepted the mechanism being
+broken**, which matters precisely when the framing changes underneath it.
+
+And the leniency it was protecting was not needed. The success line carries a count - "received {n}
+bytes back", where `n` may be 0 - so a silent external peer already passes through it. The `None`
+branch was never the external case; it is the local one. The assertion now requires the success line.
+
+### What is verified, and what is NOT
+
+- **Verified in QEMU** (`osdev test shell`, 203 passed 0 failed): the UDP socket capability opens and
+  is invoked through the tagged framing, reporting the strong outcome rather than the fallback -
+  `sock: UDP socket cap - sent 29 bytes to 10.0.2.3:53, received 1 bytes back`.
+- **NOT verified anywhere:** `serve` - the TCP listener and connection capabilities (`LOP_ACCEPT`,
+  `COP_RECV`/`SEND`/`CLOSE`). **No QEMU suite exercises it**, which was true before this change and
+  is stated here because this change touches that path.
+
+The framing itself is shared: one strip site, one echo site, common to all three capability kinds, so
+the UDP test does exercise the framing that `serve` relies on. What is untested is the op-specific
+behaviour - and no op arm was modified. The residual risk is concentrated in one place: the
+mismatch branch of `sock_invoke`, which reclaims embedded capabilities, and which only an ACCEPT
+exercises. That wants a real listener, which means hardware.

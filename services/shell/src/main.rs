@@ -7443,7 +7443,7 @@ fn sock_open(ctx: &ShellCtx) -> Option<CapHandle> {
 }
 
 /// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
-fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+fn sock_invoke(ctx: &ShellCtx, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
     // Clear any stale late-reply a prior aborted invoke left behind - AND RECLAIM ITS CAPABILITY.
     //
     // SEC-35: the kernel installs an embedded cap and queues its slot BEFORE the receiver looks at
@@ -7458,6 +7458,20 @@ fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8])
     while ctx.try_recv().is_some() {
         while let Some(h) = ctx.take_pending_cap() { ctx.remove_cap(h); }
     }
+    // TAGGED NOW (`net-stack` echoes byte 0 of a badged request). The drain above stays, but for
+    // the SEC-35 reason rather than the correlation one - an aborted invoke can leave a reply whose
+    // embedded capability must be reclaimed. What changed is that correctness no longer RESTS on it.
+    //
+    // From the shell's ONE endpoint counter: socket replies and fs replies land on the same
+    // endpoint, so a second counter here would be the same collision this branch already fixed.
+    // (The name `fs_tag` is now under-descriptive - it is the correlation tag for everything that
+    // replies to the shell - but renaming it touches far more than it explains.)
+    let tag = next_fs_tag(ctx);
+    if payload.len() + 1 > FC_REQ_MAX { return None; }
+    let mut req = [0u8; FC_REQ_MAX];
+    req[0] = tag;
+    req[1..1 + payload.len()].copy_from_slice(payload);
+    let payload = &req[..1 + payload.len()];
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
@@ -7472,7 +7486,18 @@ fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8])
     // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
     match outcome {
-        ReqOutcome::Reply(m) => Some(m),
+        ReqOutcome::Reply(m) => {
+            let b = m.payload_bytes();
+            // A reply carrying someone else's tag answers a question we already abandoned. On THIS
+            // path believing it is worse than on the fs one: an ACCEPT reply carries an embedded
+            // CONNECTION CAPABILITY, so the caller would be handed a capability to the wrong
+            // connection. Reclaim whatever came with it, then refuse (SEC-35, from the other side).
+            if b.first() != Some(&tag) {
+                while let Some(h) = ctx.take_pending_cap() { ctx.remove_cap(h); }
+                return None;
+            }
+            Some(Message::from_bytes(&b[1..]))
+        }
         _ => { ctx.remove_cap(reply); None }
     }
 }

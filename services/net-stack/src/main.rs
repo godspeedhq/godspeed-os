@@ -2977,10 +2977,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // arrived at, and its comment says exactly why: "the tag is handled here and nowhere else,
         // which is why adding it did not touch a single arm".
         //
-        // A BADGED request is untagged: it is a socket capability invoking its owner, the badge
-        // already names the socket, and the client holds no ambiguity to resolve.
+        // A BADGED request IS TAGGED, and the comment that used to sit here had the direction of
+        // the problem backwards. It read: "the badge already names the socket, and the client holds
+        // no ambiguity to resolve."
+        //
+        // The badge names the socket FOR THIS SERVICE. It does nothing for the CLIENT, which waits
+        // on its own single endpoint and cannot tell our reply from any other message landing there
+        // - so the client is the only party with an ambiguity, and it was the one left without the
+        // means to resolve it. The cost was a DRAIN in `services/shell`'s `sock_invoke`, safe only
+        // because the shell serves nobody, plus the cap-reclaim that drain made necessary (SEC-35).
+        //
+        // ONE header byte, not the two a named request carries: the tag to echo. Patience is the
+        // stash's business, and a badged request does not go through the stash.
         let (pl, reply) = match badge {
-            Some(_) => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            Some(_) => match (pl_raw.first(), pl_raw.len()) {
+                (Some(t), n) if n >= 2 => (&pl_raw[1..], Reply { cap: reply_cap, tag: Some(*t) }),
+                // One byte or none: nothing to strip and nothing to echo, exactly as on the named
+                // path. A holder that sends a bare op still reaches the right arm.
+                _ => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            },
             // TWO header bytes: the tag to echo, and how long the client will wait (used by the
             // stash, in `Displaced::note`, and of no interest to any arm below). Stripped together
             // here so that - exactly as with the tag alone - not one op arm knows either exists.
