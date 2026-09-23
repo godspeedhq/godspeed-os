@@ -68,7 +68,7 @@ The text filters (`match`/`count`/`sort`/`first`/`last`) stay - for genuinely-te
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
 producer (`is_record_producer` - `status`, `dir`, `caps`, `drives`, `find`, `observe now`), else
 the **byte** path. They coexist; the default rendering (no `to`) is the table grid. A *text*
-filter applied to a record stream (e.g. `ls | match foo`) is a loud, guided error - use
+filter applied to a record stream (e.g. `dir | match foo`) is a loud, guided error - use
 `where`/`select`/`sort <col>`, or `to json` to drop back to text first.
 
 **A live, screen-owning loop cannot be a pipe stage.** `observe` (bare) is the continuous
@@ -152,7 +152,7 @@ pair.
   `observe now | sort reverse ticks`)**; **`from json`** (text → records); and the **unified
   byte↔record pipeline** (`Stream = Bytes | Table`, dispatched by command + data type, `from`/`to`
   bridging). All in-process (no wire codec), QEMU-verified incl. a json → records → yaml → file
-  round-trip and `ls | where type=file | sort reverse size`.
+  round-trip and `dir | where type=file | sort reverse size`.
 - **Also built:** the **SDK record API** - the `Table` model, `where`/`select`/`sort`,
   `to_json`/`to_yaml`/`to_grid` (over a `RecordSink`), `from_json`, **and the binary wire codec
   (`encode`/`decode`)** now live in `godspeed_sdk::record`, so any service can produce records,

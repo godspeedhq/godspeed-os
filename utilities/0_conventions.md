@@ -59,7 +59,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
 
    **Declare whether your arguments are file paths (same commit).** When a token is *not* a
    recognized keyword, Tab falls through to **file-path** completion - it lists the current
-   directory (`ls /x<tab>`, `read /doc<tab>`). That is correct only for utilities whose
+   directory (`dir /x<tab>`, `read /doc<tab>`). That is correct only for utilities whose
    arguments *are* paths. A utility whose arguments are **service names, numbers, or fixed
    keywords - never paths** (`chaos`, `kill`, `spawn`, `restart`, `ping`, `net`, `drives`,
    `observe`, `date`, `uptime`, ...) must be added to **`NO_PATH_CMDS`** in the shell

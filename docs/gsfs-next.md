@@ -290,7 +290,7 @@ how big on request.
 **Words, not flags** (`utilities/0_conventions.md` rule 4), in any order, mixable with a path:
 `dir bytes /projects` and `dir /projects bytes` are the same command. Both orders complete
 on Tab, which is why `dir` is in BOTH the leading and trailing subcommand tables - and a first-position
-token matching no keyword falls through to path completion, so `ls /do<tab>` still works.
+token matching no keyword falls through to path completion, so `dir /do<tab>` still works.
 
 **The terse form stays the default, deliberately.** `dir` is read far more often than it is studied;
 the common question is "what is in here", and a wall of columns answers one nobody asked.

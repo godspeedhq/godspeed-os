@@ -376,6 +376,10 @@ os/
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
                          #   kernel file breaks none of them, so five ran green over exactly that
     dash_check.py        #   no em/en dashes anywhere (§21)
+    foreign_word_check.py #  no DOC shows a POSIX/DOS word being used as a command. `ls`
+                         #   became `dir` and the rename reached the shell, the specs and
+                         #   the help text - and missed TEN worked examples. Derived from
+                         #   the shell's own `FOREIGN_HINTS`, never a hand-kept list
     line_ref_check.py    #   a `path.rs:NNN` citation still points at what it claims. A line
                          #   number rots on the next edit above it, and fifteen checkers
                          #   looked at none: Audit 7 found 7 of 11 wrong, four documents
@@ -2850,9 +2854,20 @@ The full mechanics of how Unix-style scripting maps onto this model - pipes as c
 
 ## B.4 Open Question for Later
 
-When real userspace work begins, the first user-facing design decision is **how Unix-flavored the interface should feel** - Genode-style superficial familiarity (`ls /data` works, even though `ls` is a capability-bearing service) versus a fully fresh vocabulary. Either is defensible. Picking deliberately matters because retrofitting later is painful.
+When real userspace work begins, the first user-facing design decision is **how Unix-flavored the interface should feel** - Genode-style superficial familiarity (the Unix word works, even though it is a capability-bearing service) versus a fully fresh vocabulary. Either is defensible. Picking deliberately matters because retrofitting later is painful.
 
-Not a v1 decision.
+> **Answered 2026-09-23, and by a third option neither of those two is.** The vocabulary is fresh -
+> `dir`, `read`, `delete`, `copy`, `match`, `count` - and the shell keeps a table of the Unix and DOS
+> words (`FOREIGN_HINTS`) purely so that typing the reflex tells you the Godspeed word. It is a HINT
+> and never an alias: `ls` does not run, it answers `try \`dir\``. So familiarity is spent on
+> DISCOVERY rather than on compatibility, and nobody ends up writing scripts against a second set of
+> names that has to be supported forever.
+>
+> Recorded here because this appendix is where the question was posed, and an open question that has
+> been answered is worse than one that never was - the next reader takes it as still open. The
+> mechanism is in `services/shell`; `scripts/foreign_word_check.py` reads that same table to make
+> sure no document in this repository shows one of those words being used as a command, which is how
+> the `ls` -> `dir` rename was found to have missed ten worked examples.
 
 ---
 

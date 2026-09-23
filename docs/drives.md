@@ -86,7 +86,7 @@ when you replug). You normally use the **label alone**; you prefix the **index `
 only to disambiguate (see §4.2). Examples:
 
 ```
-  ls archive/projects/2026          # 'archive' is unique → no index needed
+  dir archive/projects/2026          # 'archive' is unique → no index needed
   read 0:data/notes.txt             # 'data' on drive 0
   read 1:data/notes.txt             # 'data' on drive 1 (a different drive, same label)
   read /etc/boot.cfg                # leading / → current drive, absolute path
@@ -136,7 +136,7 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 | `drives godspeed default <drive>` | which installed GodspeedOS the machine boots | **yes** |
 | `drives godspeed` | list installed GodspeedOS drives / help | - |
 | `cd <path>` · `mkdir <path>` | change current location / create a directory (`utilities/17`,`20`) | - |
-| `ls [path]` · `read <path>` · `write <path> …` · `copy`/`move`/`rename`/`delete` | navigate / read / write / manage files (`utilities/16`-`24`) | - |
+| `dir [path]` · `read <path>` · `write <path> …` · `copy`/`move`/`rename`/`delete` | navigate / read / write / manage files (`utilities/16`-`24`) | - |
 
 `<drive> = index | label | index:label` (§4.1/§4.2). No `mount`/`use` - the current
 location is a `cd` pointer (§4 note, `utilities/15_drives.md` §3.2).
@@ -176,7 +176,7 @@ gsh> drives
 gsh> drives mount 1:data
   drives: 1:data mounted (read/list only; current is still 0:data)
 
-gsh> ls 1:data/backups
+gsh> dir 1:data/backups
   NAME           SIZE
   2026-06.tar    40 KiB
 

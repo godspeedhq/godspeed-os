@@ -23,7 +23,7 @@ real fields. The names say what they do with no POSIX heritage to learn (§ conv
 - **`from`** - parse text *into* records (the bridge from the byte world).
 
 They are **pipe-only stages** - there is no `where /file`. They appear in a pipeline after a
-record producer (`status | where …`, `ls | where …`) or after `from`
+record producer (`status | where …`, `dir | where …`) or after `from`
 (`read x.json | from json | where …`). The record producers so far are all shell-side:
 **`status`** (task roster, `slot`/`name`/`core`/`state`/`mem`/`queue`/`restarts`), **`ls`**
 (`name`/`type`/`size`), **`caps`** (`resource`/`rights`), **`drives`**

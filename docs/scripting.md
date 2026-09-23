@@ -423,7 +423,7 @@ fn greet name {
 }
 
 fn ensure_dir path {
-    if !ls $path {
+    if !dir $path {
         mkdir $path
     }
 }
@@ -674,7 +674,7 @@ present, else prompts - so the same script can run interactively or be fed non-i
 ```
 # a helper: its mutable inputs are explicit params (immutable globals it could read)
 fn ensure_dir path {
-    if !ls $path {
+    if !dir $path {
         mkdir $path
         if result == Err {
             fail "could not create $path"
@@ -703,7 +703,7 @@ milestone is "these run."
 
 ```
 fn ensure_dir path {
-    if !ls $path {
+    if !dir $path {
         mkdir $path
         if result == Err {
             fail "cannot create $path"
