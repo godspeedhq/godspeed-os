@@ -1,9 +1,9 @@
 # 46 - resource capability invocation has no bounded, correlated reply
 
 **Opened:** 2026-09-23
-**Status:** PARTLY CLOSED (2026-09-23). Hole 1 is fixed for `fs` file capabilities by a protocol
-change in userspace, and `gs::cap` is built on it. Hole 2, and hole 1 for every OTHER resource-cap
-issuer, remain open.
+**Status:** HOLE 1 CLOSED (2026-09-23), in userspace, for every issuer - `fs` file capabilities and
+`net-stack` socket/listener/connection capabilities all carry a correlation tag now, and `gs::cap` is
+built on it. **HOLE 2 REMAINS OPEN** and is the only part of this entry still live.
 **Found by:** designing `gs::cap` on `feat/stdlib`, before writing it.
 
 > **`feat/stdlib` CONTAINS NO KERNEL CHANGE, and none is proposed for it.** Verified rather than
@@ -162,9 +162,13 @@ or explained, and that alone is worth the investigation.
    a reply is awaited, so an owner that dies mid-invocation does not wake its caller. `gs::cap`
    bounds this with a deadline, which is a caller-side mitigation and not the 8.6 guarantee. This one
    IS about the mechanism rather than the protocol.
-2. **Hole 1 for every other issuer.** `net-stack`'s socket and listener caps carry no tag, so the
-   shell's `sock` still relies on draining - safe only because the shell serves nobody. The same
-   one-byte protocol fix would work there; it simply has not been done.
+2. ~~**Hole 1 for every other issuer.**~~ **DONE.** `net-stack`'s badged path now strips and echoes
+   a tag exactly as `fs` does. Its machinery (`Reply { tag: Option<u8> }`) was already present and
+   deliberately switched off, with a comment reasoning that "the client holds no ambiguity to
+   resolve" - backwards, since the badge names the socket for the SERVICE and the client is the only
+   party that cannot tell one reply from another. The shell's drain stays for the SEC-35 capability
+   reclaim, but correctness no longer rests on it. Verified in QEMU (`osdev test shell`); `serve` -
+   the listener and connection ops - is exercised by no suite and wants hardware.
 3. **`examples/holder`** still does a bare, unbounded `ctx.recv()`. It remains Commandment VIII
    broken in the example that teaches the mechanism, and fixing it needs either a deadline (easy, and
    only a mitigation) or hole 2 closed (the real answer).
