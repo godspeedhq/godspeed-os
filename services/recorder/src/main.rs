@@ -164,8 +164,21 @@ fn fill_step(ctx: &ServiceContext, cap: &mut Capture) -> bool {
         }
         let n = IO_CHUNK.min((cap.capacity - cap.filled) as usize);
         // The offset is an argument now, so the 8-byte prefix this used to pack by hand is gone.
-        if fs(ctx).write_at(core::str::from_utf8(&p[..pn]).unwrap_or(""), cap.filled, &zeros[..n]).is_err() {
-            ctx.log("recorder: pre-fill write failed - stopping the capture");
+        let mut g = fs(ctx);
+        if let Err(e) = g.write_at(core::str::from_utf8(&p[..pn]).unwrap_or(""), cap.filled, &zeros[..n]) {
+            // SAY WHICH FAILURE. "pre-fill write failed" sent a reader to guess between a full disk,
+            // a dead service and a lost reply - three different things to do about it, and the reply
+            // was already carrying the answer.
+            let why = g.reason();
+            if why.is_empty() {
+                ctx.log_fmt(format_args!(
+                    "recorder: pre-fill write failed at offset {} - {} - stopping the capture",
+                    cap.filled, e.as_str()));
+            } else {
+                ctx.log_fmt(format_args!(
+                    "recorder: pre-fill write failed at offset {} - {} ({}) - stopping the capture",
+                    cap.filled, e.as_str(), why));
+            }
             cap.on = false;
             return false;
         }

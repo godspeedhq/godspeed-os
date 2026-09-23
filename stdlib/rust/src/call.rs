@@ -38,29 +38,10 @@
 //! service this task's contract did not grant. If the capability was never granted the call returns
 //! `Unreachable`, the same as any other peer this task cannot reach - it does not acquire one.
 
-use godspeed_sdk::ipc::Message;
-use godspeed_sdk::service_context::{DeadlineOutcome, ReqOutcome, ServiceContext};
+use godspeed_sdk::ipc::{IpcError, Message};
+use godspeed_sdk::service_context::{ReqOutcome, ServiceContext};
 
 use crate::error::Error;
-
-/// The SDK's outcome, carried across WITHOUT reinterpretation.
-///
-/// One-to-one, deliberately. `SendFailed` and `Timeout` must never collapse into a single value:
-/// that merge is exactly what `request_with_reply_deadline`'s `Option` performs, and what five
-/// services reached for a longer-named function to undo.
-///
-/// This lives here rather than as a `From` impl on `Error` so that `error.rs` stays free of any SDK
-/// import and remains host-unit-testable - the same shared-pure-module pattern `kernel/src/clock.rs`
-/// documents. The mapping itself is exercised on the target by `osdev test stdlib`.
-fn outcome_to_error(o: DeadlineOutcome) -> Error {
-    match o {
-        DeadlineOutcome::SendFailed => Error::Unreachable,
-        DeadlineOutcome::QueueFull  => Error::Busy,
-        DeadlineOutcome::Timeout    => Error::OutcomeUnknown,
-        // A `Reply` reaching here would be a bug in this module, not a failure of the peer.
-        DeadlineOutcome::Reply(_)   => Error::Malformed,
-    }
-}
 
 /// How long to wait before calling an answer late, when the caller does not say.
 ///
@@ -139,29 +120,41 @@ pub fn request_within_notice(
 pub fn request_within(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64,
 ) -> Result<Message, Error> {
-    match ctx.request_with_reply_deadline_outcome(peer, msg, secs) {
-        DeadlineOutcome::Reply(r) => Ok(r),
+    // `CallDeadline`, NOT a send followed by a plain recv.
+    //
+    // The kernel matches the reply to the one-shot reply capability this carries and leaves every
+    // other message queued. That is the difference between a library a SERVING task can call and one
+    // it cannot: a plain recv takes whatever lands next, so a client request that arrives mid-wait is
+    // consumed, misparsed, and lost. CLAUDE.md 8.2's amendment adds the primitive for exactly this,
+    // and `services/recorder` demonstrated the gap the day it stopped using it - a capture that died
+    // because the shell asked it a question at the wrong moment.
+    //
+    // There is nothing to hand back to the caller afterwards, either: the unrelated message was
+    // never taken, so it is still in the queue for the caller's own loop.
+    match ctx.request_with_reply_call_err(peer, msg, secs) {
+        Ok(Some(r)) => Ok(r),
+
+        // NEVER retried. See the module header.
+        Ok(None) => Err(Error::OutcomeUnknown),
+
+        // NOT retried, deliberately. Congestion clears on its own and the caller knows its own
+        // pacing; a library that retries a full queue on your behalf turns one late request into
+        // two and calls it help.
+        Err(IpcError::QueueFull) => Err(Error::Busy),
 
         // THE ONE RETRY THAT IS SAFE. The send did not happen, so re-sending is the same
         // operation rather than a second one. `reacquire_cap` is what makes the retry worth
         // doing: without it the second send uses the same stale handle and fails identically.
-        DeadlineOutcome::SendFailed => {
+        Err(_) => {
             if ctx.reacquire_cap(peer).is_err() {
                 return Err(Error::Unreachable);
             }
-            match ctx.request_with_reply_deadline_outcome(peer, msg, secs) {
-                DeadlineOutcome::Reply(r)  => Ok(r),
-                DeadlineOutcome::Timeout   => Err(Error::OutcomeUnknown),
-                other                      => Err(outcome_to_error(other)),
+            match ctx.request_with_reply_call_err(peer, msg, secs) {
+                Ok(Some(r))              => Ok(r),
+                Ok(None)                 => Err(Error::OutcomeUnknown),
+                Err(IpcError::QueueFull) => Err(Error::Busy),
+                Err(_)                   => Err(Error::Unreachable),
             }
         }
-
-        // NOT retried here, deliberately. Congestion clears on its own and the caller knows its own
-        // pacing; a library that retries a full queue on your behalf turns one late request into
-        // two and calls it help.
-        DeadlineOutcome::QueueFull => Err(Error::Busy),
-
-        // NEVER retried. See the module header.
-        DeadlineOutcome::Timeout => Err(Error::OutcomeUnknown),
     }
 }

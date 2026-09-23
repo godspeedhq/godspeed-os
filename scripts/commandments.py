@@ -963,12 +963,50 @@ def check_stdlib_delegates_reacquire(pins):
             "restore the reacquire, or remove `gs::call::*` from `reacquire_api` so the services "
             "that rely on it are held to IX themselves. A credit nothing verifies is worse than no "
             "credit."))
-    if "DeadlineOutcome::SendFailed" not in text:
-        out.append(Violation(
-            "stdlib/rust/src/call.rs", 0,
-            "the standard library must reacquire on SendFailed specifically. IX is explicit that a "
-            "reacquire driven by a DEADLINE is a different bug: a slow peer is a live peer, and "
-            "re-sending to it turns one request into two."))
+    # WHICH ARM IS THE REACQUIRE IN? This used to be `"DeadlineOutcome::SendFailed" in text`, which
+    # is a weaker question than it looks: it passes on a file that names the variant in a COMMENT and
+    # reacquires on the deadline, and it fails a file that is entirely correct in a different shape.
+    # Both happened - the second when the library moved to `CallDeadline`, where the same two facts
+    # are spelled `Err(..)` (the send never left) and `Ok(None)` (the peer is alive and slow).
+    #
+    # So: walk back from each reacquire to the match arm it sits in, and require that arm to be about
+    # a FAILED SEND. A dead peer is reacquired; a slow one is waited for.
+    lines = text.split("\n")
+    send_failed_arm = ("DeadlineOutcome::SendFailed", "Err(")
+    deadline_arm = ("DeadlineOutcome::Timeout", "Ok(None)", "ReqOutcome::Timeout")
+    found_reacquire = False
+    for i, line in enumerate(lines):
+        if not any(api in line for api in apis):
+            continue
+        found_reacquire = True
+        # The nearest `=>` at or above this line is the arm this call belongs to.
+        arm = None
+        for j in range(i, max(-1, i - 12), -1):
+            if "=>" in lines[j]:
+                arm = lines[j]
+                break
+        if arm is None:
+            out.append(Violation(
+                "stdlib/rust/src/call.rs", i + 1,
+                "a reacquire that is not inside a match arm on the request's outcome - IX needs it "
+                "to be reached for a FAILED SEND and for nothing else, and this cannot be read as "
+                "being either."))
+            continue
+        if any(d in arm for d in deadline_arm):
+            out.append(Violation(
+                "stdlib/rust/src/call.rs", i + 1,
+                "the reacquire sits in the DEADLINE arm. IX is explicit that a reacquire driven by a "
+                "deadline is a different bug: a slow peer is a live peer, and re-sending to it turns "
+                "one request into two."))
+        elif not any(f in arm for f in send_failed_arm):
+            out.append(Violation(
+                "stdlib/rust/src/call.rs", i + 1,
+                "the reacquire is not in a send-failure arm. IX asks for it on the path where the "
+                "request never left - `DeadlineOutcome::SendFailed`, or the `Err(..)` of a "
+                "`CallDeadline` - so that a deadline is never retried."))
+    if not found_reacquire:
+        # Already reported above by the `apis` check; nothing to add.
+        pass
     return out
 
 
