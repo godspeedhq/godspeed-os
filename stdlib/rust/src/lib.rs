@@ -74,6 +74,7 @@ pub mod error;
 #[cfg(not(test))] pub mod call;
 #[cfg(not(test))] pub mod fs;
 #[cfg(not(test))] pub mod io;
+#[cfg(not(test))] pub mod net;
 
 pub use error::Error;
 
@@ -84,5 +85,6 @@ pub use error::Error;
 pub mod prelude {
     pub use crate::error::Error;
     pub use crate::fs::Fs;
+    pub use crate::net::Net;
     pub use crate::io;
 }
