@@ -1,12 +1,15 @@
 # The `feat/gsfs` hardware pass - what to run, and what would make it fail
 
-**Status: FOUR OF FIVE BOARDS ARE DONE. The Raspberry Pi 2 is the one that remains, and it is the
-one that matters.** Dell Wyse 5070 (2026-09-18), then VisionFive 2, Raspberry Pi 4 and HP T630 (all
-2026-09-22): `selfcheck` clean and a power cut recovered in the strong form on every one. This is
-the checklist for the five, written while the QEMU work was fresh so that the reasons behind each
-step are recorded rather than reconstructed later.
+**Status: ALL FIVE BOARDS ARE DONE, and every one of them took an UNASSISTED power cut and recovered
+in the strong form.** `selfcheck` is clean on all five. The unassisted cuts, in order: Dell Wyse 5070
+(AHCI, 2026-09-18, mid-`selfcheck`, fourth cut), HP T630 (AHCI, 2026-09-22, first), then on
+2026-09-23 the Raspberry Pi 2 (USB/dwc2, third), Raspberry Pi 4 (USB/xhci, first) and VisionFive 2
+(USB/xhci riscv64, first). The Pi 4 and VisionFive had `crash-window` cuts on 2026-09-22 as well;
+those are superseded, so nothing here rests on a window held open for the device. This is the
+checklist for the five, written while the QEMU work was fresh so that the reasons behind each step
+are recorded rather than reconstructed later.
 
-**The last board ANSWERED, on the third cut (2026-09-23).** `CLAUDE.md` 6.1 recorded `fs` on the
+**The board 6.1 named as the exception ANSWERED, on its third cut (2026-09-23).** `CLAUDE.md` 6.1 recorded `fs` on the
 Pi 2 as restartable but NOT crash-recoverable, because its USB stick was said to refuse
 `SYNCHRONIZE CACHE`. Seven sessions across three USB stacks showed the device accepting the flush,
 and then an unassisted cut 17 s into `churn 30` - plain image, no crash-window, `CUT THE POWER AT
@@ -27,8 +30,9 @@ unorderable backend.
 per-cut hit rate under 2% and called three attempts long odds. That was wrong: it extrapolated `fs`'s
 own "under a millisecond" comment, written about an AHCI SSD, to USB. The window IS the checkpoint,
 and home-block writes are slow on a stick, so there it is a large fraction of each transaction.
-Measured since: **three hits in five unassisted cuts** across the T630 (first attempt), the Pi 2
-(third) and the Pi 4 (first). Two misses then a hit is unremarkable at that rate.
+Measured since: **five hits in ten unassisted cuts** across all five boards - Wyse (fourth attempt),
+T630 (first), Pi 2 (third), Pi 4 (first), VisionFive 2 (first). Two misses then a hit is unremarkable
+at a rate near a half.
 
 What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: home blocks reaching
 the medium before the commit record, which leaves torn metadata with no record to replay from. That

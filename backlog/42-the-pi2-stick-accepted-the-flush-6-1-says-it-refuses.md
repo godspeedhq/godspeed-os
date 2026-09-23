@@ -217,17 +217,23 @@ sit outside it, but they do not shrink it.
 
 Measured, across every unassisted cut on this branch:
 
-| board | unassisted cuts | hits |
-|---|---|---|
-| HP T630 (AHCI) | 1 | 1 (first attempt) |
-| Raspberry Pi 2 (USB/dwc2) | 3 | 1 (third attempt) |
-| Raspberry Pi 4 (USB/xhci) | 1 | 1 (first attempt) |
-| **total** | **5** | **3** |
+| board | backend | unassisted cuts | hits |
+|---|---|---|---|
+| Dell Wyse 5070 | AHCI | 4 | 1 (fourth) |
+| HP T630 | AHCI | 1 | 1 (first) |
+| Raspberry Pi 2 | USB / dwc2 | 3 | 1 (third) |
+| Raspberry Pi 4 | USB / xhci | 1 | 1 (first) |
+| VisionFive 2 | USB / xhci, riscv64 | 1 | 1 (first) |
+| **total** | | **10** | **5** |
 
-Three hits in five. At p = 0.02 that outcome has probability about 1 in 10^4, so the estimate is
-refuted rather than merely imprecise. The Pi 2's two misses were ordinary variance, not the
-1-in-35 luck the bad number implied - which is also why the third attempt succeeded rather than the
-thirty-fifth.
+Five hits in ten. At p = 0.02 that outcome has probability around 1 in 10^7, so the estimate is
+refuted rather than merely imprecise. The Pi 2's two misses were ordinary variance at a rate near a
+half, not the 1-in-35 luck the bad number implied - which is why its third attempt succeeded rather
+than its thirty-fifth.
+
+**The Wyse was unassisted all along and was not being counted.** x86 has no `crash-window` build, and
+`docs/gsfs-hardware-pass.md` records its plug being pulled at the wall mid-`selfcheck`, four times,
+the fourth landing in the commit window. It belonged in this table from the start.
 
 **Recorded because the wrong number was acted on**: it went into this entry, the carnage matrix and
 the hardware-pass doc, and it told the operator a test was infeasible when two more plug-pulls would

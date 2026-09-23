@@ -520,8 +520,9 @@ os/
 > and applied it to a USB stick. The window IS the checkpoint, the interval between the commit record
 > becoming durable and the last home block landing, and those writes are slow on a stick, so there it
 > is a large fraction of each transaction rather than a sliver of it. **Measured across every
-> unassisted cut: three hits in five** (T630 first attempt, Pi 2 third, Pi 4 first). At 2% that
-> outcome is about 1 in 10,000, so the estimate is refuted rather than imprecise. Nothing else in this
+> unassisted cut: five hits in ten** (Wyse fourth attempt, T630 first, Pi 2 third, Pi 4 first,
+> VisionFive first). At 2% that outcome is about 1 in 10^7, so the estimate is refuted rather than
+> imprecise. Nothing else in this
 > amendment depends on it - the evidence for the Pi 2 is the replay itself, not how many tries it
 > took - but the number was acted on, so it is corrected where it was stated rather than left for a
 > reader to trip over.
@@ -543,9 +544,11 @@ os/
 > write than the driver's command budget can give it. That was never the load-bearing claim - the
 > flush is - but it is not contradicted by anything here.
 >
-> Five boards, four ISAs, three storage backends, **power cut 5 of 5 recovered in the strong form**,
-> and **three of them cut UNASSISTED** - T630, Pi 2 and Pi 4, each landing in the commit window with
-> no held-open pause helping the device. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
+> Five boards, four ISAs, three storage backends, **power cut 5 of 5 recovered in the strong form,
+> and ALL FIVE cut UNASSISTED** - Wyse, T630, Pi 2, Pi 4 and VisionFive 2, each landing in the commit
+> window with no held-open pause helping the device. The Pi 4 and VisionFive also had `crash-window`
+> cuts a day earlier; those are superseded, so no result this amendment rests on depends on a window
+> held open for the device's convenience. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
 > investigation, including the two earlier Pi 2 cuts that missed the window and what they did and did
 > not measure.
 
