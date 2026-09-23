@@ -24,7 +24,7 @@
 //! operations with a demonstrated caller - because the cost of this module being wrong is not a
 //! compile error, it is a machine that quietly talks to the wrong port.
 
-use godspeed_sdk::capability::{CapHandle, RIGHT_WRITE};
+use godspeed_sdk::capability::{CapHandle, RIGHT_READ, RIGHT_WRITE};
 use godspeed_sdk::ipc::Message;
 use godspeed_sdk::service_context::ServiceContext;
 
@@ -52,6 +52,17 @@ const TAG_BASE: u8 = 0x80;
 
 /// Open a UDP socket, as `net-stack` numbers its operations.
 const OP_OPEN_SOCKET: u8 = 2;
+/// Listen on a TCP port: `[22, port_hi, port_lo]`.
+const OP_LISTEN: u8 = 22;
+
+// Operations on a LISTENER capability.
+const LOP_ACCEPT: u8 = 0;
+const LOP_CLOSE: u8 = 1;
+
+// Operations on a CONNECTION capability.
+const COP_RECV: u8 = 0;
+const COP_SEND: u8 = 1;
+const COP_CLOSE: u8 = 2;
 
 /// Everything after the echoed tag.
 fn body(m: &Message) -> &[u8] {
@@ -185,6 +196,28 @@ impl<'a> Net<'a> {
     pub(crate) fn next_tag_pub(&mut self) -> u8 {
         self.tag = TAG_BASE.wrapping_add(self.tag.wrapping_sub(TAG_BASE).wrapping_add(1) & 0x3F);
         self.tag
+    }
+
+    /// Listen on a TCP port and receive a CAPABILITY to the listener.
+    ///
+    /// The returned [`Listener`] is the authority to accept connections on one port, and nothing
+    /// else. `net-stack` refuses a port already listened on, so two programs cannot silently share
+    /// one.
+    ///
+    /// **Blocks** up to [`NET_SECS`]. **Authority:** the caller's existing `net-stack` capability.
+    ///
+    /// # Errors
+    /// - [`Error::Unavailable`] - `net-stack` would not listen: the port is taken, the listener
+    ///   table is full, or there is no usable NIC. Its log says which.
+    /// - [`Error::Failed`] - it agreed and sent no capability.
+    pub fn listen<'n>(&'n mut self, port: u16) -> Result<Listener<'n, 'a>, Error> {
+        let ctx = self.ctx;
+        let r = self.call(&[OP_LISTEN, (port >> 8) as u8, port as u8], NET_SECS)?;
+        if body(&r).first() != Some(&1) {
+            return Err(Error::Unavailable);
+        }
+        let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
+        Ok(Listener { net: self, ctx, cap, held: Held::new(), closed: false })
     }
 
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
@@ -457,5 +490,163 @@ impl<'n, 'a: 'n> Drop for Socket<'n, 'a> {
     /// otherwise assume an omission.
     fn drop(&mut self) {
         self.ctx.remove_cap(self.cap);
+    }
+}
+
+/// A TCP listener, held as a capability.
+///
+/// Accepting hands over authority - each accepted connection is its own capability - so accepting
+/// requires the listener's WRITE right. A read-only listener capability can be held and inspected
+/// and cannot take connections.
+pub struct Listener<'n, 'a: 'n> {
+    net: &'n mut Net<'a>,
+    ctx: &'a ServiceContext,
+    cap: CapHandle,
+    held: Held,
+    closed: bool,
+}
+
+impl<'n, 'a: 'n> Listener<'n, 'a> {
+    /// One invocation on a capability this listener owns, drawing from the one tag counter.
+    fn call(&mut self, cap: CapHandle, right: u8, body_bytes: &[u8]) -> Result<Message, Error> {
+        let tag = self.net.next_tag_pub();
+        resource::invoke(self.ctx, cap, right, tag, body_bytes, NET_SECS, &mut self.held)
+    }
+
+    /// Take the next connection, if one is waiting.
+    ///
+    /// **`Ok(None)` means nobody has connected yet.** That is an ordinary poll result, not an error,
+    /// so a server loops on it - and loops rather than blocking so it can still notice its own
+    /// deadline, its operator, or a request on its endpoint.
+    ///
+    /// **Blocks** up to [`NET_SECS`] per call. **Authority:** this listener's `WRITE` right, because
+    /// accepting hands over authority.
+    ///
+    /// # Errors
+    /// [`Error::PermissionDenied`] if the capability lacks `WRITE`; [`Error::Revoked`] if
+    /// `net-stack` restarted, in which case listen again - the port went with it.
+    pub fn accept(&mut self) -> Result<Option<Conn<'_, 'n, 'a>>, Error> {
+        let cap = self.cap;
+        let r = self.call(cap, RIGHT_WRITE, &[LOP_ACCEPT])?;
+        // `[tag, 1]` and an embedded capability, or `[tag, 0]` for nobody yet.
+        if body(&r).first() != Some(&1) {
+            return Ok(None);
+        }
+        let conn = self.ctx.take_pending_cap().ok_or(Error::Failed)?;
+        Ok(Some(Conn { lis: self, cap: conn, closed: false }))
+    }
+
+    /// Stop listening and release the port.
+    ///
+    /// Consumes the listener. Dropping one also releases it, but a `Drop` cannot report a failure -
+    /// and a port that was not released refuses the next `listen` on it, which is a confusing way to
+    /// find out. Close explicitly where it matters.
+    pub fn close(mut self) -> Result<(), Error> {
+        self.close_inner()
+    }
+
+    fn close_inner(&mut self) -> Result<(), Error> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let cap = self.cap;
+        let r = self.call(cap, RIGHT_WRITE, &[LOP_CLOSE]).map(|_| ());
+        self.ctx.remove_cap(cap);
+        r
+    }
+
+    /// Take one message that arrived during an operation and was NOT the reply. See
+    /// [`Socket::take_held`].
+    pub fn take_held(&mut self) -> Option<Message> {
+        self.held.take()
+    }
+}
+
+impl<'n, 'a: 'n> Drop for Listener<'n, 'a> {
+    fn drop(&mut self) {
+        let _ = self.close_inner();
+    }
+}
+
+/// One accepted TCP connection, held as a capability.
+///
+/// Borrows its [`Listener`], so one connection is open at a time and the tag counter has a single
+/// owner from `Net` down. That is `serve`'s real model - accept one, answer it, close, accept the
+/// next - now enforced rather than remembered.
+pub struct Conn<'c, 'n: 'c, 'a: 'n> {
+    lis: &'c mut Listener<'n, 'a>,
+    cap: CapHandle,
+    closed: bool,
+}
+
+impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
+    /// Read whatever has arrived, into `buf`. Returns how many bytes.
+    ///
+    /// **Zero means nothing has arrived YET**, not end of stream - TCP delivers when it delivers, so
+    /// a caller that wants more loops. Use [`is_closed`](Conn::is_closed) to tell "nothing yet" from
+    /// "the peer has gone".
+    ///
+    /// **Authority:** this connection's `READ` right.
+    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let cap = self.cap;
+        let r = self.lis.call(cap, RIGHT_READ, &[COP_RECV])?;
+        let b = r.payload_bytes();
+        let data = if b.len() > 1 { &b[1..] } else { &[][..] };
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
+
+    /// Send bytes. Returns how many were ACCEPTED, which may be fewer than offered.
+    ///
+    /// **A short send is reported, not hidden.** `net-stack`'s send arena is fixed, so a caller
+    /// offering more than fits must know how much was taken or it loses the tail without being told
+    /// (26.7). Send the remainder on a later call.
+    ///
+    /// **Authority:** this connection's `WRITE` right.
+    pub fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
+        let mut req = [0u8; 1 + 1024];
+        if 1 + data.len() > req.len() {
+            return Err(Error::InvalidInput);
+        }
+        req[0] = COP_SEND;
+        req[1..1 + data.len()].copy_from_slice(data);
+        let cap = self.cap;
+        let r = self.lis.call(cap, RIGHT_WRITE, &req[..1 + data.len()])?;
+        let b = body(&r);
+        if b.len() < 2 {
+            return Err(Error::Malformed);
+        }
+        Ok(((b[1] as usize) << 8 | b[0] as usize).min(data.len()))
+    }
+
+    /// Whether [`close`](Conn::close) has already been called on this handle.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Close the connection.
+    ///
+    /// Consumes the handle. Dropping also closes, and cannot report the outcome.
+    pub fn close(mut self) -> Result<(), Error> {
+        self.close_inner()
+    }
+
+    fn close_inner(&mut self) -> Result<(), Error> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let cap = self.cap;
+        let r = self.lis.call(cap, RIGHT_WRITE, &[COP_CLOSE]).map(|_| ());
+        self.lis.ctx.remove_cap(cap);
+        r
+    }
+}
+
+impl<'c, 'n: 'c, 'a: 'n> Drop for Conn<'c, 'n, 'a> {
+    fn drop(&mut self) {
+        let _ = self.close_inner();
     }
 }

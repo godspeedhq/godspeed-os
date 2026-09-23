@@ -1168,3 +1168,71 @@ there; it is just a different shape, and this library does not fit it.
 
 **Five migrations, and the sixth candidate correctly refused.** `recorder`, the shell's `tcp`, `dir`,
 `fcap`, `sock` and `copier` all shrank and all found defects. `time` would have grown a bug.
+
+## 21. TCP listen and accept, and the objection that was wrong
+
+Section 20 ended by arguing against wrapping TCP listen/accept: `serve` had no QEMU coverage, so a
+migration could not be verified, and the surface would have no proven caller.
+
+**The premise was wrong, and the operator said so: create a caller from outside and connect to it.**
+
+SLIRP restricts the GUEST reaching outward - its only peer is the gateway, which is the limitation
+`docs/` records and which I had generalised into "inbound cannot be tested either". Inbound is
+exactly what `hostfwd` is for, and the harness that already drives the guest over serial can equally
+open a TCP socket and be the client. One line:
+
+```
+-netdev user,id=n0,hostfwd=tcp:127.0.0.1:18080-:8080
+```
+
+### The test, before the feature
+
+`osdev test shell` now runs `serve 8080`, connects from the HOST, sends bytes and requires them back.
+Three assertions in increasing strength: the guest is listening, **a host client's bytes make the
+round trip**, and the guest accepted through ACCEPT's embedded capability.
+
+That last one is why this mattered beyond coverage. `LOP_ACCEPT` returns an **embedded connection
+capability**, and that is the riskiest part of the socket-capability tagging added in section 16: a
+reply believed on a mismatched tag would hand the caller a capability to the WRONG CONNECTION -
+SEC-35 approached from the other side. Nothing exercised it. I had flagged that gap and then proposed
+to leave it open, which was wrong twice.
+
+### Then the feature
+
+`Net::listen` returns a `Listener`; `Listener::accept` returns `Ok(None)` when nobody is waiting -
+an ordinary poll result, not an error - and `Ok(Some(Conn))` carrying a capability to one connection.
+`Conn` has `recv`, `send` and `close`.
+
+**The borrow structure is the design, not an artefact:**
+
+```text
+Net  --&mut-->  Listener  --&mut-->  Conn
+```
+
+One connection at a time, and one tag counter owner all the way down. That is `serve`'s actual model
+- accept one, answer it, close, accept the next - now enforced by the compiler rather than remembered
+by the author. It also forced one genuine improvement: the accept poll became a labelled loop that
+YIELDS the connection, because an `Option<Conn>` carried across iterations would still hold the
+listener borrow when the next `accept()` wanted it. The loop now has one job and one result.
+
+### The sixth migration
+
+`cmd_serve` runs on it. What stayed is what `serve` MEANS: the address banner (asked of net-stack
+rather than remembered, so a changed lease cannot go stale), the ten-second live sign, `q`, the
+printable-only rendering of a peer's bytes, and the 250 ms poll with its reasoning. What went is the
+wire format - the shell's socket-invoke helper, its listener-release helper and three opcode
+constants deleted, 87 lines net.
+
+Verified by the test written first: **206 passed, 0 failed**, with a real host TCP client.
+
+### One diagnosis worth recording
+
+After the dead-code cleanup the suite reported 200/6. The cleanup removed only items whose sole
+remaining occurrence was their own definition, and all 30 services built - so it was inert, and the
+serial log said so plainly: **the shell never printed its listening banner, net-stack started three
+times, and one of its passes took 8 seconds.** net-stack had restarted twice under host load. A clean
+re-run gave 206/0.
+
+That is the fourth time on this branch that a load-induced cascade has looked like a regression, and
+the third time the serial log answered it faster than another run would have. The tell is consistent:
+**no kernel panic, no wedge, and output that simply stops.**
