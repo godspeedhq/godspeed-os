@@ -184,7 +184,6 @@ const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a forei
 const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
                          // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
-const OP_SEAL: u8 = 31;  // [op, plen, path] - freeze a file's content, permanently
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
 const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]  (needs WRITE)
@@ -14169,13 +14168,14 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             return Ok(());
         }
     }
-    let reply = fs_request(ctx, OP_SEAL, path, &[]);
-    match reply.as_ref().map(|r| r.payload_bytes().first().copied()) {
-        Some(Some(FS_OK)) => {
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = gfs.seal(path);
+    let out = match r {
+        Ok(()) => {
             ctx.console_writeln_fmt(format_args!("sealed {}", str_of(path)));
             Ok(())
         }
-        Some(Some(FS_NOTFOUND)) => {
+        Err(gs::Error::NotFound) => {
             ctx.console_writeln_fmt(format_args!("seal: not found: {}", str_of(path)));
             Err(ShellError::FileNotFound)
         }
@@ -14188,13 +14188,17 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             // The fourth command today with this shape, after `write`, `move` and `copy`. The pattern
             // is worth naming: a layer that knows why something failed and answers with a menu of
             // possibilities costs the reader the one thing it could have told them (26.7).
-            match reply.as_ref().and_then(fs_err_reason) {
-                Some(why) => ctx.console_writeln_fmt(format_args!("seal: failed - {}", why)),
-                None      => ctx.console_writeln("seal: failed - see fs's log"),
+            let why = gfs.reason();
+            if why.is_empty() {
+                ctx.console_writeln("seal: failed - see fs's log");
+            } else {
+                ctx.console_writeln_fmt(format_args!("seal: failed - {}", why));
             }
             Err(ShellError::Unknown)
         }
-    }
+    };
+    ctx.fs_tag.set(gfs.tag());
+    out
 }
 
 /// `read <path>` - print a file's contents. The first command on the Ok/Err `Result` model:
@@ -15340,22 +15344,40 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
             "write: {} failed (storage, or bad path?)", if prepend { "prepend" } else { "append" }));
         return Err(ShellError::Unknown);
     }
-    let reply = match fs_request(ctx, OP_WRITE_FILE, p, content.as_bytes()) {
-        Some(r) => r,
-        None => { fs_no_answer(ctx, "write"); return Err(ShellError::Unknown); }
-    };
-    let rp = reply.payload_bytes();
-    if no_fs(ctx, rp) { return Err(ShellError::Unknown); }
-    if rp.first() == Some(&FS_OK) {
-        ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
-        Ok(())
-    } else {
-        match fs_err_reason(&reply) {
-            Some(why) => ctx.console_writeln_fmt(format_args!("write: failed - {}", why)),
-            None      => ctx.console_writeln("write: failed (bad path, or parent missing?)"),
+    // Through `gs::fs`. The handle stays alive across the match because `reason()` - the service's
+    // own sentence about what went wrong - belongs to it.
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = gfs.write(p, content.as_bytes());
+    let out = match r {
+        Ok(()) => {
+            ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
+            Ok(())
         }
-        Err(ShellError::Unknown)
-    }
+        // THE DEADLINE PASSED, WHICH IS NOT A FAILURE. `fs` may still be writing this, so the
+        // operator must not be told it failed and must not simply run it again.
+        Err(gs::Error::OutcomeUnknown) => { fs_no_answer(ctx, "write"); Err(ShellError::Unknown) }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        // Present-but-unreadable storage: the data may be intact, so flashing would DESTROY it.
+        // Deliberately does NOT advise 'drives flash'.
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            let why = gfs.reason();
+            if why.is_empty() {
+                ctx.console_writeln("write: failed (bad path, or parent missing?)");
+            } else {
+                ctx.console_writeln_fmt(format_args!("write: failed - {}", why));
+            }
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(gfs.tag());
+    out
 }
 
 // fmt's write / compare chunk buffer. MUST be a multiple of the fs payload block (DATA_PAYLOAD = 508):

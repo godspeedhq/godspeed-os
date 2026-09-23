@@ -115,6 +115,7 @@ const OP_MKDIR_P: u8 = 18;
 const OP_DELETE_TREE: u8 = 19;
 const OP_OPEN: u8 = 30;
 const OP_CHECK: u8 = 27;
+const OP_SEAL: u8 = 31;
 const OP_SCRUB: u8 = 29;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
@@ -622,6 +623,30 @@ impl<'a> Fs<'a> {
             bad: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
             scanned: u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]),
         })
+    }
+
+    /// Freeze a file's content. **Permanently.**
+    ///
+    /// A sealed file can never be written again - not by you, not by anything holding a capability
+    /// to it, not after a restart. `fs` will not even mint a writable capability for one
+    /// ([`open`](Fs::open) narrows to read-only rather than handing back a capability it could not
+    /// honour).
+    ///
+    /// **There is no unseal**, by design: a seal a holder can lift is a request rather than a
+    /// guarantee. If you are offering this to a person, ask them first - every other destructive
+    /// operation here can be undone by doing the opposite, and this one cannot.
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] - no such path.
+    /// - [`Error::Failed`] - with [`reason`](Fs::reason) saying why; "only a file can be sealed" is
+    ///   the common one, because a directory cannot be.
+    /// - Sealing twice is harmless - the second call finds it already sealed - so a no-answer error
+    ///   here may be retried, unlike most mutations.
+    pub fn seal(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.call(OP_SEAL, path.as_ref(), &[], call::DEFAULT_SECS)?;
+        Ok(())
     }
 
     /// Ask whether a path exists, and what it is.
