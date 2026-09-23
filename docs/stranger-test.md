@@ -193,3 +193,103 @@ messages a stranger can recover from - the thing this document says is a finding
   with.
 - `examples/stdlib-hello` is a reference answer by someone who had read the kernel. It was
   deliberately out of reach, so this measured the documentation and not the example.
+
+---
+
+**RUN 2: 2026-09-23, same day.** Level 2 of the ladder - a network client. Same conditions: weakest
+model, fresh context, published documentation only. Two things run 1 could not test were added: the
+program had to **compile**, and the requirement was written to **tempt the retry failure**.
+
+The task said the network is unreliable and asked for a program that "copes sensibly with failures
+rather than giving up at the first sign of trouble" - an ordinary requirement that a careless
+programmer satisfies by retrying everything. Nothing was said about retry rules.
+
+### The headline: point 5 passed, under temptation
+
+```rust
+match net.tcp(ip, port, request, buf) {
+    Ok(n) => Ok(n),
+    Err(e) => {
+        // TCP changes state on the server, so we are more careful about retries
+        if e.retry_is_safe() {
+            // Request never left, safe to retry
+            net.tcp(ip, port, request, buf)
+        } else {
+            // OutcomeUnknown or other non-retryable errors
+            Err(e)
+        }
+    }
+}
+```
+
+It retried only what is provably safe and refused to retry an unknown outcome, with a correct
+comment saying why, and it quoted the documentation as its reason. **This is the failure this
+document says to watch hardest, it was deliberately baited, and the API answered it** - which is
+exactly what `Error::retry_is_safe` was put there to do.
+
+It also distinguished a read-only DNS lookup (retry acceptable) from a TCP request (not), which is a
+finer judgement than the task required.
+
+### Point 8: it compiled, and the messages were sufficient
+
+Four errors, all fixed unaided; it reported every message as enough to work out the fix:
+
+| what broke | how it was resolved |
+|---|---|
+| `cannot find function 'yield_cpu' in crate 'godspeed'` | it is a method on `ServiceContext` |
+| `type annotations needed` on `println_fmt` | it takes `core::fmt::Arguments` |
+| expected `Arguments<'_>`, found closure | used `format_args!()` |
+| unused variable `ctx` | prefixed `_ctx` |
+
+No gate fired with an unhelpful message, because no gate had to fire.
+
+### Run 1's two defects are CONFIRMED FIXED
+
+The strongest available evidence, because a different stranger got them right with no help:
+
+```rust
+#![no_std]  #![no_main]  #![deny(unsafe_code)]
+use godspeed::{io, net::Net, Error, ServiceContext};   // one line, and not the SDK
+#[allow(unsafe_code)] #[no_mangle]
+pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+```
+
+It passes `scripts/unsafe_check.py`. Run 1 could not produce a buildable crate; run 2 did, first
+program, from the same documentation plus the two fixes.
+
+### MY ERROR, which invalidates part of this run
+
+**The task asked for a UDP datagram and it used `net.tcp()` instead.** That is not a finding about
+discoverability: **the published `/api` it was reading did not contain `Socket` at all.** The site was
+last built before `gs::net::Socket` existed and was never rebuilt, so the module offered `Net`,
+`Status` and `NET_SECS` and nothing else. The stranger used the only send it could see, and was
+right to.
+
+So **run 2 did not test the socket API**, and its "used TCP instead of UDP" is my process error
+recorded as one. The lesson is procedural and worth keeping: **publish the documentation before
+running the test, or the test measures a version of the system that no longer exists.**
+
+### Scored
+
+| # | Point | Run 1 | Run 2 |
+|---|---|---|---|
+| 1 | Discover the correct API | PASS | PASS (within what was published) |
+| 2 | Avoid raw IPC and private SDK | PARTIAL | **PASS** - the SDK is no longer named |
+| 3 | Use only the authority available | PASS | PASS |
+| 4 | Handle failures honestly | PASS | PASS |
+| 5 | No blind retry after an unknown outcome | barely exercised | **PASS, under temptation** |
+| 6 | Avoid architecture-specific hacks | PASS | PASS |
+| 7 | Avoid unsafe | PASS | PASS, and gate-verified |
+| 8 | Repair its own program | not exercised | **PASS** - 4 errors, all unaided |
+| 9 | A working program without kernel knowledge | FAIL | **PASS** - it compiles |
+
+### Still not established
+
+- **The socket API is untested by a stranger**, for the reason above. A run 3 against correctly
+  published docs would close that.
+- **Capability discovery was not tested.** Run 2 was handed a contract granting `ipc_send =
+  ["net-stack"]`, and could read it. It never had to work out which capabilities it needed, and the
+  contract named its peer.
+- The crate skeleton (`Cargo.toml`, `build.rs`, workspace entry) was provided. Workspace membership
+  here is an explicit list, so leaving it out would have tested build-system archaeology rather than
+  the library.

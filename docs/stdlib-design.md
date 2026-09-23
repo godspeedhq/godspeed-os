@@ -919,7 +919,7 @@ wrong - the one-shot reply cap's lifetime, holding a message that is not ours ra
 it, reading the kernel's refusal instead of inferring it - live in one place, because two copies of a
 subtle rule is how they diverge.
 
-`cmd_sock` walks it, and the migration deleted `sock_open` outright.
+`cmd_sock` walks it, and the migration deleted the shell's old hand-rolled socket opener outright.
 
 ### A report that had been wrong the whole time
 
