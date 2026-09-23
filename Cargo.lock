@@ -296,6 +296,7 @@ dependencies = [
 name = "copier"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 

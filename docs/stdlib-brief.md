@@ -174,7 +174,7 @@ require substantial raw IPC plumbing, identify what abstraction is missing - do 
 creating giant convenience APIs.
 
 > **STATUS: `services/recorder` migrated** (filesystem and console). 680 lines to 627; raw fs/IPC
-> plumbing from 22 sites to 2; its `fs_call` from 55 lines to 15 and, more importantly, from `bool`
+> plumbing from 22 sites to 2; its own filesystem call helper from 55 lines to 15 and, more importantly, from `bool`
 > to `Result` - it used to discard the difference between a write that timed out and one that never
 > left. The migration also DROVE the API: `recorder` needed `create_sized`, `write_at` and `rename`,
 > which were added as typed operations rather than behind an opcode escape hatch.

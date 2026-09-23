@@ -87,6 +87,19 @@ pub struct Scrub {
 
 /// The longest path `services/fs` accepts. A longer one is [`Error::InvalidInput`] and is never
 /// sent, rather than being silently truncated into a request for a DIFFERENT file.
+///
+/// # Paths are BYTES
+///
+/// Every path parameter here takes `impl AsRef<[u8]>`, so a string literal works as it reads -
+/// `fs.read_into("/data/message.txt", &mut buf)` - and so does a byte slice a program is holding
+/// from somewhere else.
+///
+/// That is not generality for its own sake. `services/fs` accepts any byte above 0x1f except `/`
+/// and 0x7f in a name, so a disk prepared elsewhere holds names that are not UTF-8, and this OS must
+/// still be able to list and DELETE them. A `&str`-only API forces such a caller through
+/// `from_utf8(..).unwrap_or("")`, which turns an unreadable name into a request for a different
+/// file - silently. [`DirEntry::name`] hands back raw bytes for the same reason; these parameters
+/// accept them for the other half of the round trip.
 pub const PATH_MAX: usize = 120;
 
 /// The most file content one request can carry, as `services/fs` frames it (7 * 508). Reads and
@@ -379,7 +392,7 @@ impl<'a> Fs<'a> {
     ///   part way through would name the wrong fault.
     /// - [`Error::Malformed`] - the service claimed more entries without advancing. Listing is
     ///   read-only, so every no-answer error here is safe to retry.
-    pub fn list_dir<F>(&mut self, path: &str, mut f: F) -> Result<Listing, Error>
+    pub fn list_dir<F>(&mut self, path: impl AsRef<[u8]>, mut f: F) -> Result<Listing, Error>
     where
         F: FnMut(DirEntry<'_>) -> bool,
     {
@@ -388,7 +401,7 @@ impl<'a> Fs<'a> {
         let mut total = 0usize;
         let mut pages = 0u16;
         loop {
-            let r = match self.call(OP_LIST_DIR, path.as_bytes(), &from.to_le_bytes(), call::DEFAULT_SECS) {
+            let r = match self.call(OP_LIST_DIR, path.as_ref(), &from.to_le_bytes(), call::DEFAULT_SECS) {
                 Ok(r) => r,
                 // The FIRST page failing means the path is not a readable directory, and the caller
                 // needs that error. A LATER one failing is a read error inside a walk that already
@@ -472,8 +485,8 @@ impl<'a> Fs<'a> {
     /// a file, say). **A no-answer error must NOT be blindly retried** - see [`Error::retry_is_safe`];
     /// creating directories is idempotent, but the transaction may have committed unseen, so
     /// re-issuing is only safe once you accept that it is a second attempt rather than the first.
-    pub fn create_dir_all(&mut self, path: &str) -> Result<(), Error> {
-        self.call(OP_MKDIR_P, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+    pub fn create_dir_all(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.call(OP_MKDIR_P, path.as_ref(), &[], call::DEFAULT_SECS)?;
         Ok(())
     }
 
@@ -491,11 +504,11 @@ impl<'a> Fs<'a> {
     /// [`reason`](Fs::reason) for a refused move ("name already exists", "cannot move root", a
     /// destination inside the source). A move MUTATES - do not retry on a no-answer error without
     /// first checking what happened.
-    pub fn move_to(&mut self, path: &str, dest: &str) -> Result<(), Error> {
-        if dest.len() > PATH_MAX {
+    pub fn move_to(&mut self, path: impl AsRef<[u8]>, dest: impl AsRef<[u8]>) -> Result<(), Error> {
+        if dest.as_ref().len() > PATH_MAX {
             return Err(Error::InvalidInput);
         }
-        self.call(OP_MOVE, path.as_bytes(), dest.as_bytes(), call::DEFAULT_SECS)?;
+        self.call(OP_MOVE, path.as_ref(), dest.as_ref(), call::DEFAULT_SECS)?;
         Ok(())
     }
 
@@ -505,16 +518,21 @@ impl<'a> Fs<'a> {
     /// directory; this removes the subtree. The names differ deliberately - a caller reaching for
     /// the destructive one should have to type something that says so.
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`], and longer for a large tree than any single-file
-    /// call. **Authority:** the caller's existing `fs` capability.
+    /// **Blocks** up to [`SWEEP_SECS`], not the ordinary deadline: removing a subtree walks it, and
+    /// a bound shorter than the work turns a slow success into [`Error::OutcomeUnknown`] - which is
+    /// worse than waiting, because an unknown outcome forbids the retry that would have fixed it.
+    /// (This doc previously said "up to `DEFAULT_SECS`, and longer for a large tree", which cannot
+    /// happen: a call does not block past its own deadline, it gives up.)
+    ///
+    /// **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
     /// [`Error::NotFound`] if the path is absent; [`Error::Failed`] with [`reason`](Fs::reason)
     /// otherwise. **Never retry this on [`Error::OutcomeUnknown`]**: the service batches its
     /// frees, so a deadline that passes mid-delete may leave the tree partly removed, and a blind
     /// retry cannot tell that from never having started.
-    pub fn delete_all(&mut self, path: &str) -> Result<(), Error> {
-        self.call(OP_DELETE_TREE, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+    pub fn delete_all(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.call(OP_DELETE_TREE, path.as_ref(), &[], SWEEP_SECS)?;
         Ok(())
     }
 
@@ -545,9 +563,9 @@ impl<'a> Fs<'a> {
     /// - [`Error::PermissionDenied`] - a writable capability was asked for on a sealed file and no
     ///   read-only fallback was available.
     /// - [`Error::Failed`] - `fs` replied without a capability. Retrying an open is safe.
-    pub fn open<'f>(&'f mut self, path: &str, rights: u8) -> Result<crate::cap::File<'f, 'a>, Error> {
+    pub fn open<'f>(&'f mut self, path: impl AsRef<[u8]>, rights: u8) -> Result<crate::cap::File<'f, 'a>, Error> {
         let ctx = self.ctx;
-        self.call(OP_OPEN, path.as_bytes(), &[rights], call::DEFAULT_SECS)?;
+        self.call(OP_OPEN, path.as_ref(), &[rights], call::DEFAULT_SECS)?;
         // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
@@ -613,8 +631,8 @@ impl<'a> Fs<'a> {
     /// # Errors
     /// [`Error::NotFound`] if the path is absent. See [`Error`] for the no-answer cases; a `stat` is
     /// read-only, so retrying any of them is safe.
-    pub fn stat(&mut self, path: &str) -> Result<Stat, Error> {
-        let r = self.call(OP_STAT_FILE, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+    pub fn stat(&mut self, path: impl AsRef<[u8]>) -> Result<Stat, Error> {
+        let r = self.call(OP_STAT_FILE, path.as_ref(), &[], call::DEFAULT_SECS)?;
         let b = r.body();
         // [status, exists, size:u64, is_dir] after the tag - 11 bytes from the tag inclusive.
         if b.len() < 10 {
@@ -625,6 +643,44 @@ impl<'a> Fs<'a> {
         }
         let size = u64::from_le_bytes([b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]]);
         Ok(Stat { size, is_dir: b[9] == 1 })
+    }
+
+    /// Read at most `buf.len()` bytes from `offset`, and say how many arrived.
+    ///
+    /// The positional read. Use it to move a file larger than any buffer, or to resume where a
+    /// previous pass stopped; use [`read_into`](Fs::read_into) when the whole file fits and you want
+    /// it in one call.
+    ///
+    /// Returns 0 at end of file. One call moves at most [`IO_CHUNK`] bytes however large `buf` is,
+    /// so a caller wanting more must loop - and the loop is the caller's, because only the caller
+    /// knows whether a short read means "done" or "keep going".
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] - no such file, or it is a directory.
+    /// - A read changes nothing, so **every no-answer error here is safe to retry** - which is what
+    ///   makes a resumable copy possible at all. See [`Error::retry_is_safe`].
+    pub fn read_at(&mut self, path: impl AsRef<[u8]>, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let want = buf.len().min(IO_CHUNK);
+        if want == 0 {
+            return Ok(0);
+        }
+        let mut tail = [0u8; 12];
+        tail[..8].copy_from_slice(&offset.to_le_bytes());
+        tail[8..].copy_from_slice(&(want as u32).to_le_bytes());
+        let r = self.call(OP_READ_AT, path.as_ref(), &tail, call::DEFAULT_SECS)?;
+        let b = r.body();
+        // `[n:u32, bytes..]` after the tag and status the call already checked.
+        if b.len() < 4 {
+            return Err(Error::Malformed);
+        }
+        let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        if n > want || b.len() < 4 + n {
+            return Err(Error::Malformed);
+        }
+        buf[..n].copy_from_slice(&b[4..4 + n]);
+        Ok(n)
     }
 
     /// Read a whole file into `buf`, returning how many bytes were written.
@@ -638,7 +694,10 @@ impl<'a> Fs<'a> {
     /// - [`Error::BufferTooSmall`] - the file does not fit. **Nothing is written**; call again with
     ///   room, having learned the size from [`stat`](Fs::stat).
     /// - A read is idempotent, so every no-answer error here may safely be retried.
-    pub fn read_into(&mut self, path: &str, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn read_into(&mut self, path: impl AsRef<[u8]>, buf: &mut [u8]) -> Result<usize, Error> {
+        // Bound once: `impl AsRef<[u8]>` is not `Copy`, and this uses the path twice (a stat, then a
+        // chunk loop). A `&[u8]` is `Copy`, so taking the reference first is all it needs.
+        let path = path.as_ref();
         let st = self.stat(path)?;
         if st.is_dir {
             return Err(Error::NotFound);
@@ -653,7 +712,7 @@ impl<'a> Fs<'a> {
             let mut tail = [0u8; 12];
             tail[..8].copy_from_slice(&(off as u64).to_le_bytes());
             tail[8..].copy_from_slice(&(want as u32).to_le_bytes());
-            let r = self.call(OP_READ_AT, path.as_bytes(), &tail, call::DEFAULT_SECS)?;
+            let r = self.call(OP_READ_AT, path.as_ref(), &tail, call::DEFAULT_SECS)?;
             let b = r.body();
             if b.len() < 4 {
                 return Err(Error::Malformed);
@@ -677,22 +736,22 @@ impl<'a> Fs<'a> {
     /// If it returns [`Error::OutcomeUnknown`], the write may have happened. Do not call it again
     /// to "make sure": read the file back, or report the uncertainty. [`Error::retry_is_safe`]
     /// answers this for you, and says `false` for that case on purpose.
-    pub fn write(&mut self, path: &str, data: &[u8]) -> Result<(), Error> {
+    pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
-            self.call(OP_WRITE_FILE, path.as_bytes(), data, call::DEFAULT_SECS)?;
+            self.call(OP_WRITE_FILE, path.as_ref(), data, call::DEFAULT_SECS)?;
             return Ok(());
         }
         // Larger than one message: create it, then fill it positionally. `WRITE_AT` at a fixed
         // offset is one of the two operations `services/fs` documents as positionally idempotent,
         // which is what makes a chunked write safe to resume at all.
-        self.call(OP_WRITE_FILE, path.as_bytes(), &data[..IO_CHUNK], call::DEFAULT_SECS)?;
+        self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], call::DEFAULT_SECS)?;
         let mut off = IO_CHUNK;
         while off < data.len() {
             let n = (data.len() - off).min(IO_CHUNK);
             let mut tail = [0u8; 8 + IO_CHUNK];
             tail[..8].copy_from_slice(&(off as u64).to_le_bytes());
             tail[8..8 + n].copy_from_slice(&data[off..off + n]);
-            self.call(OP_WRITE_AT, path.as_bytes(), &tail[..8 + n], call::DEFAULT_SECS)?;
+            self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + n], call::DEFAULT_SECS)?;
             off += n;
         }
         Ok(())
@@ -701,8 +760,8 @@ impl<'a> Fs<'a> {
     /// Create a directory. Fails if the parent does not exist.
     ///
     /// **Blocks**. Changes state: see the note on [`write`] about [`Error::OutcomeUnknown`].
-    pub fn create_dir(&mut self, path: &str) -> Result<(), Error> {
-        self.call(OP_MKDIR, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+    pub fn create_dir(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.call(OP_MKDIR, path.as_ref(), &[], call::DEFAULT_SECS)?;
         Ok(())
     }
 
@@ -711,8 +770,8 @@ impl<'a> Fs<'a> {
     /// **Blocks**. **Destructive, and not idempotent in the way that matters**: on
     /// [`Error::OutcomeUnknown`] the file may already be gone, and a second delete would report
     /// `NotFound` for work that succeeded. Report the uncertainty; do not re-send.
-    pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.call(OP_DELETE, path.as_bytes(), &[], call::DEFAULT_SECS)?;
+    pub fn delete(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.call(OP_DELETE, path.as_ref(), &[], call::DEFAULT_SECS)?;
         Ok(())
     }
 
@@ -727,8 +786,8 @@ impl<'a> Fs<'a> {
     ///
     /// Added because `services/recorder` needed it during migration. It is a real filesystem
     /// operation, so it belongs in the typed surface rather than behind an opcode escape hatch.
-    pub fn create_sized(&mut self, path: &str, capacity: u64) -> Result<(), Error> {
-        self.call(OP_WRITE_NEW, path.as_bytes(), &capacity.to_le_bytes(), call::DEFAULT_SECS)?;
+    pub fn create_sized(&mut self, path: impl AsRef<[u8]>, capacity: u64) -> Result<(), Error> {
+        self.call(OP_WRITE_NEW, path.as_ref(), &capacity.to_le_bytes(), call::DEFAULT_SECS)?;
         Ok(())
     }
 
@@ -742,14 +801,14 @@ impl<'a> Fs<'a> {
     /// Even so this returns [`Error::OutcomeUnknown`] honestly on a timeout, because the DECISION to
     /// re-send belongs to the caller who knows the offset is fixed - not to a library that would be
     /// guessing.
-    pub fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {
+    pub fn write_at(&mut self, path: impl AsRef<[u8]>, offset: u64, data: &[u8]) -> Result<(), Error> {
         if data.len() > IO_CHUNK {
             return Err(Error::InvalidInput);
         }
         let mut tail = [0u8; 8 + IO_CHUNK];
         tail[..8].copy_from_slice(&offset.to_le_bytes());
         tail[8..8 + data.len()].copy_from_slice(data);
-        self.call(OP_WRITE_AT, path.as_bytes(), &tail[..8 + data.len()], call::DEFAULT_SECS)?;
+        self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + data.len()], call::DEFAULT_SECS)?;
         Ok(())
     }
 
@@ -759,13 +818,13 @@ impl<'a> Fs<'a> {
     /// fails with [`Error::NotFound`], because the source is already gone. On
     /// [`Error::OutcomeUnknown`] check with [`exists`](Fs::exists) rather than re-sending - this is precisely
     /// the case where a retry reports failure for work that succeeded.
-    pub fn rename(&mut self, path: &str, new_name: &str) -> Result<(), Error> {
-        self.call(OP_RENAME, path.as_bytes(), new_name.as_bytes(), call::DEFAULT_SECS)?;
+    pub fn rename(&mut self, path: impl AsRef<[u8]>, new_name: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.call(OP_RENAME, path.as_ref(), new_name.as_ref(), call::DEFAULT_SECS)?;
         Ok(())
     }
 
     /// Does this path exist? A convenience over [`stat`](Fs::stat), and read-only.
-    pub fn exists(&mut self, path: &str) -> Result<bool, Error> {
+    pub fn exists(&mut self, path: impl AsRef<[u8]>) -> Result<bool, Error> {
         match self.stat(path) {
             Ok(_) => Ok(true),
             Err(Error::NotFound) => Ok(false),

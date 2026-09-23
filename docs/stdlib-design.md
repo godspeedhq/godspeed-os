@@ -266,7 +266,7 @@ which would have leaked the opcodes straight back out and defeated the module's 
 were added as typed operations instead.
 
 **Measured result on `recorder`:** 680 lines to 627, and raw fs/IPC plumbing from 22 sites to 2. The
-two that remain are a protocol tag constant of its own and a comment. Its `fs_call` went from 55
+two that remain are a protocol tag constant of its own and a comment. Its filesystem call helper went from 55
 lines to 15 - but the line count is the least of it: **it used to return `bool`**, so a write that
 hit the deadline (and may therefore have landed) was indistinguishable from one that never left.
 Eleven lines of comment explained that difference and the signature discarded it. It returns
@@ -978,3 +978,81 @@ rather than re-running until green.
   regression-tested by the suite that pins 22 Test 14.
 - `osdev test fs-reuse`: 12 passed, 0 failed.
 - 13 of 13 gates green; `cargo test -p godspeed` 7/7. Still no `kernel/` or `sdk/` change.
+
+## 18. `copier`, the fifth dogfood, and a mistake made three times
+
+`services/copier` moves onto `gs::fs`. It is the best migration so far by the only measure that
+matters - what it found.
+
+| | before | after |
+|---|---|---|
+| lines | 937 | 870 |
+| wire-format sites | 47 | **1** (its own control protocol, which is correct) |
+| hand-copied fs opcodes | 11 | 0 |
+
+### The bug it closes
+
+```rust
+const FS_TAG: u8 = 0xC0;
+req[0] = FS_TAG;                                       // every request
+if b.first() != Some(&FS_TAG) { return Fs::Failed; }   // every reply
+```
+
+**A CONSTANT tag.** It distinguishes copier's traffic from an untagged sender and nothing else - one
+copier request is indistinguishable from the next, which is the entire purpose of a correlation tag.
+A late reply to a request that already timed out passes that check and is read as the answer to the
+following one. copier has explicit `Slow` (deadline-passed) handling, so the path is reachable rather
+than theoretical. `gs::fs` carries a wrapping counter owned by the handle, and the handle now lives
+for the life of the service.
+
+### What the migration drove into the library
+
+Two things, both pulled by a real caller rather than invented:
+
+- **`read_at`** - a POSITIONAL read. `read_into` reads a whole file; copier copies one chunk at a
+  time at an offset it chooses, so an interrupted copy can resume and a file larger than any buffer
+  can move at all. The primitive already existed inside `read_into` and simply was not reachable.
+- **Paths accept BYTES.** Every path parameter took `&str`, and copier stores paths as
+  `[u8; PATH_MAX]` - as it must, because `services/fs` accepts any byte above 0x1f except `/` and
+  0x7f. A `&str`-only API forces such a caller through `from_utf8(..).unwrap_or("")`, which turns an
+  unreadable name into a request for a DIFFERENT file, silently. I had already reasoned this out for
+  `DirEntry::name` - raw bytes, precisely so a hostile name stays reachable by `delete` - and then
+  took `&str` on every path anyway. `impl AsRef<[u8]>` accepts both, so the documented
+  `fs.read_into("/data/message.txt", ..)` still reads as it does on the published page.
+
+### The same mistake, three times
+
+`delete_all` waited `DEFAULT_SECS`, and its doc said:
+
+> **Blocks** up to `DEFAULT_SECS`, and longer for a large tree than any single-file call.
+
+**Which cannot happen.** A call does not block past its own deadline; it gives up. I wrote the right
+intuition and then failed to give it a number - the third instance in this branch of a client
+deadline shorter than the worst case it waits on, after the UDP socket and the TCP transaction.
+
+copier had already worked this out for its own hand-rolled version, with a comment worth quoting
+because it names the cost exactly: five seconds "was not nearly enough and said so in the worst
+possible way - by blaming the filesystem". Its `TREE_SECS` is 120, which is the number `SWEEP_SECS`
+already carried, arrived at independently.
+
+**Three times is a pattern, not bad luck.** The rule belongs where an author will meet it: a deadline
+is part of the OPERATION's contract, not a property of the caller, and every one of these was written
+by reaching for the nearest existing constant instead of asking what the service does.
+
+### What was deliberately NOT changed
+
+`fs_idempotent`'s re-send-on-`Slow`, and its reasoning about which operations may use it -
+*"re-sending must not be able to produce a different outcome than sending once"*, a stricter and
+better rule than "reads are safe". The library refuses to retry on its own because it cannot know
+whether a caller's operation is idempotent; that judgement is copier's and stays there, with its
+comment carried across verbatim rather than retyped.
+
+The three-way `Fs { Ok, Slow, Failed }` result also stays at the call sites, so ten of them did not
+churn - but `Failed` now NAMES the failure in the log. It used to collapse NotFound, NoFilesystem,
+PermissionDenied and a malformed reply into one word while `fs` had said which (26.7).
+
+### Verified
+
+`osdev test files` **245 passed, 0 failed**, including a real 45-file directory tree copied through
+the library (`copied /many -> /manycopy (1 dirs, 45 files)`). `file-cap` 15/0 and `fs-reuse` 12/0
+confirm the byte-path change disturbed nothing. 13 of 13 gates; host tests 7/7.

@@ -46,6 +46,7 @@
 //! queued: a queue is unbounded growth wearing a small word (§26.6), and the shell's job table
 //! refuses at its own edge for the same reason.
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 /// Control opcodes on this service's endpoint.
@@ -104,25 +105,8 @@ pub const WHY_WRITE: u8 = 4;
 /// theorised: it is what the first `jobs` suite run produced.
 pub const WHY_UNANSWERED: u8 = 5;
 
-/// `fs` opcodes. Wire format is [tag, op, path_len, path.., data..]; the reply is
-/// [tag, status, ..]. Duplicated here rather than shared: services do not depend on one another's
-/// headers, and this is the same handful `recorder` repeats for the same reason.
-const FS_OP_STAT_FILE: u8 = 12;
-const FS_OP_DELETE: u8 = 16;
-const FS_OP_DELETE_TREE: u8 = 19;
-const FS_OP_CHECK: u8 = 27;
-const FS_OP_SCRUB: u8 = 29;
-const FS_OP_MKDIR: u8 = 13;
-const FS_OP_WRITE_FILE: u8 = 10;
-const FS_OP_RENAME: u8 = 15;
-const FS_OP_WRITE_NEW: u8 = 24;
-const FS_OP_WRITE_AT: u8 = 25;
-const FS_OP_READ_AT: u8 = 26;
 const FS_OK: u8 = 0;
 
-/// Correlation tag for this service's own `fs` requests. Distinct from 0, which is both what an
-/// unthinking caller sends and the value of `FS_OK` - a collision that has hidden a bug before.
-const FS_TAG: u8 = 0xC0;
 
 /// One streaming chunk, matching the shell's `IO_CHUNK` (7 data-block payloads of 508 bytes).
 /// The same size the shell's own `copy` streams in, so this service moves a file in exactly the
@@ -139,22 +123,12 @@ const IDLE_MS: u64 = 500;
 
 /// Seconds to wait for one `fs` round trip. A chunk is small and `fs` answers promptly or has a
 /// real problem; this is the same budget `recorder` gives its writes.
-const FS_SECS: i64 = 5;
 
 /// How many times one chunk is re-sent when `fs` does not answer in time. Bounded (§26.6), so a
 /// filesystem that has genuinely stopped ends the job rather than wedging it - six tries at five
 /// seconds is half a minute of patience and then a loud, accurate failure.
 const CHUNK_TRIES: u32 = 6;
 
-/// A recursive delete is ONE `fs` request that takes as long as there is tree to remove, so it gets
-/// its own budget rather than the per-chunk one. The same number the shell gives its foreground
-/// `delete ... recursive`, for the same reason.
-///
-/// WHILE THIS CALL IS OUTSTANDING THIS SERVICE ANSWERS NOTHING - it is single-threaded and blocked
-/// in the request. That is visible to the shell as a job that is running and not replying, which is
-/// why the shell distinguishes "alive but silent" from "gone" rather than reporting the first as
-/// the second.
-const TREE_SECS: i64 = 120;
 
 /// THE TRANSCRIPT: a fixed ring holding what a job had to say, replayed by `foreground`.
 ///
@@ -281,64 +255,54 @@ enum Fs {
     Failed,
 }
 
-fn fs_call(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8], out: &mut [u8]) -> Fs {
-    fs_call_within(ctx, op, path, tail, out, FS_SECS)
+/// Map a library outcome onto this service's three-way result.
+///
+/// `OutcomeUnknown` is `Slow` and NOTHING ELSE is. That distinction - "the deadline passed and `fs`
+/// may still act on this" versus "it failed" - is the one this service must never blur, because
+/// `fs_idempotent` re-sends on the first and must not on the second.
+///
+/// Every other error is `Failed` AND IS NAMED IN THE LOG. The previous code collapsed NotFound,
+/// NoFilesystem, PermissionDenied and a malformed reply into one word; `fs` had said which, and the
+/// answer was thrown away (26.7).
+fn fsr(ctx: &ServiceContext, what: &str, r: Result<usize, gs::Error>) -> Fs {
+    match r {
+        Ok(n) => Fs::Ok(n),
+        Err(gs::Error::OutcomeUnknown) => Fs::Slow,
+        Err(e) => {
+            ctx.log_fmt(format_args!("copier: {} failed - {}", what, e.as_str()));
+            Fs::Failed
+        }
+    }
 }
 
-/// `fs_call` with the deadline named by the caller, because how long an answer may take is a
-/// property of the OPERATION and not of this service. A chunk write and a scrub of the whole volume
-/// are both one request and one reply; only one of them can be expected back in five seconds.
-fn fs_call_within(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8], out: &mut [u8], secs: i64) -> Fs {
-    let mut req = [0u8; 3 + PATH_MAX + 8 + IO_CHUNK];
-    let plen = path.len().min(PATH_MAX);
-    req[0] = FS_TAG;
-    req[1] = op;
-    req[2] = plen as u8;
-    req[3..3 + plen].copy_from_slice(&path[..plen]);
-    let off = 3 + plen;
-    if off + tail.len() > req.len() {
-        // Cannot be built, so it was never sent - a failure, not a slow answer.
-        return Fs::Failed;
-    }
-    req[off..off + tail.len()].copy_from_slice(tail);
-    let n = off + tail.len();
-    let msg = Message::from_bytes(&req[..n]);
+fn fs_delete(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8]) -> Fs {
+    fsr(ctx, "delete", fs.delete(path).map(|_| 0))
+}
 
-    // REACQUIRE `fs` IF THE SEND FAILS, because `fs` restarts and this service does not. §14.3 puts
-    // the obligation on the CLIENT: a cap to a dead endpoint is stale forever and no amount of
-    // retrying the same handle fixes it.
-    //
-    // Retry only on `Err` (the send failed), NEVER on `Ok(None)` (the deadline passed). Those are
-    // different facts: a slow `fs` is alive, and re-sending a write to it is how one copy becomes
-    // two. `request_with_reply_deadline` cannot express the difference - it returns `Option`, so a
-    // dead endpoint and an expired deadline are both `None` - which is why the `_call_err` variant
-    // exists and why `recorder` and `nic-driver` both use it.
-    let take = |r: Message, out: &mut [u8]| -> Fs {
-        let b = r.payload_bytes();
-        if b.first() != Some(&FS_TAG) || b.get(1) != Some(&FS_OK) {
-            return Fs::Failed;
-        }
-        let body = &b[2..];
-        let n = body.len().min(out.len());
-        out[..n].copy_from_slice(&body[..n]);
-        Fs::Ok(n)
-    };
-    match ctx.request_with_reply_call_err("fs", &msg, secs) {
-        Ok(Some(r)) => take(r, out),
-        // The deadline passed. Reported as `Slow` and NEVER retried here - only a caller that knows
-        // its operation is idempotent may re-send (see `fs_idempotent`).
-        Ok(None) => Fs::Slow,
-        Err(_) => {
-            // ONE retry, not a loop: an `fs` that is genuinely gone must surface as a failure
-            // rather than as a request that never returns.
-            let _ = ctx.reacquire_by_name("fs");
-            match ctx.request_with_reply_call_err("fs", &msg, secs) {
-                Ok(Some(r)) => take(r, out),
-                Ok(None) => Fs::Slow,
-                Err(_) => Fs::Failed,
-            }
-        }
-    }
+fn fs_mkdir(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8]) -> Fs {
+    fsr(ctx, "mkdir", fs.create_dir(path).map(|_| 0))
+}
+
+fn fs_write_file(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], data: &[u8]) -> Fs {
+    fsr(ctx, "write", fs.write(path, data).map(|_| 0))
+}
+
+fn fs_rename(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], newname: &[u8]) -> Fs {
+    fsr(ctx, "rename", fs.rename(path, newname).map(|_| 0))
+}
+
+fn fs_write_new(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], size: u64) -> Fs {
+    fsr(ctx, "allocate", fs.create_sized(path, size).map(|_| 0))
+}
+
+/// One positional read. Idempotent - see `fs_idempotent`.
+fn fs_read_at(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], off: u64, out: &mut [u8]) -> Fs {
+    fsr(ctx, "read", fs.read_at(path, off, out))
+}
+
+/// One positional write into an already-allocated extent. Idempotent - see `fs_idempotent`.
+fn fs_write_at(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], off: u64, data: &[u8]) -> Fs {
+    fsr(ctx, "write-at", fs.write_at(path, off, data).map(|_| 0))
 }
 
 /// An `fs` call that may be RE-SENT when the deadline passes, up to `CHUNK_TRIES`.
@@ -358,10 +322,10 @@ fn fs_call_within(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8], out: &
 /// left nothing - so a re-send can turn a success into a reported failure. A positional overwrite
 /// has no such dependence. `WRITE_NEW` and `DELETE` are NOT idempotent in this sense and do not
 /// come through here.
-fn fs_idempotent(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8], out: &mut [u8]) -> Fs {
+fn fs_idempotent(ctx: &ServiceContext, mut attempt: impl FnMut() -> Fs) -> Fs {
     let mut slow = 0u32;
     loop {
-        match fs_call(ctx, op, path, tail, out) {
+        match attempt() {
             Fs::Slow => {
                 slow += 1;
                 if slow >= CHUNK_TRIES {
@@ -377,20 +341,10 @@ fn fs_idempotent(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8], out: &m
 }
 
 /// Size of `path`, and whether it is a directory. `None` if it does not exist.
-fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
-    let mut out = [0u8; 16];
-    let n = match fs_call(ctx, FS_OP_STAT_FILE, path, &[], &mut out) {
-        Fs::Ok(n) => n,
-        _ => return None,
-    };
-    // [found:1][size:u64][is_dir:1] after the tag and status this helper already removed.
-    if n >= 10 && out[0] == 1 {
-        Some((
-            u64::from_le_bytes([out[1], out[2], out[3], out[4], out[5], out[6], out[7], out[8]]),
-            out[9] == 1,
-        ))
-    } else {
-        None
+fn fs_stat(fs: &mut gs::fs::Fs, path: &[u8]) -> Option<(u64, bool)> {
+    match fs.stat(path) {
+        Ok(st) => Some((st.size, st.is_dir)),
+        Err(_) => None,
     }
 }
 
@@ -401,14 +355,14 @@ fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
 /// what `write-new` guarantees. That is the one outcome worse than no file at all: `dir` shows the
 /// expected bytes, `read` returns something, and nothing anywhere says the tail is garbage. A
 /// cancelled or failed copy therefore removes what it made, and the shell reports that it did.
-fn discard_partial(ctx: &ServiceContext, job: &Job) {
+fn discard_partial(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &Job) {
     if job.dlen == 0 {
         return;
     }
     let mut sink = [0u8; 8];
     // NOT through `fs_idempotent`: a delete is exactly the operation whose re-send can report a
     // failure for work that succeeded (carnage §3.5).
-    let gone = matches!(fs_call(ctx, FS_OP_DELETE, &job.dst[..job.dlen], &[], &mut sink), Fs::Ok(_));
+    let gone = matches!(fs_delete(ctx, fs, &job.dst[..job.dlen]), Fs::Ok(_));
     if gone {
         ctx.log("copier: removed the partial destination (an unfinished copy is a full-size file with an undefined tail)");
     } else {
@@ -420,7 +374,7 @@ fn discard_partial(ctx: &ServiceContext, job: &Job) {
 }
 
 /// Copy one chunk. Returns when the job's state has been advanced.
-fn copy_chunk(ctx: &ServiceContext, job: &mut Job) {
+fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     if job.copied >= job.total {
         job.state = ST_DONE;
         job.ended_at = ctx.epoch_secs_monotonic() as u64;
@@ -428,31 +382,27 @@ fn copy_chunk(ctx: &ServiceContext, job: &mut Job) {
         return;
     }
     let mut chunk = [0u8; IO_CHUNK];
-    let mut tail = [0u8; 12];
-    tail[..8].copy_from_slice(&job.copied.to_le_bytes());
-    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
-
-    let mut rbuf = [0u8; 4 + IO_CHUNK];
-    let got = match fs_idempotent(ctx, FS_OP_READ_AT, &job.src[..job.slen], &tail, &mut rbuf) {
-        Fs::Ok(n) if n >= 4 => {
-            let want = u32::from_le_bytes([rbuf[0], rbuf[1], rbuf[2], rbuf[3]]) as usize;
-            let have = (n - 4).min(want).min(IO_CHUNK);
-            chunk[..have].copy_from_slice(&rbuf[4..4 + have]);
-            have
-        }
+    // The typed read returns the COUNT. The length-prefix decode that used to live here - a `want`
+    // from the first four bytes, a `have` clamped three ways, a copy out of a staging buffer - was
+    // the wire format leaking into this service, and it is the library's now.
+    let off = job.copied;
+    let (src, slen) = (job.src, job.slen);
+    let r = fs_idempotent(ctx, || fs_read_at(ctx, fs, &src[..slen], off, &mut chunk));
+    let got = match r {
+        Fs::Ok(n) => n,
         Fs::Slow => {
             job.state = ST_FAILED;
             job.why = WHY_UNANSWERED;
             job.ended_at = ctx.epoch_secs_monotonic() as u64;
             ctx.log("copier: `fs` did not answer a read within the retry budget");
-            discard_partial(ctx, job);
+            discard_partial(ctx, fs, job);
             return;
         }
         _ => {
             job.state = ST_FAILED;
             job.why = WHY_READ;
             job.ended_at = ctx.epoch_secs_monotonic() as u64;
-            discard_partial(ctx, job);
+            discard_partial(ctx, fs, job);
             return;
         }
     };
@@ -464,29 +414,27 @@ fn copy_chunk(ctx: &ServiceContext, job: &mut Job) {
         job.why = WHY_READ;
         job.ended_at = ctx.epoch_secs_monotonic() as u64;
         ctx.log("copier: the source ended early - it changed under the copy");
-        discard_partial(ctx, job);
+        discard_partial(ctx, fs, job);
         return;
     }
 
-    let mut wtail = [0u8; 8 + IO_CHUNK];
-    wtail[..8].copy_from_slice(&job.copied.to_le_bytes());
-    wtail[8..8 + got].copy_from_slice(&chunk[..got]);
-    let mut sink = [0u8; 8];
-    match fs_idempotent(ctx, FS_OP_WRITE_AT, &job.dst[..job.dlen], &wtail[..8 + got], &mut sink) {
+    let (dst, dlen) = (job.dst, job.dlen);
+    let w = fs_idempotent(ctx, || fs_write_at(ctx, fs, &dst[..dlen], off, &chunk[..got]));
+    match w {
         Fs::Ok(_) => {}
         Fs::Slow => {
             job.state = ST_FAILED;
             job.why = WHY_UNANSWERED;
             job.ended_at = ctx.epoch_secs_monotonic() as u64;
             ctx.log("copier: `fs` did not answer a write within the retry budget");
-            discard_partial(ctx, job);
+            discard_partial(ctx, fs, job);
             return;
         }
         Fs::Failed => {
             job.state = ST_FAILED;
             job.why = WHY_WRITE;
             job.ended_at = ctx.epoch_secs_monotonic() as u64;
-            discard_partial(ctx, job);
+            discard_partial(ctx, fs, job);
             return;
         }
     }
@@ -507,7 +455,7 @@ fn copy_chunk(ctx: &ServiceContext, job: &mut Job) {
 /// The mix is the shell's, deliberately: a whole-file write takes the journal path, while rename and
 /// delete move directory entries and free extents, which is where the interesting interrupted states
 /// live. Writing only files would exercise one transaction shape while claiming three.
-fn churn_step(ctx: &ServiceContext, job: &mut Job) {
+fn churn_step(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     const DIR: &[u8] = b"/churn";
     const SLOTS: u64 = 8;
     const SIZES: [usize; 4] = [64, 500, 1200, 3000];
@@ -546,7 +494,7 @@ fn churn_step(ctx: &ServiceContext, job: &mut Job) {
     pl += 4;
 
     let mut sink = [0u8; 8];
-    if matches!(fs_call(ctx, FS_OP_WRITE_FILE, &path[..pl], &buf[..n], &mut sink), Fs::Ok(_)) {
+    if matches!(fs_write_file(ctx, fs, &path[..pl], &buf[..n]), Fs::Ok(_)) {
         job.writes += 1;
     }
 
@@ -557,9 +505,9 @@ fn churn_step(ctx: &ServiceContext, job: &mut Job) {
         // OP_RENAME takes the NEW NAME, not a path: the slice starts after the final `/`, or every
         // rename is refused for containing a slash and the run silently becomes writes-only.
         let name_at = DIR.len() + 1;
-        if matches!(fs_call(ctx, FS_OP_RENAME, &path[..pl], &np[name_at..pl], &mut sink), Fs::Ok(_)) {
+        if matches!(fs_rename(ctx, fs, &path[..pl], &np[name_at..pl]), Fs::Ok(_)) {
             job.renames += 1;
-            if matches!(fs_call(ctx, FS_OP_DELETE, &np[..pl], &[], &mut sink), Fs::Ok(_)) {
+            if matches!(fs_delete(ctx, fs, &np[..pl]), Fs::Ok(_)) {
                 job.deletes += 1;
             }
         }
@@ -657,6 +605,12 @@ fn reply_status(ctx: &ServiceContext, job: &Job) {
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.trace_as("copier");
+    // ONE filesystem handle for the life of the service, because the correlation tag belongs to the
+    // CHANNEL and must differ between consecutive requests. The previous code used a CONSTANT tag,
+    // so a late reply to a request that had already timed out passed its own check and was read as
+    // the answer to the next one - and this service has explicit `Slow` handling, so that path is
+    // reachable rather than theoretical.
+    let mut gfs = gs::fs::Fs::new(&ctx);
     let mut job = Job::new();
     let wait = ctx.duration_cycles(IDLE_MS);
     ctx.log("copier: ready (idle - `background copy <src> <dst>` begins a copy)");
@@ -723,7 +677,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         job.out.clear();
                         job.out.write(b"churn: writing continuously - CUT THE POWER AT ANY POINT\n");
                         let mut sink = [0u8; 8];
-                        let _ = fs_call(&ctx, FS_OP_MKDIR, b"/churn", &[], &mut sink);
+                        let _ = fs_mkdir(&ctx, &mut gfs, b"/churn");
                         reply_op(&ctx, op_code, CP_OK);
                         continue;
                     }
@@ -739,36 +693,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             b"drives check - walking the volume\n" as &[u8]
                         });
                         reply_op(&ctx, op_code, CP_OK);
-                        let mut body = [0u8; 256];
-                        // A SCRUB READS THE WHOLE VOLUME, so it gets the tree budget rather than
+                        // A SCRUB READS THE WHOLE VOLUME, so it gets the sweep budget rather than
                         // the chunk one. Five seconds was not nearly enough and said so in the
-                        // worst possible way - by blaming the filesystem.
-                        let op = if kind == KIND_SCRUB { FS_OP_SCRUB } else { FS_OP_CHECK };
-                        let outcome = fs_call_within(&ctx, op, b"/", &[], &mut body, TREE_SECS);
+                        // worst possible way - by blaming the filesystem. `gs::fs::SWEEP_SECS` is
+                        // the library's name for the same number this service arrived at.
+                        //
+                        // The verdict is TYPED now. What used to live here - a shared prefix decoded
+                        // by hand, an inline closure reading u64s at computed offsets, a length
+                        // check deciding whether the accounting was present - was the wire format in
+                        // this service. What is left is the only part that was ever copier's: which
+                        // verdict to render.
+                        let verdict = if kind == KIND_SCRUB {
+                            gfs.scrub().map(|v| (v.files, v.dirs, v.bad, 0u64, 0u64))
+                        } else {
+                            gfs.check().map(|v| (v.files, v.dirs, v.bad, v.free, v.free_before))
+                        };
                         job.ended_at = ctx.epoch_secs_monotonic() as u64;
-                        match outcome {
-                            Fs::Ok(n) => {
-                                // Both verdicts begin [files:u32, dirs:u32, bad:u32, ..]; only the
-                                // tail differs, and `bad` is the number that decides the answer.
-                                if n >= 12 {
-                                    let files = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                                    let dirs = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-                                    let bad = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-                                    // A CHECK carries the accounting too; a SCRUB does not - it is
-                                    // read-only and repairs nothing, so there is nothing to report.
-                                    let rd = |o: usize| if n >= o + 8 {
-                                        u64::from_le_bytes([body[o], body[o+1], body[o+2], body[o+3],
-                                                            body[o+4], body[o+5], body[o+6], body[o+7]])
-                                    } else { 0 };
-                                    let (free, before) = if kind == KIND_CHECK && n >= 36 {
-                                        (rd(20), rd(28))
-                                    } else { (0, 0) };
-                                    let mut line = [0u8; 160];
-                                    let len = render_verdict(&mut line, files, dirs, bad, free, before);
-                                    job.out.write(&line[..len]);
-                                } else {
-                                    job.out.write(b"ok - nothing to report\n");
-                                }
+                        match fsr(&ctx, if kind == KIND_SCRUB { "scrub" } else { "check" },
+                                  verdict.map(|_| 0)) {
+                            Fs::Ok(_) => {
+                                // Unwrap is not reachable: `fsr` returned Ok only because this did.
+                                let (files, dirs, bad, free, before) =
+                                    verdict.unwrap_or((0, 0, 0, 0, 0));
+                                let mut line = [0u8; 160];
+                                let len = render_verdict(&mut line, files, dirs, bad, free, before);
+                                job.out.write(&line[..len]);
                                 job.state = ST_DONE;
                             }
                             Fs::Slow => {
@@ -801,26 +750,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Not through `fs_idempotent`: a re-sent tree delete finds nothing the
                         // second time and reports a failure for work that succeeded - carnage §3.5
                         // exactly.
-                        let outcome = {
-                            let mut req = [0u8; 3 + PATH_MAX];
-                            req[0] = FS_TAG;
-                            req[1] = FS_OP_DELETE_TREE;
-                            req[2] = job.slen as u8;
-                            req[3..3 + job.slen].copy_from_slice(&job.src[..job.slen]);
-                            let msg = Message::from_bytes(&req[..3 + job.slen]);
-                            match ctx.request_with_reply_call_err("fs", &msg, TREE_SECS) {
-                                Ok(Some(r)) => {
-                                    let b = r.payload_bytes();
-                                    if b.first() == Some(&FS_TAG) && b.get(1) == Some(&FS_OK) {
-                                        Fs::Ok(0)
-                                    } else {
-                                        Fs::Failed
-                                    }
-                                }
-                                Ok(None) => Fs::Slow,
-                                Err(_) => Fs::Failed,
-                            }
-                        };
+                        // `delete_all` carries the sweep budget itself, so the tree deadline this
+                        // service used to pass in is the library's now - and it is the same number.
+                        let outcome = fsr(&ctx, "delete-tree",
+                                          gfs.delete_all(&job.src[..job.slen]).map(|_| 0));
                         let _ = &mut sink;
                         job.ended_at = ctx.epoch_secs_monotonic() as u64;
                         match outcome {
@@ -846,7 +779,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // waiting on this reply to print a job id and give the prompt back, and the
                     // whole point of the feature is that it does not wait for the transfer. Both
                     // calls here are one round trip each.
-                    let (size, is_dir) = match fs_stat(&ctx, &fresh.src[..slen]) {
+                    let (size, is_dir) = match fs_stat(&mut gfs, &fresh.src[..slen]) {
                         Some(v) => v,
                         None => {
                             fresh.state = ST_FAILED;
@@ -871,7 +804,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let mut sink = [0u8; 8];
                     // NOT idempotent: a second `WRITE_NEW` for the same path fails because the
                     // first one succeeded, so it does not go through `fs_idempotent`.
-                    if !matches!(fs_call(&ctx, FS_OP_WRITE_NEW, &fresh.dst[..dlen], &size.to_le_bytes(), &mut sink), Fs::Ok(_)) {
+                    if !matches!(fs_write_new(&ctx, &mut gfs, &fresh.dst[..dlen], size), Fs::Ok(_)) {
                         fresh.state = ST_FAILED;
                         fresh.why = WHY_NO_DEST;
                         job = fresh;
@@ -897,7 +830,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         job.state = ST_CANCELLED;
                         job.ended_at = ctx.epoch_secs_monotonic() as u64;
                         if job.kind == KIND_COPY {
-                            discard_partial(&ctx, &job);
+                            discard_partial(&ctx, &mut gfs, &job);
                         }
                         ctx.log("copier: cancelled");
                     }
@@ -928,8 +861,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         if job.state == ST_RUNNING {
             match job.kind {
-                KIND_COPY => copy_chunk(&ctx, &mut job),
-                KIND_CHURN => churn_step(&ctx, &mut job),
+                KIND_COPY => copy_chunk(&ctx, &mut gfs, &mut job),
+                KIND_CHURN => churn_step(&ctx, &mut gfs, &mut job),
                 _ => {}
             }
         }
