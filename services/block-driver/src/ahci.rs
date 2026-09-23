@@ -500,8 +500,11 @@ impl<'a> Ahci<'a> {
         // This issued a full FLUSH CACHE EXT after every 512-byte sector. A journal transaction is
         // several writes - staged blocks, the commit record, the checkpoint, both superblock copies -
         // so one `write /sc/a.txt hello` paid a stack of full device flushes. Measured on x86: writes
-        // 40-57 s against reads at 8.8 s, and reads issue no flush. The Pi never showed it because its
-        // USB stick refuses SYNCHRONIZE CACHE outright (§6.1) - there was no per-write flush to be slow.
+        // 40-57 s against reads at 8.8 s, and reads issue no flush. The Pi never showed it because
+        // the USB backend issues no PER-WRITE flush - there was nothing there to be slow. (This line
+        // used to attribute that to the stick refusing SYNCHRONIZE CACHE outright; it does not refuse
+        // it - §6.1, amendment 2026-09-23. The reason the Pi was quiet is the per-write flush this
+        // driver used to do and the USB path never did.)
         //
         // The flushes that MATTER are still issued, explicitly, by the layer that knows where the
         // ordering points are: `fs` flushes at BARRIER 1 (staged blocks durable before the commit
@@ -592,7 +595,10 @@ impl<'a> Ahci<'a> {
     #[cfg(feature = "volatile-cache-test")]
     fn cache_commit(&self, ctx: &ServiceContext) {
         // THE DRIVE THAT ACCEPTS THE BARRIER AND DOES NOTHING - `CLAUDE.md` §6.1's unguaranteed
-        // case, and the Pi 2's USB stick exactly (it refuses `SYNCHRONIZE CACHE` outright).
+        // case. No device in this project is known to behave this way; the Pi 2's stick was named
+        // here and does NOT (§6.1, amendment 2026-09-23 - it accepts the flush, and an unassisted
+        // cut on that board replayed the journal). Which is exactly why this feature exists: the
+        // case is real, nothing we own exhibits it, so it is MODELLED rather than waited for.
         //
         // This is what the journal's `data_crc` was built for. With an HONEST cache the check can
         // never fire: staged blocks and the commit record that authorises them land together at the

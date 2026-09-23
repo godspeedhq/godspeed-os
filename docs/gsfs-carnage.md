@@ -95,8 +95,12 @@ durable" three different words:
   metadata that is what the journal is for. For file data it is the permitted outcome above, and it
   is the honest cost of a power cut.
 - **Acknowledged is not durable.** A write the driver acknowledged has reached the device, not
-  necessarily the medium. `CLAUDE.md` 6.1 already records that this guarantee is backend-conditional
-  and that one shipping backend (the Pi 2's USB stick) refuses `SYNCHRONIZE CACHE` outright.
+  necessarily the medium. `CLAUDE.md` 6.1 records that this guarantee is backend-conditional: a
+  device that refuses or LIES about a flush cannot enforce the journal's ordering. **No shipping
+  backend here is known to be one.** 6.1 named the Pi 2's USB stick until 2026-09-23, when it
+  accepted the flush across seven sessions and recovered an unassisted power cut in the strong form
+  (6.1, amendment 2026-09-23). The rule is kept and the example is withdrawn, which is why
+  `fs-lyingflush` exists - the case is real and nothing we own exhibits it, so it is MODELLED.
 
 ## 3. The gates
 
@@ -329,7 +333,7 @@ Two drives are modelled, and the difference between them is the whole point:
 | suite | the drive | what must hold |
 |---|---|---|
 | `fs-cache` | honours the barrier: a write is acknowledged into guest RAM and reaches the medium at `OP_FLUSH` | the full guarantee - mounts, `0 bad`, no dangerous bitmap drift, barriered data intact |
-| `fs-lyingflush` | **accepts the barrier and commits nothing** - the Pi 2's USB stick exactly, which refuses `SYNCHRONIZE CACHE` | only what §6.1 still promises: damage is DETECTED and named, never silently believed, and no live block is marked free |
+| `fs-lyingflush` | **accepts the barrier and commits nothing** - the case §6.1 warns about, which NO device here is known to exhibit (the Pi 2's stick was named and does not: §6.1, amendment 2026-09-23). Modelled precisely because it is real and we cannot reach it with hardware we own | only what §6.1 still promises: damage is DETECTED and named, never silently believed, and no live block is marked free |
 
 The cache is guest RAM, so cutting the machine loses precisely what a real cache would lose with no
 host-side cooperation. Reads are served from it, because a real drive cache does - without that,

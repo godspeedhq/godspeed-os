@@ -14,7 +14,11 @@ this board as the case that cannot be honoured:
 > costs more time per write than the driver's command budget can give it. With no barrier available,
 > a power cut can lose the tail of a write sequence.
 
-`services/dwc2/src/msc.rs` repeats it at the opcode: *"This board's stick REFUSES it outright"*.
+`services/dwc2/src/msc.rs` repeated it at the opcode - *"This board's stick REFUSES it outright"* -
+and went further, calling the constitution's backend-conditional guarantee something that existed
+"precisely because of this device". Corrected 2026-09-23. The CODE was right throughout: it issues
+the CDB and reports what the device answers, which is correct whichever way the device goes. Only
+the belief around it was wrong, which is the easiest kind of error to leave in place for months.
 
 ## What the machine did
 

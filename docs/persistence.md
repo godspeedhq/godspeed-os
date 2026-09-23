@@ -547,11 +547,18 @@ means a committed-but-unfinished transaction → replay its blocks to their home
 nothing. So a crash *before* the commit record is discarded (home untouched); a crash *after*
 it is completed. There is no third outcome **on a backend that attests durability** (see the note below).
 
-**Backends that cannot be ordered (2026-07-25).** What follows is true of `ahci` and SD/EMMC, and is
-BACKEND-specific rather than architectural. The ARM USB mass-storage backend issues no per-write flush
-and the device refuses `SYNCHRONIZE CACHE`, so the journal-data -> commit -> checkpoint ordering is NOT
-enforced there; `commit_txn` now asks explicitly (three barriers) and `fs` warns once per mount when the
-answer is no. `CLAUDE.md` §6.1 (amendment 2026-07-25) carries the constitutional form.
+**Backends that cannot be ordered (2026-07-25, corrected 2026-09-23).** The rule is BACKEND-specific
+rather than architectural: a device that refuses or lies about a flush cannot enforce the journal-data
+-> commit -> checkpoint ordering, so `commit_txn` asks explicitly (three barriers) and `fs` warns once
+per mount when the answer is no.
+
+**The ARM USB backend was named here as the example, and it is not one.** That claim was never tested
+when it was written; when it finally was, the device accepted `SYNCHRONIZE CACHE` across seven sessions
+and an unassisted power cut on the Pi 2 landed inside the commit window and REPLAYED - `journal
+recovered 4 block(s)`, nothing torn, nothing repaired. So no board in this project is currently known
+to be an unorderable backend. The rule stands and is worth keeping; the example is withdrawn.
+`CLAUDE.md` §6.1 (amendments 2026-07-25 and 2026-09-23) carries the constitutional form, and
+`fs-lyingflush` models an unorderable device in QEMU so the case stays tested without one.
 
 **Why ordered durability is free.** `block-driver` flushes every sector write to the medium
 before replying (`FLUSH EXT`), and `fs` serializes requests, so the journal-data → commit →

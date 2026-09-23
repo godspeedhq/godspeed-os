@@ -6,16 +6,28 @@ one that matters.** Dell Wyse 5070 (2026-09-18), then VisionFive 2, Raspberry Pi
 the checklist for the five, written while the QEMU work was fresh so that the reasons behind each
 step are recorded rather than reconstructed later.
 
-**What the last board is for, corrected after two runs.** It is not a fifth confirmation.
-`CLAUDE.md` 6.1 records `fs` on the Pi 2 as restartable but NOT crash-recoverable, because its USB
-stick refuses `SYNCHRONIZE CACHE` - and `backlog/42` records that the same stick has now attested
-durability across six sessions and three USB stacks. A constitutional claim and a machine disagree.
+**The last board ANSWERED, on the third cut (2026-09-23).** `CLAUDE.md` 6.1 recorded `fs` on the
+Pi 2 as restartable but NOT crash-recoverable, because its USB stick was said to refuse
+`SYNCHRONIZE CACHE`. Seven sessions across three USB stacks showed the device accepting the flush,
+and then an unassisted cut 17 s into `churn 30` - plain image, no crash-window, `CUT THE POWER AT
+ANY POINT` - landed inside the commit window:
 
-This document previously said a PROBABILISTIC cut would settle it. **It will not, on this board.**
-The commit-to-checkpoint window lasts under a millisecond against a ~52 ms transaction on a USB
-stick, so an unaimed cut reaches it with probability under 2%; two were run and both missed, which
-is what those odds predict. The T630's first-attempt hit was luck on hardware where the whole
-transaction is short enough for a sub-millisecond window to be a real fraction of it.
+```
+fs: journal recovered 4 block(s) from an interrupted write
+churn verify: 7 file(s) checked, 0 empty, NONE torn
+check: 13 files, 2 dirs, 0 bad; the free count already agreed with the tree - nothing was repaired
+```
+
+A replay of 4 blocks means the commit record was durable BEFORE any home block moved: the ordering
+held on a device 6.1 said could not be ordered. **6.1 is amended (2026-09-23)** - the guarantee stays
+backend-conditional, the Pi 2 stops being the worked example, and no board here is now known to be an
+unorderable backend.
+
+**It took three cuts, and that is arithmetic rather than luck running out.** The
+commit-to-checkpoint window lasts under a millisecond against a ~52 ms transaction on a USB stick, so
+an unaimed cut reaches it with probability under 2%. Two misses then a hit is an ordinary sequence at
+those odds. The T630's first-attempt hit was the lucky one, on hardware where the whole transaction
+is short enough for a sub-millisecond window to be a real fraction of it.
 
 What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: home blocks reaching
 the medium before the commit record, which leaves torn metadata with no record to replay from. That
@@ -86,10 +98,14 @@ The permitted-outcome table allows an interrupted `delete` to leave blocks marke
 which `drives check` would have silently reclaimed, and that would still have counted as a pass.
 It did not happen.
 
-**Scope, unchanged:** one board, and a backend that ATTESTS durability. This is a SATA SSD behind
-AHCI, which honours the flush at the journal barriers. `CLAUDE.md` §6.1's backend-conditional
-caveat stands untouched - the Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, so none of
-this transfers to it.
+**Scope, as written then:** one board, and a backend that ATTESTS durability. This is a SATA SSD
+behind AHCI, which honours the flush at the journal barriers. `CLAUDE.md` §6.1's backend-conditional
+caveat stands untouched as a RULE.
+
+**The scope turned out to be wider than this paragraph assumed.** It went on to say none of this
+transfers to the Pi 2 because that stick refuses `SYNCHRONIZE CACHE`. It does not refuse it, and on
+2026-09-23 the Pi 2 recovered an unassisted power cut in the strong form (§6.1, amendment
+2026-09-23). Every one of the five boards has now done so, across three storage backends.
 
 `docs/gsfs-next.md` says a hardware pass "confirms at the end", and for most of this branch that is
 exactly right. **Two items on this list are different: they cannot be answered in QEMU at all**, and
@@ -192,9 +208,16 @@ and one transport.
 
 ### 2.4 ONLY-ON-HARDWARE: durability where the device will not be ordered
 
-The Pi 2's stick **refuses `SYNCHRONIZE CACHE` outright** (`CLAUDE.md` 6.1). On that board the
-crash-recovery guarantee is narrower than everywhere else, and `fs` is supposed to say so once per
-mount rather than imply a guarantee it cannot deliver.
+**This step was written for a device we turned out not to have.** It said the Pi 2's stick refuses
+`SYNCHRONIZE CACHE` outright and that the guarantee is therefore narrower on that board. It does not
+refuse it (`CLAUDE.md` 6.1, amendment 2026-09-23), and that board has since recovered an unassisted
+power cut in the strong form.
+
+The step is kept because the QUESTION is still the right one to ask of any new backend: a device that
+refuses or lies about a flush cannot enforce the journal's ordering, and `fs` must say so once per
+mount rather than imply a guarantee it cannot deliver. What changes is the expected answer - **the
+warning should be ABSENT on every board we own**, and its appearance is now a finding rather than a
+confirmation.
 
 ```
 drives                      # look for the durability warning in the boot log

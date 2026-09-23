@@ -485,6 +485,57 @@ os/
 > Recorded rather than closed, per §26.7: the fix is a block path that can wait out a busy device
 > without holding the core, which is real work and not a constant.
 
+> **Amendment 2026-09-23 (hardware): the amendment above is RIGHT about the rule and WRONG about its
+> only example. The Pi 2 is not a backend that cannot be ordered - it was never tested, and when it
+> finally was, it recovered.** The 2026-07-25 amendment names the Raspberry Pi 2's USB stick as the
+> worked case of a device that "refuses `SYNCHRONIZE CACHE` outright", and concludes that on that
+> board a power loss may require a reformat. Both halves are contradicted by the machine.
+>
+> **The refusal.** Seven sessions across three USB stacks - `dwc2` on the Pi 2, `xhci` on the Pi 4,
+> `xhci` on the VisionFive 2, one physical stick - and `fs` has printed no durability warning on any
+> of them. That warning fires at both journal barriers whenever the flush comes back false, so on
+> every run where writes committed it ran and stayed silent: the device answered `SYNCHRONIZE
+> CACHE(10)` and accepted it. **The only local evidence for the refusal was an instrument that could
+> not tell a refusing device from a dead driver** - it fired twice in `build/pi2a.log` immediately
+> after `block-driver died, restarting`, blaming the stick for a flush nobody was there to answer.
+> That is fixed (`Durable` / `Refused` / `NoAnswer`), and three of the seven sessions ran with the
+> corrected instrument.
+>
+> **The consequence.** On 2026-09-23 a power cut 17 s into `churn 30`, on a PLAIN image with no
+> crash-window, at a moment nobody chose, landed inside the commit-to-checkpoint window:
+>
+> ```
+> fs: journal recovered 4 block(s) from an interrupted write
+> churn verify: 7 file(s) checked, 0 empty, NONE torn
+> check: 13 files, 2 dirs, 0 bad; the free count already agreed with the tree - nothing was repaired
+> ```
+>
+> A replay of 4 blocks means the commit record was durable BEFORE any home block moved. That
+> ordering is the whole of the guarantee, and this device enforced it. Third attempt, at the ~2%
+> per-cut odds the window's sub-millisecond life implies - ordinary luck, not a fluke reading.
+>
+> **What does NOT change, and is the reason this is an amendment rather than a retraction.** The
+> guarantee stays **backend-conditional**. That reasoning is sound and untouched: a redo journal is
+> pure ordering, ordering can only be enforced by a device that attests durability, and a device that
+> refuses or LIES about a flush cannot carry the guarantee. `fs-lyingflush` models exactly that case
+> in QEMU and it stays. The honest form of the Phase D claim - `fs` is restartable everywhere, and
+> crash-recoverable on a backend that can be ordered - is correct as written.
+>
+> **What changes is that the claim is about a CLASS of device, not about this board.** The Pi 2 was
+> the one named instance and it does not belong in it; the sentence naming it stands above as ratified
+> history, and this amendment is the canonical state (§1). No board in this project is currently known
+> to refuse the barrier. If one is found, it belongs here with the evidence that put it here - which
+> is the standard the Pi 2 was held to only after the fact, and the point of recording this at all.
+>
+> **The FUA half is untouched and still true**: the stick does honour FUA, and FUA costs more per
+> write than the driver's command budget can give it. That was never the load-bearing claim - the
+> flush is - but it is not contradicted by anything here.
+>
+> Five boards, four ISAs, three storage backends, **power cut 5 of 5 recovered in the strong form**,
+> two of them unassisted. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
+> investigation, including the two earlier Pi 2 cuts that missed the window and what they did and did
+> not measure.
+
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
 > and deriving copies). It owns no kernel-critical state, so its
