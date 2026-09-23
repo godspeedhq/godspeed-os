@@ -96,6 +96,7 @@ fails.
 | [`chaos`](utilities/chaos.md) | kill things deliberately, and see what survives |
 | [`reboot`](utilities/reboot.md) | restart the machine |
 | [`poweroff`](utilities/poweroff.md) | **not provided** - and the page says why |
+| [`background`](utilities/background.md) | run long work as a job, so the prompt stays usable |
 
 ### Networking
 
