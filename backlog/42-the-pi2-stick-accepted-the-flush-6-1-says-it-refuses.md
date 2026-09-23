@@ -1,7 +1,8 @@
 # 42. The Pi 2's stick ACCEPTED a cache flush, and `CLAUDE.md` §6.1 says it refuses
 
-**Status: OPEN - a constitutional claim and a machine disagree, and the machine has only been asked
-once.** Measured 2026-09-22 on the Raspberry Pi 2. Recorded rather than acted on, because §6.1 is a
+**Status: OPEN - and the machine has now answered BOTH halves of the question. 6.1's Pi 2 example is
+contradicted on the evidence; the amendment is drafted below and awaits the operator, because a
+constitutional guarantee is not mine to edit.** Measured 2026-09-22 on the Raspberry Pi 2. Recorded rather than acted on, because §6.1 is a
 guarantee in the constitution and one hardware run is not enough to move one (§26.7).
 
 ## What §6.1 says
@@ -147,6 +148,51 @@ window rather than outside it.
 
 So the run is not evidence either way about ordering. It is the run that found the reason no run of
 its kind could have been.
+
+## THE THIRD UNASSISTED CUT HIT THE WINDOW, AND THE JOURNAL REPLAYED
+
+2026-09-23, Raspberry Pi 2, plain image, power pulled 17 s into `churn 30` at a moment nobody chose.
+
+```
+01:53:48  churn: 17s elapsed, 272 writes           <- the cut
+01:54:09  GodspeedOS arm32: _start reached SVC     <- the boot AFTER it
+01:54:12  fs: journal recovered 4 block(s) from an interrupted write
+01:54:12  fs: mounted GSFS0008 (... 31259040 free)
+01:55:14  churn verify: 7 file(s) checked, 0 empty, NONE torn
+01:55:52  check: 13 files, 2 dirs, 0 bad; 31259040 free (rebuilt from the tree)
+01:55:52  check: the free count already agreed with the tree - nothing was repaired
+```
+
+Verified rather than assumed: zero crash-window lines in the log, the banner reads `CUT THE POWER AT
+ANY POINT` rather than `NOW`, and the recovery line falls after the post-cut boot banner, not before
+it. Three attempts at under 2% each is ordinary luck.
+
+**This answers the half the earlier runs could not.** The commit record was durable BEFORE any home
+block moved - that is what a replay of 4 blocks means - so the ordering the journal rests on was
+enforced on this device. Two clean cuts measured durability; this one measured ORDERING, which is
+what 6.1 is actually about.
+
+## The case for amending 6.1
+
+Both halves of the Pi 2 sentence are now contradicted by the machine:
+
+| 6.1 says | the machine says |
+|---|---|
+| "its USB stick refuses `SYNCHRONIZE CACHE` outright" | seven sessions, no refusal - three with the instrument that distinguishes a refusing device from an absent driver |
+| "with no barrier available, a power cut can lose the tail of a write sequence" | an unassisted cut inside the commit window replayed and recovered in the strong form, nothing repaired |
+
+**What should NOT change.** The guarantee stays backend-conditional. That reasoning is sound, it is
+the honest shape of the claim, and `fs-lyingflush` models the unattested case in QEMU. A device that
+cannot be ordered genuinely cannot carry the guarantee.
+
+**What should change.** The Pi 2 stops being the worked example, because it is not one. The claim
+becomes about a CLASS of device - one that refuses or lies about a flush - rather than about this
+board and this stick, and the amendment records that the named example was tested on hardware and
+did not hold. That is exactly what this entry's own "What would settle it" called for, point 2,
+written before the evidence existed.
+
+The draft is not applied. `CLAUDE.md` is the constitution and 21 requires a recorded rationale for
+editing it; the operator sets that, not me. What is recorded here is that the evidence is in.
 
 ## CORRECTION: an unassisted cut CANNOT settle this on the Pi 2, and the arithmetic was available
 
