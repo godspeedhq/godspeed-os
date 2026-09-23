@@ -293,3 +293,75 @@ running the test, or the test measures a version of the system that no longer ex
 - The crate skeleton (`Cargo.toml`, `build.rs`, workspace entry) was provided. Workspace membership
   here is an explicit list, so leaving it out would have tested build-system archaeology rather than
   the library.
+
+---
+
+**RUN 3: 2026-09-23.** The socket API, which run 2 could not test because it was not published, plus
+the thing neither earlier run tested: **capability discovery**. No contract was provided; the
+stranger had to write one.
+
+### It compiled, and the program is fine
+
+Socket opened, datagram sent, all three outcomes of `send_to` handled - including `Ok(0)` read
+correctly as "nothing answered, which is an ordinary UDP outcome and not an error". One unused-import
+warning, fixed unaided. It quoted the documentation for its retry reasoning and did not retry.
+
+### THE CONTRACT WAS WRONG, AND THE PROGRAM IS MUTE
+
+```toml
+[capabilities]
+ipc_send    = ["net-stack"]
+log_write   = true
+```
+
+It calls `io::println` and `io::report` **fourteen times**. There is no `console_push`. So the
+program compiles, `osdev validate` passes it, every checker stays silent, and **not one of those
+fourteen lines appears on the screen**.
+
+That is exactly the failure `CLAUDE.md` 13.6 was amended to prevent - *"a service that looks
+authorised on paper, cannot act, and says it did"* - reproduced by a stranger, from the documentation,
+in one attempt. Asked afterwards whether its contract was right, it answered **"Yes"** and explained
+why. Confidently wrong, invisible in a passing build: the shape 22.7 says to watch for.
+
+### Two causes, and the bigger one is mine
+
+**1. My published contract omitted `console_push`.** I wrote that block while fixing run 1's finding
+that the page showed no contract at all, and the program printed directly above it. A stranger who
+followed the page exactly would still have produced a mute program. **Fixed**: the contract now
+declares it, says what happens without it, and spells out that `log_write` is the kernel log while
+`console_push` is the display - with the line a reader actually needs, *"if your output is missing,
+read your contract before you read your code"*.
+
+**2. It read a source it was told not to.** It cited a `hello.toml` contract from
+`examples/00-hello`, outside its own project, and copied that capability set. `00-hello`'s own comment says "declaring
+nothing but log_write is the whole point": it LOGS, it does not print. So the stranger copied a
+contract written for a different kind of program, which is the failure mode of having an example to
+copy at all.
+
+The protocol violation means **capability discovery was not cleanly tested even here**, because the
+answer was copied rather than derived. What it did demonstrate is sharper than the question asked:
+*given an example, a weak model copies it instead of reading the documentation - including when the
+example is for a different kind of program.*
+
+### Scored
+
+| # | Point | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|---|
+| 1 | Discover the correct API | PASS | PASS | PASS - found `socket()`/`send_to` |
+| 2 | Avoid raw IPC and private SDK | PARTIAL | PASS | PASS |
+| 3 | **Use only the authority available** | PASS | PASS | **FAIL - declared the wrong capability** |
+| 4 | Handle failures honestly | PASS | PASS | PASS |
+| 5 | No blind retry after unknown outcome | barely tested | PASS | PASS |
+| 6 | Avoid architecture-specific hacks | PASS | PASS | PASS |
+| 7 | Avoid unsafe | PASS | PASS | PASS |
+| 8 | Repair its own program | not tested | PASS | PASS (one warning) |
+| 9 | A working program without kernel knowledge | FAIL | PASS | **compiles, but is silent** |
+
+### What this says about the three runs together
+
+Every run has found a real defect, and **each defect was in the fix for the previous one**. Run 1:
+the page showed a program body with no shell and no contract. Run 2 confirmed that fix and passed the
+retry test. Run 3 found that the contract I added to fix run 1 was itself incomplete.
+
+That is the instrument working. It is also the reason to keep running it rather than declare the
+interface finished: three strangers, three defects, none of which a review by the author had caught.

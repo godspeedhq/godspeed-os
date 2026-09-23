@@ -61,10 +61,19 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-ipc_send    = ["fs"]     # talk to the filesystem. Drop this and `read_into` returns Unreachable
-ipc_receive = ["hello"]  # your own endpoint, named after you
-log_write   = true
+ipc_send     = ["fs"]     # talk to the filesystem. Drop this and `read_into` returns Unreachable
+ipc_receive  = ["hello"]  # your own endpoint, named after you
+console_push = true       # PUT TEXT ON THE SCREEN. Drop this and `io::println` runs and nothing
+                          # appears - no error, no warning, just a silent program
+log_write    = true       # write the kernel log ring and serial (`ctx.log`), which is NOT the screen
 ```
+
+Those last two are different capabilities and it is worth knowing which is which the first time
+rather than the second: `log_write` is the kernel log, `console_push` is the display. A program that
+declares only `log_write` and calls `io::println` compiles, passes `osdev validate`, passes every
+checker, and prints nothing at all.
+
+**If your output is missing, read your contract before you read your code.**
 
 Ask for what you use and nothing more: the contract is the reviewable statement of what your program
 may do (CLAUDE.md 26.9).
