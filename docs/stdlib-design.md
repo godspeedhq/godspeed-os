@@ -1317,3 +1317,96 @@ was then under the work it waits on. Three runs gave 5/0, 5/0, 3/2; at 300 secon
 
 Both are the same shape as the four deadline bugs in §19, one layer up: **a bound chosen against a
 smaller version of the work is not a bound on the work.**
+
+---
+
+## 23. What this branch is validated on, and what it is not
+
+Recorded here rather than left to be inferred, because the answer is not uniform across the tree and
+the uneven part is the part that matters (§26.7: a limitation that cannot be closed today is written
+down at the place a reader would otherwise rely on the claim).
+
+### The strongest fact is the smallest diff
+
+```
+git diff main...HEAD -- kernel/ sdk/     ->  empty
+```
+
+No kernel source change and no SDK change. So nothing on this branch can have altered kernel
+behaviour, and every property main held, it still holds. That is not a claim resting on a test run;
+it is a claim resting on there being nothing to test. It takes the whole §22 surface off the risk
+list by construction.
+
+What the branch DID change that runs on every port:
+
+```
+services/shell/src/main.rs      2490 lines
+services/recorder/src/main.rs    132
+services/net-stack/src/main.rs    48     (the badged header byte and client patience)
+services/fs, services/copier     the rest
+```
+
+9,813 insertions and 2,482 deletions across 72 files in total.
+
+### Validated on hardware: x86_64 only
+
+HP T630, on the image built from this branch:
+
+- `selfcheck` 516/0, all nine parts, one tally, zero skips, zero detail-cap lines
+- `net` lease, gateway and ping; `tcp` real SYN/RST with on-link ARP
+- **`serve` 3/3 accepted with byte-exact echo from a peer on the LAN** - an inbound connection
+  through a minted connection capability. This is the one path QEMU structurally cannot produce,
+  because SLIRP's only peer IS the gateway, so it had never run before this branch.
+
+### Validated by build and gate: all four ISAs
+
+The other three ports had never been COMPILED on this branch, which made the stack-fit gate's green
+misleading: it checks every target that has been BUILT and silently covers no others, so it was
+reporting on x86 alone. All four are built now and it is no longer blind:
+
+```
+stack fit: deepest single frames (limit 256 KiB)
+      81920 bytes (31.2%)  console: service_main
+      61440 bytes (23.4%)  shell: cmd_edit
+      57344 bytes (21.9%)  fs: service_main
+      49152 bytes (18.8%)  net-stack: service_main
+stack-fit: every frame fits the 262144-byte user stack:
+  aarch64-unknown-none (28 services), armv7a-none-eabi (27),
+  riscv64imac-unknown-none-elf (28), x86_64-unknown-none (30)
+```
+
+Zero hard errors on any port. The warning counts (372 / 385 / 393) are pre-existing categories, and
+the ones naming SDK functions are main's by definition since `sdk/` is zero-diff.
+
+19 of 19 checker scripts pass with all four targets present: `arch_boundary_check`, `arch_seam_check`,
+`backlog_check`, `commandments`, `contract_check`, `dash_check`, `doc_refs`, `doc_symbols_check`,
+`embed_order_check`, `facts_check`, `foreign_word_check`, `line_ending_check`, `line_ref_check`,
+`port_scope_check`, `scaffold_check`, `service_embed_check`, `shared_surface_check`, `site_check`,
+`unsafe_check`.
+
+### What is NOT validated, stated plainly
+
+**No non-x86 machine has booted this branch.** A build and a stack-fit are a real bound but they are
+a static one, and two risks on this branch are dynamic:
+
+1. **The shell changed 2,490 lines** and is the crate with the least headroom in the tree. Stack-fit
+   now covers it on every ISA, which is the cheap half of that question; the expensive half is that a
+   frame the checker cannot see (a prologue form it does not match, recursion it cannot count) only
+   shows up when the machine runs it.
+2. **`net-stack`'s wire format changed.** The badged path strips two header bytes instead of one and
+   `Displaced::note` reads patience from `pl.get(1)`. That is protocol, and it sits in front of four
+   different controllers (e1000/RTL8168, smsc95xx, GENET, dwmac). x86 exercised one of them.
+
+An ARM boot running `selfcheck` and `net` is what would close both, because ARM is where both live.
+The Wyse adds a second x86 machine with different firmware and the 4K console path, which is worth
+having and touches neither.
+
+### Open items that are not about this branch
+
+- `backlog/48` and `backlog/49` - the userspace-reachable kernel panic class. A genuine violation of
+  an absolute bar (§22: the kernel must never panic on user-controllable input), and the kernel is
+  zero-diff here, so this branch neither causes it nor worsens it.
+- `backlog/50` - `nic-driver` read 100% on the T630. One sighting, one machine, not root-caused;
+  `services/nic-driver/` is byte-identical to main.
+- `backlog/51` - the display-only console status region. Designed, deliberately not built: it changes
+  the terminal every port renders through.
