@@ -4604,8 +4604,27 @@ pub fn run_counter(image_path: &Path, persist_path: &str, smp: u32) {
 
     // Let counter persist at least one increment. The first "counter: count=N saved" line AFTER the
     // format is the first SUCCESSFUL save (N >= 1) - pre-flash attempts logged "(save failed …)".
-    let saved_n = collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(40 * sc))
-        .and_then(|chunk| digits_after(&chunk, "counter: count="));
+    //
+    // UP TO THREE MARKERS, TAKING THE FIRST THAT PARSES. `" saved"` is not unique to the line this
+    // wants: counter prints "no saved count yet - starting at 0" at startup on an empty disk, and
+    // that contains it too. Normally that line is already behind the cursor by the time the disk is
+    // flashed - but on a slow boot (measured: `block-driver: op 5 spent 453337 us`, `fs: op 10 took
+    // 487725 us`) `counter: ready` arrives AFTER the prompt, the informational line lands inside
+    // this window, and the wait stops on a line with no digits in it. The suite then reported a
+    // persistence failure for a save the serial log shows succeeding, and which boot it was decided
+    // the answer.
+    let mut saved_n = None;
+    for _ in 0..3 {
+        match collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(40 * sc)) {
+            Some(chunk) => {
+                if let Some(n) = digits_after(&chunk, "counter: count=") {
+                    saved_n = Some(n);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
     check!(matches!(saved_n, Some(n) if n >= 1), "counter persisted an increment to /counter.dat (count >= 1)");
     // Wait for a second successful save so the durable value is solidly > 0 before we kill.
     let _ = collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(20 * sc));
