@@ -104,6 +104,38 @@ idempotent that is a different bug from the one you were recovering from.
 the single failure the [Stranger Test](constitution.md) watches hardest, because it is invisible in
 a passing build.
 
+## If your program SERVES other tasks
+
+Most programs do not, and can skip this. A service does: it answers requests on its own endpoint, and
+that is the same endpoint replies from `fs` and `net-stack` arrive on. So there is a question with a
+wrong answer that looks like the right one - **what happens to a client request that lands while you
+are waiting for a reply?**
+
+The library's answer is that it does not touch it. A call waits on the reply capability it sent, so
+the kernel hands back that reply and leaves everything else queued for your own loop. You do not have
+to drain anything, and nothing you did not ask for is consumed.
+
+```rust
+// A service loop. `fs.read_into` may block for seconds; a client that speaks during it is still
+// waiting on your endpoint afterwards, not lost.
+loop {
+    let req = ctx.recv();
+    let mut buf = [0u8; 4096];
+    let n = fs.read_into("/data/answer.txt", &mut buf)?;
+    reply(&req, &buf[..n]);
+}
+```
+
+Two exceptions, both of which say so where you reach for them:
+
+- **A capability you hold** - an open file (`gs::cap::File`), a socket or a connection
+  (`gs::net`) - is invoked rather than sent by name, and the kernel routes its reply the same way.
+  Anything else that arrives during one of those is **held** for you: drain `take_held()` in a loop
+  after each operation and feed what comes back into your own loop. They are real client requests,
+  and only you can answer them.
+- **A handle built with `Fs::with_notice`** polls for an operator pressing `q`, which means it takes
+  whatever arrives. That is right for a shell, which serves nobody, and wrong for a service.
+
 ## What the library will not do
 
 - **Allocate on your behalf.** No heap, by design. You pass the buffer.

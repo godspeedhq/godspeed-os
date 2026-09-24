@@ -22,6 +22,11 @@ on:
       # Without this a corrected utility spec would never reach the published site.
       - 'utilities/**'
       - 'sdk/**'
+      # The STANDARD LIBRARY, whose rustdoc the site publishes under /api and which
+      # `website/src/stdlib.md` sends every newcomer to. Without this a corrected doc comment on
+      # `gs::fs` never reaches the published reference - the same drift the `utilities/**` line
+      # above was added to close, on the surface 22.7 actually measures.
+      - 'stdlib/**'
       - 'CLAUDE.md'
       - 'COMMANDMENTS.md'
       - 'GLOSSARY.md'

@@ -84,6 +84,55 @@ number that makes this measurable. A wait that is wrong is not a wait that is to
    fixed one such case and this survived it). The instrument that would settle it is a timestamped
    log of the completion request and its reply, which does not exist yet.
 
+## 2026-09-24: the cascade fix held, and the two named suspects are both WRONG
+
+One sighting in three runs on `feat/stdlib` (245/0, 245/0, **244 passed, 1 failed**). Two things
+follow, and the second is what step 2 above was asking for.
+
+**Step 1 works.** The failure reported as exactly one - `files-test: FAIL - tab rel-path timeout` -
+where the same event used to report as 2, 3 or 6. The count means something now.
+
+**The completion SUCCEEDED.** The serial log for that run holds the whole exchange, in order:
+
+```
+read ntime: clock floor 1790204034 recorded
+time: adopted clock floor 1790204034 from /clock.last
+fs: wall clock received from `time` - entries written from now on carry a date
+[6G[Kread note.txt net-stack: DHCP - no ACK matched: 0 frames, ...
+net-stack: DHCP - ACK, 10.0.2.15 is ours (server 10.0.2.2)
+net-stack: ICMP - 10.0.2.2 echo reply (ping OK)
+
+hello world
+gsh>
+```
+
+`[6G[K` is the shell rewriting the line, `read note.txt` is the completed command, and `hello world`
+is `/docs/note.txt`'s contents - the exact string the assertion wanted. So the completion listed the
+directory, matched the unique prefix, filled the line and ran it, correctly. **It was late, not
+wrong.**
+
+That rules out both suspects this entry names. A reply matched to the wrong request would have
+completed to the wrong name or to nothing; a stale reply in the mailbox would have produced a
+different file's contents or an error. Neither happened.
+
+**What the same log DOES show is contention.** Interleaved through that one command: the clock floor
+being written to disk, `fs` being told the wall clock, a DHCP OFFER/ACK exchange, an ARP and an ICMP
+round trip - and, a few lines earlier, `block-driver: op 2 spent 8189 us in the driver (slow #3)`.
+The boot-time network and clock burst lands at a variable point in the suite, and when it lands on
+this case the completion's `fs` round trip queues behind a clock write on a host that is emulating
+everything.
+
+So the honest reading is that the 10-second budget is genuinely exceeded by contention, which is a
+different claim from "host load" - it is a specific, identifiable, once-per-boot burst rather than a
+general excuse. The section above is right that raising the budget is the wrong fix; what would
+settle it is making the burst finish before the file cases start, or making the suite wait on it.
+
+**One structural change since:** `complete_path` now lists through `gs::fs::list_dir`, which waits
+with `CallDeadline` - the kernel hands back the reply matched to the caller's reply capability and
+leaves everything else queued. The "stale reply in the mailbox" suspect is therefore not merely
+unobserved on this path any more; it is unreachable. Recorded so that a future sighting is not spent
+re-examining it.
+
 ### The same trap is in two other suites
 
 `fs-restart` and `file-cap` define the identical `run!` macro with the identical no-resync
