@@ -267,9 +267,6 @@ enum Out<'a> {
     /// A captured function body's output (`let x = $(myfn …)`). The CaptureCall frame points a
     /// statement's `out` here; on the function's return the buffer becomes the variable's value.
     FnCap(&'a mut FnCapBuf),
-    /// `selfcheck view`: a painted dashboard on the screen, while every line goes to serial and the
-    /// kernel ring through `ctx.log()`. Two audiences, two paths - see `ViewBuf`.
-    View(&'a mut ViewBuf),
 }
 impl Out<'_> {
     /// Write a string, no trailing newline.
@@ -279,7 +276,6 @@ impl Out<'_> {
             Out::Capture(c) => c.push(s.as_bytes()),
             Out::File(r) => r.push(s.as_bytes()),
             Out::FnCap(c) => c.push(s.as_bytes()),
-            Out::View(v) => v.push(ctx, s.as_bytes()),
         }
     }
     /// Write raw bytes, no trailing newline (file content may not be clean UTF-8).
@@ -289,7 +285,6 @@ impl Out<'_> {
             Out::Capture(c) => c.push(b),
             Out::File(r) => r.push(b),
             Out::FnCap(c) => c.push(b),
-            Out::View(v) => v.push(ctx, b),
         }
     }
     /// Write a string followed by a newline.
@@ -304,13 +299,6 @@ impl Out<'_> {
             Out::Capture(c) => { let _ = core::fmt::write(c, args); c.push(b"\n"); }
             Out::File(r) => { let _ = core::fmt::write(r, args); r.push(b"\n"); }
             Out::FnCap(c) => { let _ = core::fmt::write(c, args); c.push(b"\n"); }
-            Out::View(v) => {
-                // Rendered through the same fixed buffer the view stores lines in, so a formatted
-                // line costs no more stack than a written one.
-                let mut w = ViewWriter { v, ctx };
-                let _ = core::fmt::write(&mut w, args);
-                w.v.push(ctx, b"\n");
-            }
         }
     }
 }
@@ -3892,156 +3880,6 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
 /// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
 /// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
-/// Lets `format_args!` write straight into a [`ViewBuf`] without a second staging buffer.
-struct ViewWriter<'a, 'b> { v: &'a mut ViewBuf, ctx: &'b ServiceContext }
-impl core::fmt::Write for ViewWriter<'_, '_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.v.push(self.ctx, s.as_bytes());
-        Ok(())
-    }
-}
-
-/// How many recent transcript lines the live view keeps to draw. Bounded (26.6.1): the whole buffer
-/// is `VIEW_LINES * VIEW_COLS` bytes and that number is readable right here.
-const VIEW_LINES: usize = 22;
-/// The widest stored line. Longer output is drawn truncated - it is a VIEW; the serial transcript has
-/// the untruncated line.
-const VIEW_COLS: usize = 96;
-/// Repaint after this many statements, as well as on every part boundary. A repaint per statement is
-/// a full console repaint per statement, which is what once jammed the console queue.
-const VIEW_EVERY: u32 = 8;
-
-/// The live `selfcheck view` dashboard: a ring of recent lines plus the counters the footer shows.
-///
-/// It is a VIEW, never the record. Every line handed to it is also written to the kernel ring and
-/// serial by `ctx.log()`, which is where the transcript actually lives - so losing the oldest line out
-/// of this ring loses nothing (26.4: a derived view, reconcilable against the one truth).
-struct ViewBuf {
-    line: [[u8; VIEW_COLS]; VIEW_LINES],
-    len:  [u8; VIEW_LINES],
-    head: usize,          // next slot to write
-    n:    usize,          // how many slots hold a line
-    cur:  [u8; VIEW_COLS], // the line being assembled (`put` without a newline yet)
-    curn: usize,
-    part_k: usize,
-    part_n: usize,
-    part:   [u8; 16],
-    partn:  usize,
-    /// Totals for the parts already finished, so the footer counts the RUN and not just this part.
-    base_ran: u32, base_failed: u32, base_skipped: u32,
-    ran: u32, failed: u32, skipped: u32,
-    since: u32,
-    rows: u16, cols: u16,
-}
-
-impl ViewBuf {
-    fn new(rows: u16, cols: u16) -> Self {
-        ViewBuf {
-            line: [[0; VIEW_COLS]; VIEW_LINES], len: [0; VIEW_LINES], head: 0, n: 0,
-            cur: [0; VIEW_COLS], curn: 0,
-            part_k: 0, part_n: 0, part: [0; 16], partn: 0,
-            base_ran: 0, base_failed: 0, base_skipped: 0,
-            ran: 0, failed: 0, skipped: 0, since: 0,
-            rows: if rows == 0 { 24 } else { rows },
-            cols: if cols == 0 { 80 } else { cols },
-        }
-    }
-
-    /// Take bytes for the current line. A newline commits it to the ring AND to the transcript.
-    fn push(&mut self, ctx: &ServiceContext, b: &[u8]) {
-        for &c in b {
-            if c == b'\n' {
-                self.commit(ctx);
-            } else if self.curn < VIEW_COLS {
-                self.cur[self.curn] = c;
-                self.curn += 1;
-            }
-            // Past VIEW_COLS the byte is dropped FROM THE VIEW only - `commit` logs the same
-            // truncation, and the untruncated line is the caller's to have already logged if it
-            // mattered. A view that silently widens is a view that scrolls sideways.
-        }
-    }
-
-    /// Commit the assembled line: into the ring for drawing, and to serial + the kernel ring, which
-    /// is where the transcript lives.
-    fn commit(&mut self, ctx: &ServiceContext) {
-        let n = self.curn;
-        if n > 0 {
-            ctx.log(core::str::from_utf8(&self.cur[..n]).unwrap_or("<line not utf-8>"));
-        }
-        self.line[self.head][..n].copy_from_slice(&self.cur[..n]);
-        self.len[self.head] = n as u8;
-        self.head = (self.head + 1) % VIEW_LINES;
-        if self.n < VIEW_LINES { self.n += 1; }
-        self.curn = 0;
-        self.since += 1;
-    }
-
-    /// A part has finished: fold its counts into the run's totals.
-    fn finish_part(&mut self) {
-        self.base_ran += self.ran;
-        self.base_failed += self.failed;
-        self.base_skipped += self.skipped;
-        self.ran = 0;
-        self.failed = 0;
-        self.skipped = 0;
-    }
-
-    fn set_part(&mut self, k: usize, n: usize, name: &str) {
-        self.part_k = k;
-        self.part_n = n;
-        self.partn = name.len().min(self.part.len());
-        self.part[..self.partn].copy_from_slice(&name.as_bytes()[..self.partn]);
-    }
-
-    fn due(&self) -> bool { self.since >= VIEW_EVERY }
-
-    /// Paint one whole frame. Whole frames rather than a pinned row because the console has no
-    /// scroll region (no `r`/DECSTBM final) - the same reason `edit` paints whole frames.
-    fn paint(&mut self, ctx: &ServiceContext) {
-        self.since = 0;
-        let cols = (self.cols as usize).min(VIEW_COLS);
-        let rows = self.rows as usize;
-        // Everything above the status block is content. Three rows are reserved: a blank, the bar,
-        // and the counts.
-        let body = rows.saturating_sub(4).min(VIEW_LINES);
-        ctx.console_write("\x1b[H");
-
-        let show = self.n.min(body);
-        let first = (self.head + VIEW_LINES - show) % VIEW_LINES;
-        for i in 0..show {
-            let sl = (first + i) % VIEW_LINES;
-            let l = (self.len[sl] as usize).min(cols);
-            ctx.console_write("\x1b[K");
-            ctx.console_writeln(core::str::from_utf8(&self.line[sl][..l]).unwrap_or(""));
-        }
-        for _ in show..body {
-            ctx.console_write("\x1b[K");
-            ctx.console_writeln("");
-        }
-
-        // ---- the status block, and nothing above it moves ----
-        ctx.console_write("\x1b[K");
-        ctx.console_writeln("");
-        let mut bar = [b'.'; PROGRESS_BAR_W];
-        let filled = if self.part_n == 0 { 0 } else {
-            self.part_k.saturating_sub(1) * PROGRESS_BAR_W / self.part_n
-        };
-        for c in bar.iter_mut().take(filled) { *c = b'#'; }
-        ctx.console_write("\x1b[K");
-        ctx.console_writeln_fmt(format_args!(
-            "  [{}] part {}/{}  {}",
-            str_of(&bar), self.part_k, self.part_n,
-            core::str::from_utf8(&self.part[..self.partn]).unwrap_or("")));
-        ctx.console_write("\x1b[K");
-        ctx.console_write_fmt(format_args!(
-            "  ran {}  failed {}  skipped {}     [q] quit - transcript on serial",
-            self.base_ran + self.ran, self.base_failed + self.failed,
-            self.base_skipped + self.skipped));
-        ctx.console_write("\x1b[J");
-    }
-}
-
 /// How wide the per-part progress bar is. One segment per part is the claim it makes, so the width
 /// only decides how coarse the drawing is - not what it means.
 const PROGRESS_BAR_W: usize = 22;
@@ -4489,10 +4327,6 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             if capturing {
                 let mut o = Out::FnCap(&mut fncap);
                 outcome(run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut o))
-            } else if matches!(out, Out::View(_)) {
-                // The dashboard is the destination, so the command writes into it rather than over
-                // it. Reborrowing `out` is safe here: the `> stmt` echo above is already written.
-                outcome(run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, out))
             } else {
                 let mut o = Out::Console;
                 outcome(run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut o))
@@ -4519,14 +4353,6 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             }
         }
         if stop { break; }
-        // Feed the live view its counters and let it repaint on ITS schedule (every `VIEW_EVERY`
-        // statements), never per statement.
-        if let Out::View(v) = out {
-            v.ran = ran;
-            v.failed = failed;
-            v.skipped = skipped;
-            if v.due() { v.paint(ctx); }
-        }
         // `q` BETWEEN STATEMENTS (conventions rule 9). Non-blocking, so a run nobody is watching
         // pays one queue check per statement and nothing else. Only where the caller asked for it -
         // a script driven by the harness must not be abortable by whatever happens to be in the
@@ -4637,15 +4463,10 @@ fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, 
                 str_of(&bar), k + 1, parts.len(), name,
                 if abortable { "   [q] quit" } else { "" }));
         }
-        if let Out::View(v) = out {
-            v.set_part(k + 1, parts.len(), name);
-            v.paint(ctx);
-        }
         // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
         // part that fails must not stop the parts after it. A run that gave up half way would report
         // a smaller `ran` and could read as a healthier machine than one that finished.
         let _ = run_lines(ctx, cwd, src, depth, out, params, false, Some(&mut t), abortable);
-        if let Out::View(v) = out { v.finish_part(); }
         ran_parts = k + 1;
         if t.aborted { break; }
     }
@@ -4887,14 +4708,7 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
     }
     // `selfcheck [<part>] [save <path>]`. The part name is checked against the table rather than
     // guessed at, so a typo says which names exist instead of silently running everything.
-    // `view` is a WORD, not a default (26.5, and conventions rule 4: words, never flags). The
-    // scrolling output is what 19 harness assertions and every hardware result so far have read, so
-    // the default is left exactly as it was; `view` opts in to the painted dashboard.
     let arg = arg.trim();
-    let (view, arg) = match arg.strip_prefix("view") {
-        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim()),
-        _ => (false, arg),
-    };
     let (first, rest) = split_first(arg);
     // `selfcheck`, `selfcheck <part>`, `selfcheck <part>,<part>,...`, each optionally followed by
     // `save <path>`. The comma list is the grammar `mkdir a,b,c` and `delete a,b,c` already use.
@@ -4979,25 +4793,6 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
     // BEFORE ANYTHING RUNS, and whichever parts were asked for.
     selfcheck_tidy(ctx);
 
-    if view && save.is_none() {
-        // SCREEN AND SAVE ARE ONE SINK EACH, so they do not combine: asking for a report gets the
-        // report. `Out` is a single destination by design, and threading two would be a second
-        // mechanism for a case nobody has asked for (26.2).
-        let (r, c) = ctx.console_dims();
-        let mut v = ViewBuf::new(r, c);
-        ctx.console_write("\x1b[2J");
-        let res = {
-            let mut out = Out::View(&mut v);
-            run_parts(ctx, cwd, &buf[..n], depth, &mut out, &Params::empty("selfcheck"), true)
-        };
-        v.paint(ctx);
-        ctx.console_writeln("");
-        return res;
-    }
-    if view {
-        ctx.console_writeln("selfcheck: `view` and `save` are different destinations - pick one");
-        return Err(ShellError::Unknown);
-    }
     run_with_optional_save(ctx, cwd, &buf[..n], depth, save, &Params::empty("selfcheck"), true)
 }
 
@@ -5258,7 +5053,6 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
                 ("selfcheck <part>", "run one part alone - the names are listed below", "selfcheck files"),
                 ("selfcheck <p>,<p>", "run several, in the order you name them", "selfcheck files,data"),
                 ("selfcheck save <out>", "run it and write the report to a file (read/match/edit it after)", "selfcheck save /report.txt"),
-                ("selfcheck view", "a live screen: bar, part, recent lines, counts - transcript stays on serial", "selfcheck view"),
                 ("q", "quit a run in progress - it reports what ran and says it is NOT a pass", ""),
                 ("selfcheck <part> save <out>", "both: one part, report to a file", "selfcheck files save /r.txt"),
             ], true);
