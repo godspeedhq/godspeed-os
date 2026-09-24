@@ -1,7 +1,7 @@
 # 48 - `chaos max-carnage` panics the kernel on the kill-path bound, and userspace can reach it
 
 **Opened:** 2026-09-24
-**Status:** OPEN - **REPRODUCED 2026-09-24 under host load** (1 panic in 170 carnage rounds loaded; 0 in 400 idle). The cause is understood; what to DO about it is a design decision and is the operator's.
+**Status:** OPEN - **REPRODUCED 2026-09-24 under host load** (1 panic in 170 carnage rounds loaded; 0 in 400 idle). **A VIOLATION of an absolute bar, and the fix is mandatory** - see the ruling below. One of five sites of the same shape (`backlog/49`).
 **Found by:** verification of an unrelated change (`feat/stdlib`, which makes **zero** kernel edits).
 
 ## What happened
@@ -110,8 +110,23 @@ slot, and freeing then is a use-after-free of memory a core may still be executi
 the panic is the right of two bad choices - a loud death beats silent ring-0 corruption (26.7,
 invariant 12).
 
-The defect is one level up from the panic. **A kill that cannot complete should fail the KILL, not the
-MACHINE.** Refuse the reclaim, leave the slot un-freed, report it loudly, and let the supervisor retry
+### The operator's ruling, 2026-09-24, and it is already written law
+
+> "Nothing above the kernel should have influence to panic or wedge the kernel. Nothing. If the kernel
+> panics it'll be because of the logic inside the kernel itself."
+
+This entry first recorded the remedy as a design decision for the operator. **That was wrong, and the
+constitution had already settled it** - `CLAUDE.md` 22 states the bar twice, in the strongest language
+it uses: "the kernel must never panic on user-controllable input", described as "binary and absolute";
+and "any attack that panics the kernel is a kernel bug. Both are mandatory fixes."
+
+The ruling does not forbid the kernel panicking - it requires the panic to come from the kernel's own
+logic. This one does not: nothing about the kernel is broken when a vCPU is late. `backlog/49` audits
+the other four sites of the same shape.
+
+### The fix
+
+**A kill that cannot complete should fail the KILL, not the MACHINE.** Refuse the reclaim, leave the slot un-freed, report it loudly, and let the supervisor retry
 or an operator see a leaked slot. The cost is one task's frames; the thing bought is the invariant
 that only the kernel is unkillable. That is 26.7's shape - degrade and record - applied to the one
 path that currently cannot.
@@ -142,8 +157,9 @@ contended enough to stop a vCPU for three quarters of a second, which no hardwar
 
 ## What is still open
 
-1. **The decision**: fail the kill, or keep panicking. That is the operator's call, and it is the
-   whole of what is left here - the mechanism is no longer in doubt.
+1. **The fix, which is mandatory and not a choice**: fail the kill rather than the machine, and
+   establish "not progressing" from the stuck core's IRQ count rather than inferring it from
+   lateness. The mechanism is no longer in doubt; only the shape of the change is open.
 2. **On real hardware this may be unreachable.** Every reproduction is under TCG, where a vCPU is a
    host thread that can simply stop. A physical core does not get descheduled. That does not make it
    a test artifact - a false panic under a busy CI host is still a machine that died - but it does
