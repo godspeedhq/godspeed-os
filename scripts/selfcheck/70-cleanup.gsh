@@ -14,7 +14,19 @@
 # ===== cleanup: proves delete + delete recursive =====
 echo ''
 echo '===== cleanup: proves delete + delete recursive ====='
+# MAKES ITS OWN SUBJECT. This used to delete `/sc/a.txt` and `/sc` and assume an earlier part had
+# built them, which made it the one part that could not run alone: `selfcheck cleanup` on a clean tree
+# deleted nothing and failed. A part that only works after another part is not a part.
+if dir /sc { delete /sc recursive }
+mkdir /sc
+write /sc/a.txt doomed
+assert ok read /sc/a.txt
 delete /sc/a.txt
 assert fails read /sc/a.txt
+
+# A NON-EMPTY DIRECTORY MUST REFUSE a plain delete - the guardrail, not an accident of ordering.
+mkdir /sc/deep
+write /sc/deep/inner.txt also-doomed
+assert fails delete /sc
 delete /sc recursive
 assert fails dir /sc
