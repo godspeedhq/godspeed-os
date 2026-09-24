@@ -5629,6 +5629,34 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - reading the per-part report timed out"); fail += 1; }
     }
 
+    // `q` STOPS IT, AND A STOPPED RUN IS NOT A PASS. Conventions rule 9 asks the longest command in
+    // the shell to be abortable; this checks the abort AND the thing that makes it safe - that the
+    // tally says it stopped and NAMES what never ran. `failed 0` is what this very suite greens on,
+    // so a quit that printed only a tally would pass while half the machine went unchecked.
+    send(&mut write_half, b"selfcheck\r");
+    if collect_until(&buf, &mut cursor, b"part 3/9", Duration::from_secs(180)).is_some() {
+        send(&mut write_half, b"q");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+            Some(r) => {
+                let stopped = r.contains("STOPPED at your request");
+                let not_pass = r.contains("NOT a pass");
+                let named = r.contains("never run:") && r.contains("network");
+                if stopped && not_pass && named {
+                    println!("script-test: PASS - `q` stops the run, and it refuses to look like a pass");
+                    pass += 1;
+                } else {
+                    println!("script-test: FAIL - `q` did not report a stop honestly \
+                              (stopped={stopped} not_pass={not_pass} named={named})");
+                    fail += 1;
+                }
+            }
+            None => { println!("script-test: FAIL - `q` did not end the run"); fail += 1; }
+        }
+    } else {
+        println!("script-test: FAIL - the run never reached part 3 to be quit");
+        fail += 1;
+    }
+
     // A NAME THAT IS NOT A PART MUST SAY SO, AND SAY WHICH ARE. Running everything on a typo is the
     // silent-fallback shape invariant 12 forbids: the operator asked for one thing, got another, and
     // was not told.
