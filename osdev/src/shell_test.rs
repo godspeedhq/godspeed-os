@@ -5871,6 +5871,201 @@ fn retry_tcp_connect(port: u16, timeout: Duration) -> Option<TcpStream> {
 
 /// Block (polling every 50 ms) until `sentinel` appears in `buf[*cursor..]`
 /// or `timeout` expires.  Advances `*cursor` past the sentinel on success.
+
+/// `osdev test chaos-repro[:rounds[:iters]]` - hammer `chaos max-carnage` inside one boot.
+///
+/// Written for `backlog/48`: a kernel panic on the kill path's progress bound, seen once in four
+/// `osdev test shell` runs. That rate is unusable for an investigation - each of those runs costs
+/// minutes and spends nearly all of them on things that are not carnage - so this does nothing but
+/// carnage, in a loop, in one boot.
+///
+/// It watches for `KERNEL PANIC` as well as the normal end marker. After a panic the machine halts
+/// (`-no-reboot`) and the serial goes quiet, so waiting only for the end marker would burn the whole
+/// window and then report "timed out" - which is exactly what made the original sighting read as a
+/// harness cascade rather than as the kernel fault it was.
+pub fn run_chaos_repro(image_path: &Path, smp: u32, rounds: u32, iters: u32) {
+    println!("chaos-repro: booting OS (smp={smp}) - {iters} iteration(s) of `chaos max-carnage all-services {rounds}`");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none",
+        "-no-reboot",
+        "-no-shutdown",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("chaos-repro: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    // 90s, not 10: under a deliberately loaded host QEMU may not get enough CPU to open its
+    // listening socket for tens of seconds, and the loaded phase of `backlog/48` died here before it
+    // ran a single round.
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(90)) {
+        Some(s) => s,
+        None => {
+            eprintln!("chaos-repro: could not connect to QEMU serial port {shell_port}");
+            child.kill().ok();
+            std::process::exit(1);
+        }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream for reading");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n)          => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(240)).is_none() {
+        println!("chaos-repro: FAIL - timed out waiting for first gsh>");
+        save_repro_serial(&buf);
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    let started = Instant::now();
+    let mut done = 0u32;
+    let mut panicked = false;
+    let mut wedged = false;
+    for i in 1..=iters {
+        send(&mut write_half, &format!("chaos max-carnage all-services {rounds}\r").into_bytes());
+        // The loud serial-required confirm. If it does not come, something is already wrong.
+        if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(90)).is_none() {
+            println!("chaos-repro: iteration {i}: no confirm prompt - stopping");
+            wedged = true;
+            break;
+        }
+        send(&mut write_half, b"y\r");
+        match collect_until_any(&buf, &mut cursor,
+                                &[b"foreground returned to the shell", b"KERNEL PANIC"],
+                                Duration::from_secs(420)) {
+            Some((1, _)) => { panicked = true; break; }
+            Some((_, _)) => {}
+            None => {
+                println!("chaos-repro: iteration {i}: neither a report nor a panic within 420s");
+                wedged = true;
+                break;
+            }
+        }
+        // Still answering? A machine that stops answering without panicking is its own finding, and
+        // the bound this is investigating exists precisely to turn that into a panic instead.
+        send(&mut write_half, b"cores\r");
+        let mut ok = false;
+        for _ in 0..6 {
+            match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)) {
+                Some(r) => {
+                    if r.contains("KERNEL PANIC") { panicked = true; break; }
+                    if r.contains(&format!("cores: {smp}")) { ok = true; break; }
+                }
+                None => send(&mut write_half, b"cores\r"),
+            }
+        }
+        if panicked { break; }
+        if !ok {
+            println!("chaos-repro: iteration {i}: the shell stopped answering, with no panic");
+            wedged = true;
+            break;
+        }
+        done = i;
+        if i % 5 == 0 || i == iters {
+            println!("chaos-repro: {i}/{iters} iterations, {} rounds, {:.0}s elapsed",
+                     i * rounds, started.elapsed().as_secs_f64());
+        }
+    }
+
+    let path = save_repro_serial(&buf);
+    let secs = started.elapsed().as_secs_f64();
+    println!();
+    if panicked {
+        println!("chaos-repro: REPRODUCED - kernel panic after {done} clean iteration(s) ({} rounds, {secs:.0}s)",
+                 done * rounds);
+        let g = buf.lock().unwrap();
+        let text = String::from_utf8_lossy(&g);
+        if let Some(p) = text.find("KERNEL PANIC") {
+            let from = text[..p].rfind('\n').map(|k| k + 1).unwrap_or(0);
+            let to = (p + 400).min(text.len());
+            println!("--- the panic ---\n{}\n--- end ---", text[from..to].trim_end());
+        }
+        println!("chaos-repro: serial -> {path}");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    if wedged {
+        println!("chaos-repro: STOPPED EARLY after {done} clean iteration(s) ({} rounds, {secs:.0}s) - see {path}",
+                 done * rounds);
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    println!("chaos-repro: {done} iteration(s), {} rounds, no panic, no wedge ({secs:.0}s)", done * rounds);
+    println!("chaos-repro: serial -> {path}");
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// `collect_until` with several sentinels: returns `(which, text)` for whichever appears FIRST.
+///
+/// Waiting on one marker at a time cannot express "a report, or a panic" - and a panic means the
+/// serial stops, so the one-marker form pays the whole window before saying anything useful.
+fn collect_until_any(
+    buf:       &Arc<Mutex<Vec<u8>>>,
+    cursor:    &mut usize,
+    sentinels: &[&[u8]],
+    timeout:   Duration,
+) -> Option<(usize, String)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let g = buf.lock().unwrap();
+            let slice = &g[*cursor..];
+            // The EARLIEST match wins, not the first sentinel that happens to be present: a panic
+            // that landed before the end marker must not be reported as a clean run.
+            let mut best: Option<(usize, usize)> = None;
+            for (i, s) in sentinels.iter().enumerate() {
+                if let Some(pos) = window_find(slice, s) {
+                    let end = pos + s.len();
+                    if best.map_or(true, |(b, _)| end < b) { best = Some((end, i)); }
+                }
+            }
+            if let Some((end_rel, which)) = best {
+                let end = *cursor + end_rel;
+                let chunk = String::from_utf8_lossy(&g[*cursor..end]).into_owned();
+                *cursor = end;
+                return Some((which, chunk));
+            }
+        }
+        if Instant::now() >= deadline { return None; }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn save_repro_serial(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let path = "build/tests/chaos_repro_serial.log".to_string();
+    let _ = std::fs::create_dir_all("build/tests");
+    let g = buf.lock().unwrap();
+    let _ = std::fs::write(&path, &g[..]);
+    path
+}
+
 fn collect_until(
     buf:      &Arc<Mutex<Vec<u8>>>,
     cursor:   &mut usize,

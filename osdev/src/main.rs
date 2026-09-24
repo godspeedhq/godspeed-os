@@ -1424,6 +1424,9 @@ fn cmd_test(suite: &str) {
         "chaos"        => crate::validator::run_chaos_tests(),
         "chaos-brutal" => crate::validator::run_chaos_brutal_tests(),
         "shell"        => run_shell_test(),
+        // `chaos-repro`, `chaos-repro:<rounds>`, `chaos-repro:<rounds>:<iters>` - the same shape
+        // `fs-model:<seed>:<ops>` uses. See `backlog/48`.
+        s if s == "chaos-repro" || s.starts_with("chaos-repro:") => run_chaos_repro_test(s),
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
         "blockdev-reboot" => run_blockdev_reboot_test(),
@@ -3696,6 +3699,24 @@ fn run_fs_ioretry_test() {
 }
 
 /// Build bare-metal image and run the scripted shell smoke-test.
+/// `osdev test chaos-repro[:rounds[:iters]]` - loop `chaos max-carnage` in one boot (`backlog/48`).
+fn run_chaos_repro_test(spec: &str) {
+    let mut it = spec.split(':').skip(1);
+    let rounds: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let iters:  u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(20);
+
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!("kernel ELF not found at {}", kernel_elf.display());
+        std::process::exit(1);
+    }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    crate::shell_test::run_chaos_repro(&image_path, 4, rounds, iters);
+}
+
 fn run_shell_test() {
     cmd_build_bare_metal();
 
