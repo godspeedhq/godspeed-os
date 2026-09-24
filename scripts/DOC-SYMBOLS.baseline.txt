@@ -46,10 +46,11 @@ service_config_by_name             # docs/naming-design.md
 size_bytes                         # docs/persistence.md
 spawn_init                         # docs/naming-design.md
 spawn_pong                         # docs/service-ownership.md
-write_file                         # docs/persistence.md
 write_hfnum                        # docs/arm32-usb-userspace.md
 in_view                            # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
 paint_view_indicator               # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
 put_num                            # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
 snapped_by_output                  # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
 take_output_snap                   # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+NET_TXN_SECS                       # backlog/29 + docs/stdlib-design.md - RETIRED with the shell's hand-rolled net path; both are records of what it did
+drain_stale_net_replies            # backlog/29 post-mortem - REMOVED once the correlation tag made a pre-emptive drain unnecessary; the record must name what went

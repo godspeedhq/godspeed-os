@@ -175,8 +175,6 @@ const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK,
 // stay block-aligned (no read-modify-write).
 const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
-const FS_ERR: u8 = 1;       // fs could not complete the operation (typically a device I/O error)
-const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
 const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a foreign partition table or
@@ -4697,18 +4695,6 @@ fn help_block_lines(rows: &[Row], footer: bool) -> usize {
     n
 }
 
-/// A fixed-buffer `fmt::Write` sink. Bounded, no heap (26.6.1).
-struct ClampWriter<'a> { buf: &'a mut [u8; 256], n: usize }
-impl core::fmt::Write for ClampWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let room = self.buf.len().saturating_sub(self.n);
-        let take = s.len().min(room);
-        self.buf[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
-        self.n += take;
-        Ok(())
-    }
-}
-
 /// The unpaged rendering, for a block that fits.
 fn help_block_render(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool,
                      from: usize, to: usize) {
@@ -7416,16 +7402,6 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// A name-addressed request to net-stack, with the reacquire-on-miss prime (net-stack is not a wired
-/// send-peer; the shell holds ACQUIRE_ANY). Mirrors `fs_request_q`.
-///
-/// Returns the OUTCOME rather than an `Option`, because `Aborted` and `Timeout` are different things
-/// to tell the operator: one is their own `q`, the other is net-stack failing to answer. Collapsing
-/// them to `None` would make a deliberate abort report a fault.
-fn netstack_request(ctx: &ShellCtx, payload: &[u8]) -> ReqOutcome {
-    ns_request(ctx, payload)
-}
-
 /// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
 /// response - the `sock` demo reports the round-trip, it does not parse DNS.
 fn dns_query_bytes(host: &str, buf: &mut [u8]) -> usize {
@@ -7529,15 +7505,6 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
         }
     }
 }
-
-/// Listener op: take the next completed connection. Mirrors `LOP_ACCEPT` in net-stack.
-const LOP_ACCEPT: u8 = 0;
-/// Listener: stop answering and release the port. Mirrors `LOP_CLOSE` in net-stack.
-///
-/// Dropping the capability is NOT enough - net-stack's listener table is its own state and nothing
-/// walks back to it from a dropped cap. Without this the port stays registered forever and the
-/// second `serve` on it is refused, which is what the Pi 2 showed.
-const LOP_CLOSE: u8 = 1;
 
 /// Read a duration written the way a person writes one: `30s`, `5m`, `2h`, `1d`, or a bare number
 /// of seconds.
@@ -12973,17 +12940,6 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
-/// The REASON `fs` gave for a failure, when it gave one.
-///
-/// An `FS_ERR` reply carries `[FS_ERR, reason bytes...]`. The trailing bytes are optional - older
-/// paths and the ops that have no reason to give still send the single byte - so this returns
-/// `None` rather than an empty string, and a caller falls back to its own wording.
-fn fs_err_reason(m: &Message) -> Option<&str> {
-    let p = m.payload_bytes();
-    if p.first().copied() != Some(FS_ERR) || p.len() < 2 { return None; }
-    core::str::from_utf8(&p[1..]).ok().filter(|r| !r.is_empty())
-}
-
 /// Report a mutating command that got no answer - and say WHICH of the two things happened.
 ///
 /// "storage unavailable" is true when the request never reached `fs`. It is a LIE when the request
@@ -13229,30 +13185,6 @@ fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
     net_query(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs, Some(tag))
 }
 
-/// How long the shell will wait for net-stack on the transaction path (`tcp`, `sock`, `serve`'s
-/// listen) before reporting it unavailable.
-///
-/// **This used to be UNBOUNDED, and that is a Commandment V violation: nothing above the kernel may
-/// halt.** The comment that stood here argued net-stack "sets its own budget inside and must not be
-/// cut short from here" - which is an argument for making this bound GENEROUS, not for having none.
-/// A dependency that is slow, wedged, or simply never got the message must produce a message, and an
-/// unbounded wait produces a dead prompt instead. Found on a Dell Wyse: `tcp <host> <port> big` froze
-/// the shell outright, with no `net-stack: tcp ->` line ever logged - so net-stack never even saw the
-/// request, and the shell waited on a reply that was never going to exist.
-///
-/// The number is set from what the far side can legitimately take, so a healthy-but-slow transaction
-/// is never cut off:
-///   - `tcp_transact` bounds itself at 8 s (`budget_ms`), the longest single thing net-stack does for
-///     this path;
-///   - the request may queue behind an SNTP dance that blocks net-stack for seconds - measured at 5.7
-///     s on a Pi 2 (`backlog/28`).
-/// 8 + 6 is 14, so 20 leaves real slack and still returns while a person is still watching.
-const NET_TXN_SECS: i64 = 20;
-
-/// How long the wait must linger before the `[q] quit` hint is printed. A fast transaction prints
-/// nothing, so a snappy `tcp` is not nagged.
-const NET_HINT_SECS: i64 = 2;
-
 /// How long `net resolve` waits for net-stack to answer a DNS lookup.
 ///
 /// **This is the SHORTEST deadline any client gives net-stack, and that makes it load-bearing on the
@@ -13267,66 +13199,6 @@ const NET_HINT_SECS: i64 = 2;
 /// It was a bare `8` at the call site until then. `scripts/facts_check.py` now checks this against
 /// net-stack's own budget, which it cannot do to a literal.
 const NET_RESOLVE_SECS: i64 = 8;
-
-/// Discard anything already queued on our endpoint BEFORE sending a net-stack request, reclaiming any
-/// capability a discarded reply carried.
-///
-/// The exact twin of `drain_stale_fs_replies`, for the exact same reason, and it became necessary the
-/// moment this channel became `q`-abortable: an abort leaves a reply that has not arrived yet, and it
-/// lands in our queue afterwards. On the fs channel that costs a wrong answer. HERE IT COSTS A
-/// CAPABILITY: a `serve` or `sock` reply carries a listener or socket cap, the kernel has already
-/// installed it and queued its slot, and dropping the message does not drop the cap (SEC-35) - so the
-/// NEXT `serve` would call `take_pending_cap` and receive the ABANDONED run's listener. It would then
-/// be answering on a port it never asked for, and releasing that one on the way out.
-///
-/// Draining at the START is what makes it decisive: at the instant we are about to send, every queued
-/// message is by definition somebody else's leftover. Safe because the shell is a pure CLIENT of
-/// net-stack on this endpoint - it serves nothing on it.
-///
-/// Bounded: at most a handful of discards, so a peer stuck emitting messages cannot spin us here.
-fn drain_stale_net_replies(ctx: &ServiceContext) {
-    for _ in 0..8 {
-        if ctx.try_recv().is_none() { return; }
-        while let Some(h) = ctx.take_pending_cap() {
-            ctx.remove_cap(h);
-        }
-    }
-}
-
-/// A tagged net-stack request on the transaction path (`tcp`, `sock`, `serve`'s listen): bounded by
-/// `NET_TXN_SECS`, and **`q`-abortable**, with a `[q] quit` hint once the wait lingers.
-///
-/// **A bound alone was not enough, and the Wyse proved it.** Bounding this at 20 s stopped the shell
-/// hanging forever, but the operator still had a dead prompt for twenty seconds with no way out - they
-/// could not type and `q` did nothing, so the machine was rebooted. `request_with_reply` parks the
-/// shell inside the syscall, where it cannot poll the console, so `q` is never SEEN however long the
-/// deadline is. That is conventions rule 9 (a blocking command stays `q`-abortable) broken on the whole
-/// networking surface.
-///
-/// This is the same repair `fs_request_q` already carries, applied to the other channel. The reasoning
-/// is written out there; the only thing that was ever net-stack-specific about it is that nobody had
-/// done it yet.
-fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
-    let mut buf = [0u8; 4096];
-    drain_stale_net_replies(ctx);         // an earlier abandoned reply must not be read as ours
-    let (n, tag) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
-    let first = ctx.request_with_reply_qhint(
-        "net-stack", &Message::from_bytes(&buf[..n]), NET_HINT_SECS, NET_TXN_SECS,
-        || ctx.console_writeln("  [q] quit"));
-    match ns_take_tagged(ctx, tag, first, NET_TXN_SECS) {
-        // A timeout here means the send never left or the peer is silent. Reacquire by name and retry
-        // once, with a FRESH tag - the first request may still be in flight, and its late reply must
-        // not be mistaken for the retry's answer. An ABORT is the user's decision and is never retried.
-        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => {
-            let (n2, tag2) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
-            let again = ctx.request_with_reply_qhint(
-                "net-stack", &Message::from_bytes(&buf[..n2]), NET_HINT_SECS, NET_TXN_SECS,
-                || ctx.console_writeln("  [q] quit"));
-            ns_take_tagged(ctx, tag2, again, NET_TXN_SECS)
-        }
-        other => other,
-    }
-}
 
 fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
@@ -13424,59 +13296,6 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
         while let Some(h) = ctx.take_pending_cap() {
             ctx.remove_cap(h);
         }
-    }
-}
-
-/// `fs_request` for INTERACTIVE commands (`dir`, `cd`, `read`, `find`, ...): q-abortable, and after a
-/// short lingering threshold it prints a "[q] quit" hint so the user can bail on a slow op instead
-/// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
-/// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
-/// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
-/// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
-/// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
-fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
-    const HINT_SECS: i64 = 2;    // print "[q] quit" only if the wait lingers past this
-    // How long `fs` gets to answer before the shell declares storage unavailable.
-    //
-    // **This was 3600, with the comment "effectively unbounded - fs replies fast now; q is the real
-    // exit".** That is not a bound, and "q is the real exit" makes the USER the timeout: a `tree`
-    // whose LIST_DIR never came back sat for an hour looking hung, and the reacquire-and-retry path
-    // below gives it a second hour. It is the rule above the rules - nothing above the kernel may
-    // hang; a missing, dead or slow dependency must RETURN with a loud "unavailable". Every caller
-    // already handles that outcome properly ("tree: storage unavailable"); they were simply never
-    // reached.
-    //
-    // 20 s is generous for what this helper actually carries. Its ONLY callers are READ_FILE,
-    // STAT_FILE and LIST_DIR - operations that complete in milliseconds on a healthy mount, and
-    // whose worst legitimate case is an `fs` that died and is being respawned (~1 s). The whole-disk
-    // work that genuinely takes minutes - check, scrub, flash - does not come through here.
-    //
-    // The retry doubles it, so a truly dead `fs` costs 40 s and then says so, instead of costing an
-    // afternoon and saying nothing.
-    const MAX_SECS:  i64 = FS_ANSWER_SECS; // one source for this bound, not a second copy of 20
-    let pl = path.len().min(255);
-    let mut req = [0u8; 4096];
-    let tag = next_fs_tag(ctx);
-    req[0] = tag;
-    req[1] = op;
-    req[2] = pl as u8;
-    req[3..3 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 3 - pl);
-    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..3 + pl + dn]);
-    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
-    match fs_take_tagged(ctx, tag, first, MAX_SECS) {
-        // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
-        // A fresh tag for the fresh request - see `fs_request`.
-        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
-            let tag2 = next_fs_tag(ctx);
-            let mut req2 = req;
-            req2[0] = tag2;
-            let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
-            fs_take_tagged(ctx, tag2, again, MAX_SECS)
-        }
-        other => other,
     }
 }
 
@@ -13593,14 +13412,6 @@ impl LastWriteErr {
         let n = why.len().min(self.buf.len());
         self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
         self.len = n;
-    }
-    fn set(&mut self, m: Option<&Message>) {
-        self.len = 0;
-        if let Some(why) = m.and_then(fs_err_reason) {
-            let n = why.len().min(self.buf.len());
-            self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
-            self.len = n;
-        }
     }
     fn get(&self) -> Option<&str> {
         if self.len == 0 { return None; }
@@ -13751,12 +13562,6 @@ impl core::fmt::Display for TimeCol {
             }
         }
     }
-}
-
-/// Read a little-endian u32 from a slice, mirroring `u64_le`.
-fn u32_le(b: &[u8]) -> u32 {
-    if b.len() < 4 { return 0; }
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
