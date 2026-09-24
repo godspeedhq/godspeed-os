@@ -1236,3 +1236,84 @@ re-run gave 206/0.
 That is the fourth time on this branch that a load-induced cascade has looked like a regression, and
 the third time the serial log answered it faster than another run would have. The tell is consistent:
 **no kernel panic, no wedge, and output that simply stops.**
+
+## 22. The dogfood is finished, and what it found in the last mile
+
+The sweep is done: every `fs` and net-stack call in `services/shell` goes through the library except
+two groups that are kept on purpose and named below. `services/copier` and `services/recorder` were
+migrated earlier. The shell is the interesting one because it is the biggest client of both services
+and the one an operator is looking at when something goes wrong.
+
+### What the last five commits moved
+
+| Commit | Sites | What it removed |
+|--------|-------|-----------------|
+| dogfood 17 | five `STAT` sites, `churn reset` | five independent decodings of the same eleven bytes |
+| dogfood 18 | `mkdir`, `delete` | two commands whose whole job is a mutation, reporting it as a status byte |
+| dogfood 19 | five directory walks | five copies of the page loop and the 15-byte entry stride |
+| dogfood 20 | seven deadline-bounded sites | `fs_request_bounded` and the shell's `OP_READ_FILE` decoder |
+| dogfood 21 | `churn verify` | the last walk that could be collected before it reads |
+
+Plus 195 lines of helpers that had nothing left calling them.
+
+### What stays hand-written, and why
+
+**The seven `fcap` sites.** Deliberate. §22 Test 14 is the identity test for file-as-capability, and a
+test that exercises the library rather than the protocol proves less about the protocol. They are the
+control group and should stay one.
+
+**`copy <src> <dst> recursive`.** It calls `fs` again for every entry it lists - `mkdir` for a
+directory, a streaming copy for a file - and `list_dir`'s closure holds the handle for the length of
+the walk, so a nested call cannot be spelled. `churn verify` had the same shape and was migrated by
+collecting names first, because its set is bounded at eight by construction; a subtree is not bounded
+that way, and buffering one is several kilobytes on a frame that is already tight
+(`[[project-shell-stack-pipe]]`).
+
+The route that would close it is a **paging API** - hand back one page, drop the borrow, let the
+caller do what it likes between pages - which is `DirCursor`'s shape, already proven in the shell. It
+is not written, because two call sites is not yet a reason to have one (§26.2), and this is recorded
+rather than half-done (§26.7). Nothing about the protocol forbids the nested call: the page reply is
+already in hand when the closure runs, so the tags cannot interleave. It is a borrow, not a race.
+
+### Three defects the last mile found, none of them in the code it was migrating
+
+**A tree delete cannot say "it failed".** `delete <path> recursive` frees in batches, so a lost reply
+leaves the tree possibly whole, possibly half gone, possibly untouched - and the old line asserted the
+last of the three. Same for `churn reset`. Both name the command that settles it now.
+
+**A badged request had no way to say how long its client would wait.** `net-stack` held one for a
+fixed 1500 ms and dropped it, while `serve`'s `accept` waited twenty seconds for an answer that no
+longer existed. The service had diagnosed exactly this for its NAMED path and fixed it there;
+`HOLD_MS`'s doc comment says so in the words the defect deserved - "a constant cannot know a client's
+deadline, so it stopped guessing and the client now says". It stopped one path short. Slowest serve
+pass: 64,063 ms before, 1,735 ms after.
+
+**The library was unsafe for a caller that serves clients.** `gs::call::request_within` waited with a
+plain recv, which takes whatever lands next - so a client request arriving mid-wait was consumed,
+misparsed, and lost. `services/recorder` demonstrated it the day it stopped hand-rolling its own
+request: the selfcheck polls `events persist status` once a second, and a capture died because the
+shell asked it a question at the wrong moment. The kernel has `CallDeadline` for exactly this
+(CLAUDE.md §8.2), the SDK exposes it, and the recorder had been using it before the migration - so
+the migration traded a correct primitive for a convenient one. Fixed by using the primitive; the
+whole named path is now safe for a serving caller, which is what `gs::cap`'s module header had been
+claiming for the library as a whole.
+
+That third one is the most important thing the dogfooding produced, and it is worth being plain about
+why: **it was found by a service USING the library, not by reading it.** The module header that
+promised the property and the function that did not deliver it are 300 lines apart in the same crate
+and had both been reviewed.
+
+### Two gates were wrong, and both are fixed rather than worked around
+
+`Commandment IX`'s standard-library check required the literal `DeadlineOutcome::SendFailed` in
+`gs::call`. It failed a change that preserves exactly what it guards, and would have passed a file
+that named the variant in a comment while reacquiring on the deadline. It reads the match arm the
+reacquire sits in now, which is the question IX actually asks.
+
+The harness's `selfcheck` window was 150 seconds. `fail` ends a gsh run, so while one statement in the
+middle of the suite was failing, only 326 of its 509 statements ever executed - and the window had
+been chosen against that shortened run. Fixing the failure made the suite 56% longer and the window
+was then under the work it waits on. Three runs gave 5/0, 5/0, 3/2; at 300 seconds, three for three.
+
+Both are the same shape as the four deadline bugs in §19, one layer up: **a bound chosen against a
+smaller version of the work is not a bound on the work.**

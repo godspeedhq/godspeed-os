@@ -147,12 +147,6 @@ impl DirCursor {
     /// reads as a complete one is the thing this whole mechanism exists to remove (§26.7).
     fn cut(&self) -> bool { self.cut }
 
-    /// Pages requested so far. A caller uses this to tell "the FIRST request failed" - the path is
-    /// not a directory - from "a LATER page failed", which is a read error part way through a walk
-    /// that had already returned real entries. Reporting both as "no such directory" would be a
-    /// wrong answer for the second (§26.7), exactly the way a storage error once came out as a
-    /// claim about the path.
-    fn pages_asked(&self) -> u16 { self.pages }
 }
 const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
@@ -7571,8 +7565,6 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     };
 
     // 1. Ask net-stack to listen. The reply carries a LISTENER capability.
-    let lo = (port & 0xff) as u8;
-    let hi = (port >> 8) as u8;
     // Through `gs::net`: the opcodes, the capability lifetimes and the correlation tag are the
     // library's now. What stays here is what `serve` MEANS.
     let mut gnet = gs::net::Net::new(&**ctx);
@@ -13900,58 +13892,65 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let mut checked = 0u32;
     let mut torn = 0u32;
     let mut empty = 0u32;
-    let mut truncated = false;
     let mut data = [0u8; 4096];
-    let mut cur = DirCursor::new();
-    'pages: while let Some(from) = cur.next() {
-    let reply = match fs_request(ctx, OP_LIST_DIR, DIR, &from) {
-        Some(r) => r,
-        None => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < DIR_HDR {
-        if cur.pages_asked() == 1 {
+
+    // COLLECT, THEN READ. `list_dir` holds the handle for the length of the walk, so the read of
+    // each file cannot happen inside it. The churn set is bounded at eight files by construction -
+    // `churn` rewrites the same ones in place, which is why it does not accumulate - so sixteen
+    // slots is twice the set and a full buffer is reported rather than silently trimmed.
+    const NAMES_MAX: usize = 16;
+    const NAME_MAX: usize = 48;
+    let mut names = [[0u8; NAME_MAX]; NAMES_MAX];
+    let mut nlens = [0usize; NAMES_MAX];
+    let mut nn = 0usize;
+    let mut overfull = false;
+
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let walked = g.list_dir(DIR, |e| {
+        if e.is_dir {
+            return true;
+        }
+        if nn == NAMES_MAX || e.name.len() > NAME_MAX {
+            overfull = true;
+            return false;
+        }
+        names[nn][..e.name.len()].copy_from_slice(e.name);
+        nlens[nn] = e.name.len();
+        nn += 1;
+        true
+    });
+    ctx.fs_tag.set(g.tag());
+    let mut truncated = overfull;
+    match walked {
+        Ok(l) => { if !l.complete && !overfull { truncated = true; } }
+        Err(gs::Error::NotFound) => {
             ctx.console_writeln("churn verify: no /churn directory - nothing to check");
             return Ok(());
         }
-        // `break 'pages`, NOT `continue` - this is the page loop, and re-asking would never end.
-        break 'pages;
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(_) => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
     }
-    let count = cur.take(p);
-    let mut i = DIR_HDR;
 
-    for _ in 0..count {
-        if i >= p.len() { break; }
-        let nl = p[i] as usize;
-        i += 1;
-        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-        let is_dir = p[i + nl] != 0;
+    for k in 0..nn {
         let mut path = [0u8; 64];
         let mut pl = 0usize;
         for &b in DIR { path[pl] = b; pl += 1; }
         path[pl] = b'/'; pl += 1;
-        let take = nl.min(path.len() - pl);
-        path[pl..pl + take].copy_from_slice(&p[i..i + take]);
-        pl += take;
-        i += nl + 1 + 8 + 4 + 1;
-        if is_dir { continue; }
+        path[pl..pl + nlens[k]].copy_from_slice(&names[k][..nlens[k]]);
+        pl += nlens[k];
 
         let n = match fs_read_file(ctx, &path[..pl], &mut data, 20) { Some(n) => n, None => continue };
         checked += 1;
         if n == 0 { empty += 1; continue; }
-        // The generation is byte 0 by construction; every later byte is then predicted.
-        let gen = data[0];
-        // Same source as the writer (`sdk::churn`), which is the whole point of it being there.
-        let bad_at = godspeed_sdk::churn::first_divergence(&data[..n]);
-        if let Some(k) = bad_at {
+        // Same source as the writer (`sdk::churn`), which is the whole point of it being there. The
+        // generation is byte 0 by construction; every later byte is then predicted.
+        if let Some(bad) = godspeed_sdk::churn::first_divergence(&data[..n]) {
             torn += 1;
             out.line_fmt(ctx, format_args!(
                 "churn verify: TORN - {} diverges at byte {} of {} (block {}, offset {} within it)",
-                str_of(&path[..pl]), k, n, k / 508, k % 508));
+                str_of(&path[..pl]), bad, n, bad / 508, bad % 508));
         }
     }
-    }
-    truncated = cur.cut();
 
     if truncated {
         out.line(ctx, "churn verify: NOTE - /churn is larger than the walk could read, so some files were NOT checked");
