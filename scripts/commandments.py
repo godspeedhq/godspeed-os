@@ -560,8 +560,15 @@ def check_user_vocabulary(check, pins):
     # help_block alone missed `fcap`, which is dispatched as `"fcap" => cmd_fcap(..)` and registers
     # no help block - so the check reported a documented command as missing when it is present. A
     # wrong finding is worse than a missing one: it costs the reader their trust in the whole list.
-    commands = set(re.findall(r'"([a-z][a-z0-9-]*)"\s*=>\s*help_block\(ctx,\s*"\1"', sh))
-    commands |= set(re.findall(r'"([a-z][a-z0-9-]*)"\s*=>\s*cmd_[a-z_]+\s*\(', sh))
+    # THE ARM BODY MAY START HOWEVER RUST LETS IT START. Both patterns used to demand that the call
+    # follow `=>` immediately, so an arm written `"x" => { help_block(..)` or `"x" => return cmd_x(..)`
+    # was invisible - and invisible here does not fail, it silently drops the verb from the audit and
+    # then reports its debt entry as "now reconciles". `selfcheck` is dispatched with `return` and its
+    # help block acquired a braced body, which took out both patterns at once and nearly retired a
+    # real debt. Widened once before for `fcap`; the lesson is in the module docstring.
+    start = r'"([a-z][a-z0-9-]*)"\s*=>\s*(?:\{\s*)?(?:return\s+)?'
+    commands = set(re.findall(start + r'help_block\(ctx,\s*"\1"', sh))
+    commands |= set(re.findall(start + r'cmd_[a-z_]+\s*\(', sh))
 
     spec_cmds, absent_cmds, out, seen = {}, {}, [], set()
     for fn in sorted(os.listdir(udir)):

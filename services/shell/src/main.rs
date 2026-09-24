@@ -2067,7 +2067,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
                         "{}: a library command runs a script - not available inside another script", other));
                     return Err(ShellError::Unknown);
                 }
-                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true, None);
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true, None, false);
             }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -2223,7 +2223,9 @@ fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&st
         ctx.console_writeln_fmt(format_args!("run: script CODE exceeds {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
     }
     resolve_imports(ctx, &mut script, &mut code);
-    run_with_optional_save(ctx, cwd, &[("", &script[..code])], depth, save, params)
+    // NOT abortable: `run` is unchanged by this pass. It has the same shape and arguably wants the
+    // same escape, but changing a second command's behaviour on the way past is not this change.
+    run_with_optional_save(ctx, cwd, &[("", &script[..code])], depth, save, params, false)
 }
 
 const IMPORT_MAX: usize = 16; // max names in one `from … import a b c …`
@@ -3878,6 +3880,10 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
 /// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
 /// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
+/// How wide the per-part progress bar is. One segment per part is the claim it makes, so the width
+/// only decides how coarse the drawing is - not what it means.
+const PROGRESS_BAR_W: usize = 22;
+
 /// What a run counted, so a caller running SEVERAL scripts can report one total.
 ///
 /// `run_lines`'s counters used to be locals that printed themselves, which is right for a single
@@ -3885,17 +3891,18 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// interface - nineteen harness checks match `failed 0` against it - so it must be printed once, by
 /// whoever knows the run is over.
 #[derive(Default, Clone, Copy)]
-struct Tally { ran: u32, failed: u32, skipped: u32 }
+struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
 
 /// Interpret `src`. `tally`: `None` prints the `run:` line itself (a plain `run`); `Some` adds this
 /// script's counts to the caller's total and leaves the line to it (one part of a bigger suite).
 fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool,
-             tally: Option<&mut Tally>) -> Result<(), ShellError> {
+             tally: Option<&mut Tally>, abortable: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
     let mut ran = 0u32;
     let mut failed = 0u32;
+    let mut aborted = false;
     let mut last: Result<(), ShellError> = Ok(());
     // Per-statement verdicts + spans for the end-of-run summary. With control flow, the executed
     // statements are no longer a simple prefix of the source, so record each one's (offset, len) as it
@@ -4334,6 +4341,19 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             }
         }
         if stop { break; }
+        // `q` BETWEEN STATEMENTS (conventions rule 9). Non-blocking, so a run nobody is watching
+        // pays one queue check per statement and nothing else. Only where the caller asked for it -
+        // a script driven by the harness must not be abortable by whatever happens to be in the
+        // input ring.
+        if abortable {
+            while let Some(k) = ctx.try_console_read() {
+                if k == b'q' || k == b'Q' || k == 0x1b {
+                    aborted = true;
+                    break;
+                }
+            }
+            if aborted { break; }
+        }
     }
     // Script exit (normal end OR `fail`): run any remaining defers - LIFO, across all scopes (§5).
     run_defers(ctx, cwd, b, &mut defers, &mut ndefer, 0, &mut vars, params, out, sdepth);
@@ -4394,8 +4414,9 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         t.ran += ran;
         t.failed += failed;
         t.skipped += skipped;
+        t.aborted |= aborted;
     }
-    if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
+    if failed == 0 && !aborted { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
 /// Run every part in order, reporting ONE tally for the lot.
@@ -4403,24 +4424,62 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
 /// A part is `(name, source)`; `name` is empty for a plain `run`, which has exactly one part and
 /// prints no heading. Sequential, never nested: each `run_lines` frame is gone before the next
 /// starts, which is what keeps this inside the bounded user stack.
-fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, out: &mut Out, params: &Params)
+fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, out: &mut Out,
+             params: &Params, abortable: bool)
     -> Result<(), ShellError>
 {
     let mut t = Tally::default();
-    for &(name, src) in parts {
+    let mut ran_parts = 0usize;
+    for (k, &(name, src)) in parts.iter().enumerate() {
         if parts.len() > 1 && !name.is_empty() {
+            // WHERE IT IS, as a printed line. A repainting bar would overwrite the very transcript
+            // this suite exists to produce - the serial log is what a hardware run is read from -
+            // and refreshing it per statement is a full console repaint per statement, the measured
+            // failure that once jammed the console queue and ate the shell's own keystroke echo.
+            //
+            // KEYED TO PARTS, NOT BYTES. A byte percentage was written first and thrown away: it
+            // moves 89% -> 91% across `cleanup` and `network`, the last two parts, while `network`
+            // waits on DHCP and DNS and is among the slowest stretches on the clock. Bytes are not
+            // time. One segment per part is a claim that is exactly true and needs no weighting that
+            // could drift as checks are added.
+            let mut bar = [b'.'; PROGRESS_BAR_W];
+            let filled = k * PROGRESS_BAR_W / parts.len();
+            for c in bar.iter_mut().take(filled) { *c = b'#'; }
             out.line(ctx, "");
-            out.line_fmt(ctx, format_args!("##### part: {} #####", name));
+            out.line_fmt(ctx, format_args!(
+                "##### [{}] part {}/{}  {:<8}{} #####",
+                str_of(&bar), k + 1, parts.len(), name,
+                if abortable { "   q quits" } else { "" }));
         }
         // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
         // part that fails must not stop the parts after it. A run that gave up half way would report
         // a smaller `ran` and could read as a healthier machine than one that finished.
-        let _ = run_lines(ctx, cwd, src, depth, out, params, false, Some(&mut t));
+        let _ = run_lines(ctx, cwd, src, depth, out, params, false, Some(&mut t), abortable);
+        ran_parts = k + 1;
+        if t.aborted { break; }
     }
     if parts.len() > 1 {
         out.line(ctx, "");
     }
     out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", t.ran, t.failed, t.skipped));
+    // A QUIT IS NOT A PASS. `failed 0` on its own reads as a clean run of a suite that never
+    // finished - and it is what the harness greens on. Say that it stopped, and NAME what never ran,
+    // because "which parts did I skip" is the first thing the operator needs and the one thing a
+    // count cannot tell them (26.7).
+    if t.aborted {
+        out.line_fmt(ctx, format_args!(
+            "selfcheck: STOPPED at your request after {} of {} part(s) - this is NOT a pass.",
+            ran_parts, parts.len()));
+        if ran_parts < parts.len() {
+            out.put(ctx, "selfcheck: never run:");
+            for &(n, _) in &parts[ran_parts..] {
+                out.put_bytes(ctx, b" ");
+                out.put(ctx, n);
+            }
+            out.line(ctx, "");
+        }
+        return Err(ShellError::Unknown);
+    }
     if t.failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
@@ -4429,12 +4488,13 @@ fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, 
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
 /// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
-fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, save: Option<&str>, params: &Params)
+fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, save: Option<&str>,
+                          params: &Params, abortable: bool)
     -> Result<(), ShellError>
 {
     match save {
-        None => run_parts(ctx, cwd, parts, depth, &mut Out::Console, params),
-        Some(spath) => run_and_save(ctx, cwd, parts, depth, spath, params),
+        None => run_parts(ctx, cwd, parts, depth, &mut Out::Console, params, abortable),
+        Some(spath) => run_and_save(ctx, cwd, parts, depth, spath, params, abortable),
     }
 }
 
@@ -4442,7 +4502,8 @@ fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])]
 /// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
 /// is actually running, not in the frame of every bare run.
 #[inline(never)]
-fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, spath: &str, params: &Params)
+fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, spath: &str, params: &Params,
+                abortable: bool)
     -> Result<(), ShellError>
 {
     let mut pbuf = [0u8; PATH_MAX];
@@ -4458,7 +4519,7 @@ fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u
     let mut rb = ReportBuf::new();
     let result = {
         let mut out = Out::File(&mut rb);
-        run_parts(ctx, cwd, parts, depth, &mut out, params)
+        run_parts(ctx, cwd, parts, depth, &mut out, params, abortable)
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
@@ -4594,19 +4655,45 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
     // `selfcheck [<part>] [save <path>]`. The part name is checked against the table rather than
     // guessed at, so a typo says which names exist instead of silently running everything.
     let (first, rest) = split_first(arg.trim());
-    let (part, tail) = if first.is_empty() || first == "save" {
-        (None, arg.trim())
+    // `selfcheck`, `selfcheck <part>`, `selfcheck <part>,<part>,...`, each optionally followed by
+    // `save <path>`. The comma list is the grammar `mkdir a,b,c` and `delete a,b,c` already use.
+    let mut chosen = [0usize; SELFCHECK_MAX_PARTS];
+    let mut nchosen = 0usize;
+    let tail = if first.is_empty() || first == "save" {
+        arg.trim()
     } else {
-        match SELFCHECK_PARTS.iter().position(|&(n, _)| n == first) {
-            Some(i) => (Some(i), rest.trim()),
-            None => {
-                ctx.console_writeln_fmt(format_args!("selfcheck: no part named '{}'", first));
-                ctx.console_write("selfcheck: parts are");
-                for &(n, _) in SELFCHECK_PARTS { ctx.console_write_fmt(format_args!(" {}", n)); }
-                ctx.console_writeln("");
-                return Err(ShellError::Unknown);
+        for name in first.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;   // a trailing or doubled comma is not worth a refusal
+            }
+            match SELFCHECK_PARTS.iter().position(|&(n, _)| n == name) {
+                // ONE UNKNOWN NAME REFUSES THE WHOLE LIST, and refuses it BEFORE anything runs.
+                // Running the parts that parsed and skipping the typo is how `selfcheck files,dta`
+                // comes back green having never checked what the operator asked about.
+                None => {
+                    ctx.console_writeln_fmt(format_args!("selfcheck: no part named '{}'", name));
+                    ctx.console_write("selfcheck: parts are");
+                    for &(n, _) in SELFCHECK_PARTS { ctx.console_write_fmt(format_args!(" {}", n)); }
+                    ctx.console_writeln("");
+                    return Err(ShellError::Unknown);
+                }
+                Some(i) => {
+                    if nchosen == SELFCHECK_MAX_PARTS {
+                        ctx.console_writeln_fmt(format_args!(
+                            "selfcheck: more than {} parts asked for - there are only {}",
+                            SELFCHECK_MAX_PARTS, SELFCHECK_PARTS.len()));
+                        return Err(ShellError::Unknown);
+                    }
+                    // IN THE ORDER GIVEN. The parts share the disk - `files` builds what `cleanup`
+                    // removes - so order can matter, and sorting it into table order for the
+                    // operator is the reinterpretation 26.5 refuses. A repeat runs twice.
+                    chosen[nchosen] = i;
+                    nchosen += 1;
+                }
             }
         }
+        rest.trim()
     };
     // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file -
     // direct, not a pipe, so the orchestrator can save without the nested-capture stack overflow).
@@ -4625,24 +4712,30 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
     // THE PARTS ARE BUILT HERE, not baked as a second table: `SELFCHECK_PARTS` holds `&str` because
     // `include_str!` does, and `run_lines` reads bytes. Bounded by the table's own length.
     let mut buf = [("", &[][..]); SELFCHECK_MAX_PARTS];
-    let n = match part {
-        Some(i) => { buf[0] = (SELFCHECK_PARTS[i].0, SELFCHECK_PARTS[i].1.as_bytes()); 1 }
-        None => {
-            for (k, &(name, src)) in SELFCHECK_PARTS.iter().enumerate() {
-                buf[k] = (name, src.as_bytes());
-            }
-            SELFCHECK_PARTS.len()
+    let n = if nchosen == 0 {
+        for (k, &(name, src)) in SELFCHECK_PARTS.iter().enumerate() {
+            buf[k] = (name, src.as_bytes());
         }
+        SELFCHECK_PARTS.len()
+    } else {
+        for k in 0..nchosen {
+            let (name, src) = SELFCHECK_PARTS[chosen[k]];
+            buf[k] = (name, src.as_bytes());
+        }
+        nchosen
     };
-    match part {
-        Some(i) => ctx.console_writeln_fmt(format_args!(
-            "selfcheck: running part '{}' ({} bytes, in memory) - needs a flashed drive for the file tests...",
-            SELFCHECK_PARTS[i].0, SELFCHECK_PARTS[i].1.len())),
-        None => ctx.console_writeln_fmt(format_args!(
+    let bytes: usize = buf[..n].iter().map(|&(_, b)| b.len()).sum();
+    if nchosen == 0 {
+        ctx.console_writeln_fmt(format_args!(
             "selfcheck: running the embedded suite ({} parts, {} bytes, in memory) - needs a flashed drive for the file tests...",
-            SELFCHECK_PARTS.len(), selfcheck_bytes())),
+            n, bytes));
+    } else {
+        ctx.console_write("selfcheck: running");
+        for &(name, _) in &buf[..n] { ctx.console_write_fmt(format_args!(" {}", name)); }
+        ctx.console_writeln_fmt(format_args!(
+            " ({} bytes, in memory) - needs a flashed drive for the file tests...", bytes));
     }
-    run_with_optional_save(ctx, cwd, &buf[..n], depth, save, &Params::empty("selfcheck"))
+    run_with_optional_save(ctx, cwd, &buf[..n], depth, save, &Params::empty("selfcheck"), true)
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` - the **result** form: run `<cmd>` and check that it
@@ -4896,11 +4989,27 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("fmt check <path>", "Ok if already canonical, else loud + Err; never writes", "fmt check /script.gsh"),
             ("fmt <a>,<b>,...", "format (or check) several files - comma-separated, done one at a time", "fmt /x.gsh,/y.gsh"),
         ], true),
-        "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
-            ("selfcheck", "run every part in memory; reports one ran N, failed M for the lot", "selfcheck"),
-            ("selfcheck <part>", "run ONE part - language meta hardware events persist files data cleanup network", "selfcheck files"),
-            ("selfcheck save <out>", "run it and write the report to a file (then read/edit/grep it)", "selfcheck save /report.txt"),
-        ], true),
+        "selfcheck" => {
+            help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
+                ("selfcheck", "run every part in order; ONE tally for the lot", "selfcheck"),
+                ("selfcheck <part>", "run one part alone - the names are listed below", "selfcheck files"),
+                ("selfcheck <p>,<p>", "run several, in the order you name them", "selfcheck files,data"),
+                ("selfcheck save <out>", "run it and write the report to a file (read/match/edit it after)", "selfcheck save /report.txt"),
+                ("q", "quit a run in progress - it reports what ran and says it is NOT a pass", ""),
+                ("selfcheck <part> save <out>", "both: one part, report to a file", "selfcheck files save /r.txt"),
+            ], true);
+            // THE NAMES COME FROM THE TABLE, not from a string typed here. A hand-copied list is a
+            // second place the truth lives, and it goes stale the first time a part is added - the
+            // drift `facts_check` exists to catch. The refusal path prints this same list from this
+            // same source, so help and the error cannot disagree.
+            ctx.console_write("  parts:");
+            for &(n, _) in SELFCHECK_PARTS {
+                ctx.console_write_fmt(format_args!(" {}", n));
+            }
+            ctx.console_writeln("");
+            ctx.console_writeln("  a name that is not a part is refused, and the real ones are listed - it never");
+            ctx.console_writeln("  quietly runs everything instead.");
+        }
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
             ("roster", "render the table directly (name / role / seat)", "roster"),
             ("roster | where <col><op><val>", "filter rows - it is a record source for the pipe verbs", "roster | where role=core"),

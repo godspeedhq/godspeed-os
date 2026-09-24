@@ -5575,6 +5575,60 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - `selfcheck files` timed out"); fail += 1; }
     }
 
+    // `selfcheck help` MUST NAME THE PARTS THAT ACTUALLY RUN. The list used to be typed into the
+    // help block by hand, which is a second copy of a fact the table already holds - it now reads
+    // `SELFCHECK_PARTS`, and this asserts every one of them appears. Add a part, forget the help,
+    // and this goes red instead of the help screen going confidently stale.
+    send(&mut write_half, b"selfcheck help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => {
+            let parts = ["language", "meta", "hardware", "events", "persist",
+                         "files", "data", "cleanup", "network"];
+            let missing: Vec<&str> = parts.iter().copied().filter(|p| !r.contains(p)).collect();
+            if missing.is_empty() && r.contains("parts:") {
+                println!("script-test: PASS - `selfcheck help` names every part that runs");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck help` did not name: {missing:?}");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - `selfcheck help` timed out"); fail += 1; }
+    }
+
+    // ONE PART, REPORT TO A FILE - the two parse branches meeting. Reasoned about and never run
+    // until now, which is the gap between "it should work" and "it does".
+    send(&mut write_half, b"selfcheck cleanup save /sc-part.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            // ONLY the "saved" line is on the console. A saved run sends its summary, its failures
+            // and its tally into the FILE - that is what `save` means - so `failed 0` is not here to
+            // be found. The assertion below reads the file back and checks the tally there, which is
+            // the half that proves the part actually ran green.
+            if r.contains("saved report") && r.contains("/sc-part.txt") {
+                println!("script-test: PASS - `selfcheck <part> save <out>` runs the part and writes its report");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck <part> save <out>` did not write a report");
+                fail += 1;
+            }
+        }
+        None    => { println!("script-test: FAIL - `selfcheck <part> save` timed out"); fail += 1; }
+    }
+    send(&mut write_half, b"read /sc-part.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            if r.contains("run: ran") && r.contains("failed 0") {
+                println!("script-test: PASS - the saved per-part report holds that part's tally");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - the per-part report is missing its tally");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - reading the per-part report timed out"); fail += 1; }
+    }
+
     // A NAME THAT IS NOT A PART MUST SAY SO, AND SAY WHICH ARE. Running everything on a typo is the
     // silent-fallback shape invariant 12 forbids: the operator asked for one thing, got another, and
     // was not told.
