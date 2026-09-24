@@ -338,7 +338,7 @@ Recorded so it is not rediscovered as an omission (§26.7):
 | M - adversarial | `osdev test fs-fuzz` (new), plus no regression across the eleven existing fs suites |
 | N - rights | `osdev test file-cap` extended |
 | O - timestamps | `osdev test fs-time` (new): stamp, survive a reboot, survive a restart, read a volume with no times region as `unknown` |
-| P - `dir` | `osdev test shell` (the file section) and `selfcheck.gsh` |
+| P - `dir` | `osdev test shell` (the file section) and the selfcheck suite |
 
 A hardware pass on the five boards confirms at the end. It is not needed along the way, and this plan
 is deliberately arranged so that it is not.

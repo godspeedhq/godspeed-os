@@ -5556,6 +5556,43 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - second `selfcheck` timed out"); fail += 1; }
     }
 
+    // ONE PART ON ITS OWN. The affordance the split was worth doing for: `selfcheck files` runs the
+    // file section and nothing else, which is what an operator investigating storage actually wants
+    // rather than six minutes of network and observability checks first.
+    send(&mut write_half, b"selfcheck files\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            let ran = digits_after(&r, "run: ran ");
+            // Green, and SHORTER than the whole suite - otherwise "one part" is a label on a full run.
+            if r.contains("failed 0") && !r.contains("--- failures ---") && matches!(ran, Some(n) if n > 0 && n < 200) {
+                println!("script-test: PASS - `selfcheck files` runs ONE part green ({:?} statements)", ran);
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck files` did not run one part green (ran {:?})", ran);
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - `selfcheck files` timed out"); fail += 1; }
+    }
+
+    // A NAME THAT IS NOT A PART MUST SAY SO, AND SAY WHICH ARE. Running everything on a typo is the
+    // silent-fallback shape invariant 12 forbids: the operator asked for one thing, got another, and
+    // was not told.
+    send(&mut write_half, b"selfcheck fils\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => {
+            if r.contains("no part named") && r.contains("files") && r.contains("network")
+               && !r.contains("run: ran") {
+                println!("script-test: PASS - an unknown part is refused and the real names are listed");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - an unknown part was not refused with the list of parts");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - unknown-part case timed out"); fail += 1; }
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nscript-test: {pass} passed, {fail} failed");

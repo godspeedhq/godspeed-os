@@ -1,7 +1,7 @@
 # 47 - `selfcheck.gsh` is at the baked-script ceiling
 
 **Opened:** 2026-09-23
-**Status:** OPEN - 397 bytes of headroom
+**Status:** CLOSED 2026-09-24 - split into nine parts
 **Raised by:** the operator.
 
 ## The number
@@ -60,8 +60,53 @@ Cheapest to do and the worst answer. `selfcheck` runs ON THE MACHINE, including 
 host harness exists; moving checks to QEMU-only suites would shrink the file by deleting coverage
 from the place it matters most. Recorded so it is visibly rejected rather than quietly available.
 
-## Not started
+## Closed 2026-09-24 - option 1, and two corrections to it
 
-Recorded rather than done (26.7). Nothing is broken today - the build passes - but the margin is
-small enough that the next person to add a check will hit it, and they should find this entry rather
-than a puzzling compile error.
+The suite is **nine files** under `scripts/selfcheck/`, largest 13,367 bytes against the same 65,536
+ceiling. `selfcheck` runs them in order and prints ONE tally; `selfcheck <part>` runs one.
+
+```
+00-language   13367     50-files      10947
+10-meta        8563     60-data        7156
+20-hardware    8639     70-cleanup     1042
+30-events      6651     80-network     6468
+40-persist     9725
+```
+
+**The seams were clean, which is what this entry said to confirm.** Measured before committing: all
+six `fn` definitions sit between lines 89 and 194 with every call site in that same range, and each of
+the thirteen `let` bindings is used only inside its own section. The one apparent exception - `name`,
+bound at line 50 and "used" at 303 - was a mention inside a comment. What crosses the parts is the
+working directory and the disk, and both survive, because `cwd` is threaded by `&mut` and the
+filesystem is the filesystem.
+
+### Two things this entry got wrong, both of which changed the design
+
+**"`selfcheck` would become a small driver that runs each part in turn" cannot be a script.** `run`
+and every library command is prompt-level only - `LIBRARY`'s own doc says two nested interpreter
+frames would blow the bounded user stack - so a `selfcheck.gsh` that runs the parts is exactly the
+nesting that is refused. The driver is `cmd_selfcheck`, in Rust: it walks `SELFCHECK_PARTS` and calls
+`run_lines` once per part, sequentially, at one depth. One frame at a time, never two.
+
+**"The pass/fail tally lives in the SHELL, not in the script - so a split does not have to thread
+counters between the parts" is half true, and the false half was the work.** The counters are in Rust,
+yes - but as LOCALS of one `run_lines` call, which printed them itself. Nine parts would have printed
+nine `run: ran N, failed M` lines, and that line is an interface: nineteen harness checks match
+`failed 0` against it. `run_lines` now takes an `Option<&mut Tally>`, adding its counts to a
+caller-owned total and leaving the line to whoever knows the run is over.
+
+### Two things it did not anticipate
+
+**The u16 ceiling is enforced TWICE.** `prescan_fns` indexes `fn` definitions with u16 offsets - and
+so do `run_lines`' own per-statement record arrays (`soff`, `fail_off`, `skip_off`), which index the
+same buffer. Option 2 (widen to u32) would have had to widen both, or fix one and leave the other
+wrapping silently. Splitting satisfies both, because each part is interpreted from its own buffer.
+
+**The per-statement detail cap stops biting.** `RUN_MAX_CMDS` is 256 per `run_lines` call and the
+single file ran 509 statements, so the report said "per-statement detail covers the first 256 of 509"
+and 253 statements were counted in the tally and named nowhere. Nine parts, nine budgets: the
+transcript now carries zero of those lines and every statement is named.
+
+Verified: `osdev test script` 7/0 - `ran 509, failed 0` unchanged, twice in one boot, plus
+`selfcheck files` running 131 statements alone and a name that is not a part being refused with the
+list of the ones that are.

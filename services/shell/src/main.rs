@@ -1914,7 +1914,8 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(ctx, s, args[1], 2) };
             return cmd_run(ctx, cwd, args[1], depth, save, &params);
         }
-        // `selfcheck [save <path>]` - run the embedded suite; `save` streams its report to a file.
+        // `selfcheck [<part>] [save <path>]` - run the embedded suite (or one part of it); `save`
+        // streams its report to a file.
         "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, s["selfcheck".len()..].trim()),
         _ => {}
     }
@@ -2066,7 +2067,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
                         "{}: a library command runs a script - not available inside another script", other));
                     return Err(ShellError::Unknown);
                 }
-                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true);
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true, None);
             }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -2222,7 +2223,7 @@ fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&st
         ctx.console_writeln_fmt(format_args!("run: script CODE exceeds {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
     }
     resolve_imports(ctx, &mut script, &mut code);
-    run_with_optional_save(ctx, cwd, &script[..code], depth, save, params)
+    run_with_optional_save(ctx, cwd, &[("", &script[..code])], depth, save, params)
 }
 
 const IMPORT_MAX: usize = 16; // max names in one `from … import a b c …`
@@ -3877,7 +3878,19 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
 /// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
 /// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
-fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
+/// What a run counted, so a caller running SEVERAL scripts can report one total.
+///
+/// `run_lines`'s counters used to be locals that printed themselves, which is right for a single
+/// script and wrong for `selfcheck`, whose nine parts are one suite. `run: ran N, failed M` is an
+/// interface - nineteen harness checks match `failed 0` against it - so it must be printed once, by
+/// whoever knows the run is over.
+#[derive(Default, Clone, Copy)]
+struct Tally { ran: u32, failed: u32, skipped: u32 }
+
+/// Interpret `src`. `tally`: `None` prints the `run:` line itself (a plain `run`); `Some` adds this
+/// script's counts to the caller's total and leaves the line to it (one part of a bigger suite).
+fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool,
+             tally: Option<&mut Tally>) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -4370,11 +4383,45 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                     skipped as usize - nskip_rec, RUN_MAX_FAILS));
             }
         }
-        // APPENDED, never reshaped: six harness checks match `run: ran N, failed M` exactly, and a
-        // tally line is an interface.
-        out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
+        // APPENDED, never reshaped: the harness matches `run: ran N, failed M` exactly, and a tally
+        // line is an interface. A part of a larger suite does not print it - its caller does, ONCE,
+        // after the last part, or nine parts would be nine suites as far as any reader is concerned.
+        if tally.is_none() {
+            out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
+        }
+    }
+    if let Some(t) = tally {
+        t.ran += ran;
+        t.failed += failed;
+        t.skipped += skipped;
     }
     if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// Run every part in order, reporting ONE tally for the lot.
+///
+/// A part is `(name, source)`; `name` is empty for a plain `run`, which has exactly one part and
+/// prints no heading. Sequential, never nested: each `run_lines` frame is gone before the next
+/// starts, which is what keeps this inside the bounded user stack.
+fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, out: &mut Out, params: &Params)
+    -> Result<(), ShellError>
+{
+    let mut t = Tally::default();
+    for &(name, src) in parts {
+        if parts.len() > 1 && !name.is_empty() {
+            out.line(ctx, "");
+            out.line_fmt(ctx, format_args!("##### part: {} #####", name));
+        }
+        // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
+        // part that fails must not stop the parts after it. A run that gave up half way would report
+        // a smaller `ran` and could read as a healthier machine than one that finished.
+        let _ = run_lines(ctx, cwd, src, depth, out, params, false, Some(&mut t));
+    }
+    if parts.len() > 1 {
+        out.line(ctx, "");
+    }
+    out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", t.ran, t.failed, t.skipped));
+    if t.failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
 /// Run `src` and, if `save` is `Some`, stream the report to that file (the utility writes its own
@@ -4382,12 +4429,12 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
 /// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
-fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
+fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, save: Option<&str>, params: &Params)
     -> Result<(), ShellError>
 {
     match save {
-        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params, false),
-        Some(spath) => run_and_save(ctx, cwd, src, depth, spath, params),
+        None => run_parts(ctx, cwd, parts, depth, &mut Out::Console, params),
+        Some(spath) => run_and_save(ctx, cwd, parts, depth, spath, params),
     }
 }
 
@@ -4395,7 +4442,7 @@ fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, 
 /// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
 /// is actually running, not in the frame of every bare run.
 #[inline(never)]
-fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
+fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, spath: &str, params: &Params)
     -> Result<(), ShellError>
 {
     let mut pbuf = [0u8; PATH_MAX];
@@ -4405,10 +4452,13 @@ fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &st
     ppath[..pl].copy_from_slice(path);
     let path = &ppath[..pl];
 
+    // ONE buffer for ALL the parts: a saved report of a nine-part suite is one report. The buffer
+    // lives here rather than per part for the reason it lives in this function at all - 32 KiB of
+    // frame that a bare run must not carry.
     let mut rb = ReportBuf::new();
     let result = {
         let mut out = Out::File(&mut rb);
-        run_lines(ctx, cwd, src, depth, &mut out, params, false)
+        run_parts(ctx, cwd, parts, depth, &mut out, params)
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
@@ -4458,7 +4508,32 @@ const RUN_MAX_FAILS: usize = 32;
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image - no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
 /// on-disk file (`MAX_FILE_BYTES` - a file is one ≤4 KiB IPC message; rodata is not).
-const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
+/// The fixed size of the parts scratch in `cmd_selfcheck`. A ceiling rather than a count, so adding a
+/// part is one line in the table below and not two - and a compile-time assert holds the two together.
+const SELFCHECK_MAX_PARTS: usize = 16;
+
+const SELFCHECK_PARTS: &[(&str, &str)] = &[
+    ("language", include_str!("../../../scripts/selfcheck/00-language.gsh")),
+    ("meta",     include_str!("../../../scripts/selfcheck/10-meta.gsh")),
+    ("hardware", include_str!("../../../scripts/selfcheck/20-hardware.gsh")),
+    ("events",   include_str!("../../../scripts/selfcheck/30-events.gsh")),
+    ("persist",  include_str!("../../../scripts/selfcheck/40-persist.gsh")),
+    ("files",    include_str!("../../../scripts/selfcheck/50-files.gsh")),
+    ("data",     include_str!("../../../scripts/selfcheck/60-data.gsh")),
+    ("cleanup",  include_str!("../../../scripts/selfcheck/70-cleanup.gsh")),
+    ("network",  include_str!("../../../scripts/selfcheck/80-network.gsh")),
+];
+
+/// The whole suite's size, for the line `selfcheck` prints before it starts.
+const fn selfcheck_bytes() -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < SELFCHECK_PARTS.len() {
+        n += SELFCHECK_PARTS[i].1.len();
+        i += 1;
+    }
+    n
+}
 
 /// The system library: gsh scripts baked into the image (rodata) and resolved PATH-like - typing a
 /// library name runs its script. This is the OS's "coreutils in gsh": features that grow by userspace
@@ -4476,7 +4551,22 @@ const LIBRARY: &[(&str, &str)] = &[
 
 // audit U6: baked scripts must stay under the u16 offset ceiling `prescan_fns` uses (64 KiB), or the
 // fn/summary offsets wrap silently and dispatch the wrong bodies. Fail the build, not at runtime.
-const _: () = assert!(SELFCHECK_GS.len() < 65536, "selfcheck.gsh exceeds the 64 KiB baked-script ceiling");
+//
+// PER PART, which is the point of there being parts (`backlog/47`). The suite reached 65,139 bytes of
+// this ceiling as one file, with 397 to spare; nine parts put the largest at about a fifth of it. The
+// same u16 bound applies twice over - `prescan_fns` indexes `fn` definitions with it, and
+// `run_lines`' own `soff`/`fail_off`/`skip_off` index the same buffer - and splitting satisfies both,
+// because each part is interpreted from its own buffer.
+const _: () = {
+    let mut i = 0;
+    while i < SELFCHECK_PARTS.len() {
+        assert!(SELFCHECK_PARTS[i].1.len() < 65536, "a selfcheck part exceeds the 64 KiB baked-script ceiling");
+        i += 1;
+    }
+};
+const _: () = assert!(
+    SELFCHECK_PARTS.len() <= SELFCHECK_MAX_PARTS,
+    "SELFCHECK_PARTS outgrew the scratch array in `cmd_selfcheck` - raise SELFCHECK_MAX_PARTS");
 const _: () = {
     let mut i = 0;
     while i < LIBRARY.len() {
@@ -4501,23 +4591,58 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
-    // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file -
-    // direct, not a pipe, so the orchestrator can save without the nested-capture stack overflow).
-    let save = if arg.is_empty() {
-        None
+    // `selfcheck [<part>] [save <path>]`. The part name is checked against the table rather than
+    // guessed at, so a typo says which names exist instead of silently running everything.
+    let (first, rest) = split_first(arg.trim());
+    let (part, tail) = if first.is_empty() || first == "save" {
+        (None, arg.trim())
     } else {
-        match arg.strip_prefix("save") {
-            Some(r) if r.starts_with(char::is_whitespace) && !r.trim().is_empty() => Some(r.trim()),
-            _ => {
-                ctx.console_writeln("usage: selfcheck [save <path>]");
+        match SELFCHECK_PARTS.iter().position(|&(n, _)| n == first) {
+            Some(i) => (Some(i), rest.trim()),
+            None => {
+                ctx.console_writeln_fmt(format_args!("selfcheck: no part named '{}'", first));
+                ctx.console_write("selfcheck: parts are");
+                for &(n, _) in SELFCHECK_PARTS { ctx.console_write_fmt(format_args!(" {}", n)); }
+                ctx.console_writeln("");
                 return Err(ShellError::Unknown);
             }
         }
     };
-    ctx.console_writeln_fmt(format_args!(
-        "selfcheck: running the embedded suite ({} bytes, in memory) - needs a flashed drive for the file tests...",
-        SELFCHECK_GS.len()));
-    run_with_optional_save(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, save, &Params::empty("selfcheck"))
+    // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file -
+    // direct, not a pipe, so the orchestrator can save without the nested-capture stack overflow).
+    let save = if tail.is_empty() {
+        None
+    } else {
+        match tail.strip_prefix("save") {
+            Some(r) if r.starts_with(char::is_whitespace) && !r.trim().is_empty() => Some(r.trim()),
+            _ => {
+                ctx.console_writeln("usage: selfcheck [<part>] [save <path>]");
+                return Err(ShellError::Unknown);
+            }
+        }
+    };
+
+    // THE PARTS ARE BUILT HERE, not baked as a second table: `SELFCHECK_PARTS` holds `&str` because
+    // `include_str!` does, and `run_lines` reads bytes. Bounded by the table's own length.
+    let mut buf = [("", &[][..]); SELFCHECK_MAX_PARTS];
+    let n = match part {
+        Some(i) => { buf[0] = (SELFCHECK_PARTS[i].0, SELFCHECK_PARTS[i].1.as_bytes()); 1 }
+        None => {
+            for (k, &(name, src)) in SELFCHECK_PARTS.iter().enumerate() {
+                buf[k] = (name, src.as_bytes());
+            }
+            SELFCHECK_PARTS.len()
+        }
+    };
+    match part {
+        Some(i) => ctx.console_writeln_fmt(format_args!(
+            "selfcheck: running part '{}' ({} bytes, in memory) - needs a flashed drive for the file tests...",
+            SELFCHECK_PARTS[i].0, SELFCHECK_PARTS[i].1.len())),
+        None => ctx.console_writeln_fmt(format_args!(
+            "selfcheck: running the embedded suite ({} parts, {} bytes, in memory) - needs a flashed drive for the file tests...",
+            SELFCHECK_PARTS.len(), selfcheck_bytes())),
+    }
+    run_with_optional_save(ctx, cwd, &buf[..n], depth, save, &Params::empty("selfcheck"))
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` - the **result** form: run `<cmd>` and check that it
@@ -4772,7 +4897,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("fmt <a>,<b>,...", "format (or check) several files - comma-separated, done one at a time", "fmt /x.gsh,/y.gsh"),
         ], true),
         "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
-            ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
+            ("selfcheck", "run every part in memory; reports one ran N, failed M for the lot", "selfcheck"),
+            ("selfcheck <part>", "run ONE part - language meta hardware events persist files data cleanup network", "selfcheck files"),
             ("selfcheck save <out>", "run it and write the report to a file (then read/edit/grep it)", "selfcheck save /report.txt"),
         ], true),
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
@@ -5177,7 +5303,7 @@ static HELP: &[HelpRow] = &[
     Row("echo <text>", "print text"),
     Row("result", "the last command's result (Ok / Err)"),
     Row("run <script> [save <out>]", "run a script (.gsh); `save` writes the report to a file"),
-    Row("selfcheck [save <out>]", "run the built-in self-check suite; `save` writes the report"),
+    Row("selfcheck [part] [save <out>]", "run the built-in self-check suite, or one named part of it"),
     Row("fcap", "file-as-capability self-check (diagnostic; fcap help)"),
     Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
     Gap,

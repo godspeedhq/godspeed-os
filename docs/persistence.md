@@ -682,7 +682,7 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   the bitmap is rebuildable from the tree, checksumming it is redundant (§6.10's deferred
   bitmap-CRC is folded into fsck, not built separately). Verified by `osdev test fs-check` (5/0):
   drift the free count host-side (both copies, CRC re-stamped), boot, `drives check` rebuilds the
-  correct value, 0 bad, the file survives. `selfcheck.gsh` also runs `assert ok drives check` on
+  correct value, 0 bad, the file survives. the selfcheck suite also runs `assert ok drives check` on
   a populated tree (in the script test). No regression (files 130/0).
 - **Phase H - block I/O error handling. ✅ Built + verified 2026-06-17.** A failed block
   read/write just failed the op. Now `block-driver` issues every read/write/zero through
@@ -732,7 +732,7 @@ byte in its data block, boot: `fs` logs a "data block CRC mismatch" and the read
   policy (run `drives scrub` on a schedule), not a hidden timer (§26.4: no silent complexity). Full
   §6.14. No format change, no amendment. Verified by `osdev test fs-scrub` (6/0): a corrupt data
   block is reported (`1 bad`), a second scrub still reports it (read-only - no repair), and the
-  clean file is untouched; `selfcheck.gsh` also runs `assert ok drives scrub` on a clean tree.
+  clean file is untouched; the selfcheck suite also runs `assert ok drives scrub` on a clean tree.
 
 **Deferred (heavier; pulled in only when a real need arises, §26.2 / §26.11):**
 
@@ -857,7 +857,7 @@ Two honesty points the constitution forces (§26.4/§26.7):
 
 Verified by `osdev test fs-scrub` (6/0): a disk with one clean file and one whose data block was
 flipped host-side - scrub reports `1 bad`, a second scrub still reports `1 bad` (proving it is
-read-only and repaired nothing), and the clean file is untouched. `selfcheck.gsh` runs
+read-only and repaired nothing), and the clean file is untouched. the selfcheck suite runs
 `assert ok drives scrub` over a populated clean tree (the 0-bad path). No on-disk format change; no
 constitutional amendment (within §15/§26.6, no TCB or §7 change).
 
