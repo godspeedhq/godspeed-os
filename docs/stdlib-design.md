@@ -1378,11 +1378,13 @@ stack-fit: every frame fits the 262144-byte user stack:
 Zero hard errors on any port. The warning counts (372 / 385 / 393) are pre-existing categories, and
 the ones naming SDK functions are main's by definition since `sdk/` is zero-diff.
 
-19 of 19 checker scripts pass with all four targets present: `arch_boundary_check`, `arch_seam_check`,
-`backlog_check`, `commandments`, `contract_check`, `dash_check`, `doc_refs`, `doc_symbols_check`,
-`embed_order_check`, `facts_check`, `foreign_word_check`, `line_ending_check`, `line_ref_check`,
-`port_scope_check`, `scaffold_check`, `service_embed_check`, `shared_surface_check`, `site_check`,
-`unsafe_check`.
+19 of 19 checker scripts pass with all four targets present: `scripts/arch_boundary_check.py`,
+`scripts/arch_seam_check.py`, `scripts/backlog_check.py`, `scripts/commandments.py`,
+`scripts/contract_check.py`, `scripts/dash_check.py`, `scripts/doc_refs.py`,
+`scripts/doc_symbols_check.py`, `scripts/embed_order_check.py`, `scripts/facts_check.py`,
+`scripts/foreign_word_check.py`, `scripts/line_ending_check.py`, `scripts/line_ref_check.py`,
+`scripts/port_scope_check.py`, `scripts/scaffold_check.py`, `scripts/service_embed_check.py`,
+`scripts/shared_surface_check.py`, `scripts/site_check.py`, `scripts/unsafe_check.py`.
 
 ### What is NOT validated, stated plainly
 
