@@ -4677,16 +4677,25 @@ fn selfcheck_tidy(ctx: &ShellCtx) {
     let mut removed = 0u32;
     for &(path, tree) in SELFCHECK_REMNANTS {
         let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
-        let r = if tree { g.delete_all(path.as_bytes()) } else { g.delete(path.as_bytes()) };
+        // ASK FIRST. `fs` answers a delete of an absent path with FS_ERR, not FS_NOTFOUND, so
+        // deleting blind and reading the status cannot tell "there was nothing there" from "the disk
+        // refused". On a clean T630 that printed three "a previous run's files may remain" lines
+        // about an empty tree. `exists` makes the distinction the status byte cannot, and it is what
+        // the parts themselves do: `if dir /sc { delete /sc recursive }`.
+        let present = g.exists(path.as_bytes()).unwrap_or(false);
+        let r = if !present {
+            Ok(())
+        } else if tree {
+            g.delete_all(path.as_bytes()).map(|_| removed += 1)
+        } else {
+            g.delete(path.as_bytes()).map(|_| removed += 1)
+        };
         ctx.fs_tag.set(g.tag());
-        match r {
-            Ok(()) => removed += 1,
-            // Absent is the expected case and says nothing. A storage fault is NOT swallowed: the
-            // run is about to make files, so an operator needs to know the disk refused a delete
-            // before they read the failures that follow from it.
-            Err(gs::Error::NotFound) | Err(gs::Error::NoFilesystem) => {}
-            Err(e) => ctx.console_writeln_fmt(format_args!(
-                "selfcheck: could not clear {} - {} (a previous run's files may remain)", path, e.as_str())),
+        // A refusal to delete something that IS there is not swallowed: the run is about to make
+        // files, and an operator needs that before they read the failures which follow from it.
+        if let Err(e) = r {
+            ctx.console_writeln_fmt(format_args!(
+                "selfcheck: could not clear {} - {} (a previous run's files may remain)", path, e.as_str()));
         }
     }
     if removed > 0 {
@@ -8019,9 +8028,30 @@ fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let qlen = dns_query_bytes("example.com", &mut query);
     let mut resp = [0u8; 512];
 
+    // WHERE THE RESOLVER ACTUALLY IS. This sent to 10.0.2.3 - QEMU SLIRP's resolver, hardcoded - so
+    // on real hardware the datagram went nowhere and the command reported "the peer did not answer",
+    // which is true about that address and misleading about the machine. The lease knows; ask it, the
+    // same way `serve` asks for the address it prints.
+    // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
+    let dns = match net_status_reply(ctx) {
+        Some(r) => {
+            let st = r.payload_bytes();
+            if st.len() >= 19 && st[15..19] != [0, 0, 0, 0] {
+                [st[15], st[16], st[17], st[18]]
+            } else {
+                out.line(ctx, "sock: no resolver configured - run `net` first (a lease supplies one)");
+                return Err(ShellError::Unknown);
+            }
+        }
+        None => {
+            out.line(ctx, "sock: net-stack did not answer - cannot tell where the resolver is");
+            return Err(ShellError::Unknown);
+        }
+    };
+
     let mut gnet = gs::net::Net::new(&**ctx);
     let r = match gnet.socket() {
-        Ok(mut s) => s.send_to(gs::net::Ipv4([10, 0, 2, 3]), 53, &query[..qlen], &mut resp),
+        Ok(mut s) => s.send_to(gs::net::Ipv4(dns), 53, &query[..qlen], &mut resp),
         Err(e) => {
             ctx.console_writeln_fmt(format_args!(
                 "sock: net-stack would not open a socket - {} (no NIC?)", e.as_str()));
@@ -8033,11 +8063,11 @@ fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         // single zero byte, and this command used to print the reply's LENGTH - so a query nobody
         // answered read as "received 1 bytes back". It said so under QEMU every time.
         Ok(0) => out.line_fmt(ctx, format_args!(
-            "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, nothing came back (the send went through the capability; the peer did not answer)",
-            qlen)),
+            "sock: UDP socket cap - sent {} bytes to {}.{}.{}.{}:53, nothing came back (the send went through the capability; the peer did not answer)",
+            qlen, dns[0], dns[1], dns[2], dns[3])),
         Ok(n) => out.line_fmt(ctx, format_args!(
-            "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, received {} bytes back (a round-trip through a capability)",
-            qlen, n)),
+            "sock: UDP socket cap - sent {} bytes to {}.{}.{}.{}:53, received {} bytes back (a round-trip through a capability)",
+            qlen, dns[0], dns[1], dns[2], dns[3], n)),
         // The user's own `q` is not a fault.
         Err(gs::Error::Cancelled) => return Ok(()),
         Err(e) => {
