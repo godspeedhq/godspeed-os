@@ -219,6 +219,12 @@ pub struct Fs<'a> {
     reason: [u8; REASON_MAX],
     reason_len: u8,
     notice: Option<&'a dyn Fn()>,
+    /// How long ORDINARY operations wait. `None` means [`call::DEFAULT_SECS`].
+    ///
+    /// The operations with a budget of their own - a subtree delete walks a tree, so it carries
+    /// `SWEEP_SECS` - keep it. Overriding those would let a caller set a deadline shorter than the
+    /// work it is waiting for, which is the bug this whole module keeps finding elsewhere.
+    patience: Option<i64>,
 }
 
 /// What [`stat`](Fs::stat) found.
@@ -235,7 +241,7 @@ impl<'a> Fs<'a> {
     ///
     /// Cheap, allocates nothing, and grants nothing. See the type's authority note.
     pub fn new(ctx: &'a ServiceContext) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None }
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, patience: None }
     }
 
     /// A handle that calls `notice` when a request has been waiting a while.
@@ -251,7 +257,28 @@ impl<'a> Fs<'a> {
     /// request the operator then aborts returns [`Error::Cancelled`], which is NOT a fault - report
     /// it as the deliberate act it was.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice) }
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice),
+             patience: None }
+    }
+
+    /// Wait `secs` for an ordinary operation instead of [`call::DEFAULT_SECS`].
+    ///
+    /// **This is the CALLER's patience, not a promise about the service.** Use it where waiting the
+    /// default would be worse than giving up: a shell loading its history at startup must not sit on
+    /// a prompt because `fs` respawned and is still re-mounting, and a background marker write is
+    /// not worth a long wait at all.
+    ///
+    /// **A short deadline does not make a failure smaller.** Giving up on a WRITE leaves
+    /// [`Error::OutcomeUnknown`], and shortening the wait makes that outcome MORE likely, not less -
+    /// so a caller that sets this must have something sensible to do with "it may have happened".
+    /// The right use is a write nobody is waiting on; the wrong one is shortening a write somebody
+    /// will act on the result of.
+    ///
+    /// Operations that carry their own budget because they do more work - [`delete_all`](Fs::delete_all)
+    /// walks a subtree - are NOT shortened by this. A caller cannot set a deadline under the work.
+    pub fn patience_secs(mut self, secs: i64) -> Fs<'a> {
+        self.patience = if secs > 0 { Some(secs) } else { None };
+        self
     }
 
     /// Take a handle that CONTINUES an existing tag sequence for this channel.
@@ -270,7 +297,7 @@ impl<'a> Fs<'a> {
     /// not a loud rejection - it is a stale reply silently accepted as the answer to the current
     /// question. See [`TAG_START`](self).
     pub fn from_tag(ctx: &'a ServiceContext, tag: u8) -> Fs<'a> {
-        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None }
+        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, patience: None }
     }
 
     /// Lend this handle a waiting-notice, as [`with_notice`](Fs::with_notice) describes.
@@ -317,6 +344,11 @@ impl<'a> Fs<'a> {
     /// Identical to the rule `services/shell` uses, so one counter can be shared across both (see
     /// [`from_tag`](Fs::from_tag)). Zero is skipped because a zero tag can only have come from a
     /// sender that does not tag at all, and that must stay distinguishable.
+    /// The deadline an ordinary operation waits: the caller's, or the library's default.
+    fn secs(&self) -> i64 {
+        self.patience.unwrap_or(call::DEFAULT_SECS)
+    }
+
     fn next_tag(&mut self) -> u8 {
         let t = self.tag.wrapping_add(1);
         self.tag = if t == 0 { 1 } else { t };
@@ -402,7 +434,7 @@ impl<'a> Fs<'a> {
         let mut total = 0usize;
         let mut pages = 0u16;
         loop {
-            let r = match self.call(OP_LIST_DIR, path.as_ref(), &from.to_le_bytes(), call::DEFAULT_SECS) {
+            let r = match self.call(OP_LIST_DIR, path.as_ref(), &from.to_le_bytes(), self.secs()) {
                 Ok(r) => r,
                 // The FIRST page failing means the path is not a readable directory, and the caller
                 // needs that error. A LATER one failing is a read error inside a walk that already
@@ -479,7 +511,8 @@ impl<'a> Fs<'a> {
     /// service that ensures its own data directory should not have to care whether it is the first
     /// to run. Use [`create_dir`](Fs::create_dir) where the path's absence is itself the thing being asserted.
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
+    /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
     /// [`Error::Failed`] with [`reason`](Fs::reason) naming the step that failed (a parent that is
@@ -487,7 +520,7 @@ impl<'a> Fs<'a> {
     /// creating directories is idempotent, but the transaction may have committed unseen, so
     /// re-issuing is only safe once you accept that it is a second attempt rather than the first.
     pub fn create_dir_all(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
-        self.call(OP_MKDIR_P, path.as_ref(), &[], call::DEFAULT_SECS)?;
+        self.call(OP_MKDIR_P, path.as_ref(), &[], self.secs())?;
         Ok(())
     }
 
@@ -498,7 +531,8 @@ impl<'a> Fs<'a> {
     /// inside itself - the tree stays a tree, and that rule is the service's to enforce, not the
     /// caller's to remember.
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
+    /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
     /// [`Error::NotFound`] if the source is absent; [`Error::Failed`] with
@@ -509,7 +543,7 @@ impl<'a> Fs<'a> {
         if dest.as_ref().len() > PATH_MAX {
             return Err(Error::InvalidInput);
         }
-        self.call(OP_MOVE, path.as_ref(), dest.as_ref(), call::DEFAULT_SECS)?;
+        self.call(OP_MOVE, path.as_ref(), dest.as_ref(), self.secs())?;
         Ok(())
     }
 
@@ -556,7 +590,8 @@ impl<'a> Fs<'a> {
     /// over one endpoint. The borrow is what makes that structural rather than a rule to remember.
     /// See [`File`](crate::cap::File) for how to hold two files at once.
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
+    /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability
     /// - opening a file grants nothing the contract did not already grant.
     ///
     /// # Errors
@@ -566,7 +601,7 @@ impl<'a> Fs<'a> {
     /// - [`Error::Failed`] - `fs` replied without a capability. Retrying an open is safe.
     pub fn open<'f>(&'f mut self, path: impl AsRef<[u8]>, rights: u8) -> Result<crate::cap::File<'f, 'a>, Error> {
         let ctx = self.ctx;
-        self.call(OP_OPEN, path.as_ref(), &[rights], call::DEFAULT_SECS)?;
+        self.call(OP_OPEN, path.as_ref(), &[rights], self.secs())?;
         // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
@@ -636,7 +671,8 @@ impl<'a> Fs<'a> {
     /// guarantee. If you are offering this to a person, ask them first - every other destructive
     /// operation here can be undone by doing the opposite, and this one cannot.
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
+    /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
     /// - [`Error::NotFound`] - no such path.
@@ -645,19 +681,20 @@ impl<'a> Fs<'a> {
     /// - Sealing twice is harmless - the second call finds it already sealed - so a no-answer error
     ///   here may be retried, unlike most mutations.
     pub fn seal(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
-        self.call(OP_SEAL, path.as_ref(), &[], call::DEFAULT_SECS)?;
+        self.call(OP_SEAL, path.as_ref(), &[], self.secs())?;
         Ok(())
     }
 
     /// Ask whether a path exists, and what it is.
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
+    /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
     /// [`Error::NotFound`] if the path is absent. See [`Error`] for the no-answer cases; a `stat` is
     /// read-only, so retrying any of them is safe.
     pub fn stat(&mut self, path: impl AsRef<[u8]>) -> Result<Stat, Error> {
-        let r = self.call(OP_STAT_FILE, path.as_ref(), &[], call::DEFAULT_SECS)?;
+        let r = self.call(OP_STAT_FILE, path.as_ref(), &[], self.secs())?;
         let b = r.body();
         // [status, exists, size:u64, is_dir] after the tag - 11 bytes from the tag inclusive.
         if b.len() < 10 {
@@ -680,7 +717,8 @@ impl<'a> Fs<'a> {
     /// so a caller wanting more must loop - and the loop is the caller's, because only the caller
     /// knows whether a short read means "done" or "keep going".
     ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** the caller's existing `fs` capability.
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
+    /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
     /// - [`Error::NotFound`] - no such file, or it is a directory.
@@ -694,7 +732,7 @@ impl<'a> Fs<'a> {
         let mut tail = [0u8; 12];
         tail[..8].copy_from_slice(&offset.to_le_bytes());
         tail[8..].copy_from_slice(&(want as u32).to_le_bytes());
-        let r = self.call(OP_READ_AT, path.as_ref(), &tail, call::DEFAULT_SECS)?;
+        let r = self.call(OP_READ_AT, path.as_ref(), &tail, self.secs())?;
         let b = r.body();
         // `[n:u32, bytes..]` after the tag and status the call already checked.
         if b.len() < 4 {
@@ -737,7 +775,7 @@ impl<'a> Fs<'a> {
             let mut tail = [0u8; 12];
             tail[..8].copy_from_slice(&(off as u64).to_le_bytes());
             tail[8..].copy_from_slice(&(want as u32).to_le_bytes());
-            let r = self.call(OP_READ_AT, path.as_ref(), &tail, call::DEFAULT_SECS)?;
+            let r = self.call(OP_READ_AT, path.as_ref(), &tail, self.secs())?;
             let b = r.body();
             if b.len() < 4 {
                 return Err(Error::Malformed);
@@ -763,20 +801,20 @@ impl<'a> Fs<'a> {
     /// answers this for you, and says `false` for that case on purpose.
     pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
-            self.call(OP_WRITE_FILE, path.as_ref(), data, call::DEFAULT_SECS)?;
+            self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;
             return Ok(());
         }
         // Larger than one message: create it, then fill it positionally. `WRITE_AT` at a fixed
         // offset is one of the two operations `services/fs` documents as positionally idempotent,
         // which is what makes a chunked write safe to resume at all.
-        self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], call::DEFAULT_SECS)?;
+        self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], self.secs())?;
         let mut off = IO_CHUNK;
         while off < data.len() {
             let n = (data.len() - off).min(IO_CHUNK);
             let mut tail = [0u8; 8 + IO_CHUNK];
             tail[..8].copy_from_slice(&(off as u64).to_le_bytes());
             tail[8..8 + n].copy_from_slice(&data[off..off + n]);
-            self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + n], call::DEFAULT_SECS)?;
+            self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + n], self.secs())?;
             off += n;
         }
         Ok(())
@@ -786,7 +824,7 @@ impl<'a> Fs<'a> {
     ///
     /// **Blocks**. Changes state: see the note on [`write`] about [`Error::OutcomeUnknown`].
     pub fn create_dir(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
-        self.call(OP_MKDIR, path.as_ref(), &[], call::DEFAULT_SECS)?;
+        self.call(OP_MKDIR, path.as_ref(), &[], self.secs())?;
         Ok(())
     }
 
@@ -796,7 +834,7 @@ impl<'a> Fs<'a> {
     /// [`Error::OutcomeUnknown`] the file may already be gone, and a second delete would report
     /// `NotFound` for work that succeeded. Report the uncertainty; do not re-send.
     pub fn delete(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
-        self.call(OP_DELETE, path.as_ref(), &[], call::DEFAULT_SECS)?;
+        self.call(OP_DELETE, path.as_ref(), &[], self.secs())?;
         Ok(())
     }
 
@@ -812,7 +850,7 @@ impl<'a> Fs<'a> {
     /// Added because `services/recorder` needed it during migration. It is a real filesystem
     /// operation, so it belongs in the typed surface rather than behind an opcode escape hatch.
     pub fn create_sized(&mut self, path: impl AsRef<[u8]>, capacity: u64) -> Result<(), Error> {
-        self.call(OP_WRITE_NEW, path.as_ref(), &capacity.to_le_bytes(), call::DEFAULT_SECS)?;
+        self.call(OP_WRITE_NEW, path.as_ref(), &capacity.to_le_bytes(), self.secs())?;
         Ok(())
     }
 
@@ -833,7 +871,7 @@ impl<'a> Fs<'a> {
         let mut tail = [0u8; 8 + IO_CHUNK];
         tail[..8].copy_from_slice(&offset.to_le_bytes());
         tail[8..8 + data.len()].copy_from_slice(data);
-        self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + data.len()], call::DEFAULT_SECS)?;
+        self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + data.len()], self.secs())?;
         Ok(())
     }
 
@@ -844,7 +882,7 @@ impl<'a> Fs<'a> {
     /// [`Error::OutcomeUnknown`] check with [`exists`](Fs::exists) rather than re-sending - this is precisely
     /// the case where a retry reports failure for work that succeeded.
     pub fn rename(&mut self, path: impl AsRef<[u8]>, new_name: impl AsRef<[u8]>) -> Result<(), Error> {
-        self.call(OP_RENAME, path.as_ref(), new_name.as_ref(), call::DEFAULT_SECS)?;
+        self.call(OP_RENAME, path.as_ref(), new_name.as_ref(), self.secs())?;
         Ok(())
     }
 

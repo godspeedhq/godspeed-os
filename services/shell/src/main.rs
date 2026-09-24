@@ -1564,7 +1564,7 @@ impl History {
             buf[pos..pos + l.len()].copy_from_slice(l); pos += l.len();
             buf[pos] = b'\n'; pos += 1;
         }
-        let _ = fs_request_bounded(ctx, OP_WRITE_FILE, path, &buf[..pos], HIST_SAVE_SECS);
+        let _ = sh_write_within(ctx, path, &buf[..pos], HIST_SAVE_SECS);
     }
 }
 
@@ -4436,8 +4436,7 @@ fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
     // report is small → this single-message path).
     if data.len() <= IO_CHUNK {
-        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data, SAVE_FS_MAX_SECS)
-            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+        return sh_write_within(ctx, path, data, SAVE_FS_MAX_SECS);
     }
     if !fs_write_new(ctx, path, data.len() as u64) { return false; }
     let mut off = 0usize;
@@ -6514,34 +6513,32 @@ fn clock_floor_persist(ctx: &ShellCtx, epoch: u32, quiet: bool) -> bool {
     }
     let mut b = EpochBuf { buf: [0u8; 24], len: 0 };
     let _ = core::fmt::write(&mut b, format_args!("{}", epoch));
-    match fs_request_bounded(ctx, OP_WRITE_FILE, CLOCK_FLOOR_PATH, &b.buf[..b.len], CLOCK_FS_SECS) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => true,
-        _ => {
-            // No disk, no filesystem, or a write that failed: the floor simply will not survive this power
-            // cycle. That is the honest degraded state (next boot knows nothing), not a silent success.
-            if !quiet { ctx.console_writeln("date: could not record the clock floor (no filesystem?)"); }
-            false
-        }
+    if sh_write_within(ctx, CLOCK_FLOOR_PATH, &b.buf[..b.len], CLOCK_FS_SECS) {
+        true
+    } else {
+        // No disk, no filesystem, or a write that failed: the floor simply will not survive this power
+        // cycle. That is the honest degraded state (next boot knows nothing), not a silent success.
+        if !quiet { ctx.console_writeln("date: could not record the clock floor (no filesystem?)"); }
+        false
     }
 }
 
 /// Read a whole small file into `dst`, returning the byte count, or `None` if it is absent / unreadable /
-/// `fs` is not serving. **The ONE place that parses an OP_READ_FILE reply.**
+/// `fs` is not serving.
 ///
-/// `fs` answers `[FS_OK, len:u32 LE, data..]`. Every caller that hand-parses that shape gets three
-/// chances to be wrong, and one of them already was: checking the status byte against `1` fails on every
-/// SUCCESS (FS_OK is 0; 1 is FS_ERR), and skipping only one byte splices the length prefix into the data.
-/// That bug made a feature silently inert on every boot. Parsing it once, here, removes the failure mode
-/// for the next caller instead of leaving it lying around (§26.4 - one visible mechanism, not N copies).
+/// The doc here used to say "**the ONE place that parses an OP_READ_FILE reply**", and recorded why:
+/// a caller checked the status byte against `1`, which fails on every SUCCESS, and skipped one byte
+/// instead of five so the length prefix spliced into the data - a feature silently inert on every
+/// boot. That argument is right and it leads one layer further than this file: the decoder belongs
+/// to the library, so it is one place for the whole system rather than one per crate.
+///
+/// `read_into` also STREAMS, so the 3556-byte one-message ceiling that made a larger file look
+/// ABSENT is gone - it fills `dst` however many messages that takes.
 fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
-    let r = fs_request_bounded(ctx, OP_READ_FILE, path, &[], max_secs)?;
-    let p = r.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < 5 { return None; }   // FS_NOTFOUND / FS_ERR / no filesystem
-    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-    let end = (5 + n).min(p.len());
-    let m = (end - 5).min(dst.len());
-    dst[..m].copy_from_slice(&p[5..5 + m]);
-    Some(m)
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let r = g.read_into(path, dst);
+    ctx.fs_tag.set(g.tag());
+    r.ok()
 }
 
 /// Seed the kernel's clock floor from the last-known time on disk, at startup. The floor is a BOUND, never
@@ -10239,8 +10236,7 @@ fn sticky_write(ctx: &ShellCtx, budget: u64, filter: &str, path: &str) -> bool {
     for &c in f.as_bytes().iter().take(12) { buf[n] = c; n += 1; }
     buf[n] = b' '; n += 1;
     for &c in path.as_bytes().iter().take(64) { buf[n] = c; n += 1; }
-    matches!(fs_request_bounded(ctx, OP_WRITE_FILE, STICKY_PATH, &buf[..n], STICKY_SECS).as_ref()
-                 .map(|r| r.payload_bytes().first() == Some(&FS_OK)), Some(true))
+    sh_write_within(ctx, STICKY_PATH, &buf[..n], STICKY_SECS)
 }
 
 /// Forget a sticky capture. Called on `stop`, so an explicit stop stays stopped across a reboot -
@@ -12766,6 +12762,18 @@ fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
 /// have one tag sequence; a helper that started a second could mint a tag already in flight, and a
 /// colliding tag is not rejected loudly - it lets a stale reply be accepted as the current answer.
 /// That is the bug this branch fixed in `services/copier`, which had a CONSTANT tag.
+/// Write a whole (small) file with a SHORTER deadline than the default. `true` if it went.
+///
+/// For a write nobody is waiting on - the history file, a marker, a report saved after a chaos storm
+/// has just hammered `fs`. A shorter wait makes [`gs::Error::OutcomeUnknown`] MORE likely, not less,
+/// so this is only right where "it may have landed" is an acceptable answer and hanging is not.
+fn sh_write_within(ctx: &ShellCtx, path: &[u8], data: &[u8], secs: i64) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(secs);
+    let ok = g.write(path, data).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
 /// Write a whole (small) file, borrowing the shell's one tag counter. `true` if it went.
 fn sh_write(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
     let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
@@ -13200,71 +13208,6 @@ fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
 /// net-stack's own budget, which it cannot do to a literal.
 const NET_RESOLVE_SECS: i64 = 8;
 
-fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
-    let pl = path.len().min(255);
-    let mut req = [0u8; 4096];
-    let tag = next_fs_tag(ctx);
-    req[0] = tag;
-    req[1] = op;
-    req[2] = pl as u8;
-    req[3..3 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 3 - pl);
-    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..3 + pl + dn]);
-    drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
-    let first = ctx.request_with_reply_deadline("fs", &msg, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
-    if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, max_secs) {
-        return Some(r);
-    }
-    // TIMED OUT. The request was already SENT, so `fs` will reply into our endpoint whether we are still
-    // listening or not - and an unclaimed reply is not harmless: it sits in the queue and the NEXT fs
-    // request reads IT instead of its own answer. That is not hypothetical. A 2 s read of a non-existent
-    // `/clock.last` at boot (fs still mounting) timed out, and its late 1-byte `[FS_NOTFOUND]` was then
-    // consumed by `drives`, which reported "no disk found" on a healthy, mounted 15 GB disk. The bound was
-    // right; abandoning the reply without reclaiming it was the bug.
-    //
-    // So spend a SHORT grace collecting the late reply purely to discard it. The abortable request path
-    // solves the same problem with a drain at its own top; this path had no equivalent.
-    // Timed out. Do NOT try to reclaim the late reply here - that is the race described in
-    // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
-    // NEVER RE-SEND A DESTRUCTIVE OP, and this is the carnage §3.5 gap closed rather than detected.
-    //
-    // The retry below is correct for a READ: nothing happened, so asking again is free. For a
-    // `move`, `delete` or `rename` it is not, and the failure is not hypothetical - a test that
-    // completes a move and swallows its reply produced exactly this:
-    //
-    //     [diag] reacquired fs - retrying
-    //     move: failed - source not found          <- the file was already at the destination
-    //
-    // The first attempt SUCCEEDED. The retry found nothing at the source, and its error was reported
-    // as the move's outcome: a confident wrong answer about a destructive operation (§26.7).
-    //
-    // The protocol cannot deduplicate this away. The correlation tag matches a reply to a request,
-    // and the retry deliberately draws a FRESH one so a late original can be told apart - so a retry
-    // is indistinguishable from a new request BY DESIGN. Making it distinguishable means a client-
-    // supplied operation id that survives retries, plus a reply cache in `fs`; real work, and
-    // recorded as such.
-    //
-    // What needs no protocol change is the honest answer: the operation already ran, re-sending
-    // cannot help, and the outcome is UNKNOWN. Say so.
-    if op_is_mutating(op) {
-        ctx.fs_unknown.set(true);
-        ctx.last_write_err.borrow_mut().set_text(
-            "the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - a retry can repeat a destructive operation. Check with `dir`");
-        return None;
-    }
-    if ctx.reacquire_by_name("fs") {
-        drain_stale_fs_replies(ctx);
-        let tag2 = next_fs_tag(ctx);
-        let mut req2 = req;
-        req2[0] = tag2;
-        let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-        let again = ctx.request_with_reply_deadline("fs", &msg2, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
-        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
-    }
-    None
-}
-
 /// Discard anything already queued on our endpoint BEFORE sending an fs request.
 ///
 /// This is the only reliable cure for a desynchronised reply channel, and it belongs at the START of a
@@ -13352,35 +13295,22 @@ fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Optio
 }
 
 /// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
-/// `max_secs` (RTC) via `fs_request_bounded`, so an alive-but-not-serving fs (respawned, still
-/// re-mounting) cannot hang the prompt. `None` on timeout/miss/absent, treated as "no file".
+/// `max_secs`, so an alive-but-not-serving fs (respawned, still re-mounting) cannot hang the prompt.
+/// `None` on timeout/miss/absent, treated as "no file".
 fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
-    let reply = fs_request_bounded(ctx, OP_STAT_FILE, path, &[], max_secs)?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
-        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r.ok().map(|st| (st.size, st.is_dir))
 }
 
 /// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
 /// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
 fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
-    let mut tail = [0u8; 12];
-    tail[..8].copy_from_slice(&offset.to_le_bytes());
-    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
-    let reply = fs_request_bounded(ctx, OP_READ_AT, path, &tail, max_secs)?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        let n = end - 5;
-        out[..n].copy_from_slice(&p[5..end]);
-        Some(n)
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let r = g.read_at(path, offset, out);
+    ctx.fs_tag.set(g.tag());
+    r.ok()
 }
 
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with

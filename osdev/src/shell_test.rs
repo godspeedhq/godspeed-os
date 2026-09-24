@@ -5488,8 +5488,14 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     // (no host bake) - the one-USB hardware path where the operator flashes only os.img,
     // `drives flash`es the SSD, then types `selfcheck`. The big suite + many service spawns
     // take a while under TCG, so allow a generous wall-clock window.
+    //
+    // 300s, NOT THE 150 THIS HELD. `fail` ends a gsh run, so while one statement in the middle of
+    // the suite was failing, only 326 of its 509 statements ever executed - and 150 was chosen
+    // against that shortened run. Fixing the failure made the suite 56% longer to complete and the
+    // window was then under the work it waits on: three runs of one build gave 5/0, 5/0 and 3/2, the
+    // failures being timeouts rather than anything the suite reported.
     send(&mut write_half, b"selfcheck\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(300)) {
         Some(r) => {
             // Always save the full live transcript so the run can be inspected line-by-line.
             let _ = std::fs::write("build/selfcheck-transcript.txt", r.as_bytes());
@@ -5512,8 +5518,12 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     //
     // A suite that only passes on a fresh boot fails the first time someone runs it twice, which is
     // exactly when they are investigating something.
+    //
+    // The SECOND run is the slower of the two: it contends with everything the first left running -
+    // `recorder` spawned, a capture rotated, the disk fuller - so if either window is short it is
+    // this one, and it was the one that failed first.
     send(&mut write_half, b"selfcheck\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(300)) {
         Some(r) => {
             let _ = std::fs::write("build/selfcheck-transcript-2.txt", r.as_bytes());
             if r.contains("failed 0") && !r.contains("--- failures ---") {
