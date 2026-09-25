@@ -4,7 +4,7 @@
 
 A capability-based microkernel OS written in Rust. Every privileged action requires an explicit capability. Services are isolated. Failures are visible. Authority is never inherited or ambient.
 
-📖 **[Documentation](https://godspeedhq.github.io/godspeed-os/)** · **[SDK API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/)** · **[Releases](https://github.com/godspeedhq/godspeed-os/releases)**
+📖 **[Documentation](https://godspeedhq.github.io/godspeed-os/)** · **[Standard library API](https://godspeedhq.github.io/godspeed-os/api/godspeed/)** · **[SDK API](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/)** · **[Releases](https://github.com/godspeedhq/godspeed-os/releases)**
 
 > **New here?** [**GETTING_STARTED.md**](GETTING_STARTED.md) takes you from zero to your first running service in a few minutes.
 
@@ -286,8 +286,25 @@ website/      documentation site (mdBook; renders this repo's docs)
 
 ## Documentation site
 
-**Live at [godspeedhq.github.io/godspeed-os](https://godspeedhq.github.io/godspeed-os/)**, with the
-[SDK API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/) under `/api`.
+**Live at [godspeedhq.github.io/godspeed-os](https://godspeedhq.github.io/godspeed-os/)**, with two
+API references under `/api`:
+
+- [**`godspeed`** - the standard library](https://godspeedhq.github.io/godspeed-os/api/godspeed/),
+  imported as `gs`. **This is what you write a program against**: 93 public items across
+  [`fs`](https://godspeedhq.github.io/godspeed-os/api/godspeed/fs/index.html) (files and directories,
+  a file as a real capability), [`net`](https://godspeedhq.github.io/godspeed-os/api/godspeed/net/index.html)
+  (sockets, listeners, DNS - a socket IS a capability),
+  [`cap`](https://godspeedhq.github.io/godspeed-os/api/godspeed/cap/index.html) (holding, deriving and
+  narrowing capabilities), plus
+  [`io`](https://godspeedhq.github.io/godspeed-os/api/godspeed/io/index.html),
+  [`call`](https://godspeedhq.github.io/godspeed-os/api/godspeed/call/index.html),
+  [`error`](https://godspeedhq.github.io/godspeed-os/api/godspeed/error/index.html) and
+  [`addr`](https://godspeedhq.github.io/godspeed-os/api/godspeed/addr/index.html).
+  [**Writing a program for GodspeedOS**](https://godspeedhq.github.io/godspeed-os/stdlib.html) is the
+  place to start.
+- [**`godspeed-sdk`** - the layer underneath](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/),
+  the raw syscall seam and the audited MMIO/DMA accessors a driver needs. Reach for it when the
+  standard library does not cover what you are doing.
 
 Two sections worth knowing about:
 [**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
