@@ -49,6 +49,8 @@ BOARDS = {
         "deploy": [
             "copy build/kernel7.img     -> <card>/kernel7.img",
             "copy build/config-pi2.txt  -> <card>/config.txt   (RENAME; replace the Imager's)",
+            "  or: powershell -File scripts/deploy_pi2.ps1 -Card D:   (does both, verifies both)",
+            "  a card stuck on the RAINBOW SCREEN: add -Check to diagnose it without writing",
             "the card also needs the Pi firmware: bootcode.bin, start.elf, fixup.dat",
         ],
     },
