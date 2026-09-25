@@ -244,7 +244,23 @@ jobs:
             gh release create "$V" --draft --title "$V"               --notes "Draft created by the release workflow to hold build artefacts. Write the notes and publish."
           else
             DRAFT=$(gh release view "$V" --json isDraft -q .isDraft)
-            echo "release $V already exists (draft: $DRAFT)"
+            ASSETS=$(gh release view "$V" --json assets -q '.assets | length')
+            echo "release $V already exists (draft: $DRAFT, assets: $ASSETS)"
+
+            # A PUBLISHED release with NO ASSETS is safe to upload to, and refusing it was wrong. The
+            # refusal below protects people who may already hold the old bytes; with zero assets there
+            # are no old bytes, nothing to contradict, and no SHA256SUMS to rewrite. A first upload is a
+            # first upload whether the release is draft or published.
+            #
+            # This cost a release. v0.20.0 was published before the tag-triggered run reached this step,
+            # so it failed with nothing attached and needed a human re-dispatch with
+            # overwrite_published=true. The artefacts were correct throughout; the guard was defending
+            # assets that did not exist, and left a red X on main for a build that was fine.
+            if [ "$DRAFT" != "true" ] && [ "$ASSETS" = "0" ]; then
+              echo "$V is published but has NO assets - a first upload is not a replacement"
+              OVERRIDE="true"
+            fi
+
             if [ "$DRAFT" != "true" ] && [ "$OVERRIDE" != "true" ]; then
               echo "::error::$V is PUBLISHED. Refusing to replace its assets: people may already have"
               echo "::error::downloaded them, and SHA256SUMS would be rewritten to match the new bytes,"
