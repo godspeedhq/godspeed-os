@@ -37,6 +37,7 @@ The seven trials by fire (§22) plus the verification apparatus and CI that keep
 
 | Milestone | In one line |
 |-----------|-------------|
+| [`feat/stdlib` hardware matrix](stdlib-hardware-matrix.md) | Five boards, four instruction sets, four NIC drivers: selfcheck / sock / serve green on every machine in the project (2026-09-25). Release-note material |
 | [Identity](testing/identity.md) | The §22 identity suite: the executable constitution |
 | [Property](testing/property.md) | P1-P10: universal invariants under randomized inputs |
 | [Fuzz](testing/fuzz.md) | F1-F8: the kernel must never panic on user-controllable input |
