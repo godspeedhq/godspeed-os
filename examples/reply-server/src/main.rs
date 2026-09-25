@@ -12,11 +12,11 @@
 //! endpoint, block for a request, do work, send a reply BACK. The twist that makes
 //! it a capability system - the server has no ambient way to call anyone. It can
 //! reply only because each request carries an embedded REPLY capability (a cap to
-//! the client's own endpoint). The server retrieves it with `take_pending_cap()`
+//! the client's own endpoint). The server retrieves it with `gs::ipc::take_sent_cap`
 //! and answers over it.
 //!
 //! The one discipline this example exists to teach is §8.9: the reply is sent with
-//! `try_send_by_handle` - NON-BLOCKING. A blocking `send` here could wedge the server
+//! `gs::ipc::try_send_to` - NON-BLOCKING. A blocking `send` here could wedge the server
 //! forever on a slow or dead client (and, if the client were also blocked sending to
 //! us, deadlock outright). At least one direction of a mutual exchange MUST use
 //! `try_send`; for a server, the reply is that direction.
@@ -70,7 +70,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let reply = Message::from_bytes(request.payload_bytes());
 
         // 4. Send the reply over the embedded cap - NON-BLOCKING (§8.9). A slow or dead
-        //    client can never block the server: `try_send_by_handle` returns immediately.
+        //    client can never block the server: `gs::ipc::try_send_to` returns immediately.
         //    A successful send means QUEUED, not processed (§8.6, Commandment VIII) - if
         //    the client needs an ack it must build one explicitly.
         match gs::ipc::try_send_to(&ctx, reply_cap, &reply) {
@@ -78,7 +78,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             Err(_)  => ctx.log("reply-server: client unreachable; dropping reply (it must retry)"),
         }
 
-        // 5. The reply cap was installed into our table by `take_pending_cap`; we are
+        // 5. The reply cap was installed into our table by `gs::ipc::take_sent_cap`; we are
         //    done with it. Reclaim its slot so a long-running server stays bounded and
         //    does not leak cap-table entries over many requests (§26.6).
         gs::cap::remove(&ctx, reply_cap);

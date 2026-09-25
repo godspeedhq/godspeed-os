@@ -9,7 +9,7 @@
 //! `roster` - an example **record-producing** pipe service (Appendix D, `docs/records.md`).
 //!
 //! Where `greet` emits text lines, `roster` emits **structured records**: it builds a typed
-//! `Table` with the SDK (`godspeed_sdk::record`), serializes it with the **binary wire codec**
+//! `Table` from the standard library (`gs::record`), serializes it with the **binary wire codec**
 //! (`Table::encode`), and sends the bytes through the delegated pipe cap. The shell decodes the
 //! stream straight back into a `Table` (it knows `roster` is a record service), so the record
 //! verbs operate on a real field with **no JSON round-trip**:

@@ -63,7 +63,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //     let _carrier = gs::ipc::recv(&ctx);                 // the message that carried the cap
     //     if let Some(granted) = gs::ipc::take_sent_cap(&ctx) {
     //         // `granted` is now in OUR table - use it to call the granter back.
-    //         let _ = ctx.send_by_handle(granted, &Message::from_bytes(b"thanks"));
+    //         let _ = gs::ipc::send_to(&ctx, granted, &Message::from_bytes(b"thanks"));
     //     }
 
     gs::ipc::park(&ctx)

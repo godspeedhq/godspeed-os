@@ -71,7 +71,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         resource_id
     ));
 
-    // Hand the client (`holder`) a copy of the cap. `derive_cap` duplicates it into a fresh slot;
+    // Hand the client (`holder`) a copy of the cap. `gs::cap::duplicate` copies it into a fresh slot;
     // rights can only NARROW on transfer, never widen (§7.3) - the copy carries exactly our
     // READ | GRANT and can never out-reach the original, so holder genuinely cannot WRITE. We keep
     // the owned resource (we serve it via the kernel-set badge, not the cap) and drop our copy of

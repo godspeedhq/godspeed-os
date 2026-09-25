@@ -36,12 +36,12 @@ mid-request the kernel wakes asker with `ReplyDead` and the call returns `None`,
 | Build a request | `Message::from_bytes(...)` | the payload (an incrementing decimal here) |
 | Round-trip | `ctx.request_with_reply("reply-server", &req)` | derive reply cap from our endpoint, GRANT it embedded in the request, block for the reply |
 | Check the echo | `reply.payload_bytes() == request` | the reply must equal the request - proof the round-trip closed |
-| Recover | `ctx.reacquire_by_name("reply-server")` | on `None` (peer still spawning / restarted) reacquire by name and retry |
+| Recover | `gs::cap::reacquire(&ctx, "reply-server")` | on `None` (peer still spawning / restarted) reacquire by name and retry |
 
 ## Why it is built this way (the Commandments)
 
 - **Commandment VII (no ambient authority).** asker grants reply-server the authority to call it back by
-  embedding a reply cap - a SEND|GRANT copy of its OWN endpoint cap (`derive_cap` of `self_grant_handle`,
+  embedding a reply cap - a SEND|GRANT copy of its OWN endpoint cap (`gs::cap::duplicate` of `gs::cap::self_grant`,
   packaged inside `request_with_reply`). The server gets exactly that cap and nothing else; there is no
   "reply to the sender" channel in the kernel. *(COMMANDMENTS.md VII; CLAUDE.md §7, §8.5, §8.9.)*
 - **Commandment VIII (wait on truth, not time - and the truth must include failure).** asker blocks for
@@ -68,7 +68,7 @@ example owes `chaos max-carnage`.
 
 - **Do not block-`send` the request while the server might block replying to you.** That re-opens the
   §8.9 deadlock. `request_with_reply` is safe because the *server's* reply is non-blocking
-  (`try_send_by_handle`); the cycle cannot form. *(Commandment VIII.)*
+  (`gs::ipc::try_send_to`); the cycle cannot form. *(Commandment VIII.)*
 - **Do not treat a returned reply as guaranteed-correct without checking it.** Here asker compares the
   echo to what it sent - the actual proof the round-trip closed, not just that *a* message arrived.
 - **Do not reach for the server by identity or a hardcoded endpoint id.** Resolve it by name and embed a

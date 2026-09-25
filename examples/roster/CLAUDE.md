@@ -15,7 +15,7 @@ the stream straight back into a `Table`, so `where`/`select`/`sort` work on a ge
 
 ## What it demonstrates
 
-- Build a typed table with the SDK (`godspeed_sdk::record`): `Table::new(&["name","role","seat"])`,
+- Build a typed table with the standard library (`gs::record`): `Table::new(&["name","role","seat"])`,
   `t.intern(bytes)` for string cells, `Value::Int` for numeric cells, `t.add_row(...)`.
 - Serialize with the **binary wire codec** (`Table::encode` into a `RecordSink`) - the `Table`
   itself on the wire, compact and typed, not JSON. A fixed `[u8; 1024]` `BufSink` holds it
