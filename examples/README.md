@@ -21,7 +21,8 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 
 | Example | What it is | Commandments it teaches |
 |---|---|---|
-| `00-hello` | The minimal service | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
+| `00-hello` | The minimal service, on the standard library | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
+| `stdlib-hello` | Doing real WORK with the standard library: read a file and print it, with the opcodes, framing, reply tags and streaming all behind `gs::fs` | **VII** (the contract's `ipc_send = ["fs"]` is why the read can work at all), **IX** (a failure is reported, not retried until something looks fine) |
 | `ping` / `pong` | Cross-core one-way IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name + retry on `EndpointDead`) |
 | `reply-server` / `asker` | Request/reply (RPC) + the deadlock rule - server (`reply-server`) and its client (`asker`), paired like `pong`/`ping` | **VII** (the server replies only via the client's embedded reply cap), **VIII** (a send is queued, not processed; the reply uses non-blocking `try_send`, §8.9), **IX** (the client reacquires the server by name + retries), **X** (request/reply is service policy; the kernel only routes) |
 | `cap-grant` | Transfer a capability over IPC (the GRANT right) | **VII** (authority by capability + the GRANT right), **VI**, **IX**, **X** |
@@ -40,13 +41,16 @@ a bug, the bug already existed. Each `CLAUDE.md` notes this; it is the universal
 ## Start here (reading order)
 
 1. **`00-hello`** - the anatomy of a service: `Cargo.toml`, `build.rs`, the contract, `service_main`.
-2. **`ping` / `pong`** - one-way IPC and the canonical restart/reacquire pattern (Commandments V, VIII, IX).
-3. **`reply-server`** (+ its client **`asker`**) - the other IPC direction: request/reply (RPC) and the §8.9 deadlock rule. `osdev test reply-server` boots the pair and proves the round-trip.
-4. **`cap-grant`** - how authority *moves*: transferring a capability over IPC (the GRANT right).
-5. **`resource-server`** (+ its client **`holder`**) - how authority is *born*: minting a delegated resource cap ("a file is a capability", §7.10). `osdev test resource-server` boots the pair and proves use / non-escalation / revoke.
-6. **`greet` -> `upper` -> `roster`** - composition: capability-mediated pipes, ending with typed records.
-7. **`counter`** - state that survives restart: persist via `fs`, reconstruct on spawn (Commandments V, IX).
-8. **`driver-skeleton` -> `e1000`** - driving hardware as an ordinary, restartable, least-privilege service.
+2. **`stdlib-hello`** - the same anatomy doing actual work: read a file with `gs::fs`. Read its
+   header for what you no longer need to know (opcodes, framing, reply tags, streaming) and what
+   you still do (authority is granted, and a failure is a fact).
+3. **`ping` / `pong`** - one-way IPC and the canonical restart/reacquire pattern (Commandments V, VIII, IX).
+4. **`reply-server`** (+ its client **`asker`**) - the other IPC direction: request/reply (RPC) and the §8.9 deadlock rule. `osdev test reply-server` boots the pair and proves the round-trip.
+5. **`cap-grant`** - how authority *moves*: transferring a capability over IPC (the GRANT right).
+6. **`resource-server`** (+ its client **`holder`**) - how authority is *born*: minting a delegated resource cap ("a file is a capability", §7.10). `osdev test resource-server` boots the pair and proves use / non-escalation / revoke.
+7. **`greet` -> `upper` -> `roster`** - composition: capability-mediated pipes, ending with typed records.
+8. **`counter`** - state that survives restart: persist via `fs`, reconstruct on spawn (Commandments V, IX).
+9. **`driver-skeleton` -> `e1000`** - driving hardware as an ordinary, restartable, least-privilege service.
 
 ## The set is complete
 

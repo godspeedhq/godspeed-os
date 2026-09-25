@@ -14,7 +14,7 @@ The four files every service has, and nothing more:
 
 | File | Role |
 |------|------|
-| `Cargo.toml` | the crate; depends on `godspeed-sdk` (the only way to reach the OS) |
+| `Cargo.toml` | the crate; depends on `godspeed` - the standard library, imported as `gs`. It is the only dependency a first service needs; `godspeed-sdk` is the layer underneath, for drivers and anything the standard library does not cover |
 | `build.rs` | links against `services/user.ld` and sets the entry point to `service_main` |
 | `contracts/hello.toml` | declares what the service may do (here: only `log_write`) |
 | `src/main.rs` | `service_main(ctx: ServiceContext) -> !`, the function the kernel calls at spawn |
@@ -75,7 +75,8 @@ whether to grant it (CLAUDE.md §13.3).
   global mutable is forbidden (Invariant 9) and it breaks isolation. If state must be shared, expose
   it *through a service* (**Commandment VI**), not a global.
 - **Do not write `unsafe`.** Service code is `unsafe`-free by rule (§18.2). If you think you need it,
-  you need the kernel, or the SDK's audited `Mmio`/`Dma` layer, instead.
+  you need the kernel, or the SDK's audited `Mmio`/`Dma` layer, instead. That is the one case where
+  an ordinary service reaches past `godspeed` to `godspeed-sdk`.
 
 ## How to adapt this
 

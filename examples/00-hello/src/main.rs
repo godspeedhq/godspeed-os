@@ -10,7 +10,7 @@
 //! a heartbeat. Your first service starts here.
 //!
 //! Anatomy (the four files every service has):
-//!   - Cargo.toml           : the crate; depends on `godspeed-sdk`
+//!   - Cargo.toml           : the crate; depends on `godspeed` (the standard library)
 //!   - build.rs             : links `services/user.ld`, entry point `service_main`
 //!   - contracts/hello.toml : declares what this service may do (here: only log)
 //!   - src/main.rs          : `service_main`, the function the kernel calls at spawn
@@ -18,7 +18,11 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+// The STANDARD LIBRARY, not the SDK. `godspeed` is what an ordinary program is written
+// against; `godspeed-sdk` is the layer underneath it, for when the standard library does not
+// cover what you are doing (a driver reaching MMIO, say). `ServiceContext` is re-exported
+// here, so a first program never has to name the lower layer at all.
+use godspeed::ServiceContext;
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
