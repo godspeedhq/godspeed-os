@@ -320,3 +320,33 @@ The unexercised row stands unchanged and is now better quantified: `waiting long
 fired ZERO times in 29,263 kills, so the wait never once reached its budget on any ISA. The
 IRQ-progress discrimination remains reasoned-about and compiled, not watched working. Nothing here
 changes that, and five green soaks should not be read as though it did.
+
+### The T630 completes it: FIVE boards, 35,748 kills (2026-09-25)
+
+| board | ISA | rounds | kills | PANIC | ABANDONED | "waiting longer" |
+|-------|-----|--------|-------|-------|-----------|------------------|
+| Raspberry Pi 4 | AArch64 | 1000 | 6028 | 0 | 0 | 0 |
+| Raspberry Pi 4 | AArch64 | 1000 | 5849 | 0 | 0 | 0 |
+| Raspberry Pi 2 | ARMv7 | 1000 | 5493 | 0 | 0 | 0 |
+| StarFive VisionFive 2 | RISC-V 64 | 1000 | 5911 | 0 | 0 | 0 |
+| Dell Wyse 5070 | x86-64 (Intel) | 1000 | 5982 | 0 | 0 | 0 |
+| HP T630 | x86-64 (AMD) | 1000 | 6485 | 0 | 0 | 0 |
+| **total** | **4 ISAs, 5 boards** | **6000** | **35,748** | **0** | **0** | **0** |
+
+The T630 was run on a PREDICTION THAT WAS WRONG, and the wrongness is worth keeping. `backlog/27`
+records that board's TSC as "roughly 1000x too small", which would make the kill-path budget
+(`tsc_ticks_per_quantum * 75`) ~0.75 ms instead of ~0.75 s and make it by far the likeliest board to
+exercise the abandon path. It exercised nothing. Its boot log says why:
+
+```
+apic: core 16 PIT-calibrated tsc_hz=1996256500 ticks/10ms=19962565
+```
+
+~2.0 GHz, correct for a GX-420GI - x86 moved to PIT calibration and that entry is stale. It is
+corrected there now. Two errors compounded: trusting an outdated entry, and reading the code comment
+that documents the FIX ("CPUID 0x15/0x16 give a garbage frequency on AMD") as documentation of the
+PROBLEM. The arithmetic would not have supported the prediction either - normal release is
+microseconds against a 0.75 s budget, so even a real 1000x cut leaves ~750x margin.
+
+The unexercised row is unchanged and now stands at **zero firings in 35,748 kills across five boards
+and four instruction sets**. The wait has never once reached its budget outside a forced probe.

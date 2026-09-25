@@ -50,9 +50,25 @@ names the wrong cause.
 
 - the arm32 **liveness watchdog was inert for a whole port's bring-up**, gated on a
   `tsc_ticks_per_quantum` stub that was `0`;
-- the **T630's TSC calibration is recorded as roughly 1000x too small** (CPUID leaves 0x15/0x16 are
-  Intel-only; this is an AMD part), which breaks ping RTT and `sleep` - so even a NON-zero value here
-  is not evidence the clock is right.
+- ~~the **T630's TSC calibration is recorded as roughly 1000x too small** (CPUID leaves 0x15/0x16 are
+  Intel-only; this is an AMD part), which breaks ping RTT and `sleep`~~ - **CORRECTED 2026-09-25, and
+  the correction is itself an instance of this entry's subject.** x86 calibration moved to the PIT
+  (`arch/x86_64/boot.rs`: "the PIT (portable ground truth - CPUID 0x15/0x16 give a garbage frequency
+  on AMD)"), and the T630 now measures itself correctly. From its own boot log:
+
+  ```
+  apic: core 16 PIT-calibrated tsc_hz=1996256500 ticks/10ms=19962565
+  ```
+
+  1,996,256,500 Hz is ~2.0 GHz, which is right for a GX-420GI.
+
+  **What the stale line cost.** Before a chaos soak on that board, the kill-path budget
+  (`tsc_ticks_per_quantum * 75`) was predicted to be ~1000x short, making the T630 the board most
+  likely to exercise `backlog/48`'s new abandon path. It fired nothing in 6,485 kills, because the
+  budget is a correct 0.75 s. The prediction rested on this line, and on misreading the code comment
+  above as a statement of the PROBLEM when it is a statement of the FIX. An entry that records a
+  defect and outlives it produces exactly the wrong confidence, which is this entry's own thesis
+  applied to itself.
 
 ## Why it is not fixed here
 
