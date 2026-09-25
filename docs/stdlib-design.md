@@ -1465,3 +1465,72 @@ is a path that had never once completed on real hardware before that commit.
 **`serve` on a second machine.** Three inbound connections from a separate LAN peer, each echoed byte
 for byte. QEMU structurally cannot produce this (SLIRP's only peer is the gateway), so it is two
 machines' worth of evidence for the one thing emulation cannot test at all.
+
+### The Pi 2 boots this branch, and both named risks are CLOSED (2026-09-25)
+
+The section above says "**No non-x86 machine has booted this branch**" and names two risks that only
+an ARM boot could answer. That is no longer true, and this is the correction rather than a new claim.
+
+**Raspberry Pi 2 (ARMv7, BCM2836), on the branch image:**
+
+```
+selfcheck   ran 509, failed 0, skipped 1
+sock        sent 29 bytes to 192.168.4.1:53, received 94 bytes back   (twice)
+net         192.168.4.84, gw 192.168.4.1, ping ok, lease ok (DHCP), dns 192.168.4.1
+serve       3 inbound connections from a LAN peer, every byte returned unchanged
+```
+
+**The one skip is correct and says so**: `hw-enumerator - this machine has no PCI to enumerate
+(Pi 2); not a failure`. A skip that names its reason is the behaviour this suite is built for; a
+silent one would be a test that had quietly stopped testing.
+
+#### Risk 1: the shell's stack headroom on ARM - CLOSED
+
+`services/shell` changed 2,490 lines on this branch and ARM has the tightest user stack in the tree.
+Static stack-fit passed at 23.4% of budget on all four ISAs, but a frame whose prologue the checker
+cannot match is invisible to it - which is why the static pass was recorded as the cheap half of the
+question and a boot as the expensive half.
+
+The Pi 2 reached the prompt, ran 509 checks across all nine parts including the pipe and record paths,
+then ran `serve` and answered three inbound connections. No fault, no wedge. The expensive half is
+answered.
+
+#### Risk 2: the changed net-stack header in front of a different NIC - CLOSED
+
+`services/net-stack` changed 48 lines, and the badged path now strips two header bytes instead of one
+with `Displaced::note` reading patience from `pl.get(1)`. That is a wire format, and both x86 boards
+share an RTL8168; this board is smsc95xx over USB, a different driver and a different bus.
+
+`net` took a lease and pinged, `sock` completed its round trip **twice**, and `serve` accepted three
+connections. The header change holds across three controllers now (e1000/RTL8168, RTL8168, smsc95xx).
+
+#### What `sock` proves here specifically
+
+29 bytes out, 94 back, to the lease-supplied resolver - **byte-identical to both x86 boards**. That
+path had never once completed on real hardware before `5716da17`, and `udp_roundtrip`'s three defects
+(re-transmitting instead of RX-polling, never answering an ARP for us, never pacing) were all things
+QEMU structurally cannot expose. Three boards, three NICs, three drivers, same answer.
+
+#### The count, again, and why it is not comparable
+
+`ran 509` against the T630's 516 and the Wyse's 518. All three are correct: `ran` counts statements
+EXECUTED and the suite is full of guarded blocks, so the figure is a function of machine state and
+hardware, not of correctness. The Pi 2 skipped the PCI block it has no bus for and did not carry the
+leftover churn files the Wyse did. **`failed 0` is the comparable number**; `ran` is not, and reading
+it as one has now produced a false alarm once.
+
+### Coverage after this run
+
+| board | ISA | NIC | selfcheck | sock | serve |
+|-------|-----|-----|-----------|------|-------|
+| HP T630 | x86-64 | RTL8168 | 516 / 0 | 94 B | 3/3 |
+| Dell Wyse 5070 | x86-64 | RTL8168 | 518 / 0 | 94 B | 3/3 |
+| Raspberry Pi 2 | ARMv7 | smsc95xx | 509 / 0 | 94 B | 3/3 |
+
+Three boards, two ISAs, two NIC families, and `serve` answering a real LAN peer on every one of them
+- the single thing QEMU cannot test at all, because SLIRP's only peer is the gateway.
+
+**Still unbooted on this branch: the Pi 4 (AArch64) and the VisionFive 2 (RISC-V 64).** Both build
+clean and both pass stack-fit, and the two risks that made the ARM boot load-bearing are now answered
+on ARM - but neither of those boards has run this code, and that is stated here rather than implied
+away.
