@@ -77,10 +77,11 @@ pub mod error;
 #[cfg(not(test))] pub mod file;
 #[cfg(not(test))] pub mod ipc;
 #[cfg(not(test))] pub mod task;
+#[cfg(not(test))] pub mod record;
 #[cfg(not(test))] pub mod fs;
 #[cfg(not(test))] pub mod io;
 #[cfg(not(test))] pub mod net;
-#[cfg(not(test))] mod resource;
+#[cfg(not(test))] pub mod resource;
 
 pub use error::Error;
 

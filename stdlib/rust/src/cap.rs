@@ -74,6 +74,12 @@ impl Cap {
     pub fn handle(self) -> CapHandle {
         self.0
     }
+
+    /// Wrap a handle the SDK produced. Crate-internal: a program gets a `Cap` from an operation that
+    /// grants one, never by constructing it, because a capability you can invent is not a capability.
+    pub(crate) fn from_handle(h: CapHandle) -> Self {
+        Cap(h)
+    }
 }
 
 /// Acquire a SEND capability to a service, by name, from the kernel's name directory.

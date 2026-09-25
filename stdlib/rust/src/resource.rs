@@ -21,6 +21,7 @@ use godspeed_sdk::capability::{CapError, CapHandle};
 use godspeed_sdk::ipc::{IpcError, Message};
 use godspeed_sdk::service_context::{ReqOutcome, ServiceContext};
 
+use crate::cap::Cap;
 use crate::error::Error;
 
 /// How many messages that are NOT our reply one invocation will hold before it stops taking them.
@@ -141,4 +142,46 @@ pub(crate) fn invoke(
             ReqOutcome::Timeout => return Err(Error::OutcomeUnknown),
         }
     }
+}
+
+// ── The owner's side: minting and revoking a resource of your own ──────────────────────────────
+//
+// Everything above serves a HOLDER using someone else's capability. These three are for a service
+// that ISSUES them - what `fs` does for a file and `net-stack` for a socket.
+
+/// Mint a fresh resource capability that THIS service owns (CLAUDE.md 7.10).
+///
+/// Returns the opaque `ResourceId` the kernel will badge invocations with, and a capability carrying
+/// `rights` that you can hand to a client. The kernel tracks the id and the owning endpoint and
+/// nothing else - **what the resource MEANS is yours alone**, which is what keeps filesystem logic
+/// out of the kernel (CLAUDE.md 4.4).
+///
+/// Gated: minting requires the `RESOURCE_MINT` authority, granted only to services that legitimately
+/// issue resources. Delegated minting is explicit authority, never ambient (CLAUDE.md 3.1).
+pub fn mint(ctx: &ServiceContext, rights: u8) -> Result<(u64, Cap), Error> {
+    match ctx.resource_mint(rights) {
+        Some((id, h)) => Ok((id, Cap::from_handle(h))),
+        None => Err(Error::PermissionDenied),
+    }
+}
+
+/// Revoke a resource this service owns, invalidating EVERY capability to it.
+///
+/// One generation bump, and every outstanding copy goes stale at once - there is no list of holders
+/// to walk and none can be missed (CLAUDE.md 7.5). `fs` does this on delete and on close.
+///
+/// Returns `false` if this service does not own that id. Nothing is revoked in that case, which is
+/// worth reporting rather than treating as done.
+pub fn revoke(ctx: &ServiceContext, resource_id: u64) -> bool {
+    ctx.resource_revoke(resource_id)
+}
+
+/// The resource id and right the kernel badged the message just received with.
+///
+/// `None` means the message was an ordinary name-addressed request rather than a capability
+/// invocation. The badge is set BY THE KERNEL after it validated the capability, so it cannot be
+/// forged by a client sending over its ordinary send capability - which is what makes it safe to act
+/// on. Enforce `op <= right` yourself: the kernel checked the capability, not what you do with it.
+pub fn last_badge(ctx: &ServiceContext) -> Option<(u64, u8)> {
+    ctx.last_recv_badge()
 }
