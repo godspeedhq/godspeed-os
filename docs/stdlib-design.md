@@ -1534,3 +1534,60 @@ Three boards, two ISAs, two NIC families, and `serve` answering a real LAN peer 
 clean and both pass stack-fit, and the two risks that made the ARM boot load-bearing are now answered
 on ARM - but neither of those boards has run this code, and that is stated here rather than implied
 away.
+
+### The Pi 4 boots it too - three ISAs, four boards (2026-09-25)
+
+**Raspberry Pi 4 (AArch64, BCM2711), on the branch image:**
+
+```
+selfcheck   ran 516, failed 0, skipped 0
+sock        sent 29 bytes to 192.168.4.1:53, received 94 bytes back   (twice)
+net         192.168.4.85, gw 192.168.4.1, ping ok, lease ok (DHCP), dns 192.168.4.1
+serve       3 inbound connections from a LAN peer, every byte returned unchanged
+```
+
+**Zero skips** - this board has PCI where the Pi 2 does not, so the `hw-enumerator` block the Pi 2
+correctly skipped runs here, and `ran` lands on 516: the same figure as the T630, for the same two
+reasons (PCI present, and a disk with no leftover churn files). That is a coincidence of machine state
+rather than a meaningful match, and is recorded as such so nobody reads 516 as a target.
+
+**A fourth NIC for the changed net-stack header.** GENET, on-SoC, neither the RTL8168 of the two x86
+boards nor the Pi 2's USB smsc95xx. `net`, `sock` and `serve` all work, so the badged two-byte header
+now holds across three drivers on three buses.
+
+**`sock` again returns 94 bytes**, byte-identical to all three other boards. Four boards, four NICs,
+one answer, on a path that had never once completed on real hardware before `5716da17`.
+
+### Coverage now
+
+| board | ISA | NIC | bus | selfcheck | sock | serve |
+|-------|-----|-----|-----|-----------|------|-------|
+| HP T630 | x86-64 | RTL8168 | PCIe | 516 / 0 | 94 B | 3/3 |
+| Dell Wyse 5070 | x86-64 | RTL8168 | PCIe | 518 / 0 | 94 B | 3/3 |
+| Raspberry Pi 2 | ARMv7 | smsc95xx | USB | 509 / 0 (1 skip) | 94 B | 3/3 |
+| Raspberry Pi 4 | AArch64 | GENET | on-SoC | 516 / 0 | 94 B | 3/3 |
+
+Three instruction sets, four boards, three NIC drivers on three different buses, and `serve`
+answering a real LAN peer on every one - the single thing QEMU structurally cannot test, because
+SLIRP's only peer is the gateway.
+
+**Still unbooted on this branch: the VisionFive 2 (RISC-V 64, dwmac).** It builds clean and passes
+stack-fit; it has not run this code. Recorded rather than implied away.
+
+### A deployment fact worth keeping, because it cost a boot
+
+The Pi card in use is a **DUAL-BOOT card**: it carries the Pi 2 firmware (`bootcode.bin`,
+`start.elf`, `fixup.dat`) AND the Pi 4 firmware (`start4.elf`, `fixup4.dat`), plus both kernels, and
+`config.txt` is the switch between them. A card set for one board and put in the other shows the
+RAINBOW SCREEN - the firmware starts, looks for the kernel the config names, does not find it, and
+stops.
+
+That is exactly what happened on 2026-09-25, and the BUILD was suspected first. It was not the build:
+the staging bug that once caused this class (`75cd691c`, two boards writing their config to one path)
+has stayed fixed, and the two staged configs differ and name different kernels. What was missing was
+any way to ask a card **which board it is currently set for**, which on a dual-boot card is a
+permanent question rather than a one-off mistake.
+
+The same check also caught a second fault the first would have masked: the Pi 4 kernel on that card
+was stale (3,668,928 bytes against the 3,713,984 built), so flipping only the config would have
+booted an old kernel and produced a result that looked valid and was not.
