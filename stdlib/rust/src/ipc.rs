@@ -21,6 +21,13 @@
 //! - [`Error::InvalidInput`](crate::Error) - the message exceeds one page. Nothing will make that
 //!   work; send less.
 //!
+//! A fourth appears only when you hand a capability away with [`send_granting`]:
+//!
+//! - [`Error::PermissionDenied`](crate::Error) - the capability you tried to send does not carry
+//!   [`GRANT`](crate::cap::GRANT). **Nothing moved, so it is still yours** and the slot is still
+//!   yours to reclaim. This is the first of the three checks CLAUDE.md 8.5 asks of every transfer,
+//!   and it is the one a compiler cannot make for you.
+//!
 //! # The deadlock rule, which the kernel will not save you from
 //!
 //! If A and B both send to each other, at least one direction MUST use [`try_send`]. A blocking send
@@ -44,9 +51,16 @@ pub const MAX_BYTES: usize = godspeed_sdk::ipc::MAX_PAYLOAD;
 
 /// Translate a transport failure into the one error type a program handles.
 ///
-/// The mapping is the same one [`crate::resource`] settled on, and it is about what the CALLER
-/// should do rather than about which syscall said no: a dead endpoint and a revoked capability are
-/// one situation to a sender, and a full queue is a different one.
+/// The mapping is about what the CALLER should do rather than about which syscall said no: to a
+/// sender, a dead endpoint and a revoked capability are one situation - the message never left -
+/// and a full queue is a different one.
+///
+/// **This deliberately differs from [`crate::resource`], and the difference is load-bearing.** An
+/// invocation there reports a dead or revoked capability as [`Error::Revoked`], whose
+/// [`retry_is_safe`](crate::Error::retry_is_safe) is `false`, because the capability itself must be
+/// re-opened before a retry means anything. A send reports [`Error::Unreachable`], whose
+/// `retry_is_safe` is `true`, because reacquiring the NAME and sending again is exactly the right
+/// move (CLAUDE.md invariant 11). Same kernel error, different obligation on the caller.
 fn from_ipc(e: IpcError) -> Error {
     use godspeed_sdk::capability::CapError;
     match e {
