@@ -1591,3 +1591,68 @@ permanent question rather than a one-off mistake.
 The same check also caught a second fault the first would have masked: the Pi 4 kernel on that card
 was stale (3,668,928 bytes against the 3,713,984 built), so flipping only the config would have
 booted an old kernel and produced a result that looked valid and was not.
+
+### The VisionFive 2 closes it: FIVE boards, FOUR instruction sets (2026-09-25)
+
+**StarFive VisionFive 2 Lite (RISC-V 64, JH7110), on the branch image:**
+
+```
+selfcheck   ran 516, failed 0, skipped 0
+sock        sent 29 bytes to 192.168.4.1:53, received 94 bytes back   (twice)
+net         192.168.4.86, gw 192.168.4.1, ping ok, lease ok (DHCP), dns 192.168.4.1
+serve       3 inbound connections from a LAN peer, every byte returned unchanged
+```
+
+Zero failures, zero skips. **Every machine in this project has now run this branch.**
+
+### The complete hardware matrix
+
+| board | ISA | NIC | bus | selfcheck | sock | serve |
+|-------|-----|-----|-----|-----------|------|-------|
+| HP T630 | x86-64 | RTL8168 | PCIe | 516 / 0 | 94 B | 3/3 |
+| Dell Wyse 5070 | x86-64 | RTL8168 | PCIe | 518 / 0 | 94 B | 3/3 |
+| Raspberry Pi 2 | ARMv7 | smsc95xx | USB | 509 / 0 (1 skip) | 94 B | 3/3 |
+| Raspberry Pi 4 | AArch64 | GENET | on-SoC | 516 / 0 | 94 B | 3/3 |
+| StarFive VisionFive 2 | RISC-V 64 | dwmac | on-SoC | 516 / 0 | 94 B | 3/3 |
+
+**Four instruction sets. Four NIC drivers across three bus types. `serve` answering a real LAN peer
+on every single board** - fifteen inbound connections in total, every byte returned unchanged.
+
+That last row of the `serve` column is the one worth pausing on, because QEMU structurally cannot
+produce ANY of it: SLIRP's only peer is the gateway, so an unsolicited inbound connection from a
+third party had never happened in emulation even once. Fifteen of them have now happened on iron.
+
+### What the matrix actually closes
+
+**The changed net-stack wire format.** `services/net-stack` strips two header bytes on the badged
+path instead of one, with `Displaced::note` reading patience from `pl.get(1)`. That is a protocol
+change, and it has now held in front of four different drivers - RTL8168 on PCIe, smsc95xx over USB,
+GENET and dwmac on-SoC. This was one of the two risks that made a non-x86 boot load-bearing.
+
+**The shell's stack headroom.** 2,490 lines changed in the crate with the least headroom in the tree.
+Static stack-fit passes on all four ISAs at 23.4% of budget, but a frame whose prologue that checker
+cannot match is invisible to it. Every board reached a prompt, ran its full suite across all nine
+parts, and served connections afterwards. That was the other risk.
+
+**`sock` returns 94 bytes on all five boards.** Identical. On a path that had never once completed on
+real hardware before `5716da17`, and whose three defects - re-transmitting instead of RX-polling,
+never answering an ARP for us, never pacing the poll - are each things QEMU is structurally incapable
+of exposing, for three separate reasons.
+
+### On the `ran` column, one last time
+
+516, 518, 509, 516, 516. All five correct. `ran` counts statements EXECUTED through guarded blocks,
+so it is a function of hardware and disk state: the Pi 2 skipped a PCI block it has no bus for, and
+the Wyse carried leftover churn files the others did not. **`failed 0` is the comparable figure.**
+Reading `ran` as comparable produced one false alarm in this session and is therefore stated here a
+third time.
+
+### What hardware does NOT close
+
+The `backlog/48` / `backlog/49` class - a userspace-reachable kernel panic, reproduced under load -
+is untouched by any of this and is a violation of an absolute bar (CLAUDE.md 22: the kernel must
+never panic on user-controllable input). It is not caused or worsened by this branch, whose kernel
+diff is comments only, and the operator has already scheduled it for after this work.
+
+`backlog/52` - the shell suite flaking on `sock` and `serve` in QEMU - is also untouched. Five boards
+passing does not make a flaky harness deterministic.
