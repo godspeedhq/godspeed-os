@@ -885,3 +885,9 @@ still empty - the kernel comment fixes are comments", written without running th
 immediately afterwards returned 14 lines. Recorded because this file's whole subject is documentation
 that asserts more than it verified, and the audit round doing that in its own commit message is the
 cleanest example of the pattern it exists to catch.
+
+**Superseded the same day.** The operator's rule is no kernel CODE change, not no kernel DIFF -
+comment fixes are welcome, and a comment audit that finds four dead names in `kernel/` and declines
+to fix them has not done its job. All four are restored. The property the rule protects is checked by
+filtering the diff for non-comment lines, which returns 0. What stands from the revert is the part
+that was actually the failure: the commit ASSERTED the check passed without running it.
