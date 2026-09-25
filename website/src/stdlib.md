@@ -128,7 +128,7 @@ loop {
 
 Two exceptions, both of which say so where you reach for them:
 
-- **A capability you hold** - an open file (`gs::cap::File`), a socket or a connection
+- **A capability you hold** - an open file (`gs::file::File`), a socket or a connection
   (`gs::net`) - is invoked rather than sent by name, and the kernel routes its reply the same way.
   Anything else that arrives during one of those is **held** for you: drain `take_held()` in a loop
   after each operation and feed what comes back into your own loop. They are real client requests,
