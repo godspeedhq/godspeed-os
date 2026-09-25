@@ -1,7 +1,7 @@
 # 48 - `chaos max-carnage` panics the kernel on the kill-path bound, and userspace can reach it
 
 **Opened:** 2026-09-24
-**Status:** OPEN - **REPRODUCED 2026-09-24 under host load** (1 panic in 170 carnage rounds loaded; 0 in 400 idle). **A VIOLATION of an absolute bar, and the fix is mandatory** - see the ruling below. One of five sites of the same shape (`backlog/49`).
+**Status:** OPEN - **REPRODUCED ON HARDWARE 2026-09-25 (Pi 4, AArch64, no host load) and 2026-09-24 under host load in QEMU** (1 panic in 170 carnage rounds loaded; 0 in 400 idle). **A VIOLATION of an absolute bar, and the fix is mandatory** - see the ruling below. One of five sites of the same shape (`backlog/49`).
 **Found by:** verification of an unrelated change (`feat/stdlib`, which makes **zero** kernel edits).
 
 ## What happened
@@ -167,3 +167,70 @@ contended enough to stop a vCPU for three quarters of a second, which no hardwar
 3. **The panic message should print the stuck core's IRQ count**, per the second mitigation above. It
    is the one number that separates the two explanations, and it would have settled this in one
    sighting instead of two runs and a code read.
+
+---
+
+## REPRODUCED ON REAL HARDWARE, on a second ISA, with no host load (2026-09-25)
+
+Everything above was QEMU, x86, and needed the host loaded to appear. It is not an emulation
+artefact and it is not x86-specific.
+
+**Raspberry Pi 4 (AArch64, BCM2711), `chaos max-carnage 1000`, on `feat/stdlib` (kernel diff: 0 lines
+of CODE):**
+
+```
+round 943 / 1000 (94%)
+chaos round 943: swept 9 svc, 7 flooded, 9 killed, +mem +spawn
+
+KERNEL PANIC: panicked at kernel\src\task\scheduler.rs:2679:25:
+kill: core 2 has not released task slot 1 after 135000000 counter ticks
+(CORE_CURRENT=1, CORE_LEAVING=6).
+```
+
+Same file, same line, same message, and the same `core 2` / `slot 1` as the second instance recorded
+above. **6,575 `kill_task` events** before it fired.
+
+### What is new, and why each part matters
+
+| | before | now |
+|---|---|---|
+| environment | QEMU only | **real silicon** |
+| ISA | x86-64 only | **AArch64 too** |
+| trigger | needed deliberate host load | **none applied - the board was running chaos alone** |
+| rate | 1 in 170 loaded, 0 in 400 idle | **1 in 943 on hardware** |
+
+The load dependency was the strongest remaining argument for treating this as an emulation
+scheduling artefact - a host that descheduled a vCPU at the wrong moment. That argument is gone. A
+Raspberry Pi 4 running nothing but this test panicked its own kernel on the kill path.
+
+### The counter values are NOT comparable across these runs
+
+x86 recorded 1,942,859,025 and 2,284,108,050 ticks; this run says 135,000,000. Those are different
+counters - the x86 TSC against the AArch64 generic timer - and the budget is derived per-arch from
+`liveness_deadline_cycles() / 4`. The comparable fact is the one the message states either way: **the
+budget elapsed and the core had still not released the slot.** Anyone tempted to read the smaller
+number as a shorter wait should convert it first.
+
+### The other board did NOT reproduce it
+
+The VisionFive 2 ran the same 1000 rounds, 6,449 kills, the same day, on the same branch, and gave 0
+panics. So on current evidence this is **board-dependent or simply rare**, not universal - which is
+worth knowing before anybody tunes the bound against a single machine's timing. Two hardware data
+points is not a pattern; it is two data points, and they disagree.
+
+### What this does NOT change
+
+**Not caused by `feat/stdlib`.** That branch's kernel diff is 0 lines of code (comments only,
+verified by filtering the diff). It was found by verifying that branch, for the second time, for the
+same reason: a branch that changes no kernel is a clean instrument for finding kernel bugs.
+
+**The ruling stands and is now better supported.** Nothing above the kernel may panic the kernel.
+`chaos` is a userspace program; it killed services through the ordinary supervisor path and the
+kernel panicked. CLAUDE.md §22 is absolute about this, and the fix remains mandatory.
+
+### A second-order observation from the capture
+
+The panic text is spliced with an unrelated EL0 fault report, mid-word: `0ounter ticks`, `ma ing
+progress`, `c0x.`. That is the known serial-splice behaviour under load, and it matters here because
+**the panic reason is the one line you cannot afford to have corrupted.** A reader who saw only
+`c0x.` would not have had the sentence. Recorded rather than acted on; the splice is its own issue.
