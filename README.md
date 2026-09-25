@@ -290,21 +290,30 @@ website/      documentation site (mdBook; renders this repo's docs)
 API references under `/api`:
 
 - [**`godspeed`** - the standard library](https://godspeedhq.github.io/godspeed-os/api/godspeed/),
-  imported as `gs`. **This is what you write a program against**: 93 public items across
-  [`fs`](https://godspeedhq.github.io/godspeed-os/api/godspeed/fs/index.html) (files and directories,
-  a file as a real capability), [`net`](https://godspeedhq.github.io/godspeed-os/api/godspeed/net/index.html)
-  (sockets, listeners, DNS - a socket IS a capability),
-  [`cap`](https://godspeedhq.github.io/godspeed-os/api/godspeed/cap/index.html) (holding, deriving and
-  narrowing capabilities), plus
-  [`io`](https://godspeedhq.github.io/godspeed-os/api/godspeed/io/index.html),
-  [`call`](https://godspeedhq.github.io/godspeed-os/api/godspeed/call/index.html),
-  [`error`](https://godspeedhq.github.io/godspeed-os/api/godspeed/error/index.html) and
-  [`addr`](https://godspeedhq.github.io/godspeed-os/api/godspeed/addr/index.html).
+  imported as `gs`. **This is what you write a program against** - 130 public items across 12 modules:
+
+  | Module | Covers |
+  |--------|--------|
+  | [`fs`](https://godspeedhq.github.io/godspeed-os/api/godspeed/fs/index.html) | files and directories, streaming, `open` as a capability |
+  | [`net`](https://godspeedhq.github.io/godspeed-os/api/godspeed/net/index.html) | sockets, listeners, connections, DNS - a socket IS a capability |
+  | [`ipc`](https://godspeedhq.github.io/godspeed-os/api/godspeed/ipc/index.html) | messages between services: send, receive, and giving a capability away |
+  | [`cap`](https://godspeedhq.github.io/godspeed-os/api/godspeed/cap/index.html) | capability rights, acquiring, duplicating, dropping |
+  | [`file`](https://godspeedhq.github.io/godspeed-os/api/godspeed/file/index.html) | a file held as a real kernel capability |
+  | [`task`](https://godspeedhq.github.io/godspeed-os/api/godspeed/task/index.html) | yielding, waiting, uptime and the wall clock |
+  | [`call`](https://godspeedhq.github.io/godspeed-os/api/godspeed/call/index.html) | bounded request/reply, safe for a caller that also serves |
+  | [`io`](https://godspeedhq.github.io/godspeed-os/api/godspeed/io/index.html) | console output |
+  | [`error`](https://godspeedhq.github.io/godspeed-os/api/godspeed/error/index.html) | one error type, and `retry_is_safe` |
+  | [`resource`](https://godspeedhq.github.io/godspeed-os/api/godspeed/resource/index.html) | minting and revoking a delegated resource capability |
+  | [`record`](https://godspeedhq.github.io/godspeed-os/api/godspeed/record/index.html) | typed tables, and the views derived from them |
+  | [`addr`](https://godspeedhq.github.io/godspeed-os/api/godspeed/addr/index.html) | IPv4 addresses |
+
   [**Writing a program for GodspeedOS**](https://godspeedhq.github.io/godspeed-os/stdlib.html) is the
   place to start.
 - [**`godspeed-sdk`** - the layer underneath](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/),
-  the raw syscall seam and the audited MMIO/DMA accessors a driver needs. Reach for it when the
-  standard library does not cover what you are doing.
+  the raw syscall seam and the audited MMIO/DMA accessors a driver needs. **Reach for it only if you
+  are writing a driver.** That rule is measured rather than asserted: 13 of the 15 examples name only
+  `gs`, and the two that do not are `driver-skeleton` (MMIO and DMA, which is precisely what the SDK
+  exists for, CLAUDE.md §18.1) and `holder`, which hand-rolls one protocol on purpose so it is visible.
 
 Two sections worth knowing about:
 [**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
