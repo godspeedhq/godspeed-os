@@ -73,3 +73,68 @@ now held on RTL8168 over PCIe, smsc95xx over USB, and GENET and dwmac on-SoC.
   a flaky harness deterministic.
 - **Chaos and power-cut behaviour**, which are their own runs with their own evidence
   (`docs/gsfs-carnage.md`, `milestones/resilience/`).
+
+### Chaos: 1000 rounds on the VisionFive 2, and the system came back (2026-09-25)
+
+Run on the RISC-V board deliberately - it is the one chaos has historically broken.
+
+```
+chaos max-carnage: 1000 rounds, 5901 kills, 4916 flooded, 1000 mem-pressure, 1000 spawns
+                   kernel: alive (this command returned)
+```
+
+Plus the `kill-storm supervisor` and `kill-storm events` rounds either side, for **6,449 `kill_task`
+events in one session**.
+
+| bar | result |
+|-----|--------|
+| kernel panics | **0** |
+| liveness wedges | **0** |
+| kernel faults | **0** |
+| `FAIL` lines anywhere in 127,851 lines of capture | **0** |
+
+#### The part that matters more than the storm: what came back
+
+`selfcheck` was run **before and after**, and the two tallies are identical:
+
+```
+11:38:11  run: ran 516, failed 0, skipped 0     (before)
+12:01:05  run: ran 516, failed 0, skipped 0     (after 1000 rounds)
+```
+
+Not "it survived" - it is in the same state, check for check.
+
+**Networking rebuilt itself from nothing.** The log shows `nic-driver` coming back after being killed
+and re-running its whole bring-up: link settled at 1000 Mbit/s full duplex, DMA reset cleared, MAC
+filter read back and verified, then DHCP OFFER, ACK, ARP for the gateway, and an ICMP echo reply -
+followed by `sock` returning its 94 bytes and `net` reporting lease, gateway and ping. That is
+`backlog/19` ("networking does not recover from a chaos storm") **not reproducing**, with the recovery
+visible line by line rather than inferred from a working prompt.
+
+#### What this does and does NOT say about `backlog/48`
+
+`backlog/48` is `chaos max-carnage` panicking the kernel on the kill-path bound, and it is a violation
+of an absolute bar. It **did not reproduce** in these 1000 rounds.
+
+**That is not a refutation, and must not be recorded as one.** The entry's own measurement is 1 panic
+in 170 rounds *under host load*, and 0 in 400 *idle*. A 1000-round idle run on real hardware is
+consistent with the second figure, not evidence against the first. The bug needs a late kill path to
+be preempted, and an unloaded machine is exactly where that does not happen. `backlog/48` stays OPEN
+at full severity.
+
+What this run DOES establish is that nothing in `feat/stdlib` makes it worse: the branch's kernel diff
+is 0 lines of code, and 6,449 kills on the port with the most chaos history produced no new failure
+mode.
+
+#### The capability model under carnage
+
+Scattered through the storm:
+
+```
+cap::get: ResourceId(106) gen mismatch cap=11771 rec=11806 liveness=Alive
+```
+
+That is a client holding a capability to something that has been killed and respawned 35 generations
+later, and the kernel refusing it on the generation check (§7.5) rather than routing it somewhere
+wrong. Thousands of those, and not one turned into a fault. The mechanism that makes restartability
+safe is visible doing its job, which is worth more than its absence would have been.
