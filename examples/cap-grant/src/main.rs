@@ -18,7 +18,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, IpcError, CapError};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -28,17 +28,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // 1. A grantable cap we already hold: our own SEND|GRANT cap to our endpoint,
     //    minted from the contract at spawn. This is the cap a service hands out so
     //    others may call it back (Commandment VII - authority is an explicit cap).
-    let self_cap = match ctx.self_grant_handle() {
-        Some(c) => c,
-        None => { ctx.log("cap-grant: no grantable endpoint cap to give"); ctx.park() }
+    let self_cap = match gs::cap::self_grant(&ctx) {
+        Ok(c) => c,
+        Err(_) => { ctx.log("cap-grant: no grantable endpoint cap to give"); gs::ipc::park(&ctx) }
     };
 
-    // 2. Derive a COPY to give away, keeping the original so we can re-grant after a
-    //    peer restart (Commandment IX - plan for recovery). A derived cap can only
-    //    narrow rights, never widen them (§7.3, non-escalating).
-    let gift = match ctx.derive_cap(self_cap) {
-        Some(c) => c,
-        None => { ctx.log("cap-grant: derive_cap failed"); ctx.park() }
+    // 2. Duplicate the cap to give away, keeping the original so we can re-grant after a
+    //    peer restart (Commandment IX - plan for recovery). The copy carries the SAME rights;
+    //    rights narrow where a cap is minted or granted, never on the copy (§7.3).
+    let gift = match gs::cap::duplicate(&ctx, self_cap) {
+        Ok(c) => c,
+        Err(_) => { ctx.log("cap-grant: could not duplicate the cap to give away"); gs::ipc::park(&ctx) }
     };
 
     // 3. Transfer the gift to "receiver" inside an IPC message. The kernel verifies
@@ -46,23 +46,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //    removed from our table - authority transfers, it does not duplicate
     //    (§7.6, §8.5). A cap without GRANT is refused with CapNotGrantable and kept.
     let note = Message::from_bytes(b"a cap to call me back");
-    match ctx.acquire_send_cap("receiver") {
-        Some(receiver) => match ctx.send_with_cap_by_handle(receiver, gift, &note) {
+    match gs::cap::acquire(&ctx, "receiver") {
+        Ok(receiver) => match gs::ipc::send_granting(&ctx, receiver, gift, &note) {
             Ok(()) => ctx.log("cap-grant: granted a cap to receiver (we no longer hold the copy)"),
-            Err(IpcError::CapError(CapError::CapNotGrantable)) =>
+            // The capability lacked GRANT. Nothing moved, so the gift is STILL OURS and the slot is
+            // ours to reclaim - which is why this arm is distinct from "the peer was not there".
+            Err(gs::Error::PermissionDenied) =>
                 ctx.log("cap-grant: refused - the cap lacks GRANT; authority cannot be widened"),
             Err(_) => ctx.log("cap-grant: receiver unavailable; a real client would retry"),
         },
-        None => ctx.log("cap-grant: 'receiver' not registered (expected when run standalone)"),
+        Err(_) => ctx.log("cap-grant: 'receiver' not registered (expected when run standalone)"),
     }
 
     // The RECEIVER side, in its own service, completes the transfer:
     //
-    //     let _carrier = ctx.recv();                 // the message that carried the cap
-    //     if let Some(granted) = ctx.take_pending_cap() {
+    //     let _carrier = gs::ipc::recv(&ctx);                 // the message that carried the cap
+    //     if let Some(granted) = gs::ipc::take_sent_cap(&ctx) {
     //         // `granted` is now in OUR table - use it to call the granter back.
     //         let _ = ctx.send_by_handle(granted, &Message::from_bytes(b"thanks"));
     //     }
 
-    ctx.park()
+    gs::ipc::park(&ctx)
 }

@@ -14,7 +14,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, IpcError};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -29,28 +29,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let payload = make_payload(counter);
         let msg = Message::from_bytes(&payload[..payload_len(&payload)]);
 
-        match ctx.try_send("pong", &msg) {
+        match gs::ipc::try_send(&ctx, "pong", &msg) {
             Ok(()) => {
                 success_count += 1;
                 if success_count == 20 {
                     ctx.log("ping: sent 20 messages");
                 }
             }
-            Err(IpcError::EndpointDead) => {
+            // The peer died, or its name does not resolve right now. NOTHING WAS SENT, so there is
+            // no half-delivered message to reason about - reacquire and the next tick carries on.
+            Err(gs::Error::Unreachable) => {
                 ctx.log("ping: pong endpoint dead, reacquiring via the kernel name directory");
-                if ctx.reacquire_by_name("pong") {
+                if gs::cap::reacquire(&ctx, "pong") {
                     ctx.log("ping: pong cap reacquired, resuming");
                 } else {
                     ctx.log("ping: reacquire failed, retrying next tick");
                 }
             }
-            Err(IpcError::QueueFull) => {
-                // pong is alive but busy; yield and retry.
-            }
+            // pong is alive and its queue is full. Also nothing sent, but a DIFFERENT situation:
+            // going looking for a peer that never went away would be the wrong repair.
+            Err(gs::Error::Busy) => {}
             Err(_) => {}
         }
 
-        ctx.yield_cpu();
+        gs::task::yield_now(&ctx);
     }
 }
 

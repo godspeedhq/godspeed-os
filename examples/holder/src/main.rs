@@ -40,14 +40,16 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, IpcError, CapHandle, CapError, ReqOutcome};
-use godspeed_sdk::capability::{RIGHT_READ, RIGHT_WRITE};
+use godspeed::{self as gs, ServiceContext};
+// The raw SDK, for the hand-rolled `invoke` below ONLY - see the note on that function.
+use godspeed_sdk::{CapError, CapHandle, IpcError, Message, ReqOutcome};
+
 
 // Resource operations - the FIRST payload byte of a badged invocation (mirrors resource-server's
 // OP_* / fs's FOP_*). The kernel validates the cap holds the invoked RIGHT; the owner additionally
 // enforces op <= right. These OP codes are this example's tiny protocol, not kernel constants.
-const OP_READ:  u8 = 1; // owner needs RIGHT_READ
-const OP_WRITE: u8 = 2; // owner needs RIGHT_WRITE
+const OP_READ:  u8 = 1; // owner needs gs::cap::READ
+const OP_WRITE: u8 = 2; // owner needs gs::cap::WRITE
 const OP_CLOSE: u8 = 4; // retire the resource: the owner revokes it
 
 const REPLY_OK: u8 = 0; // resource-server's "ok" reply byte
@@ -71,8 +73,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     };
 
     // 2. USE (§7.3 - a real cap is usable for what it permits). Invoke READ: the kernel validates our
-    //    cap holds RIGHT_READ and routes the op to the owner, which serves it and replies OK.
-    match invoke(&ctx, cap, RIGHT_READ, OP_READ) {
+    //    cap holds gs::cap::READ and routes the op to the owner, which serves it and replies OK.
+    match invoke(&ctx, cap, gs::cap::READ, OP_READ) {
         Ok(reply) if reply.payload_bytes().first() == Some(&REPLY_OK) =>
             ctx.log("holder: read OK"),
         Ok(_)  => ctx.log("holder: read FAIL - owner did not reply OK"),
@@ -80,10 +82,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 
     // 3. NON-ESCALATION (§7.3 - rights cannot widen). Our cap is READ-ONLY. Invoke WRITE: the KERNEL
-    //    rejects it with CapInsufficientRights because the cap lacks RIGHT_WRITE - the request never
+    //    rejects it with CapInsufficientRights because the cap lacks gs::cap::WRITE - the request never
     //    even reaches the owner. This is the load-bearing proof that a narrowed cap cannot out-reach
     //    its rights; a read-only cap is read-only, mechanically.
-    match invoke(&ctx, cap, RIGHT_WRITE, OP_WRITE) {
+    match invoke(&ctx, cap, gs::cap::WRITE, OP_WRITE) {
         Err(IpcError::CapError(CapError::CapInsufficientRights)) =>
             ctx.log("holder: write denied (non-escalation)"),
         Ok(_)  => ctx.log("holder: write FAIL - a READ-ONLY cap WROTE (escalation!)"),
@@ -95,8 +97,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //    the cap once more. It is now stale, so the kernel's generation check fails with CapRevoked -
     //    the same mechanism fs uses to revoke a file cap on delete/close. A revoked cap fails LOUDLY,
     //    never silently succeeds (Commandment IX / §26.7).
-    let _ = invoke(&ctx, cap, RIGHT_READ, OP_CLOSE);   // trigger the owner's revoke
-    match invoke(&ctx, cap, RIGHT_READ, OP_READ) {
+    let _ = invoke(&ctx, cap, gs::cap::READ, OP_CLOSE);   // trigger the owner's revoke
+    match invoke(&ctx, cap, gs::cap::READ, OP_READ) {
         // The kernel's generation check on the revoked resource returns CapRevoked (the resource was
         // marked Revoked, §7.5). The SDK surfaces that generation-mismatch family as EndpointDead, so
         // in practice it arrives here as EndpointDead - the cap is gone, which is exactly the revoke
@@ -128,6 +130,14 @@ const INVOKE_SECS: i64 = 5;
 /// non-escalation - or is stale/revoked), so no reply will come: we reclaim the reply slot (no leak,
 /// §26.6) and return the error for the caller to read. We NEVER recv after a rejected invoke (that
 /// would block forever waiting for a reply the owner was never asked to send).
+/// **This is the protocol by hand, on purpose - it is not how you should write one.**
+///
+/// The standard library does this in `resource::invoke`, and does it better: it also STASHES a
+/// reply that is not ours, which is what makes the same code safe in a service that also serves
+/// clients. A plain wait takes whatever lands next and can swallow a client request (CLAUDE.md
+/// 8.2). That wrapper is crate-internal today because its signature carries the stash, and
+/// making it public is an API decision rather than a rename; `gs::file::File` is the wrapped
+/// form for files. This example keeps the long hand so the protocol is visible.
 fn invoke(ctx: &ServiceContext, cap: CapHandle, right: u8, op: u8) -> Result<Message, IpcError> {
     // Our endpoint's own SEND|GRANT handle, then a fresh per-invoke copy to embed as the reply cap.
     let self_grant = match ctx.self_grant_handle() {

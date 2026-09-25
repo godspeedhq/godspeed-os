@@ -8,4 +8,6 @@ name = "holder"
 path = "src/main.rs"
 
 [dependencies]
+godspeed = { path = "../../stdlib/rust" }
+# The hand-rolled `invoke` still names the SDK - deliberately, see its doc comment.
 godspeed-sdk = { path = "../../sdk/rust" }
