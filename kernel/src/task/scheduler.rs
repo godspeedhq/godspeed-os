@@ -2700,6 +2700,13 @@ pub fn kill_task_by_slot(slot: usize) {
                 let (mut irqs_at_window, _) = crate::arch::imp::core_irq_debug(cid as u32);
                 let mut extensions: u32 = 0;
                 let mut spins: u32 = 0;
+                // Test-only, decided ONCE per cross-core wait and NOT dependent on the race it
+                // probes for - the first placement was inside the loop, behind the very condition
+                // QEMU cannot produce, so it never fired.
+                #[cfg(feature = "kill-abandon-test")]
+                let forced = !ABANDON_PROBE_FIRED.swap(true, Ordering::SeqCst);
+                #[cfg(not(feature = "kill-abandon-test"))]
+                let forced = false;
                 loop {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
@@ -2708,14 +2715,7 @@ pub fn kill_task_by_slot(slot: usize) {
                     // conflicting accesses are SeqCst so the two sides cannot both
                     // miss each other. (The fence is now redundant but harmless.)
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if !core_still_using(cid, slot) { break; }
-                    // Test-only: take the abandon path once, deliberately, while a core really
-                    // is still using the slot - so the report and the recovery are both exercised.
-                    #[cfg(feature = "kill-abandon-test")]
-                    let forced = !ABANDON_PROBE_FIRED.swap(true, Ordering::SeqCst);
-                    #[cfg(not(feature = "kill-abandon-test"))]
-                    let forced = false;
-
+                    if !forced && !core_still_using(cid, slot) { break; }
 
                     // RE-SEND THE WAKE. It used to be sent once, before this loop, and never again: a
                     // core that missed it - or that was not running to take it - was never poked a
