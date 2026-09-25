@@ -7,7 +7,7 @@
 //!
 //! ARCH-NEUTRAL, and BOTH ELF CLASSES. The machine and class come from the arch seam
 //! (`arch::imp::ELF_MACHINE` / `ELF_CLASS`), so one loader parses 32-bit ARMv7 service ELFs and
-//! 64-bit ones alike - `ehdr_size`, `phdr_size` and `rdaddr` all branch on the class. This said
+//! 64-bit ones alike - `ehdr_size`, `phdr_size` and `rd_addr` all branch on the class. This said
 //! "ELF64 ... EM_X86_64, ELFCLASS64", which named one ISA's answer as the rule.
 //!
 //! Only the subset used by static services is handled:
