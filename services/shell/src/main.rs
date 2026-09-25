@@ -14530,7 +14530,7 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
 
 /// `fcap gsreuse` - the same question as `fcap reuse`, asked of the STANDARD LIBRARY.
 ///
-/// A `gs::cap::File` minted before `fs` dies must reach nothing after it comes back, and must say so
+/// A `gs::file::File` minted before `fs` dies must reach nothing after it comes back, and must say so
 /// in words rather than hanging or quietly succeeding. Everything here goes through `gs::fs` and
 /// `gs::cap` so there is ONE tag counter for the whole sequence.
 ///
