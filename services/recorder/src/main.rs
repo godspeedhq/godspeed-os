@@ -33,6 +33,7 @@
 //! filesystem down with it - the failure that would turn a troubleshooting tool into an outage. Full
 //! means stop, and say so.
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 /// Control opcodes on this service's endpoint.
@@ -44,11 +45,6 @@ pub const REC_OK: u8 = 0;
 pub const REC_ERR: u8 = 1;
 
 /// `fs` opcodes. Wire format is [tag, op, path_len, path.., data..].
-const FS_OP_WRITE_NEW: u8 = 24;
-const FS_OP_WRITE_AT: u8 = 25;
-const FS_OP_RENAME: u8 = 15;
-const FS_OP_DELETE: u8 = 16;
-const FS_OK: u8 = 0;
 /// Correlation tag for this service's own `fs` requests. Distinct from 0, which is both what an
 /// unthinking caller sends and the value of `FS_OK` - a collision that has hidden a bug before.
 const FS_TAG: u8 = 0xE1;
@@ -113,60 +109,20 @@ fn reply(ctx: &ServiceContext, out: &[u8]) {
 }
 
 /// One bounded `fs` request. True when `fs` answered OK.
-fn fs_call(ctx: &ServiceContext, op: u8, path: &[u8], tail: &[u8]) -> bool {
-    let mut req = [0u8; 3 + PATH_MAX + 8 + IO_CHUNK];
-    req[0] = FS_TAG;
-    req[1] = op;
-    req[2] = path.len() as u8;
-    req[3..3 + path.len()].copy_from_slice(path);
-    let off = 3 + path.len();
-    if off + tail.len() > req.len() {
-        return false;
-    }
-    req[off..off + tail.len()].copy_from_slice(tail);
-    let n = off + tail.len();
-    // REACQUIRE `fs` IF THE SEND FAILS, because `fs` restarts and this service does not.
-    //
-    // The recorder is spawned on demand and deliberately never restarted (services/CLAUDE.md), so it
-    // outlives its dependency: chaos restarts `fs` underneath a live recorder, the cap it holds goes
-    // stale, and every later request fails against an endpoint that no longer exists. §14.3 puts the
-    // obligation on the CLIENT - reacquire by name and retry - and this one did not, so it reported
-    // "could not create the capture file - is there a filesystem?" while `fs` sat there mounted and
-    // serving. That message is true about the cap and badly misleading about the system.
-    //
-    // `request_with_reply_deadline` cannot express this: it returns `Option`, so a dead endpoint and
-    // an expired deadline are both `None`. Retrying on that would retry timeouts too, which is the
-    // failure mode the `_call_err` variant exists to prevent - the same distinction `nic-driver`
-    // draws for `dwc2`, for the same reason, after the same symptom.
-    //
-    // ONE retry, not a loop: an `fs` that is genuinely gone must surface as a failure rather than as
-    // a request that never returns.
-    let msg = Message::from_bytes(&req[..n]);
-    // THE REPLY IS [tag, status], NOT [status]. `fs` echoes the correlation tag back as byte 0,
-    // which is what lets a caller recognise its own reply among the requests it is serving. Reading
-    // byte 0 as the status made every successful write look like a failure - the file was created
-    // and the service reported "could not create the capture file", which is the worst kind of
-    // wrong because both halves are convincing.
-    let ok = |r: &Message| {
-        let b = r.payload_bytes();
-        b.first() == Some(&FS_TAG) && b.get(1) == Some(&FS_OK)
-    };
-    match ctx.request_with_reply_call_err("fs", &msg, 5) {
-        Ok(Some(r)) => ok(&r),
-        Ok(None) => false,                    // deadline: fs is alive but slow. Do NOT retry.
-        Err(_) => {
-            // Send failed - the endpoint is dead, which is what a restart looks like from here.
-            if !ctx.reacquire_by_name("fs") {
-                return false;
-            }
-            // Loud, because a silent recovery is how the stale cap went unnoticed at all.
-            ctx.log("recorder: fs had restarted - reacquired it by name and retried");
-            match ctx.request_with_reply_call_err("fs", &msg, 5) {
-                Ok(Some(r)) => ok(&r),
-                _ => false,
-            }
-        }
-    }
+/// The filesystem, via the standard library.
+///
+/// WHAT WAS HERE: 32 lines building `[tag, op, plen, path, tail]` by hand, checking `b[0]` and
+/// `b[1]` by hand, and carrying its own reacquire-and-retry loop. All of that now lives once in
+/// `godspeed::fs`, and the request tag lives in the handle rather than in a `static` (invariant 9;
+/// the shell's own tag counter was moved out of a `static AtomicU8` for exactly that reason,
+/// finding C6-1).
+///
+/// WHAT CHANGED BESIDES THE LINE COUNT, and it matters more: this returned `bool`. A write that hit
+/// the deadline - and may therefore have landed - was indistinguishable from one that never left.
+/// The comments here explained that difference at length and the signature then discarded it.
+/// Callers get `Result` now and can ask `retry_is_safe()`.
+fn fs(ctx: &ServiceContext) -> gs::fs::Fs<'_> {
+    gs::fs::Fs::new(ctx)
 }
 
 /// Fill a freshly created capture file with zeros, so every block carries a valid CRC.
@@ -207,11 +163,22 @@ fn fill_step(ctx: &ServiceContext, cap: &mut Capture) -> bool {
             break;
         }
         let n = IO_CHUNK.min((cap.capacity - cap.filled) as usize);
-        let mut tail = [0u8; 8 + IO_CHUNK];
-        tail[..8].copy_from_slice(&cap.filled.to_le_bytes());
-        tail[8..8 + n].copy_from_slice(&zeros[..n]);
-        if !fs_call(ctx, FS_OP_WRITE_AT, &p[..pn], &tail[..8 + n]) {
-            ctx.log("recorder: pre-fill write failed - stopping the capture");
+        // The offset is an argument now, so the 8-byte prefix this used to pack by hand is gone.
+        let mut g = fs(ctx);
+        if let Err(e) = g.write_at(core::str::from_utf8(&p[..pn]).unwrap_or(""), cap.filled, &zeros[..n]) {
+            // SAY WHICH FAILURE. "pre-fill write failed" sent a reader to guess between a full disk,
+            // a dead service and a lost reply - three different things to do about it, and the reply
+            // was already carrying the answer.
+            let why = g.reason();
+            if why.is_empty() {
+                ctx.log_fmt(format_args!(
+                    "recorder: pre-fill write failed at offset {} - {} - stopping the capture",
+                    cap.filled, e.as_str()));
+            } else {
+                ctx.log_fmt(format_args!(
+                    "recorder: pre-fill write failed at offset {} - {} ({}) - stopping the capture",
+                    cap.filled, e.as_str(), why));
+            }
             cap.on = false;
             return false;
         }
@@ -293,13 +260,11 @@ impl Capture {
         if !final_tail && self.staged < IO_CHUNK {
             return true; // not a whole chunk yet; keep staging so offsets stay aligned
         }
-        let mut tail = [0u8; 8 + IO_CHUNK];
-        tail[..8].copy_from_slice(&self.written.to_le_bytes());
-        tail[8..8 + self.staged].copy_from_slice(&self.stage[..self.staged]);
-        let n = 8 + self.staged;
         let mut p = [0u8; PATH_MAX + 2];
         let pn = self.cur_path(&mut p);
-        let ok = fs_call(ctx, FS_OP_WRITE_AT, &p[..pn], &tail[..n]);
+        let ok = fs(ctx)
+            .write_at(core::str::from_utf8(&p[..pn]).unwrap_or(""), self.written, &self.stage[..self.staged])
+            .is_ok();
         if ok {
             self.written += self.staged as u64;
             self.total_written += self.staged as u64;
@@ -360,10 +325,10 @@ fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
         let tl = suffixed(&cap.path[..cap.plen], i, &mut to);
         // Delete the destination first: a rename onto an existing name is not guaranteed to replace it,
         // and a rotation that silently failed would leave the oldest piece never ageing out.
-        let _ = fs_call(ctx, FS_OP_DELETE, &to[..tl], &[]);
+        let _ = fs(ctx).delete(core::str::from_utf8(&to[..tl]).unwrap_or(""));
         // OP_RENAME takes the NEW NAME as a bare basename, not a path.
         let base = basename(&to[..tl]);
-        let _ = fs_call(ctx, FS_OP_RENAME, &from[..fl], base);
+        let _ = fs(ctx).rename(core::str::from_utf8(&from[..fl]).unwrap_or(""), core::str::from_utf8(base).unwrap_or(""));
     }
 
     cap.rotations += 1;
@@ -373,7 +338,7 @@ fn rotate(ctx: &ServiceContext, cap: &mut Capture) {
     let mut p = [0u8; PATH_MAX + 2];
     let pn = cap.cur_path(&mut p);
     cap.filled = 0;
-    if !fs_call(ctx, FS_OP_WRITE_NEW, &p[..pn], &cap.capacity.to_le_bytes()) {
+    if fs(ctx).create_sized(core::str::from_utf8(&p[..pn]).unwrap_or(""), cap.capacity).is_err() {
         ctx.log("recorder: could not open the next capture file - stopping");
         cap.on = false;
         return;
@@ -451,20 +416,15 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
     // The distinction matters here too: `Ok(None)` is a busy `events` and the next tick retries,
     // which is correct and must NOT reacquire. `Err` is a dead endpoint, which never recovers on its
     // own.
+    // The reacquire-and-retry loop that was written out here is `gs::call`'s job, and it is not
+    // filesystem-specific - the same eleven lines appeared for `fs` a few hundred lines up and in
+    // four other services. Reading a ring is idempotent, so every failure here is simply "try on the
+    // next tick", but the distinction is preserved rather than discarded: an `OutcomeUnknown` from a
+    // WRITE would demand different handling, and the caller can now ask.
     let msg = Message::from_bytes(&req);
-    let r = match ctx.request_with_reply_call_err("events", &msg, 3) {
-        Ok(Some(r)) => r,
-        Ok(None) => return, // events is busy; the next tick tries again
-        Err(_) => {
-            if !ctx.reacquire_by_name("events") {
-                return;
-            }
-            ctx.log("recorder: events had restarted - reacquired it by name and retried");
-            match ctx.request_with_reply_call_err("events", &msg, 3) {
-                Ok(Some(r)) => r,
-                _ => return,
-            }
-        }
+    let r = match gs::call::request_within(&ctx, "events", &msg, 3) {
+        Ok(r) => r,
+        Err(_) => return, // next tick tries again; a ring read loses nothing by waiting
     };
     let b = r.payload_bytes();
     if b.len() < EV_HDR {
@@ -599,7 +559,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // ALLOCATE ONLY, then answer. The extent is one cheap `fs` call; the pre-fill is
                     // the expensive part and now happens in the loop below, so the caller is never
                     // blocked on an unbounded amount of device I/O.
-                    if !fs_call(&ctx, FS_OP_WRITE_NEW, &path[..plen], &cap.capacity.to_le_bytes()) {
+                    if fs(&ctx).create_sized(core::str::from_utf8(&path[..plen]).unwrap_or(""), cap.capacity).is_err() {
                         ctx.log("recorder: could not create the capture file - is there a filesystem?");
                         reply_op(&ctx, op_code, REC_ERR);
                         continue;

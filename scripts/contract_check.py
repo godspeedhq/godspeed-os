@@ -332,6 +332,49 @@ def parse_supervisor_images(name: str):
     }
 
 
+
+def check_console_push() -> list:
+    """A crate that prints through `godspeed::io` must declare `console_push`.
+
+    The one code-to-contract pairing that needs no judgement: `gs::io`'s print functions go through
+    `CONSOLE_PUSH` and nothing else, so a caller that does not declare it prints into the void -
+    compiling, validating and passing every other check on the way.
+
+    Found by a Stranger Test run that wrote `log_write = true`, called `io::println` fourteen times,
+    and reported its contract as correct. 13.4 keeps its general disclaimer - nothing here can decide
+    whether arbitrary code needs an arbitrary capability - and this is the exception that is decidable.
+
+    `ipc_send = ["console"]` is NOT a substitute: that is the console SERVICE, a different path, and
+    `gs::io` does not take it.
+    """
+    import re
+    problems = []
+    roots = [REPO_ROOT / "services", REPO_ROOT / "examples"]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for crate in sorted(p for p in root.iterdir() if p.is_dir()):
+            srcs = list((crate / "src").glob("*.rs")) if (crate / "src").is_dir() else []
+            if not srcs:
+                continue
+            text = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in srcs)
+            # `godspeed::io::print*` reached either by full path or through an alias import.
+            prints = re.search(r"\bio::(println|print|println_fmt|print_fmt|report)\s*\(", text)
+            uses_stdlib_io = prints and re.search(r"use\s+godspeed(\s+as\s+\w+)?::|use\s+godspeed::\{[^}]*\bio\b", text)
+            if not uses_stdlib_io:
+                continue
+            tomls = list((crate / "contracts").glob("*.toml")) if (crate / "contracts").is_dir() else []
+            if not tomls:
+                continue
+            decl = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in tomls)
+            live = "\n".join(l.split("#", 1)[0] for l in decl.split("\n"))
+            if not re.search(r"^\s*console_push\s*=\s*true", live, re.M):
+                problems.append(
+                    "%s calls `godspeed::io` print functions but its contract does not declare "
+                    "`console_push = true` - it would run, print NOTHING, and report no error"
+                    % crate.name)
+    return problems
+
 def main() -> int:
     source = KERNEL_CFG.read_text(encoding="utf-8")
     kernel_hw = parse_service_hw(source)
@@ -393,8 +436,26 @@ def main() -> int:
               "audit T1): fix the .toml AND kernel/src/task/mod.rs to agree.")
         return 1
 
+    # A DIFFERENT QUESTION from the reconcile above, reported separately. That asks whether the .toml
+    # agrees with the kernel's spawn table; this asks whether the CODE needs something the .toml does
+    # not declare - a non-guarantee in general (13.4), decidable for this one pairing.
+    mute = check_console_push()
+    if mute:
+        print("Contract vs CODE - a program that prints but was not granted the screen:")
+        print()
+        for m in mute:
+            print("  %s" % m)
+        print()
+        print("`godspeed::io`'s print functions go through CONSOLE_PUSH and nothing else, so this")
+        print("compiles, validates, passes every other check, and is SILENT at runtime - the failure")
+        print("13.6 was amended to prevent. Add `console_push = true`. Note that")
+        print("`ipc_send = [\"console\"]` is a different mechanism (the console SERVICE) and is not")
+        print("a substitute.")
+        return 1
+
     print(f"Contract reconcile passed - {len(CONTRACTED)} contracts match their kernel service_config "
           "(memory limit, placement core, ipc_send).")
+    print("Contract vs code: every crate that prints through `godspeed::io` declares `console_push`.")
     return 0
 
 

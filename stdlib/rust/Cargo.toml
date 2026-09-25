@@ -1,0 +1,11 @@
+[package]
+name = "godspeed"
+version.workspace = true
+edition = "2021"
+
+[lib]
+name = "godspeed"
+path = "src/lib.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }

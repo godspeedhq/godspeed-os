@@ -1,6 +1,6 @@
 # 40. `selfcheck.gsh` is 376 bytes from a hard ceiling, and the ceiling is a u16
 
-**Status: OPEN, measured 2026-09-22.** Not a regression and not new - the file has been creeping
+**Status: CLOSED 2026-09-24** (measured 2026-09-22). Not a regression and not new - the file has been creeping
 toward this for as long as checks have been added to it. What is new is that somebody finally hit it
 and measured the remaining space.
 
@@ -73,6 +73,15 @@ is a long argument for why those differ.
 3. **Trim `selfcheck.gsh`.** It is heavily commented, deliberately, and those comments are the
    record of why each check exists. Cutting them to buy room trades a permanent explanation for a
    temporary 2 KB.
+
+## Closed 2026-09-24, and the "what not to do" below is why
+
+Nothing was shaved. The suite is nine files under `scripts/selfcheck/`, each under its own copy of the
+same ceiling, and the same 509 checks run. `backlog/47` carries the treatment.
+
+The CRLF half of this entry stands as ratified history and its fix is still load-bearing: `*.gsh text
+eol=lf` is what makes a size assert mean the same thing on every platform, and it now applies to nine
+files instead of one.
 
 ## What NOT to do
 

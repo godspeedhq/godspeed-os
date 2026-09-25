@@ -560,8 +560,15 @@ def check_user_vocabulary(check, pins):
     # help_block alone missed `fcap`, which is dispatched as `"fcap" => cmd_fcap(..)` and registers
     # no help block - so the check reported a documented command as missing when it is present. A
     # wrong finding is worse than a missing one: it costs the reader their trust in the whole list.
-    commands = set(re.findall(r'"([a-z][a-z0-9-]*)"\s*=>\s*help_block\(ctx,\s*"\1"', sh))
-    commands |= set(re.findall(r'"([a-z][a-z0-9-]*)"\s*=>\s*cmd_[a-z_]+\s*\(', sh))
+    # THE ARM BODY MAY START HOWEVER RUST LETS IT START. Both patterns used to demand that the call
+    # follow `=>` immediately, so an arm written `"x" => { help_block(..)` or `"x" => return cmd_x(..)`
+    # was invisible - and invisible here does not fail, it silently drops the verb from the audit and
+    # then reports its debt entry as "now reconciles". `selfcheck` is dispatched with `return` and its
+    # help block acquired a braced body, which took out both patterns at once and nearly retired a
+    # real debt. Widened once before for `fcap`; the lesson is in the module docstring.
+    start = r'"([a-z][a-z0-9-]*)"\s*=>\s*(?:\{\s*)?(?:return\s+)?'
+    commands = set(re.findall(start + r'help_block\(ctx,\s*"\1"', sh))
+    commands |= set(re.findall(start + r'cmd_[a-z_]+\s*\(', sh))
 
     spec_cmds, absent_cmds, out, seen = {}, {}, [], set()
     for fn in sorted(os.listdir(udir)):
@@ -926,6 +933,87 @@ def check_peer_reacquire(check, pins):
                              f"peer_reacquire_debt lists '{stale}', which now has a reacquisition "
                              f"path or no peer. Delete the entry - a list not tightened when the debt "
                              f"shrinks rots into a permanent exemption."))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
+# Commandment IX, second half - the library a service DELEGATES recovery to must actually recover
+# --------------------------------------------------------------------------------------------------
+
+def check_stdlib_delegates_reacquire(pins):
+    """`reacquire_api` credits `gs::call` with being a reacquisition path. Prove it still is.
+
+    WHY THIS EXISTS. When `services/recorder` moved onto the standard library, its hand-written
+    reacquire-and-retry loop went away and the IX check stopped finding one - correctly, from where
+    it was looking. The fix is to credit the library; the danger is that crediting it makes the
+    guarantee unfalsifiable, because nothing then checks the library itself. A service would be
+    passing IX on the strength of calling a function that could have stopped reacquiring years ago.
+
+    So this reads `stdlib/rust/src/call.rs` and requires that it reaches a real reacquisition API,
+    and that it does so on the SEND-FAILED path rather than on a deadline - which is the distinction
+    the commandment's own wording insists on ("never on `Ok(None)`, which is a deadline, not a dead
+    peer").
+    """
+    path = os.path.join(ROOT, "stdlib", "rust", "src", "call.rs")
+    if not os.path.exists(path):
+        # No standard library in this tree: nothing is being credited, so nothing to prove.
+        return []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    out = []
+    apis = [a for a in (pins.get("reacquire_api", []) or []) if not a.startswith(("gs::", "call::"))]
+    if not any(api in text for api in apis):
+        out.append(Violation(
+            "stdlib/rust/src/call.rs", 0,
+            "the standard library is listed in `reacquire_api`, so services are credited with a "
+            "recovery path for calling it - and it no longer reaches any reacquisition API. Either "
+            "restore the reacquire, or remove `gs::call::*` from `reacquire_api` so the services "
+            "that rely on it are held to IX themselves. A credit nothing verifies is worse than no "
+            "credit."))
+    # WHICH ARM IS THE REACQUIRE IN? This used to be `"DeadlineOutcome::SendFailed" in text`, which
+    # is a weaker question than it looks: it passes on a file that names the variant in a COMMENT and
+    # reacquires on the deadline, and it fails a file that is entirely correct in a different shape.
+    # Both happened - the second when the library moved to `CallDeadline`, where the same two facts
+    # are spelled `Err(..)` (the send never left) and `Ok(None)` (the peer is alive and slow).
+    #
+    # So: walk back from each reacquire to the match arm it sits in, and require that arm to be about
+    # a FAILED SEND. A dead peer is reacquired; a slow one is waited for.
+    lines = text.split("\n")
+    send_failed_arm = ("DeadlineOutcome::SendFailed", "Err(")
+    deadline_arm = ("DeadlineOutcome::Timeout", "Ok(None)", "ReqOutcome::Timeout")
+    found_reacquire = False
+    for i, line in enumerate(lines):
+        if not any(api in line for api in apis):
+            continue
+        found_reacquire = True
+        # The nearest `=>` at or above this line is the arm this call belongs to.
+        arm = None
+        for j in range(i, max(-1, i - 12), -1):
+            if "=>" in lines[j]:
+                arm = lines[j]
+                break
+        if arm is None:
+            out.append(Violation(
+                "stdlib/rust/src/call.rs", i + 1,
+                "a reacquire that is not inside a match arm on the request's outcome - IX needs it "
+                "to be reached for a FAILED SEND and for nothing else, and this cannot be read as "
+                "being either."))
+            continue
+        if any(d in arm for d in deadline_arm):
+            out.append(Violation(
+                "stdlib/rust/src/call.rs", i + 1,
+                "the reacquire sits in the DEADLINE arm. IX is explicit that a reacquire driven by a "
+                "deadline is a different bug: a slow peer is a live peer, and re-sending to it turns "
+                "one request into two."))
+        elif not any(f in arm for f in send_failed_arm):
+            out.append(Violation(
+                "stdlib/rust/src/call.rs", i + 1,
+                "the reacquire is not in a send-failure arm. IX asks for it on the path where the "
+                "request never left - `DeadlineOutcome::SendFailed`, or the `Err(..)` of a "
+                "`CallDeadline` - so that a deadline is never retried."))
+    if not found_reacquire:
+        # Already reported above by the `apis` check; nothing to add.
+        pass
     return out
 
 
@@ -1467,6 +1555,20 @@ CHECKS = [
              dict(why="a contract claiming authority it is not granted must be caught",
                   pins={"contract_privileges": {"log_write": "SERVICE_CONTROL"}}, expect=True),
              dict(why="the real map against the real tree must pass", pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="IX-stdlib-delegates", commandment="IX",
+         title="the library a service delegates recovery to must actually recover",
+         kind="custom", fn=lambda check, pins: check_stdlib_delegates_reacquire(pins),
+         scope="stdlib/rust/src/call.rs, whenever `reacquire_api` credits it",
+         proves="that crediting the standard library with a reacquisition path is not a hole. "
+                "`IX-peer-reacquire` passes a service for CALLING `gs::call`; this is what makes "
+                "that credit mean something, by holding the callee to the same rule",
+         does_not_prove="that the retry is reached on every path a caller might take, nor that the "
+                        "caller handles the error it gets back",
+         probes=[
+             dict(why="the real library against the real tree must pass", pins=None, expect=False),
+             dict(why="a library that stopped reacquiring must be caught",
+                  pins={"reacquire_api": ["nothing_that_appears_in_the_file"]}, expect=True),
          ]),
     dict(nature="rule", id="IX-peer-reacquire", commandment="IX",
          title="a service that sends to a peer can reacquire it after the peer restarts",

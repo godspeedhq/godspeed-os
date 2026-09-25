@@ -40,7 +40,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, IpcError, CapHandle, CapError};
+use godspeed_sdk::{ServiceContext, Message, IpcError, CapHandle, CapError, ReqOutcome};
 use godspeed_sdk::capability::{RIGHT_READ, RIGHT_WRITE};
 
 // Resource operations - the FIRST payload byte of a badged invocation (mirrors resource-server's
@@ -113,6 +113,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.park()
 }
 
+/// How long `holder` waits for an owner to answer an invocation before calling it dead.
+///
+/// A number rather than "forever". The owner is a local service answering a one-byte operation, so
+/// seconds is already generous; what matters is that the bound EXISTS (26.6).
+const INVOKE_SECS: i64 = 5;
+
 /// Invoke the resource cap `cap` for operation `op`, asking the kernel to validate `right`.
 ///
 /// This is the client's "send" of a delegated resource cap (the mirror of the shell's `fc_invoke`,
@@ -133,7 +139,28 @@ fn invoke(ctx: &ServiceContext, cap: CapHandle, right: u8, op: u8) -> Result<Mes
         None    => return Err(IpcError::EndpointDead), // cap table full (should not happen)
     };
     match ctx.resource_invoke(cap, right, reply, &Message::from_bytes(&[op])) {
-        Ok(())  => Ok(ctx.recv()),          // routed: block for the owner's reply on our endpoint
+        // Routed. Now WAIT ON TRUTH INCLUDING FAILURE (Commandment VIII).
+        //
+        // This was `ctx.recv()` - unbounded - and it is the reason this example is being corrected:
+        // an owner that received the invocation and then died would never reply, and `holder` would
+        // block until the machine was rebooted. The kernel cannot rescue us here the way it rescues
+        // a named-peer `Call`: a `resource_invoke` is a SEND, so the kernel is never told a reply is
+        // awaited and `ReplyDead` (8.6) does not reach this path (`backlog/46`).
+        //
+        // The bound is therefore ours to set, and the SDK already provides it for exactly this case.
+        // A service with no console foreground never sees input, so this degrades to a plain
+        // deadline wait - which is what `holder` gets.
+        //
+        // The reply cap is NOT reclaimed on any path below: the send embedded it, and 8.5 removes an
+        // embedded cap from the sender's table, so the slot is already the kernel's. Removing it
+        // again removes whatever has since been put there.
+        Ok(()) => match ctx.recv_abortable_deadline(INVOKE_SECS) {
+            ReqOutcome::Reply(m) => Ok(m),
+            // The owner never answered within the bound. Say which failure this is rather than
+            // returning something vague: from a holder's side it is indistinguishable from the
+            // replier dying, which is exactly what `ReplyDead` names.
+            _ => Err(IpcError::ReplyDead),
+        },
         Err(e)  => { ctx.remove_cap(reply); Err(e) } // rejected: reclaim the unused reply slot, report
     }
 }

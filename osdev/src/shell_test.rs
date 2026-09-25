@@ -74,7 +74,11 @@ pub fn run(image_path: &Path, smp: u32) {
         // Networking Phase 0: an e1000 NIC so the kernel's PCI scan prints it (docs/networking.md).
         // Confirms the detection works in QEMU + that the NIC doesn't disturb boot (the rest of the suite).
         "-device",  "e1000,netdev=n0",
-        "-netdev",  "user,id=n0",
+        // HOSTFWD, so the harness can be a TCP CLIENT of the guest. SLIRP only restricts the
+        // guest reaching OUTWARD (its only peer is the gateway); inbound is exactly what this is
+        // for, and it is what makes `serve` - and ACCEPT's embedded connection capability - testable
+        // at all.
+        "-netdev",  "user,id=n0,hostfwd=tcp:127.0.0.1:18080-:8080",
         // Phase 1 step 3: dump every frame on the NIC backend to a pcap, so we can confirm
         // nic-driver's TX frame actually left the card, not just that the NIC set DD.
         "-object",  "filter-dump,id=nicdump,netdev=n0,file=build/net-tx.pcap",
@@ -375,9 +379,77 @@ pub fn run(image_path: &Path, smp: u32) {
     // client holds and invokes, not an ambient channel. Lenient on the UDP response (external), but
     // the open + invoke (the cap mechanism itself) must succeed - "would not open" would be a failure.
     send(&mut write_half, b"sock\r");
-    let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
-    check!(sock_out.contains("sock: UDP socket cap - sent") || sock_out.contains("socket cap invocation returned nothing"),
+    // LONGER THAN THE COMMAND CAN TAKE. `sock` does a real UDP round trip, and `net-stack` burns up
+    // to 6 x (2 + 1) = 18s of retries before replying when the peer is silent, so `gs::net` waits
+    // `SOCKET_SECS` (30). This window was 8 - fine when the shell gave up after 5 - and once the
+    // command outlived it the harness desynchronised and EVERY LATER STEP cascaded into failure.
+    // Three consecutive runs gave 12, 6 and 50 failures with no kernel panic and no wedge in the
+    // serial log, which is the signature of a harness losing its place rather than a guest breaking.
+    //
+    // Same rule as every deadline on this branch: a waiter's bound must exceed the work it waits on.
+    let sock_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    // TWO HONEST OUTCOMES, AND NOTHING ELSE.
+    //
+    // This originally accepted "socket cap invocation returned nothing", which the shell printed on
+    // exactly one condition - the invocation FAILED - so the guard for the capability mechanism
+    // accepted the mechanism being broken. That is still rejected.
+    //
+    // It was then tightened to demand success, loosened AGAIN to accept a named deadline because the
+    // command kept timing out under load, and is tightened back here - because the timeouts had a
+    // cause, and the tolerance was hiding it.
+    //
+    // The cause: `net-stack` put a badged capability invocation aside while it talked to the driver
+    // and dropped it after a fixed 1500 ms, while this client waited thirty seconds for an answer
+    // that no longer existed. A badged request now says how long its client will wait, exactly as a
+    // named one always did, so the request is held for as long as it is worth answering. Measured on
+    // the same machine that produced the timeouts: `sock` round-trips, and `net-stack`s slowest
+    // serve pass fell from 64 s to 1.7 s.
+    //
+    // So: a round trip, which may carry zero bytes back - an unanswered datagram is an ordinary UDP
+    // outcome and is still a success for what this guards, which is the CAPABILITY mechanism. A
+    // deadline is not accepted any more. If one returns, the honest place to look is `net-stack`s
+    // retry budget (up to 6 x (2 + 1) = 18 s) against `gs::net::SOCKET_SECS`, not this line.
+    check!(sock_out.contains("sock: UDP socket cap - sent"),
            "sock: opened + invoked a UDP socket capability (socket = capability, §7.10)");
+
+    // serve (utilities/42_serve.md): a TCP LISTENER as a capability, exercised by a real client.
+    //
+    // The strongest test of the socket-capability path in this repository, because ACCEPT returns an
+    // EMBEDDED CONNECTION CAPABILITY - the one part of the tagging on this branch that nothing else
+    // reaches. A reply believed on a mismatched tag would hand the shell a capability to the wrong
+    // connection; here the bytes have to come back to the host or the test fails.
+    send(&mut write_half, b"serve 8080 25s\r");
+    let listening = collect_until(&buf, &mut cursor, b"answering connections",
+                                  Duration::from_secs(20)).unwrap_or_default();
+    check!(listening.contains("listening on"),
+           "serve: the guest is listening on a TCP port (listener = capability, §7.10)");
+
+    // Now be the client. Retry briefly: the guest has printed that it is listening, but the
+    // forwarded port is the HOST's view and may take a moment to accept.
+    let mut echoed = Vec::new();
+    for _ in 0..24 {
+        if let Ok(mut c) = TcpStream::connect("127.0.0.1:18080") {
+            let _ = c.set_read_timeout(Some(Duration::from_secs(12)));
+            send(&mut c, b"stranger-knocks");
+            let mut b = [0u8; 512];
+            if let Ok(n) = c.read(&mut b) {
+                echoed.extend_from_slice(&b[..n]);
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let echoed_s = String::from_utf8_lossy(&echoed).into_owned();
+    check!(echoed_s.contains("stranger-knocks"),
+           "serve: a HOST TCP client sent bytes into the guest and got them back");
+
+    // Stop it rather than waiting out the 25s, then let the prompt come back.
+    send(&mut write_half, b"q");
+    let served = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(served.contains("accepted a connection"),
+           "serve: the guest accepted the connection through ACCEPT's embedded capability");
+
+
 
     // -----------------------------------------------------------------------
     // console scrollback
@@ -3888,8 +3960,16 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - read fs chaos report timeout"); fail += 1; }
     }
     match run!(b"dir /\r", 10) {
-        Some(r) => check!(!r.contains("storage unavailable"),
-                          "directory: shell reacquires fs after its own restart"),
+        // MUST SHOW A LISTING, not merely fail to complain. This checked only that the words
+        // "storage unavailable" were absent, which an EMPTY reply satisfies - a hang, a dropped
+        // answer or a command that gave up all passed. And this is the one test in the repository
+        // that exercises the standard library against a service that really died and came back
+        // (`dir` walks `gs::fs::list_dir`), so a vacuous pass here is a vacuous pass for the whole
+        // reacquisition claim.
+        Some(r) => check!(!r.contains("storage unavailable")
+                          && !r.contains("could not read")
+                          && (r.contains("entries") || r.contains("(empty)")),
+                          "directory: shell reacquires fs after its own restart AND lists it"),
         None    => { println!("files-test: FAIL - dir after fs-storm timeout"); fail += 1; }
     }
 
@@ -4524,8 +4604,27 @@ pub fn run_counter(image_path: &Path, persist_path: &str, smp: u32) {
 
     // Let counter persist at least one increment. The first "counter: count=N saved" line AFTER the
     // format is the first SUCCESSFUL save (N >= 1) - pre-flash attempts logged "(save failed …)".
-    let saved_n = collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(40 * sc))
-        .and_then(|chunk| digits_after(&chunk, "counter: count="));
+    //
+    // UP TO THREE MARKERS, TAKING THE FIRST THAT PARSES. `" saved"` is not unique to the line this
+    // wants: counter prints "no saved count yet - starting at 0" at startup on an empty disk, and
+    // that contains it too. Normally that line is already behind the cursor by the time the disk is
+    // flashed - but on a slow boot (measured: `block-driver: op 5 spent 453337 us`, `fs: op 10 took
+    // 487725 us`) `counter: ready` arrives AFTER the prompt, the informational line lands inside
+    // this window, and the wait stops on a line with no digits in it. The suite then reported a
+    // persistence failure for a save the serial log shows succeeding, and which boot it was decided
+    // the answer.
+    let mut saved_n = None;
+    for _ in 0..3 {
+        match collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(40 * sc)) {
+            Some(chunk) => {
+                if let Some(n) = digits_after(&chunk, "counter: count=") {
+                    saved_n = Some(n);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
     check!(matches!(saved_n, Some(n) if n >= 1), "counter persisted an increment to /counter.dat (count >= 1)");
     // Wait for a second successful save so the durable value is solidly > 0 before we kill.
     let _ = collect_until(&buf, &mut cursor, b" saved", Duration::from_secs(20 * sc));
@@ -4999,6 +5098,13 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
                    "an append-only cap CANNOT go back over what it already wrote");
             check!(r.contains("still accepted after the refusal"),
                    "a refused write did not rewind the high-water mark");
+            // THE STANDARD LIBRARY, over the same protocol. Named rather than left to the aggregate
+            // below: `gs::cap` is the only caller that must work from a task which also serves
+            // clients, so a silent regression here is the one that would not be noticed.
+            check!(r.contains("gs::cap wrote and read the file THROUGH the capability"),
+                   "gs::cap round-trips a file through the capability");
+            check!(r.contains("gs::cap non-escalation holds"),
+                   "gs::cap cannot widen rights - a READ cap is refused its write by the kernel");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }
@@ -5401,8 +5507,14 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     // (no host bake) - the one-USB hardware path where the operator flashes only os.img,
     // `drives flash`es the SSD, then types `selfcheck`. The big suite + many service spawns
     // take a while under TCG, so allow a generous wall-clock window.
+    //
+    // 300s, NOT THE 150 THIS HELD. `fail` ends a gsh run, so while one statement in the middle of
+    // the suite was failing, only 326 of its 509 statements ever executed - and 150 was chosen
+    // against that shortened run. Fixing the failure made the suite 56% longer to complete and the
+    // window was then under the work it waits on: three runs of one build gave 5/0, 5/0 and 3/2, the
+    // failures being timeouts rather than anything the suite reported.
     send(&mut write_half, b"selfcheck\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(300)) {
         Some(r) => {
             // Always save the full live transcript so the run can be inspected line-by-line.
             let _ = std::fs::write("build/selfcheck-transcript.txt", r.as_bytes());
@@ -5425,8 +5537,12 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     //
     // A suite that only passes on a fresh boot fails the first time someone runs it twice, which is
     // exactly when they are investigating something.
+    //
+    // The SECOND run is the slower of the two: it contends with everything the first left running -
+    // `recorder` spawned, a capture rotated, the disk fuller - so if either window is short it is
+    // this one, and it was the one that failed first.
     send(&mut write_half, b"selfcheck\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(150)) {
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(300)) {
         Some(r) => {
             let _ = std::fs::write("build/selfcheck-transcript-2.txt", r.as_bytes());
             if r.contains("failed 0") && !r.contains("--- failures ---") {
@@ -5438,6 +5554,125 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
             }
         }
         None => { println!("script-test: FAIL - second `selfcheck` timed out"); fail += 1; }
+    }
+
+    // ONE PART ON ITS OWN. The affordance the split was worth doing for: `selfcheck files` runs the
+    // file section and nothing else, which is what an operator investigating storage actually wants
+    // rather than six minutes of network and observability checks first.
+    send(&mut write_half, b"selfcheck files\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            let ran = digits_after(&r, "run: ran ");
+            // Green, and SHORTER than the whole suite - otherwise "one part" is a label on a full run.
+            if r.contains("failed 0") && !r.contains("--- failures ---") && matches!(ran, Some(n) if n > 0 && n < 200) {
+                println!("script-test: PASS - `selfcheck files` runs ONE part green ({:?} statements)", ran);
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck files` did not run one part green (ran {:?})", ran);
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - `selfcheck files` timed out"); fail += 1; }
+    }
+
+    // `selfcheck help` MUST NAME THE PARTS THAT ACTUALLY RUN. The list used to be typed into the
+    // help block by hand, which is a second copy of a fact the table already holds - it now reads
+    // `SELFCHECK_PARTS`, and this asserts every one of them appears. Add a part, forget the help,
+    // and this goes red instead of the help screen going confidently stale.
+    send(&mut write_half, b"selfcheck help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => {
+            let parts = ["language", "meta", "hardware", "events", "persist",
+                         "files", "data", "cleanup", "network"];
+            let missing: Vec<&str> = parts.iter().copied().filter(|p| !r.contains(p)).collect();
+            if missing.is_empty() && r.contains("parts:") {
+                println!("script-test: PASS - `selfcheck help` names every part that runs");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck help` did not name: {missing:?}");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - `selfcheck help` timed out"); fail += 1; }
+    }
+
+    // ONE PART, REPORT TO A FILE - the two parse branches meeting. Reasoned about and never run
+    // until now, which is the gap between "it should work" and "it does".
+    send(&mut write_half, b"selfcheck cleanup save /sc-part.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+        Some(r) => {
+            // ONLY the "saved" line is on the console. A saved run sends its summary, its failures
+            // and its tally into the FILE - that is what `save` means - so `failed 0` is not here to
+            // be found. The assertion below reads the file back and checks the tally there, which is
+            // the half that proves the part actually ran green.
+            if r.contains("saved report") && r.contains("/sc-part.txt") {
+                println!("script-test: PASS - `selfcheck <part> save <out>` runs the part and writes its report");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - `selfcheck <part> save <out>` did not write a report");
+                fail += 1;
+            }
+        }
+        None    => { println!("script-test: FAIL - `selfcheck <part> save` timed out"); fail += 1; }
+    }
+    send(&mut write_half, b"read /sc-part.txt\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => {
+            if r.contains("run: ran") && r.contains("failed 0") {
+                println!("script-test: PASS - the saved per-part report holds that part's tally");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - the per-part report is missing its tally");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - reading the per-part report timed out"); fail += 1; }
+    }
+
+    // `q` STOPS IT, AND A STOPPED RUN IS NOT A PASS. Conventions rule 9 asks the longest command in
+    // the shell to be abortable; this checks the abort AND the thing that makes it safe - that the
+    // tally says it stopped and NAMES what never ran. `failed 0` is what this very suite greens on,
+    // so a quit that printed only a tally would pass while half the machine went unchecked.
+    send(&mut write_half, b"selfcheck\r");
+    if collect_until(&buf, &mut cursor, b"part 3/9", Duration::from_secs(180)).is_some() {
+        send(&mut write_half, b"q");
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
+            Some(r) => {
+                let stopped = r.contains("STOPPED at your request");
+                let not_pass = r.contains("NOT a pass");
+                let named = r.contains("never run:") && r.contains("network");
+                if stopped && not_pass && named {
+                    println!("script-test: PASS - `q` stops the run, and it refuses to look like a pass");
+                    pass += 1;
+                } else {
+                    println!("script-test: FAIL - `q` did not report a stop honestly \
+                              (stopped={stopped} not_pass={not_pass} named={named})");
+                    fail += 1;
+                }
+            }
+            None => { println!("script-test: FAIL - `q` did not end the run"); fail += 1; }
+        }
+    } else {
+        println!("script-test: FAIL - the run never reached part 3 to be quit");
+        fail += 1;
+    }
+
+    // A NAME THAT IS NOT A PART MUST SAY SO, AND SAY WHICH ARE. Running everything on a typo is the
+    // silent-fallback shape invariant 12 forbids: the operator asked for one thing, got another, and
+    // was not told.
+    send(&mut write_half, b"selfcheck fils\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => {
+            if r.contains("no part named") && r.contains("files") && r.contains("network")
+               && !r.contains("run: ran") {
+                println!("script-test: PASS - an unknown part is refused and the real names are listed");
+                pass += 1;
+            } else {
+                println!("script-test: FAIL - an unknown part was not refused with the list of parts");
+                fail += 1;
+            }
+        }
+        None => { println!("script-test: FAIL - unknown-part case timed out"); fail += 1; }
     }
 
     child.kill().ok();
@@ -5718,6 +5953,201 @@ fn retry_tcp_connect(port: u16, timeout: Duration) -> Option<TcpStream> {
 
 /// Block (polling every 50 ms) until `sentinel` appears in `buf[*cursor..]`
 /// or `timeout` expires.  Advances `*cursor` past the sentinel on success.
+
+/// `osdev test chaos-repro[:rounds[:iters]]` - hammer `chaos max-carnage` inside one boot.
+///
+/// Written for `backlog/48`: a kernel panic on the kill path's progress bound, seen once in four
+/// `osdev test shell` runs. That rate is unusable for an investigation - each of those runs costs
+/// minutes and spends nearly all of them on things that are not carnage - so this does nothing but
+/// carnage, in a loop, in one boot.
+///
+/// It watches for `KERNEL PANIC` as well as the normal end marker. After a panic the machine halts
+/// (`-no-reboot`) and the serial goes quiet, so waiting only for the end marker would burn the whole
+/// window and then report "timed out" - which is exactly what made the original sighting read as a
+/// harness cascade rather than as the kernel fault it was.
+pub fn run_chaos_repro(image_path: &Path, smp: u32, rounds: u32, iters: u32) {
+    println!("chaos-repro: booting OS (smp={smp}) - {iters} iteration(s) of `chaos max-carnage all-services {rounds}`");
+
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none",
+        "-no-reboot",
+        "-no-shutdown",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("chaos-repro: QEMU launch failed at {qemu}: {e}");
+        std::process::exit(1);
+    });
+    // 90s, not 10: under a deliberately loaded host QEMU may not get enough CPU to open its
+    // listening socket for tens of seconds, and the loaded phase of `backlog/48` died here before it
+    // ran a single round.
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(90)) {
+        Some(s) => s,
+        None => {
+            eprintln!("chaos-repro: could not connect to QEMU serial port {shell_port}");
+            child.kill().ok();
+            std::process::exit(1);
+        }
+    };
+    let mut read_half  = stream.try_clone().expect("clone tcp stream for reading");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n)          => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(240)).is_none() {
+        println!("chaos-repro: FAIL - timed out waiting for first gsh>");
+        save_repro_serial(&buf);
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+
+    let started = Instant::now();
+    let mut done = 0u32;
+    let mut panicked = false;
+    let mut wedged = false;
+    for i in 1..=iters {
+        send(&mut write_half, &format!("chaos max-carnage all-services {rounds}\r").into_bytes());
+        // The loud serial-required confirm. If it does not come, something is already wrong.
+        if collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(90)).is_none() {
+            println!("chaos-repro: iteration {i}: no confirm prompt - stopping");
+            wedged = true;
+            break;
+        }
+        send(&mut write_half, b"y\r");
+        match collect_until_any(&buf, &mut cursor,
+                                &[b"foreground returned to the shell", b"KERNEL PANIC"],
+                                Duration::from_secs(420)) {
+            Some((1, _)) => { panicked = true; break; }
+            Some((_, _)) => {}
+            None => {
+                println!("chaos-repro: iteration {i}: neither a report nor a panic within 420s");
+                wedged = true;
+                break;
+            }
+        }
+        // Still answering? A machine that stops answering without panicking is its own finding, and
+        // the bound this is investigating exists precisely to turn that into a panic instead.
+        send(&mut write_half, b"cores\r");
+        let mut ok = false;
+        for _ in 0..6 {
+            match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)) {
+                Some(r) => {
+                    if r.contains("KERNEL PANIC") { panicked = true; break; }
+                    if r.contains(&format!("cores: {smp}")) { ok = true; break; }
+                }
+                None => send(&mut write_half, b"cores\r"),
+            }
+        }
+        if panicked { break; }
+        if !ok {
+            println!("chaos-repro: iteration {i}: the shell stopped answering, with no panic");
+            wedged = true;
+            break;
+        }
+        done = i;
+        if i % 5 == 0 || i == iters {
+            println!("chaos-repro: {i}/{iters} iterations, {} rounds, {:.0}s elapsed",
+                     i * rounds, started.elapsed().as_secs_f64());
+        }
+    }
+
+    let path = save_repro_serial(&buf);
+    let secs = started.elapsed().as_secs_f64();
+    println!();
+    if panicked {
+        println!("chaos-repro: REPRODUCED - kernel panic after {done} clean iteration(s) ({} rounds, {secs:.0}s)",
+                 done * rounds);
+        let g = buf.lock().unwrap();
+        let text = String::from_utf8_lossy(&g);
+        if let Some(p) = text.find("KERNEL PANIC") {
+            let from = text[..p].rfind('\n').map(|k| k + 1).unwrap_or(0);
+            let to = (p + 400).min(text.len());
+            println!("--- the panic ---\n{}\n--- end ---", text[from..to].trim_end());
+        }
+        println!("chaos-repro: serial -> {path}");
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    if wedged {
+        println!("chaos-repro: STOPPED EARLY after {done} clean iteration(s) ({} rounds, {secs:.0}s) - see {path}",
+                 done * rounds);
+        child.kill().ok(); child.wait().ok();
+        std::process::exit(1);
+    }
+    println!("chaos-repro: {done} iteration(s), {} rounds, no panic, no wedge ({secs:.0}s)", done * rounds);
+    println!("chaos-repro: serial -> {path}");
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// `collect_until` with several sentinels: returns `(which, text)` for whichever appears FIRST.
+///
+/// Waiting on one marker at a time cannot express "a report, or a panic" - and a panic means the
+/// serial stops, so the one-marker form pays the whole window before saying anything useful.
+fn collect_until_any(
+    buf:       &Arc<Mutex<Vec<u8>>>,
+    cursor:    &mut usize,
+    sentinels: &[&[u8]],
+    timeout:   Duration,
+) -> Option<(usize, String)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let g = buf.lock().unwrap();
+            let slice = &g[*cursor..];
+            // The EARLIEST match wins, not the first sentinel that happens to be present: a panic
+            // that landed before the end marker must not be reported as a clean run.
+            let mut best: Option<(usize, usize)> = None;
+            for (i, s) in sentinels.iter().enumerate() {
+                if let Some(pos) = window_find(slice, s) {
+                    let end = pos + s.len();
+                    if best.map_or(true, |(b, _)| end < b) { best = Some((end, i)); }
+                }
+            }
+            if let Some((end_rel, which)) = best {
+                let end = *cursor + end_rel;
+                let chunk = String::from_utf8_lossy(&g[*cursor..end]).into_owned();
+                *cursor = end;
+                return Some((which, chunk));
+            }
+        }
+        if Instant::now() >= deadline { return None; }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn save_repro_serial(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let path = "build/tests/chaos_repro_serial.log".to_string();
+    let _ = std::fs::create_dir_all("build/tests");
+    let g = buf.lock().unwrap();
+    let _ = std::fs::write(&path, &g[..]);
+    path
+}
+
 fn collect_until(
     buf:      &Arc<Mutex<Vec<u8>>>,
     cursor:   &mut usize,
@@ -7065,6 +7495,11 @@ pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
     // it - the shell keeps no cap table between prompts, so `fcap` here and `kill fs` there would
     // drop the handle before the interesting moment.
     let out = run!(b"fcap reuse\r", 180).unwrap_or_default();
+    // THE SAME QUESTION, ASKED OF THE STANDARD LIBRARY. A second real `fs` death, with a
+    // `gs::cap::File` held across it. This is the only place the library meets a service that
+    // genuinely dies and comes back - which a host test structurally cannot reach, and which
+    // `docs/stdlib-design.md` has recorded as owed since section 7.
+    let gsout = run!(b"fcap gsreuse\r", 180).unwrap_or_default();
 
     let after = run!(b"drives check\r", 180).unwrap_or_default();
     let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
@@ -7084,6 +7519,18 @@ pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!out.contains("still resolved to something"),
            "the stale capability resolved to nothing at all, not merely to the wrong thing");
     check!(out.contains("fcap reuse: ok"), "the whole sequence reported success");
+    // ---- THE STANDARD LIBRARY, ACROSS A REAL RESTART ----
+    check!(gsout.contains("reads the original before the restart"),
+           "gs::cap: the capability worked BEFORE the restart");
+    check!(!gsout.contains("still resolved to something"),
+           "gs::cap: the stale capability reached NOTHING after the restart");
+    // The library's job is not merely to fail - it is to fail IN WORDS. A hang times out above
+    // and a silent success is caught by the check before this; this one pins that the operator
+    // is TOLD, which is the whole reason the error model exists.
+    check!(gsout.contains("the stale cap was refused - "),
+           "gs::cap: the refusal is NAMED, not a hang and not a silent failure");
+    check!(gsout.contains("fcap gsreuse: ok"),
+           "gs::cap: the whole library sequence reported success");
     check!(after.contains("0 bad"), "the volume is intact after a restart with a live capability");
 
     println!("\nfs-reuse: {pass} passed, {fail} failed");

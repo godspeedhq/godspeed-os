@@ -793,7 +793,7 @@ fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
 }
 
 /// `bar_ix` value meaning "the first mapped MEMORY BAR" rather than a numbered one (see
-/// `hw_mmio_of`). 7 is free because the field is 3 bits and only 0..5 are real BARs.
+/// `mmio_bar`). 7 is free because the field is 3 bits and only 0..5 are real BARs.
 pub const BAR_AUTO: u8 = 7;
 
 /// Decode a `hw_flags` PCI descriptor: `bit31 | confine<<28 | bar_ix<<24 | class_code`.
@@ -1483,7 +1483,7 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
 /// a spawner can collect a cap to every service it starts without the kernel resolving names.
 fn spawn_service_with_image(
     // NOT `&'static str`. A caller-supplied name is what lets a spawner name what it spawns; the
-    // task owns its bytes now (`scheduler::set_task_name`), so nothing here needs the literal.
+    // task owns its bytes now (`scheduler::TASK_NAMES`), so nothing here needs the literal.
     name:              &str,
     // Where the image lives: kernel rodata (the catalogue path, until it is gone) or the CALLER's
     // address space (`SpawnImage`). See `loader::ImageSource` for the double-fetch discipline.

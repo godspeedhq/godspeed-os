@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://godspeed.os/schemas/service/v1",
   "title": "ServiceContract",
-  "description": "Structural schema for a GodspeedOS service contract (service.toml). See 13. NOTE (2026-09-12): this schema had drifted behind the contracts it validates - six shipped services could not pass `osdev validate` because `additionalProperties: false` met four keys the schema never declared (hw_pci_class, hw_pci_bar, hw_pci_irq, pci_cfg) and an `hw_device` enum that predated the move to class-based PCI resolution. Those are added/widened here, which is permissive and so stays within v1. Two DEAD keys are deliberately NOT removed - `hw_pio` (capability retired with ATA PIO) and `spawn` (init removed, Phase 5) - because removing a key NARROWS the schema, which 13.5 makes a major version bump with a documented migration. They are marked dead in place; the narrowing is a deliberate v2, tracked in backlog/20.",
+  "description": "Structural schema for a GodspeedOS service contract (service.toml). See 13. NOTE (2026-09-12): this schema had drifted behind the contracts it validates - six shipped services could not pass `osdev validate` because `additionalProperties: false` met four keys the schema never declared (hw_pci_class, hw_pci_bar, hw_pci_irq, pci_cfg) and an `hw_device` enum that predated the move to class-based PCI resolution. Those are added/widened here, which is permissive and so stays within v1. Two DEAD keys are deliberately NOT removed - `hw_pio` (capability retired with ATA PIO) and `spawn` (init removed, Phase 5) - because removing a key NARROWS the schema, which 13.5 makes a major version bump with a documented migration. They are marked dead in place; the narrowing is a deliberate v2, tracked in backlog/20. NOTE (2026-09-24): `console_push` was missing for the same reason and found the same way - `scripts/contract_check.py` requires any crate printing through `godspeed::io` to declare it, while `additionalProperties: false` rejected it, so the worked example the published book teaches from could not pass `osdev validate`. Added here, which is permissive and stays within v1. It went unnoticed because `osdev validate` is not run by any of the enforcement scripts - it is a separate command, and a check nobody runs is a check that is not there.",
   "type": "object",
   "required": ["name", "version", "resources", "capabilities"],
   "additionalProperties": false,
@@ -47,7 +47,11 @@
           "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
           "description": "Endpoint names this service owns and may receive on."
         },
-        "log_write": {
+        "console_push": {
+   "type": "boolean",
+   "description": "Permission to put text on the screen: the console input ring the `console` service renders (privbits::CONSOLE_PUSH). Granted from the spawn request, like every other privilege; declared here because 13.6 makes the contract the reviewable statement of what a service may do. A program that prints through `godspeed::io` without it RUNS, prints NOTHING, and reports no error - which is why `scripts/contract_check.py` requires the two to agree."
+  },
+  "log_write": {
           "type": "boolean",
           "description": "Permission to write the kernel log: syscall 5, straight to the 16 KiB ring buffer and the serial console. NOT routed through any service - CLAUDE.md 11.4 (amendment 2026-09-04) exists to deny exactly that, so that observing a failure never depends on a service that can fail."
         },

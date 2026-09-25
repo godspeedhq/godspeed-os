@@ -17,11 +17,14 @@ cd "$root"
 echo "==> [1/3] mdBook - the narrative site (includes pull docs/, CLAUDE.md, the almanac, ...)"
 ( cd website && mdbook build )
 
-echo "==> [2/3] rustdoc - the SDK API reference (-> /api)"
+echo "==> [2/3] rustdoc - the API reference: the standard library AND the SDK (-> /api)"
+# BOTH crates. `godspeed` (the standard library) is what an ordinary program is written against and
+# is the surface the Stranger Test (CLAUDE.md 22.7) measures; documenting only `godspeed-sdk`
+# published the layer underneath and left the public one unreachable. See backlog/45.
 doc=""
-if cargo doc -p godspeed-sdk --no-deps --target x86_64-unknown-none; then
+if cargo doc -p godspeed -p godspeed-sdk --no-deps --target x86_64-unknown-none; then
   doc="target/x86_64-unknown-none/doc"
-elif cargo doc -p godspeed-sdk --no-deps; then
+elif cargo doc -p godspeed -p godspeed-sdk --no-deps; then
   doc="target/doc"
 fi
 

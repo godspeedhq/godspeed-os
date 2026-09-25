@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hold the four HAND-WRITTEN site pages to the repository they describe.
+"""Hold the five HAND-WRITTEN site pages to the repository they describe.
 
 WHY THIS EXISTS. 70 of the site's 74 pages are `{{#include}}` views of real files, so they cannot
 drift - that is the whole design, and it works. Four pages have no source to be a view of:
@@ -8,6 +8,7 @@ drift - that is the whole design, and it works. Four pages have no source to be 
     gallery.md        captures of the running system
     services.md       the service catalogue, with diagrams
     utilities.md      the index of every utility
+    stdlib.md         the standard library's front door (points at /api and the design report)
 
 Those four are prose someone wrote, and prose someone wrote is prose that goes stale. The question
 asked was whether they could be GENERATED instead. Mostly they should not be: the spec files carry
@@ -39,13 +40,31 @@ def read(path):
         return ""
 
 
+def expected_hand_written():
+    """The pages with no source to be a view of. ONE definition, read by the check and by the
+    report, so a page added to the set cannot leave the summary line saying the old number."""
+    return {
+        "introduction.md",   # the front door
+        "gallery.md",        # captures of the running system
+        "services.md",       # the service catalogue, with diagrams
+        "utilities.md",      # the index of every utility
+        # The standard library's front door. Hand-written because it is not a view of any ONE
+        # file: it points at the rustdoc under /api (generated from the crate, not from docs/)
+        # and at the design report, and shows the shortest program that does something. An
+        # `{{#include}}` of stdlib-design.md would put a DESIGN REPORT in front of someone who
+        # came to write a program - which is what backlog/45 and the Stranger Test (22.7) are
+        # about.
+        "stdlib.md",
+    }
+
+
 def check_standalone_inventory():
     """A NEW hand-written page is a decision, not an accident - so it has to be admitted here.
 
     Without this, someone adds a page, writes it by hand because that is easiest, and the site
     quietly grows a second copy of something. The four below were each a deliberate choice.
     """
-    expected = {"introduction.md", "gallery.md", "services.md", "utilities.md"}
+    expected = expected_hand_written()
     found = set()
     for p in glob.glob(os.path.join(SITE, "**", "*.md"), recursive=True):
         rel = os.path.relpath(p, SITE).replace(os.sep, "/")
@@ -74,7 +93,9 @@ def check_intro_counts():
              "seventy-two": 72, "seventy-six": 76, "seventy-seven": 77,
              "seventy-eight": 78, "seventy-nine": 79, "eighty": 80,
              "eighty-one": 81, "eighty-two": 82, "eighty-three": 83,
-             "four": 4, "five": 5}
+             "eighty-four": 84, "eighty-five": 85, "eighty-six": 86,
+             "eighty-seven": 87, "eighty-eight": 88, "eighty-nine": 89,
+             "ninety": 90, "four": 4, "five": 5}
     page = read(os.path.join(SITE, "introduction.md"))
     total = inc = 0
     for p in glob.glob(os.path.join(SITE, "**", "*.md"), recursive=True):
@@ -104,8 +125,15 @@ def check_intro_counts():
     if said_total != total:
         out.append("introduction.md says there are %d pages; there are %d" % (said_total, total))
     hand = total - inc
-    if not re.search(r"\bfour exceptions\b", page, re.I) or hand != 4:
-        out.append("introduction.md calls out 'four exceptions'; %d pages are hand-written" % hand)
+    # DERIVED from the count, not hard-coded against it. This read `\bfour exceptions\b` with a
+    # literal `hand != 4` beside it, so adding a fifth hand-written page meant editing the
+    # checker to agree with the page - and a gate you edit to match the thing it checks has
+    # stopped being a gate. Now the expected word falls out of the number.
+    spelled = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight"}
+    word = spelled.get(hand)
+    if word is None or not re.search(r"\b%s exceptions\b" % word, page, re.I):
+        out.append("introduction.md should call out '%s exceptions'; %d pages are hand-written"
+                   % (word or hand, hand))
     return out
 
 
@@ -189,14 +217,16 @@ def main():
         problems += fn()
 
     if not problems:
-        print("site: the 4 hand-written pages match the repository "
-              "(utility index complete, service peers and coverage agree)")
+        print("site: the %d hand-written pages match the repository "
+              "(utility index complete, service peers and coverage agree)"
+              % len(expected_hand_written()))
         return 0
 
     print("site: %d hand-written page(s) no longer match the repository\n" % len(problems))
     for p in problems:
         print("  %s" % p)
-    print("\nThese four pages have no source to be a view of, so nothing else catches them.")
+    print("\nThese %d pages have no source to be a view of, so nothing else catches them."
+          % len(expected_hand_written()))
     return 1
 
 

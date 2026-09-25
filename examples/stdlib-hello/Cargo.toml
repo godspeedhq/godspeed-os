@@ -1,0 +1,12 @@
+[package]
+name = "stdlib-hello"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "stdlib-hello"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }

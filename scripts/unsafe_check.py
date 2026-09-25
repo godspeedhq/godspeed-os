@@ -89,7 +89,15 @@ def parse_audit() -> dict[str, int]:
 
 # Roots where 18.2 FORBIDS unsafe outright. Every crate under one of these must say so to the
 # COMPILER, not merely avoid the word.
-DENY_ROOTS = ("services", "examples", "osdev")
+# `stdlib` is here for a REASON BEYOND 18.2, and it is the load-bearing one. The standard
+# library exists to make functionality the OS already has pleasant and safe to consume; it
+# must never manufacture functionality the OS lacks. `#![deny(unsafe_code)]` is what makes
+# that STRUCTURAL: with no `unsafe` the crate cannot issue a syscall, so it is confined to
+# the SDK's safe surface and can only re-serve what already exists. A stdlib that could
+# reach the raw ABI could quietly grow a capability the system does not have.
+#
+# The attribute was already there; nothing checked it, so deleting it failed no gate.
+DENY_ROOTS = ("services", "examples", "osdev", "stdlib")
 DENY_ATTR = "#![deny(unsafe_code)]"
 
 
@@ -125,7 +133,14 @@ def deny_unsafe_crates() -> list:
                     continue
                 text = f.read_text(encoding="utf-8", errors="replace")
                 rel = f.relative_to(REPO_ROOT).as_posix()
-                if DENY_ATTR not in text:
+                # STRIP COMMENTS FIRST. This read `DENY_ATTR not in text` against the raw file,
+                # so a crate whose doc comment merely MENTIONS the attribute passed whether or not
+                # it carried one - and `stdlib/rust/src/lib.rs` is exactly that shape (its module
+                # docs explain the attribute a few lines above declaring it). Deleting the real
+                # attribute left this green. Same trap the `#[allow]` scan below already avoids for
+                # the same reason; the lesson had been learned for one half of this function only.
+                code_only = "\n".join(ln.split("//", 1)[0] for ln in text.split("\n"))
+                if DENY_ATTR not in code_only:
                     problems.append(f"{rel}: missing {DENY_ATTR} (18.2 forbids unsafe in this tree)")
                     continue
                 # The only sanctioned escape is the entry symbol. Anything else is the exception

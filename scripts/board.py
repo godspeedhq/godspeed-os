@@ -49,6 +49,8 @@ BOARDS = {
         "deploy": [
             "copy build/kernel7.img     -> <card>/kernel7.img",
             "copy build/config-pi2.txt  -> <card>/config.txt   (RENAME; replace the Imager's)",
+            "  or: powershell -File scripts/deploy_pi.ps1 -Board pi2 -Drive E   (does both, verifies both)",
+            "  a card stuck on the RAINBOW SCREEN: add -Check to diagnose it without writing",
             "the card also needs the Pi firmware: bootcode.bin, start.elf, fixup.dat",
         ],
     },
@@ -58,6 +60,8 @@ BOARDS = {
         "artifacts": ["build/kernel8.img"],
         "deploy": [
             "copy build/kernel8.img     -> <card>/godspeed8.img   (RENAME)",
+            "  or: powershell -File scripts/deploy_pi.ps1 -Board pi4 -Drive E   (does both, verifies both)",
+            "  the Pi card may be DUAL-BOOT (both firmwares); config.txt is the switch - -Check says which",
             "the card also needs the Pi firmware and a config.txt naming godspeed8.img",
         ],
     },

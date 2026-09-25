@@ -26,6 +26,7 @@
 //! streaming in `IO_CHUNK` pieces. And the shell is restartable like everything else - a crash gives a
 //! fresh prompt, losing the in-flight command but not the session (§6.2).
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
@@ -146,12 +147,6 @@ impl DirCursor {
     /// reads as a complete one is the thing this whole mechanism exists to remove (§26.7).
     fn cut(&self) -> bool { self.cut }
 
-    /// Pages requested so far. A caller uses this to tell "the FIRST request failed" - the path is
-    /// not a directory - from "a LATER page failed", which is a read error part way through a walk
-    /// that had already returned real entries. Reporting both as "no such directory" would be a
-    /// wrong answer for the second (§26.7), exactly the way a storage error once came out as a
-    /// claim about the path.
-    fn pages_asked(&self) -> u16 { self.pages }
 }
 const OP_RENAME: u8 = 15;
 const OP_DELETE: u8 = 16;
@@ -174,8 +169,6 @@ const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK,
 // stay block-aligned (no read-modify-write).
 const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
-const FS_ERR: u8 = 1;       // fs could not complete the operation (typically a device I/O error)
-const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
 const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a foreign partition table or
@@ -183,7 +176,6 @@ const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a forei
 const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
                          // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
-const OP_SEAL: u8 = 31;  // [op, plen, path] - freeze a file's content, permanently
 const OP_OPEN: u8 = 30;  // [op, plen, path, rights:u8] → [FS_OK] + embedded FILE CAP
 const FOP_READ: u8 = 1;  // [FOP_READ, offset:u64, len:u32]  (needs READ)
 const FOP_WRITE: u8 = 2; // [FOP_WRITE, offset:u64, chunk…]  (needs WRITE)
@@ -776,7 +768,7 @@ fn run_help_key(
 /// sends nothing more) from the start of a terminal escape sequence. The keyboard driver
 /// pushes a navigation key's whole `ESC [ … ~` atomically, so its follow-up byte is
 /// already queued and `try_console_read` returns it at once; a serial terminal may split
-/// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_TICKS`) before giving
+/// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_QUANTA`) before giving
 /// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
 /// How long to wait for a follow-up byte, counted in SCHEDULER QUANTA rather than cycles.
 ///
@@ -1368,29 +1360,24 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let mut w = 0usize;
     let mut hits = [PathHit { off: 0, len: 0, is_dir: false }; 32];
     let mut n = 0usize;
-    let mut cur = DirCursor::new();
-    while let Some(from) = cur.next() {
-        let reply = match fs_request(ctx, OP_LIST_DIR, dirpath, &from) { Some(r) => r, None => return };
-        let pb = reply.payload_bytes();
-        if !(pb.first() == Some(&FS_OK) && pb.len() >= 2) { return; } // not a dir / error → no menu
-        let count = cur.take(pb);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= pb.len() { break; }
-            let nl = pb[i] as usize; i += 1;
-            if i + nl + 14 > pb.len() { break; }      // entry = name_len, name, is_dir, size:u64, mtime:u32
-            let is_dir = pb[i + nl] != 0;
-            if pb[i..i + nl].starts_with(leaf) && n < hits.len() && w + nl <= rbuf.len() {
-                rbuf[w..w + nl].copy_from_slice(&pb[i..i + nl]);
-                hits[n] = PathHit { off: w, len: nl, is_dir };
-                w += nl; n += 1;
-            }
-            i += nl + 14;
+    // `list_dir` walks the pages and decodes the entries; completion keeps only the decision about
+    // which names it can offer. A failed listing means no menu - there is nothing useful to say at a
+    // half-typed prompt, and a completion that interrupts to complain is worse than one that does
+    // nothing.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let walked = g.list_dir(dirpath, |e| {
+        if e.name.starts_with(leaf) && n < hits.len() && w + e.name.len() <= rbuf.len() {
+            rbuf[w..w + e.name.len()].copy_from_slice(e.name);
+            hits[n] = PathHit { off: w, len: e.name.len(), is_dir: e.is_dir };
+            w += e.name.len();
+            n += 1;
         }
-        // Enough candidates to fill the menu, or no room left to keep them. More pages cannot
-        // change what is offered, so stop asking.
-        if n >= hits.len() { break; }
-    }
+        // Enough candidates to fill the menu, or no room left to keep them. More entries cannot
+        // change what is offered, so stop the walk here.
+        n < hits.len()
+    });
+    ctx.fs_tag.set(g.tag());
+    if walked.is_err() { return; }
     if n == 0 { return; }
     let base_len = tok_start + dir_in_tok.len();      // the line is fixed up to here
 
@@ -1571,7 +1558,7 @@ impl History {
             buf[pos..pos + l.len()].copy_from_slice(l); pos += l.len();
             buf[pos] = b'\n'; pos += 1;
         }
-        let _ = fs_request_bounded(ctx, OP_WRITE_FILE, path, &buf[..pos], HIST_SAVE_SECS);
+        let _ = sh_write_within(ctx, path, &buf[..pos], HIST_SAVE_SECS);
     }
 }
 
@@ -1741,14 +1728,6 @@ impl Line {
     }
 }
 
-/// Wait until the input subsystem reports in - the deterministic end-of-boot
-/// signal. The xHCI driver sets `input_ready` once it finishes, in every terminal
-/// path (keyboard up, no keyboard, or no controller), and it is the last
-/// subsystem to come up. So when it reports, the boot sequence - including the
-/// asynchronous xHCI enumeration on another core - is genuinely done, and we can
-/// clear the boot screen without ever cutting it off mid-stream. The loop is just
-/// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
-/// where the driver never reports (it would mean xHCI hard-crashed at boot).
 /// Report whether the input driver has announced itself - and do NOT wait for it.
 ///
 /// This used to spin up to fifty million times before the shell printed its first prompt, waiting for
@@ -1927,7 +1906,8 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             let params = if save.is_some() { Params::empty(args[1]) } else { parse_params(ctx, s, args[1], 2) };
             return cmd_run(ctx, cwd, args[1], depth, save, &params);
         }
-        // `selfcheck [save <path>]` - run the embedded suite; `save` streams its report to a file.
+        // `selfcheck [<part>] [save <path>]` - run the embedded suite (or one part of it); `save`
+        // streams its report to a file.
         "selfcheck" => return cmd_selfcheck(ctx, cwd, depth, s["selfcheck".len()..].trim()),
         _ => {}
     }
@@ -2079,7 +2059,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
                         "{}: a library command runs a script - not available inside another script", other));
                     return Err(ShellError::Unknown);
                 }
-                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true);
+                return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true, None, false);
             }
             // Build "unknown: <cmd>" in a stack buffer to avoid two ctx.log calls
             let mut buf = [0u8; 64];
@@ -2235,7 +2215,9 @@ fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&st
         ctx.console_writeln_fmt(format_args!("run: script CODE exceeds {} bytes - truncated (a huge script is a program)", SCRIPT_MAX));
     }
     resolve_imports(ctx, &mut script, &mut code);
-    run_with_optional_save(ctx, cwd, &script[..code], depth, save, params)
+    // NOT abortable: `run` is unchanged by this pass. It has the same shape and arguably wants the
+    // same escape, but changing a second command's behaviour on the way past is not this change.
+    run_with_optional_save(ctx, cwd, &[("", &script[..code])], depth, save, params, false)
 }
 
 const IMPORT_MAX: usize = 16; // max names in one `from … import a b c …`
@@ -3672,12 +3654,12 @@ fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32)
     let temp = forlines_temp(id, &mut tb);
     let mut rbuf = [0u8; IO_CHUNK];
     let n = fs_read_at(ctx, temp, off as u64, &mut rbuf).unwrap_or(0);
-    if n == 0 { let _ = fs_request(ctx, OP_DELETE, temp, &[]); return None; } // exhausted -> clean up
+    if n == 0 { let _ = sh_delete(ctx, temp); return None; } // exhausted -> clean up
     let mut k = 0usize;
     while k < n && rbuf[k] != b'\n' { k += 1; }
     let (line_end, next_off) = if k < n { (k, off + k as u32 + 1) } else { (n, off + n as u32) };
     if vars.set_slot(var, &rbuf[..line_end]).is_err() {
-        let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+        let _ = sh_delete(ctx, temp);
         return None;
     }
     Some(ForIter::FileLines { off: next_off, id })
@@ -3689,7 +3671,7 @@ fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32)
 /// producer (run_captured said why), an over-16-KiB output, or a write failure.
 #[inline(never)]
 fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
-    let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+    let _ = sh_delete(ctx, temp);
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(()); }
@@ -3701,7 +3683,7 @@ fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Resu
     while w < data.len() {
         let m = (data.len() - w).min(IO_CHUNK); // IO_CHUNK is 508-aligned, so each offset is block-aligned
         if !fs_write_at(ctx, temp, w as u64, &data[w..w + m]) {
-            let _ = fs_request(ctx, OP_DELETE, temp, &[]);
+            let _ = sh_delete(ctx, temp);
             ctx.console_writeln("gsh: for line: capture write failed");
             return Err(());
         }
@@ -3890,12 +3872,29 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
 /// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
 /// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
-fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
+/// How wide the per-part progress bar is. One segment per part is the claim it makes, so the width
+/// only decides how coarse the drawing is - not what it means.
+const PROGRESS_BAR_W: usize = 22;
+
+/// What a run counted, so a caller running SEVERAL scripts can report one total.
+///
+/// `run_lines`'s counters used to be locals that printed themselves, which is right for a single
+/// script and wrong for `selfcheck`, whose nine parts are one suite. `run: ran N, failed M` is an
+/// interface - nineteen harness checks match `failed 0` against it - so it must be printed once, by
+/// whoever knows the run is over.
+#[derive(Default, Clone, Copy)]
+struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
+
+/// Interpret `src`. `tally`: `None` prints the `run:` line itself (a plain `run`); `Some` adds this
+/// script's counts to the caller's total and leaves the line to it (one part of a bigger suite).
+fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool,
+             tally: Option<&mut Tally>, abortable: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
     let mut ran = 0u32;
     let mut failed = 0u32;
+    let mut aborted = false;
     let mut last: Result<(), ShellError> = Ok(());
     // Per-statement verdicts + spans for the end-of-run summary. With control flow, the executed
     // statements are no longer a simple prefix of the source, so record each one's (offset, len) as it
@@ -4217,7 +4216,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                             if let ForIter::FileLines { id, .. } = it {
                                 let mut tb = [0u8; 24];
                                 let t = forlines_temp(id, &mut tb);
-                                let _ = fs_request(ctx, OP_DELETE, t, &[]);
+                                let _ = sh_delete(ctx, t);
                             }
                             sp = i; pos = body_end + 1;               // pop loop + inner frames, exit past `}`
                         } else { sp = i + 1; pos = body_end; }        // keep loop; jump to `}` -> next iteration
@@ -4303,14 +4302,26 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         let (res, stop, was_skip) = {
             // While a $(fn) capture is active, the command's OUTPUT goes to the capture buffer, not
             // the console (the transcript `> stmt` above still goes to `out`).
-            let mut cmd_out = if capturing { Out::FnCap(&mut fncap) } else { Out::Console };
-            match run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut cmd_out) {
+            //
+            // AND IN VIEW MODE IT GOES TO THE VIEW. This used to hand every command a fresh
+            // `Out::Console` unconditionally, so a command's own output scrolled straight over the
+            // dashboard - found by screenshotting the framebuffer, where three `assert: ok` lines sat
+            // below the footer. The echo above has already been written, so reborrowing `out` here
+            // does not overlap it.
+            // A SKIP IS `Ok` SO THE RUN CONTINUES, and counted separately so it is not read as a
+            // pass. `last` matters here: a following `if result == Ok` must not be told a check
+            // succeeded when it never ran. Captures nothing, so the three branches below share it.
+            let outcome = |o: StmtOutcome| match o {
                 StmtOutcome::Cont(r) => (r, false, false),
                 StmtOutcome::Stop(r) => (r, true, false),
-                // A SKIP IS `Ok` SO THE RUN CONTINUES, and counted separately so it is not read as
-                // a pass. `last` matters here: a following `if result == Ok` must not be told a
-                // check succeeded when it never ran.
-                StmtOutcome::Skip     => (Ok(()), false, true),
+                StmtOutcome::Skip    => (Ok(()), false, true),
+            };
+            if capturing {
+                let mut o = Out::FnCap(&mut fncap);
+                outcome(run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut o))
+            } else {
+                let mut o = Out::Console;
+                outcome(run_stmt(ctx, cwd, s, last, sdepth, &mut vars, params, &mut o))
             }
         };
         last = res;
@@ -4334,6 +4345,19 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             }
         }
         if stop { break; }
+        // `q` BETWEEN STATEMENTS (conventions rule 9). Non-blocking, so a run nobody is watching
+        // pays one queue check per statement and nothing else. Only where the caller asked for it -
+        // a script driven by the harness must not be abortable by whatever happens to be in the
+        // input ring.
+        if abortable {
+            while let Some(k) = ctx.try_console_read() {
+                if k == b'q' || k == b'Q' || k == 0x1b {
+                    aborted = true;
+                    break;
+                }
+            }
+            if aborted { break; }
+        }
     }
     // Script exit (normal end OR `fail`): run any remaining defers - LIFO, across all scopes (§5).
     run_defers(ctx, cwd, b, &mut defers, &mut ndefer, 0, &mut vars, params, out, sdepth);
@@ -4383,11 +4407,84 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                     skipped as usize - nskip_rec, RUN_MAX_FAILS));
             }
         }
-        // APPENDED, never reshaped: six harness checks match `run: ran N, failed M` exactly, and a
-        // tally line is an interface.
-        out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
+        // APPENDED, never reshaped: the harness matches `run: ran N, failed M` exactly, and a tally
+        // line is an interface. A part of a larger suite does not print it - its caller does, ONCE,
+        // after the last part, or nine parts would be nine suites as far as any reader is concerned.
+        if tally.is_none() {
+            out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
+        }
     }
-    if failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
+    if let Some(t) = tally {
+        t.ran += ran;
+        t.failed += failed;
+        t.skipped += skipped;
+        t.aborted |= aborted;
+    }
+    if failed == 0 && !aborted { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// Run every part in order, reporting ONE tally for the lot.
+///
+/// A part is `(name, source)`; `name` is empty for a plain `run`, which has exactly one part and
+/// prints no heading. Sequential, never nested: each `run_lines` frame is gone before the next
+/// starts, which is what keeps this inside the bounded user stack.
+fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, out: &mut Out,
+             params: &Params, abortable: bool)
+    -> Result<(), ShellError>
+{
+    let mut t = Tally::default();
+    let mut ran_parts = 0usize;
+    for (k, &(name, src)) in parts.iter().enumerate() {
+        if parts.len() > 1 && !name.is_empty() {
+            // WHERE IT IS, as a printed line. A repainting bar would overwrite the very transcript
+            // this suite exists to produce - the serial log is what a hardware run is read from -
+            // and refreshing it per statement is a full console repaint per statement, the measured
+            // failure that once jammed the console queue and ate the shell's own keystroke echo.
+            //
+            // KEYED TO PARTS, NOT BYTES. A byte percentage was written first and thrown away: it
+            // moves 89% -> 91% across `cleanup` and `network`, the last two parts, while `network`
+            // waits on DHCP and DNS and is among the slowest stretches on the clock. Bytes are not
+            // time. One segment per part is a claim that is exactly true and needs no weighting that
+            // could drift as checks are added.
+            let mut bar = [b'.'; PROGRESS_BAR_W];
+            let filled = k * PROGRESS_BAR_W / parts.len();
+            for c in bar.iter_mut().take(filled) { *c = b'#'; }
+            out.line(ctx, "");
+            out.line_fmt(ctx, format_args!(
+                "##### [{}] part {}/{}  {:<8}{} #####",
+                str_of(&bar), k + 1, parts.len(), name,
+                if abortable { "   [q] quit" } else { "" }));
+        }
+        // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
+        // part that fails must not stop the parts after it. A run that gave up half way would report
+        // a smaller `ran` and could read as a healthier machine than one that finished.
+        let _ = run_lines(ctx, cwd, src, depth, out, params, false, Some(&mut t), abortable);
+        ran_parts = k + 1;
+        if t.aborted { break; }
+    }
+    if parts.len() > 1 {
+        out.line(ctx, "");
+    }
+    out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", t.ran, t.failed, t.skipped));
+    // A QUIT IS NOT A PASS. `failed 0` on its own reads as a clean run of a suite that never
+    // finished - and it is what the harness greens on. Say that it stopped, and NAME what never ran,
+    // because "which parts did I skip" is the first thing the operator needs and the one thing a
+    // count cannot tell them (26.7).
+    if t.aborted {
+        out.line_fmt(ctx, format_args!(
+            "selfcheck: STOPPED at your request after {} of {} part(s) - this is NOT a pass.",
+            ran_parts, parts.len()));
+        if ran_parts < parts.len() {
+            out.put(ctx, "selfcheck: never run:");
+            for &(n, _) in &parts[ran_parts..] {
+                out.put_bytes(ctx, b" ");
+                out.put(ctx, n);
+            }
+            out.line(ctx, "");
+        }
+        return Err(ShellError::Unknown);
+    }
+    if t.failed == 0 { Ok(()) } else { Err(ShellError::Unknown) }
 }
 
 /// Run `src` and, if `save` is `Some`, stream the report to that file (the utility writes its own
@@ -4395,12 +4492,13 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
 /// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
-fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
+fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, save: Option<&str>,
+                          params: &Params, abortable: bool)
     -> Result<(), ShellError>
 {
     match save {
-        None => run_lines(ctx, cwd, src, depth, &mut Out::Console, params, false),
-        Some(spath) => run_and_save(ctx, cwd, src, depth, spath, params),
+        None => run_parts(ctx, cwd, parts, depth, &mut Out::Console, params, abortable),
+        Some(spath) => run_and_save(ctx, cwd, parts, depth, spath, params, abortable),
     }
 }
 
@@ -4408,7 +4506,8 @@ fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, 
 /// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
 /// is actually running, not in the frame of every bare run.
 #[inline(never)]
-fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
+fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, spath: &str, params: &Params,
+                abortable: bool)
     -> Result<(), ShellError>
 {
     let mut pbuf = [0u8; PATH_MAX];
@@ -4418,10 +4517,13 @@ fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &st
     ppath[..pl].copy_from_slice(path);
     let path = &ppath[..pl];
 
+    // ONE buffer for ALL the parts: a saved report of a nine-part suite is one report. The buffer
+    // lives here rather than per part for the reason it lives in this function at all - 32 KiB of
+    // frame that a bare run must not carry.
     let mut rb = ReportBuf::new();
     let result = {
         let mut out = Out::File(&mut rb);
-        run_lines(ctx, cwd, src, depth, &mut out, params, false)
+        run_parts(ctx, cwd, parts, depth, &mut out, params, abortable)
     }; // `out` (the &mut rb borrow) ends here, so `rb` is readable below
     if rb.overflow {
         ctx.console_writeln_fmt(format_args!(
@@ -4443,8 +4545,7 @@ fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
     // report is small → this single-message path).
     if data.len() <= IO_CHUNK {
-        return matches!(fs_request_bounded(ctx, OP_WRITE_FILE, path, data, SAVE_FS_MAX_SECS)
-            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+        return sh_write_within(ctx, path, data, SAVE_FS_MAX_SECS);
     }
     if !fs_write_new(ctx, path, data.len() as u64) { return false; }
     let mut off = 0usize;
@@ -4472,7 +4573,32 @@ const RUN_MAX_FAILS: usize = 32;
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image - no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
 /// on-disk file (`MAX_FILE_BYTES` - a file is one ≤4 KiB IPC message; rodata is not).
-const SELFCHECK_GS: &str = include_str!("../../../scripts/selfcheck.gsh");
+/// The fixed size of the parts scratch in `cmd_selfcheck`. A ceiling rather than a count, so adding a
+/// part is one line in the table below and not two - and a compile-time assert holds the two together.
+const SELFCHECK_MAX_PARTS: usize = 16;
+
+const SELFCHECK_PARTS: &[(&str, &str)] = &[
+    ("language", include_str!("../../../scripts/selfcheck/00-language.gsh")),
+    ("meta",     include_str!("../../../scripts/selfcheck/10-meta.gsh")),
+    ("hardware", include_str!("../../../scripts/selfcheck/20-hardware.gsh")),
+    ("events",   include_str!("../../../scripts/selfcheck/30-events.gsh")),
+    ("persist",  include_str!("../../../scripts/selfcheck/40-persist.gsh")),
+    ("files",    include_str!("../../../scripts/selfcheck/50-files.gsh")),
+    ("data",     include_str!("../../../scripts/selfcheck/60-data.gsh")),
+    ("cleanup",  include_str!("../../../scripts/selfcheck/70-cleanup.gsh")),
+    ("network",  include_str!("../../../scripts/selfcheck/80-network.gsh")),
+];
+
+/// The whole suite's size, for the line `selfcheck` prints before it starts.
+const fn selfcheck_bytes() -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < SELFCHECK_PARTS.len() {
+        n += SELFCHECK_PARTS[i].1.len();
+        i += 1;
+    }
+    n
+}
 
 /// The system library: gsh scripts baked into the image (rodata) and resolved PATH-like - typing a
 /// library name runs its script. This is the OS's "coreutils in gsh": features that grow by userspace
@@ -4490,7 +4616,22 @@ const LIBRARY: &[(&str, &str)] = &[
 
 // audit U6: baked scripts must stay under the u16 offset ceiling `prescan_fns` uses (64 KiB), or the
 // fn/summary offsets wrap silently and dispatch the wrong bodies. Fail the build, not at runtime.
-const _: () = assert!(SELFCHECK_GS.len() < 65536, "selfcheck.gsh exceeds the 64 KiB baked-script ceiling");
+//
+// PER PART, which is the point of there being parts (`backlog/47`). The suite reached 65,139 bytes of
+// this ceiling as one file, with 397 to spare; nine parts put the largest at about a fifth of it. The
+// same u16 bound applies twice over - `prescan_fns` indexes `fn` definitions with it, and
+// `run_lines`' own `soff`/`fail_off`/`skip_off` index the same buffer - and splitting satisfies both,
+// because each part is interpreted from its own buffer.
+const _: () = {
+    let mut i = 0;
+    while i < SELFCHECK_PARTS.len() {
+        assert!(SELFCHECK_PARTS[i].1.len() < 65536, "a selfcheck part exceeds the 64 KiB baked-script ceiling");
+        i += 1;
+    }
+};
+const _: () = assert!(
+    SELFCHECK_PARTS.len() <= SELFCHECK_MAX_PARTS,
+    "SELFCHECK_PARTS outgrew the scratch array in `cmd_selfcheck` - raise SELFCHECK_MAX_PARTS");
 const _: () = {
     let mut i = 0;
     while i < LIBRARY.len() {
@@ -4504,6 +4645,57 @@ fn library_script(name: &str) -> Option<&'static str> {
     LIBRARY.iter().find(|(n, _)| *n == name).map(|&(_, src)| src)
 }
 
+/// What `selfcheck` creates at the ROOT, and therefore what it must clear before it starts.
+///
+/// Everything else it makes lives under `/sc`. `/churn` is deliberately absent: `churn` leaves its
+/// files as the evidence a power cut happened, and `churn verify` reads them.
+const SELFCHECK_REMNANTS: &[(&str, bool)] = &[
+    ("/sc", true),            // the suite's scratch tree
+    ("/tour", true),          // the language tour's scratch tree
+    ("/sc_fmt.gsh", false),   // the `fmt` check's subject
+];
+
+/// Remove what a previous run left behind, before this one starts.
+///
+/// THE PARTS STILL GUARD THEMSELVES - `if dir /sc { delete /sc recursive }` is what lets a part run
+/// alone - but those guards live in the parts that use them, so `selfcheck data` cleared nothing.
+/// Here it happens once per invocation whatever follows, which is what the suite's own header has
+/// always promised: "removed at the START of the run ... Cleaning only at the end is not re-runnable
+/// - it assumes the previous run REACHED its end."
+///
+/// Reports only when it actually removed something: a remnant means a previous run did not finish,
+/// which is worth a line, and silence on a clean tree is the ordinary case.
+fn selfcheck_tidy(ctx: &ShellCtx) {
+    let mut removed = 0u32;
+    for &(path, tree) in SELFCHECK_REMNANTS {
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        // ASK FIRST. `fs` answers a delete of an absent path with FS_ERR, not FS_NOTFOUND, so
+        // deleting blind and reading the status cannot tell "there was nothing there" from "the disk
+        // refused". On a clean T630 that printed three "a previous run's files may remain" lines
+        // about an empty tree. `exists` makes the distinction the status byte cannot, and it is what
+        // the parts themselves do: `if dir /sc { delete /sc recursive }`.
+        let present = g.exists(path.as_bytes()).unwrap_or(false);
+        let r = if !present {
+            Ok(())
+        } else if tree {
+            g.delete_all(path.as_bytes()).map(|_| removed += 1)
+        } else {
+            g.delete(path.as_bytes()).map(|_| removed += 1)
+        };
+        ctx.fs_tag.set(g.tag());
+        // A refusal to delete something that IS there is not swallowed: the run is about to make
+        // files, and an operator needs that before they read the failures which follow from it.
+        if let Err(e) = r {
+            ctx.console_writeln_fmt(format_args!(
+                "selfcheck: could not clear {} - {} (a previous run's files may remain)", path, e.as_str()));
+        }
+    }
+    if removed > 0 {
+        ctx.console_writeln_fmt(format_args!(
+            "selfcheck: cleared {} leftover path(s) from a run that did not finish", removed));
+    }
+}
+
 /// `selfcheck` - run the embedded self-check suite IN MEMORY (straight from rodata via
 /// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
 /// checkpoint - flash the boot image, (`drives flash` a drive if it's raw, so the file-command
@@ -4515,23 +4707,94 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
     }
+    // `selfcheck [<part>] [save <path>]`. The part name is checked against the table rather than
+    // guessed at, so a typo says which names exist instead of silently running everything.
+    let arg = arg.trim();
+    let (first, rest) = split_first(arg);
+    // `selfcheck`, `selfcheck <part>`, `selfcheck <part>,<part>,...`, each optionally followed by
+    // `save <path>`. The comma list is the grammar `mkdir a,b,c` and `delete a,b,c` already use.
+    let mut chosen = [0usize; SELFCHECK_MAX_PARTS];
+    let mut nchosen = 0usize;
+    let tail = if first.is_empty() || first == "save" {
+        arg.trim()
+    } else {
+        for name in first.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;   // a trailing or doubled comma is not worth a refusal
+            }
+            match SELFCHECK_PARTS.iter().position(|&(n, _)| n == name) {
+                // ONE UNKNOWN NAME REFUSES THE WHOLE LIST, and refuses it BEFORE anything runs.
+                // Running the parts that parsed and skipping the typo is how `selfcheck files,dta`
+                // comes back green having never checked what the operator asked about.
+                None => {
+                    ctx.console_writeln_fmt(format_args!("selfcheck: no part named '{}'", name));
+                    ctx.console_write("selfcheck: parts are");
+                    for &(n, _) in SELFCHECK_PARTS { ctx.console_write_fmt(format_args!(" {}", n)); }
+                    ctx.console_writeln("");
+                    return Err(ShellError::Unknown);
+                }
+                Some(i) => {
+                    if nchosen == SELFCHECK_MAX_PARTS {
+                        ctx.console_writeln_fmt(format_args!(
+                            "selfcheck: more than {} parts asked for - there are only {}",
+                            SELFCHECK_MAX_PARTS, SELFCHECK_PARTS.len()));
+                        return Err(ShellError::Unknown);
+                    }
+                    // IN THE ORDER GIVEN. The parts share the disk - `files` builds what `cleanup`
+                    // removes - so order can matter, and sorting it into table order for the
+                    // operator is the reinterpretation 26.5 refuses. A repeat runs twice.
+                    chosen[nchosen] = i;
+                    nchosen += 1;
+                }
+            }
+        }
+        rest.trim()
+    };
     // Optional `save <path>`: stream the run REPORT to a file (the utility writes its own file -
     // direct, not a pipe, so the orchestrator can save without the nested-capture stack overflow).
-    let save = if arg.is_empty() {
+    let save = if tail.is_empty() {
         None
     } else {
-        match arg.strip_prefix("save") {
+        match tail.strip_prefix("save") {
             Some(r) if r.starts_with(char::is_whitespace) && !r.trim().is_empty() => Some(r.trim()),
             _ => {
-                ctx.console_writeln("usage: selfcheck [save <path>]");
+                ctx.console_writeln("usage: selfcheck [<part>] [save <path>]");
                 return Err(ShellError::Unknown);
             }
         }
     };
-    ctx.console_writeln_fmt(format_args!(
-        "selfcheck: running the embedded suite ({} bytes, in memory) - needs a flashed drive for the file tests...",
-        SELFCHECK_GS.len()));
-    run_with_optional_save(ctx, cwd, SELFCHECK_GS.as_bytes(), depth, save, &Params::empty("selfcheck"))
+
+    // THE PARTS ARE BUILT HERE, not baked as a second table: `SELFCHECK_PARTS` holds `&str` because
+    // `include_str!` does, and `run_lines` reads bytes. Bounded by the table's own length.
+    let mut buf = [("", &[][..]); SELFCHECK_MAX_PARTS];
+    let n = if nchosen == 0 {
+        for (k, &(name, src)) in SELFCHECK_PARTS.iter().enumerate() {
+            buf[k] = (name, src.as_bytes());
+        }
+        SELFCHECK_PARTS.len()
+    } else {
+        for k in 0..nchosen {
+            let (name, src) = SELFCHECK_PARTS[chosen[k]];
+            buf[k] = (name, src.as_bytes());
+        }
+        nchosen
+    };
+    let bytes: usize = buf[..n].iter().map(|&(_, b)| b.len()).sum();
+    if nchosen == 0 {
+        ctx.console_writeln_fmt(format_args!(
+            "selfcheck: running the embedded suite ({} parts, {} bytes, in memory) - needs a flashed drive for the file tests...",
+            n, bytes));
+    } else {
+        ctx.console_write("selfcheck: running");
+        for &(name, _) in &buf[..n] { ctx.console_write_fmt(format_args!(" {}", name)); }
+        ctx.console_writeln_fmt(format_args!(
+            " ({} bytes, in memory) - needs a flashed drive for the file tests...", bytes));
+    }
+    // BEFORE ANYTHING RUNS, and whichever parts were asked for.
+    selfcheck_tidy(ctx);
+
+    run_with_optional_save(ctx, cwd, &buf[..n], depth, save, &Params::empty("selfcheck"), true)
 }
 
 /// `assert ok <cmd>` / `assert fails <cmd>` - the **result** form: run `<cmd>` and check that it
@@ -4702,18 +4965,6 @@ fn help_block_lines(rows: &[Row], footer: bool) -> usize {
     n
 }
 
-/// A fixed-buffer `fmt::Write` sink. Bounded, no heap (26.6.1).
-struct ClampWriter<'a> { buf: &'a mut [u8; 256], n: usize }
-impl core::fmt::Write for ClampWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let room = self.buf.len().saturating_sub(self.n);
-        let take = s.len().min(room);
-        self.buf[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
-        self.n += take;
-        Ok(())
-    }
-}
-
 /// The unpaged rendering, for a block that fits.
 fn help_block_render(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool,
                      from: usize, to: usize) {
@@ -4797,10 +5048,27 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("fmt check <path>", "Ok if already canonical, else loud + Err; never writes", "fmt check /script.gsh"),
             ("fmt <a>,<b>,...", "format (or check) several files - comma-separated, done one at a time", "fmt /x.gsh,/y.gsh"),
         ], true),
-        "selfcheck" => help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
-            ("selfcheck", "run the embedded suite in memory; reports ran N, failed M", "selfcheck"),
-            ("selfcheck save <out>", "run it and write the report to a file (then read/edit/grep it)", "selfcheck save /report.txt"),
-        ], true),
+        "selfcheck" => {
+            help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
+                ("selfcheck", "run every part in order; ONE tally for the lot", "selfcheck"),
+                ("selfcheck <part>", "run one part alone - the names are listed below", "selfcheck files"),
+                ("selfcheck <p>,<p>", "run several, in the order you name them", "selfcheck files,data"),
+                ("selfcheck save <out>", "run it and write the report to a file (read/match/edit it after)", "selfcheck save /report.txt"),
+                ("q", "quit a run in progress - it reports what ran and says it is NOT a pass", ""),
+                ("selfcheck <part> save <out>", "both: one part, report to a file", "selfcheck files save /r.txt"),
+            ], true);
+            // THE NAMES COME FROM THE TABLE, not from a string typed here. A hand-copied list is a
+            // second place the truth lives, and it goes stale the first time a part is added - the
+            // drift `facts_check` exists to catch. The refusal path prints this same list from this
+            // same source, so help and the error cannot disagree.
+            ctx.console_write("  parts:");
+            for &(n, _) in SELFCHECK_PARTS {
+                ctx.console_write_fmt(format_args!(" {}", n));
+            }
+            ctx.console_writeln("");
+            ctx.console_writeln("  a name that is not a part is refused, and the real ones are listed - it never");
+            ctx.console_writeln("  quietly runs everything instead.");
+        }
         "roster" => help_block(ctx, "roster", "example record-producing service (a typed table you can pipe)", &[
             ("roster", "render the table directly (name / role / seat)", "roster"),
             ("roster | where <col><op><val>", "filter rows - it is a record source for the pipe verbs", "roster | where role=core"),
@@ -5203,7 +5471,7 @@ static HELP: &[HelpRow] = &[
     Row("echo <text>", "print text"),
     Row("result", "the last command's result (Ok / Err)"),
     Row("run <script> [save <out>]", "run a script (.gsh); `save` writes the report to a file"),
-    Row("selfcheck [save <out>]", "run the built-in self-check suite; `save` writes the report"),
+    Row("selfcheck [part] [save <out>]", "run the built-in self-check suite, or one named part of it"),
     Row("fcap", "file-as-capability self-check (diagnostic; fcap help)"),
     Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
     Gap,
@@ -6533,34 +6801,32 @@ fn clock_floor_persist(ctx: &ShellCtx, epoch: u32, quiet: bool) -> bool {
     }
     let mut b = EpochBuf { buf: [0u8; 24], len: 0 };
     let _ = core::fmt::write(&mut b, format_args!("{}", epoch));
-    match fs_request_bounded(ctx, OP_WRITE_FILE, CLOCK_FLOOR_PATH, &b.buf[..b.len], CLOCK_FS_SECS) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => true,
-        _ => {
-            // No disk, no filesystem, or a write that failed: the floor simply will not survive this power
-            // cycle. That is the honest degraded state (next boot knows nothing), not a silent success.
-            if !quiet { ctx.console_writeln("date: could not record the clock floor (no filesystem?)"); }
-            false
-        }
+    if sh_write_within(ctx, CLOCK_FLOOR_PATH, &b.buf[..b.len], CLOCK_FS_SECS) {
+        true
+    } else {
+        // No disk, no filesystem, or a write that failed: the floor simply will not survive this power
+        // cycle. That is the honest degraded state (next boot knows nothing), not a silent success.
+        if !quiet { ctx.console_writeln("date: could not record the clock floor (no filesystem?)"); }
+        false
     }
 }
 
 /// Read a whole small file into `dst`, returning the byte count, or `None` if it is absent / unreadable /
-/// `fs` is not serving. **The ONE place that parses an OP_READ_FILE reply.**
+/// `fs` is not serving.
 ///
-/// `fs` answers `[FS_OK, len:u32 LE, data..]`. Every caller that hand-parses that shape gets three
-/// chances to be wrong, and one of them already was: checking the status byte against `1` fails on every
-/// SUCCESS (FS_OK is 0; 1 is FS_ERR), and skipping only one byte splices the length prefix into the data.
-/// That bug made a feature silently inert on every boot. Parsing it once, here, removes the failure mode
-/// for the next caller instead of leaving it lying around (§26.4 - one visible mechanism, not N copies).
+/// The doc here used to say "**the ONE place that parses an OP_READ_FILE reply**", and recorded why:
+/// a caller checked the status byte against `1`, which fails on every SUCCESS, and skipped one byte
+/// instead of five so the length prefix spliced into the data - a feature silently inert on every
+/// boot. That argument is right and it leads one layer further than this file: the decoder belongs
+/// to the library, so it is one place for the whole system rather than one per crate.
+///
+/// `read_into` also STREAMS, so the 3556-byte one-message ceiling that made a larger file look
+/// ABSENT is gone - it fills `dst` however many messages that takes.
 fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
-    let r = fs_request_bounded(ctx, OP_READ_FILE, path, &[], max_secs)?;
-    let p = r.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < 5 { return None; }   // FS_NOTFOUND / FS_ERR / no filesystem
-    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-    let end = (5 + n).min(p.len());
-    let m = (end - 5).min(dst.len());
-    dst[..m].copy_from_slice(&p[5..5 + m]);
-    Some(m)
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let r = g.read_into(path, dst);
+    ctx.fs_tag.set(g.tag());
+    r.ok()
 }
 
 /// Seed the kernel's clock floor from the last-known time on disk, at startup. The floor is a BOUND, never
@@ -7421,61 +7687,6 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// A name-addressed request to net-stack, with the reacquire-on-miss prime (net-stack is not a wired
-/// send-peer; the shell holds ACQUIRE_ANY). Mirrors `fs_request_q`.
-///
-/// Returns the OUTCOME rather than an `Option`, because `Aborted` and `Timeout` are different things
-/// to tell the operator: one is their own `q`, the other is net-stack failing to answer. Collapsing
-/// them to `None` would make a deliberate abort report a fault.
-fn netstack_request(ctx: &ShellCtx, payload: &[u8]) -> ReqOutcome {
-    ns_request(ctx, payload)
-}
-
-/// Open a UDP socket: net-stack mints a socket cap and grants it to us (mirrors `fc_open`).
-fn sock_open(ctx: &ShellCtx) -> Option<CapHandle> {
-    let r = match netstack_request(ctx, &[2]) {
-        ReqOutcome::Reply(r) => r,
-        // Both failures are already visible: `q` echoed the hint, and a timeout is the caller's line.
-        ReqOutcome::Aborted | ReqOutcome::Timeout => return None,
-    };
-    if r.payload_bytes().first() == Some(&1) { ctx.take_pending_cap() } else { None }
-}
-
-/// Invoke a socket cap - send a datagram through it and receive the response (mirrors `fc_invoke`).
-fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
-    // Clear any stale late-reply a prior aborted invoke left behind - AND RECLAIM ITS CAPABILITY.
-    //
-    // SEC-35: the kernel installs an embedded cap and queues its slot BEFORE the receiver looks at
-    // the message, so discarding the message does not discard the cap - it leaves an entry in the
-    // FIFO that `take_pending_cap()` reads from, and the next open receives the capability
-    // belonging to this discarded reply. That is how `fcap`'s read-only handle came to name an
-    // earlier open's read-write cap.
-    //
-    // It was harmless-looking here while every reply through this path was plain bytes. It stopped
-    // being harmless the moment ACCEPT began returning a connection capability through exactly this
-    // function.
-    while ctx.try_recv().is_some() {
-        while let Some(h) = ctx.take_pending_cap() { ctx.remove_cap(h); }
-    }
-    let self_grant = ctx.self_grant_handle()?;
-    let reply = ctx.derive_cap(self_grant)?;
-    if ctx.resource_invoke(sock, right, reply, &Message::from_bytes(payload)).is_err() {
-        ctx.remove_cap(reply);
-        return None;
-    }
-    // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` would hang forever if net-stack
-    // died after receiving the invocation but before replying. Reclaim the reply slot on every outcome.
-    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
-    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
-    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
-    // paths where the send never delivered it.
-    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
-    match outcome {
-        ReqOutcome::Reply(m) => Some(m),
-        _ => { ctx.remove_cap(reply); None }
-    }
-}
-
 /// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
 /// response - the `sock` demo reports the round-trip, it does not parse DNS.
 fn dns_query_bytes(host: &str, buf: &mut [u8]) -> usize {
@@ -7518,23 +7729,26 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
         _ => { out.line(ctx, "tcp: second argument must be a port, 1 to 65535"); return Err(ShellError::Unknown); }
     };
 
-    let mut payload = [0u8; 512];
-    payload[0] = 21;
-    payload[1..5].copy_from_slice(&ip);
-    payload[5] = (port >> 8) as u8;
-    payload[6] = port as u8;
-    let mut n = 7;
+    // The request body. The OPCODE, the address packing and the two header bytes net-stack strips
+    // are the library's business now - this assembles the text and says what it wants.
+    let mut req = [0u8; 400];
+    let mut n = 0usize;
     for (k, a) in args.iter().enumerate().skip(3) {
-        if k > 3 && n < payload.len() { payload[n] = b' '; n += 1; }
+        if k > 3 && n < req.len() { req[n] = b' '; n += 1; }
         let b = a.as_bytes();
-        let take = b.len().min(payload.len() - n);
-        payload[n..n + take].copy_from_slice(&b[..take]);
+        let take = b.len().min(req.len() - n);
+        req[n..n + take].copy_from_slice(&b[..take]);
         n += take;
     }
 
-    match netstack_request(ctx, &payload[..n]) {
-        ReqOutcome::Reply(r) => {
-            let got = r.payload_bytes();
+    // `[q] quit` while it lingers. The library fires this and knows nothing else about it: the
+    // callback takes nothing and returns nothing, so the console stays entirely on this side.
+    let notice = || ctx.console_writeln("  [q] quit");
+    let mut buf = [0u8; 512];
+    let mut net = gs::net::Net::with_notice(&*ctx, &notice);
+    match net.tcp(gs::net::Ipv4(ip), port, &req[..n], &mut buf) {
+        Ok(got_n) => {
+            let got = &buf[..got_n];
             if got.is_empty() {
                 // NOT "no reply". net-stack answered; the connection produced nothing, and it has
                 // already logged why. Saying which of the two happened is the difference between a
@@ -7553,31 +7767,29 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
             }
             Ok(())
         }
+        // net-stack answered, and the connection produced nothing. Its own log says why.
+        Err(gs::Error::Failed) => {
+            out.line(ctx, "tcp: connected to nothing - net-stack answered with no data (see its log for the reason)");
+            Ok(())
+        }
         // The user's own `q` is NOT a fault. Reporting it as one teaches the operator to distrust
-        // the error line, which is the thing they most need to trust.
-        ReqOutcome::Aborted => { out.line(ctx, "tcp: aborted"); Ok(()) }
+        // the error line, which is the thing they most need to trust. This stayed a separate arm
+        // only because `gs::Error::Cancelled` exists - the first cut of the library folded it into
+        // the timeout, which would have turned a deliberate keypress into an error message.
+        Err(gs::Error::Cancelled) => { out.line(ctx, "tcp: aborted"); Ok(()) }
         // NAME THE BOUND. "did not answer" alone reads as a refusal, which is a different thing
         // and sends the reader to the wrong log. Saying how long it waited says which it was.
-        ReqOutcome::Timeout => {
+        Err(gs::Error::OutcomeUnknown) => {
             out.line_fmt(ctx, format_args!(
-                "tcp: net-stack did not answer within {}s - see its log", NET_TXN_SECS));
+                "tcp: net-stack did not answer within {}s - see its log", gs::net::TCP_SECS));
+            Err(ShellError::Unknown)
+        }
+        Err(e) => {
+            out.line_fmt(ctx, format_args!("tcp: {}", e.as_str()));
             Err(ShellError::Unknown)
         }
     }
 }
-
-/// Listener op: take the next completed connection. Mirrors `LOP_ACCEPT` in net-stack.
-const LOP_ACCEPT: u8 = 0;
-/// Listener: stop answering and release the port. Mirrors `LOP_CLOSE` in net-stack.
-///
-/// Dropping the capability is NOT enough - net-stack's listener table is its own state and nothing
-/// walks back to it from a dropped cap. Without this the port stays registered forever and the
-/// second `serve` on it is refused, which is what the Pi 2 showed.
-const LOP_CLOSE: u8 = 1;
-/// Connection ops. Mirror `COP_*` in net-stack.
-const COP_RECV: u8 = 0;
-const COP_SEND: u8 = 1;
-const COP_CLOSE: u8 = 2;
 
 /// Read a duration written the way a person writes one: `30s`, `5m`, `2h`, `1d`, or a bare number
 /// of seconds.
@@ -7603,41 +7815,6 @@ fn parse_duration(a: &str) -> Option<i64> {
         if n > 365 * 86_400 { return None; }          // a year is a typo, not a plan
     }
     n.checked_mul(mult)
-}
-
-/// Tell net-stack to stop listening, THEN drop the capability.
-///
-/// Both halves, in that order, on every exit path. Dropping the cap alone leaves the port registered
-/// in net-stack forever - the leak the Pi 2 found, where the second `serve` on a port was refused
-/// and stayed refused until the service restarted.
-fn serve_release(ctx: &ShellCtx, listener: CapHandle) {
-    // RETRIED, AND REPORTED IF IT STILL FAILS. §26.7: a recovery step that itself fails is still a
-    // failure, and must stay as visible as the thing it was recovering from.
-    //
-    // This was one attempt with `let _ =` on it - a swallowed failed recovery, which is exactly what
-    // that section forbids. Measured over six QEMU runs it failed one in three: the port stayed
-    // listening, the next `serve` was refused, and nothing said why. The round trip is the fragile
-    // part (net-stack may be mid-poll, or have just revoked the connection alongside it), and a
-    // round trip that sometimes fails is precisely what a bounded retry is for.
-    //
-    // Three attempts, spaced. Still the client's job to ask - the kernel does not tell a service
-    // when a capability is dropped, so a port cannot release itself. That asymmetry is worth naming
-    // rather than papering over: a `serve` killed outright still leaks its port until net-stack
-    // restarts, and the honest fix is for net-stack to own a listener's lifetime rather than trust a
-    // client to end it. Recorded, not built (§26.2).
-    const TRIES: u32 = 3;
-    let mut ok = false;
-    for _ in 0..TRIES {
-        ok = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_CLOSE])
-            .map(|r| r.payload_bytes().first() == Some(&1))
-            .unwrap_or(false);
-        if ok { break; }
-        ctx.sleep(ctx.duration_cycles(150));
-    }
-    if !ok {
-        ctx.console_writeln("serve: the port was NOT released - the next `serve` on it will be refused");
-    }
-    ctx.remove_cap(listener);
 }
 
 /// `serve <port> [for]` - answer connections on `<port>` until you quit.
@@ -7682,20 +7859,21 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     };
 
     // 1. Ask net-stack to listen. The reply carries a LISTENER capability.
-    let lo = (port & 0xff) as u8;
-    let hi = (port >> 8) as u8;
-    let listener = match netstack_request(ctx, &[22, hi, lo]) {
-        ReqOutcome::Reply(r) if r.payload_bytes().first() == Some(&1) => match ctx.take_pending_cap() {
-            Some(c) => c,
-            None => { ctx.console_writeln("serve: net-stack agreed to listen but sent no capability"); return Err(ShellError::Unknown); }
-        },
-        // Nothing was granted, so there is no port to release - returning here leaks nothing.
-        ReqOutcome::Aborted => { ctx.console_writeln("serve: aborted"); return Ok(()); }
-        _ => {
-            ctx.console_writeln("serve: net-stack would not listen on that port - see its log for why");
+    // Through `gs::net`: the opcodes, the capability lifetimes and the correlation tag are the
+    // library's now. What stays here is what `serve` MEANS.
+    let mut gnet = gs::net::Net::new(&**ctx);
+    let mut lis = match gnet.listen(port) {
+        Ok(l) => l,
+        // The user's own `q` while it was being opened. Nothing was granted, so nothing leaks.
+        Err(gs::Error::Cancelled) => { ctx.console_writeln("serve: aborted"); return Ok(()); }
+        Err(e) => {
+            ctx.console_writeln_fmt(format_args!(
+                "serve: net-stack would not listen on that port - {} (see its log for why)",
+                e.as_str()));
             return Err(ShellError::Unknown);
         }
     };
+
     // SAY THE ADDRESS, not just the port. Whoever is about to connect needs `<ip>:<port>`, and
     // making them run `net` first to find out is the kind of small friction that turns a working
     // feature into an awkward one. Asked of net-stack rather than remembered, so it is the address
@@ -7717,26 +7895,38 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
             "listening on port {} - answering connections  [q] quit", port));
     }
 
-    // 2. Accept. Polled rather than blocking, so `q` works and so the wait is bounded.
-    let mut conn = None;
     let mut last_note: i64 = -1;
     let t0 = ctx.epoch_secs_monotonic();
     let mut served: u32 = 0;
+    let mut quit = false;
+
     'serving: while limit.map_or(true, |n| ctx.epoch_secs_monotonic() - t0 < n) {
         // ---- wait for the next caller ----
-        conn = None;
-        while limit.map_or(true, |n| ctx.epoch_secs_monotonic() - t0 < n) {
+        //
+        // A labelled loop that YIELDS the connection, rather than an `Option` carried across
+        // iterations: `Conn` borrows the `Listener`, so a held `Option<Conn>` would still own that
+        // borrow when the next `accept()` asked for it.
+        let conn = 'waiting: loop {
+            if limit.map_or(false, |n| ctx.epoch_secs_monotonic() - t0 >= n) {
+                break 'waiting None;
+            }
             while let Some(b) = ctx.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b {
-                    serve_release(ctx, listener);
-                    out.line_fmt(ctx, format_args!(
-                        "serve: stopped after {} connection(s)", served));
-                    return Ok(());
+                    quit = true;
+                    break;
                 }
             }
-            if let Some(r) = sock_invoke(ctx, listener, RIGHT_WRITE, &[LOP_ACCEPT]) {
-                if r.payload_bytes().first() == Some(&1) {
-                    if let Some(c) = ctx.take_pending_cap() { conn = Some(c); break; }
+            if quit {
+                break 'waiting None;
+            }
+            match lis.accept() {
+                Ok(Some(c)) => break 'waiting Some(c),
+                Ok(None) => {}
+                // The listener is gone - net-stack restarted, and the port went with it. Say so
+                // rather than polling a capability that can never answer again.
+                Err(e) => {
+                    out.line_fmt(ctx, format_args!("serve: the listener failed - {}", e.as_str()));
+                    break 'waiting None;
                 }
             }
             // A LIVE SIGN while nothing is happening. A mute prompt and a wedged one look
@@ -7757,30 +7947,28 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
             // step that answers ARP and notices the inbound SYN. A connection arriving is not made
             // faster by asking about it more often.
             ctx.sleep(ctx.duration_cycles(250));
-        }
-        let conn_h = match conn {
+        };
+
+        let mut conn = match conn {
             Some(c) => c,
-            None => break 'serving,          // the duration ran out while waiting
+            None => break 'serving,          // quit, the duration ran out, or the listener died
         };
         served += 1;
         out.line_fmt(ctx, format_args!("accepted a connection ({})", served));
 
         // ---- read what it sends, echo it back, close ----
-        let mut got = 0usize;
         let mut buf = [0u8; 512];
+        let mut got = 0usize;
         let t1 = ctx.epoch_secs_monotonic();
         while ctx.epoch_secs_monotonic() - t1 < 10 {
-            match sock_invoke(ctx, conn_h, RIGHT_READ, &[COP_RECV]) {
-                Some(r) => {
-                    let p = r.payload_bytes();
-                    if !p.is_empty() {
-                        let n = p.len().min(buf.len() - got);
-                        buf[got..got + n].copy_from_slice(&p[..n]);
-                        got += n;
-                        break;
-                    }
+            match conn.recv(&mut buf) {
+                // Zero is "nothing yet", not end of stream - keep asking until the window closes.
+                Ok(0) => {}
+                Ok(n) => { got = n; break; }
+                Err(e) => {
+                    out.line_fmt(ctx, format_args!("serve: the read failed - {}", e.as_str()));
+                    break;
                 }
-                None => break,
             }
             ctx.sleep(ctx.duration_cycles(100));
         }
@@ -7792,60 +7980,93 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
             }
             out.line_fmt(ctx, format_args!("received {} byte(s): {}", got,
                                            core::str::from_utf8(&show[..got]).unwrap_or("?")));
-            let mut echo = [0u8; 520];
-            echo[0] = COP_SEND;
-            echo[1..1 + got].copy_from_slice(&buf[..got]);
-            match sock_invoke(ctx, conn_h, RIGHT_WRITE, &echo[..1 + got]) {
-                Some(r) => {
-                    let p = r.payload_bytes();
-                    let took = if p.len() >= 2 { ((p[1] as usize) << 8) | p[0] as usize } else { 0 };
-                    out.line_fmt(ctx, format_args!("echoed {} byte(s) back", took));
-                }
-                None => out.line(ctx, "serve: the echo was not accepted"),
+            match conn.send(&buf[..got]) {
+                Ok(took) => out.line_fmt(ctx, format_args!("echoed {} byte(s) back", took)),
+                Err(e) => out.line_fmt(ctx, format_args!("serve: the echo was not accepted - {}",
+                                                         e.as_str())),
             }
         } else {
             out.line(ctx, "the peer connected but sent nothing");
         }
 
-        let _ = sock_invoke(ctx, conn_h, RIGHT_WRITE, &[COP_CLOSE]);
+        let _ = conn.close();
         // Give the close a moment to go out before the capability is dropped - the connection is
         // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
         ctx.sleep(ctx.duration_cycles(200));
-        ctx.remove_cap(conn_h);
         out.line(ctx, "closed - waiting for the next connection  [q] quit");
         // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
-        // connections and is released once, on the way out, by every exit path below.
+        // connections and is released once, below, by every exit path.
     }
 
-    serve_release(ctx, listener);
-    match limit {
-        Some(n) => out.line_fmt(ctx, format_args!(
+    // One release, on every path out. `close` reports; dropping would also release the port but
+    // could not say whether it worked, and a port that was not released refuses the next `serve`.
+    if let Err(e) = lis.close() {
+        out.line_fmt(ctx, format_args!(
+            "serve: the port was NOT released ({}) - the next `serve` on it will be refused",
+            e.as_str()));
+    }
+    match (quit, limit) {
+        (false, Some(n)) => out.line_fmt(ctx, format_args!(
             "serve: {}s elapsed, {} connection(s) served", n, served)),
-        None => out.line_fmt(ctx, format_args!("serve: stopped after {} connection(s)", served)),
+        _ => out.line_fmt(ctx, format_args!("serve: stopped after {} connection(s)", served)),
     }
     Ok(())
 }
 
 fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    let sock = match sock_open(ctx) {
-        Some(c) => c,
-        None => { ctx.console_writeln("sock: net-stack would not open a socket (no NIC?)"); return Err(ShellError::Unknown); }
-    };
-    // Send a datagram through the socket cap to the DNS server (a DNS query is just data that gets a
-    // reply); we report the round-trip, which proves the cap does real UDP I/O.
+    // Through the standard library: the opcode, the address packing and the capability's lifetime
+    // are `gs::net`'s business now. What stays here is what `sock` MEANS by a round trip.
     let mut query = [0u8; 64];
     let qlen = dns_query_bytes("example.com", &mut query);
-    let mut payload = [0u8; 96];
-    payload[0] = 10; payload[1] = 0; payload[2] = 2; payload[3] = 3;   // dest ip 10.0.2.3
-    payload[4] = 0; payload[5] = 53;                                    // dest port 53
-    payload[6..6 + qlen].copy_from_slice(&query[..qlen]);
-    match sock_invoke(ctx, sock, RIGHT_WRITE, &payload[..6 + qlen]) {
-        Some(resp) => out.line_fmt(ctx, format_args!(
-            "sock: UDP socket cap - sent {} bytes to 10.0.2.3:53, received {} bytes back (a round-trip through a capability)",
-            qlen, resp.payload_bytes().len())),
-        None => out.line(ctx, "sock: socket cap invocation returned nothing (no NIC, or nothing answered)"),
+    let mut resp = [0u8; 512];
+
+    // WHERE THE RESOLVER ACTUALLY IS. This sent to 10.0.2.3 - QEMU SLIRP's resolver, hardcoded - so
+    // on real hardware the datagram went nowhere and the command reported "the peer did not answer",
+    // which is true about that address and misleading about the machine. The lease knows; ask it, the
+    // same way `serve` asks for the address it prints.
+    // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
+    let dns = match net_status_reply(ctx) {
+        Some(r) => {
+            let st = r.payload_bytes();
+            if st.len() >= 19 && st[15..19] != [0, 0, 0, 0] {
+                [st[15], st[16], st[17], st[18]]
+            } else {
+                out.line(ctx, "sock: no resolver configured - run `net` first (a lease supplies one)");
+                return Err(ShellError::Unknown);
+            }
+        }
+        None => {
+            out.line(ctx, "sock: net-stack did not answer - cannot tell where the resolver is");
+            return Err(ShellError::Unknown);
+        }
+    };
+
+    let mut gnet = gs::net::Net::new(&**ctx);
+    let r = match gnet.socket() {
+        Ok(mut s) => s.send_to(gs::net::Ipv4(dns), 53, &query[..qlen], &mut resp),
+        Err(e) => {
+            ctx.console_writeln_fmt(format_args!(
+                "sock: net-stack would not open a socket - {} (no NIC?)", e.as_str()));
+            return Err(ShellError::Unknown);
+        }
+    };
+    match r {
+        // ZERO IS NOT AN ERROR AND IS NOT DATA. `net-stack` answers "nothing came back" with a
+        // single zero byte, and this command used to print the reply's LENGTH - so a query nobody
+        // answered read as "received 1 bytes back". It said so under QEMU every time.
+        Ok(0) => out.line_fmt(ctx, format_args!(
+            "sock: UDP socket cap - sent {} bytes to {}.{}.{}.{}:53, nothing came back (the send went through the capability; the peer did not answer)",
+            qlen, dns[0], dns[1], dns[2], dns[3])),
+        Ok(n) => out.line_fmt(ctx, format_args!(
+            "sock: UDP socket cap - sent {} bytes to {}.{}.{}.{}:53, received {} bytes back (a round-trip through a capability)",
+            qlen, dns[0], dns[1], dns[2], dns[3], n)),
+        // The user's own `q` is not a fault.
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(e) => {
+            out.line_fmt(ctx, format_args!("sock: socket cap invocation failed - {}", e.as_str()));
+            return Err(ShellError::Unknown);
+        }
     }
-    ctx.remove_cap(sock);
     Ok(())
 }
 
@@ -8077,44 +8298,33 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     // change of meaning in queries people have already written. A separate column adds an answer
     // without moving an existing one.
     let mut t = Table::new(&["name", "type", "size", "sealed"]);
-    let mut cur = DirCursor::new();
-    while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return None,
-            ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return None; }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return None; }
-        if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
-            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
-            return None;
-        }
-        let count = cur.take(p);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() { break; }
-            let nl = p[i] as usize;
-            i += 1;
-            // Phase O: each entry is [name_len, name, is_dir, size:u64, mtime:u32] - the mtime is
-            // four bytes wider than the layout before it. Every consumer of this reply must step by the same
-            // stride or it reads the NEXT entry's name out of this one's timestamp.
-            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-            let name = t.intern(&p[i..i + nl]);
-            let is_dir = p[i + nl] != 0;
-            let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-            let sealed = p[i + nl + 13] & 1 != 0;      // flags bit 0
-            i += nl + 1 + 8 + 4 + 1;
-            let kind = t.intern(if is_dir { b"dir" } else { b"file" });
-            let sz = if is_dir { Value::Empty } else { Value::Int(size) };
-            let sl = t.intern(if sealed { b"true" } else { b"false" });
-            t.add_row(&[name, kind, sz, sl]);
-        }
-        // The table is full (64 rows, or the string arena). Further pages have nowhere to go, and
+    // `list_dir` owns the page walk and the 15-byte entry stride the comment above used to warn
+    // about; this keeps only the mapping from an entry to a row.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let walked = g.list_dir(path, |e| {
+        let name = t.intern(e.name);
+        let kind = t.intern(if e.is_dir { b"dir" } else { b"file" });
+        let sz = if e.is_dir { Value::Empty } else { Value::Int(e.size) };
+        let sl = t.intern(if e.sealed { b"true" } else { b"false" });
+        t.add_row(&[name, kind, sz, sl]);
+        // The table is full (64 rows, or the string arena). Further entries have nowhere to go, and
         // `t.overflow()` already tells the reader the answer is short - so stop paying for them.
-        if t.overflow() { break; }
+        !t.overflow()
+    });
+    ctx.fs_tag.set(g.tag());
+    match walked {
+        Ok(_) => Some(t),
+        Err(gs::Error::Cancelled) => None,
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
+            None
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            None
+        }
+        Err(_) => { ctx.console_writeln("dir: storage unavailable"); None }
     }
-    Some(t)
 }
 
 /// `caps` as a record producer: one row per held capability - `resource` (the target,
@@ -8271,49 +8481,38 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut short = false;
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
+    let mut cancelled = false;
     while let Some(dlen) = stack.pop(&mut dir) {
-        let mut cur = DirCursor::new();
-        'pages: while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return None,
-            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return None; }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return None; }
-        // `break 'pages`, NOT `continue`: this loop is now the PAGE loop, and a bare `continue`
-        // would re-ask the same unreadable directory forever instead of moving to the next one.
-        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
-        let count = cur.take(p);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() { break; }
-            let nl = p[i] as usize;
-            i += 1;
-            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-            let name = &p[i..i + nl];
-            let is_dir = p[i + nl] != 0;
-            let size = u64_le(&p[i + nl + 1..i + nl + 9]);   // per-entry size, same layout `dir` reads
-            i += nl + 1 + 8 + 4 + 1;
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let walked = g.list_dir(&dir[..dlen], |e| {
             let mut child = [0u8; PATH_MAX];
-            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
-                let hit = if is_glob { glob_match(tb, name) } else { contains(name, tb) };
+            if let Some(clen) = join_path(&dir[..dlen], e.name, &mut child) {
+                let hit = if is_glob { glob_match(tb, e.name) } else { contains(e.name, tb) };
                 if hit {
-                    let nv = t.intern(name);
-                    let tv = t.intern(if is_dir { b"dir" } else { b"file" });
+                    let nv = t.intern(e.name);
+                    let tv = t.intern(if e.is_dir { b"dir" } else { b"file" });
                     let pv = t.intern(&child[..clen]);
                     // Files carry their byte size (`find * | where size>1000`, the library's `size`
                     // sum); a dir's row leaves it Empty, exactly as `dir`'s records do.
-                    let sz = if is_dir { Value::Empty } else { Value::Int(size) };
+                    let sz = if e.is_dir { Value::Empty } else { Value::Int(e.size) };
                     t.add_row(&[nv, tv, pv, sz]);
                 }
-                if is_dir { stack.push(&child[..clen]); }
+                if e.is_dir { stack.push(&child[..clen]); }
             }
+            !t.overflow()
+        });
+        ctx.fs_tag.set(g.tag());
+        match walked {
+            // A table that filled up stops the walk, and `t.overflow()` already says the answer is
+            // short - so that is NOT the "a directory was too large to read" report.
+            Ok(l) => { if !l.complete && !t.overflow() { short = true; } }
+            Err(gs::Error::Cancelled) => { cancelled = true; break; }
+            // An unreadable directory ends THIS directory, not the search. `find /` over a tree with
+            // one bad entry should still report every other match.
+            Err(_) => { short = true; }
         }
-        if t.overflow() { break 'pages; }
-        }
-        if cur.cut() { short = true; }
     }
+    if cancelled { return None; }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
@@ -10344,14 +10543,13 @@ fn sticky_write(ctx: &ShellCtx, budget: u64, filter: &str, path: &str) -> bool {
     for &c in f.as_bytes().iter().take(12) { buf[n] = c; n += 1; }
     buf[n] = b' '; n += 1;
     for &c in path.as_bytes().iter().take(64) { buf[n] = c; n += 1; }
-    matches!(fs_request_bounded(ctx, OP_WRITE_FILE, STICKY_PATH, &buf[..n], STICKY_SECS).as_ref()
-                 .map(|r| r.payload_bytes().first() == Some(&FS_OK)), Some(true))
+    sh_write_within(ctx, STICKY_PATH, &buf[..n], STICKY_SECS)
 }
 
 /// Forget a sticky capture. Called on `stop`, so an explicit stop stays stopped across a reboot -
 /// otherwise the one command that means "enough" would be the one that did not take.
 fn sticky_clear(ctx: &ShellCtx) {
-    let _ = fs_request(ctx, OP_DELETE, STICKY_PATH, &[]);
+    let _ = sh_delete(ctx, STICKY_PATH);
 }
 
 /// True if a sticky capture is recorded.
@@ -11496,13 +11694,27 @@ fn read_file_exact_bounded(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u
 /// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
 fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
     if data.len() <= IO_CHUNK {
-        match fs_request(ctx, OP_WRITE_FILE, p, data) {
-            Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
-                ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p))),
-            Some(r) if no_fs(ctx, r.payload_bytes()) => {}
-            Some(_) => ctx.console_writeln("pipe: write failed (bad path, or parent missing?)"),
-            None    => ctx.console_writeln("pipe: storage unavailable"),
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let r = g.write(p, data);
+        match r {
+            Ok(()) => ctx.console_writeln_fmt(format_args!("piped {} bytes → {}", data.len(), str_of(p))),
+            // A LOST REPLY IS NOT A FAILED WRITE. The bytes may be on the disk; saying the write
+            // failed would send the operator to re-run a pipe that already ran.
+            Err(gs::Error::OutcomeUnknown) =>
+                ctx.console_writeln("pipe: OUTCOME UNKNOWN - the reply was lost; the write MAY HAVE LANDED. Check with `read`"),
+            Err(gs::Error::NoFilesystem) => ctx.console_writeln("no filesystem - run 'drives flash' first"),
+            Err(gs::Error::Unavailable) =>
+                ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)"),
+            Err(_) => {
+                let why = g.reason();
+                if why.is_empty() {
+                    ctx.console_writeln("pipe: write failed (bad path, or parent missing?)");
+                } else {
+                    ctx.console_writeln_fmt(format_args!("pipe: write failed - {}", why));
+                }
+            }
         }
+        ctx.fs_tag.set(g.tag());
         return;
     }
     if !fs_write_new(ctx, p, data.len() as u64) {
@@ -11539,7 +11751,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
     // genuinely absent, no reply at all says `fs` could not answer.
     let old_size = match fs_stat(ctx, p) {
         Some((sz, _)) => sz as usize,
-        None if fs_request(ctx, OP_STAT_FILE, p, &[]).is_some() => 0,
+        None if sh_fs_answered(ctx, p) => 0,
         None => {
             ctx.console_writeln("write: cannot stat the target - ABORTING, nothing was changed");
             return false;
@@ -11547,8 +11759,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
     };
     let total = old_size + new.len();
     if total == 0 {
-        return matches!(fs_request(ctx, OP_WRITE_FILE, p, &[]).as_ref()
-            .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
+        return sh_write(ctx, p, &[]);
     }
     if !fs_write_new(ctx, WRITE_TMP, total as u64) { return false; }
     // Ordered segments: prepend = [new (mem) | old (disk)]; append = [old (disk) | new (mem)].
@@ -11579,9 +11790,8 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
         if !fs_write_at(ctx, WRITE_TMP, off as u64, &chunk[..n]) { return false; }
         off += n;
     }
-    let _ = fs_request(ctx, OP_DELETE, p, &[]);
-    matches!(fs_request(ctx, OP_MOVE, WRITE_TMP, p).as_ref()
-        .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)))
+    let _ = sh_delete(ctx, p);
+    sh_move(ctx, WRITE_TMP, p)
 }
 
 /// The `write` pipe sink: `… | write [append|prepend] <path>`. Parses the mode (plain overwrites),
@@ -12850,6 +13060,78 @@ fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
     match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) }
 }
 
+/// Delete a path through `gs::fs`, borrowing the shell's one correlation-tag counter.
+///
+/// For the fire-and-forget cleanups scattered through this file - temp files, test fixtures, a
+/// stale sticky note. Returns whether it went, which most callers discard and a few check.
+///
+/// **It borrows `ctx.fs_tag` rather than keeping its own.** The shell has one endpoint, so it must
+/// have one tag sequence; a helper that started a second could mint a tag already in flight, and a
+/// colliding tag is not rejected loudly - it lets a stale reply be accepted as the current answer.
+/// That is the bug this branch fixed in `services/copier`, which had a CONSTANT tag.
+/// Write a whole (small) file with a SHORTER deadline than the default. `true` if it went.
+///
+/// For a write nobody is waiting on - the history file, a marker, a report saved after a chaos storm
+/// has just hammered `fs`. A shorter wait makes [`gs::Error::OutcomeUnknown`] MORE likely, not less,
+/// so this is only right where "it may have landed" is an acceptable answer and hanging is not.
+fn sh_write_within(ctx: &ShellCtx, path: &[u8], data: &[u8], secs: i64) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(secs);
+    let ok = g.write(path, data).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Write a whole (small) file, borrowing the shell's one tag counter. `true` if it went.
+fn sh_write(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.write(path, data).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Move a path, borrowing the shell's one tag counter. `true` if it went.
+fn sh_move(ctx: &ShellCtx, from: &[u8], to: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.move_to(from, to).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Rename within a directory, borrowing the shell's one tag counter. `true` if it went.
+fn sh_rename(ctx: &ShellCtx, path: &[u8], newname: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.rename(path, newname).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
+/// Whether `fs` ANSWERED a stat of `path` - which is not the same as the path existing.
+///
+/// The distinction is load-bearing and cost a regression to learn. `write append` to a MISSING file
+/// must create it, so the question at that call site is "is the filesystem answering me", not "is
+/// the file there": a definite "no such file" is a perfectly good answer and means proceed with a
+/// zero-length original. Only a transport failure - nobody answered - means abort without touching
+/// anything.
+///
+/// The old code asked it as `fs_request(..).is_some()`, which is true for a NOTFOUND reply too.
+/// `Error::service_answered` is that question with a name.
+fn sh_fs_answered(ctx: &ShellCtx, path: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let answered = match g.stat(path) {
+        Ok(_) => true,
+        Err(e) => e.service_answered(),
+    };
+    ctx.fs_tag.set(g.tag());
+    answered
+}
+
+fn sh_delete(ctx: &ShellCtx, path: &[u8]) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.delete(path).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
 fn next_fs_tag(ctx: &ShellCtx) -> u8 {
     // C6-1: this counter used to be `static FS_TAG: AtomicU8` - unowned global mutable state
     // (Invariant 9) wearing a thread-safe type. Nothing here is concurrent; the shell is one task on
@@ -12971,17 +13253,6 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
         ReqOutcome::Reply(r) => Some(r),
         _ => None,
     }
-}
-
-/// The REASON `fs` gave for a failure, when it gave one.
-///
-/// An `FS_ERR` reply carries `[FS_ERR, reason bytes...]`. The trailing bytes are optional - older
-/// paths and the ops that have no reason to give still send the single byte - so this returns
-/// `None` rather than an empty string, and a caller falls back to its own wording.
-fn fs_err_reason(m: &Message) -> Option<&str> {
-    let p = m.payload_bytes();
-    if p.first().copied() != Some(FS_ERR) || p.len() < 2 { return None; }
-    core::str::from_utf8(&p[1..]).ok().filter(|r| !r.is_empty())
 }
 
 /// Report a mutating command that got no answer - and say WHICH of the two things happened.
@@ -13229,30 +13500,6 @@ fn ns_query(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> NetQ {
     net_query(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs, Some(tag))
 }
 
-/// How long the shell will wait for net-stack on the transaction path (`tcp`, `sock`, `serve`'s
-/// listen) before reporting it unavailable.
-///
-/// **This used to be UNBOUNDED, and that is a Commandment V violation: nothing above the kernel may
-/// halt.** The comment that stood here argued net-stack "sets its own budget inside and must not be
-/// cut short from here" - which is an argument for making this bound GENEROUS, not for having none.
-/// A dependency that is slow, wedged, or simply never got the message must produce a message, and an
-/// unbounded wait produces a dead prompt instead. Found on a Dell Wyse: `tcp <host> <port> big` froze
-/// the shell outright, with no `net-stack: tcp ->` line ever logged - so net-stack never even saw the
-/// request, and the shell waited on a reply that was never going to exist.
-///
-/// The number is set from what the far side can legitimately take, so a healthy-but-slow transaction
-/// is never cut off:
-///   - `tcp_transact` bounds itself at 8 s (`budget_ms`), the longest single thing net-stack does for
-///     this path;
-///   - the request may queue behind an SNTP dance that blocks net-stack for seconds - measured at 5.7
-///     s on a Pi 2 (`backlog/28`).
-/// 8 + 6 is 14, so 20 leaves real slack and still returns while a person is still watching.
-const NET_TXN_SECS: i64 = 20;
-
-/// How long the wait must linger before the `[q] quit` hint is printed. A fast transaction prints
-/// nothing, so a snappy `tcp` is not nagged.
-const NET_HINT_SECS: i64 = 2;
-
 /// How long `net resolve` waits for net-stack to answer a DNS lookup.
 ///
 /// **This is the SHORTEST deadline any client gives net-stack, and that makes it load-bearing on the
@@ -13267,131 +13514,6 @@ const NET_HINT_SECS: i64 = 2;
 /// It was a bare `8` at the call site until then. `scripts/facts_check.py` now checks this against
 /// net-stack's own budget, which it cannot do to a literal.
 const NET_RESOLVE_SECS: i64 = 8;
-
-/// Discard anything already queued on our endpoint BEFORE sending a net-stack request, reclaiming any
-/// capability a discarded reply carried.
-///
-/// The exact twin of `drain_stale_fs_replies`, for the exact same reason, and it became necessary the
-/// moment this channel became `q`-abortable: an abort leaves a reply that has not arrived yet, and it
-/// lands in our queue afterwards. On the fs channel that costs a wrong answer. HERE IT COSTS A
-/// CAPABILITY: a `serve` or `sock` reply carries a listener or socket cap, the kernel has already
-/// installed it and queued its slot, and dropping the message does not drop the cap (SEC-35) - so the
-/// NEXT `serve` would call `take_pending_cap` and receive the ABANDONED run's listener. It would then
-/// be answering on a port it never asked for, and releasing that one on the way out.
-///
-/// Draining at the START is what makes it decisive: at the instant we are about to send, every queued
-/// message is by definition somebody else's leftover. Safe because the shell is a pure CLIENT of
-/// net-stack on this endpoint - it serves nothing on it.
-///
-/// Bounded: at most a handful of discards, so a peer stuck emitting messages cannot spin us here.
-fn drain_stale_net_replies(ctx: &ServiceContext) {
-    for _ in 0..8 {
-        if ctx.try_recv().is_none() { return; }
-        while let Some(h) = ctx.take_pending_cap() {
-            ctx.remove_cap(h);
-        }
-    }
-}
-
-/// A tagged net-stack request on the transaction path (`tcp`, `sock`, `serve`'s listen): bounded by
-/// `NET_TXN_SECS`, and **`q`-abortable**, with a `[q] quit` hint once the wait lingers.
-///
-/// **A bound alone was not enough, and the Wyse proved it.** Bounding this at 20 s stopped the shell
-/// hanging forever, but the operator still had a dead prompt for twenty seconds with no way out - they
-/// could not type and `q` did nothing, so the machine was rebooted. `request_with_reply` parks the
-/// shell inside the syscall, where it cannot poll the console, so `q` is never SEEN however long the
-/// deadline is. That is conventions rule 9 (a blocking command stays `q`-abortable) broken on the whole
-/// networking surface.
-///
-/// This is the same repair `fs_request_q` already carries, applied to the other channel. The reasoning
-/// is written out there; the only thing that was ever net-stack-specific about it is that nobody had
-/// done it yet.
-fn ns_request(ctx: &ShellCtx, body: &[u8]) -> ReqOutcome {
-    let mut buf = [0u8; 4096];
-    drain_stale_net_replies(ctx);         // an earlier abandoned reply must not be read as ours
-    let (n, tag) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
-    let first = ctx.request_with_reply_qhint(
-        "net-stack", &Message::from_bytes(&buf[..n]), NET_HINT_SECS, NET_TXN_SECS,
-        || ctx.console_writeln("  [q] quit"));
-    match ns_take_tagged(ctx, tag, first, NET_TXN_SECS) {
-        // A timeout here means the send never left or the peer is silent. Reacquire by name and retry
-        // once, with a FRESH tag - the first request may still be in flight, and its late reply must
-        // not be mistaken for the retry's answer. An ABORT is the user's decision and is never retried.
-        ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => {
-            let (n2, tag2) = ns_build(ctx, body, &mut buf, NET_TXN_SECS);
-            let again = ctx.request_with_reply_qhint(
-                "net-stack", &Message::from_bytes(&buf[..n2]), NET_HINT_SECS, NET_TXN_SECS,
-                || ctx.console_writeln("  [q] quit"));
-            ns_take_tagged(ctx, tag2, again, NET_TXN_SECS)
-        }
-        other => other,
-    }
-}
-
-fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
-    let pl = path.len().min(255);
-    let mut req = [0u8; 4096];
-    let tag = next_fs_tag(ctx);
-    req[0] = tag;
-    req[1] = op;
-    req[2] = pl as u8;
-    req[3..3 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 3 - pl);
-    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..3 + pl + dn]);
-    drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
-    let first = ctx.request_with_reply_deadline("fs", &msg, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
-    if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, max_secs) {
-        return Some(r);
-    }
-    // TIMED OUT. The request was already SENT, so `fs` will reply into our endpoint whether we are still
-    // listening or not - and an unclaimed reply is not harmless: it sits in the queue and the NEXT fs
-    // request reads IT instead of its own answer. That is not hypothetical. A 2 s read of a non-existent
-    // `/clock.last` at boot (fs still mounting) timed out, and its late 1-byte `[FS_NOTFOUND]` was then
-    // consumed by `drives`, which reported "no disk found" on a healthy, mounted 15 GB disk. The bound was
-    // right; abandoning the reply without reclaiming it was the bug.
-    //
-    // So spend a SHORT grace collecting the late reply purely to discard it. The abortable request path
-    // solves the same problem with a drain at its own top; this path had no equivalent.
-    // Timed out. Do NOT try to reclaim the late reply here - that is the race described in
-    // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
-    // NEVER RE-SEND A DESTRUCTIVE OP, and this is the carnage §3.5 gap closed rather than detected.
-    //
-    // The retry below is correct for a READ: nothing happened, so asking again is free. For a
-    // `move`, `delete` or `rename` it is not, and the failure is not hypothetical - a test that
-    // completes a move and swallows its reply produced exactly this:
-    //
-    //     [diag] reacquired fs - retrying
-    //     move: failed - source not found          <- the file was already at the destination
-    //
-    // The first attempt SUCCEEDED. The retry found nothing at the source, and its error was reported
-    // as the move's outcome: a confident wrong answer about a destructive operation (§26.7).
-    //
-    // The protocol cannot deduplicate this away. The correlation tag matches a reply to a request,
-    // and the retry deliberately draws a FRESH one so a late original can be told apart - so a retry
-    // is indistinguishable from a new request BY DESIGN. Making it distinguishable means a client-
-    // supplied operation id that survives retries, plus a reply cache in `fs`; real work, and
-    // recorded as such.
-    //
-    // What needs no protocol change is the honest answer: the operation already ran, re-sending
-    // cannot help, and the outcome is UNKNOWN. Say so.
-    if op_is_mutating(op) {
-        ctx.fs_unknown.set(true);
-        ctx.last_write_err.borrow_mut().set_text(
-            "the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - a retry can repeat a destructive operation. Check with `dir`");
-        return None;
-    }
-    if ctx.reacquire_by_name("fs") {
-        drain_stale_fs_replies(ctx);
-        let tag2 = next_fs_tag(ctx);
-        let mut req2 = req;
-        req2[0] = tag2;
-        let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-        let again = ctx.request_with_reply_deadline("fs", &msg2, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
-        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
-    }
-    None
-}
 
 /// Discard anything already queued on our endpoint BEFORE sending an fs request.
 ///
@@ -13427,59 +13549,6 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
     }
 }
 
-/// `fs_request` for INTERACTIVE commands (`dir`, `cd`, `read`, `find`, ...): q-abortable, and after a
-/// short lingering threshold it prints a "[q] quit" hint so the user can bail on a slow op instead
-/// of waiting blind. A fast reply prints NOTHING (no nag on a snappy op). Mirrors the net commands'
-/// abort convention (`ReqOutcome`): `Reply(r)` = answered, `Aborted` = user pressed q (hint already
-/// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
-/// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
-/// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
-fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
-    const HINT_SECS: i64 = 2;    // print "[q] quit" only if the wait lingers past this
-    // How long `fs` gets to answer before the shell declares storage unavailable.
-    //
-    // **This was 3600, with the comment "effectively unbounded - fs replies fast now; q is the real
-    // exit".** That is not a bound, and "q is the real exit" makes the USER the timeout: a `tree`
-    // whose LIST_DIR never came back sat for an hour looking hung, and the reacquire-and-retry path
-    // below gives it a second hour. It is the rule above the rules - nothing above the kernel may
-    // hang; a missing, dead or slow dependency must RETURN with a loud "unavailable". Every caller
-    // already handles that outcome properly ("tree: storage unavailable"); they were simply never
-    // reached.
-    //
-    // 20 s is generous for what this helper actually carries. Its ONLY callers are READ_FILE,
-    // STAT_FILE and LIST_DIR - operations that complete in milliseconds on a healthy mount, and
-    // whose worst legitimate case is an `fs` that died and is being respawned (~1 s). The whole-disk
-    // work that genuinely takes minutes - check, scrub, flash - does not come through here.
-    //
-    // The retry doubles it, so a truly dead `fs` costs 40 s and then says so, instead of costing an
-    // afternoon and saying nothing.
-    const MAX_SECS:  i64 = FS_ANSWER_SECS; // one source for this bound, not a second copy of 20
-    let pl = path.len().min(255);
-    let mut req = [0u8; 4096];
-    let tag = next_fs_tag(ctx);
-    req[0] = tag;
-    req[1] = op;
-    req[2] = pl as u8;
-    req[3..3 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 3 - pl);
-    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..3 + pl + dn]);
-    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
-    match fs_take_tagged(ctx, tag, first, MAX_SECS) {
-        // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
-        // A fresh tag for the fresh request - see `fs_request`.
-        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
-            let tag2 = next_fs_tag(ctx);
-            let mut req2 = req;
-            req2[0] = tag2;
-            let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  [q] quit"));
-            fs_take_tagged(ctx, tag2, again, MAX_SECS)
-        }
-        other => other,
-    }
-}
-
 /// Send a BARE single-opcode request (no path, no data) to `fs`, q-abortable with a hint - for the
 /// whole-disk operations (`drives check`, `drives scrub`) that legitimately run for minutes.
 ///
@@ -13509,65 +13578,46 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
+fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r
+}
+
 fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
-    let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
-        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r.ok().map(|st| (st.size, st.is_dir))
 }
 
 /// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
 /// (0 at EOF). One message - the building block for streaming a large file.
 fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
-    let mut tail = [0u8; 12];
-    tail[..8].copy_from_slice(&offset.to_le_bytes());
-    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
-    let reply = fs_request(ctx, OP_READ_AT, path, &tail)?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        let n = end - 5;
-        out[..n].copy_from_slice(&p[5..end]);
-        Some(n)
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.read_at(path, offset, out);
+    ctx.fs_tag.set(g.tag());
+    r.ok()
 }
 
 /// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
-/// `max_secs` (RTC) via `fs_request_bounded`, so an alive-but-not-serving fs (respawned, still
-/// re-mounting) cannot hang the prompt. `None` on timeout/miss/absent, treated as "no file".
+/// `max_secs`, so an alive-but-not-serving fs (respawned, still re-mounting) cannot hang the prompt.
+/// `None` on timeout/miss/absent, treated as "no file".
 fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
-    let reply = fs_request_bounded(ctx, OP_STAT_FILE, path, &[], max_secs)?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
-        Some((u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]), p[10] == 1))
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r.ok().map(|st| (st.size, st.is_dir))
 }
 
 /// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
 /// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
 fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
-    let mut tail = [0u8; 12];
-    tail[..8].copy_from_slice(&offset.to_le_bytes());
-    tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
-    let reply = fs_request_bounded(ctx, OP_READ_AT, path, &tail, max_secs)?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        let n = end - 5;
-        out[..n].copy_from_slice(&p[5..end]);
-        Some(n)
-    } else {
-        None
-    }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let r = g.read_at(path, offset, out);
+    ctx.fs_tag.set(g.tag());
+    r.ok()
 }
 
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
@@ -13600,14 +13650,6 @@ impl LastWriteErr {
         self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
         self.len = n;
     }
-    fn set(&mut self, m: Option<&Message>) {
-        self.len = 0;
-        if let Some(why) = m.and_then(fs_err_reason) {
-            let n = why.len().min(self.buf.len());
-            self.buf[..n].copy_from_slice(&why.as_bytes()[..n]);
-            self.len = n;
-        }
-    }
     fn get(&self) -> Option<&str> {
         if self.len == 0 { return None; }
         core::str::from_utf8(&self.buf[..self.len]).ok()
@@ -13615,21 +13657,47 @@ impl LastWriteErr {
 }
 
 fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
-    let r = fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes());
-    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
-    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.create_sized(path, total);
+    let ok = r.is_ok();
+    if !ok {
+        // ALLOCATION IS A MUTATION. A lost reply may still have allocated the extent, so the stored
+        // sentence says "unknown" rather than "failed" - the caller prints it, and an operator told
+        // a write failed when it may have landed is being handed a confident wrong answer.
+        let why = g.reason();
+        if matches!(r, Err(gs::Error::OutcomeUnknown)) {
+            ctx.last_write_err.borrow_mut().set_text(
+                "the reply was lost; the space MAY HAVE BEEN allocated. Not re-sent - check with `dir`");
+        } else if why.is_empty() {
+            ctx.last_write_err.borrow_mut().set_text("fs refused the allocation - see its log");
+        } else {
+            ctx.last_write_err.borrow_mut().set_text(why);
+        }
+    }
+    ctx.fs_tag.set(g.tag());
     ok
 }
 
 /// Write `chunk` into `path` at block-aligned byte `offset`.
 fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
-    let mut tail = [0u8; 8 + IO_CHUNK];
-    tail[..8].copy_from_slice(&offset.to_le_bytes());
+    // The offset packing and the chunk cap are the library's; the IO_CHUNK clamp stays here because
+    // a caller handing over more than one message carries is this layer's business to notice.
     let n = chunk.len().min(IO_CHUNK);
-    tail[8..8 + n].copy_from_slice(&chunk[..n]);
-    let r = fs_request(ctx, OP_WRITE_AT, path, &tail[..8 + n]);
-    let ok = matches!(&r, Some(m) if m.payload_bytes().first() == Some(&FS_OK));
-    if !ok { ctx.last_write_err.borrow_mut().set(r.as_ref()); }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.write_at(path, offset, &chunk[..n]);
+    let ok = r.is_ok();
+    if !ok {
+        let why = g.reason();
+        if matches!(r, Err(gs::Error::OutcomeUnknown)) {
+            ctx.last_write_err.borrow_mut().set_text(
+                "the reply was lost; the chunk MAY HAVE BEEN written. Not re-sent - check with `read`");
+        } else if why.is_empty() {
+            ctx.last_write_err.borrow_mut().set_text("fs refused the chunk - see its log");
+        } else {
+            ctx.last_write_err.borrow_mut().set_text(why);
+        }
+    }
+    ctx.fs_tag.set(g.tag());
     ok
 }
 
@@ -13733,12 +13801,6 @@ impl core::fmt::Display for TimeCol {
     }
 }
 
-/// Read a little-endian u32 from a slice, mirroring `u64_le`.
-fn u32_le(b: &[u8]) -> u32 {
-    if b.len() < 4 { return 0; }
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
 fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<(), ShellError> {
     // WORDS, NOT FLAGS (`utilities/0_conventions.md` rule 4): `dir bytes /docs`, never `dir -b`. Any
     // order, and mixable with a path, because an order a person has to remember is one they will
@@ -13774,39 +13836,17 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     out.line_fmt(ctx, format_args!("{}", str_of(path)));
     let mut listed = 0usize;
     let mut header_done = false;
-    let mut cur = DirCursor::new();
-    while let Some(from) = cur.next() {
-    let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &from) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("dir: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_NOTFOUND) {
-        ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
-        return Err(ShellError::FileNotFound);
-    }
-    // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
-    // error - the stick pulled and replugged - came out as a claim about the path, sending the operator
-    // to look at `/` when the problem was the device. Name what actually happened (§26.7).
-    if p.first() == Some(&FS_ERR) || p.len() < DIR_HDR {
-        ctx.console_writeln_fmt(format_args!(
-            "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
-            str_of(path)));
-        return Err(ShellError::Unknown);
-    }
-    let count = cur.take(p);
-    if count > 0 && !header_done {
-        out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
-        header_done = true;
-    }
-    let mut i = DIR_HDR;
-    for _ in 0..count {
-        if i >= p.len() { break; }
-        let nl = p[i] as usize;
-        i += 1;
-        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
+    let mut truncated = false;
+    // The PAGING, the entry layout, the page cap and the did-it-finish answer are the library's.
+    // What stays here is what `dir` means by a row.
+    let notice = || ctx.console_writeln("  [q] quit");
+    let listing = {
+        let mut fs = gs::fs::Fs::from_tag(&*ctx, ctx.fs_tag.get()).noticing(&notice);
+        let r = fs.list_dir(str_of(path), |e| {
+        if !header_done {
+            out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
+            header_done = true;
+        }
         // A NAME IS UNTRUSTED INPUT, AND THIS IS WHERE IT MEETS A TERMINAL.
         //
         // `fs` refuses to CREATE a name carrying control bytes, but a disk prepared elsewhere
@@ -13815,18 +13855,17 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
         // a terminal acts on the bytes it is handed, and a name containing `ESC [ 2J` clears the
         // screen when listed, scrolling itself and everything after it out of the listing that was
         // supposed to reveal it. Found by `osdev test fs-fuzz` against a disk baked with that name.
+        //
+        // This is ALSO why `DirEntry::name` is raw bytes: sanitising in the library would have made
+        // the unsafe name unprintable AND unreachable, so `delete` could not remove it either.
         let mut safe = [b'?'; 64];
-        let shown = nl.min(safe.len());
+        let shown = e.name.len().min(safe.len());
         for k in 0..shown {
-            let b = p[i + k];
+            let b = e.name[k];
             safe[k] = if b >= 0x20 && b < 0x7f { b } else { b'.' };
         }
         let name = core::str::from_utf8(&safe[..shown]).unwrap_or("?");
-        let is_dir = p[i + nl] != 0;
-        let size = u64_le(&p[i + nl + 1..i + nl + 9]);
-        let mtime = u32_le(&p[i + nl + 9..i + nl + 13]);
-        let sealed = p[i + nl + 13] & 1 != 0;
-        i += nl + 1 + 8 + 4 + 1;
+        let (is_dir, size, mtime, sealed) = (e.is_dir, e.size, e.mtime, e.sealed);
         // A time this volume does not record prints as "unknown" rather than as 1970 - an absent
         // date is honest and a wrong one is not (Phase O).
         let when = if mtime == 0 {
@@ -13848,7 +13887,42 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
                                            name, kind, SizeCol(size, exact), when));
         }
         listed += 1;
-    }
+        true
+        });
+        ctx.fs_tag.set(fs.tag());
+        r
+    };
+    match listing {
+        // The operator's own `q`. Not a fault, so not an error line and not a failing exit.
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("dir: not a directory: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(gs::Error::Unavailable) => {
+            // Present-but-unreadable disk: the data may still be intact, so flashing would DESTROY
+            // it. Deliberately does NOT advise 'drives flash'.
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            return Err(ShellError::Unknown);
+        }
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln("dir: storage unavailable");
+            return Err(ShellError::Unknown);
+        }
+        // A read error is NOT "not a directory". Lumping the two together is how a storage I/O
+        // error - the stick pulled and replugged - came out as a claim about the path, sending the
+        // operator to look at `/` when the problem was the device. Name what happened (26.7).
+        Err(_) => {
+            ctx.console_writeln_fmt(format_args!(
+                "dir: could not read {} - storage error (the device may still be settling after a replug; try again)",
+                str_of(path)));
+            return Err(ShellError::Unknown);
+        }
+        Ok(l) => truncated = !l.complete,
     }
     if listed == 0 {
         out.line(ctx, "  (empty)");
@@ -13857,10 +13931,10 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     }
     // The walk hit its own bound rather than the end of the directory. Say so where the count is,
     // because the count is the number a reader will otherwise take as the whole truth (26.7).
-    if cur.cut() {
+    if truncated {
         out.line_fmt(ctx, format_args!(
             "  INCOMPLETE - this directory is larger than {} listing pages; the entries above are not all of it",
-            DIR_PAGE_MAX));
+            gs::fs::DIR_PAGE_MAX));
     }
     Ok(())
 }
@@ -13904,7 +13978,11 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     // allocator takes different paths for each, and a one-size churn would only ever exercise one.
     const SIZES: [usize; 4] = [64, 500, 1200, 3000];
 
-    let _ = fs_request(ctx, OP_MKDIR, DIR, &[]);
+    // ONE handle for the whole run. The correlation tag then advances across thousands of
+    // transactions instead of restarting at each call, which is the property that lets a late reply
+    // be recognised rather than believed.
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let _ = gfs.create_dir(DIR);
     out.line_fmt(ctx, format_args!(
         "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
 
@@ -13946,9 +14024,10 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         path[pl] = b'0' + slot as u8; pl += 1;
         path[pl..pl + 4].copy_from_slice(b".bin"); pl += 4;
 
-        match fs_request(ctx, OP_WRITE_FILE, &path[..pl], &buf[..n]).as_ref()
-                 .map(|r| r.payload_bytes().first().copied()) {
-            Some(Some(FS_OK)) => { writes += 1; bytes += n as u64; }
+        match gfs.write(&path[..pl], &buf[..n]) {
+            Ok(()) => { writes += 1; bytes += n as u64; }
+            // Counted as refused, INCLUDING an unknown outcome. That is the honest reading for a
+            // load generator: it does not know whether the write landed, so it must not claim it.
             _ => failures += 1,
         }
 
@@ -13969,11 +14048,9 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
             // writes" would have hidden this indefinitely, which is the argument for a tool
             // reporting what it DID rather than that it ran.
             let name_at = DIR.len() + 1;
-            if matches!(fs_request(ctx, OP_RENAME, &path[..pl], &np[name_at..pl]).as_ref()
-                          .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+            if gfs.rename(&path[..pl], &np[name_at..pl]).is_ok() {
                 renames += 1;
-                if matches!(fs_request(ctx, OP_DELETE, &np[..pl], &[]).as_ref()
-                              .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+                if gfs.delete(&np[..pl]).is_ok() {
                     deletes += 1;
                 }
             }
@@ -13986,6 +14063,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         writes, renames, deletes, bytes, failures));
     out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
     out.line(ctx, "churn: /churn is left in place (it is the evidence); `churn reset` removes it");
+    ctx.fs_tag.set(gfs.tag());
     Ok(())
 }
 
@@ -14079,18 +14157,38 @@ fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// The set is bounded at eight files anyway, rewritten in place, so nothing accumulates however many
 /// times it runs. This is for when you want the directory gone, not for hygiene it does not need.
 fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    match fs_request(ctx, OP_DELETE_TREE, b"/churn", &[]).as_ref()
-             .map(|r| r.payload_bytes().first().copied()) {
-        Some(Some(FS_OK))       => { out.line(ctx, "churn: /churn removed"); Ok(()) }
-        Some(Some(FS_NOTFOUND)) => { out.line(ctx, "churn: nothing to remove - /churn does not exist"); Ok(()) }
-        other => {
-            match other.flatten() {
-                Some(_) => out.line(ctx, "churn: could not remove /churn - see fs's log"),
-                None    => out.line(ctx, "churn: storage unavailable"),
-            }
+    // `delete_all` carries the SWEEP budget itself - removing a subtree walks it, and the ordinary
+    // request deadline is shorter than that walk on a full directory.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.delete_all(b"/churn");
+    let why = g.reason();
+    let answer = match r {
+        Ok(()) => { out.line(ctx, "churn: /churn removed"); Ok(()) }
+        Err(gs::Error::NotFound) => {
+            out.line(ctx, "churn: nothing to remove - /churn does not exist");
+            Ok(())
+        }
+        // A TREE DELETE IS NOT ONE MUTATION. It frees in batches, so a lost reply can leave the
+        // directory PARTLY removed. "Could not remove" would claim nothing happened.
+        Err(gs::Error::OutcomeUnknown) => {
+            out.line(ctx, "churn: OUTCOME UNKNOWN - /churn may be partly removed. Check with `dir /churn`");
             Err(ShellError::Unknown)
         }
-    }
+        Err(gs::Error::Unavailable) | Err(gs::Error::NoFilesystem) => {
+            out.line(ctx, "churn: storage unavailable");
+            Err(ShellError::Unknown)
+        }
+        Err(_) if !why.is_empty() => {
+            out.line_fmt(ctx, format_args!("churn: could not remove /churn - {}", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            out.line(ctx, "churn: could not remove /churn - see fs's log");
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(g.tag());
+    answer
 }
 
 /// `churn verify` - is any file in `/churn` a MIX of two generations?
@@ -14109,58 +14207,65 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let mut checked = 0u32;
     let mut torn = 0u32;
     let mut empty = 0u32;
-    let mut truncated = false;
     let mut data = [0u8; 4096];
-    let mut cur = DirCursor::new();
-    'pages: while let Some(from) = cur.next() {
-    let reply = match fs_request(ctx, OP_LIST_DIR, DIR, &from) {
-        Some(r) => r,
-        None => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < DIR_HDR {
-        if cur.pages_asked() == 1 {
+
+    // COLLECT, THEN READ. `list_dir` holds the handle for the length of the walk, so the read of
+    // each file cannot happen inside it. The churn set is bounded at eight files by construction -
+    // `churn` rewrites the same ones in place, which is why it does not accumulate - so sixteen
+    // slots is twice the set and a full buffer is reported rather than silently trimmed.
+    const NAMES_MAX: usize = 16;
+    const NAME_MAX: usize = 48;
+    let mut names = [[0u8; NAME_MAX]; NAMES_MAX];
+    let mut nlens = [0usize; NAMES_MAX];
+    let mut nn = 0usize;
+    let mut overfull = false;
+
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let walked = g.list_dir(DIR, |e| {
+        if e.is_dir {
+            return true;
+        }
+        if nn == NAMES_MAX || e.name.len() > NAME_MAX {
+            overfull = true;
+            return false;
+        }
+        names[nn][..e.name.len()].copy_from_slice(e.name);
+        nlens[nn] = e.name.len();
+        nn += 1;
+        true
+    });
+    ctx.fs_tag.set(g.tag());
+    let mut truncated = overfull;
+    match walked {
+        Ok(l) => { if !l.complete && !overfull { truncated = true; } }
+        Err(gs::Error::NotFound) => {
             ctx.console_writeln("churn verify: no /churn directory - nothing to check");
             return Ok(());
         }
-        // `break 'pages`, NOT `continue` - this is the page loop, and re-asking would never end.
-        break 'pages;
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(_) => { ctx.console_writeln("churn verify: storage unavailable"); return Err(ShellError::Unknown); }
     }
-    let count = cur.take(p);
-    let mut i = DIR_HDR;
 
-    for _ in 0..count {
-        if i >= p.len() { break; }
-        let nl = p[i] as usize;
-        i += 1;
-        if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-        let is_dir = p[i + nl] != 0;
+    for k in 0..nn {
         let mut path = [0u8; 64];
         let mut pl = 0usize;
         for &b in DIR { path[pl] = b; pl += 1; }
         path[pl] = b'/'; pl += 1;
-        let take = nl.min(path.len() - pl);
-        path[pl..pl + take].copy_from_slice(&p[i..i + take]);
-        pl += take;
-        i += nl + 1 + 8 + 4 + 1;
-        if is_dir { continue; }
+        path[pl..pl + nlens[k]].copy_from_slice(&names[k][..nlens[k]]);
+        pl += nlens[k];
 
         let n = match fs_read_file(ctx, &path[..pl], &mut data, 20) { Some(n) => n, None => continue };
         checked += 1;
         if n == 0 { empty += 1; continue; }
-        // The generation is byte 0 by construction; every later byte is then predicted.
-        let gen = data[0];
-        // Same source as the writer (`sdk::churn`), which is the whole point of it being there.
-        let bad_at = godspeed_sdk::churn::first_divergence(&data[..n]);
-        if let Some(k) = bad_at {
+        // Same source as the writer (`sdk::churn`), which is the whole point of it being there. The
+        // generation is byte 0 by construction; every later byte is then predicted.
+        if let Some(bad) = godspeed_sdk::churn::first_divergence(&data[..n]) {
             torn += 1;
             out.line_fmt(ctx, format_args!(
                 "churn verify: TORN - {} diverges at byte {} of {} (block {}, offset {} within it)",
-                str_of(&path[..pl]), k, n, k / 508, k % 508));
+                str_of(&path[..pl]), bad, n, bad / 508, bad % 508));
         }
     }
-    }
-    truncated = cur.cut();
 
     if truncated {
         out.line(ctx, "churn verify: NOTE - /churn is larger than the walk could read, so some files were NOT checked");
@@ -14201,13 +14306,14 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             return Ok(());
         }
     }
-    let reply = fs_request(ctx, OP_SEAL, path, &[]);
-    match reply.as_ref().map(|r| r.payload_bytes().first().copied()) {
-        Some(Some(FS_OK)) => {
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = gfs.seal(path);
+    let out = match r {
+        Ok(()) => {
             ctx.console_writeln_fmt(format_args!("sealed {}", str_of(path)));
             Ok(())
         }
-        Some(Some(FS_NOTFOUND)) => {
+        Err(gs::Error::NotFound) => {
             ctx.console_writeln_fmt(format_args!("seal: not found: {}", str_of(path)));
             Err(ShellError::FileNotFound)
         }
@@ -14220,13 +14326,17 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             // The fourth command today with this shape, after `write`, `move` and `copy`. The pattern
             // is worth naming: a layer that knows why something failed and answers with a menu of
             // possibilities costs the reader the one thing it could have told them (26.7).
-            match reply.as_ref().and_then(fs_err_reason) {
-                Some(why) => ctx.console_writeln_fmt(format_args!("seal: failed - {}", why)),
-                None      => ctx.console_writeln("seal: failed - see fs's log"),
+            let why = gfs.reason();
+            if why.is_empty() {
+                ctx.console_writeln("seal: failed - see fs's log");
+            } else {
+                ctx.console_writeln_fmt(format_args!("seal: failed - {}", why));
             }
             Err(ShellError::Unknown)
         }
-    }
+    };
+    ctx.fs_tag.set(gfs.tag());
+    out
 }
 
 /// `read <path>` - print a file's contents. The first command on the Ok/Err `Result` model:
@@ -14247,8 +14357,21 @@ fn fc_open(ctx: &ShellCtx, path: &[u8], rights: u8) -> Option<CapHandle> {
 /// Invoke a file cap (§7.10): the kernel validates `file` holds `right`, badges the request, and
 /// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
 /// (the cap lacks `right` - non-escalation - or is stale/revoked), so no reply comes back.
-fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+fn fc_invoke(ctx: &ShellCtx, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
     while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
+    // TAGGED NOW (`serve_filecap` echoes byte 0). The drain above stays because the shell still
+    // wants a clean slate after an aborted invoke, but it is no longer what makes this correct: a
+    // reply whose tag does not match is REFUSED below rather than believed.
+    //
+    // The tag comes from the shell's ONE fs counter, not a second one. Both fs protocols reply onto
+    // this same endpoint, so a tag only has to be unique against everything else in flight here -
+    // and two counters on one endpoint is exactly how a stale reply gets accepted as the answer.
+    let tag = next_fs_tag(ctx);
+    if payload.len() + 1 > FC_REQ_MAX { return None; }
+    let mut req = [0u8; FC_REQ_MAX];
+    req[0] = tag;
+    req[1..1 + payload.len()].copy_from_slice(payload);
+    let payload = &req[..1 + payload.len()];
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
     if ctx.resource_invoke(file, right, reply, &Message::from_bytes(payload)).is_err() {
@@ -14264,7 +14387,13 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
     // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
     match outcome {
-        ReqOutcome::Reply(m) => Some(m),
+        ReqOutcome::Reply(m) => {
+            let b = m.payload_bytes();
+            // A reply carrying someone else's tag is the answer to a question we already gave up
+            // on. Reading it as this one's is how a channel goes out of step.
+            if b.first() != Some(&tag) { return None; }
+            Some(Message::from_bytes(&b[1..]))
+        }
         _ => { ctx.remove_cap(reply); None }
     }
 }
@@ -14273,6 +14402,9 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
 /// DIAGNOSTIC, not a file tool: it creates its own throwaway file, exercises every property the
 /// capability model promises against it, then deletes it - so it never touches a file of yours
 /// and takes no argument. Each line is asserted by `osdev test file-cap` (§22 Test 14).
+/// The largest file-cap request the shell builds, plus its tag. Every `fcap` request is a short
+/// header and a small chunk; a caller needing more is refused rather than silently truncated.
+const FC_REQ_MAX: usize = 512;
 const FCAP_TMP: &[u8] = b"/.fcap-selftest";
 const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
 fn cmd_fcap_help(ctx: &ServiceContext) {
@@ -14315,8 +14447,8 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     const NEWP: &[u8] = b"/ru_new.txt";
     let mut ok = true;
 
-    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
-    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    let _ = sh_delete(ctx, OLDP);
+    let _ = sh_delete(ctx, NEWP);
     if !matches!(fs_request(ctx, OP_WRITE_FILE, OLDP, b"OLDDATA").as_ref()
                    .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
         ctx.console_writeln("fcap reuse: FAIL - could not create the original");
@@ -14360,7 +14492,7 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
 
     // FREE THE BLOCKS, THEN PUT SOMETHING ELSE IN THEM. Same length, so the allocator is offered
     // the extent it just reclaimed.
-    let _ = fs_request(ctx, OP_DELETE, OLDP, &[]);
+    let _ = sh_delete(ctx, OLDP);
     if !matches!(fs_request(ctx, OP_WRITE_FILE, NEWP, b"NEWDATA").as_ref()
                    .map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
         ctx.console_writeln("fcap reuse: FAIL - could not write the replacement");
@@ -14387,7 +14519,7 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     }
 
     ctx.remove_cap(held);
-    let _ = fs_request(ctx, OP_DELETE, NEWP, &[]);
+    let _ = sh_delete(ctx, NEWP);
     if ok {
         ctx.console_writeln("fcap reuse: ok - a capability minted before the restart reaches nothing after it");
         Ok(())
@@ -14396,8 +14528,99 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     }
 }
 
+/// `fcap gsreuse` - the same question as `fcap reuse`, asked of the STANDARD LIBRARY.
+///
+/// A `gs::cap::File` minted before `fs` dies must reach nothing after it comes back, and must say so
+/// in words rather than hanging or quietly succeeding. Everything here goes through `gs::fs` and
+/// `gs::cap` so there is ONE tag counter for the whole sequence.
+///
+/// See `build/gscap_reuse2.py` and `docs/stdlib-design.md` for what this deliberately does NOT cover
+/// (the block-reuse confused-deputy case, which `fcap reuse` pins).
+fn cmd_fcap_gsreuse(ctx: &ShellCtx) -> Result<(), ShellError> {
+    const OLDP: &str = "/gsru_old.txt";
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let _ = gfs.delete(OLDP);
+    let created = gfs.write(OLDP, b"OLDDATA").is_ok();
+    // Recorded BEFORE the kill: the generation `fs` is serving on now. A restart bumps it (14.2),
+    // and that is what "came back" will be tested against.
+    let gen_before = ctx.inspect_endpoint_generation("fs");
+
+    // Everything that touches the `File` lives in here, because the handle is borrowed for as long
+    // as the capability is. The tag is synced back exactly once, after this ends.
+    let verdict: Result<(), &'static str> = if !created {
+        Err("could not create the original")
+    } else {
+        match gfs.open(OLDP, gs::cap::READ) {
+            Err(_) => Err("could not open the original as a cap"),
+            Ok(mut f) => {
+                let mut buf = [0u8; 16];
+                let readable = matches!(f.read_at(0, &mut buf), Ok(n) if n >= 7 && &buf[..7] == b"OLDDATA");
+                if !readable {
+                    // It must WORK first, or a later refusal proves nothing: a handle that was never
+                    // valid is refused for the wrong reason and the test passes while testing nothing.
+                    Err("the cap did not read the original")
+                } else {
+                    ctx.console_writeln("fcap gsreuse: the cap reads the original before the restart");
+                    ctx.console_writeln("fcap gsreuse: killing fs with the gs::cap file still held");
+                    if ctx.kill("fs").is_err() {
+                        Err("could not kill fs")
+                    } else {
+                        // WAIT ON TRUTH, FROM OUTSIDE THE FS CHANNEL.
+                        //
+                        // The obvious probe - invoke the held capability and wait for
+                        // `Error::service_answered()` - CANNOT WORK, and the reason is worth
+                        // knowing: a stale resource cap is rejected by the KERNEL on the generation
+                        // check, before the message is routed. `fs` is never reached, so `fs` never
+                        // answers, and `service_answered()` is permanently false for a stale cap.
+                        // That is the right answer from the error model and the wrong instrument
+                        // for this question.
+                        //
+                        // `inspect_endpoint_generation` is a kernel query, so it needs no `fs`
+                        // request and no tag - which matters because the `Fs` handle is borrowed by
+                        // the `File` for this whole scope, and a second handle would mean a second
+                        // tag counter on one endpoint.
+                        let mut back = false;
+                        for _ in 0..200 {
+                            let _ = ctx.reacquire_by_name("fs");
+                            if ctx.inspect_endpoint_generation("fs") > gen_before { back = true; break; }
+                            ctx.yield_cpu();
+                        }
+                        if !back {
+                            Err("fs never came back")
+                        } else {
+                            // THE QUESTION.
+                            let mut after = [0u8; 16];
+                            match f.read_at(0, &mut after) {
+                                Ok(_) => Err("the stale cap still resolved to something"),
+                                Err(e) => {
+                                    ctx.console_writeln_fmt(format_args!(
+                                        "fcap gsreuse: the stale cap was refused - {}", e.as_str()));
+                                    Ok(())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    ctx.fs_tag.set(gfs.tag());
+
+    match verdict {
+        Ok(()) => {
+            ctx.console_writeln("fcap gsreuse: ok - a gs::cap file minted before the restart reaches nothing after it");
+            Ok(())
+        }
+        Err(why) => {
+            ctx.console_writeln_fmt(format_args!("fcap gsreuse: FAIL - {}", why));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
 fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim() == "reuse" { return cmd_fcap_reuse(ctx); }
+    if arg.trim() == "gsreuse" { return cmd_fcap_gsreuse(ctx); }
     if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
     if !arg.trim().is_empty() {
         ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");
@@ -14419,7 +14642,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // 1. Open the file as a capability (fs mints a delegated resource + hands us the cap).
     let rw = match fc_open(ctx, path, RIGHT_READ | RIGHT_WRITE) {
         Some(c) => { ctx.console_writeln("fcap: opened rw (file cap)"); c }
-        None    => { ctx.console_writeln("fcap: FAIL open rw"); let _ = fs_request(ctx, OP_DELETE, path, &[]); return Err(ShellError::Unknown); }
+        None    => { ctx.console_writeln("fcap: FAIL open rw"); let _ = sh_delete(ctx, path); return Err(ShellError::Unknown); }
     };
 
     // 2. Write THROUGH the cap (FOP_WRITE needs WRITE, which rw holds).
@@ -14444,7 +14667,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // 4. Open a READ-ONLY cap to the same file.
     let ro = match fc_open(ctx, path, RIGHT_READ) {
         Some(c) => c,
-        None    => { fail(ctx, "fcap: FAIL open ro"); ctx.remove_cap(rw); let _ = fs_request(ctx, OP_DELETE, path, &[]); return Err(ShellError::Unknown); }
+        None    => { fail(ctx, "fcap: FAIL open ro"); ctx.remove_cap(rw); let _ = sh_delete(ctx, path); return Err(ShellError::Unknown); }
     };
 
     // 5. Non-escalation, kernel layer: invoking the RO cap declaring WRITE is rejected by the
@@ -14506,7 +14729,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // size from the first moment.
     const APPEND_PATH: &[u8] = b"/.fcap_append";
     const BLK: u64 = 508;   // DATA_PAYLOAD - `write_at` demands block-aligned offsets
-    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
+    let _ = sh_delete(ctx, APPEND_PATH);
     let mut newreq = [0u8; 8];
     newreq[..8].copy_from_slice(&(3 * BLK).to_le_bytes());
     if !matches!(fs_request(ctx, OP_WRITE_NEW, APPEND_PATH, &newreq).as_ref().map(|r| r.payload_bytes().first().copied()),
@@ -14547,17 +14770,77 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         fail(ctx, "fcap: FAIL open append-only");
         ok = false;
     }
-    let _ = fs_request(ctx, OP_DELETE, APPEND_PATH, &[]);
+    let _ = sh_delete(ctx, APPEND_PATH);
 
     // Cleanup so `fcap` is leak-free and re-runnable (e.g. in selfcheck): drop both shell handles
     // (rw revoked at close, ro revoked at rename) and delete the throwaway file (now at the renamed
     // path). Otherwise each run orphans cap-table slots and leaves a stray file behind.
     ctx.remove_cap(ro);
     ctx.remove_cap(rw);
-    let _ = fs_request(ctx, OP_DELETE, FCAP_TMP_RENAMED, &[]);
+    let _ = sh_delete(ctx, FCAP_TMP_RENAMED);
+
+    // ---- THE SAME PROPERTY, THROUGH THE STANDARD LIBRARY -------------------------------------
+    //
+    // Everything above hand-rolls the protocol. This repeats the core of it through `gs::cap`, so
+    // the library is proven by the test that pins 22 Test 14 rather than by inspection.
+    //
+    // It is a real check and not a formality: both paths now share one wire protocol AND one tag
+    // counter (the `File` borrows the `Fs` handle precisely so a second counter cannot exist). If
+    // the tag is wrong in either direction, or the counters diverge, this read returns somebody
+    // else's answer instead of "gsdata".
+    const GSCAP_PATH: &str = "/.fcap-gs";
+    {
+        let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let r = (|| -> Result<(), gs::Error> {
+            gfs.create_sized(GSCAP_PATH, 32)?;
+            let mut f = gfs.open(GSCAP_PATH, gs::cap::READ | gs::cap::WRITE)?;
+            f.write_at(0, b"gsdata")?;
+            let mut buf = [0u8; 32];
+            let n = f.read_at(0, &mut buf)?;
+            if &buf[..6] != b"gsdata" { return Err(gs::Error::Failed); }
+            let sz = f.size()?;
+            f.close()?;
+            if n < 6 || sz < 6 { return Err(gs::Error::Failed); }
+            Ok(())
+        })();
+        ctx.fs_tag.set(gfs.tag());
+        match r {
+            Ok(()) => ctx.console_writeln("fcap: gs::cap wrote and read the file THROUGH the capability"),
+            Err(e) => {
+                out_fail_gs(ctx, e);
+                ok = false;
+            }
+        }
+        // A READ-only capability must be refused its write by the KERNEL, before fs is reached.
+        // Same non-escalation assertion as above, made through the library.
+        let mut gfs2 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let denied = match gfs2.open(GSCAP_PATH, gs::cap::READ) {
+            Ok(mut ro2) => {
+                let e = ro2.write_at(0, b"nope");
+                let _ = ro2.close();
+                matches!(e, Err(gs::Error::PermissionDenied))
+            }
+            Err(_) => false,
+        };
+        ctx.fs_tag.set(gfs2.tag());
+        if denied {
+            ctx.console_writeln("fcap: gs::cap non-escalation holds - a READ cap cannot write");
+        } else {
+            fail(ctx, "fcap: FAIL gs::cap let a READ-only capability write");
+            ok = false;
+        }
+        let mut gfs3 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let _ = gfs3.delete(GSCAP_PATH);
+        ctx.fs_tag.set(gfs3.tag());
+    }
 
     if ok { ctx.console_writeln("fcap: all file-capability checks passed"); Ok(()) }
     else { Err(ShellError::Unknown) }
+}
+
+/// Report a `gs::Error` from the `fcap` self-check, naming it rather than saying "failed".
+fn out_fail_gs(ctx: &ShellCtx, e: gs::Error) {
+    ctx.console_writeln_fmt(format_args!("fcap: FAIL gs::cap round trip - {}", e.as_str()));
 }
 
 // ── edit: a full-screen text editor (utilities/36_edit.md) ───────────────────────────────────
@@ -14978,8 +15261,7 @@ fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
 
     if total == 0 {
         // Empty document → write an empty file directly (one message).
-        if !matches!(fs_request(ctx, OP_WRITE_FILE, path, &[])
-            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK))) {
+        if !sh_write(ctx, path, &[]) {
             return false;
         }
     } else {
@@ -14994,10 +15276,8 @@ fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
             off += got;
         }
         // Atomic-ish replace: delete the target (ignore "not found" on a first save), move temp in.
-        let _ = fs_request(ctx, OP_DELETE, path, &[]);
-        let moved = matches!(fs_request(ctx, OP_MOVE, EDIT_TMP, path)
-            .as_ref().map(|r| r.payload_bytes().first().copied()), Some(Some(FS_OK)));
-        if !moved { return false; }
+        let _ = sh_delete(ctx, path);
+        if !sh_move(ctx, EDIT_TMP, path) { return false; }
     }
 
     // Reset the budget: the saved file is now the original; one Orig span over it, add buffer empty.
@@ -15076,22 +15356,21 @@ fn cmd_edit(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
 
     // Stat first (existence / kind / size). A directory is refused; a missing file opens empty
     // (created on first save); a file of ANY size opens - it's read in windows, never up front.
-    let mut orig_size = 0usize;
-    if let Some(stat) = fs_request(ctx, OP_STAT_FILE, path, &[]) {
-        let sp = stat.payload_bytes();
-        if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
-        let exists = sp.first() == Some(&FS_OK) && sp.len() >= 11 && sp[1] == 1;
-        if exists {
-            if sp[10] == 1 {
-                ctx.console_writeln_fmt(format_args!("edit: {} is a directory", str_of(path)));
-                return Err(ShellError::Unknown);
-            }
-            orig_size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]) as usize;
+    let orig_size = match fs_stat_r(ctx, path) {
+        Ok(st) if st.is_dir => {
+            ctx.console_writeln_fmt(format_args!("edit: {} is a directory", str_of(path)));
+            return Err(ShellError::Unknown);
         }
-    } else {
-        ctx.console_writeln("edit: storage unavailable");
-        return Err(ShellError::Unknown);
-    }
+        Ok(st) => st.size as usize,
+        // A missing file is not an error here - `edit` opens it empty and creates it on first save.
+        Err(gs::Error::NotFound) => 0,
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(_) => { ctx.console_writeln("edit: storage unavailable"); return Err(ShellError::Unknown); }
+    };
 
     let (rd, cd) = ctx.console_dims();
     let rows = if rd == 0 { 24 } else { rd as usize };
@@ -15134,20 +15413,19 @@ fn cmd_read(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
     // via read_at - so a file far larger than one IPC message reads back correctly without a
     // big buffer here.
-    let stat = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
+    let size = match fs_stat_r(ctx, path) {
+        Ok(st) if !st.is_dir => st.size,
+        Ok(_) | Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(_) => { ctx.console_writeln("read: storage unavailable"); return Err(ShellError::Unknown); }
     };
-    let sp = stat.payload_bytes();
-    if no_fs(ctx, sp) { return Err(ShellError::Unknown); }
-    let exists = sp.first() == Some(&FS_OK) && sp.len() >= 11 && sp[1] == 1;
-    let is_dir = exists && sp[10] == 1;
-    if !exists || is_dir {
-        ctx.console_writeln_fmt(format_args!("read: not found: {}", str_of(path)));
-        return Err(ShellError::FileNotFound);
-    }
-    let size = u64::from_le_bytes([sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]]);
     let mut chunk = [0u8; IO_CHUNK];
     let mut off = 0u64;
     let mut last = b'\n';
@@ -15199,22 +15477,40 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
             "write: {} failed (storage, or bad path?)", if prepend { "prepend" } else { "append" }));
         return Err(ShellError::Unknown);
     }
-    let reply = match fs_request(ctx, OP_WRITE_FILE, p, content.as_bytes()) {
-        Some(r) => r,
-        None => { fs_no_answer(ctx, "write"); return Err(ShellError::Unknown); }
-    };
-    let rp = reply.payload_bytes();
-    if no_fs(ctx, rp) { return Err(ShellError::Unknown); }
-    if rp.first() == Some(&FS_OK) {
-        ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
-        Ok(())
-    } else {
-        match fs_err_reason(&reply) {
-            Some(why) => ctx.console_writeln_fmt(format_args!("write: failed - {}", why)),
-            None      => ctx.console_writeln("write: failed (bad path, or parent missing?)"),
+    // Through `gs::fs`. The handle stays alive across the match because `reason()` - the service's
+    // own sentence about what went wrong - belongs to it.
+    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = gfs.write(p, content.as_bytes());
+    let out = match r {
+        Ok(()) => {
+            ctx.console_writeln_fmt(format_args!("wrote {} ({} bytes)", str_of(p), content.len()));
+            Ok(())
         }
-        Err(ShellError::Unknown)
-    }
+        // THE DEADLINE PASSED, WHICH IS NOT A FAILURE. `fs` may still be writing this, so the
+        // operator must not be told it failed and must not simply run it again.
+        Err(gs::Error::OutcomeUnknown) => { fs_no_answer(ctx, "write"); Err(ShellError::Unknown) }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        // Present-but-unreadable storage: the data may be intact, so flashing would DESTROY it.
+        // Deliberately does NOT advise 'drives flash'.
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            let why = gfs.reason();
+            if why.is_empty() {
+                ctx.console_writeln("write: failed (bad path, or parent missing?)");
+            } else {
+                ctx.console_writeln_fmt(format_args!("write: failed - {}", why));
+            }
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(gfs.tag());
+    out
 }
 
 // fmt's write / compare chunk buffer. MUST be a multiple of the fs payload block (DATA_PAYLOAD = 508):
@@ -15232,7 +15528,7 @@ fn fmt_to_temp(ctx: &ShellCtx, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
         let mut count = |bytes: &[u8]| -> bool { total += bytes.len() as u64; true };
         fmt_stream_pass(ctx, src, &mut count)?; // no temp exists yet - safe to `?`
     }
-    let _ = fs_request(ctx, OP_DELETE, tmp, &[]); // clear any stale temp
+    let _ = sh_delete(ctx, tmp); // clear any stale temp
     if !fs_write_new(ctx, tmp, total) { return Err(FmtErr::Write); }
     let mut wlen = 0usize;
     let mut woff = 0u64;
@@ -15256,8 +15552,8 @@ fn fmt_to_temp(ctx: &ShellCtx, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
         if !werr && wlen > 0 && !fs_write_at(ctx, tmp, woff, &wbuf[..wlen]) { werr = true; } // final flush
         rr
     };
-    if let Err(e) = r { let _ = fs_request(ctx, OP_DELETE, tmp, &[]); return Err(e); }
-    if werr { let _ = fs_request(ctx, OP_DELETE, tmp, &[]); return Err(FmtErr::Write); }
+    if let Err(e) = r { let _ = sh_delete(ctx, tmp); return Err(e); }
+    if werr { let _ = sh_delete(ctx, tmp); return Err(FmtErr::Write); }
     Ok(total)
 }
 
@@ -15330,7 +15626,7 @@ fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), 
         // Compare the freshly-formatted temp against the original (two DIFFERENT files, read
         // sequentially), then discard the temp. `check` never modifies the file.
         let canonical = fmt_compare_files(ctx, tmp, p);
-        let _ = fs_request(ctx, OP_DELETE, tmp, &[]);
+        let _ = sh_delete(ctx, tmp);
         if canonical { return Ok(()); } // silent Ok
         ctx.console_writeln_fmt(format_args!("fmt: {} is not canonical (run: fmt {})", str_of(p), str_of(p)));
         return Err(ShellError::Unknown);
@@ -15340,8 +15636,8 @@ fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), 
     let mut bstart = 0usize;
     for (i, &c) in p.iter().enumerate() { if c == b'/' { bstart = i + 1; } }
     let base = &p[bstart..];
-    let _ = fs_request(ctx, OP_DELETE, p, &[]);
-    if matches!(fs_request(ctx, OP_RENAME, tmp, base), Some(r) if r.payload_bytes().first() == Some(&FS_OK)) {
+    let _ = sh_delete(ctx, p);
+    if sh_rename(ctx, tmp, base) {
         ctx.console_writeln_fmt(format_args!("fmt {} ({} bytes)", str_of(p), total));
         Ok(())
     } else {
@@ -15369,23 +15665,47 @@ fn cmd_mkdir(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), 
 fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
-    let reply = match fs_request(ctx, op, path, &[]) {
-        Some(r) => r,
-        None => { fs_no_answer(ctx, "mkdir"); return Err(ShellError::Unknown); }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = if parents { g.create_dir_all(path) } else { g.create_dir(path) };
+    let why = g.reason();
+    let answer = match r {
+        Ok(()) => {
+            ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
+            Ok(())
+        }
+        // A DIRECTORY IS A MUTATION TOO. If the reply was lost the entry may exist, and telling the
+        // operator it failed sends them to create it again - which then fails for real, as already
+        // present, and looks like the first failure was a lie.
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln_fmt(format_args!(
+                "mkdir: OUTCOME UNKNOWN - {} MAY HAVE BEEN created. Check with `dir`", str_of(path)));
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => { fs_no_answer(ctx, "mkdir"); Err(ShellError::Unknown) }
+        Err(_) if !why.is_empty() && parents => {
+            ctx.console_writeln_fmt(format_args!("mkdir: failed - {}", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if !why.is_empty() => {
+            ctx.console_writeln_fmt(format_args!(
+                "mkdir: failed - {} (a missing parent needs 'mkdir <path> parents')", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if parents => {
+            ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
+            Err(ShellError::Unknown)
+        }
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) {
-        ctx.console_writeln_fmt(format_args!("created {}", str_of(path)));
-        Ok(())
-    } else if parents {
-        ctx.console_writeln("mkdir: failed (a component is in the way as a file?)");
-        Err(ShellError::Unknown)
-    } else {
-        ctx.console_writeln("mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents')");
-        Err(ShellError::Unknown)
-    }
+    ctx.fs_tag.set(g.tag());
+    answer
 }
 
 /// `cd [path]` - change the current directory (validates it exists + is a directory).
@@ -15406,26 +15726,31 @@ fn cmd_cd(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
         ctx.console_writeln("/");
         return Ok(());
     }
-    let reply = match fs_request_q(ctx, OP_STAT_FILE, path, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("cd: storage unavailable"); return Err(ShellError::Unknown); }
-    };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    // STAT reply: [FS_OK, exists, size:u64, is_dir].
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
-        if p[10] == 1 {
+    match fs_stat_r(ctx, path) {
+        Ok(st) if st.is_dir => {
             cwd.set(path);
             ctx.console_writeln(cwd.as_str());
             Ok(())
-        } else {
+        }
+        Ok(_) => {
             ctx.console_writeln_fmt(format_args!("cd: not a directory: {}", str_of(path)));
             Err(ShellError::Unknown)
         }
-    } else {
-        ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
-        Err(ShellError::FileNotFound)
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("cd: no such directory: {}", str_of(path)));
+            Err(ShellError::FileNotFound)
+        }
+        // The operator's own `q`. Nothing failed, so nothing is reported - and the working
+        // directory is left where it was.
+        Err(gs::Error::Cancelled) => Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            ctx.console_writeln("cd: storage unavailable");
+            Err(ShellError::Unknown)
+        }
     }
 }
 
@@ -15439,22 +15764,27 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
     let sl = spath.len();
     sp[..sl].copy_from_slice(spath);
     // Check the source exists and is a file (also surfaces the "no filesystem" hint).
-    let stat = match fs_request(ctx, OP_STAT_FILE, &sp[..sl], &[]) {
-        Some(r) => r,
-        None => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
+    let stat_src = match fs_stat_r(ctx, &sp[..sl]) {
+        Ok(st) => Some(st),
+        Err(gs::Error::NotFound) => None,
+        Err(gs::Error::Cancelled) => return Ok(()),
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            return Err(ShellError::Unknown);
+        }
+        Err(_) => { fs_no_answer(ctx, "copy"); return Err(ShellError::Unknown); }
     };
-    let stp = stat.payload_bytes();
-    if no_fs(ctx, stp) { return Err(ShellError::Unknown); }
-    let exists = stp.first() == Some(&FS_OK) && stp.len() >= 11 && stp[1] == 1;
-    if !exists {
-        ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
-        return Err(ShellError::FileNotFound);
-    }
-    if stp[10] == 1 {
+    let st = match stat_src {
+        Some(st) => st,
+        None => {
+            ctx.console_writeln_fmt(format_args!("copy: source not found: {}", str_of(&sp[..sl])));
+            return Err(ShellError::FileNotFound);
+        }
+    };
+    if st.is_dir {
         ctx.console_writeln("copy: source is a directory (use 'copy <src> <dst> recursive')");
         return Err(ShellError::Unknown);
     }
-    drop(stat);
 
     let mut dbuf = [0u8; PATH_MAX];
     let dpath = match resolve_or_err(ctx, cwd, dst, &mut dbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
@@ -15572,14 +15902,18 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
 
 /// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
 fn stat_kind(ctx: &ShellCtx, path: &[u8]) -> Option<bool> {
-    let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
-    let p = reply.payload_bytes();
-    if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 { Some(p[10] != 0) } else { None }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.stat(path);
+    ctx.fs_tag.set(g.tag());
+    r.ok().map(|st| st.is_dir)
 }
 
 /// `mkdir <path>` via fs, treating success as true. Used by recursive copy to recreate dirs.
 fn mkdir_at(ctx: &ShellCtx, path: &[u8]) -> bool {
-    matches!(fs_request(ctx, OP_MKDIR, path, &[]), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let ok = g.create_dir(path).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
 }
 
 /// Stream-copy a file `src`→`dst` of any size: stat the size, allocate `dst`, then chunk
@@ -16266,15 +16600,42 @@ fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<()
     let pl = abspath.len();
     pp[..pl].copy_from_slice(abspath);
     // fs_request appends `newname` after the path - exactly the OP_RENAME wire format.
-    match fs_request(ctx, OP_RENAME, &pp[..pl], newname.as_bytes()) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.rename(&pp[..pl], newname.as_bytes());
+    let out = match r {
+        Ok(()) => {
             ctx.console_writeln_fmt(format_args!("renamed {} → {}", str_of(&pp[..pl]), newname));
             Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) => { ctx.console_writeln("rename: failed (not found, or name exists, or bad name)"); Err(ShellError::Unknown) }
-        None    => { fs_no_answer(ctx, "rename"); Err(ShellError::Unknown) }
-    }
+        // A RENAME IS DESTRUCTIVE AND WAS NOT RE-SENT. It may have happened; saying it failed would
+        // be a confident wrong answer about a mutation (carnage §3.5).
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln("rename: OUTCOME UNKNOWN - the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - check with `dir`");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            // NAME THE REASON. This said "failed (not found, or name exists, or bad name)" - three
+            // unrelated faults offered as a guess, while `fs` knew which and said so in a reply
+            // nobody read. The same shape `seal` carries a comment about.
+            let why = g.reason();
+            if why.is_empty() {
+                ctx.console_writeln("rename: failed - see fs's log");
+            } else {
+                ctx.console_writeln_fmt(format_args!("rename: failed - {}", why));
+            }
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(g.tag());
+    out
 }
 
 /// `delete <path>` - remove a file or empty directory; `delete <path> recursive` removes a
@@ -16306,18 +16667,57 @@ fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(
     let mut pp = [0u8; PATH_MAX];
     let pl = path.len();
     pp[..pl].copy_from_slice(path);
-    let op = if recursive { OP_DELETE_TREE } else { OP_DELETE };
-    match fs_request(ctx, op, &pp[..pl], &[]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+    // `delete_all` carries the SWEEP budget, because a tree delete walks the tree and the ordinary
+    // request deadline is shorter than that walk.
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = if recursive { g.delete_all(&pp[..pl]) } else { g.delete(&pp[..pl]) };
+    let why = g.reason();
+    let answer = match r {
+        Ok(()) => {
             let what = if recursive { "deleted (recursive)" } else { "deleted" };
             ctx.console_writeln_fmt(format_args!("{} {}", what, str_of(&pp[..pl])));
             Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(_) if recursive => { ctx.console_writeln("delete: failed (not found, or tree too deep?)"); Err(ShellError::Unknown) }
-        Some(_) => { ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')"); Err(ShellError::Unknown) }
-        None    => { fs_no_answer(ctx, "delete"); Err(ShellError::Unknown) }
-    }
+        // THE WORST CASE IN THE SHELL for a lost reply. A tree delete frees in batches, so the tree
+        // may be wholly gone, partly gone, or untouched, and "delete: failed" asserts the last of
+        // the three. Name the command that settles it instead.
+        Err(gs::Error::OutcomeUnknown) if recursive => {
+            ctx.console_writeln_fmt(format_args!(
+                "delete: OUTCOME UNKNOWN - {} may be PARTLY removed. Check with `dir`", str_of(&pp[..pl])));
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln_fmt(format_args!(
+                "delete: OUTCOME UNKNOWN - {} MAY HAVE BEEN removed. Check with `dir`", str_of(&pp[..pl])));
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => { fs_no_answer(ctx, "delete"); Err(ShellError::Unknown) }
+        // The service's sentence REPLACES the guess but not the ADVICE: "directory not empty" is the
+        // fact, and "use `delete <path> recursive`" is the thing to do about it.
+        Err(_) if !why.is_empty() && recursive => {
+            ctx.console_writeln_fmt(format_args!("delete: failed - {}", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if !why.is_empty() => {
+            ctx.console_writeln_fmt(format_args!(
+                "delete: failed - {} (a non-empty directory needs 'delete <path> recursive')", why));
+            Err(ShellError::Unknown)
+        }
+        Err(_) if recursive => {
+            ctx.console_writeln("delete: failed (not found, or tree too deep?)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            ctx.console_writeln("delete: failed (not found, or directory not empty? use 'delete <path> recursive')");
+            Err(ShellError::Unknown)
+        }
+    };
+    ctx.fs_tag.set(g.tag());
+    answer
 }
 
 /// `move <src> <dst>` - relocate an entry (same data; only the directory entries change).
@@ -16337,23 +16737,40 @@ fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
         ctx.console_writeln("move: cannot move into itself");
         return Err(ShellError::Unknown);
     }
-    match fs_request(ctx, OP_MOVE, &sp[..sl], &dp[..dl]) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.move_to(&sp[..sl], &dp[..dl]);
+    let out = match r {
+        Ok(()) => {
             ctx.console_writeln_fmt(format_args!("moved {} → {}", str_of(&sp[..sl]), str_of(&dp[..dl])));
             Ok(())
         }
-        Some(r) if no_fs(ctx, r.payload_bytes()) => Err(ShellError::Unknown),
-        Some(ref m) => {
-            match fs_err_reason(m) {
-                Some(why) if ctx.fs_unknown.get() =>
-                    ctx.console_writeln_fmt(format_args!("move: OUTCOME UNKNOWN - {}", why)),
-                Some(why) => ctx.console_writeln_fmt(format_args!("move: failed - {}", why)),
-                None      => ctx.console_writeln("move: failed (not found, or dest exists?)"),
+        // The distinction this command used to read off `ctx.fs_unknown` arrives IN THE ANSWER now.
+        // The flag existed because the old helper returned `None` for both a dead service and a lost
+        // reply to a mutation, and had nowhere else to put the difference.
+        Err(gs::Error::OutcomeUnknown) => {
+            ctx.console_writeln("move: OUTCOME UNKNOWN - the reply was lost; it MAY HAVE SUCCEEDED. Not re-sent - check with `dir`");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(ShellError::Unknown)
+        }
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(ShellError::Unknown)
+        }
+        Err(_) => {
+            let why = g.reason();
+            if why.is_empty() {
+                ctx.console_writeln("move: failed (not found, or dest exists?)");
+            } else {
+                ctx.console_writeln_fmt(format_args!("move: failed - {}", why));
             }
             Err(ShellError::Unknown)
         }
-        None    => { fs_no_answer(ctx, "move"); Err(ShellError::Unknown) }
-    }
+    };
+    ctx.fs_tag.set(g.tag());
+    out
 }
 
 /// `find <pattern> [path]` - search a subtree (default the whole filesystem, `/`) for entries
@@ -16377,44 +16794,33 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     let mut matches = 0u32;
     let mut short = false;
     let mut dir = [0u8; PATH_MAX];
+    let mut cancelled = false;
     while let Some(dlen) = stack.pop(&mut dir) {
-        let mut cur = DirCursor::new();
-        'pages: while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &dir[..dlen], &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return Ok(()),
-            ReqOutcome::Timeout => { ctx.console_writeln("find: storage unavailable"); return Err(ShellError::Unknown); }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        // `break 'pages`, NOT `continue` - see the records `find`. This is the page loop now.
-        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
-        let count = cur.take(p);
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() { break; }
-            let nl = p[i] as usize;
-            i += 1;
-            if i + nl + 1 + 8 + 4 + 1 > p.len() { break; }
-            let name = &p[i..i + nl];
-            let is_dir = p[i + nl] != 0;
-            i += nl + 1 + 8 + 4 + 1; // name_len + name + is_dir + size:u64 + mtime:u32
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let walked = g.list_dir(&dir[..dlen], |e| {
             let mut child = [0u8; PATH_MAX];
-            if let Some(clen) = join_path(&dir[..dlen], name, &mut child) {
-                let hit = if is_glob { glob_match(target, name) } else { contains(name, target) };
+            if let Some(clen) = join_path(&dir[..dlen], e.name, &mut child) {
+                let hit = if is_glob { glob_match(target, e.name) } else { contains(e.name, target) };
                 if hit {
                     // The matched paths are the pipe data; the summary below is metadata.
                     out.line(ctx, str_of(&child[..clen]));
                     matches += 1;
                 }
-                if is_dir {
+                if e.is_dir {
                     stack.push(&child[..clen]);
                 }
             }
+            true
+        });
+        ctx.fs_tag.set(g.tag());
+        match walked {
+            Ok(l) => { if !l.complete { short = true; } }
+            Err(gs::Error::Cancelled) => { cancelled = true; break; }
+            // An unreadable directory ends THIS directory, not the search.
+            Err(_) => { short = true; }
         }
-        }
-        if cur.cut() { short = true; }
     }
+    if cancelled { return Ok(()); }
     if stack.overflow {
         ctx.console_writeln_fmt(format_args!(
             "find: search truncated - more than {} directories pending (bounded walk)", FIND_QCAP));
@@ -16481,36 +16887,25 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         if !is_dir { files += 1; continue; }
         if d > 0 { dirs += 1; }
 
-        let mut cur = DirCursor::new();
-        'pages: while let Some(from) = cur.next() {
-        let reply = match fs_request_q(ctx, OP_LIST_DIR, &buf[..plen], &from) {
-            ReqOutcome::Reply(r) => r,
-            ReqOutcome::Aborted => return Ok(()),
-            ReqOutcome::Timeout => { ctx.console_writeln("tree: storage unavailable"); return Err(ShellError::Unknown); }
-        };
-        let p = reply.payload_bytes();
-        if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-        // `break 'pages`, NOT `continue` - see `find`. This is the page loop now.
-        if p.first() != Some(&FS_OK) || p.len() < 2 { break 'pages; }
-        // Record each child's offset, then push in REVERSE so they pop in directory order. Both
-        // halves stay INSIDE the page loop: the offsets point into THIS reply and do not outlive it.
-        let count = cur.take(p);
-        let mut offs = [0usize; TREE_FANOUT];
+        // PUSH FORWARD, THEN REVERSE THE RANGE. The stack is LIFO, so children have to go on
+        // backwards to pop in directory order - and doing that one PAGE at a time (which is what the
+        // page loop here used to do) listed a large directory's second page before its first.
+        // Reversing once, after the whole directory, is both correct across pages and free of a
+        // second buffer: the entries are already on the stack.
+        let base = stack.top;
         let mut nc = 0usize;
-        let mut i = DIR_HDR;
-        for _ in 0..count {
-            if i >= p.len() || nc >= TREE_FANOUT { break; }
-            let nl = p[i] as usize;
-            if i + 1 + nl + 1 + 8 > p.len() { break; }
-            offs[nc] = i;
+        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let walked = g.list_dir(&buf[..plen], |e| {
+            // THE FAN-OUT CAP IS REPORTED NOW. It used to stop at 64 children of a page and say
+            // nothing, so a wide directory was drawn short and read as complete - the same class of
+            // wrong answer the depth bound below has a report for.
+            if nc >= TREE_FANOUT {
+                deep = true;
+                return false;
+            }
             nc += 1;
-            i += 1 + nl + 1 + 8 + 4 + 1;
-        }
-        for k in (0..nc).rev() {
-            let off = offs[k];
-            let nl = p[off] as usize;
-            let cname = &p[off + 1..off + 1 + nl];
-            let cdir = p[off + 1 + nl] != 0;
+            let cname = e.name;
+            let cdir = e.is_dir;
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&buf[..plen], cname, &mut child) {
                 // STOPPING SILENTLY AT THE DEPTH BOUND IS A WRONG ANSWER SERVED AS A RIGHT ONE.
@@ -16522,10 +16917,11 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
                 // indistinguishable from having reached the end (§26.7).
                 if depth as usize + 1 >= TREE_MAX_DEPTH {
                     deep = true;
-                    continue;
+                    return true;
                 }
-                // The last child read (forward order) is its parent's last → draws `└──`.
-                stack.push(&child[..clen], cdir, depth + 1, k == nc - 1);
+                // `is_last` is stamped on the final child AFTER the walk - which one that is cannot
+                // be known while it is still running.
+                stack.push(&child[..clen], cdir, depth + 1, false);
             } else {
                 // THE PATH GOT TOO LONG, AND THIS IS THE BOUND THAT ACTUALLY FIRES FIRST.
                 //
@@ -16539,11 +16935,17 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
                 // and the depth guard above never fired because this limit was reached first.
                 deep = true;
             }
-        }
-        }
+            true
+        });
+        ctx.fs_tag.set(g.tag());
         // A directory too large to read fully is the same class of answer as the depth bound: the
         // tree drawn is not the tree on disk, and saying nothing makes it read as though it were.
-        if cur.cut() { deep = true; }
+        match walked {
+            Ok(l) => { if !l.complete && nc < TREE_FANOUT { deep = true; } }
+            Err(gs::Error::Cancelled) => return Ok(()),
+            Err(_) => deep = true,
+        }
+        stack.mark_last_and_reverse(base);
     }
     if deep {
         ctx.console_writeln_fmt(format_args!(
@@ -16583,6 +16985,29 @@ struct TreeStack {
     overflow: bool,
 }
 impl TreeStack {
+    /// Finish a directory's children: mark the last one pushed as its parent's last child (so it
+    /// draws `└──`), then reverse the range so a LIFO pop yields them in directory order.
+    ///
+    /// Swapping in place rather than buffering the names elsewhere: they are already here, and a
+    /// second copy of a directory's worth of paths is the kind of working set 26.6.1 asks you to
+    /// change the representation to avoid rather than to find room for.
+    fn mark_last_and_reverse(&mut self, base: usize) {
+        if self.top <= base {
+            return;
+        }
+        self.is_last[self.top - 1] = true;
+        let (mut i, mut j) = (base, self.top - 1);
+        while i < j {
+            self.buf.swap(i, j);
+            self.len.swap(i, j);
+            self.is_dir.swap(i, j);
+            self.depth.swap(i, j);
+            self.is_last.swap(i, j);
+            i += 1;
+            j -= 1;
+        }
+    }
+
     fn new() -> Self {
         TreeStack {
             buf: [[0u8; PATH_MAX]; TREE_CAP], len: [0; TREE_CAP],
@@ -16670,6 +17095,51 @@ fn str_of(b: &[u8]) -> &str {
 // by default, `*`/`?` glob like `find` (shared `contains`/`glob_match`); `except` inverts.
 // See utilities/27_match.md.
 
+/// The most a filter built-in reads from a file in one pass.
+///
+/// Deliberately larger than the 3556 bytes one `OP_READ_FILE` message could carry. That ceiling was
+/// invisible and reported a too-large file as NOT FOUND.
+const FILTER_READ_MAX: usize = 8192;
+
+/// Read a whole file for a filter built-in, reporting the outcome in this shell's words.
+///
+/// `Err(())` means the operator has already been told; the caller just returns. The distinction that
+/// matters is the one the old path could not make: a file that is ABSENT versus one that is merely
+/// bigger than the buffer. Both used to print "not found".
+fn filter_read(ctx: &ShellCtx, verb: &str, path: &[u8], buf: &mut [u8]) -> Result<usize, ()> {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let r = g.read_into(path, buf);
+    ctx.fs_tag.set(g.tag());
+    match r {
+        Ok(n) => Ok(n),
+        Err(gs::Error::NotFound) => {
+            ctx.console_writeln_fmt(format_args!("{}: not found: {}", verb, str_of(path)));
+            Err(())
+        }
+        // THE ANSWER THAT USED TO BE A LIE: the file is there, it does not fit.
+        Err(gs::Error::BufferTooSmall) => {
+            ctx.console_writeln_fmt(format_args!(
+                "{}: {} is larger than {} bytes - too big to filter in one pass",
+                verb, str_of(path), FILTER_READ_MAX));
+            Err(())
+        }
+        Err(gs::Error::NoFilesystem) => {
+            ctx.console_writeln("no filesystem - run 'drives flash' first");
+            Err(())
+        }
+        Err(gs::Error::Unavailable) => {
+            ctx.console_writeln("storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)");
+            Err(())
+        }
+        // The operator's own `q`: not a fault, and nothing to report.
+        Err(gs::Error::Cancelled) => Err(()),
+        Err(_) => {
+            ctx.console_writeln_fmt(format_args!("{}: storage unavailable", verb));
+            Err(())
+        }
+    }
+}
+
 /// Filter `input`'s lines by `pattern`, writing each matching line (with its newline) to `out`.
 /// Substring by default; a pattern with `*`/`?` is an anchored glob (same as `find`). `invert`
 /// keeps the lines that do NOT match (the `except` form). Blank lines are skipped.
@@ -16714,22 +17184,15 @@ fn cmd_match(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<()
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("match: storage unavailable"); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, "match", abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        match_lines(ctx, &p[5..end], pattern.as_bytes(), invert, &mut Out::Console);
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("match: not found: {}", str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    match_lines(ctx, &fbuf[..n_read], pattern.as_bytes(), invert, &mut Out::Console);
+    Ok(())
 }
 
 /// Run a filter built-in (`match`, `count`) over `input`, writing its output to `out`. Used
@@ -16803,22 +17266,15 @@ fn cmd_count(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<()
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("count: storage unavailable"); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, "count", abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        write_count(ctx, &p[5..end], &mut Out::Console);
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("count: not found: {}", str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    write_count(ctx, &fbuf[..n_read], &mut Out::Console);
+    Ok(())
 }
 
 // ── sort - order the lines (ascending, or `reverse`) ─────────────────────────────
@@ -16883,22 +17339,15 @@ fn cmd_sort(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(),
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln("sort: storage unavailable"); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, "sort", abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + n).min(p.len());
-        write_sorted(ctx, &p[5..end], reverse, &mut Out::Console);
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("sort: not found: {}", str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    write_sorted(ctx, &fbuf[..n_read], reverse, &mut Out::Console);
+    Ok(())
 }
 
 // ── first / last - keep the first or last N lines (the head/tail-equivalent) ──────
@@ -16970,23 +17419,16 @@ fn cmd_take(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -
     }
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let reply = match fs_request_q(ctx, OP_READ_FILE, abspath, &[]) {
-        ReqOutcome::Reply(r) => r,
-        ReqOutcome::Aborted => return Ok(()),
-        ReqOutcome::Timeout => { ctx.console_writeln_fmt(format_args!("{}: storage unavailable", name)); return Err(ShellError::Unknown); }
+    // Through `gs::fs`, which streams: the one-message size ceiling that made a large file look
+    // ABSENT is gone, and a file too big for the buffer now says so.
+    let mut fbuf = [0u8; FILTER_READ_MAX];
+    let n_read = match filter_read(ctx, name, abspath, &mut fbuf) {
+        Ok(n) => n,
+        Err(()) => return Err(ShellError::FileNotFound),
     };
-    let p = reply.payload_bytes();
-    if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_OK) && p.len() >= 5 {
-        let cnt = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-        let end = (5 + cnt).min(p.len());
-        if last { write_last(ctx, &p[5..end], n, &mut Out::Console); }
-        else    { write_first(ctx, &p[5..end], n, &mut Out::Console); }
-        Ok(())
-    } else {
-        ctx.console_writeln_fmt(format_args!("{}: not found: {}", name, str_of(abspath)));
-        Err(ShellError::FileNotFound)
-    }
+    if last { write_last(ctx, &fbuf[..n_read], n, &mut Out::Console); }
+    else    { write_first(ctx, &fbuf[..n_read], n, &mut Out::Console); }
+    Ok(())
 }
 
 /// Bounded stack of directory paths still to visit during a `find` walk (§26.6). Pushing

@@ -86,6 +86,11 @@ const DANCE_TRIES: u32 = 6;
 // Wyse with a slow lookup was 24 seconds - three times longer than the client waiting for the answer.
 const DNS_RX_TRIES: u32 = 12;
 
+/// The same backstop for `udp_roundtrip`'s RX poll, and the same number for the same reason.
+/// Named apart from the DNS one because it bounds a different loop: a rename of either must
+/// not silently re-tune the other.
+const UDP_RX_TRIES: u32 = 12;
+
 /// The shortest deadline any CLIENT gives a single net-stack request.
 ///
 /// The shell's `net resolve` is the one: `ns_query(ctx, &req, 8)`. It is restated here because this
@@ -506,14 +511,16 @@ impl Displaced {
             self.live -= 1;
         }
         let slot = (self.head + self.live) % STASH_N;
-        // THE CLIENT SAID HOW LONG IT WILL WAIT (byte 1 of a tagged request). Hold it for that,
-        // rather than for one global guess - see `HOLD_MS`. A badged invocation carries no header, so
-        // it gets the default. Holding longer than the client will wait is pure waste; holding for
-        // less is the bug this fixes.
-        let hold_ms = match badge {
-            None => pl.get(1).map(|p| (*p as u64).saturating_mul(1_000)).unwrap_or(HOLD_MS),
-            Some(_) => HOLD_MS,
-        };
+        // THE CLIENT SAID HOW LONG IT WILL WAIT (byte 1). Hold it for that, rather than for one
+        // global guess - see `HOLD_MS`. Holding longer than the client will wait is pure waste;
+        // holding for less is the bug this fixes.
+        //
+        // BADGED AND NAMED ALIKE. This read the byte for a named request and handed a badged one the
+        // constant, which is the defect `HOLD_MS` describes, left standing on the other path: an
+        // `accept` whose client waits twenty seconds was dropped after 1500 ms. Both carry the byte
+        // now, so there is one rule rather than a rule and an exception.
+        let hold_ms = pl.get(1).map(|p| (*p as u64).saturating_mul(1_000)).unwrap_or(HOLD_MS);
+        let _ = badge;
         let mut h = Held {
             len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), hold_ms,
             body: [0u8; HELD_BYTES],
@@ -1254,26 +1261,61 @@ fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6]
     frame[38] = (ulen >> 8) as u8; frame[39] = ulen as u8;
     frame[42..42 + dlen].copy_from_slice(&data[..dlen]);
     let req = Message::from_bytes(&frame[..42 + dlen]);
-    // Bounded + retry past stray frames (Stage B: never block on a busy/silent driver). Match the reply
-    // to OUR datagram: a UDP packet FROM dest_ip back TO our src_port.
-    for _ in 0..DANCE_TRIES {
-        let reply = match sifted_req(ctx, pending, &req, DANCE_SECS) {
-            DeadlineOutcome::Reply(r) => Some(r),
-            _ => None,
+
+    // SEND ONCE, THEN RX-POLL. This used to re-transmit the datagram on every pass and read whatever
+    // came back from the SEND, which is the shape the DNS path above was fixed out of and for the same
+    // reason: `nic-driver` no longer couples a receive to a transmit, so the answer has to be ASKED
+    // for with an RX-only poll ([4]) - and a re-TX drains the frame that had already arrived and
+    // throws it away. On a live LAN the real reply sits behind stray broadcast traffic, so every retry
+    // destroyed it and the caller was told nobody answered.
+    //
+    // Found on the T630 by `sock`, the only caller: "nothing came back" from 192.168.4.1 while
+    // `net dns` resolved through that same server in the same run. QEMU cannot show it - SLIRP has no
+    // stray traffic to bury the reply and answers faster than the loop can spin - which is why this
+    // survived every green suite.
+    if nic_req(ctx, pending, &req, DANCE_SECS).is_none() {
+        // The SEND failing is a different fault from nobody answering, and worth separating for
+        // whoever reads the log next.
+        ctx.log("net-stack: a socket datagram could not be handed to nic-driver");
+        return None;
+    }
+    let rx_only = Message::from_bytes(&[4u8]);
+    let mut arp_out = [0u8; 42];
+    let mut reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
+    for _ in 0..UDP_RX_TRIES {
+        let (matched, answer_arp) = {
+            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
+            // A UDP packet FROM dest_ip back TO our src_port. f[36..38] is the reply's DESTINATION
+            // port, which is the source port we sent from.
+            let m = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
+                && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
+                && f[36] == (src_port >> 8) as u8 && f[37] == src_port as u8;
+            // ANSWER AN ARP FOR US WHILE WE WAIT. A gateway that has forgotten our MAC asks for it
+            // before it can deliver the reply; staying silent here means the reply is never sent at
+            // all. The DNS path already does this - a peer on a real LAN does it and SLIRP does not.
+            let a = !m && build_arp_reply(f, our_ip, our_mac, &mut arp_out);
+            (m, a)
         };
-        let reply = match reply {
-            Some(r) => r,
-            None => { let _ = ctx.reacquire_by_name("nic-driver"); continue; }
-        };
-        let f = reply.payload_bytes();
-        if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
-            && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
-            && f[36] == (src_port >> 8) as u8 && f[37] == src_port as u8 {
+        if matched {
+            // Computed from this same reply, so it is Some - but bind it rather than unwrap it, the
+            // way the DNS loop does: one refactor of how `matched` is derived and an unwrap here
+            // halts the network stack.
+            let Some(r) = reply.as_ref() else { return None };
+            let f = r.payload_bytes();
             let payload_len = (((f[38] as usize) << 8) | (f[39] as usize)).saturating_sub(8);
             let n = payload_len.min(f.len() - 42).min(out.len());
             out[..n].copy_from_slice(&f[42..42 + n]);
             return Some(n);
         }
+        if answer_arp {
+            let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), DANCE_SECS);
+        }
+        // PACE IT. Op 4 is a bounded poll that answers in microseconds whether or not a frame
+        // arrived, so N of them back to back is N instant questions rather than a wait - the exact
+        // defect measured on the DNS path, where the whole loop finished in 78 ms and reported that
+        // nothing had answered.
+        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     }
     None
 }
@@ -2691,7 +2733,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // was DEAF for the ~45 s its budgets take when nothing answers - `net` said "net-stack
     // unavailable", `time` said "cannot reach net-stack", ping had no stack. The intermediate fix
     // was to skip the boot dance and configure on first demand, which only moved the deafness inside
-    // the loop. Neither is needed: `run_dance_serving` answers throughout, so the boot dance is back
+    // the loop. Neither is needed: `run_dance` answers throughout (its `serve_status` argument is what makes it serve), so the boot dance is back
     // and costs no responsiveness. Clients asking during it get the truthful unconfigured status.
     let d = if link_is_up(&ctx, pending) {
         run_dance(&ctx, pending, Some(&[0u8; 19]))
@@ -2977,10 +3019,34 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // arrived at, and its comment says exactly why: "the tag is handled here and nowhere else,
         // which is why adding it did not touch a single arm".
         //
-        // A BADGED request is untagged: it is a socket capability invoking its owner, the badge
-        // already names the socket, and the client holds no ambiguity to resolve.
+        // A BADGED request IS TAGGED, and the comment that used to sit here had the direction of
+        // the problem backwards. It read: "the badge already names the socket, and the client holds
+        // no ambiguity to resolve."
+        //
+        // The badge names the socket FOR THIS SERVICE. It does nothing for the CLIENT, which waits
+        // on its own single endpoint and cannot tell our reply from any other message landing there
+        // - so the client is the only party with an ambiguity, and it was the one left without the
+        // means to resolve it. The cost was a DRAIN in `services/shell`'s `sock_invoke`, safe only
+        // because the shell serves nobody, plus the cap-reclaim that drain made necessary (SEC-35).
+        //
+        // THE SAME TWO HEADER BYTES AS A NAMED REQUEST: the tag to echo, and how long the client
+        // will wait. An earlier cut of this took only the tag, on the reasoning that "patience is the
+        // stash's business, and a badged request does not go through the stash".
+        //
+        // It does. `pending.note` runs for EVERY message, and it had an explicit arm handing a badged
+        // one the `HOLD_MS` constant - so `accept`, whose client waits twenty seconds, was put aside
+        // for 1500 ms and then dropped, and `serve` never saw a connection that had already arrived.
+        // `HOLD_MS`'s own comment had diagnosed exactly this for the named path and stopped one path
+        // short: "a constant cannot know a client's deadline, so it stopped guessing and the client
+        // now says." Now both say.
         let (pl, reply) = match badge {
-            Some(_) => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            Some(_) => match (pl_raw.first(), pl_raw.len()) {
+                (Some(t), n) if n >= 3 => (&pl_raw[2..], Reply { cap: reply_cap, tag: Some(*t) }),
+                // Too short to carry the header: nothing to strip and nothing to echo, exactly as on
+                // the named path. A holder that sends a bare op still reaches the right arm, and
+                // falls back to `HOLD_MS` because it said nothing about how long it will wait.
+                _ => (pl_raw, Reply { cap: reply_cap, tag: None }),
+            },
             // TWO header bytes: the tag to echo, and how long the client will wait (used by the
             // stash, in `Displaced::note`, and of no interest to any arm below). Stripped together
             // here so that - exactly as with the tag alone - not one op arm knows either exists.

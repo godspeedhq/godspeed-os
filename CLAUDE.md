@@ -404,7 +404,7 @@ os/
   backlog/               # open items - recorded rather than closed (§26.7)
   boot/                  # per-board boot config (pi2/, pi4/)
   contracts/schema/      # the JSON Schema a service contract is validated against
-  examples/              # 14 worked services
+  examples/              # 15 worked services
   milestones/            # what was achieved and when; ALMANAC.md is the chronicle
   bugs/                  # long-form investigations of four specific hardware bugs
   editors/               # syntax files for the gsh shell language
@@ -2580,6 +2580,49 @@ test supervisor_survives_own_restart:           # osdev test identity (also: cha
 | 15. Supervisor survives own restart | §6.2, §6.3, §3.7, §14, §3.11 | Restartability / unkillable = {kernel} |
 
 If any cell becomes obsolete, the corresponding spec section is being changed and the change requires a CLAUDE.md amendment.
+
+---
+
+### 22.7 The Stranger Test - is the PUBLIC interface doing the teaching?
+
+Every test above this line asks whether the kernel is correct. This one asks whether the system can
+be USED, and it is the only test here whose subject is the developer rather than the machine.
+
+**The bar:** give the least capable model available a fresh context, the PUBLIC developer
+documentation only, and one ordinary application requirement. No architectural coaching. If it
+produces a correct Godspeed program under those conditions, the public interface is doing a
+substantial amount of the teaching. If it can only succeed after someone explains MISCIS, the
+interface is not finished, whatever the kernel does.
+
+**Why the weakest model rather than the best.** A sophisticated model can infer the architecture from
+the source and would pass by being clever, which measures the model. A weak one cannot, so what it
+produces measures the DOCUMENTATION AND THE API. The point is not to find out whether Godspeed can be
+understood; it is to find out whether it has to be understood before it can be used.
+
+**Let the repository teach, and do not grade on a curve.** The temptation is to explain the rules and
+then be pleased when they are followed. The rules are already mechanised, so the test is whether the
+gates catch a stranger's mistakes and whether the resulting error says enough to recover from:
+`#![deny(unsafe_code)]` refuses unsafe at the compiler, `arch_boundary_check` refuses an
+ISA-conditional workaround, `commandments.py` refuses ambient authority and an unrecoverable peer,
+and `Error::retry_is_safe` answers the one question a stranger is most likely to get wrong. A gate
+that fires with an unhelpful message is a finding, not a pass.
+
+**It is the inversion of the grokability probe** in `audits/documentation-audit.md`, which asks
+whether a weak model can REGENERATE a document. That one tests whether Godspeed can be understood;
+this one tests whether it can be used without being understood. Both use the same instrument and
+neither substitutes for the other.
+
+**This is not an identity test and does not pretend to be.** It has no pass/fail assertion, cannot
+be run in CI, and failing it does not mean the system stopped being the system §22.1 describes. It
+means v1's stated intent - *"Godspeed is simple to program for because its own architecture has a
+small, coherent and honest developer interface"* - is not yet met. It is recorded here rather than in
+`docs/` alone because that intent is a commitment, and a commitment nobody measures is a preference.
+
+**The correct path must be easier than cheating.** That is the whole design rule this test exists to
+check, and the honest form of the success condition: a stranger should fall into the supported model
+because it is the path of least resistance, not because they were told to.
+
+`docs/stranger-test.md` has the protocol, what to measure, and the difficulty ladder.
 
 ---
 
