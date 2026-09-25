@@ -627,6 +627,33 @@ static CORE_WAKE_HINT: PerCore<AtomicUsize> = PerCore::new();
 /// kill_task_by_slot through yield_current's switch_context.  After switch_context
 /// RSP is on a different stack; IF=1 is restored in the incoming task.  The timer
 /// ISR can only fire after that point, by which time RSP is not on K_a.
+/// How often, in spin iterations, the kill-path wait re-sends its WAKE_RECEIVER IPI.
+///
+/// It used to be sent once before the loop and never again, so a core that missed it was never
+/// poked a second time (`backlog/48`). Re-poking a core that is merely slow costs one IPI.
+/// Test-only: fire the kill-path ABANDON exactly once, so that path is observed rather than assumed.
+///
+/// The abandon path replaced a `panic!` (`backlog/48`). The race that reaches it needs a core wedged
+/// inside a masked window and does not occur under QEMU, so without this the code shipped having
+/// never run. `iommu-fault-test` exists for the same reason and is the precedent.
+///
+/// ONCE rather than always: shrinking the budget outright makes every cross-core kill abandon, which
+/// leaks every slot and proves nothing about whether the machine carries on. One abandon, then normal
+/// behaviour, answers the question that matters.
+#[cfg(feature = "kill-abandon-test")]
+static ABANDON_PROBE_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+const WAKE_RESEND_SPINS: u32 = 4096;
+
+/// How many extra budget windows the kill-path wait will grant a core that is PROVING PROGRESS.
+///
+/// The wait extends only while the other core's interrupt tally is still moving, so this is not a
+/// longer timeout - it is a different question being asked. Bounded so that a core which advances
+/// its tally while never scheduling cannot hold this one forever (26.6): the total wait is at most
+/// `(1 + MAX_WAIT_EXTENSIONS)` windows.
+const MAX_WAIT_EXTENSIONS: u32 = 4;
+
 const PENDING_KSTACK_CAP: usize = 8;
 static CORE_PENDING_KSTACK: PerCoreMut<[u64; PENDING_KSTACK_CAP]> = PerCoreMut::new();
 static CORE_PENDING_KSTACK_LEN: PerCore<AtomicUsize> = PerCore::new();
@@ -2665,7 +2692,14 @@ pub fn kill_task_by_slot(slot: usize) {
                 // A quarter of the liveness deadline, so this fires FIRST and gets to say the useful thing -
                 // which core is holding what - rather than leaving the watchdog to blame the wrong one.
                 let budget = crate::arch::imp::liveness_deadline_cycles() / 4;
-                let t0 = crate::arch::imp::read_cycle_counter();
+                let mut t0 = crate::arch::imp::read_cycle_counter();
+                // The other core's interrupt tally when this window opened. If it MOVES, that core is
+                // taking interrupts - it is alive and slow, not stuck - and the right answer is to wait
+                // longer, not to declare it wedged. `core_irq_debug` is the same seam member the
+                // liveness watchdog reads.
+                let (mut irqs_at_window, _) = crate::arch::imp::core_irq_debug(cid as u32);
+                let mut extensions: u32 = 0;
+                let mut spins: u32 = 0;
                 loop {
                     // Compiler + hardware barrier: reload CORE_CURRENT[cid] from
                     // memory on every iteration; do not use a cached register value.
@@ -2675,13 +2709,70 @@ pub fn kill_task_by_slot(slot: usize) {
                     // miss each other. (The fence is now redundant but harmless.)
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                     if !core_still_using(cid, slot) { break; }
-                    if budget > 0 && crate::arch::imp::read_cycle_counter().wrapping_sub(t0) > budget {
-                        panic!(
-                            "kill: core {} has not released task slot {} after {} counter ticks (CORE_CURRENT={}, CORE_LEAVING={}). It is running or leaving a task this kill must reclaim and is not making progress, so this core cannot safely free the stack and page tables - and will not wait forever pretending it can.",
-                            cid, slot, budget,
+                    // Test-only: take the abandon path once, deliberately, while a core really
+                    // is still using the slot - so the report and the recovery are both exercised.
+                    #[cfg(feature = "kill-abandon-test")]
+                    let forced = !ABANDON_PROBE_FIRED.swap(true, Ordering::SeqCst);
+                    #[cfg(not(feature = "kill-abandon-test"))]
+                    let forced = false;
+
+
+                    // RE-SEND THE WAKE. It used to be sent once, before this loop, and never again: a
+                    // core that missed it - or that was not running to take it - was never poked a
+                    // second time. Re-poking a merely-slow core costs nothing.
+                    spins = spins.wrapping_add(1);
+                    if spins % WAKE_RESEND_SPINS == 0 {
+                        // SAFETY: cid is a valid core index (loop bound); APIC mapped (outer unsafe).
+                        crate::smp::ipi::send_ipi(
+                            cid as u32,
+                            crate::smp::ipi::vectors::WAKE_RECEIVER,
+                        );
+                    }
+
+                    if forced || (budget > 0 && crate::arch::imp::read_cycle_counter().wrapping_sub(t0) > budget) {
+                        let (irqs_now, last_src) = crate::arch::imp::core_irq_debug(cid as u32);
+                        if !forced && irqs_now != irqs_at_window && extensions < MAX_WAIT_EXTENSIONS {
+                            // ALIVE AND SLOW. It has taken interrupts inside this window, so it is
+                            // running - it simply has not reached a scheduling point yet. Open a fresh
+                            // window rather than condemning it. Bounded by MAX_WAIT_EXTENSIONS so this
+                            // cannot become the unbounded spin it replaced (26.6).
+                            irqs_at_window = irqs_now;
+                            t0 = crate::arch::imp::read_cycle_counter();
+                            extensions += 1;
+                            continue;
+                        }
+
+                        // FAIL THE KILL, NOT THE MACHINE.
+                        //
+                        // This used to `panic!`, which took the whole machine down because one core
+                        // would not let go of one slot - reachable from userspace through an ordinary
+                        // supervisor kill, which CLAUDE.md 22 forbids absolutely: nothing above the
+                        // kernel may panic the kernel. Reproduced on a Raspberry Pi 4 at chaos round
+                        // 943 of 1000 with no host load (backlog/48).
+                        //
+                        // So: abandon the reclaim and leave the slot un-freed. The task is already
+                        // Dead and its endpoints are already torn down, so it cannot run and cannot be
+                        // messaged; what is given up is only the MEMORY, and only for this one task.
+                        // The slot stays VALID, which is what makes the leak VISIBLE in `status`
+                        // rather than silent (26.7 - degrade and record), and the supervisor is free
+                        // to try again.
+                        //
+                        // The report says which core, which slot, and - the part the old panic could
+                        // not say - whether that core was taking interrupts at all, so a reader can
+                        // tell a wedged core from a slow one without re-deriving it.
+                        crate::kprintln!(
+                            "kill: ABANDONED slot {} - core {} still using it after {} ticks x{} window(s) (CORE_CURRENT={}, CORE_LEAVING={}, its irqs {}->{} last_src={}). {}. The task is Dead and unreachable; its frames are LEAKED and the slot stays visible in `status`. The machine continues - a kill that cannot finish fails the kill, not the kernel.",
+                            slot, cid, budget, extensions + 1,
                             CORE_CURRENT.get(cid).load(Ordering::SeqCst),
                             CORE_LEAVING.get(cid).0.load(Ordering::SeqCst),
+                            irqs_at_window, irqs_now, last_src,
+                            if irqs_now == irqs_at_window {
+                                "That core took NO interrupts in the last window, so it is wedged rather than slow"
+                            } else {
+                                "That core is still taking interrupts, so it is alive but never reached a scheduling point"
+                            },
                         );
+                        return;
                     }
                     core::hint::spin_loop();
                 }
