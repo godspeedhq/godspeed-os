@@ -27,7 +27,7 @@
 //! it dies or is replaced. The next use of a stale capability fails with
 //! [`Error::EndpointDead`](crate::Error) or `CapRevoked` rather than reaching the new instance. That
 //! is not a fault to route around: it is the system telling you the thing you held is gone, and
-//! [`reacquire_by_name`] is how you answer it.
+//! [`reacquire`] is how you answer it.
 //!
 //! **Transfer MOVES.** Sending a capability with [`send_granting`](crate::ipc) removes it from your
 //! table. If the send fails it stayed, and it is yours to reclaim; if it succeeded it is not yours
