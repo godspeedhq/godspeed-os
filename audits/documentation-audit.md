@@ -856,3 +856,32 @@ therefore it gets a normal retest rather than a proof-by-hash.
 The durable outputs of this round are not the twelve renames. They are `scripts/docs_index_check.py`,
 which makes A7-2 unrepeatable, and `build/comment_symbol_audit.py` with its probe fixture, which is
 the first thing in this repository ever to read the 52,000 comment lines.
+
+### Disposition correction: the four KERNEL comment fixes were reverted (2026-09-25)
+
+The table above lists A7-10, A7-11, A7-12 and A7-15 as fixed. They were, and then they were taken
+back out in `db3365ca`, because `feat/stdlib` must expose no kernel change and
+`git diff main...HEAD -- kernel/ sdk/` had been empty for the life of the branch.
+
+They are comments, which is not the point. That check's value is that it returns NOTHING; a reviewer
+who has to read four lines to satisfy themselves the lines are harmless has already paid the cost the
+rule exists to avoid.
+
+So their real disposition on this branch is **recorded, not fixed** - with the replacement for each
+already established, so applying them elsewhere is a one-word edit rather than a re-investigation:
+
+| Finding | File | Dead name | Replacement |
+|---------|------|-----------|-------------|
+| A7-10 | `kernel/src/task/mod.rs:796` | `hw_mmio_of` | `mmio_bar` |
+| A7-11 | `kernel/src/task/mod.rs:1486` | `scheduler::set_task_name` | `scheduler::TASK_NAMES` |
+| A7-12 | `kernel/src/ipc/names.rs:173` | `scheduler::live_task_named_other_than` | `scheduler::find_task_by_name_excluding` |
+| A7-15 | `kernel/src/loader.rs:10` | `rd_addr` | `rdaddr` |
+
+`scripts/comment_symbol_audit.py` re-finds all four on demand, so nothing here depends on this table
+being remembered.
+
+**And the commit that introduced them claimed the check still passed.** It said the kernel diff "is
+still empty - the kernel comment fixes are comments", written without running the command; running it
+immediately afterwards returned 14 lines. Recorded because this file's whole subject is documentation
+that asserts more than it verified, and the audit round doing that in its own commit message is the
+cleanest example of the pattern it exists to catch.
