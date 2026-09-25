@@ -14,19 +14,19 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+use godspeed::{self as gs, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log_fmt(format_args!("pong: ready on core {}", ctx.core_id()));
+    ctx.log_fmt(format_args!("pong: ready on core {}", gs::task::core_id(&ctx)));
 
     // No self-registration. The kernel name-directory records "pong" at spawn and refreshes it on
     // every restart (in place), so ping reacquires us by name through the directory (syscall 10)
     // with no push from us.
 
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         ctx.log_fmt(format_args!(
             "pong: received \"{}\"",
             core::str::from_utf8(msg.payload_bytes()).unwrap_or("<invalid utf8>")

@@ -36,7 +36,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -61,8 +61,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 Some(_) => ctx.log("asker: HANG unexpectedly answered"),
                 None    => ctx.log("asker: HANG woke with no reply - peer died, did NOT hang (ReplyDead recovered)"),
             }
-            ctx.reacquire_by_name("reply-server");
-            ctx.yield_cpu();
+            gs::cap::reacquire(&ctx, "reply-server");
+            gs::task::yield_now(&ctx);
             continue;
         }
 
@@ -88,11 +88,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Reacquire it by name through the kernel directory and retry next tick
                 // (§14.3) - wait for truth, not a sleep (Commandment VIII/IX).
                 ctx.log("asker: no reply (reply-server unreachable) - reacquiring by name");
-                ctx.reacquire_by_name("reply-server");
+                gs::cap::reacquire(&ctx, "reply-server");
             }
         }
 
-        ctx.yield_cpu();
+        gs::task::yield_now(&ctx);
     }
 }
 

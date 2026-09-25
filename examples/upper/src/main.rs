@@ -21,7 +21,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -32,13 +32,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     let mut out = [0u8; 4096]; // one message's worth (MAX_PAYLOAD)
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         let src = msg.payload_bytes();
         // send_peers[0] is the SEND cap to the shell (our downstream), delegated at spawn.
-        let down = match ctx.send_peer_at(0) { Some(p) => p, None => continue };
+        let down = match gs::ipc::peer_at(&ctx, 0) { Some(p) => p, None => continue };
         if src == [0x04] {
             // End of this input stream - forward the EOT so the shell stops draining.
-            let _ = ctx.send_by_handle(down, &Message::from_bytes(&[0x04]));
+            let _ = gs::ipc::send_to(&ctx, down, &Message::from_bytes(&[0x04]));
             continue;
         }
         let n = src.len().min(out.len());
@@ -47,6 +47,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ASCII lowercase → uppercase; everything else passes through.
             out[i] = if c.is_ascii_lowercase() { c - 32 } else { c };
         }
-        let _ = ctx.send_by_handle(down, &Message::from_bytes(&out[..n]));
+        let _ = gs::ipc::send_to(&ctx, down, &Message::from_bytes(&out[..n]));
     }
 }

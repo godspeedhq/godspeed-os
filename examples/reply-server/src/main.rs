@@ -27,7 +27,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -37,12 +37,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         // 1. Block for the next request. With no client wired this simply parks the
         //    service here (idle) - the graceful degrade, never a panic.
-        let request = ctx.recv();
+        let request = gs::ipc::recv(&ctx);
 
         // 2. The request must carry an embedded REPLY capability - a SEND cap to the
         //    client's own endpoint. This is the ONLY authority the server has to call
         //    back: no ambient channel, no identity-based reach (Commandment VII, §7).
-        let reply_cap = match ctx.take_pending_cap() {
+        let reply_cap = match gs::ipc::take_sent_cap(&ctx) {
             Some(cap) => cap,
             None => {
                 // A malformed request with no reply cap. Degrade, never panic (§26.7):
@@ -60,7 +60,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // "HANG" (`asker` sends it only in the reply-test build, once, to drive exactly this test).
         if request.payload_bytes() == b"HANG" {
             ctx.log("reply-server: HANG received - withholding reply (peer-death test hook)");
-            ctx.remove_cap(reply_cap);   // consume the cap but send NO reply - the client stays blocked
+            gs::cap::remove(&ctx, reply_cap);   // consume the cap but send NO reply - the client stays blocked
             continue;
         }
 
@@ -73,7 +73,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //    client can never block the server: `try_send_by_handle` returns immediately.
         //    A successful send means QUEUED, not processed (§8.6, Commandment VIII) - if
         //    the client needs an ack it must build one explicitly.
-        match ctx.try_send_by_handle(reply_cap, &reply) {
+        match gs::ipc::try_send_to(&ctx, reply_cap, &reply) {
             Ok(())  => ctx.log("reply-server: replied to a request"),
             Err(_)  => ctx.log("reply-server: client unreachable; dropping reply (it must retry)"),
         }
@@ -81,6 +81,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // 5. The reply cap was installed into our table by `take_pending_cap`; we are
         //    done with it. Reclaim its slot so a long-running server stays bounded and
         //    does not leak cap-table entries over many requests (§26.6).
-        ctx.remove_cap(reply_cap);
+        gs::cap::remove(&ctx, reply_cap);
     }
 }

@@ -18,7 +18,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -34,20 +34,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ];
 
     // send_peers[0] is the SEND cap the shell granted us to the pipe sink.
-    match ctx.send_peer_at(0) {
+    match gs::ipc::peer_at(&ctx, 0) {
         Some(sink) => {
             for line in lines.iter() {
                 let msg = Message::from_bytes(line.as_bytes());
                 // Blocking send: the sink (upper, or the shell as a `| write` sink) wakes and
                 // drains each line.
-                let _ = ctx.send_by_handle(sink, &msg);
+                let _ = gs::ipc::send_to(&ctx, sink, &msg);
             }
             // End-of-stream marker: a one-byte EOT (0x04). A built-in sink (the shell draining
             // `greet | write file`) recvs until it sees this, so it knows the stream is done
             // without waiting forever. (A zero-length message is not a reliable signal - the
             // IPC path does not deliver an empty body.) A service sink like `upper` just
             // uppercases the control byte harmlessly.
-            let _ = ctx.send_by_handle(sink, &Message::from_bytes(&[0x04]));
+            let _ = gs::ipc::send_to(&ctx, sink, &Message::from_bytes(&[0x04]));
             ctx.log("greet: sent 3 lines + EOF through the delegated pipe cap");
         }
         None => {
@@ -58,6 +58,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // A pipe stage with no more output just idles (clean exit semantics are a
     // later refinement - see the shell-pipes notes).
     loop {
-        ctx.yield_cpu();
+        gs::task::yield_now(&ctx);
     }
 }

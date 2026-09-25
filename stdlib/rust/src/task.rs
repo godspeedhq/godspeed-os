@@ -58,3 +58,13 @@ pub fn epoch_secs_monotonic(ctx: &ServiceContext) -> i64 {
 pub fn datetime(ctx: &ServiceContext) -> Datetime {
     ctx.datetime()
 }
+
+/// Which core this service is running on.
+///
+/// For reporting, not for deciding. Placement is the supervisor's (CLAUDE.md 9.2), a service never
+/// migrates while it runs, and it may be placed on a different core after a restart - so a service
+/// that CHANGES BEHAVIOUR based on this has coupled itself to a deployment detail that is explicitly
+/// allowed to move (invariant 11).
+pub fn core_id(ctx: &ServiceContext) -> u32 {
+    ctx.core_id()
+}

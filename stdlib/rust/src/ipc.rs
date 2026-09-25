@@ -154,3 +154,24 @@ pub fn take_sent_cap(ctx: &ServiceContext) -> Option<Cap> {
 pub fn park(ctx: &ServiceContext) -> ! {
     ctx.park()
 }
+
+/// A capability to a peer this service was WIRED TO at spawn, by position.
+///
+/// Not a name lookup. These are the capabilities the supervisor installed from the contract's
+/// `ipc_send` list before this service ran, and position `0` is the first of them. A pipe stage
+/// reaches the next stage this way, which is what lets it send downstream while holding authority to
+/// reach nothing else (CLAUDE.md appendix D.3).
+///
+/// `None` means no peer was wired at that position - the contract did not ask for one, or the
+/// composition that would have supplied it did not happen.
+pub fn peer_at(ctx: &ServiceContext, idx: usize) -> Option<Cap> {
+    ctx.send_peer_at(idx).map(Cap::from_handle)
+}
+
+/// A capability to a peer this service was wired to at spawn, by name.
+///
+/// The same set as [`peer_at`], addressed by the name in the contract rather than by position. Use
+/// this when the contract names several peers and position would be a guess.
+pub fn peer(ctx: &ServiceContext, name: &str) -> Option<Cap> {
+    ctx.send_peer_handle(name).map(Cap::from_handle)
+}
