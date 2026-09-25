@@ -290,7 +290,7 @@ website/      documentation site (mdBook; renders this repo's docs)
 API references under `/api`:
 
 - [**`godspeed`** - the standard library](https://godspeedhq.github.io/godspeed-os/api/godspeed/),
-  imported as `gs`. **This is what you write a program against** - 130 public items across 12 modules:
+  imported as `gs`. **This is what you write a program against** - 143 public items across 13 modules:
 
   | Module | Covers |
   |--------|--------|
@@ -299,12 +299,13 @@ API references under `/api`:
   | [`ipc`](https://godspeedhq.github.io/godspeed-os/api/godspeed/ipc/index.html) | messages between services: send, receive, and giving a capability away |
   | [`cap`](https://godspeedhq.github.io/godspeed-os/api/godspeed/cap/index.html) | capability rights, acquiring, duplicating, dropping |
   | [`file`](https://godspeedhq.github.io/godspeed-os/api/godspeed/file/index.html) | a file held as a real kernel capability |
-  | [`task`](https://godspeedhq.github.io/godspeed-os/api/godspeed/task/index.html) | yielding, waiting, uptime and the wall clock |
+  | [`task`](https://godspeedhq.github.io/godspeed-os/api/godspeed/task/index.html) | yielding, waiting, uptime, and whether the wall clock can be trusted |
   | [`call`](https://godspeedhq.github.io/godspeed-os/api/godspeed/call/index.html) | bounded request/reply, safe for a caller that also serves |
   | [`io`](https://godspeedhq.github.io/godspeed-os/api/godspeed/io/index.html) | console output |
   | [`error`](https://godspeedhq.github.io/godspeed-os/api/godspeed/error/index.html) | one error type, and `retry_is_safe` |
   | [`resource`](https://godspeedhq.github.io/godspeed-os/api/godspeed/resource/index.html) | minting and revoking a delegated resource capability |
   | [`record`](https://godspeedhq.github.io/godspeed-os/api/godspeed/record/index.html) | typed tables, and the views derived from them |
+  | [`trace`](https://godspeedhq.github.io/godspeed-os/api/godspeed/trace/index.html) | metrics, the IPC event ring, and the log tail - publish, and read back |
   | [`addr`](https://godspeedhq.github.io/godspeed-os/api/godspeed/addr/index.html) | IPv4 addresses |
 
   [**Writing a program for GodspeedOS**](https://godspeedhq.github.io/godspeed-os/stdlib.html) is the

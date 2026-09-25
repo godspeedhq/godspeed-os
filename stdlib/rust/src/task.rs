@@ -13,7 +13,7 @@
 
 use godspeed_sdk::service_context::ServiceContext;
 
-pub use godspeed_sdk::service_context::Datetime;
+pub use godspeed_sdk::service_context::{ClockSource, Datetime};
 
 /// Give up the rest of this quantum.
 ///
@@ -57,6 +57,58 @@ pub fn epoch_secs_monotonic(ctx: &ServiceContext) -> i64 {
 /// check it rather than printing it. [`uptime_secs`] is the one that is always meaningful.
 pub fn datetime(ctx: &ServiceContext) -> Datetime {
     ctx.datetime()
+}
+
+/// Where the wall clock came from, so a displayed timestamp can say what it stands on.
+///
+/// This is the check [`datetime`] tells you to make, and it is the difference between a date and a
+/// date you can quote. The four answers are genuinely different claims:
+///
+/// | | |
+/// |---|---|
+/// | [`ClockSource::Unset`] | No clock at all. Whatever [`datetime`] renders is an epoch date, not today. |
+/// | [`ClockSource::Rtc`] | A local hardware clock reading a plausible date. |
+/// | [`ClockSource::Ntp`] | Corrected from the network this boot. |
+/// | [`ClockSource::Floor`] | A LOWER BOUND carried from the last boot - real, advancing correctly, but blind to how long the machine was off. |
+///
+/// `Floor` is the one worth reading twice, and it is why this is an enum rather than a bool. Several
+/// of the boards this runs on have no RTC, so the clock starts from a persisted floor and creeps
+/// forward correctly while being arbitrarily far behind. Reporting that as `Rtc` would claim hardware
+/// the board does not have; reporting it as `Unset` would deny a time it is displaying.
+///
+/// **A machine that cannot be asked reads [`ClockSource::Unset`]**, deliberately. The `time` service
+/// is restartable, so an unanswered question is normal during a restart - and an unknown clock and an
+/// unset clock oblige a caller to do the same thing, which is not to quote the date as fact.
+pub fn clock_source(ctx: &ServiceContext) -> ClockSource {
+    // OP_NOW -> [ok, epoch(8), source]. Bounded, and reacquiring: see `crate::call::request_within`.
+    const OP_NOW: u8 = 1;
+    let reply = match crate::call::request_within(
+        ctx, "time", &godspeed_sdk::ipc::Message::from_bytes(&[OP_NOW]), 2) {
+        Ok(r) => r,
+        Err(_) => return ClockSource::Unset,
+    };
+    let p = reply.payload_bytes();
+    if p.len() < 10 || p[0] == 0 {
+        return ClockSource::Unset;
+    }
+    match p[9] {
+        1 => ClockSource::Rtc,
+        2 => ClockSource::Ntp,
+        3 => ClockSource::Floor,
+        _ => ClockSource::Unset,
+    }
+}
+
+/// Whether [`datetime`] is worth showing as a date at all.
+///
+/// True for [`ClockSource::Rtc`] and [`ClockSource::Ntp`]. False for [`ClockSource::Unset`], and
+/// false for [`ClockSource::Floor`] - a floor is a real lower bound but not a reading, so a program
+/// that only wants to know "may I print this as today's date" should treat it as no.
+///
+/// Reach for [`clock_source`] when the distinction matters, which it does more often than this
+/// shorthand suggests.
+pub fn clock_is_set(ctx: &ServiceContext) -> bool {
+    matches!(clock_source(ctx), ClockSource::Rtc | ClockSource::Ntp)
 }
 
 /// Which core this service is running on.
