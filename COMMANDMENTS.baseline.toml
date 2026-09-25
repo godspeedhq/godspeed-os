@@ -69,6 +69,18 @@ features = [
     # behaviour change on any non-faulting path. Off by default; the faulting task dies either way.
     "fault-dump-wide",
     "iommu-fault-test",
+    # Fault-injection, and registered here for the same reason `iommu-fault-test` is: it exists to make
+    # an ERROR PATH observable that the ordinary suites cannot reach. The kill-path abandon
+    # (`backlog/48`) replaced a `panic!`, and the race that reaches it needs a core wedged inside a
+    # masked window - which does not happen under QEMU. Without this the new path would ship having
+    # executed zero times, which is the standing of a guard this project has already learned not to
+    # trust.
+    #
+    # It forces exactly ONE abandon, then behaves normally. Shrinking the budget outright would make
+    # every cross-core kill abandon, leak every slot, and prove nothing about whether the machine
+    # carries on - which is the actual question. It adds no kernel responsibility: no syscall, no
+    # subsystem, and no behaviour change on any path that is not already about to abandon.
+    "kill-abandon-test",
     "memmap-clamp-test",
     "mmio-map-fault-test",
 # The ROUTINE half of the kernel's name-directory trace - every register, every clear. Admitted as a

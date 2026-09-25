@@ -1,7 +1,7 @@
 # 48 - `chaos max-carnage` panics the kernel on the kill-path bound, and userspace can reach it
 
 **Opened:** 2026-09-24
-**Status:** OPEN - **REPRODUCED ON HARDWARE 2026-09-25 (Pi 4, AArch64, no host load) and 2026-09-24 under host load in QEMU** (1 panic in 170 carnage rounds loaded; 0 in 400 idle). **A VIOLATION of an absolute bar, and the fix is mandatory** - see the ruling below. One of five sites of the same shape (`backlog/49`).
+**Status:** **CLOSED 2026-09-25** - the panic is deleted (gone by construction, verified absent in every shipped binary), the replacement is observed working, and 4000 chaos rounds across three ISAs produced no kernel panic. Reproduced on hardware first (Pi 4, AArch64, no host load, round 943) and in QEMU under host load. One part of the fix stays UNEXERCISED and is recorded at the end. (1 panic in 170 carnage rounds loaded; 0 in 400 idle). **A VIOLATION of an absolute bar, and the fix is mandatory** - see the ruling below. One of five sites of the same shape (`backlog/49`).
 **Found by:** verification of an unrelated change (`feat/stdlib`, which makes **zero** kernel edits).
 
 ## What happened
@@ -234,3 +234,119 @@ The panic text is spliced with an unrelated EL0 fault report, mid-word: `0ounter
 progress`, `c0x.`. That is the known serial-splice behaviour under load, and it matters here because
 **the panic reason is the one line you cannot afford to have corrupted.** A reader who saw only
 `c0x.` would not have had the sentence. Recorded rather than acted on; the splice is its own issue.
+
+---
+
+## The fix, on hardware: four ISAs, 4000 chaos rounds, no panic (2026-09-25)
+
+`fix/kill-path-fail-the-kill`, built per board with no test features.
+
+| board | ISA | rounds | kills | KERNEL PANIC | ABANDONED | "waiting longer" | selfcheck after |
+|-------|-----|--------|-------|--------------|-----------|------------------|-----------------|
+| Raspberry Pi 4 | AArch64 | 1000 | 6028 | 0 | 0 | 0 | 516 / 0 |
+| Raspberry Pi 4 | AArch64 | 1000 | 5849 | 0 | 0 | 0 | 516 / 0 |
+| Raspberry Pi 2 | ARMv7 | 1000 | 5493 | 0 | 0 | 0 | 507 / 0 (1 skip: no PCI) |
+| StarFive VisionFive 2 | RISC-V 64 | 1000 | 5911 | 0 | 0 | 0 | 516 / 0 |
+
+**23,281 kills across four soaks and three instruction sets, zero kernel panics.** The Pi 4 is the
+board that panicked at round 943 before the fix.
+
+### What is PROVEN, and by what
+
+**The panic cannot recur - by construction, not by sampling.** The `panic!` at `scheduler.rs:2679` is
+deleted. Verified absent from each shipped binary (`strings | grep "has not released task slot"` = 0
+on aarch64, armv7 and riscv64). No number of clean rounds would establish this and none is needed to:
+the code is gone.
+
+**Abandoning leaves a healthy system - observed.** Forced through the `kill-abandon-test` feature and
+captured on raw serial:
+
+```
+kill: ABANDONED slot 6 - core 1 still using it after 1942901475 ticks x1 window(s)
+killed: block-driver
+supervisor: block-driver died, restarting -> block-driver restarted
+```
+
+The kill reported completion, the supervisor restarted the service, the machine carried on.
+
+**No regression on any ISA - observed.** The four soaks above, plus shell 206/0, chaos 8/8 and
+identity 24/24 in QEMU.
+
+### What is NOT proven, and stays recorded
+
+**The extension path has never been exercised by a real slow core.** `waiting longer for core ...`
+fired zero times in 23,281 kills, meaning the wait never once reached its budget. So the
+IRQ-progress discrimination - the part that decides to grant another window rather than abandon - has
+been reasoned about and compiled, not watched working.
+
+**And the race itself did not recur.** Pre-fix it was 1 occurrence in 943 rounds; post-fix, 0 in 4000.
+If the rate were unchanged you would expect about four, so seeing none has roughly a 2% chance by
+luck - suggestive that the re-sent WAKE_RECEIVER IPI made the race rarer, and not proof of it. A
+single pre-fix observation is a poor rate estimate and this should not be read as one.
+
+**x86 hardware has not run chaos on this kernel.** The T630 and Wyse ran the QEMU suites only. The
+change is in the neutral kernel and compiles identically on all four ports, so this is a gap in
+coverage rather than a reason to suspect x86 specifically.
+
+### Disposition
+
+`backlog/48` - **CLOSED.** It is this bug, this is the fix its own "The fix" section specifies, the
+panic is gone by construction, and the replacement behaviour is observed. The unexercised extension
+path is recorded above rather than papered over.
+
+`backlog/49` - **OPEN, 1 of 5 done.** The kill path was the only one of the five ever proven
+reachable. The other four remain, and three of them are bounded by SPIN COUNTS rather than time,
+which that entry calls out as a separate defect. What this buys them is a worked pattern:
+`core_irq_debug` as the progress oracle, fail-the-operation as the response.
+
+### Sweep completed: x86 closes the fourth ISA (2026-09-25)
+
+| board | ISA | rounds | kills | KERNEL PANIC | ABANDONED | "waiting longer" |
+|-------|-----|--------|-------|--------------|-----------|------------------|
+| Raspberry Pi 4 | AArch64 | 1000 | 6028 | 0 | 0 | 0 |
+| Raspberry Pi 4 | AArch64 | 1000 | 5849 | 0 | 0 | 0 |
+| Raspberry Pi 2 | ARMv7 | 1000 | 5493 | 0 | 0 | 0 |
+| StarFive VisionFive 2 | RISC-V 64 | 1000 | 5911 | 0 | 0 | 0 |
+| Dell Wyse 5070 | x86-64 | 1000 | 5982 | 0 | 0 | 0 |
+| **total** | **4 ISAs** | **5000** | **29,263** | **0** | **0** | **0** |
+
+The Wyse ran `selfcheck` twice: `513 / 0 / 1 skip` then `514 / 0 / 0`. The skip names itself -
+`dns - no internet to resolve through; not a failure` - because the first ran before the WAN came
+back after the storm and the second after. The suite skipping with a reason rather than failing on
+an absent network is the intended behaviour, and the pair is the post-storm recovery visible in the
+counts.
+
+The unexercised row stands unchanged and is now better quantified: `waiting longer for core ...`
+fired ZERO times in 29,263 kills, so the wait never once reached its budget on any ISA. The
+IRQ-progress discrimination remains reasoned-about and compiled, not watched working. Nothing here
+changes that, and five green soaks should not be read as though it did.
+
+### The T630 completes it: FIVE boards, 35,748 kills (2026-09-25)
+
+| board | ISA | rounds | kills | PANIC | ABANDONED | "waiting longer" |
+|-------|-----|--------|-------|-------|-----------|------------------|
+| Raspberry Pi 4 | AArch64 | 1000 | 6028 | 0 | 0 | 0 |
+| Raspberry Pi 4 | AArch64 | 1000 | 5849 | 0 | 0 | 0 |
+| Raspberry Pi 2 | ARMv7 | 1000 | 5493 | 0 | 0 | 0 |
+| StarFive VisionFive 2 | RISC-V 64 | 1000 | 5911 | 0 | 0 | 0 |
+| Dell Wyse 5070 | x86-64 (Intel) | 1000 | 5982 | 0 | 0 | 0 |
+| HP T630 | x86-64 (AMD) | 1000 | 6485 | 0 | 0 | 0 |
+| **total** | **4 ISAs, 5 boards** | **6000** | **35,748** | **0** | **0** | **0** |
+
+The T630 was run on a PREDICTION THAT WAS WRONG, and the wrongness is worth keeping. `backlog/27`
+records that board's TSC as "roughly 1000x too small", which would make the kill-path budget
+(`tsc_ticks_per_quantum * 75`) ~0.75 ms instead of ~0.75 s and make it by far the likeliest board to
+exercise the abandon path. It exercised nothing. Its boot log says why:
+
+```
+apic: core 16 PIT-calibrated tsc_hz=1996256500 ticks/10ms=19962565
+```
+
+~2.0 GHz, correct for a GX-420GI - x86 moved to PIT calibration and that entry is stale. It is
+corrected there now. Two errors compounded: trusting an outdated entry, and reading the code comment
+that documents the FIX ("CPUID 0x15/0x16 give a garbage frequency on AMD") as documentation of the
+PROBLEM. The arithmetic would not have supported the prediction either - normal release is
+microseconds against a 0.75 s budget, so even a real 1000x cut leaves ~750x margin.
+
+The unexercised row is unchanged and now stands at **zero firings in 35,748 kills across five boards
+and four instruction sets**. The wait has never once reached its budget outside a forced probe.
