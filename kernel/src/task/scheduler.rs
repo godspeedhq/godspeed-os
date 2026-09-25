@@ -2736,6 +2736,16 @@ pub fn kill_task_by_slot(slot: usize) {
                             // running - it simply has not reached a scheduling point yet. Open a fresh
                             // window rather than condemning it. Bounded by MAX_WAIT_EXTENSIONS so this
                             // cannot become the unbounded spin it replaced (26.6).
+                            // SAY SO. A wait that needed extending is the interesting case - it is
+                            // the difference between "the race never happened" and "the race happened
+                            // and was absorbed", and without this line a clean run cannot distinguish
+                            // them. Bounded by MAX_WAIT_EXTENSIONS, and silent whenever the first
+                            // window suffices, which is nearly always.
+                            crate::kprintln!(
+                                "kill: waiting longer for core {} to release slot {} - it IS progressing (irqs {}->{}), window {} of {}",
+                                cid, slot, irqs_at_window, irqs_now,
+                                extensions + 2, MAX_WAIT_EXTENSIONS + 1,
+                            );
                             irqs_at_window = irqs_now;
                             t0 = crate::arch::imp::read_cycle_counter();
                             extensions += 1;
