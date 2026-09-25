@@ -298,3 +298,25 @@ path is recorded above rather than papered over.
 reachable. The other four remain, and three of them are bounded by SPIN COUNTS rather than time,
 which that entry calls out as a separate defect. What this buys them is a worked pattern:
 `core_irq_debug` as the progress oracle, fail-the-operation as the response.
+
+### Sweep completed: x86 closes the fourth ISA (2026-09-25)
+
+| board | ISA | rounds | kills | KERNEL PANIC | ABANDONED | "waiting longer" |
+|-------|-----|--------|-------|--------------|-----------|------------------|
+| Raspberry Pi 4 | AArch64 | 1000 | 6028 | 0 | 0 | 0 |
+| Raspberry Pi 4 | AArch64 | 1000 | 5849 | 0 | 0 | 0 |
+| Raspberry Pi 2 | ARMv7 | 1000 | 5493 | 0 | 0 | 0 |
+| StarFive VisionFive 2 | RISC-V 64 | 1000 | 5911 | 0 | 0 | 0 |
+| Dell Wyse 5070 | x86-64 | 1000 | 5982 | 0 | 0 | 0 |
+| **total** | **4 ISAs** | **5000** | **29,263** | **0** | **0** | **0** |
+
+The Wyse ran `selfcheck` twice: `513 / 0 / 1 skip` then `514 / 0 / 0`. The skip names itself -
+`dns - no internet to resolve through; not a failure` - because the first ran before the WAN came
+back after the storm and the second after. The suite skipping with a reason rather than failing on
+an absent network is the intended behaviour, and the pair is the post-storm recovery visible in the
+counts.
+
+The unexercised row stands unchanged and is now better quantified: `waiting longer for core ...`
+fired ZERO times in 29,263 kills, so the wait never once reached its budget on any ISA. The
+IRQ-progress discrimination remains reasoned-about and compiled, not watched working. Nothing here
+changes that, and five green soaks should not be read as though it did.
