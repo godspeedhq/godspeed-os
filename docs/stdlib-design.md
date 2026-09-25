@@ -1412,3 +1412,56 @@ having and touches neither.
   `services/nic-driver/` is byte-identical to main.
 - `backlog/51` - the display-only console status region. Designed, deliberately not built: it changes
   the terminal every port renders through.
+
+### Both x86 machines, and why their selfcheck counts DIFFER (2026-09-25)
+
+**Dell Wyse 5070, on the same image as the T630:**
+
+```
+selfcheck   ran 518, failed 0, skipped 0
+sock        sent 29 bytes to 192.168.4.1:53, received 94 bytes back
+net         192.168.4.83, gw 192.168.4.1, ping ok, lease ok (DHCP), dns 192.168.4.1
+serve       3 inbound connections from a LAN peer, every byte returned unchanged
+```
+
+**The T630 reported `ran 516` on that same binary, and both numbers are correct.** This is worth
+writing down because the difference reads as a regression and is not one; it cost a round of
+investigation here and would cost the next person the same.
+
+`ran` counts STATEMENTS EXECUTED, and the suite has conditional blocks. The one that bit is in
+`60-data.gsh`:
+
+```
+if dir /churn {
+    echo 'selfcheck: an earlier churn is still on disk - verifying it BEFORE it is overwritten'
+    if churn verify { echo 'PASS  churn - the earlier run holds no torn file ...' }
+}
+```
+
+The Wyse's disk carried churn files from an earlier session, so that branch ran and added exactly two
+statements. The T630's disk had been freshly flashed, so the block did not run at all. 516 + 2 = 518,
+and the extra two PASSED - the leftover data verified intact, which is precisely what that block
+exists to check before overwriting it.
+
+**So a machine with disk history does MORE checking, not less, and a higher count is the healthier
+reading.** The numbers that matter are `failed 0` and `skipped 0`; `ran` is a function of machine
+state and is not comparable across machines without knowing the state. The retry loops in
+`40-persist.gsh` (`for i in range 30`) and `80-network.gsh` (`for i in range 4`) vary the same way:
+their bodies are guarded, so a first-try success executes fewer statements than a retry.
+
+This is a documentation gap rather than a defect - nothing told the operator that `ran` is
+state-dependent, and `selfcheck` has no `utilities/` spec to say it in (`audits/documentation-audit.md`
+A7-4). Recorded here until it does.
+
+**What the Wyse adds over the T630**, since a second x86 machine is not automatically new evidence:
+different firmware, a different storage controller, the 4K console path whose framebuffer memory type
+was the 596 ms -> 29-41 ms per-scroll fix, and a disk with history rather than a fresh format. The
+~2,750-line selfcheck ran in 96 seconds, so the console fix is intact on this board.
+
+**`sock` on a second machine.** Byte-identical result to the T630 - 29 out, 94 back, from the
+lease-supplied resolver. The `udp_roundtrip` fix (`5716da17`) is now confirmed on two boards, and it
+is a path that had never once completed on real hardware before that commit.
+
+**`serve` on a second machine.** Three inbound connections from a separate LAN peer, each echoed byte
+for byte. QEMU structurally cannot produce this (SLIRP's only peer is the gateway), so it is two
+machines' worth of evidence for the one thing emulation cannot test at all.
