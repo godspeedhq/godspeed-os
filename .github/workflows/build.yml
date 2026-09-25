@@ -22,7 +22,14 @@ jobs:
       # ELF bytes via include_bytes!(env!("SVC_*_ELF")), so the service binaries
       # must exist in target/ before the kernel crate compiles.
       - name: Build services (bare-metal)
-        run: cargo build --target x86_64-unknown-none --workspace --exclude osdev --exclude kernel
+        # THE SUPERVISOR EMBEDS THE OTHER SERVICES, so they must be built first. `--workspace` gives
+        # cargo no ordering guarantee between members, so a plain workspace build can reach
+        # `supervisor/build.rs` before `pong` exists and panic - which is what broke this workflow
+        # silently for months while it was paused and nothing ran it.
+        run: |
+          cargo build --target x86_64-unknown-none --workspace \
+            --exclude osdev --exclude kernel --exclude supervisor
+          cargo build --target x86_64-unknown-none -p supervisor
 
       - name: Build kernel (bare-metal)
         run: cargo build --target x86_64-unknown-none -p kernel
@@ -31,7 +38,11 @@ jobs:
         run: cargo build -p osdev
 
       - name: Clippy services (bare-metal)
-        run: cargo clippy --target x86_64-unknown-none --workspace --exclude osdev --exclude kernel
+        # Same ordering, same reason: clippy runs the build scripts.
+        run: |
+          cargo clippy --target x86_64-unknown-none --workspace \
+            --exclude osdev --exclude kernel --exclude supervisor
+          cargo clippy --target x86_64-unknown-none -p supervisor
 
       - name: Clippy kernel (bare-metal)
         run: cargo clippy --target x86_64-unknown-none -p kernel
