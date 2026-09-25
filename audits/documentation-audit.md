@@ -664,3 +664,195 @@ All six are the same shape: a change landed, and the prose describing the thing 
 move with it. Four of them were introduced by ME, within hours, in this branch. The defence is not
 "write better comments" - it is to prefer sources that CANNOT drift: a returned count over a constant,
 a grid header over a copied column list, a pointer to the file over a duplicated table.
+
+---
+
+## Audit 7 - documents and CODE COMMENTS at `feat/stdlib` merge readiness (2026-09-25, `6f4ccd76`)
+
+Two sweeps in one round, because the second one had never been run at all. The document half is the
+usual: does what we say match what we built. The comment half is new - **nothing in this repository
+has ever checked the ~52,000 comment lines the way `doc_symbols_check.py` checks the 49,000 doc
+lines**, and comments rot faster than docs because they sit beside the thing that changed and nobody
+re-reads them while changing it.
+
+### The instrument, and the fact that it was BLIND first
+
+`build/comment_symbol_audit.py` extracts every backticked name from every `//`, `///` and `//!`
+comment in `services/`, `sdk/`, `stdlib/`, `kernel/` and `osdev/`, and reports the ones that appear
+nowhere in the tree's non-comment source, config or prose.
+
+Its first run reported **0 findings across 52,523 comment lines**, which is exactly the reading this
+project has learned not to believe. A planted probe naming two invented symbols was **not detected**.
+The cause: `load_haystack()` read every file INCLUDING the comments being scanned, so every name in a
+comment "existed" because the comment itself was in the haystack. A symbol exists if it appears in
+CODE, config or prose - never merely in a comment.
+
+With Rust comments stripped from the haystack the planted probe is caught and the real count is
+**223 names**, of which 12 are genuine rot. The zero was not a clean tree; it was an instrument
+measuring itself. `build/plant_probe.py` is the fixture that proves it fires.
+
+### Document findings
+
+| ID | Sev | Where | What |
+|----|-----|-------|------|
+| **A7-1** | **HIGH** | `utilities/41_sock.md` | **Wrong in five ways, and its confident partial diagnosis concealed a second bug.** It states the destination is "hardcoded to `10.0.2.3:53`" (false since `82705c59`, which reads the resolver from the DHCP lease); presents the lease fix as an open recommendation - "the fix is for the demo to use the DNS server from the DHCP lease ... recorded here rather than left for the next person to diagnose" - when that fix has shipped; shows `received 0 bytes back` and `received 45 bytes back` as the output strings when the zero case now reads `nothing came back (the peer did not answer)`; and shows a QEMU address as the documented output. The damaging part is the diagnosis: it attributes the hardware zero ENTIRELY to the address, and `udp_roundtrip` was destroying the reply as well (`5716da17`). The doc told the next person the cause was known and singular; they fixed the address, watched it still fail, and only then found the second cause. A partial diagnosis stated confidently is worse than none. |
+| **A7-2** | **MED** | `docs/CLAUDE.md`, `scripts/` | **`docs/` has no index gate, and has drifted in exactly the way the backlog gate exists to prevent.** CLAUDE.md 5 designates `docs/CLAUDE.md` as the index. Four docs are absent from it - `gsfs-next.md`, `ipc-efficiency.md`, `tcp-design.md`, `x-residue.md` - while being cited from 2 to 5 other places each. `doc_refs.py` checks only that a citation resolves; `backlog_check.py` was written specifically to check the OTHER direction, after entries 33-38 "existed as files and appeared in no index, so the folder's own README promised 'this is the index' while six items were invisible". That lesson was learned for `backlog/` and never applied to `docs/`. `x-residue.md` is where `commandments.py` says the un-mechanised half of Commandment X is written down, so the enforcement layer points at a document the index does not list. |
+| **A7-3** | **MED** | `utilities/49_serve.md` | **Records only QEMU verification of the one path QEMU structurally cannot test.** The status line reads "Verified end to end in QEMU (`scripts/tcp_serve_test.py`)". On 2026-09-24 the T630 accepted three inbound connections from a machine on the LAN and echoed every byte unchanged - an inbound connection through a minted connection capability, which SLIRP cannot produce because its only peer IS the gateway. The strongest evidence this utility has is the evidence its spec does not mention. |
+| **A7-4** | LOW | `utilities/` | **`selfcheck` has no spec, and the gap grew on this branch.** It is carried in `utility_vocab_debt` (`COMMANDMENTS.baseline.toml`), so the absence is recorded rather than undiscovered - but it was a single command when the debt was taken, and it is now nine parts, 516 checks, a comma list, `save`, `q`, a `help` subcommand and a tidy that runs on failure. The debt entry is a flat name; the debt behind it is not flat. |
+
+### Code comment findings - names that resolve to nothing
+
+All twelve confirmed by grep against non-comment source. Each names a thing as if a reader could go
+look at it.
+
+| ID | Sev | Where | Dead name | Reality |
+|----|-----|-------|-----------|---------|
+| **A7-5** | MED | `services/shell/src/main.rs:771` | `ESC_WAIT_TICKS` | The constant is `ESC_WAIT_QUANTA` (`:789`). The rename was deliberate - the line directly below it says "counted in SCHEDULER QUANTA rather than cycles" - and the doc comment four lines above kept the old noun. |
+| **A7-6** | MED | `services/shell/src/main.rs:1737` | `MAX_SPINS` | Describes a spin loop that was DELETED. The surrounding comment argues the removal ("This used to spin up to fifty million times ... Waiting for the driver to be ready buys nothing"), and a fragment describing the old loop's safety net survived the edit. |
+| **A7-7** | MED | `services/fs/src/main.rs:483` and `:3739` | `CLOCK_REFRESH_S` | The constant is `CLOCK_MAX_AGE_S` (`:161`). Stale in two places, one of them a "See `now_epoch` and `CLOCK_REFRESH_S`" pointer that sends a reader after nothing. |
+| **A7-8** | MED | `services/net-stack/src/main.rs:2736` | `run_dance_serving` | The function is `run_dance` (`:2398`), which takes `serve_status`. The comment's whole argument rests on the named function answering clients throughout, so the name carries the claim. |
+| **A7-9** | MED | `services/console/src/term.rs:43` | `SCROLL_LIVE` | No such action exists. The comment distinguishes `End` from it ("Distinct from `SCROLL_LIVE`, which leaves"), so it asserts a contrast with something unfindable. |
+| **A7-10** | MED | `kernel/src/task/mod.rs:796` | `hw_mmio_of` | "(see `hw_mmio_of`)" - a see-also pointing at nothing. |
+| **A7-11** | MED | `kernel/src/task/mod.rs:1486` | `scheduler::set_task_name` | Asserts the mechanism by name: "the task owns its bytes now (`scheduler::set_task_name`)". |
+| **A7-12** | MED | `kernel/src/ipc/names.rs:173` | `scheduler::live_task_named_other_than` | Same shape - the kill path's capability is asserted by naming a function that does not exist. |
+| **A7-13** | MED | `services/probe/src/table.rs:10` | `task::probe_authority` | "the kernel keeps them keyed by name (`task::probe_authority`)" - names a kernel structure, in a module header explaining an authority boundary. |
+| **A7-14** | MED | `kernel/src/syscall/dispatch.rs:2730` | `LAST_FAIL` | "`usb_disk_busy()` reads `LAST_FAIL`". `usb_disk_busy()` is real (`arch/aarch64/mod.rs:1378`); `LAST_FAIL` is not, so the explanation of a structural conflation rests on a name. |
+| **A7-15** | LOW | `kernel/src/loader.rs:10` | `rd_addr` | "`ehdr_size`, `phdr_size` and `rd_addr` all branch on the class". The first two are real functions at `:53` and `:54`; the third is not, which is what makes it a slip rather than a wholesale stale block. |
+| **A7-16** | LOW | `services/net-stack/src/tcp.rs:211` | `bytes_sent` | "kept so `bytes_sent` can be reported" - plausibly prose rather than a symbol, recorded at LOW for that reason. |
+
+### Classified as NOT findings (recorded so they are not re-chased)
+
+- **Linux/BSD reference symbols in drivers.** `dwmac4_dma.h`, `stmmac_dma_operation_mode`, `mmc.h`,
+  `GMAC_CONFIG_ACS` and ~180 others across `nic-driver`, `dwc2`, `genet` and the riscv64 display and
+  net files. 26.14 sanctions reading those as executable datasheets and citing them at the point of
+  divergence; a citation of an external header is the doctrine working, not rot.
+- **`civil_from_days`** (`sdk/rust/src/service_context.rs:142`) - Howard Hinnant's published
+  algorithm, named as an attribution. Same class as the above.
+- **Comments that say a thing WAS REMOVED.** `arm_spawn_events_neutral` / `arm_spawn_shell_neutral`
+  (`task/mod.rs:2436`, "USED TO LIVE HERE") and `clock_synced_secs_ago`
+  (`service_context.rs:2991`, "were REMOVED with the kernel's wall clock"). A comment documenting an
+  absence is correct by naming it; flagging these would punish exactly the behaviour 26.7 asks for.
+- **Non-symbols the pattern catches**: range expressions (`tok_start..end`, `from..cols`), register
+  fields (`SCTLR.DZ`, `wMaxPacketSize`), assembly mnemonics (`LDRB`), field access (`EndpointId.0`),
+  filenames (`supervisor.elf`, `probes.rs`), commit hashes (`fe09e428`), format placeholders
+  (`SSSS`).
+
+### Verified still true (do not re-check)
+
+- **19 of 19 checker scripts pass** with all four ISA targets built.
+- **`stdlib/` has ZERO dead comment names** - 1,371 comment lines in the newest crate in the tree,
+  all resolving. The crate written most recently is the cleanest, which is the expected direction and
+  worth recording as the baseline the older files are being measured against.
+- **The `todo!()` claims are exact**: `osdev/src/main.rs` has four, and `new`, `publish`, `status`
+  and `caps` are the four documented as NOT IMPLEMENTED in both CLAUDE.md 17 and `osdev/CLAUDE.md`.
+- **All 12 osdev subcommands named in the front-door docs exist** in the CLI.
+- **Front-door docs make one numeric claim** (`README.md:180`, identity 15 tests / 24 cases) and it
+  matches CLAUDE.md. Numeric restraint in the public docs is why they have not rotted.
+- **`backlog/` is sound**: 52 of 52 entries carry a capitalised status line, every entry is linked
+  from the index, no number is reused. The two entries with a lowercase secondary `**Status:**`
+  (08, 10) each carry a proper capitalised one at line 3, so the gate is not being evaded.
+- **No document names a feature this branch added and removed** - `selfcheck view`, `live`,
+  `ViewBuf` and `outcome_to_error` appear in no `.md` file.
+
+### The pattern worth naming
+
+Three of the four document findings and all twelve comment findings are the same failure, and it is
+not carelessness: **the edit and the prose describing it are in different places, and only one of
+them is compiled.** A renamed constant fails the build at every call site and at no comment. A
+deleted loop takes its code with it and leaves its explanation. A fixed bug removes the defect and
+leaves the doc that recommends fixing it.
+
+That is an argument for a gate rather than for more care, which is why A7-2 (an index checker docs/
+does not have) and the instrument built for this round are the durable outputs here. The findings
+themselves are a day's work; the two checkers are what stops the next 52,000 comment lines needing a
+human to read them.
+
+### Corrections to the table above, found while FIXING the findings
+
+Two entries understated what was wrong, and the fixes are what revealed it. Recorded here rather than
+edited into the table, because the table is what the sweep found and this is what the repair found.
+
+**A7-9 is not a dead name. It is an ORPHANED DOC COMMENT, and it was documenting the wrong item.**
+The `///` block sat above `pub(crate) const SB_BYTES` with a blank line between, and Rust attaches a
+doc comment to the next item regardless of blank lines. Its own item went with the scroll-request
+mechanism (`bbd24478`), so a **scrollback BYTE CAPACITY was documented as "End - jump to the NEWEST
+line"**, citing a constant deleted in that same commit. A doc comment left without an item does not
+warn you - it silently adopts its neighbour. Now a `//` note, which cannot.
+
+**A7-6 is not a dead name either. It is a SPLICE.** The paragraph naming `MAX_SPINS` documented the
+SPINNING wait, which was deleted; it survived directly above the function that REPLACED it. So the
+doc asserted a spin loop and its safety net immediately above the line "Report whether the input
+driver has announced itself - **and do NOT wait for it**". One function, two contradictory doc
+paragraphs, the older one first. Same shape as `DOC-4` in the `feat/trace` round, which is the second
+occurrence of this pattern in this file.
+
+**A7-13 is worse than MED and is NOT fixed.** `task::probe_authority` does not exist **and no
+replacement could be located**: nothing in the kernel keys authority by probe name, and
+`service_config` covers only the supervisor (CLAUDE.md 13.6). So a module header explaining an
+AUTHORITY BOUNDARY - "A caller may say what a probe IS; it may not assert what it may DO" - grounds
+that boundary in a mechanism that cannot be found. 13.6's own amendment exists because someone was
+misled about where authority comes from. Left as-is deliberately: replacing a visibly wrong name with
+an invented right-sounding one would convert a findable error into an unfindable one.
+
+**A7-14 is also left.** `usb_disk_busy()` is now `-> false` on both cfg arms, so the comment does not
+merely name a dead constant - it explains the behaviour of a function that has been stubbed out.
+
+### The instrument fooled ITSELF twice, in two different ways
+
+Worth recording in full, because both readings looked like success.
+
+1. **It read the comments under test.** `load_haystack` walked every file including the `.rs` files
+   being scanned, so a name in a comment "existed" because that comment was in the haystack. Reported
+   **0 findings across 52,523 lines** and did not detect a planted probe. Fixed by stripping Rust
+   comments from the haystack; the count went 0 -> 223.
+2. **It read THIS DOCUMENT.** Once the round above was appended, every dead name it lists became
+   resolvable - because the audit naming them is a `.md` file in the haystack. Three deliberately
+   unfixed findings (`probe_authority`, `LAST_FAIL`, `bytes_sent`) silently vanished from the report
+   and the total fell by 39 when about 11 names had been fixed. **An audit that records a dead symbol
+   makes that symbol exist**, which is a genuinely funny way to reach a clean bill of health. Fixed by
+   excluding `audits/`, `milestones/` and `bugs/` - dated evidence, not a statement of what exists now,
+   which is the same exemption `line_ref_check.py` already makes for the same reason.
+
+The pattern in both: **an instrument that includes its own output in its input measures itself.** It
+was caught both times by the same fixture (`build/plant_probe.py`), and neither time by reading the
+code, which is the argument for keeping the fixture beside the instrument.
+
+### Two mechanical traps this round walked into
+
+**Mixed line endings, in the same tree.** `services/console/src/term.rs`,
+`kernel/src/task/mod.rs` and `kernel/src/ipc/names.rs` are CRLF; `services/shell/src/main.rs`,
+`services/fs/src/main.rs`, `services/net-stack/src/main.rs` and `kernel/src/loader.rs` are LF. A
+multi-line patch pattern written with `\n` matches half the tree and silently misses the other half,
+and `sed -n 'Np'` prints both identically so the difference is invisible at the shell. Two patch
+attempts failed on this before the third detected the ending per file.
+`line_ending_check.py` covers only the 22 files under an `eol=lf` gitattributes rule, which is
+correct for what it guards and is not a tree-wide guarantee.
+
+**A comment-only edit is NOT always a byte-identical binary.** Offered as proof and only half true.
+Measured across the six edited crates:
+
+| line count changed | binary |
+|--------------------|--------|
+| `fs`, `net-stack`, `probe` (same-line replacements) | **byte-identical** |
+| `shell` (-8 lines), `console` (+6 lines) | **differs** |
+| `kernel` | **differs** - it `include_bytes!`-embeds the supervisor, which embeds shell and console |
+
+A rebuild with no source change was byte-stable, so the difference is real and not build
+nondeterminism. The cause is panic-location metadata: `core::panic::Location` bakes line numbers in,
+so deleting comment lines above a `panic!` moves it. **Semantically inert, not bit-inert** - and
+therefore it gets a normal retest rather than a proof-by-hash.
+
+### What was FIXED in this round
+
+| Finding | Disposition |
+|---------|-------------|
+| A7-1 `sock` | Rewritten. The stale "hardcoded to 10.0.2.3" claim and its already-shipped recommendation are gone; both causes are recorded, with the lesson that stating one confidently concealed the other |
+| A7-2 docs index | 4 rows added, **and `scripts/docs_index_check.py` written** - the backlog index gate applied to the folder that makes the same promise. Proven to fire on the real defect before the fix, and to pass after |
+| A7-3 `serve` | The T630 LAN-peer run recorded, with why QEMU structurally cannot produce it |
+| A7-5, A7-7, A7-8, A7-10, A7-11, A7-12, A7-15 | Renamed to the symbol that actually exists |
+| A7-6, A7-9 | Restructured (a splice and an orphan), not merely renamed |
+| A7-4 `selfcheck` spec, A7-13, A7-14, A7-16 | **Left open, deliberately**, each for a stated reason |
+
+The durable outputs of this round are not the twelve renames. They are `scripts/docs_index_check.py`,
+which makes A7-2 unrepeatable, and `build/comment_symbol_audit.py` with its probe fixture, which is
+the first thing in this repository ever to read the 52,000 comment lines.

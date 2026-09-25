@@ -480,7 +480,7 @@ struct Fs {
     blk_cycles: core::cell::Cell<u64>,
     /// The cached wall clock: `(epoch_seconds, the monotonic second it was read)`. `Cell` because
     /// stamping happens on `&self` paths, and owned by `Fs` rather than a static (invariant 9).
-    /// See `now_epoch` and `CLOCK_REFRESH_S`.
+    /// See `now_epoch` and `CLOCK_MAX_AGE_S`.
     clock: core::cell::Cell<(u32, i64)>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
@@ -3736,7 +3736,7 @@ fn replay_window(_ctx: &ServiceContext) {}
     }
 
     /// Resolve a delegated resource id → its file path (copied out so `self` can be reborrowed).
-    /// The wall clock NOW, as epoch seconds, for stamping a record. See `CLOCK_REFRESH_S`.
+    /// The wall clock NOW, as epoch seconds, for stamping a record. See `CLOCK_MAX_AGE_S`.
     ///
     /// Never blocks and never fails: a clock that cannot be reached yields `TIME_UNKNOWN`, and a
     /// record stamped with it reads back as "unknown" rather than as 1970.

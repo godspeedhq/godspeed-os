@@ -768,7 +768,7 @@ fn run_help_key(
 /// sends nothing more) from the start of a terminal escape sequence. The keyboard driver
 /// pushes a navigation key's whole `ESC [ … ~` atomically, so its follow-up byte is
 /// already queued and `try_console_read` returns it at once; a serial terminal may split
-/// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_TICKS`) before giving
+/// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_QUANTA`) before giving
 /// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
 /// How long to wait for a follow-up byte, counted in SCHEDULER QUANTA rather than cycles.
 ///
@@ -1728,14 +1728,6 @@ impl Line {
     }
 }
 
-/// Wait until the input subsystem reports in - the deterministic end-of-boot
-/// signal. The xHCI driver sets `input_ready` once it finishes, in every terminal
-/// path (keyboard up, no keyboard, or no controller), and it is the last
-/// subsystem to come up. So when it reports, the boot sequence - including the
-/// asynchronous xHCI enumeration on another core - is genuinely done, and we can
-/// clear the boot screen without ever cutting it off mid-stream. The loop is just
-/// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
-/// where the driver never reports (it would mean xHCI hard-crashed at boot).
 /// Report whether the input driver has announced itself - and do NOT wait for it.
 ///
 /// This used to spin up to fifty million times before the shell printed its first prompt, waiting for

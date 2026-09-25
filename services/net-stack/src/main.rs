@@ -2733,7 +2733,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // was DEAF for the ~45 s its budgets take when nothing answers - `net` said "net-stack
     // unavailable", `time` said "cannot reach net-stack", ping had no stack. The intermediate fix
     // was to skip the boot dance and configure on first demand, which only moved the deafness inside
-    // the loop. Neither is needed: `run_dance_serving` answers throughout, so the boot dance is back
+    // the loop. Neither is needed: `run_dance` answers throughout (its `serve_status` argument is what makes it serve), so the boot dance is back
     // and costs no responsiveness. Clients asking during it get the truthful unconfigured status.
     let d = if link_is_up(&ctx, pending) {
         run_dance(&ctx, pending, Some(&[0u8; 19]))

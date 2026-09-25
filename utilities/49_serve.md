@@ -4,6 +4,12 @@
 the guest's own report and the bytes the test machine received over a socket outside the guest. That
 test also runs `serve` twice on the same port, which is the regression for the listener leak below.
 
+**And hardware-verified on the HP T630 (2026-09-24), which is the run that matters most.** Three
+inbound connections from a separate machine on the LAN, each accepted, echoed and closed, every byte
+returned unchanged. QEMU structurally CANNOT test this: SLIRP's only peer is the gateway, so an
+unsolicited inbound connection from a real third party had never happened before that run. The whole
+point of `serve` is answering a stranger, and until then only the guest's own side had been proved.
+
     serve <port> [for]
 
 Listen on `<port>` and KEEP ANSWERING: each connection is accepted, printed, echoed back and closed,

@@ -170,7 +170,7 @@ pub fn unregister(name: &str) {
 /// What `unregister_endpoint` actually did. Returned rather than logged, because this module does its
 /// logging with the table lock RELEASED and because only the CALLER knows whether the outcome is
 /// interesting: the caller is the kill path, and it can see whether another live task still answers to
-/// this name (`scheduler::live_task_named_other_than`).
+/// this name (`scheduler::find_task_by_name_excluding`).
 ///
 /// The distinction exists to catch ONE bug, and it is silent in a healthy run. Two instances of one
 /// service can be alive at once (a supervisor respawn racing a death notification), and when the older

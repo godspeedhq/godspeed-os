@@ -40,12 +40,18 @@ use godspeed_sdk::Framebuffer;
 use crate::render;
 use crate::render::{CELL_H, CELL_W};
 
-/// End - jump to the NEWEST line and STAY in the view. Distinct from `SCROLL_LIVE`, which leaves.
-///
-/// They were the same action, and that was wrong: `End` took you to the bottom and dropped you out,
-/// so the only way to reach the newest line and keep looking was to not press the key named "End".
-/// Leaving is `Esc`'s job. "The view is at offset 0" and "there is no view" are different states and
-/// now have different actions.
+// KEY SEMANTICS - a note, deliberately NOT a doc comment.
+//
+// `End` jumps to the NEWEST line and STAYS in the view. Leaving the view is `Esc`, and only `Esc`.
+// They were the same action once, and that was wrong: `End` took you to the bottom and dropped you
+// out, so the only way to reach the newest line and keep looking was to not press the key named
+// "End". "The view is at offset 0" and "there is no view" are different states with different
+// actions.
+//
+// It carried three slashes until Audit 7. The item it documented went with the scroll-request
+// mechanism (`bbd24478`), and a doc comment left with no item does not warn you - it silently
+// attaches to the NEXT one. So `SB_BYTES`, a scrollback BYTE CAPACITY, was documented as "End -
+// jump to the NEWEST line", citing a constant that had been deleted in the same commit.
 
 pub(crate) const SB_BYTES: usize = 32 * 1024;
 

@@ -2,7 +2,8 @@
 
 **Utility:** `sock` - open a UDP socket capability and send a datagram through it
 **Status:** Built (first slice). As-built reference. Hardware-verified on the Raspberry Pi 2
-(2026-09-15): the mint, the grant and the badged invocation all complete on real hardware.
+(2026-09-15): the mint, the grant and the badged invocation all complete on real hardware. The
+DATAGRAM round trip took until 2026-09-25 and two separate fixes - see 3.
 **Shape:** shell built-in that opens a socket cap from `net-stack` and invokes it.
 
 ---
@@ -33,25 +34,40 @@ next steps (§7).
 
 ```
 gsh> sock
-sock: UDP socket cap - sent 29 bytes to 10.0.2.3:53, received 45 bytes back (a round-trip through a capability)
+sock: UDP socket cap - sent 29 bytes to 192.168.4.1:53, received 94 bytes back (a round-trip through a capability)
 ```
 
 The datagram is a small DNS query (just data that elicits a UDP response); `sock` reports the
 round-trip - bytes out and back - which proves the cap does real UDP I/O. When there is no NIC, the
-invocation returns nothing and `sock` says so plainly.
+invocation returns nothing and `sock` says so plainly. The destination is **the resolver from the
+DHCP lease**, which is why the address above is a LAN address and not a constant; with no lease,
+`sock` says there is no resolver rather than sending into the void.
 
-**The destination is hardcoded to `10.0.2.3:53`, which is a QEMU address, so on real hardware this
-reports 0 bytes back.** Measured on the Pi 2:
+### It took TWO fixes to work on hardware, and the first one's success hid the second
+
+This section used to say the destination was "hardcoded to `10.0.2.3:53`, which is a QEMU address,
+so on real hardware this reports 0 bytes back", and recommended reading the resolver from the lease.
+That was true, the fix shipped (`82705c59`), and **it was only half the cause**:
+
+1. **The address.** `10.0.2.3` is QEMU SLIRP's resolver and nothing else, so on any real LAN the
+   datagram went nowhere. Unfalsifiable under emulation, where the constant happens to be right.
+2. **The wait.** `udp_roundtrip` RE-TRANSMITTED the query on every retry and read whatever came back
+   from the send. `nic-driver` no longer couples a receive to a transmit, so each retry drained the
+   reply that HAD arrived and discarded it; it also never answered an ARP for us, and never paced its
+   polls. Fixed in `5716da17` by giving it the send-once-then-RX-poll shape the DNS path already had.
+
+The lesson is about the DOC, not the code: stating one cause confidently concealed the other. After
+fix 1 the address was right, the command still failed, and the spec said the cause was known. A
+partial diagnosis asserted as complete is worse than no diagnosis, because it stops the next person
+looking. Measured on the T630 between the two fixes:
 
 ```
-sock: UDP socket cap - sent 29 bytes to 10.0.2.3:53, received 0 bytes back (a round-trip through a capability)
+sock: UDP socket cap - sent 29 bytes to 192.168.4.1:53, nothing came back (the send went through the capability; the peer did not answer)
 ```
 
-That is the *capability* path working exactly as designed - minted, granted, invoked, badged, routed,
-answered - with the datagram sent to a host that does not exist on that LAN. `10.0.2.3` is the DNS
-server QEMU's user-mode network provides, and nothing else. The fix is for the demo to use the DNS
-server from the DHCP lease (`net` reports it) rather than a constant, and it is recorded here rather
-than left for the next person to diagnose from a zero.
+Right address, real resolver, reply destroyed in flight. The *capability* path - minted, granted,
+invoked, badged, routed, answered - was working correctly the whole time, which is what made the
+wrong half so easy to believe.
 
 **The socket path is deliberately UNTAGGED.** Every other net-stack request carries a correlation
 byte at offset 0 (`docs/net-tags-design.md` §8); a badged socket invocation does not, because the
