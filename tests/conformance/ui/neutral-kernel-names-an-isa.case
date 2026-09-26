@@ -1,0 +1,30 @@
+# target: kernel/src/ipc/message.rs
+# mode: append
+# checker: scripts/arch_boundary_check.py
+# why: The claim a port depends on: you write `arch/<isa>/` and NOTHING else in the kernel changes.
+# why: Neutral code reaches hardware only through the `arch::imp` seam, so a named ISA or inline asm
+# why: outside `arch/` is the boundary leaking. The fix is never to special-case the call site - it is
+# why: to add the missing primitive, because the fault is a MISSING primitive.
+--- plant ---
+
+fn _probe_tsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+--- expect ---
+error[GS0202]: neutral kernel code names an ISA, or contains inline assembly
+   --> kernel/src/ipc/message.rs:154
+    |
+    = commandment: I - CLAUDE.md 4.1
+    = why: A port is bounded to `arch/<isa>/`: you write that directory and nothing else in
+           the kernel changes. Neutral code reaches hardware only through the `arch::imp`
+           seam. Also: use `portable_atomic::AtomicU64`, never `core`'s - 32-bit RISC-V has
+           no 64-bit atomic.
+    = help: Add an `arch::imp` primitive and call that, rather than special-casing your arch
+            at the call site. The fault is a MISSING primitive, not a stubborn call site.
+    = note: `py scripts/conform.py --explain GS0202` for the long form
+
+  arch_boundary_check.py reported:
+  | Arch-boundary check - FAILURES (arch-specific code leaked into a neutral kernel layer):
+  |   kernel/src/ipc/message.rs:154: names `arch::x86_64::` directly - use `arch::imp::` (the seam) so a new arch stays a drop-in
+  |   kernel/src/ipc/message.rs:154: uses `core::arch::x86_64::` intrinsics in a neutral file - wrap it in an `arch::imp` primitive in kernel/src/arch/
+  | 2 violation(s). The neutral layers must reach hardware only through the `arch::imp` seam (docs/aarch64.md); add an `arch::imp` primitive rather than inlining asm or naming a specific arch. This keeps the NEXT port BOUNDED.

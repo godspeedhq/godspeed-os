@@ -15,5 +15,6 @@
 # which is a YAML edit rather than a Rust one. So the gap is specifically the local build, not CI.
 #
 # One name per line, relative to the repository root.
-
-scripts/python_floor_check.py
+# EMPTY, and that is the goal state. python_floor_check.py graduated into EXTRA_CHECKS the
+# moment Rust could be touched, which is exactly what this file was for: making the gap visible
+# until it could be closed rather than letting it go unnoticed.

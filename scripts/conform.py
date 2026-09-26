@@ -13,6 +13,8 @@ build, which is exactly what CLAUDE.md 22.7 says the repository must not require
     py scripts/conform.py --explain GS0403
     py scripts/conform.py --list       every rule, its code and its commandment
     py scripts/conform.py --selftest   prove the OUTPUT is good, not just that rules fire
+    py scripts/conform.py --bless      write the OBSERVED render into each case (read the diff!)
+    py scripts/conform.py --gallery    write tests/conformance/GALLERY.md - what a developer SEES
 
 THE ONE DESIGN DECISION, and everything else follows from it: **decidable versus judgement.**
 
@@ -408,12 +410,15 @@ SITE = re.compile(r"\b((?:[a-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:rs|md|toml|py|json|
 
 def run_one(script):
     try:
-        # ENCODING IS EXPLICIT. `text=True` alone decodes with the locale encoding, which on a
-        # Windows machine is not UTF-8 - so every `§` a checker printed came through as a
-        # replacement character. A tool that garbles the output it is quoting is not to be trusted
-        # about anything else.
+        # ENCODING IS EXPLICIT AT BOTH ENDS, and the second end is the one that was missing.
+        # Decoding as UTF-8 is not enough: a child Python writing to a PIPE on Windows ENCODES with
+        # the locale codec, so the bytes really were cp1252 and every section sign a checker printed
+        # arrived as a replacement character. `PYTHONIOENCODING` tells the child to emit UTF-8, which
+        # is the half that makes the decode correct. A tool that garbles the output it quotes is not
+        # one to trust about anything else.
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         r = subprocess.run([sys.executable, script], cwd=ROOT, capture_output=True,
-                           text=True, encoding="utf-8", errors="replace")
+                           text=True, encoding="utf-8", errors="replace", env=env)
     except OSError as e:
         return None, "conform: cannot run %s (%s)" % (script, e)
     return r.returncode, ANSI.sub("", (r.stdout or "") + (r.stderr or "")).rstrip()
@@ -492,7 +497,10 @@ def render_commandments(output):
         FOOTER = ("COMMANDMENTS.md is the law", "An exemption is legitimate")
         useful = []
         for d in detail:
-            if site and d.rstrip(":").strip() == site.split(":")[0]:
+            # Compare against BOTH forms. It compared only `site.split(":")[0]` - the path without the
+            # line number - while a checker prints `path:line`, so the site was never recognised and
+            # got printed as the `why`. A reason that restates the location says nothing.
+            if site and d.rstrip(":").strip() in (site, site.split(":")[0]):
                 continue
             if d.startswith(FOOTER):
                 continue
@@ -618,7 +626,8 @@ def explain_commandment(code):
     # file of that name, which fails quietly enough that the parse simply found nothing and the
     # explain printed "none found" - a wrong answer rather than an error.
     r = subprocess.run([sys.executable, os.path.join("scripts", "commandments.py"), "--report"],
-                       cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                       cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
     out = ANSI.sub("", (r.stdout or "") + (r.stderr or ""))
 
     mech, manual = [], []
@@ -690,8 +699,14 @@ UI_DIR = os.path.join(ROOT, "tests", "conformance", "ui")
 
 
 def _parse_case(path):
-    """(meta, plant, expect) from a `.case` file. See tests/conformance/ui/README.md."""
-    text = io.open(path, encoding="utf-8").read()
+    """(meta, plant, expect) from a `.case` file. See tests/conformance/ui/README.md.
+
+    `newline=""` IS LOAD-BEARING. With default universal-newline handling Python translates `\r\n` to
+    `\n` on read, which silently destroyed the carriage returns the CRLF case exists to plant - the
+    checker then found nothing and `--bless` recorded that as expected. A fixture loader must not
+    normalise, because some fixtures are ABOUT bytes.
+    """
+    text = io.open(path, encoding="utf-8", newline="").read()
     meta, plant, expect, where = {}, [], [], "head"
     for line in text.split("\n"):
         if line.strip() == "--- plant ---":
@@ -729,68 +744,221 @@ def _dirty_paths():
     return dirty
 
 
-def selftest():
-    """Plant each case, render it, restore, diff against its `expect`.
+def _run_case(meta, plant):
+    """Plant, render, restore. Returns (rendered_diagnostic_or_empty, error_or_None).
 
-    THE GUARD IS SCOPED TO THE CASE TARGETS, not to the tree. It was the whole tree at first, which
-    meant editing `conform.py` blocked `--selftest` - while iterating on the RENDERER, which is exactly
-    when the golden files are what you want. A guard that stops the work it protects gets turned off,
-    and then it protects nothing. The real risk is narrow: a plant landing on a file with unsaved work,
-    and a crash before the restore.
+    RESTORE IS IN A `finally` AND COMES FROM MEMORY, never from git. `mode: create` deletes the file it
+    made, for the same reason: a crash mid-case must not leave a planted violation or a stray file
+    behind. `commandments_redteam.py` restores with `git checkout`, and that has eaten uncommitted work
+    in this repository once already.
     """
-    if not os.path.isdir(UI_DIR):
-        print("conform --selftest: no tests/conformance/ui/ - nothing to check")
-        return 0
+    target = os.path.join(ROOT, meta.get("target", ""))
+    checker = meta.get("checker", "")
+    mode = meta.get("mode", "append")
+    if not checker:
+        return None, "case is malformed: needs `# checker:`"
 
-    cases = sorted(f for f in os.listdir(UI_DIR) if f.endswith(".case"))
-    if not cases:
-        print("conform --selftest: tests/conformance/ui/ holds no `.case` files")
-        return 0
-
-    parsed = [(fn, _parse_case(os.path.join(UI_DIR, fn))) for fn in cases]
-    dirty = _dirty_paths()
-    at_risk = sorted({m.get("target", "") for _, (m, _, _) in parsed} & dirty)
-    if at_risk:
-        print("conform --selftest: these case TARGETS have uncommitted changes, and a case plants a")
-        print("violation into them to measure it:")
-        for p in at_risk:
-            print("    %s" % p)
-        print("Commit or stash those files first. (The restore is byte-for-byte from an in-memory")
-        print("copy and never touches git - but a crash with unsaved work in a planted file is not a")
-        print("risk worth taking for a test.) Everything else in the tree may be dirty; only these")
-        print("matter.")
-        return 2
-
-    passed, failed = 0, []
-    for fn, (meta, plant, expect) in parsed:
-        target = os.path.join(ROOT, meta.get("target", ""))
-        checker = meta.get("checker", "")
-        mode = meta.get("mode", "append")
-        if not os.path.isfile(target) or not checker:
-            failed.append((fn, "case is malformed: needs `# target:` and `# checker:`"))
-            continue
-
+    created = mode == "create"
+    original = None
+    if not created:
+        if not os.path.isfile(target):
+            return None, "target does not exist: %s" % meta.get("target")
         original = io.open(target, "rb").read()
-        try:
+    elif os.path.exists(target):
+        return None, "mode: create but the target already exists: %s" % meta.get("target")
+
+    try:
+        if created:
+            d = os.path.dirname(target)
+            if d and not os.path.isdir(d):
+                os.makedirs(d)
+            io.open(target, "w", encoding="utf-8", newline="").write(plant)
+        else:
             text = original.decode("utf-8")
             io.open(target, "w", encoding="utf-8", newline="").write(
                 text + plant if mode == "append" else plant)
 
-            rc, out = run_one(checker)
-            if rc is None:
-                failed.append((fn, out))
-                continue
-            if expect.strip() == "NOTHING":
-                got = "" if rc == 0 else render(checker, out)
-                want = ""
-            else:
-                # Dry-run the fixer so a DECIDABLE case renders in its compact form, exactly as it
-                # would for a real `--check`. Never `apply=True`: the plant must survive being
-                # measured.
-                got = render(checker, out, [rel for rel, _ in fix_decidable(apply=False)]) if rc else ""
-                want = expect
-        finally:
+        rc, out = run_one(checker)
+        if rc is None:
+            return None, out
+        if rc == 0:
+            return "", None
+        return render(checker, out, [rel for rel, _ in fix_decidable(apply=False)]), None
+    finally:
+        if created:
+            if os.path.exists(target):
+                os.remove(target)
+        else:
             io.open(target, "wb").write(original)
+
+
+def _guard(parsed):
+    """Refuse if a case TARGET has uncommitted work. Scoped to the targets, not the tree."""
+    dirty = _dirty_paths()
+    at_risk = sorted({m.get("target", "") for _, (m, _, _) in parsed} & dirty)
+    if at_risk:
+        print("conform: these case TARGETS have uncommitted changes, and a case plants a violation")
+        print("into them to measure it:")
+        for p in at_risk:
+            print("    %s" % p)
+        print("Commit or stash those files first. The restore is byte-for-byte from an in-memory copy")
+        print("and never touches git, but a crash with unsaved work in a planted file is not a risk")
+        print("worth taking for a test. Everything else in the tree may be dirty.")
+        return False
+    return True
+
+
+def _cases():
+    if not os.path.isdir(UI_DIR):
+        return []
+    return [(fn, _parse_case(os.path.join(UI_DIR, fn)))
+            for fn in sorted(f for f in os.listdir(UI_DIR) if f.endswith(".case"))]
+
+
+def bless():
+    """Write the OBSERVED render into each case's `expect` block.
+
+    rustc's `--bless`. The dangerous flag in any UI-test suite, because blessing a regression is one
+    keystroke - so it names every case it changed and a human still reads the diff. A golden file
+    DEFENDS a judgement; it cannot make one. `--selftest` never writes.
+    """
+    parsed = _cases()
+    if not parsed:
+        print("conform --bless: no cases")
+        return 0
+    if not _guard(parsed):
+        return 2
+
+    changed = 0
+    for fn, (meta, plant, expect) in parsed:
+        got, err = _run_case(meta, plant)
+        if err:
+            print("  SKIP  %s: %s" % (fn, err))
+            continue
+        new = got if got else "NOTHING"
+        if _norm(new) == _norm(expect):
+            print("  same  %s" % fn)
+            continue
+
+        path = os.path.join(UI_DIR, fn)
+        text = io.open(path, encoding="utf-8", newline="").read()
+        head, sep, _rest = text.partition("--- expect ---")
+        if not sep:
+            print("  SKIP  %s: no `--- expect ---` marker" % fn)
+            continue
+        eol = "\r\n" if "\r\n" in text else "\n"
+        io.open(path, "w", encoding="utf-8", newline="").write(
+            head + sep + eol + new.replace(chr(10), eol) + eol)
+        changed += 1
+        print("  BLESSED %s" % fn)
+
+    print()
+    print("conform --bless: %d case(s) updated. READ THE DIFF - blessing a regression is one"
+          % changed)
+    print("keystroke, and a golden file defends a judgement rather than making one.")
+    return 0
+
+
+GALLERY_PATH = os.path.join(ROOT, "tests", "conformance", "GALLERY.md")
+
+
+def gallery():
+    """Render every case into one markdown catalogue: what a contributor SEES, per rule.
+
+    WRITES THE FILE ITSELF, UTF-8. Printing to stdout and redirecting died on Windows, where the console
+    is cp1252 and the catalogue quotes an em-dash and a section sign - the encoder refuses before the
+    shell ever sees the bytes, leaving an EMPTY file.
+
+    IT LIVES IN `tests/conformance/`, not `docs/`, because a catalogue of violations IS a pile of
+    violations: it contains a dead symbol, a rotted `path:line` and a POSIX word shown as a command,
+    since those are what it catalogues. In `docs/` it failed three gates and perturbed three unrelated
+    cases. `tests/conformance/` is exempt in the three checkers that would scan it, the same way
+    `audits/` is - the content is evidence of what was seen, not a claim about the code now.
+    """
+    parsed = _cases()
+    if not parsed:
+        print("conform --gallery: no cases")
+        return 0
+    if not _guard(parsed):
+        return 2
+
+    rows = [(fn, meta, _run_case(meta, plant)) for fn, (meta, plant, _e) in parsed]
+
+    out = ["<!-- SPDX-License-Identifier: GPL-2.0-only -->",
+           "# What `conform` says when something is wrong", "",
+           "**GENERATED - do not edit.** Regenerate with:", "",
+           "    py scripts/conform.py --gallery", "",
+           "The catalogue of what a contributor actually SEES, one entry per rule, produced by "
+           "planting a",
+           "real violation and capturing the output. Generated from the same "
+           "`tests/conformance/ui/*.case`",
+           "corpus that `--selftest` verifies, so the catalogue cannot drift from the tested "
+           "behaviour: one",
+           "corpus, two views.", "",
+           "Why it exists: `CLAUDE.md` 22.7 says **a gate that fires with an unhelpful message is a "
+           "finding,",
+           "not a pass**. That is a claim about rendered text, and the only way to hold it is to READ "
+           "the",
+           "text - so it is written down, reviewable in a diff, and regenerated rather than "
+           "remembered.", ""]
+
+    for fn, meta, (got, err) in rows:
+        out.append("## %s" % fn[:-5].replace("-", " "))
+        out.append("")
+        why = meta.get("why", "").strip()
+        if why:
+            out.append(why)
+            out.append("")
+        out.append("*Planted in `%s` (`%s`), caught by `%s`.*"
+                   % (meta.get("target", "?"), meta.get("mode", "append"),
+                      meta.get("checker", "?")))
+        out.append("")
+        if err:
+            out.append("```")
+            out.append("CASE DID NOT RUN: %s" % err)
+            out.append("```")
+        elif not got:
+            out.append("**No finding, and that is the point.** This case exists to prove the gate "
+                       "stays QUIET here.")
+        else:
+            out.append("```")
+            out.extend(got.split(chr(10)))
+            out.append("```")
+        out.append("")
+
+    body = chr(10).join(out) + chr(10)
+    d = os.path.dirname(GALLERY_PATH)
+    if not os.path.isdir(d):
+        os.makedirs(d)
+    io.open(GALLERY_PATH, "w", encoding="utf-8", newline=chr(10)).write(body)
+    print("conform --gallery: wrote %s (%d entries)"
+          % (os.path.relpath(GALLERY_PATH, ROOT).replace(os.sep, "/"), len(rows)))
+    return 0
+
+
+def selftest():
+    """Plant each case, render it, restore, diff against its `expect`. Never writes a case.
+
+    THE GUARD IS SCOPED TO THE CASE TARGETS, not to the tree. It was the whole tree at first, which
+    meant editing `conform.py` blocked `--selftest` - while iterating on the RENDERER, which is exactly
+    when the golden files are what you want. A guard that stops the work it protects gets turned off,
+    and then it protects nothing.
+    """
+    parsed = _cases()
+    if not parsed:
+        print("conform --selftest: tests/conformance/ui/ holds no `.case` files")
+        return 0
+    if not _guard(parsed):
+        return 2
+
+    passed, failed = 0, []
+    for fn, (meta, plant, expect) in parsed:
+        got, err = _run_case(meta, plant)
+        if err:
+            failed.append((fn, err))
+            print("  FAIL  %s" % fn)
+            continue
+        want = "" if expect.strip() == "NOTHING" else expect
 
         if _norm(got) == _norm(want):
             passed += 1
@@ -799,23 +967,30 @@ def selftest():
             failed.append((fn, None))
             print("  FAIL  %s" % fn)
             print("    --- expected ---")
-            for ln in (want or "(no finding)").split("\n"):
+            for ln in (want or "(no finding)").split(chr(10)):
                 print("    %s" % ln)
             print("    --- got ---")
-            for ln in (got or "(no finding)").split("\n"):
+            for ln in (got or "(no finding)").split(chr(10)):
                 print("    %s" % ln)
 
     print()
     for fn, why in failed:
         if why:
             print("  %s: %s" % (fn, why))
-    print("conform --selftest: %d of %d case(s) render as expected" % (passed, len(cases)))
-    return 0 if passed == len(cases) else 1
+    print("conform --selftest: %d of %d case(s) render as expected" % (passed, len(parsed)))
+    return 0 if passed == len(parsed) else 1
+
 
 
 def main(argv):
     if "--selftest" in argv:
         return selftest()
+
+    if "--bless" in argv:
+        return bless()
+
+    if "--gallery" in argv:
+        return gallery()
 
     if "--explain" in argv:
         i = argv.index("--explain")

@@ -29,6 +29,14 @@ import conform_ok               # noqa: E402  - the shared `conform-ok` escape m
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKIP_DIRS = ('target', '.git', 'build', 'node_modules', 'book', 'audits', 'milestones', 'bugs')
+# `tests/conformance/` is the UI-fixture corpus and the GENERATED gallery, which quote
+# violations VERBATIM - a rotted citation and a POSIX word used as a command are in there on
+# purpose, because that is what they catalogue. Same genre as the `audits/` exemption above:
+# evidence of what was seen, not a claim about the code now. A path prefix rather than a
+# SKIP_DIRS entry because it is a subtree, and narrow on purpose - `tests/` at large is still
+# scanned.
+FIXTURE_SUBTREE = 'tests/conformance/'
+
 CITE = re.compile(r'((?:services|kernel|sdk|osdev|scripts|examples|tests)/[A-Za-z0-9_./-]+\.(?:rs|py)):([0-9]{1,5})\b')
 WINDOW = 10          # lines either side the anchor may have drifted: a citation should land you
 MIN_ANCHOR = 6       # a word shorter than this is not distinctive enough to anchor on
@@ -57,6 +65,8 @@ def main():
                 continue
             path = os.path.join(root, name)
             rel = os.path.relpath(path, ROOT).replace(os.sep, '/')
+            if rel.startswith(FIXTURE_SUBTREE):
+                continue
             if rel.startswith('scripts/line_ref_check.py'):
                 continue
             try:

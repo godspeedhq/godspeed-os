@@ -1,0 +1,28 @@
+# target: docs/pipes.md
+# mode: append
+# checker: scripts/doc_symbols_check.py
+# why: A rename breaks prose SILENTLY, because the sentence still reads correctly. Four had rotted when
+# why: this gate was written, one of them in CLAUDE.md pointing at a file an amendment in the same
+# why: document had deleted. The legitimate escape is the baseline, with a reason on the line - a
+# why: deliberate mention of an external symbol is not a defect.
+--- plant ---
+
+The buffer is threaded by `pipe_thread_the_needle`, which returns the stage count.
+--- expect ---
+error[GS0402]: a document names a symbol that does not exist in the source
+   --> docs/pipes.md
+    |
+    = rule: CLAUDE.md 26.7
+    = why: A rename breaks prose SILENTLY, because the sentence still reads correctly. Four
+           had rotted when this was written, one of them in CLAUDE.md pointing at a file an
+           amendment in the same document had deleted.
+    = help: Name what does the job now. If the mention is deliberate - an external symbol, or
+            a proposal that was never built - add it to `scripts/DOC-SYMBOLS.baseline.txt`
+            with the reason on the line. The baseline may shrink freely; it may not grow
+            silently.
+    = note: `py scripts/conform.py --explain GS0402` for the long form
+
+  doc_symbols_check.py reported:
+  | DOC SYMBOL CHECK FAILED: 1 backticked name(s) in current-tense docs match nothing in the source.
+  |   pipe_thread_the_needle             docs/pipes.md
+  | (5 more lines of explanation, which the frame above covers - `py scripts/doc_symbols_check.py` for all of it)

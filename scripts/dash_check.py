@@ -9,6 +9,7 @@ was previously kept by hand-grepping each diff; this makes it a mechanical CI gu
 Exit: 0 if no em/en dash is present in tracked text files, 1 otherwise.
 """
 
+import os
 import subprocess
 import sys
 import re
@@ -30,6 +31,13 @@ TEXT_SUFFIXES = {".rs", ".md", ".toml", ".py", ".yml", ".yaml", ".sh", ".json", 
                  ".js", ".txt", ".gsh", ".c", ".h", ".s", ".ld", ".cfg", ".conf"}
 
 
+# `tests/conformance/` holds the UI fixtures and the GENERATED gallery, which quote violations
+# verbatim - including an em-dash, because one case is about em-dashes. Exempt for the same reason
+# `audits/` is exempt from `line_ref_check`: the content is a record of what was SEEN, not a claim.
+# By path, and narrow: nothing else under `tests/` is exempt.
+CONFORMANCE_FIXTURES = "tests/conformance/"
+
+
 def tracked_files() -> list[Path]:
     """Git-tracked files, so generated/vendored trees (target/, build/, tools/) are never scanned."""
     out = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
@@ -39,6 +47,8 @@ def tracked_files() -> list[Path]:
 def main() -> int:
     violations: list[str] = []
     for path in tracked_files():
+        if CONFORMANCE_FIXTURES in str(path).replace(os.sep, "/"):
+            continue
         if path.suffix.lower() not in TEXT_SUFFIXES:
             continue
         try:

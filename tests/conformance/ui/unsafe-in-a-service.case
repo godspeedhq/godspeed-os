@@ -1,0 +1,33 @@
+# target: services/observe/src/main.rs
+# mode: append
+# checker: scripts/unsafe_check.py
+# why: Commandment X and CLAUDE.md 18.2: a service may not write `unsafe`, full stop. The SDK's
+# why: `Mmio`/`Dma` wrappers exist precisely so a DRIVER needs none either, and `services/` is at zero
+# why: mechanically. The compiler refuses it too (`#![deny(unsafe_code)]`), which is the stronger half;
+# why: this holds the audit inventory to the source.
+# why:
+# why: First written against `examples/00-hello` and BLESSED to "no finding", because `unsafe_check`
+# why: scans `services/` and `sdk/`. A green case that proves nothing is worse than a missing one.
+--- plant ---
+
+fn _probe() -> u32 {
+    unsafe { core::ptr::read_volatile(0x1000 as *const u32) }
+}
+--- expect ---
+error[GS0201]: the unsafe inventory does not match the source
+   --> services/observe/src/main.rs
+    |
+    = commandment: X - CLAUDE.md 18
+    = why: Unsafe is permitted only in arch/, memory/, capability/ and smp/, plus the SDK's
+           audited hardware/ABI layer, and every block carries a SAFETY comment. The
+           grandfathered counts may FALL freely and may rise only by a recorded 18.5
+           amendment.
+    = help: If you added an `unsafe` block, add it to `audits/unsafe-audit.md` in the same
+            commit. If you removed one, lower the frozen count. If a service needs `unsafe`,
+            it does not: go through the SDK's `Mmio`/`Dma` wrappers.
+    = note: `py scripts/conform.py --explain GS0201` for the long form
+
+  unsafe_check.py reported:
+  | Unsafe audit - FAILURES:
+  |   FAIL  services/observe/src/main.rs: 1 unsafe line(s) - §18.2 forbids `unsafe` in a userspace service; move it behind a safe SDK wrapper (§18.1, e.g. sdk `adversarial`/`mmio`/`dma`)
+  | 1 violation(s). See audits/unsafe-audit.md and §18 of CLAUDE.md for the policy.

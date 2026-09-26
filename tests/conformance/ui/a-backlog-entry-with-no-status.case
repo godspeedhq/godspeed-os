@@ -1,0 +1,28 @@
+# target: backlog/99-a-conform-probe-entry.md
+# mode: create
+# checker: scripts/backlog_check.py
+# why: 26.7 says a limitation that cannot be closed is RECORDED. A record nobody can find is not a
+# why: record, and a record whose STATE is unclear is worse: two hand surveys of that folder disagreed
+# why: with each other before the status line was made mandatory and mechanical - one read only the
+# why: first four lines, one put three closed items in the open pile.
+--- plant ---
+# 99 - a probe entry with no status line
+
+Created by a conformance case and deleted immediately afterwards.
+--- expect ---
+error[GS0410]: a backlog entry has no status line, or is not linked from the index
+   --> backlog/99-a-conform-probe-entry.md
+    |
+    = rule: CLAUDE.md 26.7
+    = why: 26.7 says a limitation that cannot be closed is RECORDED. A record nobody can find
+           is not a record: two hand surveys of that folder disagreed with each other before
+           the status line was made mandatory and mechanical.
+    = help: Put `**Status:` in the first 12 lines carrying OPEN or CLOSED, and add a row to
+            `backlog/README.md`. An entry also owes its evidence, what is RULED OUT, and the
+            next concrete step.
+    = note: `py scripts/conform.py --explain GS0410` for the long form
+
+  backlog_check.py reported:
+  | backlog check: NOT INDEXED: backlog/99-a-conform-probe-entry.md is not linked from backlog/README.md
+  | backlog check: NO STATUS: backlog/99-a-conform-probe-entry.md has no "**Status:" line carrying CLOSED/OPEN/RESOLVED/FIXED (capitals) in its first 12 lines
+  | (1 more line of explanation, which the frame above covers - `py scripts/backlog_check.py` for all of it)

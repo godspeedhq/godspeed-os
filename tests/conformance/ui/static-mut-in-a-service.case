@@ -1,0 +1,23 @@
+# target: services/observe/src/main.rs
+# mode: append
+# checker: scripts/commandments.py
+# why: Commandment VI, and the reason it is absolute: unowned global mutable state in a service is
+# why: state nobody owns, which invariants 8 and 9 forbid outright. A service keeps its state in its own
+# why: bounded structures, and anything that must outlive a restart is persisted and reconstructed -
+# why: because the service WILL be restarted (Commandment IX), and a static does not survive that.
+# why:
+# why: Note the check is about SERVICES: the first draft planted this in `examples/` and was blessed to
+# why: "no finding", which is the `--bless` hazard doing exactly what it was documented to do.
+--- plant ---
+
+static mut PROBE_TICKS: u32 = 0;
+--- expect ---
+error[GS0006]: no unowned global mutable state in services
+   --> services/observe/src/main.rs:416
+    |
+    = commandment: VI - Thou shalt not introduce shared mutable state.
+    = why: unowned global mutable state: give it an owner, or pass it explicitly
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0006` for the long form

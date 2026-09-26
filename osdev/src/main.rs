@@ -101,6 +101,25 @@ enum Commands {
     },
     /// Validate all service contracts against the JSON schema.
     Validate,
+    /// Check the tree against every rule this project enforces, and fix what is decidable.
+    ///
+    /// The front door to the enforcement layer: it fixes what has one right answer (dashes, line
+    /// endings) and REPORTS what needs a decision, naming which Commandment a violation breaks.
+    /// `--check` changes nothing, which is what CI wants. See `docs/conformance.md`.
+    Conform {
+        /// Report everything and change nothing (non-zero if anything would change).
+        #[arg(long)]
+        check: bool,
+        /// Prove the rendered OUTPUT is right, against `tests/conformance/ui/*.case`.
+        #[arg(long)]
+        selftest: bool,
+        /// Every rule, its code and its Commandment, with the code legend.
+        #[arg(long)]
+        list: bool,
+        /// The long form for one rule code, e.g. `GS0004`.
+        #[arg(long, value_name = "CODE")]
+        explain: Option<String>,
+    },
     /// Format a disk image with a GodspeedOS filesystem superblock (docs/persistence.md §6).
     Mkfs { image: String },
     /// Build a flashable GSFS data disk with a `.gsh` script baked in (run it on hardware).
@@ -123,6 +142,8 @@ fn main() {
         Commands::Image { mode }     => cmd_image(&mode),
         Commands::Shell { smp }      => cmd_shell(smp),
         Commands::Validate           => cmd_validate(),
+        Commands::Conform { check, selftest, list, explain } =>
+            cmd_conform(check, selftest, list, explain.as_deref()),
         Commands::Mkfs { image }     => cmd_mkfs(&image),
         Commands::ScriptDisk { out, script } => cmd_script_disk(&out, &script),
     }
@@ -442,7 +463,46 @@ const EXTRA_CHECKS: &[&str] = &[
     // a name as resolved if it appears anywhere in the source INCLUDING comments, which applied to
     // comments is circular - the comment would satisfy itself. Here a cited name must be in CODE.
     "scripts/comment_symbol_check.py",
+
+    // The declared Python floor must be the TRUE one. `README.md` tells a contributor they need 3.8,
+    // and a hand-measured number is right on the day it is taken and silently wrong afterwards - the
+    // lesson `shared_surface_check.py` was written for. Without this, the next script using a `match`
+    // statement raises the real floor to 3.10 and a contributor on 3.8 meets the drift as a
+    // SyntaxError FROM A CHECKER, which is the worst first experience this repository can offer.
+    //
+    // This was in `scripts/CONFORM-EXTRA.txt` while the branch that wrote it touched no Rust. That
+    // file exists to make such a gap VISIBLE rather than silent, and it is empty again now.
+    "scripts/python_floor_check.py",
 ];
+
+/// `osdev conform` - forward to `scripts/conform.py` and pass its exit code through.
+///
+/// DELIBERATELY A SHIM. `conform` stays a script for the same reason the seventeen checkers do: it IS
+/// the enforcement layer, Python is already a hard dependency (this binary refuses to build without
+/// it), and re-implementing it in Rust is the optional half `docs/conformance.md` records as declined.
+/// A wrapper that forwards cannot drift from the thing it forwards to.
+///
+/// THE EXIT CODE IS PASSED THROUGH, which is the one thing a wrapper here must get right. `conform`
+/// returns non-zero when something needs a decision; a shim that returned 0 anyway would turn a loud
+/// failure into a silent one, which is the defect the tool exists to stop.
+fn cmd_conform(check: bool, selftest: bool, list: bool, explain: Option<&str>) {
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg("scripts/conform.py");
+    if check { cmd.arg("--check"); }
+    if selftest { cmd.arg("--selftest"); }
+    if list { cmd.arg("--list"); }
+    if let Some(code) = explain { cmd.args(["--explain", code]); }
+
+    match cmd.status() {
+        Ok(st) => std::process::exit(st.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("osdev: cannot run scripts/conform.py ({e}).");
+            eprintln!("osdev: Python 3.8 or newer must be on PATH as `python` - see README.md, \
+                       Requirements. A checker that cannot run is not a checker that passed.");
+            std::process::exit(2);
+        }
+    }
+}
 
 fn commandment_check() {
     for extra in EXTRA_CHECKS {

@@ -1,0 +1,34 @@
+# target: docs/pipes.md
+# mode: append
+# checker: scripts/line_ref_check.py
+# why: A line number is the fastest-rotting citation in the repository - every edit above it moves it.
+# why: Audit 7 found 7 of 11 live citations wrong, with FOUR documents citing one dead line because the
+# why: citation had been copied rather than checked. `audits/`, `milestones/` and `bugs/` are exempt:
+# why: a line number correct on the day an audit ran is a true record of what was seen.
+# why:
+# why: The check is ANCHORED - it looks for a distinctive word from the citing sentence near the cited
+# why: line - so a citation must carry a real word to be judged. The first draft cited a line past the
+# why: end of a file in a sentence with nothing to anchor on, and was blessed to "no finding".
+--- plant ---
+
+The bounded inter-stage buffer and its overflow behaviour are implemented at
+`services/shell/src/main.rs:12` - see the surrounding pipeline staging code.
+--- expect ---
+error[GS0404]: a `path:line` citation no longer points at what it claims
+   --> docs/pipes.md:271
+    |
+    = rule: CLAUDE.md 26.7
+    = why: A line number is the fastest-rotting citation in the repository: every edit above
+           it moves it. Audit 7 found 7 of 11 live citations wrong, with four documents
+           citing ONE dead line because the citation had been copied rather than checked.
+    = help: Re-point it, or cite the FUNCTION or the distinctive comment instead - those
+            survive editing and a reader can grep for them. `audits/`, `milestones/` and
+            `bugs/` are exempt: a line number correct on the day an audit ran is a true
+            record of what was seen.
+    = note: `py scripts/conform.py --explain GS0404` for the long form
+
+  line_ref_check.py reported:
+  | line refs: 1 citation(s) no longer point at what they claim
+  |   docs/pipes.md:271
+  |       cites services/shell/src/main.rs:12 - nothing within 10 lines matches the citing sentence
+  | (4 more lines of explanation, which the frame above covers - `py scripts/line_ref_check.py` for all of it)

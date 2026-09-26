@@ -1,0 +1,28 @@
+# target: docs/zz-conform-probe.md
+# mode: create
+# checker: scripts/docs_index_check.py
+# why: An index that calls itself the index while files are invisible to it is worse than no index.
+# why: Two documents sat unlisted in `docs/`, and six backlog entries before that - and a reader picks
+# why: from the index, so a file nobody can reach is a file nobody reads. `mode: create` exists for
+# why: this shape of rule: it can only be tripped by a file that does not exist yet.
+--- plant ---
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
+# A probe document
+
+Created by a conformance case and deleted immediately afterwards.
+--- expect ---
+error[GS0408]: a file in docs/ is not reachable from the docs index
+   --> docs/CLAUDE.md
+    |
+    = rule: CLAUDE.md 5
+    = why: An index that calls itself the index while files are invisible to it is worse than
+           no index. Two documents sat unlisted, and six backlog entries before that.
+    = help: Add a row to `docs/CLAUDE.md` saying what the file is FOR. A reader picks from
+            the index; a one-word entry does not help them choose.
+    = note: `py scripts/conform.py --explain GS0408` for the long form
+
+  docs_index_check.py reported:
+  | DOCS INDEX CHECK FAILED: 1 file(s) in docs/ are named nowhere in docs/CLAUDE.md
+  |   docs/zz-conform-probe.md
+  | CLAUDE.md 5 designates `docs/CLAUDE.md` as the index for this directory. A document
+  | (3 more lines of explanation, which the frame above covers - `py scripts/docs_index_check.py` for all of it)

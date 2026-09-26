@@ -1,0 +1,29 @@
+# target: docs/pipes.md
+# mode: append
+# checker: scripts/foreign_word_check.py
+# why: The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`, `count` - and a
+# why: foreign word is a HINT, never an alias: `ls` does not run, it answers ``try `dir` ``. The
+# why: `ls` to `dir` rename reached the shell, the specs and the help text and missed TEN worked
+# why: examples, which is why this is gated from the shell's own FOREIGN_HINTS rather than a list.
+--- plant ---
+
+```
+gsh> ls /data
+```
+--- expect ---
+error[GS0406]: a document shows a POSIX or DOS word being used as a command
+   --> docs/pipes.md:271
+    |
+    = rule: CLAUDE.md Appendix B.4
+    = why: The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`,
+           `count` - and a foreign word is a HINT, never an alias: `ls` does not run, it
+           answers ``try `dir` ``. The `ls` to `dir` rename reached the shell, the specs and
+           the help text, and missed TEN worked examples.
+    = help: Use the Godspeed word. The list this checks is read from the shell's own
+            `FOREIGN_HINTS`, so it cannot drift from what the shell actually refuses.
+    = note: `py scripts/conform.py --explain GS0406` for the long form
+
+  foreign_word_check.py reported:
+  | foreign words: 1 example(s) use a word the shell REFUSES
+  |   docs/pipes.md:271
+  | (5 more lines of explanation, which the frame above covers - `py scripts/foreign_word_check.py` for all of it)
