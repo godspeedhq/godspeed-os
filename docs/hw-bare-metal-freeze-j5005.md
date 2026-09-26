@@ -1,6 +1,20 @@
 # Bare-Metal Boot Freeze - Intel J5005 (Goldmont+, Wyse 5070)
 
-## Status: Backburner - blocked by firmware
+## Status: RESOLVED - the Wyse 5070 boots bare metal and is a routine test machine
+
+This freeze does not reproduce. On 2026-06-09 a hardened image booted the Wyse first try - four
+cores, the AHCI flash, the Realtek NIC taking a DHCP lease and answering a ping, the shell
+(`milestones/ALMANAC.md`) - and the board has been a standing hardware target since: selfcheck
+377/0 twice and 100 rounds of chaos max-carnage with zero kernel panics and zero wedges
+(`docs/probe-params-design.md`).
+
+The C-state hypothesis below was never confirmed, and it is not what was blocking: MSR 0xE2 is still
+locked by firmware on this part, the OS still cannot raise the C-state limit, and it boots anyway.
+`milestones/ALMANAC.md` records the diagnosis this board's symptoms were traced to instead, and it
+was in our own concurrency - core 0 wedging with interrupts disabled, so a task blocked on `recv` on
+the BSP was never woken (`bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md`,
+`bugs/1_FINDINGS_AP_TO_BSP_IPI.md`). Nothing in the boot path had to be told about this board; the
+rest of this file is the record of the investigation as it stood.
 
 ## Symptom
 
@@ -38,19 +52,14 @@ interrupts are dropped after supervisor is queued but before it gets its first
 quantum. The system then spins silently in the idle loop with no runnable tasks
 getting CPU time.
 
-## Why we cannot fix it
+## Why the MSR cannot be changed (still true, and still not a blocker)
 
-- Lock bit prevents OS from raising the C-state limit via RDMSR/WRMSR.
+- The lock bit prevents the OS from raising the C-state limit via RDMSR/WRMSR.
 - Firmware does not expose the setting in BIOS/UEFI setup.
-- Would require custom BIOS/microcode or an ACPI override - out of scope.
+- Changing it would require custom BIOS/microcode or an ACPI override - out of scope.
 
-## Workaround for testing
-
-Use QEMU (`osdev run --smp 4`) for all development and test cycles.
-The full build with probe services runs correctly in QEMU.
-
-Hardware testing: wait for AMD GX-420GI (HP T630) which does not have the
-Goldmont+ APIC power-gating quirk.
+The machine boots and runs the full suite with the MSR exactly as locked, so none of this needs
+working around.
 
 ## Hardware data points
 

@@ -2055,11 +2055,18 @@ fn handle_alloc_mem(size: u64) -> i64 {
 ///   Returns the current generation of the named endpoint as a non-negative
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
-    // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
-    // are ungated, as are the
-    // boot/RTC reads (10, 11). Every other query discloses another task's or
-    // system-wide state and requires the INTROSPECT capability with READ (§3.1;
-    // docs/introspection-capability.md).
+    // THE LIST BELOW IS THE UNGATED SET, and it is written that way round on purpose: a query added
+    // without thought lands on the GATED side, which is the safe default (§3.1). Ungated are
+    // self-state (0 = own alloc bytes, 13 = do I own the console foreground), the cycle counter (3),
+    // and task-neutral board/transport facts that disclose nobody's state: the RTC and timing reads
+    // (10, 11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
+    // EMMC base clock, one byte off the COM2 operator channel and the board MAC (14, 15, 18, 19, 20,
+    // 21, 23). Every other query discloses another task's or system-wide state and requires the
+    // INTROSPECT capability with READ (docs/introspection-capability.md).
+    //
+    // 9 and 22 are dead entries: both queries were REMOVED (see the notes at their old arms below),
+    // so they fall through to `_` either way. Kept listed rather than silently dropped because an
+    // allowlist is the wrong place to leave a reader guessing whether an absence was deliberate.
     if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)

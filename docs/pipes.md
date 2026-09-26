@@ -25,12 +25,14 @@ A pipeline is **one producer, zero or more filters, one sink**:
  PRODUCER  |    FILTER | FILTER  |     SINK
 ```
 
-- **PRODUCER** - emits text (or records), ignores input. Built-ins: `read`, `echo`, `dir`, `tree`,
-  `find`, the system-info commands `about` / `mem` / `cores` / `date` / `help`, and the introspection
-  producers `status` / `caps` / `drives` / `observe now`. Services: `greet` (text),
-  `roster` (records). *(There is no `cat`: `read` is the one file reader - `utilities/18_read.md`,
-  the replacement for POSIX `cat`, whose name describes a different operation. This OS does not
-  carry POSIX vocabulary for its own sake.)*
+- **PRODUCER** - emits text (or records), ignores input. Text built-ins
+  (`is_producer_builtin`): `read`, `echo`, `tree`, `input`, and the system-info commands `about` /
+  `version` / `whatis` / `mem` / `cores` / `date` / `net` / `ping` / `sock` / `help`. Record
+  built-ins (`is_record_producer`): `status`, `dir`, `caps`, `drives`, `find`, `uptime`, `events`,
+  `trace`, `jobs`, and `observe now`. Services: `greet` (text), `roster` (records). *(There is no
+  `cat`: `read` is the one file reader - `utilities/18_read.md`, the replacement for POSIX `cat`,
+  whose name describes a different operation. This OS does not carry POSIX vocabulary for its own
+  sake.)*
 - **FILTER** - consumes input, emits output. Service: `upper`. Built-ins: `match`/`count`/`sort`/
   `first`/`last` (text) and the record verbs `where`/`select`/`sort`/`from`/`to` (`docs/records.md`).
 - **SINK** - consumes the final buffer. Built-in: `write [append|prepend] <file>` (plain
@@ -39,13 +41,9 @@ A pipeline is **one producer, zero or more filters, one sink**:
   recognised sink, the buffer is printed.
 
 The shell threads a bounded buffer down the chain: stage 1 fills it, each filter transforms it,
-the sink consumes it. Each inter-stage buffer is **16 KiB** (loud on overflow, §26.6); it lives
-> **Corrected 2026-09-26: this document claimed 64 KiB in nine places** (a tenth names it as history, below, and is kept). The buffer is
-> `CAP_MAX = 16 * 1024` (`services/shell/src/main.rs`), and the comment above that constant
-> records the history - "Cost, unchanged from when this was 64 KiB". It was shrunk for stack
-> headroom and this page never followed, so the two-coexisting figure was wrong by 4x too.
-on the user stack - two coexist for a middle filter (input + output ≈ 32 KiB), within the
-256 KiB user stack.
+the sink consumes it. Each inter-stage buffer is **16 KiB** (`CAP_MAX` in
+`services/shell/src/main.rs`; loud on overflow, §26.6); it lives on the user stack - two coexist
+for a middle filter (input + output ≈ 32 KiB), within the 256 KiB user stack.
 
 Examples:
 
@@ -63,8 +61,9 @@ The governing idea is simple: **anything that displays information can be saved.
 pipe source iff its job is to *emit data*. That splits the command set three ways:
 
 - **Data / display commands → pipe sources.** Anything whose purpose is to show you something:
-  `about`, `mem`, `cores`, `date`, `help`, `status`, `dir`, `caps`, `drives`, `find`, `tree`,
-  `read`, `echo`, `observe now`. Each renders through an `Out` target that is the console when run
+  `about`, `version`, `whatis`, `mem`, `cores`, `date`, `net`, `ping`, `sock`, `help`, `status`,
+  `dir`, `caps`, `drives`, `find`, `uptime`, `events`, `trace`, `jobs`, `tree`, `read`, `echo`,
+  `input`, `observe now`. Each renders through an `Out` target that is the console when run
   bare and a capture buffer when piped - so `about` prints, and `about | write /f` saves, the same
   bytes. No new authority: a built-in already held these capabilities; the pipe just redirects its
   text.
@@ -218,9 +217,9 @@ sidesteps the hardest part of real pipes - §8.9, where the kernel will *not* de
 deadlock, and a concurrent producer/consumer needs backpressure. Store-and-forward has exactly
 one service alive at a time and one bounded message each way, so it is provably deadlock-free.
 
-The cost is that it is bounded in *total* data, not just in buffer size. After the 64 KiB bump
-the buffer is no longer the binding limit; **three smaller ceilings are**, and they are all the
-same "no streaming / no multi-block" limitation:
+The cost is that it is bounded in *total* data, not just in buffer size. The 16 KiB buffer is not
+the binding limit; **the ceilings below are**, and they are all the same "no streaming /
+no multi-block" limitation:
 
 | Limit | Value | Set by |
 |-------|-------|--------|

@@ -1,18 +1,20 @@
 # Who owns a service: images, authority, discovery, trust
 
-**Status:** step A BUILT and hardware-verified; MERGED (released in v0.13.0). Steps C, D and 2 are
-design, agreed in discussion, not yet built.
-**Merge bar (stated by the project owner):** this branch does not merge to `main` until the supervisor
-actually owns the ELF images and the catalogue is out of the kernel. Step A alone does not earn it.
+**Status:** steps A, C, D1, D1b and D2 are BUILT, hardware-verified and merged; D3 is built except for
+the second half of slice 3 (below). Step 2 - images from `fs`, as signed packages - is design, not
+built.
+**Merge bar (stated by the project owner):** this branch did not merge to `main` until the supervisor
+actually owned the ELF images and the catalogue was out of the kernel. That bar is met: the
+`service_configs` pin is at its target of **1**, `supervisor` alone.
 
 ---
 
 ## 1. The problem, in one sentence
 
-The kernel spawns only the `supervisor`, but it holds a `service_config` row for **every** service -
-the embedded ELF, memory limit, placement core, send peers, hardware class and privileges - so
-**adding a service is a kernel change.** That is backwards for a microkernel, and it bites on every
-new service.
+The kernel spawned only the `supervisor`, yet held a `service_config` row for **every** service - the
+embedded ELF, memory limit, placement core, send peers, hardware class and privileges - so **adding a
+service was a kernel change.** That is backwards for a microkernel, and it bit on every new service.
+Every row but the supervisor's is gone now (section 9); `service_hw` has no arms left at all.
 
 `COMMANDMENTS.baseline.toml` already names it as debt and refuses growth:
 
@@ -154,40 +156,42 @@ Number 3 is the one that matters. The other two are bugs; that one is why they s
 
 ---
 
-## 3. What is left: three steps
+## 3. The four steps, and where they stand
 
 ```
    step A  DONE      probe PARAMETERS out of the kernel      pin 221 -> 29
       |
       v
-   step C            supervisor owns the IMAGES + authority  pin 29 -> 1
+   step C  DONE      supervisor owns the IMAGES + authority  pin 29 -> 1
       |              => adding a SERVICE touches no kernel file
       v
-   step D            bus DISCOVERY out of the kernel
+   step D  DONE      bus DISCOVERY out of the kernel - bar the second half of
+      |              slice 3, where the kernel still resolves MMIO and IRQ from its
+      |              own scan rather than from the supplied BDF
       |              => adding a DRIVER touches no kernel file
       v
-   step 2            images come from `fs`, packages are SIGNED
+   step 2  NOT BUILT images come from `fs`, packages are SIGNED
                      => update without reflash; authority enforceable again
 ```
 
 ---
 
-## 4. Step C: the supervisor owns the images
+## 4. Step C: the supervisor owns the images (BUILT)
 
 ```
-   TODAY                                   AFTER STEP C
+   BEFORE STEP C                           NOW
    ------------------------------          ------------------------------
    kernel                                  kernel
      include_bytes! x27                      include_bytes! x1  (supervisor only)
      service_config: 29 rows                 service_config: 1 row
-     service_hw(name)                        - gone -
-     service_privileges(name)                - gone -
+     service_hw(name)                        no arms left at all
+     service_privileges(name)                answers only the supervisor's own spawn
         |                                       |
         | spawns by NAME,                       | spawns from a POINTER the
         | from its own rodata                   | supervisor hands it
         v                                       v
    supervisor                              supervisor
-     ctx.spawn("fs")                         include_bytes! x26
+     ctx.spawn("fs")                         include_bytes! per service
                                              spawn(image_ptr, len, config)
 ```
 
@@ -270,23 +274,23 @@ changes at step 2.
 
 ---
 
-## 5. Step D: bus discovery leaves the kernel
+## 5. Step D: bus discovery leaves the kernel (BUILT: D1, D1b, D2, D3)
 
-After step C, adding an ordinary **service** touches no kernel file. Adding a **driver** still can,
-and it is worth being precise about why, because it is not authority.
+After step C, adding an ordinary **service** touched no kernel file, but adding a **driver** still
+could, and it is worth being precise about why, because it was never authority.
 
-Adding a driver today takes four kernel edits:
+Adding a driver used to take four kernel edits, and all four are closed:
 
-| edit | what it is | removed by |
+| edit | what it is | closed by |
 |---|---|---|
 | `service_config` row | image, memory, core, peers | **step C** |
 | `service_privileges(name)` | which caps it may hold | **step C** |
 | `service_hw(name)` + an `HwClass` variant | MMIO base, DMA size, BDF, IOMMU policy | **step C** (passed at spawn) |
-| `pci::XXX_FOUND` / `MMIO_BASE` / `BDF` statics | what the kernel's PCI scan found | **step D** |
+| `pci::XXX_FOUND` / `MMIO_BASE` / `BDF` statics | what the kernel's PCI scan found | **step D** (D3c-D3e) |
 
-`HwClass::Xhci` does not decide anything. It **reads** `pci::XHCI_FOUND` and `pci::XHCI_MMIO_BASE`,
-which the kernel's PCI scanner filled in. The kernel enumerates the bus for a fixed set of device
-classes it was taught about.
+`HwClass::Xhci` never decided anything. It read the per-class statics the kernel's PCI scanner filled
+in, and those are gone: the scan records into one generic device table and `pci::xhci()` / `pci::nic()`
+/ `pci::ehci()` are `find_by_class` lookups over it, so the kernel holds no name for any device.
 
 ```
    TODAY                                AFTER STEP D  [REVISED - see the
@@ -311,9 +315,10 @@ classes it was taught about.
 
 So the truthful answer to "can a contributor write a driver without touching the kernel?" is:
 
-- **an ordinary service** - yes, after step C
-- **a driver for a device the scanner already recognises** - yes, after step C
-- **a driver for a new kind of device** - not until step D
+- **an ordinary service** - yes, from step C
+- **a driver for a device the scanner already recognises** - yes, from step C
+- **a driver for a device this kernel has never heard of** - yes, from D1 + D1b: it names the device
+  by PCI class code and the kernel supplies the BAR, the DMA arena, the BDF and a pool MSI vector
 
 Step D is not large: the kernel already does the scan, so it is a matter of granting a hw-enumerator
 service access to config space and having it report, instead of the kernel keeping a table of device
@@ -321,19 +326,22 @@ classes. It also fits the constitution better than what is there now - enumerati
 which driver claims which device is policy, and 4.4 already says drivers are not kernel scope.
 
 Step D is arch-shaped work: x86 config space via I/O ports, Pi 4 via ECAM, and **arm32 has no PCI at
-all** (the DWC2 is soldered to the SoC, which is why `HwClass::Dwc2` is the one class whose presence
-is a `cfg!`, not a scan).
+all** (the DWC2 is soldered to the SoC, which is why `HwClass::Dwc2`'s presence is answered through the
+arch seam, `pci::dwc2_present`, rather than by a scan).
 
 ### What happens when `hw-enumerator` dies
 
-Drivers get their MMIO base, IRQ and DMA arena from `hw-enumerator`, so it must come up before any
-driver. That is a new ordering dependency, and the failure question follows immediately.
+The sketch above has drivers take their MMIO base, IRQ and DMA arena from `hw-enumerator`, which would
+make it an ordering dependency of every driver. That is not what was built - the kernel still grants
+all three, and the reporter supplies only WHICH device - but the failure question is the reason why.
 
-**The supervisor caches the enumeration results** - a bounded array of `(BDF, class, BAR, size, IRQ)`,
-fixed size, no heap, the same discipline as its `name -> cap` map. It is the thing that respawns
-drivers, so it needs those facts at restart time. If it had to query a possibly-dead `hw-enumerator`
-first, a `hw-enumerator` crash would take out every driver restart with it (Commandment VIII: a
-dependent must not hang on a dependency that is gone).
+**The supervisor does NOT cache the enumeration results, and the attempt is instructive.** A bounded
+`(BDF, class, BAR, size, IRQ)` array to save one IPC round trip per driver spawn needs a `static mut`
+in a service, which is both `unsafe` (§18.2, mechanically forbidden) and unowned global mutable state
+(§3.9, Commandment VI). The checker refused it, correctly. What answers instead is the kernel's own
+generic device table - see the 2026-09-04 amendment at the end of this section: the query is
+best-effort with a 2-second deadline, and a driver spawned while `hw-enumerator` is dead resolves its
+device from that table rather than waiting on a dependency that is gone (Commandment VIII).
 
 If the SUPERVISOR dies, it re-derives, and the chain terminates:
 
@@ -516,15 +524,16 @@ rebuild** - a whitelist of specific silicon, in the kernel, which is precisely w
 delete. Named by class 0x020000 ("PCI ethernet controller", which every one of them reports) the
 whitelist is gone and the kernel knows none of them.
 
-ARM keeps the kind, correctly: neither Pi has a PCI bus (LAN9514 over USB on the Pi 2, GENET on the
-Pi 4), so there is no class code to name and no table to find it in.
+ARM keeps the kind, correctly: neither Pi has a PCI ETHERNET controller (LAN9514 over USB on the
+Pi 2, GENET on the SoC on the Pi 4), so there is no class code to name and no table row to find it in.
+The Pi 4 does have PCIe - the VL805 xHCI is on it - it just has nothing of that class on it.
 
-The remaining gap is not interrupts, it is arches: only x86_64 fills the device table (below).
-
-**Per-arch state.** x86_64 fills the table. arm32 never will - it has no PCI at all, the DWC2 is
-soldered, and every driver there names a non-PCI kind. aarch64 is a real GAP rather than a
-non-applicable one: the Pi 4 has PCIe and `pcie::init` walks it, but it does not record into the
-table yet, so its drivers still name a kind.
+**Per-arch state.** x86_64, aarch64 and riscv64 all fill the generic table (`pcie.rs` calls
+`record_device` on the Pi 4; the VisionFive answers `find_by_class` and falls back to its soldered
+SoC controller when the scan finds nothing). arm32 never will - it has no PCI at all, the DWC2 is
+soldered, and every driver there names a non-PCI kind. What still differs is what a driver NAMES, and
+it is asked as a BOARD fact rather than as an ISA (`nic_on_pci`, `xhci_msi`, set in `build.rs`): a
+board whose NIC is not on PCI, or which has no routable MSI pool, keeps the kind.
 
 ### The blocker D2 has to answer: who may name an ADDRESS
 
@@ -555,7 +564,9 @@ the same posture §6.4 already accepts for a DMA-capable driver on a board with 
 new CATEGORY of exposure; today's arrangement is not safer, only more implicit.
 
 With that, the kernel's bus responsibility goes to **zero**: no scan, no classification, no `HwClass`
-variant per device, none of the 21 per-class statics.
+variant per device. (The per-class statics are already gone, deleted by D3c-D3e; and the 2026-09-04
+amendment at the end of this section revises the "zero" itself - the kernel keeps the generic table of
+facts and loses only the interpretation.)
 
 **Not all of `pci.rs` leaves, and the earlier claim that it did was wrong in kind, not only in number.**
 Measured at `8f3c1a10`, the file is ~1,320 lines: roughly **870 go** (the bus walk, `find_by_class`, the
@@ -752,10 +763,11 @@ the same shape as the RTC read `time` needs).
 The Pi 2 has no PCI at all, so there the kernel can only refuse - which it says, rather than handing
 back a plausible zero a caller would read as an empty machine.
 
-**What it does NOT do yet.** This is ADDITIVE. `kernel/src/arch/x86_64/pci.rs` still runs and still
-does the boot scan - nothing consumes the userspace results for anything load-bearing. Retiring those
-the SCAN is the next step - about 870 of the file's ~1,320 lines, the rest being mechanism that stays
-(see above) - and it wants the two walks agreeing on REAL HARDWARE first, not only in QEMU. That is the same discipline D1 followed: record, cross-check, and only then switch over.
+**What it did NOT do at first.** D2 was ADDITIVE: `kernel/src/arch/x86_64/pci.rs` still ran the boot
+scan and nothing consumed the userspace results. That changed with D3 - the supervisor asks
+`hw-enumerator` for a device's BDF and passes it in the spawn request, and a supplied BDF now WINS over
+the kernel's own class lookup. The scan itself stays, reduced to filling the generic table: the
+2026-09-04 amendment at the end of this section is why.
 
 **THE WALKS NOW AGREE ON EVERY MACHINE (2026-09-03), and getting there took a hardware round trip.**
 
@@ -843,8 +855,9 @@ identify a device; it may not thereby acquire authority over that device.** And 
 responsibility: config reads, MSI programming and interrupt routing are all already the kernel's
 (§4.3). What leaves is the SCAN, which is semantics.
 
-**Slice 3 (NOT BUILT): the supervisor passes the BDF in the spawn request.** The kernel then resolves
-MMIO and IRQ from that BDF instead of from `find_by_class`.
+**Slice 3 (HALF BUILT): the supervisor passes the BDF in the spawn request.** It does - `req.bdf`,
+from `ask_bdf_for_class` - and a supplied BDF WINS over the class when the kernel picks the device.
+What is not built is the other half: MMIO and IRQ still come from `find_by_class`, not from that BDF.
 
 **Slice 4 (BUILT): the assignment / re-enumeration split - and half of it needed no code.**
 
@@ -937,7 +950,7 @@ verification here for an oversight and go add one. It is not, and adding one now
 speculative feature - so the reasoning is recorded rather than left to be re-derived.
 
 **Every service ships INSIDE the kernel image.** `hw-enumerator` is embedded in the supervisor
-(`include_bytes!`, 29 of them), the supervisor is embedded in the kernel, and no image is read from
+(`include_bytes!`, one per service), the supervisor is embedded in the kernel, and no image is read from
 disk, filesystem or network by any path that exists today. One artifact.
 
 **For that case embedding is STRICTLY STRONGER than signing, not a substitute for it.** A signature
@@ -1166,20 +1179,16 @@ everything. Three details the implementation has to get right:
 `spawnwired` keeps testing exactly what it was written to test - that a child uses a PASSED cap rather
 than a name - with the cap now sourced from whoever actually spawned the service.
 
-### Where this stopped, and why
+### Where this ended up
 
-Seven moved: `pong`, `ping`, `roster`, `reply-server`, `holder`, `upper`, `mem-pressure`.
-Pin 29 -> 22. `ping` is wired to `pong`, so the installs path is exercised rather than merely built.
+Every service moved, in dependency order, one blocker at a time. Pin 29 -> 1: `supervisor` alone,
+because nothing is beneath it. `ping` is wired to `pong`, so the installs path is exercised rather
+than merely built.
 
-`pong`, `greet`, `upper` and `mem-pressure` were moved and REVERTED. Each is referenced by something
-that spawns it by name (`spawnwired`, the pipe tests, `chaos`), and the three blockers above are
-prerequisites rather than details. Reverting is sequencing, not scope reduction: the infrastructure
-(`SpawnImage`, the loader, the command channel, the reacquire recovery, the widened contract gate) is
-all in place and green.
-
-**A correction worth recording.** The `pong` move was reported as "proven end to end" on the strength
-of identity 24/0/0. The SHELL suite - not run at the time - fails on it, and would have then. One
-suite is not end to end, and the commit message that says so is wrong.
+One lesson from the sequencing is worth keeping: a service referenced by something that spawns it by
+name (`spawnwired`, the pipe tests, `chaos`) cannot move until that caller is routed through the
+supervisor, and moving it first only looks green because the suite that would catch it was not run.
+One suite is not end to end.
 
 ### The double-fetch the loader closes
 
@@ -1203,44 +1212,25 @@ so the destination page becomes a SAFE SLICE ONCE made both the zeroing and the 
 and `loader.rs` went **2 -> 1**: it shrank while gaining the ability to read user memory. The rule did
 not merely catch a violation, it produced a better design.
 
-### Where step C stopped, and exactly what each remaining service waits on
+### The last nineteen rows all reduced to one question: privileges and hw
 
-**Pin 29 -> 19. Ten services the kernel has never heard of:** `pong`, `ping`, `time`, `events`,
-`asker`, `roster`, `reply-server`, `holder`, `upper`, `mem-pressure`. That includes `events`, which
-every service logs through, and `time`, which the shell and net-stack depend on - so the mechanism is
-carrying load-bearing services, not only demos.
+Once everything that could move without new mechanism had moved, every remaining row was waiting on
+the same two fields - `privileges` and `hw` - rather than on plumbing. Both are in the spawn request
+now: the supervisor states a privilege word and a device CLASS, the kernel refuses any privilege the
+supervisor does not itself hold (`SUPERVISOR_DELEGATABLE`) and resolves the class against its own bus
+scan. `service_hw` has no arms left; `service_privileges` answers only the supervisor's own spawn.
 
-Everything that could move without new mechanism has moved. The remaining 19 rows:
+### The trap the privileges design did not inherit: privilege by NAME PREFIX
 
-| service | waits on |
-|---|---|
-| `counter` | nothing technical - it is `spawncap`'s only viable subject (not running at boot, has a recv endpoint, and its peer `fs` is always up) |
-| `greet` | `spawnwired` needs the SHELL to TRANSFER a cap into the spawn request; nothing else wants that, so building it would be speculative (26.2) |
-| `probe` | the probe path resolves its ELF via `service_config`, AND probes need `is_probe` privileges |
-| `observe`, `observe-now`, `observe-live` | INTROSPECT, granted by NAME PREFIX |
-| `chaos`, `control`, `shell` | privileges (SPAWN, SERVICE_CONTROL, ACQUIRE_ANY, REBOOT) |
-| `console`, `fs`, `net-stack`, `resource-server` | `service_hw` - framebuffer grant / RESOURCE_MINT |
-| `block-driver`, `xhci`, `ehci`, `dwc2`, `nic-driver` | `service_hw` - MMIO, DMA arena, IRQ, IOMMU |
-| `supervisor` | stays forever - the recovery anchor |
+`INTROSPECT` used to be granted to any service whose name started with `observe`, `prop-` or
+`stress-`. That is harmless only while the kernel owns every name: the moment a CALLER supplies names
+it reads as "call yourself `observe-x` and get introspection" - a privilege obtainable by choosing a
+string.
 
-**Seventeen of the nineteen reduce to ONE question:** the `privileges` and `hw` fields, which is the
-amendment. Only `counter` and `greet` are blocked on anything else, and both are small.
-
-So the machinery of step C is done and proven; what remains is a decision about the trust model, not
-more plumbing.
-
-### A trap the privileges design must not inherit: privilege by NAME PREFIX
-
-`INTROSPECT` is granted to any service whose name starts with `observe`, `prop-` or `stress-`:
-
-```rust
-introspect: ... || name.starts_with("observe") || name.starts_with("prop-") ...
-```
-
-Harmless while the kernel owns every name. The moment a CALLER supplies names it reads as "call
-yourself `observe-x` and get introspection" - a privilege obtainable by choosing a string. Whatever
-replaces `service_privileges` must not carry this forward, and it is a concrete reason the privileges
-design deserves a look rather than a mechanical port.
+The prefix hole is closed. A privilege travels in the spawn request and is checked against what the
+CALLER may delegate, so the prop-/stress- drivers get `INTROSPECT` from the supervisor's request
+(`probes::privileges_of`) and a probe deliberately spawned WITHOUT the cap still gets none. Only
+`supervisor` is matched by name, because only the supervisor is still spawned by name.
 
 It is the same shape as the two defects the moves already surfaced (the contract reconciler,
 `AcquireSendCap`): **authorization keyed on something the kernel is giving up.**
@@ -1576,9 +1566,9 @@ four machines** in the step A validation without a single kernel panic.
 | **A (done)** | **29** | kernel change | kernel change | no |
 | **C (done)** | **1** | **no kernel change** | kernel change | no |
 | **D1 (done)** | 1 | no kernel change | **no kernel change** (polled drivers) | no |
-| D1b | 1 | no kernel change | **no kernel change** (+ interrupts) | no |
-| D2 | 1 | no kernel change | no kernel change, and no bus code in the kernel | no |
-| 2 | 1 | no kernel change | no kernel change | **yes** |
+| **D1b (done)** | 1 | no kernel change | **no kernel change** (+ interrupts) | no |
+| **D2 (done)** | 1 | no kernel change | no kernel change; the bus WALK is a service, the kernel keeps the generic table | no |
+| 2 (not built) | 1 | no kernel change | no kernel change | **yes** |
 
 **Step C is built, and the pin is at its target: 1.** `supervisor` alone, because the kernel must
 bootstrap it - nothing is beneath it. Every other service's image, memory limit, placement, peers,
@@ -1673,15 +1663,8 @@ does the service still call the syscall?
   the answer to that, and remains open. The honest statement is that step C's widening is now
   bounded to ONE principal instead of every SPAWN holder (§26.7).
 
-- **`probe` is the last non-supervisor row.** It needs two things, both of which fit the existing
-  model: a `SPAWN_FLAG_PEERS_GRANT` bit (`probe-5a-send` gets grantable peer caps, which the
-  supervisor already holds and so may pass on), and a class for the TEST interrupt line that
-  `probe-11a` receives - the kernel supplying vector 33 from the class, exactly as it does a
-  device's. The work is larger than it looks because the 193 probe spawns go through `Spawn`'s
-  packed-parameter path rather than `SpawnImage`.
-- **Step D's arch shape** is unmeasured. x86 I/O-port config space and Pi 4 ECAM are known
-  quantities; arm32 has no PCI, so the hw-enumerator is x86 + Pi 4 only and `dwc2` keeps its
-  SoC-presence path.
+- **Step D's arch shape** is x86 + Pi 4: arm32 has no PCI at all, so `dwc2` keeps its SoC-presence
+  path. The two walks agree device-for-device on QEMU q35, the Wyse and the Pi 4.
 - **Step 2's key management** has no design yet, and it is process as much as code.
 - **A9-4, the BSP idle wedge**, is unrelated to this work and remains open and deferred. It did not
   recur on any of the four hardware runs.

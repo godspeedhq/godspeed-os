@@ -12,7 +12,7 @@ references in `kernel/src/`), and the adversarial suite pins the denial (A11,
 
 ## 1. Problem
 
-The two kernel introspection syscalls are **ambient** - any task can call them
+The two kernel introspection syscalls **were ambient** - any task could call them
 holding no capability:
 
 - `InspectKernel` (syscall 13) - alloc bytes, live-endpoint count, frame counts,
@@ -66,17 +66,25 @@ reading only your own state, or a hardware clock, does not.*
 | `InspectKernel` 6 | a core's active ticks (system) |
 | `InspectKernel` 7 | a core's total ticks (system) |
 | `InspectKernel` 8 | ready core count (system) |
+| `InspectKernel` 24 | the endpoint a given task owns |
+| `InspectKernel` 25 | the endpoint a given task is blocked in `Call` awaiting |
+| `InspectKernel` 26 | the count of fault diagnostics emitted without the serial lock |
 
 ### Ambient (no capability)
 
 | Syscall / query | Why it stays open |
 |---|---|
 | `InspectKernel` 0 | the caller's **own** allocated bytes - its own state |
-| `InspectKernel` 3 | `read_tsc` - a hardware clock, not anyone's state |
+| `InspectKernel` 3 | the cycle counter - a hardware clock, not anyone's state |
+| `InspectKernel` 13 | whether the CALLER owns the console foreground - caller-specific, like 0 |
+| `InspectKernel` 10, 11, 12, 16, 17 | board-neutral timing: input-ready, the RTC now/boot reads, TSC-per-quantum, deglitched monotonic seconds |
+| `InspectKernel` 14, 15, 18, 19, 20, 21, 23 | board facts and transport: NIC identity and BAR, driver-presence bits, a hardware random word, the EMMC base clock, one byte off the COM2 operator channel, the board's own MAC |
 
-This line is chosen so the migration cost is identical to a narrower line (the
-same three services need the cap regardless), making the complete version free:
-gate the whole cross-task/system surface, keep self-state and the clock open.
+The gate is a single `matches!` on the ungated set in `handle_inspect_kernel`, so a
+query added without thought lands on the gated side - the right default. The line is
+chosen so the migration cost is identical to a narrower one (the same services need
+the cap regardless), making the complete version free: gate the whole cross-task and
+system surface, keep self-state, the clock and task-neutral board facts open.
 
 ---
 
@@ -159,9 +167,14 @@ legitimate caller hits it.
 
 ## 6. Migration
 
-Add an `introspect` grant to `ServiceConfig` (a `has_introspect: bool` flag, minted
-at spawn exactly like `has_console_read`), and set it for the services that
-legitimately read cross-task/system state:
+The grant travels in the **spawn request's privilege word** (`privbits::INTROSPECT`),
+and the kernel mints the cap only if the SPAWNER holds the same authority itself
+(`privileges_caller_lacks`). It began as a name match in the kernel's own
+`service_privileges`, which was a hole once probe names became caller-supplied -
+"call yourself `observe-x` and get introspection". The decision is still made by
+name, but in the supervisor (`probes::privileges_of`), by a principal that holds
+INTROSPECT and may pass it on; the kernel no longer infers authority from a string.
+The services that legitimately read cross-task/system state:
 
 | Service | Needs the cap because it calls | Notes |
 |---|---|---|
@@ -170,13 +183,10 @@ legitimately read cross-task/system state:
 | `probe` | `inspect_endpoint_generation` (query 2) | test harness; query 0 + TSC stay ambient so most probe paths are unaffected |
 
 The kernel mints `INTROSPECT_RESOURCE` (READ) into each declaring task's cap table
-at spawn (§14.1). No contract-file change is required if grants are driven by the
-in-kernel `ServiceConfig` table, consistent with how `has_console_read` /
-`console_push` (name-gated `xhci`) work today.
-
-> **To confirm at implementation:** how the `probe` configs are enumerated (one
-> `ServiceConfig` reused across probe_modes vs. several) so the grant lands on
-> every probe instance that needs query 2.
+at spawn (§14.1). The grant lands on exactly the probes that need query 2 and on no
+others: the `prop-` and `stress-` drivers read their victims' generations, while
+`adv-a11` - whose whole subject is a service WITHOUT the cap - is excluded by name,
+which is why it cannot be "every probe".
 
 ---
 
@@ -214,15 +224,17 @@ in-kernel `ServiceConfig` table, consistent with how `has_console_read` /
 1. `capability/mod.rs`: add `INTROSPECT_RESOURCE = ResourceId(5)` + register it.
 2. `task/scheduler.rs` (+ `capability/table.rs` as needed):
    `current_task_holds_resource(rid, right) -> bool`.
-3. `syscall/dispatch.rs`: gate `handle_task_stat` and the system-state arms of
-   `handle_inspect_kernel` (1,2,4,5,6,7,8); leave 0 and 3 ambient.
-4. `task/mod.rs`: `ServiceConfig.has_introspect`; mint the cap at spawn; set it for
-   `shell`, `observe`, `probe`.
+3. `syscall/dispatch.rs`: gate `handle_task_stat` unconditionally, and gate
+   `handle_inspect_kernel` by listing the UNGATED query ids - so anything new is gated
+   by default (§3).
+4. `task/mod.rs`: carry the grant in the spawn request's privilege word
+   (`privbits::INTROSPECT`), refuse any bit the spawner does not hold itself, and mint
+   the cap at spawn for the services whose row asks for it.
 5. Docs: update `syscall/CLAUDE.md`, the `§7` capability list, and
    `utilities/1_observe.md` §7/§8.
 6. Build (`osdev image`), run the identity/property/perf/adversarial suites; add the
    new "introspection denied without cap" adversarial test.
 7. Hardware sanity on the T630 if the suite passes in QEMU.
 
-When this lands, merge `feat/introspect-cap` → `feat/observe` and resume the
-`observe now` build on solid, least-authority ground.
+All seven are done, and `observe` was built on top of them - a least-authority
+service whose introspection authority is one declared capability.

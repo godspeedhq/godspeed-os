@@ -1,8 +1,9 @@
 # Structured records - typed pipes (PowerShell/nushell-style)
 
-> **Status:** First slice built + QEMU-verified (`osdev test shell`): `status` emits a typed
-> **table**; `where` filters it; `to json` renders it. Forward-looking design intent for the
-> rest. Non-normative - does not amend `CLAUDE.md`.
+> **Status:** Built + QEMU-verified (`osdev test shell`, `osdev test files`): the `Table` model,
+> ten record producers, `where` / `select` / `sort`, `to json` / `to yaml` / the grid, `from json`,
+> the binary wire codec, and the unified byte-or-record pipeline. What is NOT built is listed under
+> *What's built vs next*. Non-normative - does not amend `CLAUDE.md`.
 
 ## Why
 
@@ -66,7 +67,8 @@ grammar is deliberately **terse and code-like**, not an English sentence:
 
 The text filters (`match`/`count`/`sort`/`first`/`last`) stay - for genuinely-text streams like
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
-producer (`is_record_producer` - `status`, `dir`, `caps`, `drives`, `find`, `observe now`), else
+producer (`is_record_producer` - `status`, `dir`, `caps`, `drives`, `find`, `uptime`, `events`,
+`trace`, `jobs`, `observe now`), else
 the **byte** path. They coexist; the default rendering (no `to`) is the table grid. A *text*
 filter applied to a record stream (e.g. `dir | match foo`) is a loud, guided error - use
 `where`/`select`/`sort <col>`, or `to json` to drop back to text first.
@@ -147,7 +149,8 @@ pair.
   string cells - no clipping), `to_json`, `to_yaml`; the compact `where`, `select`,
   `sort [reverse] <col>`; **the shell-side record producers - `status` (task roster),
   `dir` (`name`/`type`/`size`/`sealed`), `caps` (`resource`/`rights`), `drives`
-  (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`), and
+  (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`),
+  `uptime`, `events`, `trace`, `jobs`, and
   `observe now` (the roster + a `ticks` cumulative-cpu-time column - the native "top",
   `observe now | sort reverse ticks`)**; **`from json`** (text → records); and the **unified
   byte↔record pipeline** (`Stream = Bytes | Table`, dispatched by command + data type, `from`/`to`
@@ -170,4 +173,4 @@ automatic `ToString()`. Keep everything **bounded** (§26.6): fixed cols/rows/ar
 overflow. This is a *subsystem*, pulled into existence one producer at a time (§26.2), not a
 speculative framework. The payoff is deleting a whole category of cryptic tools: keep the data
 typed and most of `grep`/`awk`/`sed`/`cut` never needs to be born - replaced by
-`where`/`select`/`sort by`, which read on sight.
+`where`/`select`/`sort`, which read on sight.

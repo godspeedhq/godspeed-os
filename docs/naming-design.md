@@ -1,10 +1,12 @@
 # Design Spec: Move Naming Out of the Kernel
 
-> **Status:** Direction **signed off (2026-06-20)**; Phases 0a-3c **built + merged** (the supervisor
-> now wires every real service from a `name → cap` map at boot **and** on restart - zero kernel name
-> resolution for them). **End-state revised 2026-06-21 to Path C (§3.7)** - supersedes the original
-> §3.5 "retire registry, supervisor = sole namer." The constitution amendments (§6) land *with* their
-> phases. The spec wins on any conflict; this doc trails it.
+> **Status:** **COMPLETE.** Every phase - 0a through 6 - is built and merged. The supervisor wires
+> every service from a `name → cap` map at boot **and** on restart; the `registry` SERVICE is retired
+> and deleted (Phase 4); `init` is removed and the kernel spawns the supervisor directly (Phase 5);
+> and the supervisor is itself restartable, respawned by the kernel unconditionally and forever
+> (Phase 6), so the unkillable set is `{kernel}` alone. **End state is Path C (§3.7)** - it supersedes
+> the original §3.5 "retire registry, supervisor = sole namer." The constitution amendments (§6)
+> landed *with* their phases. The spec wins on any conflict; this doc trails it.
 >
 > **Author intent (2026-06-20):** the kernel currently performs a *policy* job - resolving service
 > *names* to *endpoints* - which §26.10 says belongs in a service. Pull it out so the kernel is pure
@@ -65,7 +67,7 @@ and only one leaves:
 | **Routing table** (`EndpointId → core/gen/liveness`) | mechanism - opaque ids, the kernel routes messages | **STAYS** |
 | **Cap mint / validate / install**, the spawn syscall, IPC enqueue/IPI | mechanism | **STAYS** |
 | **Task labels** ("this task is `fs`") for death notices, `observe`, logs | mechanism - a task's own identity, not third-party resolution | **STAYS** |
-| **name → ELF + `ServiceConfig`** for spawning embedded services (`service_config_by_name`) | v1 *packaging* reality (ELFs are `include_bytes!`'d into the kernel image) - a **separate concern** | **STAYS (out of scope, see §7)** |
+| **name → ELF + `ServiceConfig`** for spawning embedded services (`service_config`) | a *packaging* reality at the time (ELFs were `include_bytes!`'d into the kernel image) - a **separate concern** | **OUT OF SCOPE here, see §7** (since moved to the supervisor) |
 | **name → EndpointId resolution for IPC send-peers** (`ipc::names`) | **policy** - who may reach whom | **LEAVES** |
 | **Syscall 10 `AcquireSendCap`** (ungated mint-by-name) | **policy** + ambient surface | **LEAVES** |
 | **Spawn-time send-peer name wiring** (the `names::lookup` loop in `spawn_service_with_config`) | **policy** | **LEAVES** |
@@ -264,7 +266,7 @@ supervisor - **stand unchanged**; only the endgame's target moves.
 - **InspectKernel query 2** ("endpoint generation by name") - rides on the kept directory; no longer
   needs a name-free rewrite.
 
-Also unchanged: routing, cap machinery, the spawn syscall (new shape), `service_config_by_name`
+Also unchanged: routing, cap machinery, the spawn syscall (new shape), `service_config`
 (ELF lookup - §7), task labels, MMIO/DMA/IRQ + endpoint + delegated-resource minting.
 
 ---
@@ -285,14 +287,14 @@ The boot/spawn path is the most load-bearing code in the system and is currently
 | **3b** | Move `registry` spawn `init → supervisor` (§11); provide `registry` to all services → every real service 100% supervisor-wired **at boot**. | ✅ merged |
 | **3c** | Flip the supervisor's **restart** paths to re-wire from the map (map updates in place + frees the dead cap). Boot **and** restart now avoid kernel name resolution. | ✅ merged |
 
-**Endgame - re-scoped for Path C (§3.7).** Each phase still a mergeable, always-bootable, suite-green
-increment.
+**Endgame - re-scoped for Path C (§3.7).** Each phase a mergeable, always-bootable, suite-green
+increment; all three are merged.
 
-| Phase | Change | Done when |
+| Phase | Change | Status |
 |---|---|---|
-| **4 - Retire the registry service; the kernel directory becomes the namer.** | Clients reacquire via the **gated** kernel directory (`AcquireSendCap`) instead of the registry service; delete the `registry` service + its userspace lookup path. The registry-bootstrap stopgap becomes the *normal* path. **Gate `AcquireSendCap`** behind a recovery cap (close the ambient surface). | No `registry` service in the tree; clients reacquire via the gated directory; chaos double-storm green; suite green. |
-| **5 - Remove `init`; the kernel spawns the supervisor directly.** | Retarget `spawn_init` at `supervisor`; move `logger`'s spawn into the supervisor; delete `init`. −1 TCB member. | Boot via kernel→supervisor→all; suite green; §11/§6 amended. |
-| **6 - Make the supervisor restartable; unkillable = `{kernel}`.** | Kernel **respawns the supervisor on death** (instead of panic) and **re-points death notices** to the new instance. Supervisor persists a **manifest**, and on respawn rebuilds its `name → cap` map from the kernel directory + reconciles against live tasks. | Kill the supervisor → kernel respawns it → it recovers + the system continues, no reboot; new identity test pins it; §6.2 amended. |
+| **4 - Retire the registry service; the kernel directory becomes the namer.** | Clients reacquire via the **gated** kernel directory (`AcquireSendCap`) instead of the registry service; the `registry` service + its userspace lookup path deleted. The registry-bootstrap stopgap became the *normal* path. `AcquireSendCap` is gated: a caller needs `ACQUIRE_ANY`, or the name must be one of its own declared send-peers. | ✅ merged |
+| **5 - Remove `init`; the kernel spawns the supervisor directly.** | The kernel's one direct spawn is `supervisor` (`task::spawn_supervisor`); the logger's spawn moved into the supervisor; `init` deleted. −1 TCB member. | ✅ merged |
+| **6 - Make the supervisor restartable; unkillable = `{kernel}`.** | Kernel **respawns the supervisor on death** (instead of panic) and **re-points death notices** to the new instance. The supervisor rebuilds its `name → cap` map from the kernel directory and reconciles against live tasks, adopting the survivors rather than duplicating them. Pinned by §22 Test 15. | ✅ merged |
 
 Roll-back is per-phase: each phase is a mergeable, green increment, so a regression reverts one phase,
 not the program. Phases 4 and 5 are mechanical; **Phase 6 is the constitutional one** (it amends §6.2:
@@ -328,12 +330,13 @@ To be drafted into `CLAUDE.md` at adoption (each with a commit rationale, §21):
 
 ## 7. Out of scope (and why)
 
-- **name → ELF resolution for spawn (`service_config_by_name`).** The kernel spawns embedded services
-  by name because their ELFs are `include_bytes!`'d into the kernel image (a v1 packaging reality).
-  Moving *that* out means the supervisor carries/loads the binaries (from disk - the Prime/loader
-  story, `docs/prime.md`). That is a deeper, separate change; this spec deliberately stops at IPC
-  name resolution. The two are independent: the new spawn protocol works whether the ELF is kernel-
-  embedded or supplied by the caller.
+- **name → ELF resolution for spawn (`service_config`).** When this spec was written the kernel
+  spawned every embedded service by name, because their ELFs were `include_bytes!`'d into the kernel
+  image. That was a separate, deeper change and this spec deliberately stopped at IPC name
+  resolution - correctly, since the two are independent: the spawn protocol works whether the ELF is
+  kernel-embedded or supplied by the caller. It has since been made: the supervisor holds every
+  service's image and hands the kernel a pointer (`SpawnImage`), and the kernel's catalogue is
+  `supervisor` alone. See `docs/service-ownership.md`.
 - **Multi-node / cluster naming** (Appendix C.4) - unaffected; the supervisor-as-name-authority model
   generalizes cleanly but is far-future.
 

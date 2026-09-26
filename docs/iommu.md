@@ -15,7 +15,8 @@
 >    Three of the four shipping ports are in the "without an IOMMU" case.
 > 2. **`xhci` is the only confined driver, even on x86.** `ehci` and `block-driver`
 >    keep a stale firmware DMA pointer that confinement would fault, so both run in
->    passthrough by design (`kernel/src/task/mod.rs, the `confine` flag on `HwClass::Pci``), and `nic-driver` is
+>    passthrough by design (the `confine` flag on `HwClass::Pci`, in
+>    `kernel/src/task/mod.rs`), and `nic-driver` is
 >    spawned `confine=false`. "Confinement is applied per driver" (§6.4) is doing
 >    more work in that sentence than it looks: today it selects exactly one.
 
@@ -238,11 +239,15 @@ amendment fixed:
 
 **Open questions to resolve with sign-off:**
 
-1. **Interrupt remapping.** Confinement here covers DMA to memory. If a driver
-   ever uses MSI/MSI-X (writes to the `0xfeex_xxxx` interrupt region), that write
-   is also a DMA and would need either an interrupt-remapping table entry or an
-   explicit mapping. The current USB drivers use pin-based IRQs (no MSI), so this
-   does not arise today, but the amendment should state the boundary.
+1. **Interrupt remapping.** Confinement here covers DMA to memory. A driver's MSI/MSI-X
+   write to the `0xfeex_xxxx` interrupt region is also a DMA, and would need either an
+   interrupt-remapping table entry or an explicit mapping. **This is live, not
+   hypothetical: both USB controllers are MSI/MSI-X on x86** - the kernel programs the
+   vector itself (`XHCI_MSI_VECTOR` 0x28, `EHCI_MSI_VECTOR` 0x29, plus the D1b pool
+   vectors for a device named by class code) - and `iommu.rs` contains no
+   interrupt-remapping table and maps no interrupt region. The confined xHCI
+   nonetheless runs fault-free on the T630, so the boundary is unstated rather than
+   broken, and it should be stated.
 2. **The no-IOMMU machine.** The conditional trust posture above means the TCB is
    *machine-dependent*. That is honest but novel for this project; it deserves a
    deliberate decision rather than a default.

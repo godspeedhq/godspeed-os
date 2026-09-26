@@ -1,12 +1,13 @@
 # Probe parameters at spawn: taking 193 policy rows out of the kernel
 
 **Status:** BUILT and MERGED (released in v0.13.0). The pin moved 221 -> 29 and
-`kernel/src/task/mod.rs` lost 2,317 lines.
-**Scope:** test probes only. Real services are untouched by this step.
+`kernel/src/task/mod.rs` lost 2,317 lines. Step C then took the remaining rows, including the
+`probe` one, so the pin is at its target of 1 - see `docs/service-ownership.md`.
+**Scope:** test probes only. Real services were untouched by this step.
 
 ## The problem, measured
 
-`kernel/src/task/mod.rs` holds a `service_config` entry for **221** services. `COMMANDMENTS.baseline.toml`
+`kernel/src/task/mod.rs` held a `service_config` entry for **221** services. `COMMANDMENTS.baseline.toml`
 pins that list as debt that may only shrink, and the target is **one** entry: `supervisor`.
 
 But 221 entries is not 221 programs. Only **27 distinct ELFs** are embedded, and **193 of the 221
@@ -46,7 +47,7 @@ needs the list and nothing else. The payload limit went from 64 to 128 bytes, wh
 payload is well under; a payload that will not fit is REFUSED rather than truncated, because a
 silently shortened peer name would wire a probe to the wrong service and read as a passing test.
 
-The kernel keeps **one** `probe` entry: the ELF and the defaults.
+The kernel kept **one** `probe` entry: the ELF and the defaults. (Step C moved that one too.)
 
 ### The prerequisite: task names had to be owned
 
@@ -70,18 +71,25 @@ table is two truths (Commandment III): the second drifts, and a probe respawned 
 is a test that passes while testing the wrong thing. It lives with the `probe` program because it
 describes that program's test modes, not the supervisor's policy.
 
-## What stays in the kernel, and why
+## What did not move with the parameters, and why
 
-Two of the 193 outliers are not parameters, they are **authority**:
+Two of the 193 outliers are not parameters, they are **authority**, so this step left both keyed by
+name in the kernel beside the other hardware-privilege decisions:
 
-- **`probe-11a` needs IRQ 33 routed to it.** Routing a hardware interrupt line to a service is a grant,
-  not a setting. It stays keyed by name in the kernel, beside the other hardware-privilege decisions.
+- **`probe-11a` needs IRQ 33 routed to it.** Routing a hardware interrupt line to a service is a
+  grant, not a setting.
 - **`probe-5a-send` needs `send_peers_grant`** - its peer caps carry GRANT so it can re-delegate them
   (§22 Test 5A). Handing out a re-delegatable capability is authority too.
 
 This is the line: **the kernel keeps decisions about what a service may DO; the caller supplies what a
 service IS.** A probe's mode, core, mailbox and memory ceiling are the latter. An IRQ route and a
 grantable capability are the former.
+
+Both later found homes in that same model without weakening it, when step C moved the probe image
+too: the IRQ route became a device CLASS (`hwclass::TEST_IRQ` - the probe names the class and the
+kernel still states vector 33, exactly as it does for a real device) and the grantable peer caps
+became a spawn FLAG the supervisor already holds and may pass on. The caller still cannot name a
+vector. See `docs/service-ownership.md`.
 
 ## What this does NOT do
 
@@ -101,8 +109,9 @@ longer anywhere the kernel can look them up. Two consequences:
 - A probe that `chaos` kills stays dead. That is unchanged: probes were never in the supervisor's
   `MANAGED` set, so nothing respawned them before either.
 
-Spawning a **real service** by name is untouched: those 29 rows are still in the kernel, and the
-plain `Spawn` path is byte-for-byte what it was.
+Spawning a **real service** by name was untouched by this step: those 29 rows stayed in the kernel
+and the plain `Spawn` path was byte-for-byte what it had been. Step C moved them afterwards, leaving
+`supervisor` alone.
 
 ## Effect on the pin
 

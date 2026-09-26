@@ -144,9 +144,12 @@ whole OS (invariant 11, scaled up).
 Prime boots the *mechanism*. The richer vision - "plug my drive into any GodspeedOS
 and **continue from there**" - layers on top: after Prime boots, the supervisor
 **loads additional services from the drive's GSFS region** and spawns them, and
-services reconstruct their state from GSFS (§15). Today services are baked into the
-kernel image; loading-and-running from `fs` is the one capability that unlocks the
-portable *world* on top of portable *Prime*.
+services reconstruct their state from GSFS (§15). Half of that is already in place: the
+supervisor holds every service's image and spawns it from a pointer it supplies
+(`SpawnImage`, `docs/service-ownership.md`), so the kernel no longer has to know a
+service exists. What is missing is only where the bytes come from - they are still
+embedded in the supervisor rather than read from a drive, and reading them from `fs` is
+the one capability that unlocks the portable *world* on top of portable *Prime*.
 
 This is the **update model (§16) generalized**: §16 is "restart a service with a new
 binary"; this is "load a service's binary from a drive." Same principle - the binary
@@ -165,11 +168,17 @@ ESP (Limine + kernel), and a GSFS region - exactly what `osdev image` does **on 
 host**, now self-hosted. The crux was: where do the boot-image bytes come from? A
 constraint settles it:
 
-> **GodspeedOS cannot read the medium it booted from.** `block-driver` is an
-> **AHCI/SATA** driver; the USB you boot Prime from lives on the **xhci/ehci**
-> controller - a different device entirely. So "read the boot ESP back from the boot
-> medium" is impossible for the first USB→SSD install (it would need a USB
-> mass-storage driver). The bytes must come from inside Prime.
+> **On x86, GodspeedOS cannot read the medium it booted from.** There `block-driver` is
+> an **AHCI/SATA** driver (`STORAGE_HOST=none`, chosen by target in its `build.rs`); the
+> USB you boot Prime from lives on the **xhci/ehci** controller - a different device
+> entirely. So "read the boot ESP back from the boot medium" is impossible for the first
+> USB→SSD install, which is the case this design has to serve. The bytes must come from
+> inside Prime.
+>
+> A USB mass-storage path does exist - `services/xhci/src/msc.rs`, reached through
+> `block-driver`'s `xhciblk.rs` - and it is how the Pi 2, Pi 4 and VisionFive take their
+> storage. It does not change the conclusion: on those boards the stick is the ONLY
+> storage, so there is still nothing else to read an image from.
 
 **So Prime *carries* a copy of its own bootable image** and stamps it onto any target
 (raw block writes - the ESP is an opaque blob, so **no FAT *read/write* needed for
