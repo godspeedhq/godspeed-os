@@ -24,6 +24,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import conform_ok               # noqa: E402  - the shared `conform-ok` escape marker
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKIP_DIRS = ('target', '.git', 'build', 'node_modules', 'book', 'audits', 'milestones', 'bugs')
 CITE = re.compile(r'((?:services|kernel|sdk|osdev|scripts|examples|tests)/[A-Za-z0-9_./-]+\.(?:rs|py)):([0-9]{1,5})\b')
@@ -42,6 +45,11 @@ def anchors(sentence):
 def main():
     bad = []
     checked = 0
+    # A document that SHOWS a diagnostic must contain the stale citation that provoked it. Four
+    # sites in `docs/conformance.md` hit exactly that, and the UI fixtures that document specifies
+    # will hit it by construction - a `.expected` file holds the citation verbatim. `conform-ok`
+    # lets a site say so, naming this rule and giving a reason.
+    supp = conform_ok.Suppressions()
     for root, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for name in files:
@@ -60,6 +68,8 @@ def main():
                     target, num = m.group(1), int(m.group(2))
                     checked += 1
                     tpath = os.path.join(ROOT, target)
+                    if supp.covers(path, line_no, 'GS0304'):
+                        continue
                     if not os.path.exists(tpath):
                         bad.append((rel, line_no, target, num, 'the file does not exist'))
                         continue
@@ -68,12 +78,19 @@ def main():
                         bad.append((rel, line_no, target, num,
                                     'past end of file (%d lines)' % len(body)))
                         continue
+                    if supp.covers(path, line_no, 'GS0304'):
+                        continue
                     lo, hi = max(0, num - 1 - WINDOW), min(len(body), num + WINDOW)
                     near = '\n'.join(body[lo:hi]).lower()
                     found = [a for a in anchors(line) if a.lower() in near]
                     if not found:
                         bad.append((rel, line_no, target, num,
                                     'nothing within %d lines matches the citing sentence' % WINDOW))
+    for p, ln, why in supp.problems:
+        rel_p = os.path.relpath(p, ROOT).replace(os.sep, '/')
+        print('line refs: %s:%d - %s' % (rel_p, ln, why))
+    if supp.problems:
+        return 1
     if bad:
         print('line refs: %d citation(s) no longer point at what they claim' % len(bad))
         print()
@@ -86,8 +103,11 @@ def main():
         print('can find them with grep. `audits/`, `milestones/` and `bugs/` are exempt: their')
         print('numbers are dated evidence of what was seen, not claims about the code now.')
         return 1
+    note = ''
+    if supp.allowed:
+        note = ', %d site(s) exempted by a `conform-ok` marker' % supp.allowed
     print('line refs: %d `path:line` citation(s) still point at what they claim '
-          '(dated evidence in audits/, milestones/, bugs/ exempt)' % checked)
+          '(dated evidence in audits/, milestones/, bugs/ exempt%s)' % (checked, note))
     return 0
 
 

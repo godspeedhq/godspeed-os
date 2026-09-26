@@ -1,8 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # Conformance: `osdev conform`, and the Python question
 
-**Status:** SPEC, nothing built. Branch `feat/osdev-conformance`. Trails `CLAUDE.md`, which wins on
-any conflict.
+**Status:** BUILT as `scripts/conform.py`; the `osdev conform` shim is not written yet (it needs a
+Rust edit, and this branch deliberately touches none). Branch `feat/osdev-conformance`. Trails
+`CLAUDE.md`, which wins on any conflict.
+
+    py scripts/conform.py            fix what is decidable, report what needs judgement
+    py scripts/conform.py --check    report both, change nothing (what CI wants)
+    py scripts/conform.py --explain GS0303
+    py scripts/conform.py --list
 
 This proposes a front door for the enforcement layer, and answers - with measurements rather than
 taste - whether that layer should stay in Python.
@@ -178,6 +184,83 @@ every tool a maintainer chooses to run.
 `docs/porting.md` and CI. That was always the part that delivered the developer-facing win; the port
 was the optional half, and it is now declined.
 
+**And the seam turned out not to need Rust at all.** `scripts/conform.py` is the whole thing: it reads
+`EXTRA_CHECKS` out of `osdev/src/main.rs`, runs each checker, frames the failures, fixes the decidable
+class, and answers `--explain` and `--list`. `osdev conform` will be a shim that shells out to it -
+three lines - which means the front door exists and works today, and the Rust is a convenience rather
+than the feature.
+
+## As built, and the five defects that only appeared when it was RUN
+
+Every one of these was found by running the tool on the real tree, and none of them by reading the
+code. That is the argument for UI fixtures arriving a day early.
+
+**1. The fixer invented its own scope.** First run offered to "fix" 562 files. This is a Windows
+checkout and `.gitattributes` says `* text=auto`, so CRLF in the working tree is NORMAL; only `*.sh`,
+`*.gsh`, `*.gs` and `boot/**` are declared `eol=lf`. It also stripped trailing whitespace, which NO
+gate polices - a rule invented by the tool, which is §26.2 backwards. Fixed by DERIVING scope from the
+checkers: it imports `dash_check` for its file set and `line_ending_check` for its `.gitattributes`
+rules. **That is now the rule: `conform` may only fix what a gate would fail you for, and it takes the
+scope from that gate** - which makes it structurally impossible for `conform` and a build to disagree,
+the same reason the checker list is read out of osdev rather than copied.
+
+Note the `.gitattributes` match must be LAST-WINS, as git resolves it: `boot/** text eol=lf` is
+deliberately followed by `*.dtb binary` so that marking a directory text does not have git "normalise"
+a 58 KB device tree blob.
+
+**2. The dash fixer contained two dashes.** The file was written with the literal em-dash and en-dash
+in its own substitution table. Writing them as source escapes does not help either - `dash_check`
+catches the escaped form on purpose, because "a dash written as a source escape is invisible to a
+literal scan". A tool that must NAME these characters has to compute them: `chr(0x2014)`.
+
+**3. A new file violates nothing until it is staged.** `dash_check` reads `git ls-files`, so while
+`conform.py` was untracked its dashes were invisible and the gate passed. `git add -N` is how you find
+out before you commit. Worth knowing generally: a contributor's brand-new file is unchecked until it
+is at least intent-to-added.
+
+**4. The same problem was reported twice, and counted twice.** A fixable violation appeared both in
+the "would fix" list and as a full error frame whose help said "`conform` fixes this" - the least
+interesting class taking the most space, which trains a reader to skim. Now it collapses to one line
+when the fixer claimed every file, and keeps its full frame when it did not, because a fixable RULE
+can fail for a reason the fixer cannot reach (an escaped dash). The summary double-counted it too:
+"1 would be fixed, 1 need a decision" for one problem, putting a number in the needs-a-human column
+that needed no human.
+
+**5. It garbled the output it was quoting.** `subprocess.run(text=True)` decodes with the LOCALE
+encoding, not UTF-8, so every `§` a checker printed came through as a replacement character. A tool
+that mangles what it quotes is not one to trust about anything else.
+
+### What the render looks like
+
+A judgement finding, unabridged. The marker below is the escape this document argued for, in use: the sample holds the very citation that provoked it, so the site is legitimately unresolvable.
+
+<!-- conform-ok: GS0304 - a pasted sample of conform's own output; the cited line is the one the example was generated from -->
+
+```
+error[GS0303]: a Rust comment names something that exists nowhere in the code
+   --> examples/00-hello/src/main.rs:53
+    |
+    = rule: CLAUDE.md 26.7, 26.14
+    = why: A comment is read BEFORE any document, because it sits beside the code being
+           changed. There are 27,000 doc-comment lines here and until 2026-09-26 nothing
+           checked one of them.
+    = help: Name what does the job now - or, if it names something OUTSIDE this tree on
+            purpose (a hardware register, an SBI call, a Linux function cited per 26.14), add
+            it to the baseline with which kind it is. A comment that says "X was deleted" is
+            RIGHT to name X: that is a record, and it belongs in the baseline.
+    = note: `py scripts/conform.py --explain GS0303` for the long form
+```
+
+and a clean tree:
+
+```
+conform --check: 0 would be fixed, 0 need a decision - 17 checks ran, 17 passed
+nothing to do. Every rule this project enforces is satisfied.
+```
+
+The count of checks that RAN is in every line on purpose. A run that silently skipped twelve checkers
+and printed a clean verdict is the failure this whole document exists to prevent.
+
 ## 4. The output contract: clear, friendly, and it suggests the fix
 
 The bar is `rustc`. Not its cleverness - its **shape**: say what is wrong in one plain line, show
@@ -332,16 +415,34 @@ was paraphrased away rather than suppressed - which is fine for prose and **will
 fixtures.** A `.expected` file holds a diagnostic verbatim, including the dead name and the stale line
 that provoked it. Every one of them will trip a gate the moment `tests/conformance/ui/` exists.
 
-Two gates already solved this locally - `<!-- doc-command-ok: reason -->` and
-`<!-- foreign-ok: reason -->` - which is the precedent and also the problem: they solved it twice,
-differently, for two of the fifteen. Proposal: **one marker, honoured by every checker,
-`<!-- conform-ok: <rule> - <reason> -->`**, scoped to the block it heads, naming WHICH rule it
-suppresses and WHY. A blanket "ignore everything here" would be the hole the baselines exist to avoid;
-naming the rule keeps it a stated exception rather than a door. `tests/conformance/ui/` would then be
-exempt wholesale by path, the way `audits/`, `milestones/` and `bugs/` already are for dated evidence.
+**BUILT: `scripts/conform_ok.py`**, one marker honoured by the gates that need it.
 
-That is the one piece of work in this spec that is NOT just a front door - it changes fifteen
-checkers - and it should be settled before the fixtures are written, not after.
+    <!-- conform-ok: GS0304 - a pasted sample of the tool own output -->
+
+Two gates had already solved this locally and differently - `doc-command-ok` and `foreign-ok` - which
+was the precedent and also the problem: solved twice, in two shapes, for two of seventeen.
+
+Four things keep it from becoming a door, and they are the only interesting part of it:
+
+1. **It must NAME the rule.** No blanket "ignore everything here": a block exempted from one rule is
+   still checked by the other sixteen.
+2. **It must carry a REASON.** A marker with nothing after the dash is REFUSED, and the refusal fails
+   the build rather than silently suppressing.
+3. **Its scope is narrow and predictable** - the fenced block that immediately follows, or one line if
+   the next thing is not a fence. Never a file, a section, or "everything below".
+4. **Every honoured suppression is COUNTED and printed**, e.g. `1 site(s) exempted by a conform-ok
+   marker`. An escape nobody counts is one nobody notices, which is how one becomes a door.
+
+Each guard was proved by forcing it: a marker with no reason is refused, one naming no rule is refused,
+a marker for one code does not suppress another, and the count increments only on a real suppression.
+
+Wired into `line_ref_check` so far, because that is the gate that actually blocked four times. The
+other two keep their local markers until there is a case for folding them in - adding an escape to a
+gate that has never been blocked by one would be speculative (26.2).
+
+This document now uses it, once, on the sample of `conform`'s own output - which holds the exact
+citation that generated it, so the site is unresolvable by construction. That is the fixture problem
+arriving early, on the document that predicted it.
 
 ### What to do with the manual break anyway
 
