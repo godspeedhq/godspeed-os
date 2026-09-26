@@ -1,0 +1,27 @@
+# target: services/observe/src/main.rs
+# mode: append
+# checker: scripts/commandments.py
+# why: Commandment V, and the RULE ABOVE THE RULES: nothing above the kernel may halt or crash the
+# why: machine. Only the kernel is unkillable, so a `panic!` in a service is a service deciding the
+# why: machine's fate - and an `unwrap` is a panic with better manners. A missing or dead dependency
+# why: must RETURN with a loud "unavailable", never take everything down with it.
+# why:
+# why: Both spellings fire. This case uses the explicit one because it is the one a contributor reaches
+# why: for while debugging and then forgets to remove.
+--- plant ---
+
+fn _probe_panic() {
+    panic!("probe");
+}
+--- expect ---
+error[GS0005]: no service may halt the machine
+   --> services/observe/src/main.rs:417
+    |
+    = commandment: V - Thou shalt not assume thy service is special. Only the kernel is
+                   special.
+    = why: a service must never halt the machine: return a loud error instead (unwrap_or /
+           unwrap_or_else / let-else / an explicit match)
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0005` for the long form

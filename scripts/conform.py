@@ -861,6 +861,37 @@ def bless():
 
 GALLERY_PATH = os.path.join(ROOT, "tests", "conformance", "GALLERY.md")
 
+# WHY A CODE HAS NO GALLERY ENTRY. Every code without a case must appear here, and the gallery CHECKS
+# that - an unexplained absence is reported as one, because a catalogue that looks complete and is not
+# is worse than one that says where it stops.
+NO_CASE_REASON = {
+    "GS0008": "Commandment VIII has NO mechanical check at all, so this code can never fire. It is in "
+              "the not-mechanised list as \"[static heuristic, not built] Wait on truth\". Listed here "
+              "rather than quietly absent, because a code nothing can produce reads as coverage.",
+    "GS0002": "Commandment II's check derives who may escape chaos from `is_transient()` and from "
+              "chaos's own spawn calls - deliberately NOT from a list, so there is nothing to append "
+              "to. Tripping it means editing that function, which a single-file case cannot express "
+              "honestly.",
+    "GS0003": "Commandment III wants the same module-level constant in two files of one crate. Probed "
+              "four shapes - including duplicating a real `const` from `dwc2/src/chan.rs` into "
+              "`hid.rs`, same crate, same value - and none fired. The precise shape it wants was not "
+              "established, and a case that passes for the wrong reason is worse than none.",
+    "GS0007": "Commandment VII pins what each service may REACH, which lives in the supervisor's "
+              "spawn table. Tripping it means changing a grant there, not appending to a file.",
+    "GS0009": "Commandment IX wants a service that sends to a peer and cannot reacquire it. That is a "
+              "property of a whole service, so the plant would be a new service rather than a line.",
+    "GS0203": "`arch_seam_check` needs a NEW `arch::imp::` member called from neutral code, which every "
+              "arch then fails to answer - a multi-file edit by construction.",
+    "GS0405": "`facts_check` needs a doc that restates a number the code owns. Picking one means "
+              "hard-coding a pairing the checker DISCOVERS, so the case would rot exactly as the "
+              "checker exists to prevent.",
+    "GS0409": "`site_check` needs a hand-written website page to disagree with the repository - again a "
+              "two-file relationship.",
+    "GS0000": "The deliberate FALLBACK for a Commandment failure `conform` cannot attribute. Producing "
+              "it means breaking `commandments.py`'s report format, which is not a violation of "
+              "anything - it is a bug in this tool, and the frame says so when it happens.",
+}
+
 
 def gallery():
     """Render every case into one markdown catalogue: what a contributor SEES, per rule.
@@ -925,6 +956,51 @@ def gallery():
             out.extend(got.split(chr(10)))
             out.append("```")
         out.append("")
+
+    # COVERAGE, COMPUTED. Which codes have an entry is derived from what the cases actually
+    # rendered, so this cannot drift when a case is added or removed - and an unexplained absence is
+    # itself reported, because a catalogue that looks complete and is not is worse than one that says
+    # where it stops.
+    shown = set()
+    for _fn, _m, (g, _e) in rows:
+        for m in re.finditer(r"error\[(GS[0-9]{4})\]", g or ""):
+            shown.add(m.group(1))
+
+    all_codes = {r["code"] for r in RULES.values()} | set(COMMANDMENT_CODE.values())
+    missing = sorted(all_codes - shown)
+
+    out.append("## Coverage, and where this catalogue stops")
+    out.append("")
+    out.append("%d of %d codes have an entry above. The rest are named here with a reason each, and "
+               "this list is" % (len(shown), len(all_codes)))
+    out.append("COMPUTED from the rule set minus what the cases actually rendered - so it cannot go "
+               "stale when a")
+    out.append("case is added, and an absence nobody explained is reported as a defect rather than "
+               "left to be")
+    out.append("mistaken for coverage.")
+    out.append("")
+    unexplained = [c for c in missing if c not in NO_CASE_REASON]
+    for code in missing:
+        why = NO_CASE_REASON.get(code)
+        if why:
+            out.append("- **`%s`** - %s" % (code, why))
+        else:
+            out.append("- **`%s`** - NO REASON RECORDED. Add one to `NO_CASE_REASON` in "
+                       "`scripts/conform.py`, or write the case." % code)
+    out.append("")
+    if unexplained:
+        out.append("> **This catalogue is INCOMPLETE and does not explain why: %s.** That is a defect "
+                   "in the gallery, not a gap in the rules." % ", ".join("`%s`" % c for c in unexplained))
+        out.append("")
+    out.append("Messages that are not rule diagnostics, and so have no case: the refusal when a checker "
+               "cannot be")
+    out.append("RUN at all (`conform` reports no verdict rather than a clean one); `conform-ok`'s two "
+               "refusals, for")
+    out.append("a marker with no reason and one naming no rule; the unframed passthrough for a checker "
+               "with no")
+    out.append("`RULES` entry; and the ratchet's \"can tighten\" line when a baseline entry is no "
+               "longer needed.")
+    out.append("")
 
     body = chr(10).join(out) + chr(10)
     d = os.path.dirname(GALLERY_PATH)
@@ -1023,8 +1099,11 @@ def main(argv):
         # THE TEN FIRST, in numeral order, because they have the first block and they are the law.
         # Listing them last would undo the whole point of the renumbering.
         for numeral in NUMERALS:
-            print("%-8s %-28s %-12s %s" % (COMMANDMENT_CODE[numeral], "commandments.py",
-                                           numeral, "no"))
+            code = COMMANDMENT_CODE[numeral]
+            # A code nothing can produce reads as coverage. Commandment VIII has no mechanical check -
+            # it is human review every time - so say that here rather than listing it like the others.
+            note = "no" if code not in NO_CASE_REASON or code != "GS0008" else "no  (NO CHECK - human review only)"
+            print("%-8s %-28s %-12s %s" % (code, "commandments.py", numeral, note))
         print()
         for name, rule in sorted(RULES.items(), key=lambda kv: kv[1]["code"]):
             if name == "commandments.py":

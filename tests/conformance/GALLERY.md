@@ -39,6 +39,27 @@ error[GS0410]: a backlog entry has no status line, or is not linked from the ind
   | (1 more line of explanation, which the frame above covers - `py scripts/backlog_check.py` for all of it)
 ```
 
+## a doc for a command that does not exist
+
+Commandment X, in the one part of it a machine can decide: the user-facing vocabulary and its documentation must agree. `docs/x-residue.md` records honestly what this does NOT prove - "place complexity in the layer that owns it" is a judgement about layers that no pattern reads - so that "10 of 10 mechanised" cannot be read as a stronger claim than it is. Why this shape matters: a utility spec is a reference a reader TYPES from. The `ls` to `dir` rename reached the shell, the specs and the help text and still missed ten worked examples.
+
+*Planted in `utilities/99_probequux.md` (`create`), caught by `scripts/commandments.py`.*
+
+```
+error[GS0010]: the user-facing vocabulary and its documentation agree
+   --> utilities/99_probequux.md
+    |
+    = commandment: X - Thou shalt place complexity where it belongs.
+    = why: `probequux` has a utility spec and the shell answers no such verb. A documented
+           command that does not exist costs the user more than a missing feature: they learn
+           the documentation cannot be trusted. Implement it, delete the spec, or rewrite the
+           spec to document the ABSENCE (as utilities/14_poweroff.md does).
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0010` for the long form
+```
+
 ## a doc missing from the index
 
 An index that calls itself the index while files are invisible to it is worse than no index. Two documents sat unlisted in `docs/`, and six backlog entries before that - and a reader picks from the index, so a file nobody can reach is a file nobody reads. `mode: create` exists for this shape of rule: it can only be tripped by a file that does not exist yet.
@@ -85,6 +106,26 @@ error[GS0407]: a documented invocation does not work
   | doc commands: 1 documented invocation(s) the code does not answer
   |   docs/pipes.md:271
   | (5 more lines of explanation, which the frame above covers - `py scripts/doc_command_check.py` for all of it)
+```
+
+## a kernel module claiming no responsibility
+
+Commandment I, mechanised against MISCIS - the kernel's SIX responsibilities: Memory isolation, IPC, Scheduling, Capabilities, Interrupts, SMP routing. A seventh is not a feature, it is a change to what this kernel IS, so every module must claim one of the six and the list is derived from CLAUDE.md 4.3 itself rather than copied into config. `fbcon` was the last standing violation here and it left the kernel for `services/console`; 1,172 lines of terminal emulation, because rendering a shell prompt is policy. `mode: create` because a new responsibility arrives as a new FILE, which is exactly how one sneaks in.
+
+*Planted in `kernel/src/probe_telemetry.rs` (`create`), caught by `scripts/commandments.py`.*
+
+```
+error[GS0001]: the kernel has six responsibilities, and every module claims one
+   --> kernel/src/probe_telemetry.rs
+    |
+    = commandment: I - Thou shalt not expand the responsibilities of the kernel. It is
+                   complete. Use a service.
+    = why: this module claims no kernel responsibility. Name which of the six (4.3) it
+           serves, or which sanctioned support role and where the constitution sanctions it.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0001` for the long form
 ```
 
 ## a line citation that rotted
@@ -139,6 +180,26 @@ error[GS0406]: a document shows a POSIX or DOS word being used as a command
   | (5 more lines of explanation, which the frame above covers - `py scripts/foreign_word_check.py` for all of it)
 ```
 
+## a service that can halt the machine
+
+Commandment V, and the RULE ABOVE THE RULES: nothing above the kernel may halt or crash the machine. Only the kernel is unkillable, so a `panic!` in a service is a service deciding the machine's fate - and an `unwrap` is a panic with better manners. A missing or dead dependency must RETURN with a loud "unavailable", never take everything down with it. Both spellings fire. This case uses the explicit one because it is the one a contributor reaches for while debugging and then forgets to remove.
+
+*Planted in `services/observe/src/main.rs` (`append`), caught by `scripts/commandments.py`.*
+
+```
+error[GS0005]: no service may halt the machine
+   --> services/observe/src/main.rs:417
+    |
+    = commandment: V - Thou shalt not assume thy service is special. Only the kernel is
+                   special.
+    = why: a service must never halt the machine: return a loud error instead (unwrap_or /
+           unwrap_or_else / let-else / an explicit match)
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0005` for the long form
+```
+
 ## an em dash in prose
 
 The DECIDABLE class, and what it must look like: one line, not a frame. A fixable violation rendered as a full diagnostic whose help says "conform fixes this" is the least interesting problem taking the most space, which trains a reader to skim past the ones that matter. This case pins the compact form, and it only holds because the fixer claimed the file - a fixable rule that fails on a file the fixer cannot reach keeps its frame.
@@ -184,6 +245,33 @@ THE CASE THAT MUST STAY QUIET, and it matters as much as the ones that fire. Hal
 *Planted in `examples/00-hello/src/main.rs` (`append`), caught by `scripts/comment_symbol_check.py`.*
 
 **No finding, and that is the point.** This case exists to prove the gate stays QUIET here.
+
+## contract and spawn row disagree
+
+The kernel is no_std and cannot parse TOML, so a contract is a build-time DECLARATION reconciled against what the supervisor's spawn row actually grants. This is the gate that keeps the two from drifting, and it covers the memory limit, the placement core and the send peers. Note it reconciles the MANAGED services only - an `examples/` contract is not its business, and the first draft of this case planted one and passed. Authority claimed in an example contract is `IV-contract-authority`'s job, which is a separate case in this gallery.
+
+*Planted in `services/observe/contracts/observe.toml` (`append`), caught by `scripts/contract_check.py`.*
+
+```
+error[GS0301]: a service contract disagrees with what the spawn request actually grants
+   --> kernel/src/task/mod.rs
+    |
+    = commandment: IV - CLAUDE.md 13.6
+    = why: The kernel is no_std and cannot parse TOML: authority comes from the SPAWN
+           REQUEST, never from the contract. The contract is the reviewable declaration, and
+           this is what keeps the two from drifting. 13.6 exists because a model added a
+           capability to a contract, reported that the kernel would grant it, and was wrong
+           in a way nothing caught.
+    = help: Change the supervisor's spawn row and the contract together. If the contract says
+            a service may do something the spawn row does not grant, the service cannot do it
+            - and will say it did.
+    = note: `py scripts/conform.py --explain GS0301` for the long form
+
+  contract_check.py reported:
+  | Contract reconcile - FAILURES (a .toml disagrees with the kernel service_config):
+  | 1 mismatch(es). The contract is the source of truth (Commandment III / audit T1): fix the .toml AND kernel/src/task/mod.rs to agree.
+  | (1 more line of explanation, which the frame above covers - `py scripts/contract_check.py` for all of it)
+```
 
 ## contract claims authority nothing grants
 
@@ -387,4 +475,26 @@ error[GS0201]: the unsafe inventory does not match the source
   |   FAIL  services/observe/src/main.rs: 1 unsafe line(s) - §18.2 forbids `unsafe` in a userspace service; move it behind a safe SDK wrapper (§18.1, e.g. sdk `adversarial`/`mmio`/`dma`)
   | 1 violation(s). See audits/unsafe-audit.md and §18 of CLAUDE.md for the policy.
 ```
+
+## Coverage, and where this catalogue stops
+
+19 of 28 codes have an entry above. The rest are named here with a reason each, and this list is
+COMPUTED from the rule set minus what the cases actually rendered - so it cannot go stale when a
+case is added, and an absence nobody explained is reported as a defect rather than left to be
+mistaken for coverage.
+
+- **`GS0000`** - The deliberate FALLBACK for a Commandment failure `conform` cannot attribute. Producing it means breaking `commandments.py`'s report format, which is not a violation of anything - it is a bug in this tool, and the frame says so when it happens.
+- **`GS0002`** - Commandment II's check derives who may escape chaos from `is_transient()` and from chaos's own spawn calls - deliberately NOT from a list, so there is nothing to append to. Tripping it means editing that function, which a single-file case cannot express honestly.
+- **`GS0003`** - Commandment III wants the same module-level constant in two files of one crate. Probed four shapes - including duplicating a real `const` from `dwc2/src/chan.rs` into `hid.rs`, same crate, same value - and none fired. The precise shape it wants was not established, and a case that passes for the wrong reason is worse than none.
+- **`GS0007`** - Commandment VII pins what each service may REACH, which lives in the supervisor's spawn table. Tripping it means changing a grant there, not appending to a file.
+- **`GS0008`** - Commandment VIII has NO mechanical check at all, so this code can never fire. It is in the not-mechanised list as "[static heuristic, not built] Wait on truth". Listed here rather than quietly absent, because a code nothing can produce reads as coverage.
+- **`GS0009`** - Commandment IX wants a service that sends to a peer and cannot reacquire it. That is a property of a whole service, so the plant would be a new service rather than a line.
+- **`GS0203`** - `arch_seam_check` needs a NEW `arch::imp::` member called from neutral code, which every arch then fails to answer - a multi-file edit by construction.
+- **`GS0405`** - `facts_check` needs a doc that restates a number the code owns. Picking one means hard-coding a pairing the checker DISCOVERS, so the case would rot exactly as the checker exists to prevent.
+- **`GS0409`** - `site_check` needs a hand-written website page to disagree with the repository - again a two-file relationship.
+
+Messages that are not rule diagnostics, and so have no case: the refusal when a checker cannot be
+RUN at all (`conform` reports no verdict rather than a clean one); `conform-ok`'s two refusals, for
+a marker with no reason and one naming no rule; the unframed passthrough for a checker with no
+`RULES` entry; and the ratchet's "can tighten" line when a baseline entry is no longer needed.
 
