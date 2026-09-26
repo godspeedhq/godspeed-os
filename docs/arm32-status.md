@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # ARM32 (Raspberry Pi 2) port - status
 
-Branch `feat/pi2-arm32-hardening`. This is the living status of the 32-bit ARM (ARMv7-A, BCM2836) port. It
-records what runs, how to build/run it, and what remains. It trails the spec (`CLAUDE.md` wins on any
+This is the living status of the 32-bit ARM (ARMv7-A, BCM2836) port, merged and on `main`. It records
+what runs, how to build/run it, and what remains. It trails the spec (`CLAUDE.md` wins on any
 conflict) and complements `docs/multi-arch.md` (the cross-arch proof).
 
 ## What runs today (QEMU `raspi2b` + real Pi 2 hardware)
@@ -15,7 +15,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **The real OS bootstrap:** the kernel makes its one direct spawn (the **supervisor**), which spawns
   services from its manifest through the neutral spawn path (per-task address spaces, PL0 user mode,
   banked-register trap frames, fault-survival: a PL0 fault kills just that task and the kernel continues).
-- **Services:** `supervisor`, `events`, `console`, `shell`, `ping`, `pong`, the driver services
+- **Services:** `supervisor`, `events`, `recorder`, `copier`, `console`, `shell`, `ping`, `pong`, the driver services
   (`dwc2`, `block-driver` + `fs`, `nic-driver` + `net-stack`, `time`, `control`) and the example services
   (`observe`, `chaos`, `mem-pressure`, `counter`, `greet`, `upper`, `roster`, `reply-server`, `asker`,
   `resource-server`, `holder`) - all cross-compiled to `armv7a-none-eabi` and embedded. The embedded set
@@ -34,7 +34,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   kernel panics and 0 liveness wedges, `selfcheck` 350/0, 0 console writes lost. Full account:
   `docs/console-service.md` §9.
 - **Interactive shell:** a supervisor-spawned `gsh>` prompt over serial. Verified utilities in QEMU:
-  `help`, `version` (`GodspeedOS 0.10.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
+  `help`, `version` (the workspace version, architecture and git stamp), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
   (`status | count` -> `3`), and graceful degradation (`dir` -> `dir: storage unavailable`).
 - **Persistence (USB stick -> fs):** `block-driver` reaches a **USB mass-storage stick** through the
   `dwc2` SERVICE over the block IPC protocol, and `fs` mounts on top. `drives flash` formats GSFS, files
@@ -166,27 +166,25 @@ GodspeedOS way.
 - **USB keyboard (DWC2)** - **DONE + HW-verified.** Driven by the userspace `services/dwc2`
   (`hid.rs` bind/poll, `hub.rs::enumerate_downstream`, HID boot protocol, keystrokes to the shell via
   `CONSOLE_PUSH`), interrupt-driven off `USB_VECTOR` - NOT polled from the timer tick. Clean under
-  sustained use on hardware (2026-08-17). The two lessons below are kept because they still bite:
-  pending. The full path runs end to end under `qemu-system-arm -M raspi2b,usb=on -device usb-kbd`: DMA
-  control transfers, enumerate the **hub** the keyboard sits behind (the Pi 2's LAN9514 topology, and
-  QEMU's NEC-hub model), select HID **boot protocol**, and poll the interrupt IN endpoint from the timer
-  tick -> `decode_report` -> `console_push_byte`. Keys typed on the emulated keyboard reach the `gsh>`
-  prompt (verified: injecting `hello` via the QEMU monitor `sendkey` echoes to the shell). Two lessons:
+  sustained use on hardware (2026-08-17). The full path also runs end to end under `qemu-system-arm -M
+  raspi2b,usb=on -device usb-kbd`: DMA control transfers, enumerate the **hub** the keyboard sits behind
+  (the Pi 2's LAN9514 topology, and QEMU's NEC-hub model), select HID **boot protocol**, then the
+  interrupt IN endpoint -> `decode_report` -> the console push. Two lessons that still bite:
   (1) QEMU's DWC2 model emulates **only the DMA engine**, not slave/PIO - so the driver uses internal DMA
-  (also how u-boot/Linux drive it), bracketed with cache maintenance for the A7's non-coherent DMA;
+  (also how u-boot/Linux drive it), and needs no cache maintenance because the kernel maps the service's
+  DMA arena non-cacheable (`DMA_ARENA_UNCACHED`, see SEC-28 below);
   (2) the HCDMA buffer address is the VideoCore bus alias `0xC000_0000 | phys` on **real hardware** but
-  identity (`0`) under **QEMU**, selected by the `qemu` cargo feature (`scripts/arm_build.py --qemu`) so
-  the shipped image stays hardware-correct. **Build for QEMU test:** `arm_build.py --release --qemu`;
-  **build for the Pi:** `arm_build.py --release` (default = hardware alias). Real-Pi bring-up may still
-  need the hard-won register quirks (halt-all-channels at init, `FSLSPClkSel=0` for the HS PHY) that QEMU
-  does not exercise - see the `dwc2.rs` comments + git log.
+  identity (`0`) under **QEMU**, selected by the `qemu` cargo feature - on the `dwc2` SERVICE, which is
+  what `scripts/arm_build.py --qemu` now passes it - so the shipped image stays hardware-correct.
+  **Build for QEMU test:** `arm_build.py --release --qemu`; **build for the Pi:** `arm_build.py
+  --release` (default = hardware alias). The hard-won register quirks (UTMI+ 8-bit PHY selection, the
+  bcm2835 FIFO layout, the post-resize FIFO flush) live in `services/dwc2/src/core.rs` with the
+  comments that explain why each is load-bearing on silicon and invisible in QEMU.
 - **SD/EMMC block driver -> `fs`** - **WITHDRAWN, not done.** `sdhci.rs` is kept for reference but is
   NOT compiled in: on a single-slot Pi the EMMC *is* the boot card, and pointing GSFS at it (superblock
   at LBA 0, over the partition table) **corrupted two cards to RAW**. Storage on ARM is the USB stick
   through `dwc2`. The original entry read DONE with 'remaining: multi-block transfers' - work on a code
-  path that is unreachable and must stay so. Historical detail follows:
-  the kernel's fixed-peripheral MMIO grant; `fs` mounts + persists in QEMU. Remaining: real-hardware
-  verification on a Pi, and multi-block/faster transfers (PIO single-block today).
+  path that is unreachable and must stay so.
 - **USB bulk transfers (DWC2)** - **DONE + QEMU-verified** (2026-07-23). `bulk_xfer` (the third transfer
   type after control + interrupt) is the shared foundation for USB mass storage and USB-Ethernet. Proven
   end to end against QEMU's `usb-storage`: a Bulk-Only Transport + minimal SCSI layer (`bot_command`,
@@ -219,28 +217,25 @@ GodspeedOS way.
   bug fell out: `now_epoch_monotonic()` was a `0` stub, so `calibrate_tsc_hz` spun ~100M yields and every
   deadline wait never expired, hanging net-stack before its serve loop - now wired to the generic timer
   (`cntpct()/timer_hz()`).
-- **LAN9514 (`smsc95xx`) for the real Pi 2** - **DONE + HW-verified.** Lives in
+- **LAN9514 (`smsc95xx`) for the real Pi 2** - **DONE + HW-verified, ZERO packet loss.** Lives in
   `services/dwc2/src/net.rs` (`smsc_bring_up`, `link_up`, `link_reconfigure`). DHCP, ARP and internet
-  ping all work on real hardware at ~4% loss, with RX interrupt-driven. This entry said
-  'HW-UNVERIFIED' while the same document's 'What runs today' already reported it working - the
-  contradiction is the tell that a status file was updated in one place only. Original notes:
+  ping all work on real hardware: 56 ping replies, 0 timeouts, 117 frames parsed = 117 handed out (tag
+  `pi2-net-zero-loss`), with RX client-polled as described under "Networking" above. The
   NIC is a **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not* CDC-ECM and not
-  QEMU-emulated. `configure_smsc95xx` is a clean reimplementation from the working u-boot/Linux `smsc95xx`
+  QEMU-emulated. `smsc_bring_up` is a clean reimplementation from the working u-boot/Linux `smsc95xx`
   reference (per the driver doctrine): chip config via **vendor control requests** (bRequest 0xA0 write /
   0xA1 read, register offset in wIndex), lite-reset + PHY-reset, MAC from the chip's ADDRH/ADDRL (firmware-
   programmed) with a locally-administered fallback, MDIO PHY auto-negotiation, MAC TX/RX enable. Each TX
   frame is prefixed with the **8-byte TX command word** and each RX frame carries a **4-byte RX status
-  word** (`net_frame_tx`/`rx` branch on `NET_KIND`). It slots into `enumerate_downstream` alongside CDC-ECM
-  over the same enumeration + `bulk_xfer` + `net_frame_*` bridge, so the whole stack above it (nic-driver,
+  word**. It slots into `enumerate_downstream` alongside CDC-ECM
+  over the same enumeration and bulk-transfer path, so the whole stack above it (nic-driver,
   net-stack, `net`/`ping`) works unchanged once the device comes up. **Every hardware wait is bounded**, so
   a wrong assumption leaves the NIC unconfigured (net-stack degrades) rather than hanging the boot. QEMU
-  never exercises this branch, so it awaits **real-Pi verification** - the MAC-from-VideoCore-mailbox is a
-  known refinement for that pass.
+  never exercises this branch, so hardware is the only place it is proven.
 - **SDK DMA cache-coherence (SEC-28) - ANSWERED, by mapping rather than by hooks.** The other option
   `dma.rs` itself named was taken: `DMA_ARENA_UNCACHED = true` on ARM, so the kernel maps a service's DMA
   arena non-cacheable at spawn and `sdk/rust/src/dma.rs` needs no cache maintenance. `services/dwc2`
-  DMAs through it today. (`kernel/src/arch/arm/CLAUDE.md`'s SEC-28 bullet still says the opposite and
-  needs the same correction.)
+  DMAs through it today, and `kernel/src/arch/arm/CLAUDE.md`'s SEC-28 bullet records the same answer.
 - **Watchdog / PM reset (`hardware_reset`) - DONE + QEMU-verified** (2026-07-23). Was a stub that spun, so
   the shell `reboot` (and the Ctrl+Alt+Del chord that routes through it) hung the Pi 2 instead of resetting
   it. Now does the BCM2835 power-management watchdog reset (`arch/arm/mod.rs`): write `PM_WDOG` (peripheral
@@ -315,7 +310,7 @@ the cause was never identified. Recording it so the next attempt does not repeat
    `syscall/CLAUDE.md`: ungated are 0,3,9,10,11,12,13), so it is gated on INTROSPECT. Check what that
    syscall does on ARM from the shell's context before assuming it is harmless; caching the value once
    at startup instead of per-sleep would sidestep it entirely and is the cheapest thing to try.
-2. The shell is known to run near its 64 KiB user-stack ceiling (measured: `pipe_run` sits near that ceiling and reports a high-water mark when it moves); two extra
+2. The shell is known to run near its 256 KiB user-stack ceiling (measured: `pipe_run` sits near that ceiling and reports a high-water mark when it moves); two extra
    frames in `service_main`'s loop are not obviously safe on this port.
 3. Unrelated but found while tracing, and worth fixing on its own: `shell`'s `ESC_WAIT_CYCLES =
    200_000_000` is "~100 ms at ~2 GHz" in **`read_tsc` cycles**, and `read_tsc` on the Pi is the ~1 MHz

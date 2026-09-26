@@ -6,9 +6,10 @@
 > in `CLAUDE.md`'s amendments and in `docs/multi-arch.md`. Audit 4 flagged this same line as stale on
 > 2026-08-12 (finding A4-9) and it was recorded rather than closed; closing it now.
 >
-> What is still design rather than built is called out per-section below; the *port* is not.
-> Non-normative until the constitution is amended (see
-> "Constitution amendments needed" below). Target board: **Raspberry Pi 4 Model B, 4 GB, run in
+> What is still design rather than built is called out per-section below; the *port* is not. The
+> constitution amendments this port needed have landed (§6.4's stubs-on-non-x86 note and §11.1's
+> multiple-entry-paths note, both 2026-09-12), so this is a record of the plan rather than a proposal.
+> Target board: **Raspberry Pi 4 Model B, 4 GB, run in
 > AArch64 (64-bit).** This doc captures the bring-up plan and, more importantly, the *measured*
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
@@ -802,8 +803,8 @@ Confirm the physical board first: **Pi 4** = two micro-HDMI, USB-C power, 2xUSB3
   **the existing `xhci` driver has a real shot at porting** - it is spec-based (drove QEMU qemu-xhci and
   the T630 controller). That replaces "write DWC2 from scratch" (the older Pi's long pole) with "PCIe +
   reuse xhci."
-- **Storage = SD/EMMC** (no SATA/AHCI). `block-driver` becomes an EMMC driver, or USB mass storage once
-  xhci is up.
+- **Storage = SD/EMMC** (no SATA/AHCI). Resolved as USB mass storage: the userspace `xhci` service
+  serves the block IPC protocol `block-driver` already spoke, so no EMMC driver was written.
 - **4 GB + DMA ranges.** Some legacy peripherals can only DMA into the low 1 GB (bus addresses), so
   their DMA arenas must live in low memory. Fits the existing "reserved DMA arena per driver" model -
   just constrain where the arena is allocated.
@@ -812,39 +813,55 @@ Confirm the physical board first: **Pi 4** = two micro-HDMI, USB-C power, 2xUSB3
   allows). The same binary is least-privilege where an IOMMU confines it and trust-critical where none
   does - now literally true across x86-with-IOMMU and this Pi.
 
-## 5. Boot path decision (open)
+## 5. Boot path decision - settled: bare GPU bootloader + DTB
+
+The two options were:
 
 - **UEFI + Limine-aarch64.** The Pi 4 UEFI firmware (TianoCore) is mature. Keeps the handoff shape
   **identical to x86** - memory map, framebuffer, SMP topology handed over, minimal new parsing.
   Preserves the "arch layer is a reimplementation, not a new world" framing. Slightly off the stock Pi
   path (requires the RPi4 UEFI firmware on the SD card).
-- **Bare GPU bootloader + DTB.** Stock Pi path: the VideoCore firmware loads `kernel8.img` and jumps to
+- **Bare GPU bootloader + DTB.** Stock Pi path: the VideoCore firmware loads a flat image and jumps to
   `0x80000` with the DTB pointer in `x0`. You get RAM size + framebuffer from the **VideoCore mailbox
-  property interface** and hardcode the single known peripheral base - so full Device-Tree parsing can
-  be deferred. No Limine dependency.
+  property interface** and hardcode the single known peripheral base. No Limine dependency.
 
-**Lean: UEFI + Limine-aarch64 if the firmware cooperates**, to keep the handoff identical to x86.
+**The second was taken.** It needs nothing on the card but the image, and it does not foreclose UEFI -
+that would be a different linker script and entry, not a change above the arch layer. Two consequences
+worth knowing: the device tree is parsed after all (it is the authoritative memory map, and the mailbox
+fallback under-reports a >1 GiB board by half - see milestone 7), and our image is deployed under a
+**name of our own**, `godspeed8.img`, selected by `kernel=` in `boot/pi4/config.txt` rather than
+overwriting the stock `kernel8.img` and destroying the card's only known-good kernel.
 
 ## 6. Bring-up order
 
-1. Boot handoff (UEFI+Limine or GPU+DTB) -> reach `kernel_main` with a memory map.
+1. Boot handoff (GPU+DTB, per §5) -> reach `aarch64_boot_main` with a memory map. Note this is the
+   port's OWN entry, not the x86 `kernel_main`: `_start` brings the machine up and then joins the
+   neutral kernel, so anything added to the x86 boot path does not run here (`CLAUDE.md` §11.1,
+   amendment 2026-09-12).
 2. GIC + generic timer + MMU + EL0/EL1 exceptions + PL011 UART.
 3. SMP via PSCI (all 4 A72 cores ready).
 4. **Identity suite green on the arch core** - this is the definition of "the port is done", because
    everything the 24 tests exercise above the arch line is already-hardened code.
-5. Drivers, in this order: **GENET (network first, USB-independent)** -> **PCIe** -> **xhci reuse** ->
-   **EMMC**.
+5. Drivers, in this order: **GENET (network first, USB-independent)** -> **PCIe** -> **xhci reuse**.
+   EMMC was on the end of this list and was never needed: USB mass storage through `xhci` is the
+   storage path (§4).
 
-## 7. Constitution amendments needed (before this is normative)
+## 7. Constitution amendments - landed
 
-The spec is written single-arch in a few places; adding AArch64 turns these into "on x86 ...; on
-AArch64 the analog is ...", with the rationale in the commit (§21):
+The spec was written single-arch in a few places; adding AArch64 turned these into "on x86 ...; on
+AArch64 the analog is ...". All three are now recorded in `CLAUDE.md`:
 
-- **§11.2 / Appendix A** - the Limine + real-mode INIT+SIPI trampoline is x86-specific; AArch64 uses
-  PSCI/spin-table and (optionally) Limine-aarch64.
-- **§6.4 (H1 IOMMU)** - AMD-Vi is x86-specific; on the Pi 4 there is no usable SMMU, so DMA drivers are
-  trusted-on-this-machine (the machine-dependent posture already generalizes).
-- **§9 / §10 arch notes** - CR3->TTBR, IPI-shootdown -> broadcast TLBI, ring 0/3 -> EL0/EL1.
+- **§11.1 / §11.2 / Appendix A** - the Limine + real-mode INIT+SIPI trampoline is x86-specific. The
+  2026-09-12 amendment to §11.1 records that `kernel_main` is x86-64's entry alone and that the ARM,
+  AArch64 and RISC-V ports bring the machine up themselves.
+- **§6.4 (H1 IOMMU)** - AMD-Vi is x86-specific. The 2026-09-12 DMA-census amendment states it plainly:
+  every `iommu::` entry point on `arm`, `aarch64` and `riscv64` is a stub and `confine_device` returns
+  `false`, so all three non-x86 ports are entirely in the "without an IOMMU" case and their DMA-capable
+  drivers are trust-critical on this machine. SEC-33/SEC-34 in the §6.4 amendments carry the Pi 4's
+  specifics, including that nothing is printed either way at boot.
+- **§4.1 / §9 / §10 arch notes** - CR3->TTBR, IPI-shootdown -> broadcast TLBI, ring 0/3 -> EL0/EL1. The
+  2026-09-12 multi-architecture amendment to §4.1 makes the noun plural and states the bounded-port
+  rule the checkers enforce.
 
 ## 8. What is NOT re-audited
 

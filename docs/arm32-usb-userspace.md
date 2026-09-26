@@ -1,6 +1,6 @@
 # Taking the DWC2 USB stack out of the arm32 kernel
 
-> **Status: DONE.** `kernel/src/arch/arm/dwc2.rs` no longer exists, and `services/dwc2` (6061 lines
+> **Status: DONE.** `kernel/src/arch/arm/dwc2.rs` no longer exists, and `services/dwc2` (6173 lines
 > across its modules) drives the controller from userspace on `USB_VECTOR`. Keyboard, mass storage
 > and LAN9514 networking all run through it on real hardware. The constitution records the move in
 > its 2026-08-17 amendment (§6.4).
@@ -33,8 +33,8 @@ A port should check whether the branch exists before conceding that the hardware
 |---|---|---|
 | **1** | Route the USB IRQ to userspace *when a service has registered for it*; real mask/unmask on the BCM2835 legacy controller | ✅ `58eb4610` - hardware-verified inert (selfcheck 350/0 + 351/0, chaos 50 rounds, no panics) |
 | **2** | A skeleton `dwc2` service holding MMIO + DMA + `hw_irqs = [0x29]`, which does nothing but prove the interrupt ARRIVES in userspace | ✅ **PROVEN on hardware 2026-08-12** - see below |
-| **3** | Port the driver: `dwc2.rs` -> the service, through the SDK's safe `Mmio`/`Dma` wrappers so the service carries no `unsafe` (§18.2) | **unblocked** - its premise is now measured |
-| **4** | Retire `NET_DEVICE` (syscalls 42-44) and the `usb_disk_*` syscalls - they exist only because the driver is in-kernel. `nic-driver` and `block-driver` then talk to `dwc2` over IPC, exactly as on the Pi 4 | not started |
+| **3** | Port the driver: `dwc2.rs` -> the service, through the SDK's safe `Mmio`/`Dma` wrappers so the service carries no `unsafe` (§18.2) | ✅ done - slices below, all hardware-verified |
+| **4** | Retire `NET_DEVICE` (syscalls 42-44) and the `usb_disk_*` syscalls - they exist only because the driver is in-kernel. `nic-driver` and `block-driver` then talk to `dwc2` over IPC, exactly as on the Pi 4 | ✅ both clients moved to IPC; the arm backends behind those syscalls answer "no device", so the dispatch arms survive as inert stubs rather than being deleted |
 
 **Phase 2 is deliberately a skeleton.** It is the point where the fallback stops being taken, so the
 first boot after it is the one where USB either works from userspace or does not work at all. Proving
@@ -49,8 +49,8 @@ the interrupt arrives BEFORE betting 3981 lines on it costs one boot and removes
 ```
 
 Same millisecond, kernel router to userspace service. **`CLAUDE.md` §6.4's justification for the
-in-kernel ARM32 USB stack is empirically dead** - the port is now work not yet done, not a property
-of the hardware. §6.4 needs amending once Phase 3 lands.
+in-kernel ARM32 USB stack is empirically dead** - it was work not yet done, not a property of the
+hardware. §6.4's 2026-08-17 amendment records that.
 
 Exactly one interrupt, which is correct: the skeleton never unmasks, because it cannot clear the
 device condition that keeps a level-triggered line asserted.
@@ -93,29 +93,8 @@ That also settles the other open item for free: the unmask path demonstrably wor
 earlier second-spawn `0 IRQs` was a quiet bus, not a broken unmask. Both hypotheses were live and the
 throttle distinguished them without a separate experiment.
 
-**Phase 3 is unblocked.** Its assumption - that a userspace driver can receive its controller's
-interrupt repeatedly - is now measured rather than hoped.
-
-Still unconfirmed and harmless: `observe` showed core 0 at 97% while the skeleton held the vector,
-most likely the in-kernel driver polling a controller whose interrupt has been taken away. Worth a
-glance during Phase 3, when that driver stops existing.
-
-## `spawn dwc2` is one-way: reboot to get USB back
-
-`kill dwc2` releases the route and unmasks the line, and the keyboard still does not come back.
-Handing back the INTERRUPT does not hand back DEVICE STATE: while the service held the vector, the
-keyboard's transfer completions were delivered to a driver that ignores them, so the in-kernel
-driver's channel sits mid-transfer waiting on an event it never saw resolve, and the periodic hooks
-resume polling a channel that is already stuck.
-
-Calling the driver's own `init()` on the ownership edge was tried and **removed**. It never fired -
-it sat in `wait_for_interrupt`, and core 0 does not reach idle in that window. Making it fire needs
-somewhere that reliably runs plus a ~600 ms bring-up that cannot happen in a tick handler: real work,
-on a recovery path for a driver Slice 5 deletes.
-
-**So: reboot between experiments.** Twenty seconds, no code, and the serial console keeps the machine
-usable throughout - the shell, `selfcheck` and the logs all work with USB down, which is what makes
-Slices 1 to 4 testable at all.
+**Phase 3 was unblocked by this.** Its assumption - that a userspace driver can receive its
+controller's interrupt repeatedly - was measured rather than hoped.
 
 ## Phase 3 slicing
 
@@ -153,7 +132,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 
 | # | Work | Test |
 |---|---|---|
-| **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | ✅ selfcheck 351/0, no panics, invisible on a normal boot. **Handover is ONE-WAY - see below** |
+| **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | ✅ selfcheck 351/0, no panics, invisible on a normal boot |
 | **1a** | Core bring-up: soft reset, host mode, FIFO sizing, root-port power + reset | ✅ **hardware-verified 2026-08-12** - `core bring-up OK`, `HPRT=0x0000100f connected=true enabled=true speed=high` |
 | **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
 | **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
@@ -165,8 +144,8 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **3b** | BOT/SCSI: READ CAPACITY + READ(10) over the bulk endpoints | ✅ **hardware-verified 2026-08-12** - `31266816 sectors`, sector 0 reads `47 53 46 53` (GSFS) |
 | **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | ✅ **hardware-verified 2026-08-12** - `drives` shows the GSFS volume, served over IPC |
 | **4a** | Find + configure the USB ethernet (LAN9514) | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
-| **4b** | Frame TX/RX over the bulk endpoints; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
-| **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
+| **4b** | Frame TX/RX over the bulk endpoints; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | ✅ **HW-verified, ZERO packet loss** - DHCP, ARP, internet `ping`; 56 replies, 0 timeouts (tag `pi2-net-zero-loss`) |
+| **5** | Delete `arch/arm/dwc2.rs` and the tick hooks | ✅ **done** - the in-kernel DWC2 driver (3,981 lines) and the shared HID decoder (241) are both deleted, and the tick hooks with them; §6.4 amended 2026-08-17. The six syscall arms remain, answering "no device" |
 
 ### Two things to decide deliberately rather than inherit
 
@@ -409,51 +388,6 @@ downstream believes it:
 | port speed bits | read BEFORE the port reset | 3 boots hunting correct split code |
 | keystroke counter | counted NAKs as reports | hid a real bug for 2 boots |
 | `moved` from HCTSIZ | field is not a byte counter in DMA mode | 2175 log lines |
-
-## Slice 4a result
-
-```
-port 1  USB ETHERNET bound  - bulk IN 1 OUT 2 mps 512
-port 2  MASS STORAGE bound  - bulk IN 1 OUT 2 mps 512
-port 4  BOOT KEYBOARD bound - interface 0 endpoint 1 mps 8 interval 10
-```
-
-All three devices bound from userspace, endpoints matching the kernel driver exactly. The
-`SET_CONFIGURATION` retry did not fire on this boot - kept regardless, since the kernel driver only
-added it after seeing the failure.
-
-### 4b: the frame formats, read out of the kernel driver
-
-**The LAN9514 is NOT plain CDC-ECM.** It carries a proprietary 8-byte TX command header, and a driver
-written on the assumption that this is raw-frames-over-bulk will send garbage the device silently
-drops. From `net_frame_tx`:
-
-```
-smsc95xx TX:  TX_CMD_A = len | FIRST_SEG(0x2000) | LAST_SEG(0x1000)   (4 bytes LE)
-              TX_CMD_B = len                                          (4 bytes LE)
-              then the frame
-CDC-ECM  TX:  the raw frame, and a trailing ZERO-LENGTH PACKET when the length is an
-              exact multiple of the bulk max packet size - the short packet is what
-              delimits a datagram, so an exact multiple has no boundary without it.
-              (**CORRECTED 2026-09-26: a ZLP IS NEEDED.** This said smsc95xx carries an explicit length so it needs none. Linux sets `FLAG_SEND_ZLP` for this device, and without the terminating zero-length packet a frame whose length is an exact multiple of the max packet size leaves the device's receive buffer open forever, NAKing every later OUT - transmit works for hundreds of frames and then dies permanently. See `services/dwc2/src/net.rs`, which quotes this very sentence and refutes it.)
-```
-
-The RX side has its own status header and has NOT been read yet - do that before writing the receive
-path, not after. The TX format above was one read; guessing it would have been silently wrong, which
-on a NIC means frames that vanish rather than an error.
-
-### What 4b needs
-
-- **Frame TX/RX** over the bulk pair. CDC-ECM carries raw ethernet frames with no per-packet framing,
-  which makes this simpler than BOT - no CBW/CSW, just bulk in and out.
-- **`nic-driver` moves off `NET_DEVICE` (syscalls 42-44)** to frame IPC, the same shape as
-  `block-driver`'s move in 3c. It will need a `send_peers` grant to `dwc2`, which is the edge whose
-  absence cost the Pi 4 a day and cost this port nothing because the comment recording it was read.
-- **The RX path is where the design choice is.** The kernel driver keeps a background-armed bulk-IN on
-  a dedicated channel so the device is listened to continuously; a poll model dropped replies its
-  small RX FIFO could not hold. That decision should be made deliberately rather than inherited -
-  and note the loop now blocks on `recv_timeout`, so an always-armed IN needs somewhere to live that
-  is not "every pass".
 
 ## SLICE 3 COMPLETE - storage is served from userspace
 
@@ -740,15 +674,9 @@ Pi 4 a week.
 
 Small, real, and deliberately not being chased mid-port. Collected here so they are not lost.
 
-- **`dwc2: smsc95xx (LAN9514) up: ... (HW-UNVERIFIED)`** - the label is stale. That NIC gets a DHCP
-  lease on the same boot that prints it, so it is hardware-verified and has been for some time. A
-  label that says "unverified" about a working device teaches a reader to distrust the labels.
 - **`fs`'s "20s" mount wait** was fixed (`21324670`) but the same shape - an attempt count that
   outruns a clock bound because the loop advances with `yield_cpu` - is worth grepping for elsewhere.
   `yield_cpu` does not wait; it hands the core back and leaves the task Ready.
-- **`boot/pi4/config.txt` is not in the repo.** The Pi 2's is (`boot/pi2/config.txt`), so the v0.10.0
-  release could ship a complete Pi 2 bundle and only a bare kernel image for the Pi 4. Capture the
-  real file from a working card - do not reconstruct it from memory.
 
 ## Slice 4b: the frame IPC protocol (nic-driver off the syscalls)
 

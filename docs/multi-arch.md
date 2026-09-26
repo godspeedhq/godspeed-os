@@ -44,10 +44,14 @@ arm32  :  GodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS. 
   SDK and services. LoongArch reaches the UART-print milestone; s390x compiles.
   *(This paragraph said only x86-64 reached a shell and called the rest "deliberate future work". That
   was true when written and was not revisited as three more ports finished.)*
-- **Enforced, not just achieved:** the boundary is held by four CI guards (`unsafe_check`,
-  `contract_check`, `arch_boundary_check`, `dash_check`) plus the multi-arch compile itself. A future ISA
-  is a drop-in: add `arch/<new>/` to the `imp` surface, add the `#[cfg(target_arch)]` arm, and CI proves
-  no neutral file smuggled in arch-specific code.
+- **Enforced, not just achieved:** the boundary is held by six checkers - `arch_boundary_check`
+  (neutral layers reach hardware only through the seam), `arch_seam_check` (every arch answers every
+  member of it, discovered from usage rather than a hand-kept list), `scaffold_check` (how far a fresh
+  ISA gets with only `arch/<isa>/` written), `shared_surface_check` (ratchets arch-conditional code
+  above the kernel), `port_scope_check` (did the port edit anything it should not have) and
+  `unsafe_check` - plus the multi-arch compile itself. A future ISA is `arch/<new>/` and five wiring
+  files, none of them a neutral kernel file; `docs/porting.md` is the map, and the checkers name any
+  neutral file you had to touch.
 
 ## Per-arch bring-up notes (for the next porter)
 
@@ -57,9 +61,12 @@ arm32  :  GodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS. 
   NEON for `memcpy`/byte-copy, so `_start` must enable `CPACR_EL1.FPEN` before any Rust (found via
   `qemu -d int` → ESR `0x07`); AArch64 SP must be 16-byte aligned (EL1 SP-align check). RISC-V used
   `riscv64imac` (soft-float), sidestepping the FP-enable step entirely, and booted first try - as did LoongArch (`-softfloat`).
-- **Linker scripts:** `kernel/kernel.ld` (x86, higher-half), `kernel-aarch64.ld` (virt `0x4008_0000`),
-  `kernel-riscv64.ld` (virt `0x8020_0000`), `kernel-loongarch64.ld` (virt `0x20_0000`). `kernel/build.rs` selects by target and embeds an empty
-  service-ELF placeholder only for targets with no real services yet (riscv32, LoongArch, s390x); x86-64, ARMv7, AArch64 and RISC-V 64 all embed the real ones.
+- **Linker scripts:** `kernel/kernel.ld` (x86, higher-half), `kernel-arm.ld` (flat at `0x8000`),
+  `kernel-aarch64.ld` (virt `0x4008_0000`) with `kernel-aarch64-pi4.ld` for the board,
+  `kernel-riscv64.ld` (virt `0x8020_0000`) with `kernel-riscv64-visionfive.ld` for that board, and
+  `kernel-loongarch64.ld` (virt `0x20_0000`). `kernel/build.rs` selects by target and embeds an empty
+  service-ELF placeholder for any service not yet built for that target - so riscv32, LoongArch and
+  s390x are all placeholder, while x86-64, ARMv7, AArch64 and RISC-V 64 embed real ones.
 
 ## Word size: 32-bit as well as 64-bit (proof, recorded for the future)
 
@@ -115,10 +122,10 @@ switch - correct across any address-space change - fixes it, and it held on hard
 Diagnosis used the full toolkit: `-d int` (service runs past the svc), symbol addresses
 (`GLOBAL_RESOURCES` at `0x3f0078`), `ATS1CPR` (the page IS mapped), and lock-vs-lock_irq isolation.
 
-Gated behind the `arm-spawn-logger` build feature (the default image boots to the clean selftest
-halt). This is a **minimal** spawn - one service, one capability, entered directly rather than through
-the full scheduler; IPC endpoints, the registry, the supervisor manifest, and running the *neutral*
-`scheduler::run` are the remaining work toward a full multi-service boot.
+That first spawn was **minimal** - one service, one capability, entered directly rather than through
+the full scheduler. What it was a step toward has since shipped: IPC endpoints, the supervisor
+manifest and the *neutral* `scheduler::run` all drive the full multi-service boot on this board
+(`docs/arm32-status.md`).
 
 Everything below is the machine layer under it, each part verified on the silicon by its own selftest:
 
@@ -164,9 +171,9 @@ the argument for hardware-in-the-loop bring-up, recorded so the next porter expe
   cacheable descriptor stores must be cleaned out with `DCCMVAC` or the first translation faults. The
   SEC-28 DMA-coherence class, applied to the table walker.
 
-Still pending: **userspace** - `memory::init` from the DTB (retiring the page-table static arena for
-`alloc_frame`), user mode (PL0) via a fabricated SPSR return, the SVC syscall ABI, and building ARMv7
-service ELFs. That is the "entire port" `docs/aarch64.md` scopes; the machine layer below it is done.
+Userspace landed on top of it: `memory::init` from the DTB (retiring the page-table static arena for
+`alloc_frame`), user mode (PL0) via a fabricated SPSR return, the SVC syscall ABI, and ARMv7 service
+ELFs. That was the "entire port" `docs/aarch64.md` scopes, and it is done.
 
 **ARMv7 is a SEPARATE PORT from AArch64, not a variant of it.** `arch/arm/` and `arch/aarch64/` share
 zero code: processor modes and CP15 (`MRC`/`MCR`) instead of exception levels and system registers
@@ -201,9 +208,9 @@ Budget a 32-bit ARM port as its own work; almost nothing carries over from the 6
   the literal-pool `__bss_start` resolves into the *running code*, so the BSS-zero loop **overwrites
   its own instructions** (visible in `-d in_asm` as live opcodes turning into `00000000`). Test under
   QEMU with `-device loader,file=kernel7.img,addr=0x8000 -device loader,addr=0x8000,cpu-num=0`.
-- **All four cores start.** Read `MPIDR` and park cores 1-3 in `WFE`. Later SMP work takes them off
-  the firmware mailboxes at `0x4000_008C + 0x10*core` instead (the Pi 2 has no PSCI and no GIC - that
-  is Pi 4 hardware).
+- **All four cores start.** `_start` reads `MPIDR` and parks cores 1-3 watching their BCM2836 mailbox-3
+  read/clear register (`0x4000_008C + 0x10*core`); `smp_bringup` writes each core's release address and
+  the core jumps to it. The Pi 2 has no PSCI and no GIC - that is Pi 4 hardware.
 - **Deploying is a file copy, not a flash.** `kernel7.img` is a raw ARM binary that goes *on* the
   existing FAT32 boot partition beside `bootcode.bin`/`start.elf` - it is not a disk image, and Rufus
   correctly refuses it. (Windows may leave that partition without a drive letter; assign one via
@@ -212,6 +219,6 @@ Budget a 32-bit ARM port as its own work; almost nothing carries over from the 6
 ## The point
 
 The value was never "GodspeedOS runs on ARM." It's that a capability microkernel kept *small enough to
-audit exhaustively* has an arch boundary *clean enough that a second, third, and fourth ISA are bounded drops-in* -
-proven by the compiler and by four QEMU consoles, not by argument. The intense commandment audits were
-the groundwork; this is the payoff.
+audit exhaustively* has an arch boundary *clean enough that every further ISA is a bounded drop-in* -
+proven by the compiler, by five QEMU consoles, and by four boards running the full OS on real silicon,
+not by argument. The intense commandment audits were the groundwork; this is the payoff.

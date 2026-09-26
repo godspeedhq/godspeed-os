@@ -25,38 +25,38 @@ Broadcom's, and large); the Raspberry Pi Imager writes them for you.
    points the firmware at our kernel.
 2. **Reinsert the card** so Windows mounts the small FAT **boot partition** (labelled `bootfs` or
    `boot`).
-3. **Copy `build/config-pi2.txt` onto it AS `config.txt`, replacing the Imager's** (say yes to overwrite). Ours is the
-   canonical `boot/pi2/config.txt`, staged next to the kernel by `arm_build.py`. It is three lines:
+3. **Run `powershell -File scripts\deploy_pi.ps1 -Board pi2 -Drive E`** (substituting the card's drive
+   letter). That writes both files, performs the `config.txt` rename, and verifies the result: it
+   refuses a partition that is not a Pi 2 boot partition, compares the kernel by SHA256 after copying,
+   and reads `config.txt` back off the card to check it names `kernel7.img` and carries no carriage
+   returns. Add `-Check` to diagnose a card without writing anything - which also answers "which board
+   is this card currently set for" on a dual-boot card that carries both Pi firmwares.
+
+   The two files it writes, if you would rather copy them by hand: `build/config-pi2.txt` **onto the
+   card AS `config.txt`, replacing the Imager's** (say yes to overwrite), and `build/kernel7.img`.
+   Ours is the canonical `boot/pi2/config.txt`, staged next to the kernel by `arm_build.py`. It is
+   three lines:
    - `kernel=kernel7.img` - load our flat image by name (the firmware loads it at `0x8000`, where
      `kernel/kernel-arm.ld` expects it).
    - `arm_64bit=0` - force a 32-bit boot; our port is ARMv7, and this guards against a 64-bit OS image's
      default trying to load a `kernel8`.
    - `enable_uart=1` - keep the PL011 clock stable so the 115200 8N1 serial console is not garbled.
-4. **Copy `build/kernel7.img` onto it.**
-5. **Optionally keep a `kernel7.img.bak` on the card.** On the original stock card this `.bak` was the
+4. **Optionally keep a `kernel7.img.bak` on the card.** On the original stock card this `.bak` was the
    Raspbian kernel - a way back to Linux. Ours is just a copy of our own image, so it buys a manual
-   rollback and nothing else.
-
-   > **This used to claim a guard that does not exist.** The text here said the flash flow "uses this
-   > file as its 'is this the right card?' guard and refuses to write a card that lacks it". There is no
-   > flash flow: nothing under `scripts/` or in `osdev` mentions `bootfs` or `kernel7.img.bak`, and the
-   > copy is done by hand every time. A reader was being told they were protected against writing the
-   > wrong card when nothing was checking. **Check the drive letter yourself before you copy.**
-6. **Eject safely, boot the Pi, watch serial (115200 8N1).** You should see `GodspeedOS arm32: _start
+   rollback and nothing else. Nothing reads it: the script's "is this the right card?" guard is the
+   firmware check (`bootcode.bin` / `start.elf` / `fixup.dat` must all be present), not this file.
+5. **Eject safely, boot the Pi, watch serial (115200 8N1).** You should see `GodspeedOS arm32: _start
    reached...`, then the boot, then `dwc2-svc: USB vector armed`, and on the first device interrupt
    `dwc2-svc: *** USB INTERRUPT DELIVERED TO USERSPACE ***`. If serial is blank, the firmware cannot read
    the card (bad FAT / wrong files); if it prints `_start` then stops, the kernel faulted.
 
-   (This step named `dwc2: USB IRQ DELIVERY CONFIRMED`, a string that appears nowhere in the tree - the
-   driver became a userspace service and its log lines are prefixed `dwc2-svc:`. Anyone following the
-   old text concluded a healthy board was broken.)
+**The volume label does not matter** (`boot`, `bootfs`, anything): the script is told the drive letter
+and nothing reads the label.
 
-**If the label is `boot` not `bootfs`,** rename the volume to `bootfs` in Windows so the flash flow
-finds it, or the copy step just becomes a manual drag of the two files.
-
-**Reflashing after the first setup** is only step 4 (copy the new `build/kernel7.img`); the firmware,
-`config.txt`, and `.bak` stay. Verify the copy by **SHA256 match** (source vs card) - that is the
-reliable check, not a boot attempt.
+**Reflashing after the first setup** is the same command - `deploy_pi.ps1 -Board pi2 -Drive E` - and it
+leaves the firmware in place. By hand it is just the new `build/kernel7.img`, with the firmware,
+`config.txt` and `.bak` staying put; verify that copy by **SHA256 match** (source vs card), which is
+the reliable check and not a boot attempt.
 
 ---
 
