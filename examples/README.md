@@ -52,6 +52,22 @@ now runs somewhere, and this is where:
 | `e1000` | `osdev test examples` | its DEGRADE path: no device, so it logs and idles |
 | `driver-skeleton` | `osdev test examples` | the same, which is the discipline it exists to teach |
 
+**Those five are proven on all four ISAs, not just x86.** A claim about one instruction set is not a
+claim about the others here - the RISC-V port found four bugs that QEMU on x86 structurally could not
+reach. Each port builds them with `--examples`, which adds the same `examples-test` supervisor feature
+`osdev test examples` uses, so it is the same proof rather than a similar one:
+
+| ISA | Build | Boot |
+|---|---|---|
+| x86-64 | (built by the test) | `osdev test examples` - 11 assertions |
+| ARMv7 | `py scripts/arm_build.py --release --examples` | `py scripts/arm_run.py --release` |
+| AArch64 | `py scripts/pi4_build.py --release --examples` | `py scripts/pi4_run.py` |
+| RISC-V 64 | `py scripts/riscv_build.py --release --examples` | `py scripts/riscv_run.py --release` |
+
+On all four, every one of the five logged its startup line AND its documented outcome, with zero
+kernel panics. The flag is opt-in and changes nothing without it: the default `kernel7.img`,
+`kernel8.img` and VisionFive images rebuild to their exact previous byte sizes.
+
 **Two gaps, stated rather than implied.** `e1000` and `driver-skeleton` are drivers, and in
 `osdev test examples` they are granted no device - so their MMIO paths are NOT exercised, only their
 degrade paths. Granting `e1000` the NIC would put two drivers on one controller (`nic-driver` takes

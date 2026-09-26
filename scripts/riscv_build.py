@@ -139,8 +139,14 @@ def main():
             print("    the window, so the next mount must report `journal recovered`.")
             print("    Reflash a normal image afterwards - this one deliberately stalls writes.")
             print("")
+        # `examples-test` adds the five examples nothing else ever spawns - the same feature
+        # the x86 `osdev test examples` uses, so the proof is the same proof.
+        if "--examples" in sys.argv:
+            for ex in ["hello", "stdlib-hello", "cap-grant", "e1000", "driver-skeleton"]:
+                run(["cargo", "build", "-p", ex, "--target", TARGET, "--release"])
+        sup_feats = "bare-metal,examples-test" if "--examples" in sys.argv else "bare-metal"
         run(["cargo", "build", "-p", "supervisor", "--target", TARGET, "--release",
-             "--features", "bare-metal"])
+             "--features", sup_feats])
         sup = os.path.join(ROOT, "target", TARGET, "release", "supervisor")
         if not os.path.exists(sup):
             sys.exit("supervisor did not build; the kernel would silently embed a placeholder")

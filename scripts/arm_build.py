@@ -111,6 +111,8 @@ def main():
     ap.add_argument("--feature", default="arm-supervisor",
                     help="kernel boot-path feature (arm-supervisor)")
     ap.add_argument("--release", action="store_true")
+    ap.add_argument("--examples", action="store_true",
+                    help="also build and spawn the five examples nothing else runs (hello, stdlib-hello, cap-grant, e1000, driver-skeleton) - `examples-test`")
     # A DETERMINISTIC POWER CUT, and this board is the one that needs it most.
     #
     # §6.1 records `fs` on the Pi 2 as restartable but NOT crash-recoverable: its USB stick refuses
@@ -174,11 +176,17 @@ def main():
     # it was index 4 of 24 - cargo reuses the previous run's binaries for everything after it, and the
     # image ships services one build behind next to a current kernel. Nothing fails and nothing warns.
     # Caught when a shell change verified on x86 was demonstrably absent from `kernel7.img`.
+    if args.examples:
+        for ex in ["hello", "stdlib-hello", "cap-grant", "e1000", "driver-skeleton"]:
+            run(["cargo", "build", "-p", ex, "--target", TARGET] + rel)
     ordered = [s for s in ARM_SERVICES if s != "supervisor"] +               (["supervisor"] if "supervisor" in ARM_SERVICES else [])
     for svc in ordered:
         feats = []
         if svc == "supervisor":
-            feats = ["--features", "bare-metal"]
+            # `examples-test` adds the five examples nothing else ever spawns. Same feature the x86
+            # `osdev test examples` uses, so what is proven here is the same thing proven there.
+            feats = ["--features",
+                     "bare-metal,examples-test" if args.examples else "bare-metal"]
         elif svc == "dwc2" and args.qemu:
             feats = ["--features", "qemu"]
         elif svc == "fs" and args.crash_window:

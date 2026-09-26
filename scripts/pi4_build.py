@@ -130,6 +130,10 @@ if "--features" in sys.argv:
 # still in the kernel - see arch/arm/CLAUDE.md.
 EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
 CRASH_WINDOW = "--crash-window" in sys.argv
+# Also build and spawn the five examples nothing else ever runs (hello, stdlib-hello,
+# cap-grant, e1000, driver-skeleton) - the `examples-test` supervisor feature, the same one
+# the x86 `osdev test examples` uses.
+EXAMPLES_ON = "--examples" in sys.argv
 
 rel = ["--release"] if PROFILE == "release" else []
 
@@ -143,10 +147,14 @@ service_embed_check.enforce(str(ROOT), "aarch64")
 # THE SUPERVISOR IS BUILT LAST - it `include_bytes!`s every other service, so building it earlier
 # (it was index 6 of 24) ships the PREVIOUS build of everything after it. See scripts/embed_order_check.py.
 _ORDERED = [s for s in PI4_SERVICES if s != "supervisor"] +            (["supervisor"] if "supervisor" in PI4_SERVICES else [])
+if EXAMPLES_ON:
+    for _ex in ["hello", "stdlib-hello", "cap-grant", "e1000", "driver-skeleton"]:
+        run(["cargo", "build", "-p", _ex, "--target", TARGET] + rel)
 for svc in _ORDERED:
-    feats = ["--features", "bare-metal"] if svc == "supervisor" else []
-    if svc == "supervisor":
-        feats = ["--features", "bare-metal"]
+    # `examples-test` adds the five examples nothing else ever spawns - the same feature
+    # the x86 `osdev test examples` uses, so the proof is the same proof.
+    feats = (["--features", "bare-metal,examples-test" if EXAMPLES_ON else "bare-metal"]
+             if svc == "supervisor" else [])
     # The THIRD crate the one switch has to reach. block-driver must be told to fetch its sectors
     # from the `xhci` SERVICE over IPC instead of from the in-kernel stack by syscall; without it the
     # service drives the disk and block-driver asks a kernel that is no longer driving anything, so
