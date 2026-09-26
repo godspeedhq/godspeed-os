@@ -37,6 +37,17 @@ fn main() {
     let bare_metal = std::env::var("CARGO_FEATURE_BARE_METAL").is_ok();
     let probe: &[&str] = if bare_metal { &[] } else { &["probe"] };
 
+    // The five examples nothing else ever spawns, embedded ONLY for `osdev test examples`. Before
+    // this they compiled on four architectures and had never been executed - which made "example" a
+    // weaker word than it reads, since two of them are what a newcomer is pointed at first. Behind a
+    // feature for the same reason as `counter-test`: the daily-driver image should not carry a
+    // service whose whole job is to log that it started.
+    let examples: &[&str] = if std::env::var("CARGO_FEATURE_EXAMPLES_TEST").is_ok() {
+        &["hello", "stdlib-hello", "cap-grant", "e1000", "driver-skeleton"]
+    } else {
+        &[]
+    };
+
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let usb: &[&str] = match arch.as_str() {
         "x86_64"  => &["xhci", "ehci"],
@@ -132,7 +143,7 @@ fn main() {
                                    cannot locate the profile directory"))
         .to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(probe.iter()) {
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(probe.iter()).chain(examples.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing
         // would produce a supervisor that cannot start the service, failing far from the cause.

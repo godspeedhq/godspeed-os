@@ -19,7 +19,7 @@ all without writing `unsafe` and without expanding the kernel's responsibilities
 | Acquire | get the kernel-granted MMIO window for the NIC | `ctx.mmio()` |
 | Read | Device Status (link up?), Receive Address (the MAC) | `Mmio::read32` |
 | Report | log link + MAC | `ctx.log` / `ctx.log_fmt` |
-| Degrade | no e1000 mapped -> log and idle, never crash | `ctx.try_recv()` + `ctx.yield_cpu()` |
+| Degrade | no e1000 mapped -> log and idle, never crash | `gs::ipc::try_recv` + `gs::task::yield_now` |
 
 Registers used (byte offsets into BAR0): `STATUS 0x0008` (bit 1 = Link Up), `RAL0 0x5400` + `RAH0
 0x5404` (the 6-byte MAC the NIC auto-loaded from its EEPROM). Reads go through the SDK `Mmio` wrapper,

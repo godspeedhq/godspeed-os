@@ -41,7 +41,7 @@ understand supervisor internals, or know architecture-specific details.
 The desired experience is approximately:
 
 ```rust
-use godspeed::fs;
+use godspeed::{self as gs};
 
 fn main() -> Result<(), godspeed::Error> {
     let contents = fs::read_to_string("/data/hello.txt")?;

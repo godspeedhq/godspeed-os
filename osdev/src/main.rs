@@ -616,6 +616,54 @@ pub fn cmd_build_bare_metal() {
 /// feature, so it spawns `examples/counter` - the stateful service that persists its count to `fs`
 /// and recovers it across its own restart (§14/§15). `counter` is kept out of the daily-driver image
 /// (plain `bare-metal`) so its per-tick disk writes are test-only.
+/// Build for `osdev test examples`: the bare-metal set PLUS the five examples nothing else runs.
+///
+/// Same shape as `cmd_build_counter`, with `examples-test` in place of `counter-test`. The example
+/// crates are built explicitly because they are not in `SERVICE_CRATES` - they are examples, and
+/// `supervisor/build.rs` panics rather than embedding a stale binary, so they must exist first.
+pub fn cmd_build_examples() {
+    clean_supervisor();
+    for crate_name in SERVICE_CRATES {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
+        println!("build: {} OK", crate_name);
+    }
+    // The five examples themselves.
+    for crate_name in ["hello", "stdlib-hello", "cap-grant", "e1000", "driver-skeleton"] {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", crate_name,
+                   "--target", "x86_64-unknown-none"])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", crate_name, e));
+        if !status.success() { eprintln!("build: {} FAILED", crate_name); std::process::exit(1); }
+        println!("build: {} OK", crate_name);
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor",
+               "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal,supervisor/examples-test"])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() {
+        eprintln!("build: supervisor (bare-metal + examples-test) FAILED");
+        std::process::exit(1);
+    }
+    println!("build: supervisor (bare-metal + examples-test) OK");
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
+        .status()
+        .expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
+    println!("build: kernel OK");
+}
+
 pub fn cmd_build_counter() {
     clean_supervisor();
     let non_supervisor = SERVICE_CRATES;
@@ -1439,6 +1487,7 @@ fn cmd_test(suite: &str) {
         "peer-storm"   => run_peer_storm_test(),
         "adopt-storm"  => run_adopt_storm_test(),
         "counter"      => run_counter_test(),
+        "examples"     => run_examples_test(),
         "reply-server" => run_reply_server_test(),
         "reply-dead"   => run_reply_dead_test(),
         "trace"        => run_trace_chain_test(),
@@ -2646,6 +2695,28 @@ fn run_fs_restart_test() {
 /// mounts, lets `counter` persist a couple of increments to /counter.dat, KILLs counter over the
 /// control channel, and - after the supervisor respawns it - asserts the fresh instance RECOVERED a
 /// non-zero count from the file (not "starting at 0"). That single assertion is the proof.
+/// The five examples that nothing else ever spawned (`examples/`), each asserted to RUN.
+///
+/// Until this existed, `hello`, `stdlib-hello`, `cap-grant`, `e1000` and `driver-skeleton` compiled
+/// on four architectures and had never been executed - including the two HELLO examples the README
+/// and CLAUDE.md 17 point a newcomer at first. "Example" was doing more work as a word than the
+/// repository could back.
+///
+/// A real disk is attached because `stdlib-hello` reads a file; the others need nothing but their log.
+fn run_examples_test() {
+    println!("\n=== examples: the five that nothing else ever ran (examples/) ===");
+    cmd_build_examples();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_examples.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_examples(&image_path, persist, 4);
+}
+
 fn run_counter_test() {
     println!("\n=== counter: stateful service survives its own restart (examples/counter, §14/§15) ===");
     cmd_build_counter();

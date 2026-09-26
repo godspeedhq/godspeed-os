@@ -32,7 +32,34 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 | `roster` | Pipe **record producer** (typed `Table`) | **III** (the table is the one truth; JSON/grid are derived views), **VI**, **VII**, **X** |
 | `counter` | Restart-with-state: persist to `fs`, recover on spawn | **V** (restartable like any service), **IX** (persist externally, reconstruct on startup), **VIII** (load the persisted truth), **III** (`fs` owns the durable copy) |
 | `driver-skeleton` | A userspace driver (MMIO/DMA/IRQ), `unsafe`-free | **I** + **X** (a driver is a service; `unsafe` isolated to the SDK), **VII** (only the granted MMIO + IRQ), **VI** (an owned DMA arena), **V** + **IX** (restartable, re-inits on spawn), **VIII** (wait on the interrupt, not a sleep) |
-| `e1000` | A real minimal NIC driver that runs in QEMU | same as `driver-skeleton`, proven against actual hardware |
+| `e1000` | A real minimal NIC driver, read-only: reports link state and the MAC | same as `driver-skeleton`. Its DEGRADE path is proven by `osdev test examples`; its MMIO path is not (see the table below) |
+
+## How each example is PROVEN to run
+
+An example that has never been executed is a claim this folder cannot back. Every one of the fifteen
+now runs somewhere, and this is where:
+
+| Example | What runs it | What that proves |
+|---|---|---|
+| `ping` / `pong` | `osdev test identity` (Tests 3, 6, 9, 10) | cross-core IPC, restart, cap rebinding |
+| `counter` | `osdev test counter` | persisted a count, was killed, recovered it on respawn |
+| `reply-server` / `asker` | `osdev test reply-server` | the round trip closed and the reply echoed the request |
+| `resource-server` / `holder` | `osdev test resource-server` | mint, use, non-escalation refused, `CapRevoked` after revoke |
+| `greet` / `upper` / `roster` | every bare-metal boot, including all five boards | they spawn, reach `ready`, and survive repeated chaos respawns |
+| `00-hello` | `osdev test examples` | it starts, holds one capability, and yields through `gs::task` |
+| `stdlib-hello` | `osdev test examples` | the `gs::fs` + `gs::io` path reaches a definite outcome |
+| `cap-grant` | `osdev test examples` | `gs::cap::self_grant` and `gs::cap::duplicate` really succeed |
+| `e1000` | `osdev test examples` | its DEGRADE path: no device, so it logs and idles |
+| `driver-skeleton` | `osdev test examples` | the same, which is the discipline it exists to teach |
+
+**Two gaps, stated rather than implied.** `e1000` and `driver-skeleton` are drivers, and in
+`osdev test examples` they are granted no device - so their MMIO paths are NOT exercised, only their
+degrade paths. Granting `e1000` the NIC would put two drivers on one controller (`nic-driver` takes
+it by PCI class, unconditionally), which is the footgun the 2026-08-09 amendment in CLAUDE.md 6.4
+records. The register-read path is covered instead by `nic-driver`, which uses the same
+`Mmio::read32` wrapper on every boot and is hardware-verified on the T630 and the Wyse. Likewise
+`cap-grant`'s actual TRANSFER has no `receiver` to land on; that path is covered by
+`resource-server` granting to `holder`.
 
 **Cross-cutting: Commandment II (love Chaos).** *Every* service here, before it is "done", must
 survive `chaos max-carnage` - kill storms, flood storms, mem pressure, spawn storms. If Chaos finds

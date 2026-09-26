@@ -22,7 +22,7 @@
 // against; `godspeed-sdk` is the layer underneath it, for when the standard library does not
 // cover what you are doing (a driver reaching MMIO, say). `ServiceContext` is re-exported
 // here, so a first program never has to name the lower layer at all.
-use godspeed::ServiceContext;
+use godspeed::{self as gs, ServiceContext};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -40,8 +40,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("hello: alive; yielding the CPU each tick");
         }
         // Cooperative yield. Preemption (the 10 ms quantum, CLAUDE.md §9.1) happens
-        // regardless; `yield_cpu` is advisory - never rely on timing for correctness
+        // regardless; this is advisory - never rely on timing for correctness
         // (Commandment VIII). A real service would block on `recv` here instead.
-        ctx.yield_cpu();
+        //
+        // `gs::task::yield_now`, NOT `ctx.yield_cpu()`. Both work, and reaching for the
+        // context method is reaching past the standard library to the layer underneath -
+        // which is the one thing this example exists to show you never need to do.
+        gs::task::yield_now(&ctx);
     }
 }

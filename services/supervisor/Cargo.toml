@@ -21,6 +21,14 @@ blockdev = []
 # used by `osdev test counter`. Kept OUT of the daily-driver image and identity build (which use
 # `bare-metal` / `identity-only` without this) so counter's per-tick disk writes are test-only noise.
 counter-test = []
+# Additionally spawn the five examples that nothing else ever runs: `hello`, `stdlib-hello`,
+# `cap-grant`, `e1000` and `driver-skeleton` (examples/). Used by `osdev test examples`. Kept OUT of
+# the daily-driver image and the identity build for the same reason as `counter-test`: an example
+# that logs every tick is test-only noise in an image someone actually uses.
+#
+# They are gathered under ONE feature rather than five because they share a single question - does
+# this example run at all - and five flags would be five ways to build a half-populated image.
+examples-test = []
 # Additionally spawn `reply-server` + its client `asker` (examples/) on top of the bare-metal set.
 # `asker` sends `reply-server` a request carrying an embedded reply cap; reply-server replies over it;
 # the round-trip is asserted by `osdev test reply-server`. Kept OUT of the daily-driver image and

@@ -28,7 +28,7 @@
 // from `godspeed_sdk`, while the documentation told an ordinary program it would not need that
 // crate. The Stranger Test caught the contradiction - a weak model guessed the SDK path and flagged
 // it as the thing most likely to stop its program compiling - so the library re-exports it now.
-use godspeed::{fs, io, Error, ServiceContext};
+use godspeed::{self as gs, Error, ServiceContext};
 
 /// Where the text comes from. `selfcheck` writes this file, so the program has something to find
 /// on a running machine.
@@ -42,7 +42,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The filesystem handle. This grants NOTHING - it borrows the context, and the context can only
     // reach what the contract asked for. A program without `ipc_send = ["fs"]` gets this same
     // handle and every call through it fails with `Unreachable`.
-    let mut disk = fs::Fs::new(&ctx);
+    let mut disk = gs::fs::Fs::new(&ctx);
 
     // The caller owns the buffer. There is no heap on this machine (CLAUDE.md §26.6.1), so the
     // maximum this program can use is readable right here rather than hidden in an allocator.
@@ -51,32 +51,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match disk.read_into(PATH, &mut buf) {
         Ok(n) => {
             let text = core::str::from_utf8(&buf[..n]).unwrap_or("<not valid utf-8>");
-            io::println_fmt(&ctx, format_args!("{} ({} bytes):", PATH, n));
-            io::println(&ctx, text);
+            gs::io::println_fmt(&ctx, format_args!("{} ({} bytes):", PATH, n));
+            gs::io::println(&ctx, text);
         }
 
         // A file that is not there is not a malfunction, and is worth telling apart from one.
         Err(Error::NotFound) => {
-            io::println_fmt(&ctx, format_args!("{} is not there - run `selfcheck` to create it", PATH));
+            gs::io::println_fmt(&ctx, format_args!("{} is not there - run `selfcheck` to create it", PATH));
         }
 
-        // Everything else prints what actually happened. `io::report` phrases it, so every program
+        // Everything else prints what actually happened. `gs::io::report` phrases it, so every program
         // says the same thing about the same failure - including the one that matters most, where
         // the operation MAY have completed and the honest answer is to say so.
         Err(e) => {
-            io::report(&ctx, "read", e);
+            gs::io::report(&ctx, "read", e);
 
             // A read is idempotent, so retrying any no-answer failure is safe here. `retry_is_safe`
             // is asked rather than assumed, because for a WRITE the answer would be different and
             // this is the habit worth forming.
             if e.retry_is_safe() {
-                io::println(&ctx, "read: nothing happened, so this one is safe to try again");
+                gs::io::println(&ctx, "read: nothing happened, so this one is safe to try again");
             }
         }
     }
 
     ctx.log("stdlib-hello: done");
     loop {
-        ctx.yield_cpu();
+        gs::task::yield_now(&ctx);
     }
 }

@@ -198,6 +198,20 @@ static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
 static OBSERVE_ELF: &[u8] = include_bytes!(env!("SVC_OBSERVE_ELF"));
 static GREET_ELF: &[u8] = include_bytes!(env!("SVC_GREET_ELF"));
 static COUNTER_ELF: &[u8] = include_bytes!(env!("SVC_COUNTER_ELF"));
+
+// The five examples that nothing else spawns, present only in the `examples-test` build. The env
+// vars exist only there (supervisor/build.rs), so the cfg is not decoration - without it this build
+// does not compile anywhere else.
+#[cfg(feature = "examples-test")]
+static HELLO_ELF: &[u8] = include_bytes!(env!("SVC_HELLO_ELF"));
+#[cfg(feature = "examples-test")]
+static STDLIB_HELLO_ELF: &[u8] = include_bytes!(env!("SVC_STDLIB_HELLO_ELF"));
+#[cfg(feature = "examples-test")]
+static CAP_GRANT_ELF: &[u8] = include_bytes!(env!("SVC_CAP_GRANT_ELF"));
+#[cfg(feature = "examples-test")]
+static E1000_ELF: &[u8] = include_bytes!(env!("SVC_E1000_ELF"));
+#[cfg(feature = "examples-test")]
+static DRIVER_SKELETON_ELF: &[u8] = include_bytes!(env!("SVC_DRIVER_SKELETON_ELF"));
 static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
 static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
@@ -376,6 +390,34 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // it was handed, not by resolving a name.
     ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0, 0),
     ("counter", COUNTER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
+
+    // ---- examples that nothing else ever ran (examples-test build) ------------------------------
+    //
+    // `hello` holds log_write and NOTHING else, which is the whole lesson of the example: no send
+    // peers, no endpoint, no privileges. If this row ever grows an entry, the example has stopped
+    // being what it teaches.
+    #[cfg(feature = "examples-test")]
+    ("hello", HELLO_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    // `stdlib-hello` reads a file through `gs::fs`, so it is WIRED to fs like `counter` is.
+    #[cfg(feature = "examples-test")]
+    ("stdlib-hello", STDLIB_HELLO_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
+    // `cap-grant` needs its OWN endpoint (REQ_RECV) so `gs::cap::self_grant` has something to hand
+    // out, and ACQUIRE_ANY so its lookup of "receiver" reaches the name directory. With no such
+    // service present the lookup MISSES - which is the documented standalone outcome, and a more
+    // useful thing to assert than a privilege denial that would stop it one step earlier.
+    #[cfg(feature = "examples-test")]
+    ("cap-grant", CAP_GRANT_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     32 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::ACQUIRE_ANY, 0, 0),
+    // `e1000` and `driver-skeleton` are DRIVERS and get NO device here, deliberately: `nic-driver`
+    // already owns the NIC by PCI class, and two drivers on one controller is the footgun 6.4's
+    // 2026-08-09 amendment records. So these two prove their DEGRADE path - log and idle, never
+    // crash (Commandment V) - and not their MMIO path, which `nic-driver` covers on every boot
+    // through the same `Mmio::read32` wrapper.
+    #[cfg(feature = "examples-test")]
+    ("e1000", E1000_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    #[cfg(feature = "examples-test")]
+    ("driver-skeleton", DRIVER_SKELETON_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     // The user's interface. GPIO and SET_CLOCK_FLOOR are ARM-only in effect but the bits are
     // arch-neutral: the kernel refuses any the supervisor cannot delegate, and on x86 the underlying
     // grant is simply never used. SET_CLOCK_FLOOR is the NARROW right (raise the clock floor), not
@@ -1395,6 +1437,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // instance instead of duplicating it. block-driver + fs are spawned above (bare-metal set).
     #[cfg(feature = "counter-test")]
     ensure_wired(&ctx, &mut name_map, "counter", &["fs"]);
+
+    // The five examples nothing else ran (`osdev test examples`). `stdlib-hello` is WIRED to fs
+    // because it reads a file; the rest need only the log capability their row grants.
+    //
+    // Spawned here, AFTER fs and the shell, for the reason `counter` is: an example that reads a
+    // file before the filesystem is mounted would report a missing file and be telling the truth
+    // about the wrong thing.
+    #[cfg(feature = "examples-test")]
+    {
+        ensure_wired(&ctx, &mut name_map, "stdlib-hello", &["fs"]);
+        ensure_mapped(&ctx, &mut name_map, "hello", 0xFFFF);
+        ensure_mapped(&ctx, &mut name_map, "cap-grant", 0xFFFF);
+        ensure_mapped(&ctx, &mut name_map, "e1000", 0xFFFF);
+        ensure_mapped(&ctx, &mut name_map, "driver-skeleton", 0xFFFF);
+    }
 
     // reply-server + asker (examples/): the request/reply (RPC) pair. Spawned ONLY in the
     // `reply-test` build (`osdev test reply-server`); idle/absent everywhere else. reply-server owns

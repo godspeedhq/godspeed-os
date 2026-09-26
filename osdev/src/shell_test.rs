@@ -4533,6 +4533,108 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
 /// `counter` persist a couple of increments to /counter.dat, KILL counter over the control channel,
 /// and - after the supervisor respawns it - assert the fresh instance RECOVERED a non-zero count
 /// from the file (not "starting at 0"). That single assertion is the proof the state survived.
+/// The five examples nothing else ever spawned, each asserted to actually RUN (`examples/`).
+///
+/// `hello`, `stdlib-hello`, `cap-grant`, `e1000` and `driver-skeleton` compiled on four
+/// architectures and had never been executed - two of them the HELLO examples a newcomer is pointed
+/// at first. This boots the `examples-test` image and watches each of them say what it is documented
+/// to say.
+///
+/// BOOT-AND-OBSERVE, not interactive, and that is the right shape: four of the five exist to
+/// demonstrate a POSTURE - hold exactly one capability, degrade instead of crashing - and a posture
+/// is proven by what a service says unprompted, not by asking it something.
+///
+/// WHAT THIS DOES NOT PROVE, stated here because the alternative is a test that overclaims.
+/// `e1000` and `driver-skeleton` are DRIVERS and are granted no device, so their MMIO paths are not
+/// exercised - only their degrade paths. Giving `e1000` the NIC would put two drivers on one
+/// controller (`nic-driver` takes it by PCI class, unconditionally), which is the footgun CLAUDE.md
+/// 6.4's 2026-08-09 amendment records. The register-read path is covered elsewhere: `nic-driver`
+/// uses the same `Mmio::read32` wrapper on every boot, hardware-verified on the T630 and the Wyse.
+/// `cap-grant`'s actual transfer is likewise unexercised - no `receiver` service exists - and that
+/// path is covered by `resource-server` granting to `holder`.
+pub fn run_examples(image_path: &Path, persist_path: &str, smp: u32) {
+    let sc = crate::qemu::timeout_scale();
+    println!("examples: booting (smp={smp}) bare-metal + AHCI disk + the five examples; serial on COM1");
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist   = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),   // COM1: logs (QEMU waits for us)
+        "-serial",  "null",                                  // COM2: unused here
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("examples: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("examples: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("examples: PASS - {}", $label); pass += 1; } else { println!("examples: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // ONE settle window for the whole boot, then assert against the accumulated log. A per-example
+    // cursor would impose an ORDER the supervisor does not promise: these five are spawned in one
+    // block and their lines interleave with the managed set's.
+    let _ = collect_until(&buf, &mut 0usize, b"examples-settled-never-appears",
+                          Duration::from_secs(45 * sc));
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let saw = |needle: &str| whole.contains(needle);
+
+    // 1. hello - the canonical first example. It holds log_write and nothing else.
+    check!(saw("hello: starting"), "hello: ran (examples/00-hello)");
+    check!(saw("hello: I hold only the log_write capability"),
+           "hello: reported its authority - one capability, no ambient anything");
+
+    // 2. stdlib-hello - the `gs::fs` + `gs::io` tour, against a real filesystem. EITHER outcome is a
+    //    pass: it read the file, or it correctly reported the file is absent. What is NOT acceptable
+    //    is silence, which is what a wedged fs client looks like.
+    check!(saw("stdlib-hello: starting"), "stdlib-hello: ran (examples/stdlib-hello)");
+    check!(saw("/sc/a.txt") || saw("stdlib-hello: done"),
+           "stdlib-hello: reached a definite outcome through gs::fs (read it, or said it was absent)");
+
+    // 3. cap-grant - self_grant + duplicate really happen; the transfer has no receiver to land on.
+    check!(saw("cap-grant: starting"), "cap-grant: ran (examples/cap-grant)");
+    check!(saw("'receiver' not registered") || saw("granted a cap to receiver"),
+           "cap-grant: gs::cap::self_grant + duplicate succeeded, and the grant reported its outcome");
+
+    // 4+5. The two drivers, proving the DEGRADE path (Commandment V): no device, so log and idle.
+    check!(saw("e1000: starting"), "e1000: ran (examples/e1000)");
+    check!(saw("no Intel e1000 mapped"),
+           "e1000: DEGRADED cleanly with no device granted (did not crash)");
+    check!(saw("driver-skeleton: starting"), "driver-skeleton: ran (examples/driver-skeleton)");
+    check!(saw("no device mapped - idling (degraded)"),
+           "driver-skeleton: DEGRADED cleanly with no device granted (did not crash)");
+
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic while the five examples ran");
+    let _ = std::fs::write("build/tests/examples_serial.log", whole.as_bytes());
+
+    child.kill().ok(); child.wait().ok();
+    println!("\nexamples: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_counter(image_path: &Path, persist_path: &str, smp: u32) {
     let sc = crate::qemu::timeout_scale();
     println!("counter: booting (smp={smp}) bare-metal + AHCI disk + counter; shell on COM1, control on COM2");

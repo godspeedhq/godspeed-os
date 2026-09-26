@@ -22,7 +22,7 @@ A whole program - every line of it, because the parts around your code are not g
 #![no_main]                 // the entry point is `service_main`, not `main`
 #![deny(unsafe_code)]       // required of every program; see the note below
 
-use godspeed::{fs, io, Error, ServiceContext};
+use godspeed::{self as gs, Error, ServiceContext};
 
 // `#[no_mangle]` is itself covered by the `unsafe_code` lint (an exported symbol can collide), and
 // the entry symbol must be exported because the linker looks for `service_main` by name. So this
@@ -30,19 +30,19 @@ use godspeed::{fs, io, Error, ServiceContext};
 #[allow(unsafe_code)]
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    let mut fs = fs::Fs::new(&ctx);
+    let mut fs = gs::fs::Fs::new(&ctx);
 
     // There is no `read_to_string`. GodspeedOS has no heap (CLAUDE.md 26.6.1), so the CALLER owns
     // the buffer and the bound is visible in the source.
     let mut buf = [0u8; 4096];
     match fs.read_into("/data/message.txt", &mut buf) {
-        Ok(n) => io::println(&ctx, core::str::from_utf8(&buf[..n]).unwrap_or("<not utf-8>")),
-        Err(e) => io::report(&ctx, "read", e),
+        Ok(n) => gs::io::println(&ctx, core::str::from_utf8(&buf[..n]).unwrap_or("<not utf-8>")),
+        Err(e) => gs::io::report(&ctx, "read", e),
     }
 
     // A program does not return. There is no `exit`: every runnable thing here is a service, and a
     // service that has finished its work waits to be stopped.
-    loop { ctx.yield_cpu(); }
+    loop { gs::task::yield_now(&ctx); }
 }
 ```
 

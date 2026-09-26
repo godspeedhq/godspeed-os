@@ -666,6 +666,12 @@ SpawnImage               = 52
 [kernel.service_grants]
 "asker" = ["peer:reply-server"]
 "block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
+# examples/cap-grant, examples-test build only. ACQUIRE_ANY so its lookup of "receiver" reaches the
+# kernel name directory: with no such service present the lookup MISSES, which is the standalone
+# outcome the example documents and `osdev test examples` asserts. Without the privilege it would be
+# denied one step earlier and prove nothing about naming. No peers - the transfer it demonstrates
+# has no receiver, by design.
+"cap-grant" = ["priv:ACQUIRE_ANY"]
 "chaos" = ["peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "console" = ["hw:FRAMEBUFFER", "peer:events"]
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
@@ -675,6 +681,10 @@ SpawnImage               = 52
 "ehci" = ["hw:EHCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
+# examples/stdlib-hello, examples-test build only. It reads a file through `gs::fs`, which is
+# the whole point of the example, so it needs the one peer that serves files - the same single
+# grant `counter` and `copier` carry for the same reason.
+"stdlib-hello" = ["peer:fs"]
 "hw-enumerator" = ["peer:events", "priv:PCI_CFG"]
 "net-stack" = ["peer:events", "peer:nic-driver", "peer:time", "priv:RESOURCE_MINT", "priv:SET_CLOCK"]
 "nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events"]
