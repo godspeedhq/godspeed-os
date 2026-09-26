@@ -119,7 +119,7 @@ to drain anything, and nothing you did not ask for is consumed.
 // A service loop. `fs.read_into` may block for seconds; a client that speaks during it is still
 // waiting on your endpoint afterwards, not lost.
 loop {
-    let req = ctx.recv();
+    let req = gs::ipc::recv(&ctx);
     let mut buf = [0u8; 4096];
     let n = fs.read_into("/data/answer.txt", &mut buf)?;
     reply(&req, &buf[..n]);

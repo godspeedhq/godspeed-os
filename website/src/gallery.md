@@ -10,7 +10,9 @@ mockup.
 
 The kernel comes up on all cores, spawns the supervisor directly, and the supervisor wires each
 service from its name-cap map. Here the USB stack has just enumerated a keyboard end to end, and the
-shell is ready. The display is driven by the `console` service, which renders the interactive console stream; the serial line keeps the full log.
+shell is ready. Boot output reaches the display through the kernel's own minimal framebuffer blit,
+which hands the screen to the `console` service once that service is up; the serial line keeps the
+full log either way.
 
 ![GodspeedOS booting to steady state](images/boot.png)
 
@@ -29,7 +31,7 @@ IPC endpoints). Authority is never ambient or inherited - it is this list, and o
 `observe` is a live, full-screen view of every service the system is running - scheduler slot, name,
 core, state, memory against its contract limit, restart count, IPC queue depth, CPU share, and
 uptime. It reads structured per-service state the kernel and supervisor already track; there is no
-`/proc` text to parse. Here all eight services are healthy, spread across the four cores.
+`/proc` text to parse. Here all eight services are healthy.
 
 ![The observe live view](images/observe.png)
 
@@ -45,8 +47,8 @@ boundary and a capability check to get there - there is no ambient file access a
 ## Editing a file: `edit`
 
 `edit` is a full-screen, modeless text editor - a title bar with the filename and a dirty mark, the
-text area, and a status bar showing the two keys you need (`^S` save, `^Q` quit), the column, the
-byte count, and the edit-buffer fill (`buf 106/32768`). It opens a file of *any* size without loading
+text area, and a status bar showing the two keys you need (`Ctrl-S` save, `Ctrl-Q` quit), the column,
+the byte count, and the edit-buffer fill (`buf 106/32768`). It opens a file of *any* size without loading
 it whole: the original stays on disk, read in fixed windows as you scroll, while edits accumulate in
 a bounded add-buffer and a save streams the pieces back out. Bounded, no heap, loud when the buffer
 fills - never a silent truncation.

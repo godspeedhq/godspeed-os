@@ -70,19 +70,20 @@ Arrows point from the caller to the service it sends to.
   ┌─────▼────────┐                      ┌─────▼──────┐
   │ block-driver │                      │ net-stack  │
   └─────┬────────┘                      └─────┬──────┘
-        │  (ARM only)                         │
+        │  (USB disk)                         │
   ┌─────▼────────┐                      ┌─────▼──────┐
   │ dwc2 / xhci  │                      │ nic-driver │
   │  USB host    │                      └─────┬──────┘
-  └──────────────┘                            │ (ARM: through USB)
+  └──────────────┘                            │ (Pi 2: through USB)
                                         ┌─────▼──────┐
                                         │   dwc2     │
                                         └────────────┘
 ```
 
 On x86 `block-driver` talks to an AHCI controller through its own MMIO capability and has no USB peer
-at all; on the Pi 2 and Pi 4 the disk is a USB device, so it goes through the USB host service. Same
-service, same block protocol, different peer - which is the point of naming peers rather than devices.
+at all; on the Pi 2, the Pi 4 and the VisionFive 2 the disk is a USB device, so it goes through the
+USB host service. Same service, same block protocol, different peer - which is the point of naming
+peers rather than devices.
 
 ---
 
@@ -145,14 +146,16 @@ reboot - which is what took it out of the trusted computing base.
 
 ```
    fs ──[op, lba, data?]──▶ block-driver ──▶ AHCI  (x86: own MMIO cap + DMA)
-      ◀──[status, data?]───              └──▶ dwc2 / xhci  (ARM: over IPC)
+      ◀──[status, data?]───              └──▶ dwc2 / xhci  (USB: over IPC)
 ```
 
-It knows sectors, not files. On ARM the disk is behind the USB host service, so a peer restart makes
-its capacity **temporarily unknowable** - and *unknowable* is answered with an error, never with "no
-disk". Publishing zero sectors during a peer restart is how a filesystem gets mounted against nothing.
+It knows sectors, not files. Where the disk is a USB device it sits behind the USB host service, so a
+peer restart makes its capacity **temporarily unknowable** - and *unknowable* is answered with an
+error, never with "no disk". Publishing zero sectors during a peer restart is how a filesystem gets
+mounted against nothing.
 
-**Peers:** `dwc2` (ARM only).
+**Peers:** `events`, plus the USB host where the disk is on USB - `dwc2` on the Pi 2, `xhci` on the
+Pi 4 and the VisionFive 2.
 
 ### `xhci` / `ehci` / `dwc2` - the USB host controllers
 
@@ -201,7 +204,7 @@ filesystem.
 cannot format, position or scroll - because a panic halts every core including this service, so it
 cannot ask a service to report it (§11.4).
 
-**Peers:** none - it is written *to*.
+**Peers:** `events` only - everything else writes *to* it.
 
 ### `time` - the wall clock
 
@@ -238,7 +241,7 @@ none, retry a sample after reacquiring, and republish their liveness row on the 
 the sink returns.
 
 **Read it with:** `events ipc`, `events metrics`, `events log`, `events status`.
-**Peers:** fourteen services publish to it; it publishes to nobody.
+**Peers:** thirteen services declare it as a send peer; it publishes to nobody.
 
 ### `recorder` - the capture that outlives the screen
 
@@ -270,7 +273,7 @@ that it died.
 It holds the narrowest hardware capability in the system. It cannot write configuration space at all -
 that would be write access to every BAR of every device on the bus.
 
-**Peers:** none - the supervisor asks it.
+**Peers:** `events` only - the supervisor asks it, never the other way round.
 
 ### `control` - the operator channel
 
@@ -296,9 +299,8 @@ The single most important behaviour to understand, because every service depends
    t4   shell ──AcquireSendCap("fs")──▶ fresh cap  and carries on
 ```
 
-Between t1 and t3 the name does not resolve - a few hundred milliseconds, measured at 312 ms worst on
-a Pi 2 and 1,680 ms on a T630. A client that treats that window as *"the peer is gone forever"* rather
-than *"ask again"* is the shape of most of the bugs this system has had.
+Between t1 and t3 the name does not resolve. A client that treats that window as *"the peer is gone
+forever"* rather than *"ask again"* is the shape of most of the bugs this system has had.
 
 **Reacquiring the endpoint is necessary but not sufficient** (§14.3). Anything derived from the dead
 instance - an open-file capability, a socket, a cached capacity - was issued by an instance that no
