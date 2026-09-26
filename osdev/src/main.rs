@@ -402,6 +402,33 @@ const EXTRA_CHECKS: &[&str] = &[
     // and the rule above is the whole reason this list exists: a checker on one build path is a
     // checker on none.
     "scripts/line_ending_check.py",
+
+    // ---- THE DOCUMENTATION LAYER, wired here 2026-09-26 -----------------------------------------
+    //
+    // These seven existed and worked and were on NO developer build path. They ran only in
+    // `build.yml`, which is `workflow_dispatch`-only and paused, and in `release.yml`, which fires
+    // on a `v*` tag - so documentation was effectively checked AT RELEASE. That is too late by
+    // construction, and v0.20.0 is the worked example: its tag-triggered run failed late and the
+    // release shipped with no artefacts at all.
+    //
+    // It is also why the 2026-09-26 audit found 233 defects across `docs/`, `utilities/`,
+    // `website/src/` and the code comments. Every one of them would have had to pass a gate that
+    // never ran. The rule in the comment directly above applies to itself: a checker on one build
+    // path is a checker on none.
+    //
+    // Cost, measured: ~11.5 s for all eight together, on a build that compiles a kernel and twenty
+    // services. The alternatives were "find out at release" and "find out in an audit".
+    "scripts/doc_refs.py",
+    "scripts/docs_index_check.py",
+    "scripts/facts_check.py",
+    "scripts/foreign_word_check.py",
+    "scripts/line_ref_check.py",
+    "scripts/site_check.py",
+    "scripts/backlog_check.py",
+    // A documented INVOCATION must work: `gsh> dir long /` lists a directory NAMED `long` and
+    // discards the path, and `osdev test blockdev-ahci` names a suite that does not exist. Both
+    // shipped. Reads `SUBCMD_FIRST` and osdev's own `match suite`, so it cannot drift from them.
+    "scripts/doc_command_check.py",
 ];
 
 fn commandment_check() {

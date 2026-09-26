@@ -310,6 +310,7 @@ made `trace service fs` read oddly beside `trace deps fs`. The sketch below also
 duration, which was not built: the kernel does not stamp when a task blocked, and adding that stamp is
 kernel growth for a diagnostic. See the reference section above for what it actually prints.
 
+<!-- doc-command-ok: a PROPOSAL: these shipped as the single `trace chain <name|slot>` -->
 ```
 gsh> trace task 42
 task 42 "shell"  BlockedCall 12ms

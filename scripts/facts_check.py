@@ -253,6 +253,79 @@ def help_coverage_problems():
     return problems
 
 
+
+def dispatch_utils_problems():
+    """Every command the shell DISPATCHES must be in UTILS, or be an explicitly exempt non-utility.
+
+    The other two UTILS checks start from the list and ask whether its members are documented. This
+    asks the opposite and catches what they cannot: a command the shell ANSWERS that is not in the
+    list at all. `UTILS` gates the `argc == 2 && is_util` intercept, so a command missing from it
+    never reaches the intercept, and `<cmd> version` is parsed as an ordinary argument.
+
+    That shipped: `fmt version` formats a file NAMED `version`, `serve version` replies "the argument
+    must be a port", `tcp version` prints usage. Rule 1 of `0_conventions.md` says every utility
+    answers both words, and `utilities/39_fmt.md` documents `fmt version` and `fmt help` as working -
+    `fmt`'s `util_help` arm exists and is unreachable.
+
+    EXEMPT, with the reason, because not every dispatched word is a utility. This set may shrink
+    freely; growing it takes an edit here and a line in the commit message saying why.
+    """
+    import re
+    problems = []
+    src = read("services/shell/src/main.rs")
+
+    u = re.search(r"const UTILS: &\[&str\] = &\[(.*?)\n\];", src, re.S)
+    if not u:
+        return ["dispatch/UTILS: could not find `const UTILS` in services/shell/src/main.rs"]
+    utils = set(re.findall(r'"([a-z0-9_-]+)"', re.sub(r"//[^\n]*", "", u.group(1))))
+
+    # `execute`'s dispatch: `match args[0] { "name" => ... }`. Take the whole function and read the
+    # string literals in arm position, which is `"word" =>` or `"word" | "word2" =>`.
+    ex = re.search(r"\nfn execute\(.*?\n\}\n", src, re.S)
+    if not ex:
+        return ["dispatch/UTILS: could not find `fn execute` in services/shell/src/main.rs"]
+    body = re.sub(r"//[^\n]*", "", ex.group(0))
+    dispatched = set()
+    for m in re.finditer(r'^\s*((?:"[a-z0-9_-]+"\s*\|\s*)*"[a-z0-9_-]+")\s*=>', body, re.M):
+        dispatched.update(re.findall(r'"([a-z0-9_-]+)"', m.group(1)))
+
+    # NOT utilities, each for a stated reason.
+    EXEMPT = {
+        # gsh language keywords - statements, not commands (docs/scripting.md).
+        "if", "else", "switch", "for", "while", "let", "fn", "import", "return",
+        "break", "continue", "defer", "in", "true", "false",
+        # session and job verbs: they act on the session, and `<verb> version` would be ambiguous
+        # with a job name (utilities/55_background.md).
+        "background", "jobs", "foreground",
+        # the pipe/record stages - they are documented as STAGES and are never a bare command
+        # (docs/pipes.md, docs/records.md).
+        "where", "select", "sort", "first", "last", "count", "match", "sum", "avg", "max", "min",
+        "to", "paginate", "paste", "unique", "number", "except", "reverse",
+        # `help` itself, and the empty line.
+        "help", "",
+    }
+
+    missing = sorted(d for d in dispatched if d not in utils and d not in EXEMPT)
+
+    # PINNED. Lower it freely when a command gains its help/version intercept; raising it needs a
+    # reason in the commit message. 7 is the state on 2026-09-26: fmt, tcp, serve, random, gpio,
+    # spawncap, spawnwired - each answers a command and cannot answer `version`.
+    BASELINE = 7
+    if len(missing) > BASELINE:
+        problems.append(
+            "dispatch/UTILS: %d command(s) the shell answers are absent from UTILS (baseline %d) - %s. "
+            "A command missing from UTILS never reaches the `argc == 2 && is_util` intercept, so "
+            "`<cmd> version` is parsed as an argument: that is how `fmt version` came to format a "
+            "file named `version`. Add it to UTILS (it needs a `util_help` block), or add it to "
+            "EXEMPT in this check with the reason it is not a utility."
+            % (len(missing), BASELINE, ", ".join(missing)))
+    elif len(missing) < BASELINE:
+        problems.append(
+            "dispatch/UTILS: %d absent from UTILS, below the baseline of %d - a gap was CLOSED. "
+            "Lower BASELINE in scripts/facts_check.py to %d to keep the ratchet tight (%s)."
+            % (len(missing), BASELINE, len(missing), ", ".join(missing) or "none left"))
+    return problems
+
 def util_help_coverage_problems():
     """Every utility in UTILS must have a `util_help` BLOCK, not just a mention in `help`.
 
@@ -542,6 +615,7 @@ def main():
 
     tree = (porting_tree_problems() + budget_ordering_problems() + wire_format_problems()
             + help_coverage_problems() + util_help_coverage_problems()
+            + dispatch_utils_problems()
             + help_philosophy_problems())
     for name, truth, source, pats in facts():
         if not pats:

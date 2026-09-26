@@ -145,6 +145,7 @@ location is a `cd` pointer (§4 note, `utilities/15_drives.md` §3.2).
 
 Flash and use a raw drive - immediately, no reboot:
 
+<!-- doc-command-ok: section 6 is mockups - `drives use` / `drives mount` are designed, not built -->
 ```
 gsh> drives
   #  LABEL      STATUS     SIZE      CONTENTS                   USE
@@ -166,6 +167,7 @@ gsh> drives use default 0
 
 Multiple drives, paths, duplicate labels, mount vs use:
 
+<!-- doc-command-ok: section 6 is mockups - `drives use` / `drives mount` are designed, not built -->
 ```
 gsh> drives
   #  LABEL      STATUS     SIZE      CONTENTS                   USE
@@ -189,6 +191,7 @@ gsh> drives use 1:data
 
 Replug-safety (identity over location):
 
+<!-- doc-command-ok: section 6 is mockups - `drives use` / `drives mount` are designed, not built -->
 ```
 gsh> drives use archive          # by label
    …unplug drive, move to another SATA port, replug…

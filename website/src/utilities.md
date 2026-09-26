@@ -12,11 +12,11 @@ environment inheritance, no signals. What replaces them is capabilities.
 
 ```
    UNIX                              GODSPEEDOS
-   ls /data | grep .txt              ls /data | match .txt
+   ls /data | grep .txt              dir /data | match .txt
    ────────────────────              ──────────────────────
    fork + exec + pipe(2)             the shell creates an ENDPOINT
    fd 1 inherited by the child       and grants one end to each side
-   ambient access to /data           `ls` holds a cap to `fs`, or it
+   ambient access to /data           `dir` holds a cap to `fs`, or it
                                      cannot read anything at all
 ```
 

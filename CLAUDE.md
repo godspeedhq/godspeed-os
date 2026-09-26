@@ -384,6 +384,24 @@ os/
                          #   number rots on the next edit above it, and fifteen checkers
                          #   looked at none: Audit 7 found 7 of 11 wrong, four documents
                          #   citing ONE dead line. `audits/` is exempt - dated evidence
+    doc_command_check.py #   a documented INVOCATION must work. `doc_symbols_check` asks
+                         #   whether a NAME resolves and `facts_check` whether a NUMBER
+                         #   matches; nothing asked whether a documented prompt runs. `dir long /` does
+                         #   not - `long` was removed, so the shell lists a directory NAMED
+                         #   `long` and discards the path, which is a WRONG ANSWER rather
+                         #   than an error. Reads `SUBCMD_FIRST` and osdev's own `match
+                         #   suite`, so it cannot drift from either
+
+    # WHERE THESE RUN, which until 2026-09-26 was the hole under all the others. The eight
+    # DOCUMENTATION checkers above (doc_refs, docs_index_check, facts_check,
+    # foreign_word_check, line_ref_check, site_check, backlog_check, doc_command_check) were
+    # on NO developer build path: they ran only in `build.yml`, which is
+    # `workflow_dispatch`-only and paused, and in `release.yml`, which fires on a `v*` tag.
+    # Documentation was therefore checked AT RELEASE - too late by construction, and v0.20.0
+    # is the worked example (its tag run failed late and the release shipped with no
+    # artefacts). They are in `osdev`'s `EXTRA_CHECKS` now, so a build runs them. ~11.5 s for
+    # all eight, measured. The rule this list already states about `line_ending_check.py`
+    # applies to itself: a checker on one build path is a checker on none.
     service_embed_check.py #  every managed service is really embedded in the image
     embed_order_check.py #   the supervisor is newer than the services it embeds
     stack_fit_check.py   #   a service's frames fit the stack it is given (§26.6.1)

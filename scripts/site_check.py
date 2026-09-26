@@ -138,7 +138,11 @@ def check_intro_counts():
 
 
 def check_utilities_index():
-    """Every utility spec has a row, and every row has a spec."""
+    """Every utility spec has a row, every row has a spec, and every row is PUBLISHED.
+
+    The third clause is the one that was missing: a row can link a page that `SUMMARY.md`
+    does not list, which mdBook silently does not render. See the note inline.
+    """
     page = read(os.path.join(SITE, "utilities.md"))
     if not page:
         return ["website/src/utilities.md is missing"]
@@ -151,6 +155,25 @@ def check_utilities_index():
         out.append("utilities.md has NO ROW for `%s` (utilities/*_%s.md exists)" % (missing, missing))
     for extra in sorted(linked - specs):
         out.append("utilities.md links `%s`, which has no spec under utilities/" % extra)
+
+    # AND THE PAGE MUST ACTUALLY BE PUBLISHED. `SUMMARY.md` is the only file mdBook reads to decide
+    # what to render, so a row linking a page SUMMARY does not list is a dead link on the live site -
+    # not a broken build, not a warning, a 404 for readers while every gate stays green.
+    #
+    # This is exactly how `seal`, `tcp` and `serve` shipped unrendered for up to twelve days, and it
+    # had happened before: commit `eb01c860`, "the `background` utility was never published to the
+    # site". Fixed by hand that time, with nothing added to catch the third occurrence.
+    summary = read(os.path.join(SITE, "SUMMARY.md"))
+    if not summary:
+        out.append("website/src/SUMMARY.md is missing - mdBook renders nothing without it")
+        return out
+    published = set(re.findall(r"\]\(utilities/([a-z0-9_-]+)\.md\)", summary))
+    for unpublished in sorted(linked - published):
+        out.append("utilities.md links `utilities/%s.md` but SUMMARY.md does not list it - "
+                   "mdBook will not render it and the link 404s on the site" % unpublished)
+    for orphan in sorted(published - linked):
+        out.append("SUMMARY.md publishes `utilities/%s.md` but utilities.md has no row for it - "
+                   "the page is unreachable from the index a reader browses" % orphan)
     return out
 
 
