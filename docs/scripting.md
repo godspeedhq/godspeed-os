@@ -22,6 +22,11 @@
   buffers would overflow the bounded 256 KiB user stack (§26.6); stage it through a file instead -
   `greet | count | write /t.txt` then `let n = $(read /t.txt)`, the materialize-then-capture idiom.
 
+> **Corrected 2026-09-26.** Nine worked examples in this document captured a pipeline directly
+> (`let n = $(greet | count)`), which is the thing this very bullet says is refused. They are
+> staged now. The bound is real - a nested pipe inside a capture is what the bounded stack
+> cannot afford - so an example that hides it fails on first use.
+
 - **Functions** (§7) - `fn name params { … }` called like a command; named params; scoped locals plus
   immutable-global access; `return`; and bounded recursion via explicit call frames (no native
   recursion, §9). Function-valued conditions (`if fn { }`, §4) and function output-capture
@@ -145,9 +150,11 @@ echo "hi $name, n=$n"          # hi Matthew, n=3
 Capture - promote a command into a value with `$( )`:
 
 ```
-let count = $(greet | count)               # 3
+greet | count | write /t.txt               # stage it - a capture cannot hold a pipeline
+let count = $(read /t.txt)                 # 3
 let when  = $(date)                         # the date stamp
-let live  = $(status | where state=Running | count)
+status | where state=Running | count | write /t.txt
+let live  = $(read /t.txt)
 echo "running: $live, at $when"
 
 fn make_greeting name { echo "Hello, $name!" }
@@ -341,7 +348,7 @@ for arg in $args {
     echo "arg: $arg"
 }
 
-for svc in events fs registry {
+for svc in events fs block-driver {
     echo "checking $svc"
 }
 ```
@@ -482,9 +489,7 @@ Each returns a `Result`, so they compose with `if`.
 - `defer <command>` - run a command when the current scope (function, or the whole script) exits,
   **including on `fail`**; deferreds run LIFO.
 - `Ok` / `Err` and the variant names (`FileNotFound`, `Denied`, `AssertFailed`, `Unknown`).
-- `true` / `false` - always-`Ok` / always-`Err`.
 - `range N` / `range A B` - the counting iterator for `for`.
-- `empty <v>` - true if `<v>` is empty (a prefix test, handy in conditions).
 - `break`, `continue`.
 
 Arithmetic is **inline** (`+ - * / %`, value position) - see §3, not a builtin.
@@ -502,11 +507,16 @@ write /tmp/build/out done
 stream); the column reducers are record-only:
 
 ```
-let rows  = $(roster | count)            # row count
-let files = $(dir /work | count)          # entries in a directory
-let used  = $(status | sum mem)          # sum a numeric column
-let big   = $(dir /work | max size)       # largest file
-let avgq  = $(status | avg queue)        # average a column
+roster | count | write /t.txt            # row count (stage, then capture)
+let rows  = $(read /t.txt)
+dir /work | count | write /t.txt          # entries in a directory
+let files = $(read /t.txt)
+status | sum mem | write /t.txt          # sum a numeric column
+let used  = $(read /t.txt)
+dir /work | max size | write /t.txt       # largest file
+let big   = $(read /t.txt)
+status | avg queue | write /t.txt        # average a column
+let avgq  = $(read /t.txt)
 ```
 
 - `count` - rows (record stream) or lines (byte stream).
@@ -689,7 +699,8 @@ for row in (roster | where seat > 0) {
     echo "$row.name is a $row.role at seat $row.seat"
 }
 
-let lines = $(greet | count)
+greet | count | write /t.txt
+let lines = $(read /t.txt)
 echo "greet emitted $lines"
 ```
 
@@ -757,8 +768,10 @@ for row in (status | where state=Running) {
     echo "  $row.name  core=$row.core  queue=$row.queue"
 }
 
-let running = $(status | where state=Running | count)   # row count (record-aware)
-let memuse  = $(status | sum mem)                        # reduce a column
+status | where state=Running | count | write /t.txt     # row count (record-aware)
+let running = $(read /t.txt)
+status | sum mem | write /t.txt                          # reduce a column
+let memuse  = $(read /t.txt)
 echo "$running running, $memuse KiB in use"
 ```
 

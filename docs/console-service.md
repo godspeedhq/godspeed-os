@@ -442,11 +442,19 @@ requirement, not the other port's answer (§26.14).
 
 | | |
 |---|---|
-| **Added** | `ConsoleDrain` syscall (the service reads the console byte stream); a `CONSOLE_RENDER` authority gating it; a framebuffer grant in the spawn path; one `service_config` row |
+| **Added** | a framebuffer grant in the spawn path; one `service_config` row. **No new syscall** - see the correction below |
 | **Removed** | `InspectKernel` query 9 (`dims_packed`) - the shell asked the KERNEL for terminal geometry, which is a service's question; `FB_READBACK_CHEAP` from the arch contract, halving the framebuffer surface an arch owes to `fb_commit` alone; ~840 lines of ring-0 code |
 
-The syscall pin grows by one and the introspection pin shrinks by one. That is the trade the audit
-predicted and it is deliberate: a byte read is mechanism, terminal geometry is policy.
+The introspection pin shrinks by one, and the syscall pin does NOT grow. That is better than the
+trade the audit predicted: terminal geometry left the kernel and nothing was added to pay for it.
+
+> **Corrected 2026-09-26.** This table said the split ADDED a `ConsoleDrain` syscall and a
+> `CONSOLE_RENDER` authority gating it, and the sentence above said "the syscall pin grows by one".
+> Neither exists - not in `kernel/`, not in `services/`, not in `sdk/`, and `SyscallNumber` has no
+> such entry. What shipped is what §9.2 of this document describes: `ConsoleWrite` enqueues the same
+> bytes to the service's ordinary IPC endpoint, with no new ring and no new syscall. The wrong half
+> mattered more than it looks: someone auditing the kernel's syscall surface against Commandment I
+> would have gone looking for an addition that was never made.
 
 ### 9.7 Geometry has ONE owner
 

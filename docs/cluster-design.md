@@ -66,7 +66,7 @@ ipc_send_remote = ["ledger"]   # explicit cross-node send, different failure dom
 
 ```rust
 // Local service - identical to today
-let pong = ctx.send_cap("pong")?;
+let pong = ctx.acquire_send_cap("pong")?;
 pong.send(msg)?;
 
 // Remote service - developer explicitly opts into a different failure domain

@@ -115,7 +115,7 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
   trust claim. `nic-driver` is spawned `hwclass::pci(0x02_00_00, BAR_AUTO, false)` - the third argument
   is `confine`, and it is `false` (`services/supervisor/src/main.rs:383`). **`xhci` is the only confined
   driver in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
-  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``). So the
+  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs, the `confine` flag on `HwClass::Pci``). So the
   NIC driver's DMA is unconfined: a *buggy* one is bounded by the arena it was granted, but a
   *compromised* one can point the controller anywhere in RAM, which is kernel-equivalent reach by
   §6.4's own rule. It is restartable, and it is **in the TCB on every machine today**. All `unsafe`

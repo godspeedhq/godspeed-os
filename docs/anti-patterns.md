@@ -329,7 +329,7 @@ Growth or work with no ceiling.
 | Reach for the heap where a bounded arena or stack was required. | Default to fixed stack arrays / bounded arenas / streaming in fixed chunks (§26.6.1); change the representation, do not add a heap. |
 | A retry with no cap. | Bound the retries and report exhaustion (§26.6). |
 | Recursion with no bounded stack. | Iterate with an explicit bounded stack (§26.6.1); unbounded recursion overflows into a guard page. |
-| Cap-table entries accumulated and never reclaimed. | `remove_cap` when a cap is no longer needed; a long-running server stays bounded (§26.6, `examples/reply-server`). |
+| Cap-table entries accumulated and never reclaimed. | `gs::cap::remove` when a cap is no longer needed (`remove_cap` is the SDK-only spelling); a long-running server stays bounded (§26.6, `examples/reply-server`). |
 
 ---
 

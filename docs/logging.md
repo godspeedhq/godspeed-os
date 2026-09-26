@@ -122,18 +122,28 @@ services --(send cap)--> events  (stateless router, unforgeable attribution)
 
 ## What runs now
 
-`services/events/src/main.rs` is 29 lines and does almost none of the above:
+`services/events/src/main.rs` is **469 lines** and serves four query protocols:
 
 1. Logs `events: ready` at startup.
-2. Blocks on `recv()` and **drops every message**.
+2. Holds a **192-event IPC trace ring** (`RING = 192`), a **64-slot metrics table** (`METRICS = 64`)
+   and an 8 KiB log window.
+3. Dispatches `TRACE_OP_EVENT / METRIC / LOG` (publish) and `TRACE_OP_DUMP / METRICS / LOGS / STATUS`
+   (query), which is what `events ipc`, `events metrics`, `events log` and `events status` read - and
+   what [`gs::trace`](https://godspeedhq.github.io/godspeed-os/api/godspeed/trace/index.html) wraps.
 
-The drop loop is not laziness - it is a real fix. The service owns an endpoint, and an endpoint has a
-16-deep queue. A stub that merely parked would let that queue fill (a chaos flood-storm, one stray send)
-and sit at 16/16 forever, failing every later sender. Blocking on `recv` and dropping keeps it drained
-while still parking the task between messages, so the core idles.
+> **Corrected 2026-09-26.** This said the service "is 29 lines", "**drops every message**", and that
+> "**nothing currently logs *through* `events`**". All three were true of the drop-loop stub this
+> section was written about, and none is true now. The paragraph below is kept because its REASONING
+> still holds and still explains why the service drains rather than parks.
 
-Note what this means: **nothing currently logs *through* `events`.** `ctx.log()` is syscall 5 - it goes
-straight to the kernel ring buffer and out to serial, never touching the service. Its practical value
-today is as the simplest restartable service: stateless, so it is the trivial restart case (§15), and the
-second thing the supervisor spawns, which makes it a useful canary that the spawn path works before
-anything complicated starts.
+**Why it drains rather than parks** (the original rationale, still the reason): the service owns an
+endpoint, and an endpoint has a 16-deep queue. A stub that merely parked would let that queue fill (a
+chaos flood-storm, one stray send) and sit at 16/16 forever, failing every later sender. Receiving and
+handling keeps it drained while still parking the task between messages, so the core idles.
+
+**And the precise form of the logging claim, because CLAUDE.md §11.4 turns on it.** `ctx.log()` is
+syscall 5: it writes the kernel ring and serial **directly, first, always** - so log output does not
+depend on `events` being up, and a chaos storm that kills the service loses no lines. That floor is
+unchanged. What IS new is that `ctx.log()` also sends a COPY to the sink (`log_copy` ->
+`try_send`, `sdk/rust/src/service_context.rs`), which is what makes `events log` queryable. A copy to
+a restartable service, never the path of record.

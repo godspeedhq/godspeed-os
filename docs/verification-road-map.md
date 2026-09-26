@@ -1,8 +1,8 @@
 # Post-v1 Verification Roadmap
 
-> **Status:** Non-normative. Records the verification work that follows the 130-test suite (§22 of CLAUDE.md). Not a replacement for the constitution; a sequence of concrete activities that raise rigor without bolting on certification overhead.
+> **Status:** Non-normative. Records the verification work that follows the identity + property + fuzz + stress + perf + adversarial + chaos suite (147 `TestSpec` entries as of 2026-09-26; this said 130) (§22 of CLAUDE.md). Not a replacement for the constitution; a sequence of concrete activities that raise rigor without bolting on certification overhead.
 >
-> **Context:** GodspeedOS v1 shipped with all 130 tests passing across seven categories (identity, property, fuzz, stress, performance, adversarial, chaos), each with brutal variants. The kernel is correct against its spec. The work below sharpens what is already there: finding what the tests miss, what QEMU hides, and what only emerges over time.
+> **Context:** GodspeedOS v1 shipped with all 130 tests passing across seven categories (the suite is 147 entries now) (identity, property, fuzz, stress, performance, adversarial, chaos), each with brutal variants. The kernel is correct against its spec. The work below sharpens what is already there: finding what the tests miss, what QEMU hides, and what only emerges over time.
 >
 > **Progress (2026-05-16):** Items 1, 3-6 complete. Item 2 and items 7-9 deferred pending hardware arrival.
 
@@ -26,7 +26,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 ## 1. Code Coverage
 
-**Intent.** Measure where the 130 tests do *not* exercise the code. Use the gaps to find dead code (delete it) and underexercised paths (add tests).
+**Intent.** Measure where the suite does *not* exercise the code. Use the gaps to find dead code (delete it) and underexercised paths (add tests).
 
 **Why first.** Coverage tells you where to look. Every later activity benefits from knowing which lines, branches, and unsafe blocks are actually tested. It also surfaces dead code, which a kernel that prides itself on smallness should not carry.
 
@@ -63,7 +63,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 **Why it matters.** QEMU TCG models the x86_64 ISA but not the timing or memory ordering of real silicon. Classes of bugs that only real hardware finds:
 
-- **Cache coherence.** Real CPUs have weaker memory ordering than QEMU TCG effectively serializes to. Atomic operations and the cap-table `RwLock` are prime suspects.
+- **Cache coherence.** Real CPUs have weaker memory ordering than QEMU TCG effectively serializes to. Atomic operations and the cap-table `SpinLock` are prime suspects. (It is a `SpinLock`, not an `RwLock`: CLAUDE.md 7.8's 2026-09-12 amendment corrected that, and there is no `RwLock` type in the kernel at all.)
 - **TLB latency.** QEMU TLB shootdowns are essentially instant; real shootdowns take real time. If the protocol assumed instantaneous IPI completion, it breaks here.
 - **APIC delivery.** Real IPIs have measurable latency. Any code path that assumes "IPI delivery is fast" gets tested for the first time.
 - **Power management.** Real cores have C-states. The idle loop probably needs `hlt` or `mwait`, not a busy loop, or the CPU cooks.

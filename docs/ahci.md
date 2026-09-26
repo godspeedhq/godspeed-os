@@ -51,18 +51,18 @@ IOMMU or not, exactly as §6.4 says an unconfined DMA driver must be.
 
 Developed behind the `block-driver/ahci` cargo feature so the ATA PIO tests stay
 green during the migration; becomes the default (retiring ATA PIO + the IDE probe)
-once read/write/fs/reboot are verified on it. Test: `osdev test blockdev-ahci`.
+once read/write/fs/reboot are verified on it. Test: `osdev test blockdev`.
 
 - **Step A - detect + HBA init. ✅ done.** Map ABAR, enable AHCI mode (GHC.AE),
   read CAP/VS/PI, enumerate implemented ports, report which carry a SATA disk
   (DET=3, sig 0x00000101). Verified: 6 ports, disks on ports 0/1.
-- **Step B - port init + IDENTIFY. ✅ done** (`osdev test blockdev-ahci`, AHCI.B).
+- **Step B - port init + IDENTIFY. ✅ done** (`osdev test blockdev`, AHCI.B).
   Stop the port (clear ST/FRE, wait CR/FR), plant the command list + received-FIS
   base in the arena, restart (FRE then ST), then issue IDENTIFY DEVICE via a command
   header + H2D Register FIS + single-PRDT command table, wait on PxCI, and parse the
   result. Verified: model `QEMU HARDDISK`, 131072 sectors (64 MiB). The full DMA
   command path (command list / FIS / PRDT / command-issue / completion) now works.
-- **Step C - read. ✅ done** (`osdev test blockdev-ahci`, AHCI.C). READ DMA EXT (0x25)
+- **Step C - read. ✅ done** (`osdev test blockdev`, AHCI.C). READ DMA EXT (0x25)
   via `issue()` into the PRDT data buffer; block IPC `ReadBlock` restored. Verified:
   `fs` mounts the AHCI disk over IPC (`fs: mounted`).
 - **Step D - write + integrate. ✅ done** (AHCI.D). WRITE DMA EXT (0x35) + FLUSH EXT

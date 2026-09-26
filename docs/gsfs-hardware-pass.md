@@ -129,7 +129,7 @@ Build fresh and verify the sweep is green on the machine you are flashing from, 
 is the trap this project has hit most:
 
 ```
-osdev build                 # 20 commandments, 73 redteam probes, 15 checkers
+osdev build                 # 21 commandments, 75 redteam probes, 15 checkers
 osdev test fs-all           # 33 suites, roughly 55 minutes
 osdev test shell            # 174
 osdev test files            # 222
