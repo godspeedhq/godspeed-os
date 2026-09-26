@@ -18,6 +18,17 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      # PIN PYTHON. This job runs FOURTEEN `python3 scripts/...` checkers and until now took whatever
+      # the runner happened to ship - an unpinned dependency on the enforcement layer itself, where a
+      # silent version change would mean nobody knows which Python the rules were last verified
+      # against. `README.md` declares the floor as 3.8 and `scripts/python_floor_check.py` holds it
+      # mechanically, so 3.8 is what CI runs: if a script ever needs newer, that gate fails first and
+      # the floor is raised deliberately rather than discovered.
+      - name: Install Python (the declared floor - README.md Requirements)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+
       # Services must be built before the kernel: kernel/build.rs embeds service
       # ELF bytes via include_bytes!(env!("SVC_*_ELF")), so the service binaries
       # must exist in target/ before the kernel crate compiles.
@@ -98,6 +109,11 @@ jobs:
 
       - name: Site check (the hand-written pages still describe the real repository)
         run: python3 scripts/site_check.py
+
+      # The declared Python floor must be the TRUE one. Not in osdev's EXTRA_CHECKS yet (that is
+      # a Rust edit and the branch introducing it touches none), so CI carries it meanwhile.
+      - name: Python floor matches what README.md declares
+        run: python3 scripts/python_floor_check.py
 
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py

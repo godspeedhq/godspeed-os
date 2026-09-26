@@ -444,6 +444,44 @@ This document now uses it, once, on the sample of `conform`'s own output - which
 citation that generated it, so the site is unresolvable by construction. That is the fixture problem
 arriving early, on the document that predicted it.
 
+### BUILT: `conform --selftest`, three cases, and two more defects it caught
+
+`tests/conformance/ui/` holds one `.case` file per case: a `# target:`/`# checker:` header, the text to
+plant, and the exact expected render. `--selftest` plants each at its real path, runs the one checker,
+restores from an in-memory copy in a `finally`, and diffs. It never touches git and the fixer runs
+dry-run only, so a planted em-dash survives being measured.
+
+The three cases are the deliberate violation (GS0303, rendered in full), the decidable one (GS0001,
+collapsed to a line), and **one that must stay silent** - a comment correctly RECORDING a removal.
+
+Proved it can fail: changing `27,000` to `27000` in one `why` string fails the case and exits 1.
+
+Two more defects, again found only by running it:
+
+- **The dirty-tree guard was too broad.** It refused on ANY uncommitted change, which blocked
+  `--selftest` while iterating on the RENDERER - exactly when the goldens are what you want. A guard
+  that stops the work it protects gets turned off, and then it protects nothing. Narrowed to the case
+  TARGETS, which is where the real risk is.
+- **The fixer derived scope from the wrong half of `dash_check`.** `tracked_files()` is every tracked
+  file; the suffix filter lives in its `main()`. So the fixer offered to "fix" the em-dash planted in a
+  `.case` fixture - a file `dash_check` cannot see, which is why `.case` was chosen - and would have
+  silently defeated its own test. **Deriving scope from a checker means deriving the same FILTER, not
+  just borrowing its listing helper.**
+
+### And the floor is now held mechanically
+
+`README.md` declares Python 3.8, and a hand-measured number is right on the day it is taken.
+`scripts/python_floor_check.py` fails if any tracked script uses a feature newer than `FLOOR`, and it
+makes the same function-local-annotation distinction the measurement did: at module or class level
+`list[str]` genuinely needs 3.9, inside a function body it never evaluates. Proved by planting a
+`match` statement.
+
+It cannot go in `EXTRA_CHECKS` without a Rust edit, so it is listed in `scripts/CONFORM-EXTRA.txt` -
+checkers `conform` runs that a LOCAL build does not - and `conform` prints the count every run
+(`18 checks ran ... 1 of them not yet on the build path`). CI runs it, since that is YAML. A visible
+gap gets closed; an invisible one does not. `build.yml` also now pins Python to 3.8 rather than taking
+whatever the runner ships, which was an unpinned dependency on the enforcement layer itself.
+
 ### What to do with the manual break anyway
 
 Keep it, for the first render only. Before there are fixtures there is nothing to diff against, so the

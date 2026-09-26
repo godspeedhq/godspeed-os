@@ -213,6 +213,17 @@ RULES = {
              "`backlog/README.md`. An entry also owes its evidence, what is RULED OUT, and the next "
              "concrete step."),
 
+    "python_floor_check.py": dict(
+        code="GS0003", fixable=False, commandment=None, section="README.md, Requirements",
+        title="a script uses a Python feature newer than the declared floor",
+        why="`README.md` tells a contributor they need Python 3.8. That number was measured by hand, "
+            "and a hand-measured number is right on the day it is taken and silently wrong afterwards. "
+            "A contributor on the floor version would meet the drift as a SyntaxError from a CHECKER, "
+            "which is the worst first experience this repository can offer.",
+        help="Rewrite it to work on the floor, or RAISE the floor deliberately - `FLOOR` in "
+             "`scripts/python_floor_check.py` and the Requirements line in `README.md`, together. "
+             "Never let the number drift upward by accident."),
+
     "commandments.py": dict(
         code="GS0900", fixable=False, commandment="all ten", section="COMMANDMENTS.md",
         title="a Commandment check failed",
@@ -284,7 +295,15 @@ def fix_decidable(apply):
     changed = []
     lf_only = _eol_lf_paths()
 
+    # `tracked_files()` is every tracked file; the SUFFIX FILTER lives in `dash_check.main()` against
+    # `TEXT_SUFFIXES`. Borrowing only the listing helper made this broader than the gate it derives
+    # from, and a fixture caught it: `conform` offered to "fix" the em-dash planted in
+    # `tests/conformance/ui/an-em-dash-in-prose.case`, which `dash_check` cannot see because `.case` is
+    # not a text suffix - so the fixer would have silently defeated its own test. Deriving scope from a
+    # checker means deriving the same FILTER, not just its helper.
     for path in dash_check.tracked_files():
+        if path.suffix.lower() not in dash_check.TEXT_SUFFIXES:
+            continue
         p = str(path)
         rel = os.path.relpath(p, ROOT).replace(os.sep, "/")
         try:
@@ -309,16 +328,34 @@ def fix_decidable(apply):
     return changed
 
 
+EXTRA_LIST = os.path.join(ROOT, "scripts", "CONFORM-EXTRA.txt")
+
+
 def checkers():
-    """The list a BUILD enforces, read from osdev so `conform` cannot drift from it."""
+    """(gated, ungated) - what a BUILD enforces, and what only `conform` runs.
+
+    `gated` is read from `osdev/src/main.rs` so the two cannot disagree. `ungated` is
+    `scripts/CONFORM-EXTRA.txt`: checkers that cannot reach the build path without a Rust edit. They
+    are run and LABELLED, because the alternatives are to leave them unrun or to run them silently as
+    though they were gated - and both hide something. The count is printed on every run, so the gap
+    is visible and gets closed.
+    """
     src = io.open(OSDEV_MAIN, encoding="utf-8", errors="replace").read()
     m = re.search(r"const EXTRA_CHECKS[^=]*=\s*&\[(.*?)\n\];", src, re.S)
-    names = re.findall(r'"(scripts/[a-z_0-9]+\.py)"', m.group(1)) if m else []
-    if not names:
+    gated = re.findall(r'"(scripts/[a-z_0-9]+\.py)"', m.group(1)) if m else []
+    if not gated:
         print("conform: could not read EXTRA_CHECKS from osdev/src/main.rs - refusing to guess "
               "which checks a build runs.", file=sys.stderr)
         sys.exit(2)
-    return names + ["scripts/commandments.py"]
+    gated = gated + ["scripts/commandments.py"]
+
+    ungated = []
+    if os.path.exists(EXTRA_LIST):
+        for line in io.open(EXTRA_LIST, encoding="utf-8"):
+            line = line.split("#", 1)[0].strip()
+            if line and line not in gated:
+                ungated.append(line)
+    return gated, ungated
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -505,16 +542,25 @@ def _norm(s):
     return "\n".join(ln.rstrip() for ln in s.strip().split("\n"))
 
 
-def selftest():
-    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
-                           capture_output=True, text=True).stdout.strip()
-    if dirty:
-        print("conform --selftest: the working tree is not clean, and this plants violations at REAL")
-        print("paths to measure them. Commit or stash first. (It restores from an in-memory copy and")
-        print("never touches git - but a crash with unsaved work beside a planted file is not a risk")
-        print("worth taking for a test.)")
-        return 2
+def _dirty_paths():
+    out = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
+                         capture_output=True, text=True).stdout
+    dirty = set()
+    for line in out.split("\n"):
+        if len(line) > 3:
+            dirty.add(line[3:].strip().strip('"'))
+    return dirty
 
+
+def selftest():
+    """Plant each case, render it, restore, diff against its `expect`.
+
+    THE GUARD IS SCOPED TO THE CASE TARGETS, not to the tree. It was the whole tree at first, which
+    meant editing `conform.py` blocked `--selftest` - while iterating on the RENDERER, which is exactly
+    when the golden files are what you want. A guard that stops the work it protects gets turned off,
+    and then it protects nothing. The real risk is narrow: a plant landing on a file with unsaved work,
+    and a crash before the restore.
+    """
     if not os.path.isdir(UI_DIR):
         print("conform --selftest: no tests/conformance/ui/ - nothing to check")
         return 0
@@ -524,9 +570,22 @@ def selftest():
         print("conform --selftest: tests/conformance/ui/ holds no `.case` files")
         return 0
 
+    parsed = [(fn, _parse_case(os.path.join(UI_DIR, fn))) for fn in cases]
+    dirty = _dirty_paths()
+    at_risk = sorted({m.get("target", "") for _, (m, _, _) in parsed} & dirty)
+    if at_risk:
+        print("conform --selftest: these case TARGETS have uncommitted changes, and a case plants a")
+        print("violation into them to measure it:")
+        for p in at_risk:
+            print("    %s" % p)
+        print("Commit or stash those files first. (The restore is byte-for-byte from an in-memory")
+        print("copy and never touches git - but a crash with unsaved work in a planted file is not a")
+        print("risk worth taking for a test.) Everything else in the tree may be dirty; only these")
+        print("matter.")
+        return 2
+
     passed, failed = 0, []
-    for fn in cases:
-        meta, plant, expect = _parse_case(os.path.join(UI_DIR, fn))
+    for fn, (meta, plant, expect) in parsed:
         target = os.path.join(ROOT, meta.get("target", ""))
         checker = meta.get("checker", "")
         mode = meta.get("mode", "append")
@@ -602,7 +661,8 @@ def main(argv):
     changed = fix_decidable(apply=not check_only)
 
     # ---- the judgement half -------------------------------------------------------------------
-    scripts = checkers()
+    gated, ungated = checkers()
+    scripts = gated + ungated
     fixed_rels = [rel for rel, _ in changed]
     ran, failed, deferred, reports = 0, [], [], []
     for s in scripts:
@@ -636,7 +696,10 @@ def main(argv):
         head = "conform --check: %d would be fixed, %d need a decision" % (n_fix, n_judge)
     else:
         head = "conform: fixed %d, %d need a decision" % (n_fix, n_judge)
-    print("%s - %d checks ran, %d passed" % (head, ran, ran - n_problems))
+    tail = ""
+    if ungated:
+        tail = (" (%d of them not yet on the build path - scripts/CONFORM-EXTRA.txt)" % len(ungated))
+    print("%s - %d checks ran, %d passed%s" % (head, ran, ran - n_problems, tail))
 
     if n_judge == 0 and n_fix == 0:
         print("nothing to do. Every rule this project enforces is satisfied.")

@@ -202,6 +202,10 @@ whose only alternative is a second copy of a fact `block-driver/build.rs` alread
 Six checkers, and each answers a different question. None of them is optional and all of them run
 against your tree without hardware.
 
+These need **Python 3.8 or newer on your PATH**, like the rest of the enforcement layer - `README.md`
+declares it in Requirements and `osdev build` refuses to build without it. Or run them all at once with
+`py scripts/conform.py`, which names the Commandment each failure breaks (`docs/conformance.md`).
+
 | run this | it tells you |
 |----------|--------------|
 | `python scripts/arch_seam_check.py` | which `arch::imp` members your arch has not answered yet |

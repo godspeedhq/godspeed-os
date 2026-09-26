@@ -1,0 +1,19 @@
+# Checkers `conform` runs that are NOT YET on the build path.
+#
+# `osdev`'s `EXTRA_CHECKS` is the list a BUILD enforces, and `conform` reads it so the two cannot
+# disagree. But adding a checker to it is a Rust edit, and the branch that introduced `conform`
+# deliberately touches no Rust. So a checker written here lands in this file first: `conform` runs it
+# and LABELS it as not-yet-gated, which is the honest state rather than a silent one.
+#
+# This file must stay SHORT and must shrink. An entry here is a checker a LOCAL BUILD does not run,
+# which means a contributor can pass `osdev build` and be caught later - a smaller version of the
+# "checked at release" failure the documentation gates were moved onto the build path to end. The
+# moment Rust may be touched, every line here moves into `EXTRA_CHECKS` and this file goes back to
+# empty.
+#
+# What DOES run them meanwhile: `conform` (labelled, with a count) and `.github/workflows/build.yml`,
+# which is a YAML edit rather than a Rust one. So the gap is specifically the local build, not CI.
+#
+# One name per line, relative to the repository root.
+
+scripts/python_floor_check.py
