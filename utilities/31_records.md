@@ -59,7 +59,7 @@ usage:
 The predicate is **one token, operator attached** (no spaces, no quotes unless the value has a
 space): `where mem>0`, `where state=BlockRecv`, `where name!=shell`, `where core>=1`. The parser
 finds the operator inside the token by **longest match** (`!=` `>=` `<=` before `=` `>` `<`):
-before it is the column, after is the value. Ops: `=` `!=` `>` `<` `>=` `<=` `~` (contains). The
+before it is the column, after is the value. Ops: `=` `!=` `>` `<` `>=` `<=` ` contains ` (the spaced word; `~` is NOT accepted - rule 3 rejects synonyms). The
 comparison is **numeric** when both sides parse as numbers, else **textual**. An unknown column is
 a loud error naming the available columns (§3.12).
 

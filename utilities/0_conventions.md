@@ -148,7 +148,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
 14. **Multiple same-type targets are a COMMA-separated list, never spaced.** `kill ehci,xhci,fs`,
     `spawn ping,pong`, `restart fs,events`, `delete /a,/b`, `mkdir docs,tmp`, `fmt a.gsh,b.gsh`,
     `chaos max-carnage nic-driver,net-stack` - one argument, comma-delimited. NOT spaced
-    (`kill ehci xhci fs`): the shell tokenizes a line to a small fixed arg count (`MAX_ARGS = 4`), so a
+    (`kill ehci xhci fs`): the shell tokenizes a line to a small fixed arg count (`MAX_ARGS = 8`), so a
     spaced list silently caps at ~3 targets, while a comma-list is a SINGLE token and is therefore
     unbounded. Comma is also the one uniform rule - the same separator on every command - so the user
     never has to guess which verb wants which shape. Each target runs the command's normal

@@ -13,7 +13,7 @@ the word for you, once, and does not run anything (`FOREIGN_HINTS` in `services/
 ## 1. What it is
 
 `dir` lists the entries of a directory - each name, whether it is a file or a directory,
-and (for files) the size. With no argument it lists the **current directory** (`20_cd.md`);
+and (for files) the size. With no argument it lists the **current directory** (`17_cd.md`);
 with a path it lists that directory. `dir` is read-only: it never changes the disk.
 
 ### Why `dir` and not `ls`, and not `list`
@@ -183,7 +183,7 @@ This is the structured replacement for the old plan to bolt name/size sorting on
 
 `<path>` is the standard file address: a `[index:]label/path` on any present drive, a
 `/absolute` path on the current drive, or a `relative` path from the current directory.
-The current location is one drive+directory pointer moved by `cd` (`20_cd.md`).
+The current location is one drive+directory pointer moved by `cd` (`17_cd.md`).
 
 ## 4. Implementation
 

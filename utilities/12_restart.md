@@ -31,12 +31,15 @@ back on a **different core**: identity is stable, location is not (§11, §14.2)
   service can transparently move cores across a restart.
 - The optional `<core>` argument is the supervisor's `placement_override` (§14.4),
   exposed for dev-mode use; it is subject to the same strict placement rules.
-- **Same guards as `kill`** (it is the kill half): requires `SERVICE_CONTROL`,
-  refuses the trusted root (§6.2), and the shell refuses to restart the session's
-  own input devices (`xhci`, `ehci`, `shell`) - see `11_kill.md` §3.
+- **Same guards as `kill`** (it is the kill half): requires `SERVICE_CONTROL`.
+  There is NO trusted-root refusal, and the shell refuses only `supervisor` and
+  `shell` - `xhci` and `ehci` pass straight through. See `11_kill.md` §3, corrected
+  2026-09-26; this said the trusted root was refused and that xhci/ehci were
+  guarded, and neither is true.
 - **Client recovery is the client's job** (§14.3): a client of the restarted
-  service sees `EndpointDead` / `CapRevoked` on its next call and must reacquire via
-  the registry. The kernel does not rebind for it.
+  service sees `EndpointDead` / `CapRevoked` on its next call and must reacquire by name
+  through the kernel name directory (`AcquireSendCap`) - the `registry` service was
+  retired in naming Phase 4. The kernel does not rebind for it.
 
 ## 4. Capabilities
 

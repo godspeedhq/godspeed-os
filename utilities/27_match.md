@@ -73,7 +73,7 @@ A shell built-in **filter**: input bytes → matching lines out (`match_lines`, 
 `contains` + `glob_match`). In a pipe it consumes the previous stage's buffer (`pipe_transform`
 dispatches the stage, and a text filter lands in `run_filter_builtin`); as a built-in it runs
 **in-process**, so
-it is **not** subject to the 4 KiB service-boundary cap and can filter a full 64 KiB stage
+it is **not** subject to the 4 KiB service-boundary cap and can filter a full 16 KiB stage
 buffer. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new `fs` surface.
 `match` is a FILTER, never a pipe producer: `match … /file | …` is refused (use `read /file |
 match …`). Minimal quoting lives in the shared `tokenize`/`strip_quotes` helpers, so it benefits

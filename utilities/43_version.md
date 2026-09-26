@@ -27,7 +27,7 @@ count, credits), `version` is the version fact. `about` carries no version numbe
 
 ```
 gsh> version
-GodspeedOS 0.3.0 (f7a6946)
+GodspeedOS 0.21.0 x86_64 (f7a6946)
 ```
 
 The number is the system version (kept in lockstep with the crate versions and the shell's

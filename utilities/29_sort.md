@@ -53,7 +53,7 @@ its text form predates them.
 ## 4. Implementation
 
 A shell built-in FILTER (`run_filter_builtin`, with `match`/`count`): it runs **in-process**, so
-it is **not** subject to the 4 KiB pipe service-boundary cap and can sort a full 64 KiB stage
+it is **not** subject to the 4 KiB pipe service-boundary cap and can sort a full 16 KiB stage
 buffer. It records each line as a `(start, end)` pair into a fixed `SORT_MAX_LINES` array on the
 stack and `sort_unstable_by`s the index array (no heap - `sort_unstable` is in-place), then emits
 the lines in order. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new

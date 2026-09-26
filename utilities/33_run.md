@@ -10,8 +10,10 @@ replay a suite of commands without typing them (the point: validate on hardware)
 
 `run <path>` reads a script file and executes **each command exactly as if you typed it** at the
 prompt. It is the trivial, sequential case of Appendix D.2 ("`cmd1; cmd2`") - a **command-list
-runner**, deliberately **not** a scripting *language* (no variables, no `if`/`while`; those are
-far-future, Appendix D).
+runner** in its simplest use - but the gsh LANGUAGE is complete and this said it did not exist.
+`let` / `let mut`, `if` / `else if` / `else`, `switch`, `fn` with parameters and bounded recursion,
+`import`, arithmetic and `$()` capture are all built (`docs/scripting.md`, whose own status line reads
+COMPLETE). Appendix D's "far-future" framing was overtaken.
 
 ```
 gsh> run /suite.gsh
@@ -57,7 +59,7 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 
 ## 4. Bounds & safety (loud, never silent - §26.6 / §3.12)
 
-- A script is one `fs` file, buffered whole; over `SCRIPT_MAX` (4 KiB) is reported, not silently
+- A script is one `fs` file, buffered whole; over `SCRIPT_MAX` (7112 bytes = 2 x `IO_CHUNK`) is reported, not silently
   truncated.
 - **Scripts cannot nest.** A `run` inside a script is refused (`run` at depth > 0). This is a
   hard rule, not a nicety: unbounded `run`-calls-`run` recursion would overflow the bounded user

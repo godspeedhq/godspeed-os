@@ -30,14 +30,25 @@ graceful-shutdown mechanism.
   `CapNotHeld`. This closes the §3.1/§14.4 ambient-authority hole - before it,
   any service could kill any other. Held only by the shell, supervisor, and test
   probes. See `docs/service-control-cap.md`.
-- **TCB guard (kernel).** Killing a trusted-root service (init / supervisor /
-  registry / block-driver / fs) is refused - their death means a reboot (§6.2), so
-  the request is rejected before any kill happens.
-- **Session-input guard (shell).** The shell additionally refuses to `kill` the
-  services the live session depends on for input - `xhci`, `ehci`, and `shell`
-  itself - because killing your own keyboard/console from the prompt would strand
-  the session. This is a shell-level UX guard, not a kernel block (those services
-  are restartable in principle, just not from the session that needs them).
+- **There is NO TCB guard, and that is deliberate.** Nothing here is refused on
+  trusted-root grounds, because the non-restartable set is `{kernel}` alone (§6.2,
+  §6.3 - Path C / Phase 6). `fs` and `block-driver` are freely killable and the
+  chaos suite kills them by the thousand; killing the `supervisor` is answered by
+  the KERNEL respawning it, which the shell says out loud. `init` and `registry`
+  do not exist to protect - `init` was removed in Phase 5 and the `registry`
+  service retired in Phase 4.
+- **`shell` is the one special case, and it is not a refusal either.** Killing the
+  shell from the shell self-kills and the supervisor respawns a fresh prompt (the
+  in-flight command is lost - a re-init, not a resume). `xhci` and `ehci` are not
+  guarded; the shell's own source notes they USED to be.
+
+  > **Corrected 2026-09-26.** This section promised a kernel TCB guard refusing
+  > `init / supervisor / registry / block-driver / fs` and a shell guard refusing
+  > `xhci / ehci / shell`. Neither exists. `CORE_SERVICES` holds one name -
+  > `"supervisor"` - and the guard reads `is_core_service(name) && name !=
+  > "supervisor"`, so the branch can never fire. A document that invents a safety
+  > net is worse than one that admits there is none, because it invites the
+  > experiment.
 
 ## 4. Capabilities
 
