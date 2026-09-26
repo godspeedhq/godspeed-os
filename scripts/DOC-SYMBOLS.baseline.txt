@@ -10,7 +10,6 @@
 CONSOLE_RENDER                     # docs/console-service.md
 FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
-NET_KIND                           # docs/arm32-status.md
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
 async_bulk_watchdog                # docs/arm32-usb-userspace.md
 bot_command                        # docs/arm32-status.md, docs/arm32-usb-userspace.md
@@ -18,7 +17,6 @@ bot_recover                        # docs/arm32-usb-userspace.md
 chan_dma                           # docs/arm32-usb-userspace.md
 chan_program                       # docs/arm32-usb-userspace.md
 configure_cdc_ecm                  # docs/arm32-status.md
-configure_smsc95xx                 # docs/arm32-status.md
 ctrl_xfer                          # docs/arm32-usb-userspace.md
 decode_report                      # docs/arm32-status.md
 dims_packed                        # docs/console-service.md
