@@ -290,7 +290,7 @@ website/      documentation site (mdBook; renders this repo's docs)
 API references under `/api`:
 
 - [**`godspeed`** - the standard library](https://godspeedhq.github.io/godspeed-os/api/godspeed/),
-  imported as `gs`. **This is what you write a program against** - 143 public items across 13 modules:
+  imported as `gs`. **This is what you write a program against** - 149 public items across 13 modules (counting free functions, constants and types, plus the methods on those types and every re-export; `scripts/stdlib_gap_check.py --list` shows the other side of the same surface):
 
   | Module | Covers |
   |--------|--------|

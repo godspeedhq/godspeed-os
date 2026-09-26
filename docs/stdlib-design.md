@@ -1692,6 +1692,17 @@ flags, so `gs::cap::READ` at an `fs.open` call site reads correctly and no call 
 
 130 items across 12 public modules, from 93 across 7.
 
+> **Dated 2026-09-25, and both halves of that sentence need a note.** The figure is a SNAPSHOT of what
+> the split produced; `gs::trace` and `gs::task::clock_source` landed the next day, so the current
+> surface is **149 items across 13 modules**, which is what `README.md` publishes.
+>
+> And the two numbers are not comparable, which is the more useful thing to record. This table counts
+> `gs::record` as **1** - one `pub use` statement - while the README's method counts the **10 names**
+> that statement re-exports, because what a developer can call is a name and not a statement. Three
+> different totals have been published across two days (93, 130, 143) precisely because nobody fixed
+> the method first. It is fixed now, and stated in the README next to the figure so the next person
+> can re-derive it instead of trusting it.
+
 ### `gs::record` is a re-export and that is a decision, not laziness
 
 Everything else here wraps the SDK because there is something to translate: a capability to hold, an

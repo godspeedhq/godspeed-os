@@ -45,7 +45,7 @@ now runs somewhere, and this is where:
 | `counter` | `osdev test counter` | persisted a count, was killed, recovered it on respawn |
 | `reply-server` / `asker` | `osdev test reply-server` | the round trip closed and the reply echoed the request |
 | `resource-server` / `holder` | `osdev test resource-server` | mint, use, non-escalation refused, `CapRevoked` after revoke |
-| `greet` / `upper` / `roster` | every bare-metal boot, including all five boards | they spawn, reach `ready`, and survive repeated chaos respawns |
+| `greet` / `upper` / `roster` | the shell, ON DEMAND, whenever a pipe names them (`spawn_via_supervisor`) - so `osdev test shell` and any `selfcheck` run exercise them | they spawn, reach `ready`, and survive repeated chaos respawns. Observed: `greet` + `upper` in the x86 shell suite; all three on the VisionFive 2, `roster` twenty times across a 1000-round chaos run |
 | `00-hello` | `osdev test examples` | it starts, holds one capability, and yields through `gs::task` |
 | `stdlib-hello` | `osdev test examples` | the `gs::fs` + `gs::io` path reaches a definite outcome |
 | `cap-grant` | `osdev test examples` | `gs::cap::self_grant` and `gs::cap::duplicate` really succeed |
