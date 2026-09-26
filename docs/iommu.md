@@ -263,17 +263,31 @@ amendment fixed:
    **What it does NOT buy, which is the part worth recording (§26.7).** Confinement bounds a
    driver's DMA **to memory**. It does not bound its interrupt reach, because the DMA page
    tables are not in that path. Whether a compromised confined driver could retarget its own
-   interrupt therefore depends on where its message lives, and `program_xhci_msi` tries both:
+   interrupt therefore depends on where its message lives, and `program_xhci_msi` tries both -
+   **and on the machine where confinement actually operates, it is the safe one:**
    - **Legacy MSI (capability 0x05)** keeps the address and data in **PCI configuration
-     space**, which no service can write - `PCI_CFG` is a read authority and the kernel
-     programs the message itself. Out of the driver's reach.
-   - **MSI-X (capability 0x11)** keeps the message table in **MMIO inside a BAR**, and the
-     driver holds its BAR. Where the table sits inside the window the driver was granted, a
-     compromised driver can point its own interrupt somewhere else.
+     space**, which no service can write: `PCI_CFG` is a read authority and the kernel programs
+     the message itself. Out of the driver's reach. **This is the T630 case, and it is
+     measured, not assumed.** Every T630 boot log pairs the two lines on the same BDF, one
+     immediately after the other:
+
+     ```
+     pci: MSI enabled on 00:10.0 vector=0x28 (64-bit addr)
+     iommu: confined BDF 00:10.0 -> domain 1 arena 0x1cf9000..0x1e1d000 (292 pages); DTE invalidated
+     ```
+
+     So the only confined driver in the system holds no path to its own MSI message.
+   - **MSI-X (capability 0x11)** keeps the message table in **MMIO inside a BAR** (`bir=0` on
+     every controller observed here, so BAR0 - the window a driver is granted), and the driver
+     holds that BAR. A compromised driver could point its own interrupt elsewhere. Observed on
+     `qemu-xhci`, which the code names as the MSI-X case; not on any confined device.
 
    So the honest boundary is: **confinement makes a compromised driver unable to reach memory
-   outside its arena, and does not make it unable to misdirect its own interrupt on an MSI-X
-   controller.** Closing that needs an interrupt-remapping table, which is real work and not a
+   outside its arena, and would not make it unable to misdirect its own interrupt on an MSI-X
+   controller - but no confined driver is on one today.** The exposure is therefore latent
+   rather than live: it arrives the first time a machine confines an MSI-X-only controller, and
+   the thing to check at that moment is whether the vector table falls inside the granted MMIO
+   window. Closing it properly needs an interrupt-remapping table, which is real work and not a
    constant, so it is recorded here rather than implied away. It does not weaken the §6.4
    claim, which is about DMA, but it is the limit of that claim and belongs beside it.
 2. **The no-IOMMU machine.** The conditional trust posture above means the TCB is
