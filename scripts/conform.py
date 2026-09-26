@@ -10,8 +10,9 @@ build, which is exactly what CLAUDE.md 22.7 says the repository must not require
 
     py scripts/conform.py              fix what is DECIDABLE, report what needs JUDGEMENT
     py scripts/conform.py --check      report both, change nothing (this is what CI wants)
-    py scripts/conform.py --explain GS0007
+    py scripts/conform.py --explain GS0303
     py scripts/conform.py --list       every rule, its code and its commandment
+    py scripts/conform.py --selftest   prove the OUTPUT is good, not just that rules fire
 
 THE ONE DESIGN DECISION, and everything else follows from it: **decidable versus judgement.**
 
@@ -471,7 +472,115 @@ def explain(code):
     return 2
 
 
+UI_DIR = os.path.join(ROOT, "tests", "conformance", "ui")
+
+
+def _parse_case(path):
+    """(meta, plant, expect) from a `.case` file. See tests/conformance/ui/README.md."""
+    text = io.open(path, encoding="utf-8").read()
+    meta, plant, expect, where = {}, [], [], "head"
+    for line in text.split("\n"):
+        if line.strip() == "--- plant ---":
+            where = "plant"
+            continue
+        if line.strip() == "--- expect ---":
+            where = "expect"
+            continue
+        if where == "head":
+            m = re.match(r"#\s*([a-z]+)\s*:\s*(.*)$", line)
+            if m:
+                k, v = m.group(1), m.group(2).rstrip()
+                meta[k] = (meta.get(k, "") + " " + v).strip() if k == "why" else v
+        elif where == "plant":
+            plant.append(line)
+        else:
+            expect.append(line)
+    # `\uXXXX` is decoded so a case can plant a character it must not CONTAIN literally.
+    body = "\n".join(plant)
+    body = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), body)
+    return meta, body, "\n".join(expect).strip()
+
+
+def _norm(s):
+    return "\n".join(ln.rstrip() for ln in s.strip().split("\n"))
+
+
+def selftest():
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        print("conform --selftest: the working tree is not clean, and this plants violations at REAL")
+        print("paths to measure them. Commit or stash first. (It restores from an in-memory copy and")
+        print("never touches git - but a crash with unsaved work beside a planted file is not a risk")
+        print("worth taking for a test.)")
+        return 2
+
+    if not os.path.isdir(UI_DIR):
+        print("conform --selftest: no tests/conformance/ui/ - nothing to check")
+        return 0
+
+    cases = sorted(f for f in os.listdir(UI_DIR) if f.endswith(".case"))
+    if not cases:
+        print("conform --selftest: tests/conformance/ui/ holds no `.case` files")
+        return 0
+
+    passed, failed = 0, []
+    for fn in cases:
+        meta, plant, expect = _parse_case(os.path.join(UI_DIR, fn))
+        target = os.path.join(ROOT, meta.get("target", ""))
+        checker = meta.get("checker", "")
+        mode = meta.get("mode", "append")
+        if not os.path.isfile(target) or not checker:
+            failed.append((fn, "case is malformed: needs `# target:` and `# checker:`"))
+            continue
+
+        original = io.open(target, "rb").read()
+        try:
+            text = original.decode("utf-8")
+            io.open(target, "w", encoding="utf-8", newline="").write(
+                text + plant if mode == "append" else plant)
+
+            rc, out = run_one(checker)
+            if rc is None:
+                failed.append((fn, out))
+                continue
+            if expect.strip() == "NOTHING":
+                got = "" if rc == 0 else render(checker, out)
+                want = ""
+            else:
+                # Dry-run the fixer so a DECIDABLE case renders in its compact form, exactly as it
+                # would for a real `--check`. Never `apply=True`: the plant must survive being
+                # measured.
+                got = render(checker, out, [rel for rel, _ in fix_decidable(apply=False)]) if rc else ""
+                want = expect
+        finally:
+            io.open(target, "wb").write(original)
+
+        if _norm(got) == _norm(want):
+            passed += 1
+            print("  ok    %s" % fn)
+        else:
+            failed.append((fn, None))
+            print("  FAIL  %s" % fn)
+            print("    --- expected ---")
+            for ln in (want or "(no finding)").split("\n"):
+                print("    %s" % ln)
+            print("    --- got ---")
+            for ln in (got or "(no finding)").split("\n"):
+                print("    %s" % ln)
+
+    print()
+    for fn, why in failed:
+        if why:
+            print("  %s: %s" % (fn, why))
+    print("conform --selftest: %d of %d case(s) render as expected" % (passed, len(cases)))
+    return 0 if passed == len(cases) else 1
+
+
 def main(argv):
+    if "--selftest" in argv:
+        return selftest()
+
     if "--explain" in argv:
         i = argv.index("--explain")
         if i + 1 >= len(argv):

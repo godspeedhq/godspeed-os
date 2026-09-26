@@ -1,0 +1,14 @@
+# target: examples/00-hello/CLAUDE.md
+# mode: append
+# checker: scripts/dash_check.py
+# why: The DECIDABLE class, and what it must look like: one line, not a frame. A fixable violation
+# why: rendered as a full diagnostic whose help says "conform fixes this" is the least interesting
+# why: problem taking the most space, which trains a reader to skim past the ones that matter. This
+# why: case pins the compact form, and it only holds because the fixer claimed the file - a fixable
+# why: rule that fails on a file the fixer cannot reach keeps its frame.
+--- plant ---
+
+A trailing note — with an em-dash in it.
+--- expect ---
+error[GS0001]: an em-dash or en-dash appears in a tracked text file
+    = note: 1 file, listed above; `py scripts/conform.py` fixes it

@@ -250,6 +250,33 @@ cargo run -p osdev -- test property
 cargo run -p osdev -- test peer-storm
 ```
 
+**Before you commit: `conform`.** One command over the whole enforcement layer - the checkers that
+hold the Ten Commandments, the contracts, the arch boundary and the documentation. It fixes what is
+DECIDABLE and reports what needs JUDGEMENT, naming which Commandment a violation breaks and what to do
+about it:
+
+```bash
+# Fix what is decidable, report what needs a decision
+py scripts/conform.py
+
+# Report both and change nothing - this is what CI wants
+py scripts/conform.py --check
+
+# What a rule means, why it exists, and whether it is auto-fixable
+py scripts/conform.py --explain GS0303
+
+# Every rule, its code and its Commandment
+py scripts/conform.py --list
+```
+
+A clean tree says `0 would be fixed, 0 need a decision - 17 checks ran, 17 passed`. The count of checks
+that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
+the failure the whole thing exists to prevent.
+
+`osdev build` runs the same checkers and refuses to build if any fails, so `conform` is not an extra
+gate - it is the same gate, askable. It is `py scripts/conform.py` rather than `osdev conform` because
+the shim is not written yet; `docs/conformance.md` is the spec and records why.
+
 The build is pure Cargo plus the `osdev` CLI - identical on every platform. The full `osdev` CLI reference is in `CLAUDE.md §17` and `osdev/CLAUDE.md`.
 
 ### Flashing to real hardware

@@ -1,0 +1,29 @@
+# target: examples/00-hello/src/main.rs
+# mode: append
+# checker: scripts/comment_symbol_check.py
+# why: The single highest-value case of the 2026-09-26 sweep. A plausible-looking name for a thing
+# why: that no longer exists, in a comment a contributor reads BEFORE any document because it sits
+# why: beside the code being changed. The message has to carry the reason AND both escape routes,
+# why: because the right fix is sometimes the baseline rather than the comment.
+--- plant ---
+
+// The scroll view is repainted by `reclaim_view_state`, which returns the row count.
+--- expect ---
+error[GS0303]: a Rust comment names something that exists nowhere in the code
+   --> examples/00-hello/src/main.rs:53
+    |
+    = rule: CLAUDE.md 26.7, 26.14
+    = why: A comment is read BEFORE any document, because it sits beside the code being
+           changed. There are 27,000 doc-comment lines here and until 2026-09-26 nothing
+           checked one of them.
+    = help: Name what does the job now - or, if it names something OUTSIDE this tree on
+            purpose (a hardware register, an SBI call, a Linux function cited per 26.14), add
+            it to `scripts/COMMENT-SYMBOLS.baseline.txt` with which kind it is. A comment
+            that says "X was deleted" is RIGHT to name X: that is a record, and it belongs in
+            the baseline.
+    = note: `py scripts/conform.py --explain GS0303` for the long form
+
+  comment_symbol_check.py reported:
+  | comment symbols: 1 name(s) in Rust comments name nothing in the code:
+  |     `reclaim_view_state`  examples/00-hello/src/main.rs:53
+  | (4 more lines of explanation, which the frame above covers - `py scripts/comment_symbol_check.py` for all of it)

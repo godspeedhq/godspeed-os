@@ -1,0 +1,15 @@
+# target: examples/00-hello/src/main.rs
+# mode: append
+# checker: scripts/comment_symbol_check.py
+# why: THE CASE THAT MUST STAY QUIET, and it matters as much as the ones that fire. Half of what the
+# why: 2026-09-26 comment sweep found was comments correctly RECORDING a removal - `pci.rs` has nine
+# why: such sites and `services/console` ten, one of which literally opens "REQ_SCROLL IS GONE".
+# why: A checker that fired on those would be unusable, and the first break attempted while building
+# why: `--selftest` accidentally proved it: it used `paint_view`, which is baselined as exactly this
+# why: kind of record, so nothing fired. Correct behaviour, wrong test. This case pins that on purpose.
+--- plant ---
+
+// `paint_view` IS GONE, deleted with the scroll-request mechanism (backlog/37). It repainted the
+// whole grid per message, which jammed the 16-deep queue and ate the shell's keystroke echo.
+--- expect ---
+NOTHING
