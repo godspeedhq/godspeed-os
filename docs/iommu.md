@@ -239,15 +239,43 @@ amendment fixed:
 
 **Open questions to resolve with sign-off:**
 
-1. **Interrupt remapping.** Confinement here covers DMA to memory. A driver's MSI/MSI-X
-   write to the `0xfeex_xxxx` interrupt region is also a DMA, and would need either an
-   interrupt-remapping table entry or an explicit mapping. **This is live, not
-   hypothetical: both USB controllers are MSI/MSI-X on x86** - the kernel programs the
-   vector itself (`XHCI_MSI_VECTOR` 0x28, `EHCI_MSI_VECTOR` 0x29, plus the D1b pool
-   vectors for a device named by class code) - and `iommu.rs` contains no
-   interrupt-remapping table and maps no interrupt region. The confined xHCI
-   nonetheless runs fault-free on the T630, so the boundary is unstated rather than
-   broken, and it should be stated.
+1. **Interrupt remapping - ANSWERED 2026-09-26. Confinement does not touch the interrupt
+   path at all, and that is structural rather than lucky.** The question was: a driver's
+   MSI/MSI-X write to the `0xfeex_xxxx` interrupt region is also a DMA, `iommu.rs` contains
+   no interrupt-remapping table and maps no interrupt region, and yet the confined xHCI runs
+   fault-free. Why?
+
+   Because `write_dte` writes **four** DTE words and words 2 and 3 are **always zero** - in
+   the default passthrough entry written for every BDF at init and in the confined entry
+   alike. Every AMD-Vi interrupt-remapping field (IV, IntTabLen, Interrupt Table Root
+   Pointer, IntCtl) lives in those two words. Confinement edits only word 0 (mode 4 plus the
+   page-table root) and word 1 (the DomainID). So a confined device's MSI takes byte-for-byte
+   the same path as every other device's on the machine, and **the arena's page tables are
+   never consulted for it**: the IOMMU classifies a write to the interrupt region as an
+   interrupt request and handles it on the interrupt path, not the translation path. Nothing
+   faults because nothing is being translated. The xHCI being the confined one is irrelevant.
+
+   **What this relies on, stated rather than assumed:** that the IOMMU FORWARDS interrupt
+   requests unremapped while those fields are zero. That is not a confinement-specific
+   assumption - it is the machine's normal state with translation enabled, for every device
+   on the bus, and if it did not hold nothing would take an interrupt at all.
+
+   **What it does NOT buy, which is the part worth recording (§26.7).** Confinement bounds a
+   driver's DMA **to memory**. It does not bound its interrupt reach, because the DMA page
+   tables are not in that path. Whether a compromised confined driver could retarget its own
+   interrupt therefore depends on where its message lives, and `program_xhci_msi` tries both:
+   - **Legacy MSI (capability 0x05)** keeps the address and data in **PCI configuration
+     space**, which no service can write - `PCI_CFG` is a read authority and the kernel
+     programs the message itself. Out of the driver's reach.
+   - **MSI-X (capability 0x11)** keeps the message table in **MMIO inside a BAR**, and the
+     driver holds its BAR. Where the table sits inside the window the driver was granted, a
+     compromised driver can point its own interrupt somewhere else.
+
+   So the honest boundary is: **confinement makes a compromised driver unable to reach memory
+   outside its arena, and does not make it unable to misdirect its own interrupt on an MSI-X
+   controller.** Closing that needs an interrupt-remapping table, which is real work and not a
+   constant, so it is recorded here rather than implied away. It does not weaken the §6.4
+   claim, which is about DMA, but it is the limit of that claim and belongs beside it.
 2. **The no-IOMMU machine.** The conditional trust posture above means the TCB is
    *machine-dependent*. That is honest but novel for this project; it deserves a
    deliberate decision rather than a default.

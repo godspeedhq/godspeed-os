@@ -1631,10 +1631,17 @@ does the service still call the syscall?
 
 ## 10. Open items
 
-- **The CLAUDE.md amendment for step C** must state the widening in section 4's words: after C, a
-  runtime-compromised supervisor can introduce new code, and nothing before step 2 prevents it.
-  (The IRQ-routing half of this concern is closed - see 9.1 - but the code-introduction half stands
-  and is the reason step 2 exists.)
+- **CLOSED 2026-09-26: the CLAUDE.md amendment for step C is written**, under §14.1, where step 1
+  already described the post-C world ("Supervisor takes the service's image") without saying what it
+  cost. It records all of it: that `SpawnImage` (syscall 52) now accepts an image from userspace;
+  that starting arbitrary bytes is a separate authority from starting a known service, gated by
+  `IMAGE_SPAWN` **on top of** `SPAWN`, so the shell / `chaos` / `control` / every probe no longer
+  hold it; that `IMAGE_SPAWN` is deliberately absent from `SUPERVISOR_DELEGATABLE`; what the kernel
+  refuses outright (raw MMIO addresses and raw interrupt vectors among them); and - the half this
+  item was really about - **that a runtime-compromised supervisor can now introduce new code, which
+  before C it could not, and that nothing before step 2 prevents it.** The IRQ-routing half is closed
+  (see 9.1). The code-introduction half stands, is now recorded in the constitution rather than only
+  here, and is the reason step 2 exists.
 - **CLOSED: the name-squatting regression this work caused.** `spawn_probe` let a SPAWN holder choose
   the NAME of the task it started while the KERNEL supplied the probe image, and refused "a real
   service's name" by asking the kernel's service catalogue - which step C emptied, silently shrinking

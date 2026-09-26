@@ -1553,6 +1553,55 @@ Every syscall checks the calling task's capability table, populated at spawn tim
     ── service_main() ── enters work loop
 ```
 
+> **Amendment 2026-09-26 (step C): step 1 above is only true because the kernel now accepts an IMAGE
+> from userspace, and that widening was never recorded here.** When the supervisor took ownership of
+> every service image (`docs/service-ownership.md`, step C), the kernel stopped holding the bytes it
+> spawns. Its catalogue is `supervisor` alone. So a spawner can no longer ask for "the image you
+> already have" - it must SUPPLY one, and `SpawnImage` (syscall 52) is the syscall that accepts it.
+>
+> **Starting arbitrary bytes is a different authority from starting a known service, and it is now a
+> different capability.** `SPAWN` and image-spawn were the same right until step C, which meant every
+> `SPAWN` holder - the shell, `chaos`, `control`, every probe - could introduce NEW CODE under a real
+> service's name in the window while that service was dead, and a client reacquiring that name (§14.3)
+> would wire itself to it. `SpawnImage` therefore requires `IMAGE_SPAWN` **on top of** `SPAWN`, and
+> the kernel refuses the call when a caller holds only the latter.
+>
+> **`IMAGE_SPAWN` is deliberately NOT delegatable.** It is absent from `SUPERVISOR_DELEGATABLE`, so
+> the supervisor cannot pass it on even to a service it trusts - a delegatable version would re-open
+> the hole one grant later. The only two callers in the tree are the supervisor's own
+> `spawn_by_image` and `spawn_probe_row`; everything else asks the supervisor over IPC. It stops the
+> authority leaking to the dozen services that merely wanted to start something.
+>
+> **What the supervisor GAINED, said plainly, because this is a real widening and not a re-labelling.**
+> Before step C the kernel held every image, so a runtime-compromised supervisor could start only
+> code the kernel already carried - it could start the wrong service, or the right one too often, but
+> it could not introduce code that was not in the image. **After step C it can.** A compromised
+> supervisor supplies the bytes, so it can run anything under any name, and **nothing before step 2
+> prevents that** - step 2 (a signature over each image, `docs/service-ownership.md`) exists precisely
+> to close it. This does not move the TCB: the supervisor is the trusted root (§6.1) and its
+> compromise was always systemic. It does mean the CONSEQUENCE of that compromise is strictly larger
+> than it was, and per §26.7 a limitation that cannot be closed today is recorded rather than left for
+> a reader to discover. The IRQ-routing half of the same concern IS closed: the kernel refuses raw
+> vectors and raw MMIO outright, as the paragraph below describes.
+>
+> **What the kernel refuses, so that "supplies an image" is not "supplies a machine".** The request
+> is a fixed, versioned struct, and the kernel rejects a wrong version, a wrong size, an unreadable
+> buffer, a name outside 1..=64 bytes, a `dma_pages` over its cap, an unknown device class, a BDF on a
+> non-PCI class, any privilege the caller does not hold itself (`privileges_caller_lacks`), and - the
+> two that matter most - **raw MMIO addresses and raw interrupt vectors**. A driver names a device
+> CLASS and the kernel resolves the window, the arena, the BDF and the vector against its own bus
+> scan (§12.3). A caller cannot hand the kernel an address and be given it.
+>
+> **Why this is recorded rather than merely implemented.** It is a new kernel authority and a widened
+> syscall surface, which Commandment I pins and §26.9 requires be traceable to the capability that
+> granted it. The code says all of this at `kernel/src/capability/mod.rs`; the constitution said none
+> of it, and `docs/service-ownership.md` has carried "the CLAUDE.md amendment for step C must state
+> the widening" as an open item since. No invariant moves: authority is still explicit (§3.3) and the
+> kernel still holds no policy - it validates a request and mints exactly what the request asks for
+> and the spawner may give (§13.6, §26.10). The net effect on authority points BOTH ways and it is
+> worth being exact about which: **narrower for the dozen `SPAWN` holders**, who lost the ability to
+> introduce code at all, and **wider for the supervisor alone**, as the paragraph above records.
+
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 
 ```text
