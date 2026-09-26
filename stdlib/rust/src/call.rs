@@ -3,7 +3,7 @@
 //!
 //! # Why this exists
 //!
-//! The SDK offers eight `request_with_reply*` functions across three outcome enums. They are all
+//! The SDK offers twelve `request_with_reply*` functions across three outcome enums. They are all
 //! correct; the problem is which one is shortest to type. `request_with_reply_deadline` returns
 //! `Option<Message>`, so "the request never left" and "the deadline passed" arrive as the same
 //! `None` - and those two demand opposite responses. Five services
@@ -31,6 +31,29 @@
 //! **It never retries a timeout.** That is not caution, it is correctness: a slow service is a live
 //! service, and re-sending a `delete` to one is not a retry, it is a second delete whose failure
 //! looks like success.
+//!
+//! # ONE OF THESE IS SAFE FOR A SERVING CALLER, AND THE OTHER IS NOT
+//!
+//! Read this before picking. The difference is not ergonomic, it decides whether a task that also
+//! SERVES clients can lose one of their requests (CLAUDE.md 8.2).
+//!
+//! - [`request_within`] rides `CallDeadline`. The kernel matches the reply to this call's own
+//!   one-shot reply capability and leaves every other message queued. **Safe for a serving task.**
+//! - [`request_within_notice`] rides the SDK's `_qhint` variant, which DRAINS the endpoint before
+//!   sending (`while self.try_recv().is_some() {}`) and then waits with a plain timed receive, taking
+//!   whatever lands next. **NOT safe for a serving task**: a client request arriving mid-wait is
+//!   consumed and dropped.
+//!
+//! That is deliberate rather than an oversight, and the SDK says so where it lives: `_qhint`
+//! interleaves ON PURPOSE so it can notice a `q` keypress while waiting, and making it dequeue only
+//! the reply would delete that. The honest fix is a bounded stash, which is real work and is not
+//! done - so the limitation is recorded here (26.7) instead of being implied away.
+//!
+//! **It reaches further than this module.** Every `Fs::call` goes through
+//! [`request_within_notice`](request_within_notice), and so does every `Net` call, so a handle built
+//! with `Fs::with_notice` or `Net::with_notice` is on that path too. Use the plain constructors in a
+//! service that serves; `with_notice` is for a foreground command where a person is waiting and may
+//! want to press `q`.
 //!
 //! # Authority
 //!
