@@ -391,6 +391,15 @@ os/
                          #   `long` and discards the path, which is a WRONG ANSWER rather
                          #   than an error. Reads `SUBCMD_FIRST` and osdev's own `match
                          #   suite`, so it cannot drift from either
+    comment_symbol_check.py # ...and the same question asked of CODE COMMENTS, which are
+                         #   27,126 lines across 238 files - twice the documentation, inside
+                         #   the kernel, and read FIRST because they sit beside the code.
+                         #   Resolution is STRICTER than for a doc: `doc_symbols_check`
+                         #   accepts a name found anywhere in the source, comments included,
+                         #   which here would be circular - the comment would satisfy
+                         #   itself. A name cited by a comment must exist in CODE. Most of
+                         #   its baseline is permanent and correct: registers, SBI calls and
+                         #   Linux functions a driver cites on purpose (§26.14)
 
     # WHERE THESE RUN, which until 2026-09-26 was the hole under all the others. The eight
     # DOCUMENTATION checkers above (doc_refs, docs_index_check, facts_check,

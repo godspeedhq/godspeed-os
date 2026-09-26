@@ -429,6 +429,19 @@ const EXTRA_CHECKS: &[&str] = &[
     // discards the path, and `osdev test blockdev-ahci` names a suite that does not exist. Both
     // shipped. Reads `SUBCMD_FIRST` and osdev's own `match suite`, so it cannot drift from them.
     "scripts/doc_command_check.py",
+
+    // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
+    //
+    // The eight checkers above cover 163 documents. They do not look at the 27,126 doc-comment
+    // lines in 238 Rust files - twice the volume, inside the kernel, and read FIRST, because a
+    // comment sits next to the code being changed. The 2026-09-26 sweep corrected
+    // `docs/service-ownership.md` for citing `pci::XHCI_FOUND` after step D deleted it, and left
+    // the comments citing the same dead static untouched, because nothing looks at comments.
+    //
+    // Resolution is stricter here than for documents, and it has to be: `doc_symbols_check` counts
+    // a name as resolved if it appears anywhere in the source INCLUDING comments, which applied to
+    // comments is circular - the comment would satisfy itself. Here a cited name must be in CODE.
+    "scripts/comment_symbol_check.py",
 ];
 
 fn commandment_check() {
