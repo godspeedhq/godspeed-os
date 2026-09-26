@@ -73,15 +73,18 @@ TOKEN = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+
 # sites, with no false alarms to baseline.
 PATH_TOKEN = re.compile(r"`(?:[A-Za-z_][A-Za-z0-9_]*::)+([A-Za-z_][A-Za-z0-9_]*)`")
 
-# STILL A BLIND SPOT, measured and recorded rather than half-enabled (§26.2, §26.7): a CamelCase
-# name in backticks - a type or an enum variant - matches neither pattern, because `TOKEN` requires
-# an underscore. `UsbExclusive` was dead, cited in a live comment, and invisible for exactly this
-# reason. Measured cost of turning it on: 15 names over 23 sites, and roughly half are NOT ours and
-# never will be - `AttrIndx`, `DminLine`, `IminLine` are ARM register FIELDS, `HubAddr`, `PrtAddr`,
-# `SplEna` are DWC2 ones, `GenuineIntel` is a CPUID vendor string. The other half look like real
-# rot (`SetClock`, `CreateEndpoint`, `UnknownSyscall`, `ReclaimBuffer`). So enabling it is a
-# triage pass, not a regex change, and doing it in the same commit would mean baselining findings to
-# keep the gate green - which is the one thing a ratchet must not be used for. `backlog/58`.
+# A CamelCase name - a TYPE or an enum variant. `TOKEN` requires an underscore, so this was a blind
+# spot until 2026-09-26: `UsbExclusive` was dead, cited in the present tense in a live comment, and
+# invisible. Two or more humps, each a capital followed by lower case, which is what keeps prose out:
+# `GodspeedOS` does not match (the trailing `OS` has no lower case), nor does `README` or `CLAUDE`.
+#
+# Enabled in a SEPARATE change from the widening above, and the separation was the point: turning it
+# on and seeding the result in one step would have put FINDINGS into the baseline to keep the gate
+# green, which is the one thing a ratchet must not be used for. It was `backlog/58` for exactly as
+# long as it took to triage all 23 sites by hand - about half were ARM/DWC2 register FIELDS
+# (`AttrIndx`, `DminLine`, `HubAddr`, `SplEna`) and a CPUID vendor string, which are outward
+# references and belong in the baseline forever; the rest were real.
+CAMEL_TOKEN = re.compile(r"`([A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+)`")
 LINE_COMMENT = re.compile(r"^\s*(///|//!|//)\s?(.*)$")
 
 
@@ -186,7 +189,7 @@ def scan():
     for p, comments in per_file:
         rel = os.path.relpath(p, ROOT).replace(os.sep, "/")
         for lineno, ctext in comments:
-            for rx in (TOKEN, PATH_TOKEN):
+            for rx in (TOKEN, PATH_TOKEN, CAMEL_TOKEN):
                 for m in rx.finditer(ctext):
                     tok = m.group(1)
                     if tok not in code_text:

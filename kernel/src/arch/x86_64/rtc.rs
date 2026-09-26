@@ -112,9 +112,14 @@ pub fn read_datetime() -> u64 {
     dt
 }
 
-/// Set the wall clock from the network (SNTP). A NO-OP on x86: the hardware CMOS RTC is the authority here,
-/// so `read_datetime` already reports real time and there is nothing to set. Exists so the arch-neutral
-/// `SetClock` syscall compiles on every arch; the RTC-less ARM port is the one that actually uses it.
+/// Set the wall clock from the network (SNTP). A NO-OP on x86: the hardware CMOS RTC is the authority
+/// here, so `read_datetime` already reports real time and there is nothing to set.
+///
+/// **This has no callers on any arch.** It said it "exists so the arch-neutral `SetClock` syscall
+/// compiles on every arch" - there is no such syscall, and nothing in `syscall/` or `task/` reaches
+/// this. Clock slice 3 gave the wall clock to the `time` service; the seam survived the move. See
+/// `backlog/59`, and `capability/mod.rs`'s `SET_CLOCK_RESOURCE` for the same story on the capability
+/// side.
 pub fn set_wall_clock(_epoch: i64) -> bool { false }   // the CMOS RTC is the authority here
 
 /// A DEGLITCHED "now" in epoch seconds: monotonic + forward-jump-bounded, for time-DELTA uses (per-service

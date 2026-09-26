@@ -1,8 +1,10 @@
 # 58 - a CamelCase name in a comment is invisible to `comment_symbol_check`
 
-**Status:** OPEN - a measured blind spot in a gate that shipped the same day. Recorded rather than
-closed because closing it is a triage pass over 23 sites, not a regex change, and doing it in the
-commit that added the gate would have meant baselining findings to keep the gate green.
+**Status:** CLOSED 2026-09-26, same day. `CAMEL_TOKEN` is enabled in
+`scripts/comment_symbol_check.py` and all 21 sites were triaged BEFORE seeding, which was the whole
+reason for filing it separately: 4 were real and are fixed, 11 are outward references or records and
+are baselined with a reason each. One of the four - three comments naming a `SetClock` syscall that
+does not exist - led to `backlog/59`.
 **Found:** 2026-09-26, by the kernel half of the first comment sweep, which hit a dead name the new
 gate could not see.
 

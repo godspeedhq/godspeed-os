@@ -99,11 +99,20 @@ pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
 /// never ambient (the same posture as NET_DEVICE). A no-op off ARM, where disks are userspace drivers.
 pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
 
-/// Authority to set the wall clock via `SetClock` (the SNTP-fed time-of-day). The RTC-less ARM port has
-/// no hardware clock, so `date` reads zero until a network time source sets it; setting it changes every
+/// Authority to set the wall clock (the SNTP-fed time-of-day). The RTC-less ARM port has no
+/// hardware clock, so `date` reads zero until a network time source sets it; setting it changes every
 /// task's view of the time of day, so it is a privileged action (§3.1), not ambient. Granted only to
-/// `net-stack`, which runs the SNTP round-trip. A no-op on arches with a real RTC (x86). Validated by
-/// holdings (like `reboot`/8), since `SetClock` spends its one argument register on the epoch.
+/// `net-stack`, which runs the SNTP round-trip.
+///
+/// **NOTHING SPENDS THIS CAPABILITY ANY MORE, and that is worth knowing before you reason about it.**
+/// This said the authority is spent "via `SetClock`, validated by holdings like `reboot`". There is no
+/// such syscall: no `SyscallNumber` variant sets a clock, and no code in `syscall/` or `task/` calls
+/// any arch's `set_wall_clock`. Clock slice 3 moved the wall clock to the `time` SERVICE, which
+/// `net-stack` now asks over IPC (`OP_SET`), so the privileged action this gates no longer passes
+/// through the kernel at all. The ResourceId is still registered and still minted from the privilege
+/// word, so it is granted and never checked - dead authority, which is the kind §26.9 says a reviewer
+/// must be able to see. Recorded as `backlog/59` rather than deleted here, because removing a
+/// ResourceId renumbers nothing but does touch the spawn path and wants re-verification.
 pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);
 
 /// Inject a test interrupt (`FireIrq`, syscall 51). Held ONLY by the control service.

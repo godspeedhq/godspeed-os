@@ -1897,8 +1897,13 @@ fn spawn_service_with_image(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // SET_CLOCK: net-stack sets the wall clock from SNTP (`SetClock` syscall) on the RTC-less ARM port.
-    // Minted here; WHO holds it is in `service_privileges`. Inert (no-op syscall) off ARM.
+    // SET_CLOCK: net-stack sets the wall clock from SNTP on the RTC-less ARM port. Minted here; WHO
+    // holds it is in `service_privileges`.
+    //
+    // MINTED AND CHECKED BY NOBODY, on every arch. This said the authority is spent through a
+    // `SetClock` syscall, "inert (no-op syscall) off ARM" - implying it is live ON arm. There is no
+    // such syscall on any arch: clock slice 3 moved the wall clock to the `time` SERVICE, which
+    // `net-stack` asks over IPC. The grant is real and nothing consumes it (`backlog/59`).
     if privs.set_clock {
         let sc_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::WRITE);
         caps.insert(sc_cap)

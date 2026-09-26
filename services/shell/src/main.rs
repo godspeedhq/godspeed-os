@@ -4539,7 +4539,8 @@ fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u
 
 /// Write a report buffer to `path`, streaming to a multi-block file (the report exceeds one
 /// message). Quiet (the caller prints the human message); returns success. Reuses the same
-/// `WriteFile` / `WriteNew`+`WriteAt` shape as the pipe `write` sink, with no intermediate copy.
+/// `OP_WRITE_FILE` / `OP_WRITE_NEW`+`OP_WRITE_AT` shape as the pipe `write` sink (the op constants
+/// in `services/fs/src/main.rs`), with no intermediate copy.
 fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
     // Bounded fs request (wall-clock): a chaos report is saved right after the storm may have hammered
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate

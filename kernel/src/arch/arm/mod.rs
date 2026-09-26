@@ -1866,7 +1866,8 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// keyboard was unaffected (it pushes through `console_push_byte`), so the signature was the odd one of
 /// a live keyboard beside a dead serial line.
 ///
-/// Exclusion is now by PROTOCOL rather than by core, the same discipline `UsbExclusive` uses next door:
+/// Exclusion is now by PROTOCOL rather than by core, the same discipline the USB path used next door
+/// (that one was `UsbExclusive`, deleted with the in-kernel driver in slice 5):
 /// a CAS claims the drain, any core may win it, and a loser returns immediately instead of waiting -
 /// correct because the winner is draining that very FIFO right now, so the bytes reach the ring either
 /// way. IRQs stay masked inside so this core's own tick cannot interleave between the FR check and the

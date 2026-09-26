@@ -168,3 +168,16 @@ msc_sync_cache                     # arch/arm/mod.rs - 'went with arch/arm/dwc2.
 process_pending                    # 3 sites, each saying in terms that it 'no longer exists' - the COM2 channel is services/control now (C1-6)
 probe_authority                    # services/probe/src/table.rs - CORRECTED: authority never was keyed by name in the kernel after step C; the name is kept naming the thing that is gone
 probe_mass_storage                 # kernel/src/syscall/dispatch.rs - CORRECTED: the kernel claims no USB device now; the name records the helper that went with arch/arm/dwc2.rs
+# --- CamelCase (types / enum variants), enabled 2026-09-26 after triaging all 21 sites --------
+AttrIndx                           # ARM MAIR_EL1 field name - the silicon's, not ours (26.14)
+DminLine                           # ARM CTR_EL0 field - ditto
+IminLine                           # ARM CTR_EL0 field - ditto
+HubAddr                            # DWC2 HCSPLT register field
+PrtAddr                            # DWC2 HCSPLT register field
+SplEna                             # DWC2 HCSPLT register field
+GenuineIntel                       # the CPUID vendor string, matched as bytes
+CreateEndpoint                     # a syscall docs/net-tags-design.md REJECTED as unnecessary - never built, and naming the thing not built IS the record (3 sites)
+UnknownSyscall                     # project vocabulary for the -1 an unknown syscall number returns (CLAUDE.md 22, F2); a spec name, not a Rust item
+ReclaimBuffer                      # 'The old `ReclaimBuffer`' - a record of what freeing inline replaced
+UsbExclusive                       # the in-kernel dwc2's exclusion token, deleted in slice 5; both surviving sites now name it AS history
+SetClock                           # a syscall that never existed after clock slice 3; all 4 sites now name it while SAYING it does not exist (backlog/59)
