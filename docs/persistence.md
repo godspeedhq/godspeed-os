@@ -1239,9 +1239,15 @@ All replies are exactly one of `{Ok-with-data, defined error}` - never silent
   `block-driver` from the TCB** (a recorded `CLAUDE.md` §6 amendment with sign-off). A
   **log-structured** layout is the natural route - appends with an atomic commit record
   make crash-consistency fall out for free, and pair well with the no-overwrite discipline.
-  Because the ATA PIO driver has no DMA reach (§5.1), `block-driver` can leave the TCB on
-  its own merits without depending on IOMMU presence - a cleaner exit than the DMA drivers
-  had.
+  **Corrected 2026-09-26: this said the opposite of the truth and is the reverse of a
+  safety claim, so it is replaced rather than softened.** It read "because the ATA PIO driver
+  has no DMA reach (§5.1), `block-driver` can leave the TCB without depending on IOMMU
+  presence". The ATA-PIO backend is retired: `block-driver` is AHCI, it takes a DMA arena
+  (`services/block-driver/src/ahci.rs`, `arena: Dma`), and it is spawned **unconfined**
+  (`hwclass::pci(0x01_06_01, 5, false)` in the supervisor's spawn table). By CLAUDE.md 6.4's
+  own rule any service granted a DMA arena on a machine that cannot confine it is
+  trust-critical, so `block-driver` is IN the TCB on every machine, IOMMU or not - which is
+  what `docs/ahci.md` and the 2026-09-12 DMA-census amendment both say.
 
 ## 10. Phased build plan
 

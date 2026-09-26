@@ -1590,8 +1590,9 @@ absent from `os-usb.img`.
 
 ### 9.1 What a driver names, and what it may not
 
-A driver row names a device **class** (`hwclass::AHCI`, `XHCI`, `EHCI`, `DWC2`, `NIC`,
-`FRAMEBUFFER`). The kernel resolves that against its own bus scan and supplies the MMIO window, the
+A driver row names a device **class** (`hwclass::XHCI`, `EHCI`, `DWC2`, `NIC`,
+`FRAMEBUFFER`, `TEST_IRQ`) or, where there is no class for it, a PCI class CODE - which is how
+AHCI is named (`0x010601`), there being no `hwclass::AHCI` and never having been. The kernel resolves that against its own bus scan and supplies the MMIO window, the
 DMA arena, the PCI BDF **and the interrupt vector**. `SpawnImage` refuses a request that names any
 of them directly.
 

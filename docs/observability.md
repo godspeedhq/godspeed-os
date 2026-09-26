@@ -54,8 +54,8 @@ are dropped (`services/events/CLAUDE.md`).
                                             |   |  written UNCONDITIONALLY       |
                                             |   +--------------------------------+
                                             |                  |
-                                            |                  |  drained ONCE,
-                                            v                  v  at events start
+                                            |                  |  NOT drained:
+                                            v                  v  zero callers
                                      +------------------------------+
                                      |  events  (-> `events`)       |
                                      |    192-event trace ring      |
@@ -178,12 +178,20 @@ Checked rather than assumed, because it changes the answer:
 
 ```
    kprintln!  ->  [u8; 16 KiB] BYTE ring  ->  serial (always)
-                                          ->  drained ONCE, when `events` starts
+                                          ->  NOT drained (zero callers - see below)
 ```
 
 `kernel/src/log.rs` is a **byte ring of formatted, human-readable lines** - not typed records - and
-`drain_to_events` has exactly one caller, `events`'s startup. After that everything reaches serial
-and the ring only matters again on the next boot.
+**nothing drains it.** `drain_to_events` has ZERO callers anywhere in the tree, deliberately: every
+`ctx.log()` writes the ring AND serial directly by syscall, so the ring is a floor rather than a queue
+awaiting a consumer (CLAUDE.md 11.4's 2026-09-04 amendment). `log.rs`'s own header says so in its first
+line, and the function is kept only because its masking discipline is the right shape for any future
+drainer.
+
+> **Corrected 2026-09-26.** This said `drain_to_events` "has exactly one caller, `events`'s startup".
+> `log.rs` was corrected and carries the correction in its header; this document kept the original
+> claim, here and in the two diagrams above. A corrected defect that survives in the documentation
+> goes on causing the error it was corrected for.
 
 **So "kernel events ride the existing ring" would mean PARSING TEXT**, which is fragile and creates a
 second truth: the parser's idea of an event versus what the kernel meant (26.4). A format change in a
