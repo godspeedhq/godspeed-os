@@ -1,0 +1,32 @@
+# target: examples/counter/contracts/counter.toml
+# mode: append
+# checker: scripts/commandments.py
+# why: A COMMANDMENT violation, which is the case the frame exists for - and the case it rendered
+# why: WORST before this fixture existed. `conform` treated commandments.py as one checker with one
+# why: code and the title "a Commandment check failed", so a Commandment IV failure printed
+# why: "= commandment: all ten". Naming which of the Ten a violation breaks is the whole point of the
+# why: frame, and for the checker covering all ten it was doing it least well.
+# why:
+# why: The violation itself is the one CLAUDE.md 13.6 was written for: a weak model was asked to let a
+# why: service restart a peer, added `service_control = true` to its CONTRACT, and reported that the
+# why: kernel would grant it. It compiled, `osdev validate` passed, and every call is denied at
+# why: runtime while a log line printed BEFORE the call asserts the restart happened. So the message
+# why: has to say that the contract is not read at runtime, and name both real fixes.
+--- plant ---
+
+service_control = true      # restart fs when it stops answering
+--- expect ---
+error[GS0904]: a contract's claim of authority matches what is actually granted
+   --> examples/counter/contracts/counter.toml
+    |
+    = commandment: IV - Thou shalt honor service contracts.
+    = why: declares `service_control = true`, and NOTHING GRANTS IT. The contract is not read
+           at runtime (13.6): authority comes from the supervisor's spawn row and the
+           kernel's `service_config`. A service claiming an authority it is never given
+           loads, runs, and has every such call DENIED - and a denial is easy to discard, so
+           it fails silently. Either grant SERVICE_CONTROL in services/supervisor/src/main.rs
+           (and pin it under [kernel.service_grants]), or delete the claim.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0904` for the long form

@@ -359,6 +359,29 @@ def checkers():
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# One stable code per Commandment. `commandments.py` covers all ten, so framing it under a single code
+# threw away the only thing the frame is for: naming WHICH of the Ten a violation breaks.
+NUMERALS = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
+COMMANDMENT_CODE = {n: "GS09%02d" % (i + 1) for i, n in enumerate(NUMERALS)}
+VIOLATION = re.compile(r"^\s*Commandment\s+(I|II|III|IV|V|VI|VII|VIII|IX|X)\s*-\s*(.+?)\s*$")
+
+
+def commandment_text():
+    """{numeral: the commandment's own words} read from COMMANDMENTS.md.
+
+    Read rather than restated: a second copy of the Ten Commandments inside a Python file is exactly
+    the duplicate truth Commandment III forbids, and it would drift the first time one is reworded.
+    """
+    out = {}
+    path = os.path.join(ROOT, "COMMANDMENTS.md")
+    if not os.path.exists(path):
+        return out
+    for line in io.open(path, encoding="utf-8", errors="replace"):
+        m = re.match(r"^#+\s*(I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s+(.+?)\s*$", line)
+        if m:
+            out.setdefault(m.group(1), m.group(2))
+    return out
 SITE = re.compile(r"\b((?:[a-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:rs|md|toml|py|json|ld|gsh))(?::(\d+))?")
 
 
@@ -407,6 +430,63 @@ def covered_by_fixer(script, output, fixed_rels):
     return bool(sites) and sites <= set(fixed_rels)
 
 
+def render_commandments(output):
+    """One frame per failing Commandment, named and coded individually."""
+    words = commandment_text()
+    found = []
+    for line in output.split("\n"):
+        m = VIOLATION.match(line)
+        if m and (m.group(1), m.group(2)) not in found:
+            found.append((m.group(1), m.group(2)))
+
+    if not found:
+        return None
+
+    frames = []
+    for numeral, title in found:
+        code = COMMANDMENT_CODE[numeral]
+        body = ["error[%s]: %s" % (code, title)]
+        site = None
+        take = False
+        detail = []
+        for line in output.split("\n"):
+            m = VIOLATION.match(line)
+            if m:
+                take = m.group(1) == numeral
+                continue
+            if take and line.strip():
+                if site is None:
+                    s = SITE.search(line)
+                    if s:
+                        site = s.group(1) + (":" + s.group(2) if s.group(2) else "")
+                detail.append(line.strip())
+        if site:
+            body.append("   --> %s" % site)
+        body.append("    |")
+        body.append(wrap("commandment", "%s - %s" % (numeral, words.get(numeral, "see COMMANDMENTS.md"))))
+
+        # ANYTHING THE FRAME STATES, THE PASSTHROUGH MUST NOT RESTATE. Two ways that was broken here:
+        # the site appears on its own line and was taken as the `why` (it is already in the arrow),
+        # and the checker's constant FOOTER repeated the frame's own `help` twice.
+        FOOTER = ("COMMANDMENTS.md is the law", "An exemption is legitimate")
+        useful = []
+        for d in detail:
+            if site and d.rstrip(":").strip() == site.split(":")[0]:
+                continue
+            if d.startswith(FOOTER):
+                continue
+            useful.append(d)
+
+        for i, d in enumerate(useful[:3]):
+            body.append(wrap("why" if i == 0 else "note", d))
+        body.append(wrap("help", "`COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the "
+                                 "correct pattern for this category. An exemption is legitimate ONLY "
+                                 "if a CLAUDE.md amendment already accepts it - not a baseline entry."))
+        body.append(wrap("note", "`py scripts/conform.py --explain %s` for the long form" % code))
+        frames.append("\n".join(body))
+    return "\n\n".join(frames)
+
+
 def render(script, output, fixed_rels=()):
     """Frame one checker's failure.
 
@@ -418,6 +498,11 @@ def render(script, output, fixed_rels=()):
     """
     name = os.path.basename(script)
     rule = RULES.get(name)
+
+    if name == "commandments.py":
+        framed = render_commandments(output)
+        if framed:
+            return framed
 
     if covered_by_fixer(script, output, fixed_rels):
         n = len({m.group(1) for m in SITE.finditer(output)})
@@ -490,7 +575,70 @@ def _para(label, text, width=94):
     return "\n".join(lines)
 
 
+def explain_commandment(code):
+    """The long form for a GS09NN code, READ from `commandments.py --report`.
+
+    Not restated here. Which checks cover a commandment - and which aspects are deliberately not
+    mechanised - is a fact that report owns, and a second copy would drift about precisely how much of
+    the constitution is proved. That is the last claim in this repository that should be allowed to
+    overstate itself.
+    """
+    numeral = next((n for n, c in COMMANDMENT_CODE.items() if c.lower() == code.lower()), None)
+    if numeral is None:
+        return None
+
+    words = commandment_text().get(numeral, "(see COMMANDMENTS.md)")
+    print("%s - Commandment %s" % (code.upper(), numeral))
+    print()
+    print(_para("law ", words))
+    print()
+
+    # Separate argv elements. Passing "commandments.py --report" as ONE string made python look for a
+    # file of that name, which fails quietly enough that the parse simply found nothing and the
+    # explain printed "none found" - a wrong answer rather than an error.
+    r = subprocess.run([sys.executable, os.path.join("scripts", "commandments.py"), "--report"],
+                       cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    out = ANSI.sub("", (r.stdout or "") + (r.stderr or ""))
+
+    mech, manual = [], []
+    for line in out.split("\n"):
+        plain = line.rstrip()
+        m = re.match(r"^\s*(I|II|III|IV|V|VI|VII|VIII|IX|X)\s+(\S+)\s+\[([a-z ]+)\]\s+(\w+)\s+(.*)$",
+                     plain)
+        if m and m.group(1) == numeral:
+            mech.append((m.group(2), m.group(3).strip(), m.group(4), m.group(5).strip()))
+            continue
+        m2 = re.match(r"^\s*(I|II|III|IV|V|VI|VII|VIII|IX|X)\s+\[(.+?)\]\s*(.*)$", plain)
+        if m2 and m2.group(1) == numeral:
+            manual.append((m2.group(2), m2.group(3).strip()))
+
+    if mech:
+        print("  mechanised checks:")
+        for cid, kind, verdict, title in mech:
+            print("    %-24s [%s] %s" % (cid, kind, title))
+    else:
+        print("  mechanised checks: none found in the report")
+    print()
+
+    if manual:
+        print("  NOT mechanised - human review, every time:")
+        for kind, what in manual:
+            print(_para("  [%s]" % kind, what))
+    else:
+        print("  NOT mechanised: nothing outstanding for this commandment")
+    print()
+    print(_para("note", "Every one of the Ten has at least one mechanical check, which is what "
+                        "\"10 of 10 mechanised\" means. It does NOT mean each is proved: eight aspects "
+                        "across the Ten are human review, and `docs/x-residue.md` records what "
+                        "Commandment X's checker specifically does not show."))
+    return 0
+
+
 def explain(code):
+    r = explain_commandment(code)
+    if r is not None:
+        return r
+
     for name, rule in sorted(RULES.items()):
         if rule["code"].lower() == code.lower():
             print("%s - %s" % (rule["code"], rule["title"]))
@@ -650,9 +798,16 @@ def main(argv):
     if "--list" in argv:
         print("%-8s %-28s %-12s %s" % ("code", "enforced by", "commandment", "fixable"))
         for name, rule in sorted(RULES.items(), key=lambda kv: kv[1]["code"]):
+            if name == "commandments.py":
+                continue
             print("%-8s %-28s %-12s %s" % (rule["code"], name,
                                            rule["commandment"] or "-",
                                            "yes" if rule["fixable"] else "no"))
+        # The Ten get a code EACH, because naming which one a violation breaks is the whole point of
+        # the frame - and one code for all ten threw that away.
+        for numeral in NUMERALS:
+            print("%-8s %-28s %-12s %s" % (COMMANDMENT_CODE[numeral], "commandments.py",
+                                           numeral, "no"))
         return 0
 
     check_only = "--check" in argv
