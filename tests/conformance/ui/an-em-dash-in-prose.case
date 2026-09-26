@@ -10,5 +10,5 @@
 
 A trailing note — with an em-dash in it.
 --- expect ---
-error[GS0001]: an em-dash or en-dash appears in a tracked text file
+error[GS0101]: an em-dash or en-dash appears in a tracked text file
     = note: 1 file, listed above; `py scripts/conform.py` fixes it

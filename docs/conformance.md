@@ -7,7 +7,7 @@ Rust edit, and this branch deliberately touches none). Branch `feat/osdev-confor
 
     py scripts/conform.py            fix what is decidable, report what needs judgement
     py scripts/conform.py --check    report both, change nothing (what CI wants)
-    py scripts/conform.py --explain GS0303
+    py scripts/conform.py --explain GS0403
     py scripts/conform.py --list
 
 This proposes a front door for the enforcement layer, and answers - with measurements rather than
@@ -234,10 +234,10 @@ that mangles what it quotes is not one to trust about anything else.
 
 A judgement finding, unabridged. The marker below is the escape this document argued for, in use: the sample holds the very citation that provoked it, so the site is legitimately unresolvable.
 
-<!-- conform-ok: GS0304 - a pasted sample of conform's own output; the cited line is the one the example was generated from -->
+<!-- conform-ok: GS0404 - a pasted sample of conform's own output; the cited line is the one the example was generated from -->
 
 ```
-error[GS0303]: a Rust comment names something that exists nowhere in the code
+error[GS0403]: a Rust comment names something that exists nowhere in the code
    --> examples/00-hello/src/main.rs:53
     |
     = rule: CLAUDE.md 26.7, 26.14
@@ -248,7 +248,7 @@ error[GS0303]: a Rust comment names something that exists nowhere in the code
             purpose (a hardware register, an SBI call, a Linux function cited per 26.14), add
             it to the baseline with which kind it is. A comment that says "X was deleted" is
             RIGHT to name X: that is a record, and it belongs in the baseline.
-    = note: `py scripts/conform.py --explain GS0303` for the long form
+    = note: `py scripts/conform.py --explain GS0403` for the long form
 ```
 
 and a clean tree:
@@ -298,8 +298,24 @@ synthesised caret" rule implies one level up: cite the precision you have.
 
 Five rules behind that layout:
 
-1. **A stable code per rule** (`GS0031`), so it can be searched, cited in a commit, and explained.
-   Codes are never reused or renumbered, exactly as rustc's are not.
+1. **A stable code per rule**, so it can be searched, cited in a commit, and explained. Codes are
+   never reused, exactly as rustc's are not - and the FIRST block is the constitution:
+
+   | block | what |
+   |---|---|
+   | `GS0001`..`GS0010` | the Ten Commandments, one each. **The number IS the numeral**, so `GS0004` is IV and needs no decoder. A fixed block: there are exactly ten, permanently |
+   | `GS01xx` | house writing conventions (dashes, line endings, the Python floor) |
+   | `GS02xx` | the kernel boundary and unsafe |
+   | `GS03xx` | contracts and authority |
+   | `GS04xx` | documentation and comments telling the truth |
+
+   The first cut put the Commandments at `GS09xx`, where the `09` meant nothing - it was the ninth
+   group because it was written last - and gave the first block to a dash convention. That put a
+   decoder between a reader and the law, which is backwards for a project whose argument is that the
+   model is the product. Renumbered before anything merged, because a code is stable forever once
+   cited. `GS0000` is kept as the deliberate FALLBACK for a Commandment failure `conform` cannot
+   attribute - reporting it unattributed beats a violation that renders as nothing because a regex
+   moved.
 2. **The commandment is named, not just the script.** The contributor is being held to a rule; tell
    them which one and where it is written. `commandments.py` already knows this mapping.
 3. **`= why` before `= help`.** The reason is what makes the rule stick; the fix without the reason
@@ -417,7 +433,7 @@ that provoked it. Every one of them will trip a gate the moment `tests/conforman
 
 **BUILT: `scripts/conform_ok.py`**, one marker honoured by the gates that need it.
 
-    <!-- conform-ok: GS0304 - a pasted sample of the tool own output -->
+    <!-- conform-ok: GS0404 - a pasted sample of the tool own output -->
 
 Two gates had already solved this locally and differently - `doc-command-ok` and `foreign-ok` - which
 was the precedent and also the problem: solved twice, in two shapes, for two of seventeen.
@@ -451,7 +467,7 @@ plant, and the exact expected render. `--selftest` plants each at its real path,
 restores from an in-memory copy in a `finally`, and diffs. It never touches git and the fixer runs
 dry-run only, so a planted em-dash survives being measured.
 
-The three cases are the deliberate violation (GS0303, rendered in full), the decidable one (GS0001,
+The three cases are the deliberate violation (GS0403, rendered in full), the decidable one (GS0101,
 collapsed to a line), and **one that must stay silent** - a comment correctly RECORDING a removal.
 
 Proved it can fail: changing `27,000` to `27000` in one `why` string fails the case and exits 1.

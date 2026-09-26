@@ -19,7 +19,7 @@ Two gates had already solved this locally and differently - `<!-- doc-command-ok
 `<!-- foreign-ok: -->` - which is both the precedent and the problem: two of seventeen, twice, in two
 shapes.
 
-    <!-- conform-ok: GS0304 - a pasted sample of conform's own output -->
+    <!-- conform-ok: GS0404 - a pasted sample of conform's own output -->
 
 WHAT KEEPS IT FROM BECOMING A DOOR, which is the only interesting part of the design:
 

@@ -263,15 +263,20 @@ py scripts/conform.py
 py scripts/conform.py --check
 
 # What a rule means, why it exists, and whether it is auto-fixable
-py scripts/conform.py --explain GS0303
+py scripts/conform.py --explain GS0403
 
 # Every rule, its code and its Commandment
 py scripts/conform.py --list
 ```
 
-A clean tree says `0 would be fixed, 0 need a decision - 17 checks ran, 17 passed`. The count of checks
+A clean tree says `0 would be fixed, 0 need a decision - 18 checks ran, 18 passed`. The count of checks
 that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
 the failure the whole thing exists to prevent.
+
+**The codes are readable.** `GS0001`..`GS0010` are the Ten Commandments - the number IS the numeral, so
+`GS0004` is Commandment IV. Above that, `GS01xx` is house writing conventions, `GS02xx` the kernel
+boundary and unsafe, `GS03xx` contracts and authority, `GS04xx` documentation and comments.
+`conform --list` prints the legend and every rule; `docs/conformance.md` has the reasoning.
 
 `osdev build` runs the same checkers and refuses to build if any fails, so `conform` is not an extra
 gate - it is the same gate, askable. It is `py scripts/conform.py` rather than `osdev conform` because

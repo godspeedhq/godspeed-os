@@ -16,7 +16,7 @@
 
 service_control = true      # restart fs when it stops answering
 --- expect ---
-error[GS0904]: a contract's claim of authority matches what is actually granted
+error[GS0004]: a contract's claim of authority matches what is actually granted
    --> examples/counter/contracts/counter.toml
     |
     = commandment: IV - Thou shalt honor service contracts.
@@ -29,4 +29,4 @@ error[GS0904]: a contract's claim of authority matches what is actually granted
     = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
             for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
             already accepts it - not a baseline entry.
-    = note: `py scripts/conform.py --explain GS0904` for the long form
+    = note: `py scripts/conform.py --explain GS0004` for the long form

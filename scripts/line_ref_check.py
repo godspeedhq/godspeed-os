@@ -68,7 +68,7 @@ def main():
                     target, num = m.group(1), int(m.group(2))
                     checked += 1
                     tpath = os.path.join(ROOT, target)
-                    if supp.covers(path, line_no, 'GS0304'):
+                    if supp.covers(path, line_no, 'GS0404'):
                         continue
                     if not os.path.exists(tpath):
                         bad.append((rel, line_no, target, num, 'the file does not exist'))
@@ -78,7 +78,7 @@ def main():
                         bad.append((rel, line_no, target, num,
                                     'past end of file (%d lines)' % len(body)))
                         continue
-                    if supp.covers(path, line_no, 'GS0304'):
+                    if supp.covers(path, line_no, 'GS0404'):
                         continue
                     lo, hi = max(0, num - 1 - WINDOW), min(len(body), num + WINDOW)
                     near = '\n'.join(body[lo:hi]).lower()

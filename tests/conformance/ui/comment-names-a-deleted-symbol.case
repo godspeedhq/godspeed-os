@@ -9,7 +9,7 @@
 
 // The scroll view is repainted by `reclaim_view_state`, which returns the row count.
 --- expect ---
-error[GS0303]: a Rust comment names something that exists nowhere in the code
+error[GS0403]: a Rust comment names something that exists nowhere in the code
    --> examples/00-hello/src/main.rs:53
     |
     = rule: CLAUDE.md 26.7, 26.14
@@ -21,7 +21,7 @@ error[GS0303]: a Rust comment names something that exists nowhere in the code
             it to `scripts/COMMENT-SYMBOLS.baseline.txt` with which kind it is. A comment
             that says "X was deleted" is RIGHT to name X: that is a record, and it belongs in
             the baseline.
-    = note: `py scripts/conform.py --explain GS0303` for the long form
+    = note: `py scripts/conform.py --explain GS0403` for the long form
 
   comment_symbol_check.py reported:
   | comment symbols: 1 name(s) in Rust comments name nothing in the code:

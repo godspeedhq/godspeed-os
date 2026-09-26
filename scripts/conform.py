@@ -10,7 +10,7 @@ build, which is exactly what CLAUDE.md 22.7 says the repository must not require
 
     py scripts/conform.py              fix what is DECIDABLE, report what needs JUDGEMENT
     py scripts/conform.py --check      report both, change nothing (this is what CI wants)
-    py scripts/conform.py --explain GS0303
+    py scripts/conform.py --explain GS0403
     py scripts/conform.py --list       every rule, its code and its commandment
     py scripts/conform.py --selftest   prove the OUTPUT is good, not just that rules fire
 
@@ -59,16 +59,24 @@ OSDEV_MAIN = os.path.join(ROOT, "osdev", "src", "main.rs")
 # the LEGITIMATE escape where one exists - a gate that only ever says "no" invites a contributor to
 # disable it.
 #
-# Codes are stable and never reused. They are grouped so a reader can tell the class from the number:
-#   GS00xx  house writing conventions (mechanical, decidable)
-#   GS01xx  the kernel boundary and unsafe
-#   GS02xx  contracts and authority
-#   GS03xx  documentation and comments telling the truth
-#   GS09xx  the Commandments themselves, via commandments.py
+# Codes are stable and never reused, and the FIRST block is the constitution itself:
+#
+#   GS0001..GS0010  THE TEN COMMANDMENTS, one each - the number IS the numeral, so `GS0004` is
+#                   Commandment IV and needs no decoder. A fixed block: there are exactly ten,
+#                   permanently, so it never grows.
+#   GS01xx          house writing conventions (dashes, line endings, the Python floor)
+#   GS02xx          the kernel boundary and unsafe
+#   GS03xx          contracts and authority
+#   GS04xx          documentation and comments telling the truth
+#
+# The first cut had the Commandments at `GS09xx`, where the 09 meant nothing - it was the ninth group
+# because it was written last - and gave the first block to a dash convention. That put the decoder
+# between a reader and the law, and it was backwards for a project whose argument is that the model is
+# the product. Renumbered before anything merged, because a code is stable forever once cited.
 # --------------------------------------------------------------------------------------------------
 RULES = {
     "dash_check.py": dict(
-        code="GS0001", fixable=True, commandment=None, section="CLAUDE.md 21",
+        code="GS0101", fixable=True, commandment=None, section="CLAUDE.md 21",
         title="an em-dash or en-dash appears in a tracked text file",
         why="A house writing convention, enforced repo-wide so that prose, code, comments and commit "
             "messages read the same. Only the plain ASCII hyphen is a dash here.",
@@ -76,14 +84,14 @@ RULES = {
              "Box-drawing characters are fine and are left alone."),
 
     "line_ending_check.py": dict(
-        code="GS0002", fixable=True, commandment=None, section="backlog/26",
+        code="GS0102", fixable=True, commandment=None, section="backlog/26",
         title="a tracked text file carries CRLF line endings",
         help="`conform` fixes this by rewriting the file with LF endings.",
         why="A CRLF in a boot config boots NOTHING while showing a perfect menu: U-Boot reads the "
             "trailing CR as part of every filename. It cost two reflashes before it was gated."),
 
     "unsafe_check.py": dict(
-        code="GS0101", fixable=False, commandment="X", section="CLAUDE.md 18",
+        code="GS0201", fixable=False, commandment="X", section="CLAUDE.md 18",
         title="the unsafe inventory does not match the source",
         why="Unsafe is permitted only in arch/, memory/, capability/ and smp/, plus the SDK's audited "
             "hardware/ABI layer, and every block carries a SAFETY comment. The grandfathered counts "
@@ -93,7 +101,7 @@ RULES = {
              "go through the SDK's `Mmio`/`Dma` wrappers."),
 
     "arch_boundary_check.py": dict(
-        code="GS0102", fixable=False, commandment="I", section="CLAUDE.md 4.1",
+        code="GS0202", fixable=False, commandment="I", section="CLAUDE.md 4.1",
         title="neutral kernel code names an ISA, or contains inline assembly",
         why="A port is bounded to `arch/<isa>/`: you write that directory and nothing else in the "
             "kernel changes. Neutral code reaches hardware only through the `arch::imp` seam. Also: "
@@ -102,7 +110,7 @@ RULES = {
              "call site. The fault is a MISSING primitive, not a stubborn call site."),
 
     "arch_seam_check.py": dict(
-        code="GS0103", fixable=False, commandment="I", section="CLAUDE.md 4.1",
+        code="GS0203", fixable=False, commandment="I", section="CLAUDE.md 4.1",
         title="an arch does not answer every member of the `arch::imp` seam",
         why="The other direction of the boundary: neutral code may only call the seam, and every arch "
             "must answer all of it. Discovered from usage rather than a hand-kept list, so it cannot "
@@ -111,7 +119,7 @@ RULES = {
              "returns a number a watchdog reads must say whether zero means disabled or unlimited."),
 
     "contract_check.py": dict(
-        code="GS0201", fixable=False, commandment="IV", section="CLAUDE.md 13.6",
+        code="GS0301", fixable=False, commandment="IV", section="CLAUDE.md 13.6",
         title="a service contract disagrees with what the spawn request actually grants",
         why="The kernel is no_std and cannot parse TOML: authority comes from the SPAWN REQUEST, never "
             "from the contract. The contract is the reviewable declaration, and this is what keeps the "
@@ -122,7 +130,7 @@ RULES = {
              "will say it did."),
 
     "doc_refs.py": dict(
-        code="GS0301", fixable=False, commandment=None, section="CLAUDE.md 26.7",
+        code="GS0401", fixable=False, commandment=None, section="CLAUDE.md 26.7",
         title="a document points at a path that does not exist",
         why="A citation of a file that was deleted sends a reader after nothing. A citation of a "
             "backlog entry that was never written is worse: it reads as though the limitation HAS been "
@@ -131,7 +139,7 @@ RULES = {
              "the citation was rather than deleting the sentence."),
 
     "doc_symbols_check.py": dict(
-        code="GS0302", fixable=False, commandment=None, section="CLAUDE.md 26.7",
+        code="GS0402", fixable=False, commandment=None, section="CLAUDE.md 26.7",
         title="a document names a symbol that does not exist in the source",
         why="A rename breaks prose SILENTLY, because the sentence still reads correctly. Four had "
             "rotted when this was written, one of them in CLAUDE.md pointing at a file an amendment in "
@@ -141,7 +149,7 @@ RULES = {
              "reason on the line. The baseline may shrink freely; it may not grow silently."),
 
     "comment_symbol_check.py": dict(
-        code="GS0303", fixable=False, commandment=None, section="CLAUDE.md 26.7, 26.14",
+        code="GS0403", fixable=False, commandment=None, section="CLAUDE.md 26.7, 26.14",
         title="a Rust comment names something that exists nowhere in the code",
         why="A comment is read BEFORE any document, because it sits beside the code being changed. "
             "There are 27,000 doc-comment lines here and until 2026-09-26 nothing checked one of them.",
@@ -151,7 +159,7 @@ RULES = {
              "\"X was deleted\" is RIGHT to name X: that is a record, and it belongs in the baseline."),
 
     "line_ref_check.py": dict(
-        code="GS0304", fixable=False, commandment=None, section="CLAUDE.md 26.7",
+        code="GS0404", fixable=False, commandment=None, section="CLAUDE.md 26.7",
         title="a `path:line` citation no longer points at what it claims",
         why="A line number is the fastest-rotting citation in the repository: every edit above it moves "
             "it. Audit 7 found 7 of 11 live citations wrong, with four documents citing ONE dead line "
@@ -161,7 +169,7 @@ RULES = {
              "a line number correct on the day an audit ran is a true record of what was seen."),
 
     "facts_check.py": dict(
-        code="GS0305", fixable=False, commandment="III", section="CLAUDE.md 26.4",
+        code="GS0405", fixable=False, commandment="III", section="CLAUDE.md 26.4",
         title="a number a document restates disagrees with the code that owns it",
         why="Commandment III: do not duplicate truth. A restated number is a derived view, and a "
             "derived view that cannot be reconciled is a second truth waiting to lie.",
@@ -169,7 +177,7 @@ RULES = {
              "restated at all, describe it instead so it cannot rot again."),
 
     "foreign_word_check.py": dict(
-        code="GS0306", fixable=False, commandment=None, section="CLAUDE.md Appendix B.4",
+        code="GS0406", fixable=False, commandment=None, section="CLAUDE.md Appendix B.4",
         title="a document shows a POSIX or DOS word being used as a command",
         why="The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`, `count` - and "
             "a foreign word is a HINT, never an alias: `ls` does not run, it answers ``try `dir` ``. "
@@ -179,7 +187,7 @@ RULES = {
              "so it cannot drift from what the shell actually refuses."),
 
     "doc_command_check.py": dict(
-        code="GS0307", fixable=False, commandment=None, section="CLAUDE.md 26.7",
+        code="GS0407", fixable=False, commandment=None, section="CLAUDE.md 26.7",
         title="a documented invocation does not work",
         why="Names resolving and numbers matching is not enough: nothing asked whether a documented "
             "PROMPT runs. `dir long /` lists a directory NAMED `long` and discards the path, which is a "
@@ -188,7 +196,7 @@ RULES = {
              "and osdev's own `match suite`, so this cannot drift from either."),
 
     "docs_index_check.py": dict(
-        code="GS0308", fixable=False, commandment=None, section="CLAUDE.md 5",
+        code="GS0408", fixable=False, commandment=None, section="CLAUDE.md 5",
         title="a file in docs/ is not reachable from the docs index",
         why="An index that calls itself the index while files are invisible to it is worse than no "
             "index. Two documents sat unlisted, and six backlog entries before that.",
@@ -196,7 +204,7 @@ RULES = {
              "a one-word entry does not help them choose."),
 
     "site_check.py": dict(
-        code="GS0309", fixable=False, commandment=None, section="CLAUDE.md 5",
+        code="GS0409", fixable=False, commandment=None, section="CLAUDE.md 5",
         title="a hand-written website page disagrees with the repository",
         why="Most pages `{{#include}}` their source and cannot drift. The hand-written ones can, and "
             "they are the most public text in the project.",
@@ -204,7 +212,7 @@ RULES = {
              "both directions, so an unlinked page and a linked-but-absent page both fail."),
 
     "backlog_check.py": dict(
-        code="GS0310", fixable=False, commandment=None, section="CLAUDE.md 26.7",
+        code="GS0410", fixable=False, commandment=None, section="CLAUDE.md 26.7",
         title="a backlog entry has no status line, or is not linked from the index",
         why="26.7 says a limitation that cannot be closed is RECORDED. A record nobody can find is not "
             "a record: two hand surveys of that folder disagreed with each other before the status line "
@@ -214,7 +222,7 @@ RULES = {
              "concrete step."),
 
     "python_floor_check.py": dict(
-        code="GS0003", fixable=False, commandment=None, section="README.md, Requirements",
+        code="GS0103", fixable=False, commandment=None, section="README.md, Requirements",
         title="a script uses a Python feature newer than the declared floor",
         why="`README.md` tells a contributor they need Python 3.8. That number was measured by hand, "
             "and a hand-measured number is right on the day it is taken and silently wrong afterwards. "
@@ -224,15 +232,24 @@ RULES = {
              "`scripts/python_floor_check.py` and the Requirements line in `README.md`, together. "
              "Never let the number drift upward by accident."),
 
+    # THE FALLBACK, and it is deliberately still here. `render_commandments` normally attributes a
+    # failure to its Commandment and uses GS0001..GS0010. This entry catches the case where
+    # `commandments.py` fails but its output cannot be parsed - a format change, say. Reporting it
+    # UNATTRIBUTED is the safe direction: the alternative is a Commandment violation that renders as
+    # nothing because a regex moved, which is the silent failure this whole tool exists to prevent.
+    # GS0000 reads as "a Commandment violation, not attributed", at the head of the Ten block.
     "commandments.py": dict(
-        code="GS0900", fixable=False, commandment="all ten", section="COMMANDMENTS.md",
-        title="a Commandment check failed",
-        why="These are the distillation of the constitution, mechanised where they can be. Ten of ten "
-            "have a mechanical check; `docs/x-residue.md` records honestly what the tenth does NOT "
-            "prove, so that '10 of 10' cannot be read as a stronger claim than it is.",
-        help="Read the check's own output: it names the module and the responsibility. If you believe "
-             "the rule is wrong, that is a CLAUDE.md amendment with a written rationale, not a "
-             "baseline entry."),
+        code="GS0000", fixable=False, commandment="one of the Ten - not attributed",
+        section="COMMANDMENTS.md",
+        title="a Commandment check failed, and conform could not tell which",
+        why="The per-commandment frame reads `Commandment <numeral> - <title>` out of the checker's "
+            "output. Seeing this instead means that line was not found, so the violation is real but "
+            "unattributed - most likely `commandments.py` changed its report format and "
+            "`render_commandments` needs updating.",
+        help="Read the raw output below: it names the commandment, the module and the rule. Then fix "
+             "the parse in `render_commandments`, because an unattributed violation defeats the point "
+             "of the frame. If you believe the RULE is wrong, that is a CLAUDE.md amendment with a "
+             "written rationale, never a baseline entry."),
 }
 
 # The decidable class, fixed in place. Each entry: (name, finder, fixer) over one file's TEXT.
@@ -289,8 +306,8 @@ def fix_decidable(apply):
     gate rather than restating it. That is what makes it structurally impossible for `conform` and a
     build to disagree - the same reason the checker LIST is read out of `osdev/src/main.rs`.
 
-      GS0001  dashes  every tracked text file, per `dash_check.tracked_files`
-      GS0002  CRLF    only where `.gitattributes` says `eol=lf`, per `line_ending_check`
+      GS0101  dashes  every tracked text file, per `dash_check.tracked_files`
+      GS0102  CRLF    only where `.gitattributes` says `eol=lf`, per `line_ending_check`
     """
     changed = []
     lf_only = _eol_lf_paths()
@@ -363,7 +380,11 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # One stable code per Commandment. `commandments.py` covers all ten, so framing it under a single code
 # threw away the only thing the frame is for: naming WHICH of the Ten a violation breaks.
 NUMERALS = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
-COMMANDMENT_CODE = {n: "GS09%02d" % (i + 1) for i, n in enumerate(NUMERALS)}
+# GS0001..GS0010: the number IS the commandment numeral, so `GS0004` is IV and needs no decoder.
+# This is COMPUTED, which is why the renumber from the first scheme nearly missed it - a
+# literal search-and-replace across the tree found 37 written codes and could not see this line.
+# The UI fixture for a Commandment violation caught it, which is what the fixtures are for.
+COMMANDMENT_CODE = {n: "GS00%02d" % (i + 1) for i, n in enumerate(NUMERALS)}
 VIOLATION = re.compile(r"^\s*Commandment\s+(I|II|III|IV|V|VI|VII|VIII|IX|X)\s*-\s*(.+?)\s*$")
 
 
@@ -627,6 +648,9 @@ def explain_commandment(code):
     else:
         print("  NOT mechanised: nothing outstanding for this commandment")
     print()
+    print(_para("scheme", "The number is the Commandment numeral - GS0001 is I, GS0010 is X. "
+                          "`--list` shows every block."))
+    print()
     print(_para("note", "Every one of the Ten has at least one mechanical check, which is what "
                         "\"10 of 10 mechanised\" means. It does NOT mean each is proved: eight aspects "
                         "across the Ten are human review, and `docs/x-residue.md` records what "
@@ -652,6 +676,11 @@ def explain(code):
             print(_para("why ", rule["why"]))
             print()
             print(_para("help", rule["help"]))
+            print()
+            print(_para("scheme", "Codes are grouped: GS0001..GS0010 are the Ten Commandments (the "
+                                  "number is the numeral), GS01xx house conventions, GS02xx the "
+                                  "kernel boundary, GS03xx contracts and authority, GS04xx "
+                                  "documentation. `--list` shows them all."))
             return 0
     print("conform: no rule with code %s. `--list` shows them all." % code)
     return 2
@@ -791,23 +820,43 @@ def main(argv):
     if "--explain" in argv:
         i = argv.index("--explain")
         if i + 1 >= len(argv):
-            print("conform: --explain needs a code, e.g. --explain GS0001")
+            print("conform: --explain needs a code, e.g. --explain GS0101")
             return 2
         return explain(argv[i + 1])
 
     if "--list" in argv:
+        # THE LEGEND FIRST. This is the command whose job is "what are the rules", so it is where the
+        # code convention belongs - it was previously stated only in a comment in this file and a
+        # table in `docs/conformance.md`, neither of which is reachable from a contributor's actual
+        # position, which is staring at `error[GS0004]` in a terminal. A convention nobody can find is
+        # not a convention.
+        print("Rule codes are stable and never reused. The number is not arbitrary:")
+        print()
+        print("    GS0001..GS0010   the Ten Commandments, one each - the NUMBER IS THE NUMERAL,")
+        print("                     so GS0004 is Commandment IV. Exactly ten, permanently.")
+        print("    GS01xx           house writing conventions (dashes, line endings, Python floor)")
+        print("    GS02xx           the kernel boundary and unsafe")
+        print("    GS03xx           contracts and authority")
+        print("    GS04xx           documentation and comments telling the truth")
+        print("    GS0000           a Commandment violation conform could not attribute (a fallback:")
+        print("                     unattributed beats a violation that renders as nothing)")
+        print()
+        print("`--explain <code>` gives the long form for any of them. Full rationale:")
+        print("docs/conformance.md.")
+        print()
         print("%-8s %-28s %-12s %s" % ("code", "enforced by", "commandment", "fixable"))
+        # THE TEN FIRST, in numeral order, because they have the first block and they are the law.
+        # Listing them last would undo the whole point of the renumbering.
+        for numeral in NUMERALS:
+            print("%-8s %-28s %-12s %s" % (COMMANDMENT_CODE[numeral], "commandments.py",
+                                           numeral, "no"))
+        print()
         for name, rule in sorted(RULES.items(), key=lambda kv: kv[1]["code"]):
             if name == "commandments.py":
                 continue
             print("%-8s %-28s %-12s %s" % (rule["code"], name,
                                            rule["commandment"] or "-",
                                            "yes" if rule["fixable"] else "no"))
-        # The Ten get a code EACH, because naming which one a violation breaks is the whole point of
-        # the frame - and one code for all ten threw that away.
-        for numeral in NUMERALS:
-            print("%-8s %-28s %-12s %s" % (COMMANDMENT_CODE[numeral], "commandments.py",
-                                           numeral, "no"))
         return 0
 
     check_only = "--check" in argv
