@@ -22,7 +22,7 @@ loop:
   result = try_send("pong", msg)
   if EndpointDead:
     log("pong endpoint dead, reacquiring via the kernel name directory")
-    reacquire_by_name("pong")   // a thin shim over reacquire_cap (syscall 10): looks pong up
+    gs::cap::reacquire("pong")  // a thin shim over reacquire_cap (syscall 10): looks pong up
                                      // in the kernel NAME DIRECTORY and updates the named-peer cache
                                      // so try_send("pong") uses the fresh cap (possibly on a new
                                      // core).

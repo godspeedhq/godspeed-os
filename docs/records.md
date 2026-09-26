@@ -21,7 +21,7 @@ is therefore a **typed value**, with text/JSON as *renderings* of it - never the
 ## The three representations
 
 1. **In-memory model** - a Rust value, the `Table` (typed columns + rows). The "language between
-   utilities", and it lives in the **SDK** (`godspeed_sdk::record`) so *any* service can build,
+   utilities", and it is reached through the **standard library** (`gs::record`) so *any* service can build,
    filter, and render records - not just the shell. Between same-address-space stages it is
    passed **by value**, never serialized.
 2. **Wire codec** - a compact, *bounded* binary encoding, used when a record crosses a **service**
@@ -155,7 +155,7 @@ pair.
   round-trip and `dir | where type=file | sort reverse size`.
 - **Also built:** the **SDK record API** - the `Table` model, `where`/`select`/`sort`,
   `to_json`/`to_yaml`/`to_grid` (over a `RecordSink`), `from_json`, **and the binary wire codec
-  (`encode`/`decode`)** now live in `godspeed_sdk::record`, so any service can produce records,
+  (`encode`/`decode`)** now live in `gs::record`, so any service can produce records,
   render them, or put them on the wire as records (`sdk/rust/CLAUDE.md`). `examples/roster` is a
   record *service*: it `encode`s a `Table`, the shell `decode`s it - `roster | where role=core`,
   no `from json`.

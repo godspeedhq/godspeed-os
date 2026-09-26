@@ -9,7 +9,7 @@
 //! `roster` - an example **record-producing** pipe service (Appendix D, `docs/records.md`).
 //!
 //! Where `greet` emits text lines, `roster` emits **structured records**: it builds a typed
-//! `Table` with the SDK (`godspeed_sdk::record`), serializes it with the **binary wire codec**
+//! `Table` from the standard library (`gs::record`), serializes it with the **binary wire codec**
 //! (`Table::encode`), and sends the bytes through the delegated pipe cap. The shell decodes the
 //! stream straight back into a `Table` (it knows `roster` is a record service), so the record
 //! verbs operate on a real field with **no JSON round-trip**:
@@ -26,7 +26,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{Message, RecordSink, ServiceContext, Table, Value};
+use godspeed::{self as gs, ipc::Message, record::{RecordSink, Table, Value}, ServiceContext};
 
 /// A `RecordSink` that accumulates the encoded bytes into a fixed buffer (no heap). The wire
 /// encoding for a handful of rows is well under one IPC message (4 KiB); overflow is flagged,
@@ -75,12 +75,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     t.encode(&mut sink);
 
     // send_peers[0] is the SEND cap the shell delegated to the pipe sink.
-    match ctx.send_peer_at(0) {
+    match gs::ipc::peer_at(&ctx, 0) {
         Some(dst) => {
             // The encoding fits in one 4 KiB message; then the EOT end-of-stream marker. (A larger
             // table would be chunked - never as a lone 0x04, which is EOT.)
-            let _ = ctx.send_by_handle(dst, &Message::from_bytes(&sink.buf[..sink.len]));
-            let _ = ctx.send_by_handle(dst, &Message::from_bytes(&[0x04]));
+            let _ = gs::ipc::send_to(&ctx, dst, &Message::from_bytes(&sink.buf[..sink.len]));
+            let _ = gs::ipc::send_to(&ctx, dst, &Message::from_bytes(&[0x04]));
             ctx.log("roster: sent a 4-row table via the binary record codec through the pipe cap");
         }
         None => {
@@ -89,6 +89,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 
     loop {
-        ctx.yield_cpu();
+        gs::task::yield_now(&ctx);
     }
 }

@@ -39,10 +39,12 @@ next run got past that step and died later.
 
 ```
 error: this public function might dereference a raw pointer but is not marked `unsafe`
-   --> kernel/src/main.rs:269:32
-269 |     let boot_info = unsafe { &*boot_info_ptr };
+       in `kernel_main` (kernel/src/main.rs): let boot_info = unsafe { &*boot_info_ptr };
     = note: `#[deny(clippy::not_unsafe_ptr_arg_deref)]` on by default
 ```
+
+(The compiler names a line; `kernel_main` is quoted instead because a line number rots on the next
+edit above it and this entry may sit here a while. The full output is in the run log.)
 
 That is `kernel_main`, the x86 boot entry. It has not changed; the LINT has. `not_unsafe_ptr_arg_deref`
 is deny-by-default, and this workflow last passed under a toolchain where this did not fire.

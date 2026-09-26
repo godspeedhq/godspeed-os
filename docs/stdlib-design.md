@@ -1656,3 +1656,81 @@ diff is comments only, and the operator has already scheduled it for after this 
 
 `backlog/52` - the shell suite flaking on `sock` and `serve` in QEMU - is also untouched. Five boards
 passing does not make a flaky harness deterministic.
+
+---
+
+## 24. `gs::cap` was split, and what the earlier sections call `gs::cap` is now `gs::file`
+
+**Read sections 10 to 12 with this in front of you.** They record the reasoning that produced a module
+called `gs::cap`, and that reasoning is unchanged and still correct - but the NAME moved, so a reader
+following it into the current tree would land somewhere else.
+
+    what sections 10-12 call `gs::cap`   ->   `gs::file`   (a file held as a capability)
+    what `gs::cap` means now             ->   capability rights, and the operations on a capability
+
+### Why the split, and it is not a tidying
+
+The module was 256 lines whose doc opened "A file as a capability". It held `File` and nothing else.
+So a program that wanted to ACQUIRE, DUPLICATE or DROP an ordinary capability found nothing in the
+module named `cap` and reached into `godspeed_sdk` - the layer this crate exists so that a program
+does not need. That is the mechanical reason `cap-grant`, `holder` and `resource-server` all imported
+the SDK, and it was invisible for as long as nobody asked the question the name answers.
+
+The rights constants did not move. `READ` and `WRITE` are capability rights (CLAUDE.md 7.4), not file
+flags, so `gs::cap::READ` at an `fs.open` call site reads correctly and no call site changed.
+
+### What else arrived with it
+
+| Module | Items | Why it exists |
+|--------|-------|---------------|
+| `gs::ipc` | 14 | Messages. **This was the gap.** Nothing in `gs` could send one, so nine of fifteen examples had no choice but the SDK |
+| `gs::cap` | 12 | acquire, duplicate, remove, self_grant - what the name always promised |
+| `gs::file` | 9 | what the module actually was |
+| `gs::task` | 7 | yield, sleep, uptime, the wall clock |
+| `gs::resource` | 4 | mint and revoke. It already existed as `mod resource;` - PRIVATE - which is also why the public count read 93 rather than 94 |
+| `gs::record` | 1 | a re-export, deliberately - see below |
+
+130 items across 12 public modules, from 93 across 7.
+
+### `gs::record` is a re-export and that is a decision, not laziness
+
+Everything else here wraps the SDK because there is something to translate: a capability to hold, an
+error to map onto one type, a protocol to hide. A `Table` has none of those - it is a bounded arena
+and some arithmetic, no syscall, no failure a program should hear about differently. Wrapping sixteen
+methods to change nothing would be the speculative layer 26.2 warns against AND a second name for one
+thing (Commandment III).
+
+### MMIO and DMA stay in the SDK, permanently
+
+The rule this work exists to make true is **use `gs`; reach for `godspeed-sdk` only if you are writing
+a driver**. That rule is clean precisely because MMIO and DMA are on the other side of it. A
+`gs::mmio` would either be a second name for `sdk/rust/src/mmio.rs` - which CLAUDE.md 18.1 designates
+BY NAME as one of the few places `unsafe` is permitted in userspace - or a move requiring a
+constitutional amendment. And it would erase the boundary the moment it was written: there would be
+no remaining reason to reach for the SDK, while drivers would still be doing something categorically
+different.
+
+### The rule is measured now, not asserted
+
+13 of 15 examples name only `gs`. The two that do not:
+
+- **`driver-skeleton`** - `Mmio` and `Dma`. Correct, and the reason the SDK exists.
+- **`holder`** - its hand-rolled `resource_invoke` only. The standard library has that and does it
+  BETTER: `resource::invoke` also stashes replies that are not ours, which is what makes it safe in a
+  service that also serves clients (8.2). It is `pub(crate)` because its signature carries the stash,
+  and making that public is an API-shape decision rather than a rename. **Still owed.**
+
+### Four things written from assumption, and caught by building each module as it was written
+
+Recorded because the pattern is the lesson, not the four:
+
+1. `derive_cap` takes NO rights argument. It duplicates a capability that already holds GRANT, with
+   the same rights. The wrapper was `derive(ctx, cap, rights)` with a doc explaining that rights can
+   only be dropped - describing something the syscall does not do. It is `duplicate` now.
+2. `Error::Denied` does not exist; the variant is `PermissionDenied`.
+3. `epoch_secs` is on `Datetime`, not on `ServiceContext`.
+4. `name_str` is on `TaskStat`. A service cannot ask its own name - `ctx.name()` is `todo!()` - so
+   that wrapper was removed rather than wrapped around a stub.
+
+All four surfaced within a minute of `cargo build`. The method that catches them is building the
+module as it is written rather than writing the crate and then checking it.

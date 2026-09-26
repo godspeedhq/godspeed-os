@@ -8,4 +8,4 @@ name = "e1000"
 path = "src/main.rs"
 
 [dependencies]
-godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }

@@ -404,7 +404,7 @@ impl<'a> Net<'a> {
 ///
 /// # Why it borrows the [`Net`] handle
 ///
-/// The same reason [`File`](crate::cap::File) borrows its `Fs`: both speak to one service over one
+/// The same reason [`File`](crate::file::File) borrows its `Fs`: both speak to one service over one
 /// endpoint and must share ONE correlation-tag counter. Two counters can mint the same tag for two
 /// exchanges in flight, and the result is not a loud rejection but a stale reply silently accepted
 /// as the current answer. The borrow makes that unspellable.
@@ -488,7 +488,7 @@ impl<'n, 'a: 'n> Drop for Socket<'n, 'a> {
     /// **There is no close operation for a UDP socket** - `net-stack` exposes send and nothing else
     /// on this capability - so this releases the local cap-table slot and cannot tell the service
     /// anything. The socket is reclaimed when `net-stack` revokes it or restarts. Recorded rather
-    /// than hidden: a reader comparing this with [`File`](crate::cap::File), which does close, would
+    /// than hidden: a reader comparing this with [`File`](crate::file::File), which does close, would
     /// otherwise assume an omission.
     fn drop(&mut self) {
         self.ctx.remove_cap(self.cap);

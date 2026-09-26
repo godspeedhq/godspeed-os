@@ -12,22 +12,22 @@ than silently duplicating.
 
 ## What it demonstrates
 
-The granter side, using only real `ServiceContext` methods:
+The granter side, using only real standard-library calls:
 
 | Step | Call | What happens |
 |------|------|--------------|
-| Hold a grantable cap | `ctx.self_grant_handle()` | our own SEND\|GRANT cap to our endpoint (minted at spawn, from the supervisor's spawn request) - the cap others use to call us back |
-| Make a copy to give | `ctx.derive_cap(self_cap)` | a derived cap; rights can only narrow, never widen (§7.3) |
-| Find the peer | `ctx.acquire_send_cap("receiver")` | a SEND cap to the service we will grant to |
-| Transfer it | `ctx.send_with_cap_by_handle(receiver, gift, &note)` | the kernel checks the cap carries GRANT, then **moves** it into the receiver's table and removes it from ours (§7.6, §8.5) |
+| Hold a grantable cap | `gs::cap::self_grant(&ctx)` | our own SEND\|GRANT cap to our endpoint (minted at spawn, from the supervisor's spawn request) - the cap others use to call us back |
+| Make a copy to give | `gs::cap::duplicate(&ctx, self_cap)` | a derived cap; rights can only narrow, never widen (§7.3) |
+| Find the peer | `gs::cap::acquire(&ctx, "receiver")` | a SEND cap to the service we will grant to |
+| Transfer it | `gs::ipc::send_granting(&ctx, receiver, gift, &note)` | the kernel checks the cap carries GRANT, then **moves** it into the receiver's table and removes it from ours (§7.6, §8.5) |
 
 The receiver side, in its own service, completes the transfer:
 
 ```rust
-let _carrier = ctx.recv();                 // the message that carried the cap
-if let Some(granted) = ctx.take_pending_cap() {
+let _carrier = gs::ipc::recv(&ctx);        // the message that carried the cap
+if let Some(granted) = gs::ipc::take_sent_cap(&ctx) {
     // `granted` now lives in OUR table; use it to call the granter back.
-    let _ = ctx.send_by_handle(granted, &Message::from_bytes(b"thanks"));
+    let _ = gs::ipc::send_to(&ctx, granted, &Message::from_bytes(b"thanks"));
 }
 ```
 
@@ -42,7 +42,7 @@ if let Some(granted) = ctx.take_pending_cap() {
   memory. The receiver cannot reach into our address space, and we cannot reach into theirs;
   delegated authority travels as a typed token through IPC, which is the only channel between
   services. *(COMMANDMENTS.md VI; Invariant 2, §2.5.)*
-- **Commandment IX (plan for recovery).** We `derive_cap` a *copy* to give away and keep the
+- **Commandment IX (plan for recovery).** We `gs::cap::duplicate` a *copy* to give away and keep the
   original, so that if the receiver restarts we can mint and re-grant without having lost our own
   authority. A delegator that gave away its only handle could never recover. *(COMMANDMENTS.md IX;
   CLAUDE.md §14.2.)*
@@ -78,9 +78,9 @@ endpoint (so it has a SEND\|GRANT cap to itself to hand out) and a SEND cap to `
 ## How to adapt this
 
 A capability broker (a shell, a supervisor-like spawner, a connection manager) follows this exact
-shape: mint or hold a cap, `derive_cap` a narrowed copy, and `send_with_cap_by_handle` it to the
+shape: mint or hold a cap, `gs::cap::duplicate` a copy, and `gs::ipc::send_granting` it to the
 child you are authorizing. Declare the endpoints you broker in the contract; let the kernel enforce
-GRANT. To receive a delegated cap, pair `ctx.recv()` with `ctx.take_pending_cap()`.
+GRANT. To receive a delegated cap, pair `gs::ipc::recv` with `gs::ipc::take_sent_cap`.
 
 ## See also
 

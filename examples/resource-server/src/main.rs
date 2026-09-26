@@ -32,14 +32,14 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
-use godspeed_sdk::capability::{RIGHT_READ, RIGHT_WRITE, RIGHT_GRANT};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
+
 
 // Resource operations - the FIRST payload byte of a badged invocation (mirrors fs's FOP_*).
 // The kernel has already validated the cap holds the invoked right; this service additionally
 // enforces that the op needs <= that right (the non-escalation check, §7.3).
-const OP_READ:  u8 = 1; // needs RIGHT_READ
-const OP_WRITE: u8 = 2; // needs RIGHT_WRITE
+const OP_READ:  u8 = 1; // needs gs::cap::READ
+const OP_WRITE: u8 = 2; // needs gs::cap::WRITE
 const OP_CLOSE: u8 = 4; // retire the resource: revoke it (any holder may close their handle)
 
 // Reply codes (this service's tiny protocol; a real one is richer - see fs's FS_OK/FS_ERR).
@@ -54,16 +54,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Mint a delegated resource this service OWNS. The kernel registers a fresh opaque
     // ResourceId at generation 0, records THIS service's endpoint as its owner, and returns
     // a real cap carrying the rights we asked for. We mint it READ-ONLY (plus GRANT so we can
-    // derive a copy to hand to a client - mirrors fs's `want | RIGHT_GRANT`): the copy `holder`
+    // derive a copy to hand to a client - mirrors fs's `want | gs::cap::GRANT`): the copy `holder`
     // gets therefore CANNOT widen to WRITE (§7.3), which is what makes holder's write-denial a
     // REAL non-escalation rather than an arbitrary refusal. Minting is gated: without the
     // RESOURCE_MINT authority (granted by name in the kernel to minters like fs - and, in the
     // resource-test build, to us), this returns None and we degrade gracefully.
-    let (resource_id, cap) = match ctx.resource_mint(RIGHT_READ | RIGHT_GRANT) {
-        Some(minted) => minted,
-        None => {
+    let (resource_id, cap) = match gs::resource::mint(&ctx, gs::cap::READ | gs::cap::GRANT) {
+        Ok(minted) => minted,
+        Err(_) => {
             ctx.log("resource-server: no RESOURCE_MINT cap (gated, §7.10) - idling. fs is the real resource server; see examples/e1000 for the by-name kernel grant.");
-            ctx.park()
+            gs::ipc::park(&ctx)
         }
     };
     ctx.log_fmt(format_args!(
@@ -71,31 +71,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         resource_id
     ));
 
-    // Hand the client (`holder`) a copy of the cap. `derive_cap` duplicates it into a fresh slot;
+    // Hand the client (`holder`) a copy of the cap. `gs::cap::duplicate` copies it into a fresh slot;
     // rights can only NARROW on transfer, never widen (§7.3) - the copy carries exactly our
     // READ | GRANT and can never out-reach the original, so holder genuinely cannot WRITE. We keep
     // the owned resource (we serve it via the kernel-set badge, not the cap) and drop our copy of
     // the handed-out cap on success - authority MOVES, it does not silently duplicate. `holder` is a
     // contract-declared send-peer, so `acquire_send_cap` is allowed (not ambient, §3.1); the
     // supervisor spawns holder BEFORE us, so by here it is registered in the kernel directory.
-    if let Some(copy) = ctx.derive_cap(cap) {
-        match ctx.acquire_send_cap("holder") {
-            Some(holder) => {
+    if let Ok(copy) = gs::cap::duplicate(&ctx, cap) {
+        match gs::cap::acquire(&ctx, "holder") {
+            Ok(holder) => {
                 let note = Message::from_bytes(b"a cap to a resource I own");
-                match ctx.send_with_cap_by_handle(holder, copy, &note) {
+                match gs::ipc::send_granting(&ctx, holder, copy, &note) {
                     Ok(())  => ctx.log("resource-server: granted a resource cap to holder"),
-                    Err(_)  => ctx.remove_cap(copy), // send failed: reclaim the untransferred copy (no leak)
+                    Err(_)  => gs::cap::remove(&ctx, copy), // send failed: reclaim the untransferred copy (no leak)
                 }
             }
-            None => {
+            Err(_) => {
                 ctx.log("resource-server: no 'holder' to grant to (expected when run standalone)");
-                ctx.remove_cap(copy);
+                gs::cap::remove(&ctx, copy);
             }
         }
     }
     // fs drops its own minted cap after handing the client a copy - it serves the resource
     // through the unforgeable badge, never the cap. We do the same.
-    ctx.remove_cap(cap);
+    gs::cap::remove(&ctx, cap);
 
     // Serve the resource. A holder USES its cap by invoking it (`resource_invoke`); the kernel
     // validates the cap (generation + the invoked right) and routes the message HERE, badged
@@ -103,11 +103,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // presence is unforgeable proof of a real, live cap on a resource we own.
     ctx.log("resource-server: serving resource API");
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         // The reply cap the kernel embedded in the invocation (so we can answer the holder).
-        let reply = ctx.take_pending_cap();
+        let reply = gs::ipc::take_sent_cap(&ctx);
 
-        match ctx.last_recv_badge() {
+        match gs::resource::last_badge(&ctx) {
             Some((rid, right)) => {
                 // A kernel-validated invocation. Learn the op, then enforce op <= right: a
                 // READ-validated cap must NEVER drive a WRITE (the load-bearing non-escalation
@@ -115,13 +115,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // this is the owner's matching check on the operation it is about to perform.
                 let op = msg.payload_bytes().first().copied().unwrap_or(0);
                 let needed = match op {
-                    OP_READ  => RIGHT_READ,
-                    OP_WRITE => RIGHT_WRITE,
+                    OP_READ  => gs::cap::READ,
+                    OP_WRITE => gs::cap::WRITE,
                     _        => 0,
                 };
                 if op != OP_CLOSE && needed & right == 0 {
                     ctx.log("resource-server: denied - op needs a right the cap lacks (non-escalation)");
-                    if let Some(r) = reply { let _ = ctx.send_by_handle(r, &Message::from_bytes(&[DENIED])); }
+                    if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[DENIED])); }
                     continue;
                 }
 
@@ -129,18 +129,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     OP_READ | OP_WRITE => {
                         // ... act on the resource `rid` here (fs reads/writes the file it maps
                         // this id to). The kernel never learns what `rid` means - we do.
-                        if let Some(r) = reply { let _ = ctx.send_by_handle(r, &Message::from_bytes(&[OK])); }
+                        if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[OK])); }
                     }
                     OP_CLOSE => {
                         // Revoke the resource: a generation bump makes EVERY outstanding cap to
                         // it go stale, so the holder's next use returns CapRevoked (§7.5/§7.10).
                         // Owner-gated by the kernel - ownership is the check. fs does this on
                         // delete/close.
-                        ctx.resource_revoke(rid);
-                        if let Some(r) = reply { let _ = ctx.send_by_handle(r, &Message::from_bytes(&[OK])); }
+                        gs::resource::revoke(&ctx, rid);
+                        if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[OK])); }
                     }
                     _ => {
-                        if let Some(r) = reply { let _ = ctx.send_by_handle(r, &Message::from_bytes(&[DENIED])); }
+                        if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[DENIED])); }
                     }
                 }
             }

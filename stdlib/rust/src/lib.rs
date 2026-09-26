@@ -74,10 +74,15 @@ pub mod error;
 // with a mock.
 #[cfg(not(test))] pub mod call;
 #[cfg(not(test))] pub mod cap;
+#[cfg(not(test))] pub mod file;
+#[cfg(not(test))] pub mod ipc;
+#[cfg(not(test))] pub mod task;
+#[cfg(not(test))] pub mod trace;
+#[cfg(not(test))] pub mod record;
 #[cfg(not(test))] pub mod fs;
 #[cfg(not(test))] pub mod io;
 #[cfg(not(test))] pub mod net;
-#[cfg(not(test))] mod resource;
+#[cfg(not(test))] pub mod resource;
 
 pub use error::Error;
 
@@ -99,7 +104,7 @@ pub use godspeed_sdk::service_context::ServiceContext;
 #[cfg(not(test))]
 pub mod prelude {
     pub use crate::error::Error;
-    pub use crate::cap::File;
+    pub use crate::file::File;
     pub use crate::fs::Fs;
     pub use crate::net::Net;
     pub use crate::io;

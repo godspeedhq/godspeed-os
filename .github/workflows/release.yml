@@ -70,6 +70,26 @@ jobs:
           echo "sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
           echo "Building $TAG at $(git rev-parse --short=8 HEAD)"
 
+          # THE TAG AND THE MANIFEST ARE TWO STATEMENTS OF ONE FACT, so one of them can be wrong.
+          # v0.20.0 shipped with every crate labelled 0.19.0: the workspace version was bumped for
+          # v0.19.0 and never again, and nothing compared the two. rustdoc prints the crate version on
+          # every published API page and the README sends newcomers to those pages, so the first fact
+          # a reader met was a superseded version. Twelve checkers passed and were right to - no
+          # DOCUMENT restates the version, so `facts_check.py` had nothing to reconcile (backlog/55).
+          #
+          # Fail here, before anything is published, rather than discovering it an audit later.
+          # Only the leading vMAJOR.MINOR.PATCH is compared, so `v0.21.0-rc1` still matches a 0.21.0
+          # manifest instead of failing for a reason nobody intended.
+          MANIFEST="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          TAGVER="$(printf '%s' "$TAG" | sed -E 's/^v//; s/-.*$//')"
+          if [ "$MANIFEST" != "$TAGVER" ]; then
+            echo "::error::tag $TAG says $TAGVER but Cargo.toml says $MANIFEST." \
+                 "Bump [workspace.package] version in Cargo.toml to match the tag, or retag." \
+                 "See backlog/55 - this is the check that exists because v0.20.0 shipped as 0.19.0."
+            exit 1
+          fi
+          echo "version: tag $TAG agrees with Cargo.toml ($MANIFEST)"
+
       - name: Install Rust toolchain
         # `rustup show` honours rust-toolchain.toml, which pins the compiler DATE and
         # names every target and component the four ports need. This step used to be

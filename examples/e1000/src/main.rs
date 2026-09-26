@@ -21,7 +21,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::ServiceContext;
+use godspeed::{self as gs, ServiceContext};
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
 const REG_STATUS: usize = 0x0008; // Device Status; bit 1 (LU) = Link Up
@@ -43,8 +43,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("e1000: no Intel e1000 mapped (absent, or a different NIC) - idling");
             // Drain our endpoint so a flood cannot sit at 16/16 forever, then yield.
             loop {
-                while ctx.try_recv().is_some() {}
-                ctx.yield_cpu();
+                while gs::ipc::try_recv(&ctx).is_some() {}
+                gs::task::yield_now(&ctx);
             }
         }
     };
@@ -69,7 +69,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // serve a network stack over IPC and re-init the controller on every restart
     // (Commandments V + IX). Idle, draining the endpoint.
     loop {
-        while ctx.try_recv().is_some() {}
-        ctx.yield_cpu();
+        while gs::ipc::try_recv(&ctx).is_some() {}
+        gs::task::yield_now(&ctx);
     }
 }

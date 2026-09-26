@@ -26,8 +26,8 @@ The owner side, using only real `ServiceContext` methods:
 | Step | Call | What happens |
 |------|------|--------------|
 | Mint | `ctx.resource_mint(READ\|WRITE\|GRANT)` | the kernel allocates a fresh opaque `ResourceId` at generation 0, records THIS service as its owner, and mints a real cap for it - returns `(resource_id, cap)` |
-| Make a copy to give | `ctx.derive_cap(cap)` | a derived copy; rights can only narrow, never widen (§7.3) |
-| Hand it to a client | `ctx.send_with_cap_by_handle(client, copy, &note)` | the kernel **moves** the copy into the client's table (§7.6, §8.5); we drop our own cap and serve via the badge |
+| Make a copy to give | `gs::cap::duplicate(&ctx, cap)` | a derived copy; rights can only narrow, never widen (§7.3) |
+| Hand it to a client | `gs::ipc::send_granting(&ctx, client, copy, &note)` | the kernel **moves** the copy into the client's table (§7.6, §8.5); we drop our own cap and serve via the badge |
 | Serve a use | `ctx.last_recv_badge()` -> `(resource_id, right)` | a holder's `resource_invoke` is kernel-validated and routed here, **badged** with which resource and the right the kernel already checked |
 | Enforce non-escalation | `op <= right` | a READ-validated cap must never drive a WRITE - the owner's matching check (§7.3) |
 | Revoke | `ctx.resource_revoke(resource_id)` | a generation bump makes EVERY outstanding cap to the resource go stale: next use is `CapRevoked` (§7.5) |
@@ -76,7 +76,7 @@ endpoint cap:
 - **Unforgeable.** Only the kernel constructs it. A client cannot fabricate a `ResourceId` and act on
   it; a random handle is `CapNotHeld` / `CapInvalid`. The badge that proves a real invocation is set
   only by the kernel after the cap check, so it cannot be faked over an ordinary `send`.
-- **Non-escalating (`op <= right`).** Rights narrow on transfer, never widen (`derive_cap`). A
+- **Non-escalating (`op <= right`).** Rights narrow on transfer, never widen (`gs::cap::duplicate`). A
   READ-only copy cannot write: the kernel rejects a WRITE invocation of a READ cap with
   `CapInsufficientRights`, and the owner re-checks `op <= right` on the validated badge. Two layers,
   same rule.
@@ -102,7 +102,7 @@ endpoint cap:
 
 To serve any resource-as-capability: get the kernel to grant your service a `RESOURCE_MINT` authority
 by name (the e1000 BAR hook is the template for that kind of by-name grant), `resource_mint` a
-resource per client, hand each client a `derive_cap` copy, then serve invocations off
+resource per client, hand each client a `gs::cap::duplicate` copy, then serve invocations off
 `last_recv_badge()` - resolving the `ResourceId` to your own meaning, enforcing `op <= right`, and
 `resource_revoke`-ing when the resource goes away. `services/fs` is this exact shape, fully grown.
 

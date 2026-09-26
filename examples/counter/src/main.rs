@@ -32,7 +32,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 // ── fs file-API wire protocol (client <-> fs) ───────────────────────────────────
 // MUST match `services/fs` and the shell's fs helpers (services/shell/src/main.rs).
@@ -93,7 +93,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     if let Some(r) = ctx.request_with_reply("fs", &msg).and_then(strip) {
         return Some(r);
     }
-    if ctx.reacquire_by_name("fs") {
+    if gs::cap::reacquire(&ctx, "fs") {
         return ctx.request_with_reply("fs", &msg).and_then(strip);
     }
     None
@@ -156,11 +156,11 @@ fn save_count(ctx: &ServiceContext, count: u64) -> bool {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("counter: ready");
 
-    // Probe whether `fs` is reachable. `acquire_send_cap` resolves "fs" by name via
+    // Probe whether `fs` is reachable. `gs::cap::acquire` resolves "fs" by name via
     // the kernel directory and installs a SEND cap; `None` means `fs` has not come
     // up (or we hold no authority to send to it). Either way we keep running - the
     // count just will not persist (graceful, loud degrade, never a silent fallback).
-    let mut persist = ctx.acquire_send_cap("fs").is_some();
+    let mut persist = gs::cap::acquire(&ctx, "fs").is_ok();
 
     // LOAD-ON-SPAWN. After a restart this is what makes the count survive: the fresh
     // instance reconstructs its state from the durable copy instead of starting over.
@@ -194,15 +194,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // mode and try to reacquire `fs` for the next tick (reacquire + retry,
                 // §14.3). The count keeps advancing; it just isn't durable right now.
                 ctx.log_fmt(format_args!("counter: count={} (save failed - fs degraded)", count));
-                persist = ctx.acquire_send_cap("fs").is_some();
+                persist = gs::cap::acquire(&ctx, "fs").is_ok();
             }
         } else {
             ctx.log_fmt(format_args!("counter: count={} (in-RAM only)", count));
             // Keep trying to bring fs back; once it answers, future ticks persist again.
-            persist = ctx.acquire_send_cap("fs").is_some();
+            persist = gs::cap::acquire(&ctx, "fs").is_ok();
         }
 
         // Pace the loop. `sleep` lets the core halt instead of busy-yielding.
-        ctx.sleep_ms(TICK_MS);
+        gs::task::sleep_ms(&ctx, TICK_MS);
     }
 }

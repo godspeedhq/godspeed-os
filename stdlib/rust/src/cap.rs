@@ -1,256 +1,156 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A file as a capability, safely, from a service that serves other clients.
+//! Capabilities: the rights a capability carries, and the operations on one.
 //!
-//! # What this is
+//! # What a capability is here
 //!
-//! [`Fs::open`](crate::fs::Fs::open) asks `fs` for a **delegated resource capability** (CLAUDE.md
-//! 7.10) to one file, and returns a [`File`]. The capability is real and kernel-minted: unforgeable,
-//! revocable, and non-escalating. A READ-only [`File`] cannot write, and the refusal comes from the
-//! kernel before `fs` is ever reached.
+//! An unforgeable token naming a resource, the rights you hold over it, and the generation it was
+//! minted at (CLAUDE.md 7.2). Holding one is necessary and sufficient authority for what it permits.
+//! There is no other way to act: no ambient authority, no privilege inherited from who you are.
 //!
-//! ```ignore
-//! let mut fs = gs::fs::Fs::new(ctx);
-//! let mut f = fs.open("/data/log.txt", cap::READ | cap::WRITE)?;
-//! f.write_at(0, b"hello")?;
-//! let mut buf = [0u8; 64];
-//! let n = f.read_at(0, &mut buf)?;
-//! f.close()?;
-//! ```
+//! # What this module is, and what it replaced
 //!
-//! # Why this could not be written until the protocol carried a tag
+//! `gs::cap` used to be the FILE module - 256 lines whose doc opened "a file as a capability" and
+//! which held [`File`](crate::file::File) and nothing else. So a program needing to acquire, derive
+//! or drop an ordinary capability found nothing here and reached into `godspeed_sdk`, which is the
+//! layer a program is not supposed to need. The file half now lives in [`crate::file`].
 //!
-//! Using a resource capability is `resource_invoke` - a SEND that embeds a one-shot reply cap. The
-//! kernel routes it to the owning service and then forgets the exchange, so the caller must wait for
-//! the answer on **its own ordinary endpoint**, the same endpoint its clients send to. A task owns
-//! exactly one endpoint; there is no second one to wait on.
+//! The rights constants stayed, because they were never file-specific: [`READ`] and [`WRITE`] are
+//! capability rights (CLAUDE.md 7.4), and `cap::READ` at an `fs.open` call site reads correctly.
 //!
-//! That leaves a caller two bad choices, and `services/shell` takes the second:
+//! # The three properties worth knowing before you use one
 //!
-//! - block on a plain `recv` and read whatever arrives as the reply, or
-//! - drain the endpoint first, destroying any client request that was queued.
+//! **Rights only narrow.** A copy never carries more than its source, and there is no path back up.
+//! [`duplicate`] makes an identical copy to hand away; narrowing happens where a capability is
+//! minted or granted (CLAUDE.md 7.3), not on the copy.
 //!
-//! The shell gets away with draining because the shell serves nobody. **A library cannot make that
-//! assumption**, which is why this module did not exist for as long as the file-cap protocol carried
-//! no correlation tag.
+//! **A capability can go stale.** Every one carries a generation, and the resource bumps its own when
+//! it dies or is replaced. The next use of a stale capability fails with
+//! [`Error::EndpointDead`](crate::Error) or `CapRevoked` rather than reaching the new instance. That
+//! is not a fault to route around: it is the system telling you the thing you held is gone, and
+//! [`reacquire`] is how you answer it.
 //!
-//! It carries one now, matching the convention the NAMED `fs` protocol in the same service always
-//! had. With a tag, a message that is not the reply is *recognisable*, and a caller that receives one
-//! can **hold it and hand it back** instead of losing it. That is what [`File::take_held`] is for,
-//! and it is the whole reason this is safe to hand to a service.
-//!
-//! **Nothing here is a new kernel facility.** The tag is a protocol byte and the holding is a fixed
-//! array; the standard library is re-serving what the system already does, which is the only thing it
-//! is allowed to do.
-//!
-//! # The obligation this puts on a serving caller
-//!
-//! If your task answers clients on its endpoint, **you must drain [`File::take_held`] after any
-//! operation** and feed those messages back into your own loop. They are real client requests that
-//! arrived while you were waiting. Ignoring them loses them just as surely as draining would have -
-//! the difference is that here you are told, and there you were not.
-//!
-//! A program that serves nobody (most programs) can ignore all of this: nothing will ever be held.
+//! **Transfer MOVES.** Sending a capability with [`send_granting`](crate::ipc) removes it from your
+//! table. If the send fails it stayed, and it is yours to reclaim; if it succeeded it is not yours
+//! any more. Either way the outcome of the send decides what you may do next, so it is never
+//! ignorable (CLAUDE.md 8.5).
 
 use godspeed_sdk::capability::CapHandle;
-use godspeed_sdk::ipc::Message;
 use godspeed_sdk::service_context::ServiceContext;
 
-use crate::call;
-use crate::error::{from_fs_status, Error};
-use crate::fs::Fs;
-use crate::resource::{self, Held};
+use crate::error::Error;
 
 /// Read the file's contents.
 pub const READ: u8 = 1 << 0;
+
 /// Write the file's contents.
 pub const WRITE: u8 = 1 << 1;
+
 /// Write only PAST the end of what is already there: an append-only capability.
 ///
 /// Enforced by `fs` against the file's size at the moment of the write, so a holder cannot read the
 /// size, decide to overwrite, and send the old offset.
 pub const APPEND: u8 = 1 << 6;
 
-// The file-cap operations, as `services/fs` numbers them.
-const FOP_READ: u8 = 1;
-const FOP_WRITE: u8 = 2;
-const FOP_STAT: u8 = 3;
-const FOP_CLOSE: u8 = 4;
-
-/// The most bytes one invocation moves, as `services/fs` frames it.
-pub const IO_CHUNK: usize = crate::fs::IO_CHUNK;
-
-/// How many messages that are NOT our reply a [`File`] will hold before it stops taking them.
+/// Transfer this capability onward (CLAUDE.md 7.4).
 ///
-/// See [`File::take_held`]. The bound and the reason for it live in the shared resource-invocation
-/// module, because sockets need exactly the same thing.
-pub const HELD_MAX: usize = resource::HELD_MAX;
+/// A capability handed out WITHOUT this right cannot be passed on by its holder. Grant it only when
+/// the receiver is meant to re-delegate: rights narrow on transfer and never widen, so the floor you
+/// set here is the floor for every copy that follows.
+pub const GRANT: u8 = 1 << 4;
 
-/// An open file, held as a capability.
+/// A capability this service holds, by the slot the kernel put it in.
 ///
-/// # Why it borrows the [`Fs`] handle
-///
-/// A [`File`] and its `Fs` speak to the same service on the same endpoint, so they must share ONE
-/// correlation tag counter - two counters can mint the same tag for two exchanges in flight, and the
-/// result is not a loud rejection but a stale reply silently accepted as the current answer. Holding
-/// `&mut Fs` makes that structural: the borrow checker will not let the two be used at once, so
-/// there is no way to spell the bug.
-///
-/// The cost is that one `Fs` handle opens one file at a time. To hold two, thread the counter
-/// yourself with [`Fs::from_tag`](crate::fs::Fs::from_tag) and [`Fs::tag`](crate::fs::Fs::tag).
-pub struct File<'f, 'a: 'f> {
-    fs: &'f mut Fs<'a>,
-    ctx: &'a ServiceContext,
-    cap: CapHandle,
-    right: u8,
-    /// Messages that arrived while we were waiting and are NOT ours. Never dropped.
-    held: Held,
-    closed: bool,
-}
+/// Thin on purpose: the value is an index into this task's capability table, and the kernel is what
+/// gives it meaning. Wrapping it in a type stops it being confused with the resource ids, endpoint
+/// ids and file descriptors it is NOT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cap(pub(crate) CapHandle);
 
-impl<'f, 'a: 'f> File<'f, 'a> {
-    pub(crate) fn new(fs: &'f mut Fs<'a>, ctx: &'a ServiceContext, cap: CapHandle, right: u8) -> Self {
-        File { fs, ctx, cap, right, held: Held::new(), closed: false }
+impl Cap {
+    /// The raw slot, for the rare call that still needs the SDK.
+    ///
+    /// Present so that reaching the lower layer is a visible, deliberate step rather than a reason to
+    /// abandon this module. If you find yourself calling this often, the missing thing belongs here.
+    pub fn handle(self) -> CapHandle {
+        self.0
     }
 
-    /// The rights this capability actually carries.
-    ///
-    /// May be NARROWER than you asked for: `fs` refuses a writable capability to a sealed file and
-    /// hands back a read-only one rather than minting a cap it cannot honour (7.3 - rights narrow).
-    /// Check this rather than assuming the open succeeded on your terms.
-    pub fn rights(&self) -> u8 {
-        self.right
-    }
-
-    /// Take one message that arrived during an operation and was NOT the reply.
-    ///
-    /// Call this in a loop until it returns `None` after every operation, if your task serves
-    /// clients. These are real requests from them; the library held them rather than dropping them,
-    /// but only you can answer them.
-    ///
-    /// Returns `None` for a task that serves nobody, always.
-    pub fn take_held(&mut self) -> Option<Message> {
-        self.held.take()
-    }
-
-    /// Read from the file through the capability.
-    ///
-    /// Returns how many bytes landed in `buf`, which may be fewer than asked for at end of file.
-    /// One invocation moves at most [`IO_CHUNK`] bytes; call again with a later offset for more.
-    ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** this capability's `READ` right, which
-    /// the KERNEL checks before `fs` is reached.
-    ///
-    /// # Errors
-    /// - [`Error::PermissionDenied`] - this capability does not carry `READ`.
-    /// - [`Error::NotFound`] - the file was deleted; the capability has been revoked.
-    /// - A read changes nothing, so every no-answer error here is safe to retry.
-    pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let want = buf.len().min(IO_CHUNK);
-        let mut req = [0u8; 13];
-        req[0] = FOP_READ;
-        req[1..9].copy_from_slice(&offset.to_le_bytes());
-        req[9..13].copy_from_slice(&(want as u32).to_le_bytes());
-        let reply = self.invoke(READ, &req)?;
-        let b = reply.payload_bytes();
-        // `[tag, status, n:u32, bytes..]`. `invoke` VERIFIES the tag and leaves it in place - it does
-        // not strip it, because stripping means rebuilding a 4 KiB `Message` on the stack for every
-        // read. So the body starts at 2, not at 1.
-        if b.len() < 6 {
-            return Err(Error::Malformed);
-        }
-        let n = u32::from_le_bytes([b[2], b[3], b[4], b[5]]) as usize;
-        if n > want || 6 + n > b.len() {
-            return Err(Error::Malformed);
-        }
-        buf[..n].copy_from_slice(&b[6..6 + n]);
-        Ok(n)
-    }
-
-    /// Write to the file through the capability.
-    ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** this capability's `WRITE` right.
-    ///
-    /// # Errors
-    /// - [`Error::PermissionDenied`] - no `WRITE`, or an `APPEND`-only capability was asked to write
-    ///   back over bytes it had already written.
-    /// - [`Error::InvalidInput`] - more than [`IO_CHUNK`] bytes in one call. **Nothing is written**;
-    ///   split it rather than assuming a partial write happened.
-    /// - **A write MUTATES.** Do not retry on [`Error::OutcomeUnknown`] without first reading back
-    ///   what is actually there - see [`Error::retry_is_safe`].
-    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
-        if data.len() > IO_CHUNK {
-            return Err(Error::InvalidInput);
-        }
-        let mut req = [0u8; 9 + IO_CHUNK];
-        req[0] = FOP_WRITE;
-        req[1..9].copy_from_slice(&offset.to_le_bytes());
-        req[9..9 + data.len()].copy_from_slice(data);
-        self.invoke(WRITE, &req[..9 + data.len()])?;
-        Ok(())
-    }
-
-    /// The file's current size in bytes.
-    ///
-    /// **Blocks** up to [`call::DEFAULT_SECS`]. **Authority:** this capability's `READ` right.
-    pub fn size(&mut self) -> Result<u64, Error> {
-        let reply = self.invoke(READ, &[FOP_STAT])?;
-        let b = reply.payload_bytes();
-        // `[tag, status, size:u64]` - the body starts at 2, as in `read_at`.
-        if b.len() < 10 {
-            return Err(Error::Malformed);
-        }
-        Ok(u64::from_le_bytes([b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]]))
-    }
-
-    /// Close the file, revoking this capability and every copy of it.
-    ///
-    /// Consumes the handle, and returns what the service said. Dropping a `File` without calling
-    /// this also closes it, but a `Drop` cannot report a failure - so close explicitly wherever the
-    /// outcome matters.
-    pub fn close(mut self) -> Result<(), Error> {
-        self.close_inner()
-    }
-
-    fn close_inner(&mut self) -> Result<(), Error> {
-        if self.closed {
-            return Ok(());
-        }
-        self.closed = true;
-        // CLOSE is permitted to any holder, so it is invoked under whatever right we hold rather
-        // than under WRITE - a read-only holder must still be able to let go.
-        let r = self.invoke(self.right, &[FOP_CLOSE]).map(|_| ());
-        self.ctx.remove_cap(self.cap);
-        r
-    }
-
-    /// One invocation, through the shared resource-capability path, then the fs status byte.
-    ///
-    /// The generic half - reply-cap lifetime, holding a message that is not ours, reading the
-    /// kernel's refusal - is `crate::resource`. What is specific to a file is the status byte at
-    /// index 1 of the reply, which this maps to an [`Error`].
-    fn invoke(&mut self, right: u8, body: &[u8]) -> Result<Message, Error> {
-        let tag = self.fs.next_tag_pub();
-        // NO PATIENCE BYTE. `fs` answers a file-capability invocation from its own serve loop and
-        // never puts one aside, so the byte would be carried and never read - and `serve_filecap`
-        // reads the operation at index 1 of what it receives.
-        let m = resource::invoke(self.ctx, self.cap, right, tag, None, body, call::DEFAULT_SECS,
-                                 &mut self.held)?;
-        // `[tag, status, ..]`. The tag is verified and LEFT IN PLACE, so a body starts at index 2.
-        let status = *m.payload_bytes().get(1).ok_or(Error::Malformed)?;
-        from_fs_status(status)?;
-        Ok(m)
+    /// Wrap a handle the SDK produced. Crate-internal: a program gets a `Cap` from an operation that
+    /// grants one, never by constructing it, because a capability you can invent is not a capability.
+    pub(crate) fn from_handle(h: CapHandle) -> Self {
+        Cap(h)
     }
 }
 
-impl<'f, 'a: 'f> Drop for File<'f, 'a> {
-    /// Closes the file if [`close`](File::close) was not called.
-    ///
-    /// `fs` keeps a FIXED table of open resources, so leaking one is not merely untidy - enough
-    /// leaks and nothing can be opened at all. That is why this closes rather than merely warning.
-    ///
-    /// A `Drop` cannot return a `Result`, so a close that FAILS here is invisible. That is the
-    /// reason [`close`](File::close) exists and is worth calling wherever the outcome matters.
-    fn drop(&mut self) {
-        let _ = self.close_inner();
+/// Acquire a SEND capability to a service, by name, from the kernel's name directory.
+///
+/// This is how a client finds a service it was not wired to at spawn, and how it finds the NEW
+/// instance after one died (CLAUDE.md 14.2). It is gated: a service that was not granted the
+/// authority to acquire by name gets nothing, which is what stops name resolution being an ambient
+/// back door around the contract.
+pub fn acquire(ctx: &ServiceContext, name: &str) -> Result<Cap, Error> {
+    match ctx.acquire_send_cap(name) {
+        Some(h) => Ok(Cap(h)),
+        None => Err(Error::NotFound),
+    }
+}
+
+/// Acquire a SEND capability that may itself be passed on ([`GRANT`]).
+///
+/// Separate from [`acquire`] rather than a flag on it, because handing out a re-delegatable
+/// capability is a different decision from using one and should read differently at the call site.
+pub fn acquire_grantable(ctx: &ServiceContext, name: &str) -> Result<Cap, Error> {
+    match ctx.acquire_send_grant_cap(name) {
+        Some(h) => Ok(Cap(h)),
+        None => Err(Error::NotFound),
+    }
+}
+
+/// Re-acquire a service by name after its previous instance died.
+///
+/// The answer to a [`Error::EndpointDead`](crate::Error): the name is stable, the instance is not
+/// (CLAUDE.md invariant 11). Returns `true` if a fresh capability was installed.
+///
+/// **Re-acquiring the endpoint is necessary and not sufficient.** Anything you derived from the DEAD
+/// instance - an open file, a socket, a connection id, a cached copy of its state - was issued by a
+/// service that no longer exists and the new one has never heard of. Re-establish those too, or you
+/// are holding a handle the new instance will refuse (CLAUDE.md 14.3).
+pub fn reacquire(ctx: &ServiceContext, name: &str) -> bool {
+    ctx.reacquire_by_name(name)
+}
+
+/// Duplicate a capability you hold, to hand the copy away while keeping the original.
+///
+/// The copy carries the SAME resource, generation and rights - this does not narrow, and there is no
+/// rights argument because the kernel's `DeriveCap` does not take one. Narrowing is real (CLAUDE.md
+/// 7.3) and happens where a capability is minted or granted, not here.
+///
+/// Requires the source to hold [`GRANT`]: a capability you may not pass on is also one you may not
+/// copy for passing on. Fails if it lacks GRANT, has gone stale, or the table is full - and those
+/// three are not distinguished, which is a limitation of the syscall rather than of this wrapper.
+pub fn duplicate(ctx: &ServiceContext, cap: Cap) -> Result<Cap, Error> {
+    match ctx.derive_cap(cap.0) {
+        Some(h) => Ok(Cap(h)),
+        None => Err(Error::PermissionDenied),
+    }
+}
+
+/// Drop a capability from this service's table.
+///
+/// Authority you no longer need is authority you should not hold. This is also how a table slot is
+/// returned after a transfer failed and left the capability with you (CLAUDE.md 8.5).
+pub fn remove(ctx: &ServiceContext, cap: Cap) {
+    ctx.remove_cap(cap.0);
+}
+
+/// A grantable capability to THIS service's own endpoint, to hand to someone who must reply.
+///
+/// The shape behind request/reply: the caller sends one of these so the replier has somewhere to
+/// answer, and the kernel wakes the caller with `ReplyDead` if the replier dies holding it, so a
+/// reply that will never come is reported rather than waited for (CLAUDE.md 8.6).
+pub fn self_grant(ctx: &ServiceContext) -> Result<Cap, Error> {
+    match ctx.self_grant_handle() {
+        Some(h) => Ok(Cap(h)),
+        None => Err(Error::PermissionDenied),
     }
 }

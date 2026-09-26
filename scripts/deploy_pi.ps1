@@ -128,7 +128,14 @@ if (Test-Path $kernPath) {
     $srcFull = Join-Path $repo $b.KernelSrc
     if (Test-Path $srcFull) {
         if ((FileSha $srcFull) -ne $onCard) {
-            $verdict += ("$($b.KernelAs) on the card is STALE ({0} bytes) - the build is {1}" -f (Get-Item $kernPath).Length, (Get-Item $srcFull).Length)
+            # REPORT THE HASH, because the hash is what was COMPARED. This used to print the two
+            # FILE SIZES, which are routinely identical when only comments changed - so it announced
+            # "STALE (3713984 bytes) - the build is 3713984", a verdict followed by two matching
+            # numbers offered as its reason. The verdict was right and its evidence was unrelated,
+            # which is the shape that teaches a reader to distrust a correct instrument.
+            $verdict += ("$($b.KernelAs) on the card is STALE - card sha256 {0}..., build {1}... ({2} bytes vs {3})" -f `
+                $onCard.Substring(0, 16), (FileSha $srcFull).Substring(0, 16), `
+                (Get-Item $kernPath).Length, (Get-Item $srcFull).Length)
         } else {
             Say "  $($b.KernelAs) on the card is already current"
         }

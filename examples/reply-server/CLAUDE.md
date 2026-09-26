@@ -24,11 +24,11 @@ The server side, using only real `ServiceContext` methods:
 | Step | Call | What happens |
 |------|------|--------------|
 | Own an endpoint | (from the contract's `ipc_receive`) | clients send requests here |
-| Block for a request | `ctx.recv()` | returns the next `Message`; idle (parked) when none - the graceful degrade |
-| Take the reply cap | `ctx.take_pending_cap()` | the SEND cap the client embedded, now in OUR table - the ONLY way we can call back (§7.10, §8.5) |
+| Block for a request | `gs::ipc::recv(&ctx)` | returns the next `Message`; idle (parked) when none - the graceful degrade |
+| Take the reply cap | `gs::ipc::take_sent_cap(&ctx)` | the SEND cap the client embedded, now in OUR table - the ONLY way we can call back (§7.10, §8.5) |
 | Compute a reply | (service logic) | echo the payload, or its byte length as text - this is policy, and it lives here |
-| Reply, non-blocking | `ctx.try_send_by_handle(reply_cap, &reply)` | answers without ever blocking on the client (§8.9) |
-| Reclaim the slot | `ctx.remove_cap(reply_cap)` | keeps a long-running server bounded (§26.6) |
+| Reply, non-blocking | `gs::ipc::try_send_to(&ctx, reply_cap, &reply)` | answers without ever blocking on the client (§8.9) |
+| Reclaim the slot | `gs::cap::remove(&ctx, reply_cap)` | keeps a long-running server bounded (§26.6) |
 
 A request that arrives with no reply cap is logged and dropped - the server degrades, it never panics
 (§26.7).
@@ -41,22 +41,22 @@ it in the request, then blocks for the answer. This is the cap-embedding mechani
 
 ```rust
 // In the CLIENT's service_main(ctx):
-use godspeed_sdk::Message;
+use godspeed::{self as gs, ipc::Message};
 
 let request = Message::from_bytes(b"echo me");
 
 // 1. A reply cap = a SEND|GRANT copy of our OWN endpoint cap. The server replies here.
-let self_cap  = ctx.self_grant_handle().expect("client owns an endpoint");
-let reply_cap = ctx.derive_cap(self_cap).expect("derive a copy to give away");
+let self_cap  = gs::cap::self_grant(&ctx).expect("client owns an endpoint");
+let reply_cap = gs::cap::duplicate(&ctx, self_cap).expect("a copy to give away");
 
 // 2. Find the server and send the request WITH the reply cap embedded. The kernel
 //    moves reply_cap into the server's table (it carried GRANT) - that is the server's
 //    only authority to answer us (Commandment VII).
-let server = ctx.acquire_send_cap("reply-server").expect("server registered");
-ctx.send_with_cap_by_handle(server, reply_cap, &request).expect("request sent");
+let server = gs::cap::acquire(&ctx, "reply-server").expect("server registered");
+gs::ipc::send_granting(&ctx, server, reply_cap, &request).expect("request sent");
 
 // 3. Block on our own endpoint for the reply.
-let reply = ctx.recv();
+let reply = gs::ipc::recv(&ctx);
 let _ = reply.payload_bytes();   // "echo me"
 ```
 
@@ -69,7 +69,7 @@ send. The block above is spelled out so the mechanism is visible.) The runnable 
 
 - **Commandment VII (no ambient authority).** The server can reply ONLY because the client handed it a
   reply capability. There is no `ipc_send` in the contract, no "reply to whoever called", no identity
-  lookup - the cap retrieved by `take_pending_cap` *is* the authority to call back, and nothing else
+  lookup - the cap retrieved by `gs::ipc::take_sent_cap` *is* the authority to call back, and nothing else
   grants it. *(COMMANDMENTS.md VII; CLAUDE.md §7, §7.10, §8.5, Invariant 1.)*
 - **Commandment VIII (wait on truth, not time - and the truth must include failure).** A successful
   reply send means the message was *queued*, not *processed* (§8.6) - so a protocol needing confirmation
@@ -89,7 +89,7 @@ send. The block above is spelled out so the mechanism is visible.) The runnable 
 
 The kernel does **not** detect or break deadlocks (§8.9). If the server replied with a blocking `send`
 to a client whose reply queue is full - and that client were itself blocked sending its next request to
-the server - both would block forever. Using `try_send_by_handle` for the reply removes the cycle: the
+the server - both would block forever. Using `gs::ipc::try_send_to` for the reply removes the cycle: the
 server never blocks on the client, so the mutual-blocking deadlock cannot form. The cost is that a reply
 to a full/dead client is dropped (returns an error) rather than waited on - which is exactly the
 loud-failure trade GodspeedOS wants (§26.7). The client retries; it does not hang.
@@ -111,7 +111,7 @@ reply-side twin of §22 Test 4 (blocked sender wakes with `EndpointDead`).
 ## What you must NOT do
 
 - **Do not reply with a blocking `send`.** That re-opens the §8.9 deadlock and lets one slow client
-  wedge the whole server. Use `try_send_by_handle` for the reply - always.
+  wedge the whole server. Use `gs::ipc::try_send_to` for the reply - always.
 - **Do not assume the client received the reply because the send returned `Ok`.** `Ok` means queued,
   not processed (§8.6). If you need confirmation, the client must ack explicitly (**Commandment VIII**).
 - **Do not invent a way to "reply to the sender" without the embedded cap.** There is none, by design.
@@ -124,7 +124,7 @@ reply-side twin of §22 Test 4 (blocked sender wakes with `EndpointDead`).
 
 This is the skeleton of every real GodspeedOS server. Replace step 3 (the echo) with your service
 logic: parse the request payload, do the work (read a block, open a file, look up a name), and
-`try_send_by_handle` the result back over the embedded reply cap. For richer protocols, badge requests
+`gs::ipc::try_send_to` the result back over the embedded reply cap. For richer protocols, badge requests
 with an operation code in the payload and branch on it. To make a request *from* the client side, follow
 the code block above (or call `ctx.request_with_reply`).
 

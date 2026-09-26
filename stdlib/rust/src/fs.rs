@@ -573,14 +573,14 @@ impl<'a> Fs<'a> {
 
     /// Open a file as a CAPABILITY (CLAUDE.md 7.10), rather than acting on it by path.
     ///
-    /// The returned [`File`](crate::cap::File) holds an unforgeable, revocable, non-escalating
+    /// The returned [`File`](crate::file::File) holds an unforgeable, revocable, non-escalating
     /// kernel capability to exactly this file. A read-only one cannot write, and the refusal comes
     /// from the KERNEL before `fs` is reached - which is the difference between a capability and a
     /// handle a service merely agrees to honour.
     ///
     /// `rights` is a mask of [`cap::READ`](crate::cap::READ), [`cap::WRITE`](crate::cap::WRITE) and
     /// [`cap::APPEND`](crate::cap::APPEND). **Check
-    /// [`File::rights`](crate::cap::File::rights) on the result**: `fs` narrows rather than refuses
+    /// [`File::rights`](crate::file::File::rights) on the result**: `fs` narrows rather than refuses
     /// in one case - it will not mint a writable capability to a SEALED file, and hands back a
     /// read-only one instead of a capability it could not honour.
     ///
@@ -588,7 +588,7 @@ impl<'a> Fs<'a> {
     ///
     /// The `File` and this `Fs` share one correlation-tag counter, because they talk to one service
     /// over one endpoint. The borrow is what makes that structural rather than a rule to remember.
-    /// See [`File`](crate::cap::File) for how to hold two files at once.
+    /// See [`File`](crate::file::File) for how to hold two files at once.
     ///
     /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's
     /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability
@@ -599,13 +599,13 @@ impl<'a> Fs<'a> {
     /// - [`Error::PermissionDenied`] - a writable capability was asked for on a sealed file and no
     ///   read-only fallback was available.
     /// - [`Error::Failed`] - `fs` replied without a capability. Retrying an open is safe.
-    pub fn open<'f>(&'f mut self, path: impl AsRef<[u8]>, rights: u8) -> Result<crate::cap::File<'f, 'a>, Error> {
+    pub fn open<'f>(&'f mut self, path: impl AsRef<[u8]>, rights: u8) -> Result<crate::file::File<'f, 'a>, Error> {
         let ctx = self.ctx;
         self.call(OP_OPEN, path.as_ref(), &[rights], self.secs())?;
         // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
-        Ok(crate::cap::File::new(self, ctx, cap, rights))
+        Ok(crate::file::File::new(self, ctx, cap, rights))
     }
 
     /// Rebuild the free-space bitmap from the file tree, and report what was found.
