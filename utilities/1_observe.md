@@ -81,7 +81,7 @@ them; what remains below is `observe`'s own normative help output.
 ### Help output shape (normative)
 
 ```
-observe 0.4.0 - system metrics viewer
+observe 0.4.0 - live system metrics view (records when piped)
 
 usage:
   observe          watch live metrics (refreshes until you press q)

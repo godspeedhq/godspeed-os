@@ -53,7 +53,7 @@ to its grid) and checks it. Because it's the last stage, *its* verdict is the pi
 
 ```
 roster | where role=core | assert contains vesta
-ls / | assert lacks secret
+dir / | assert lacks secret
 find *.tmp | assert empty
 ```
 

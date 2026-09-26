@@ -10,7 +10,7 @@ the `fs` MKDIR API, on hierarchical GSFS (`docs/persistence.md`). Mutating. Trai
 
 `mkdir <path>` creates a directory. The parent directory must already exist; creating an
 already-existing name is a loud error, never a silent no-op (§3.12). `mkdir` is kept as a
-verb - a universal contraction, one of the three short ones we keep (`ls` / `cd` / `mkdir`).
+verb - a universal contraction, one of the two short ones we keep (`cd` / `mkdir`).
 
 ## 2. Usage
 

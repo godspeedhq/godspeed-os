@@ -55,7 +55,7 @@ message is the *detail*.
 **Every command is on the `Result` model.** `execute()` returns the command's genuine `Result` -
 there is no `Ok`-wrapping that could hide a failure:
 
-- **File/storage** - `read`, `ls`, `cd`, `write` (+`append`), `mkdir`, `copy` (+recursive),
+- **File/storage** - `read`, `dir`, `cd`, `write` (+`append`), `mkdir`, `copy` (+recursive),
   `move`, `rename`, `delete`, `find`, `tree`, and the filter built-ins' direct form
   `match`/`count`/`sort`/`first`/`last`: `Ok` on success, `Err(FileNotFound)` for a missing path,
   `Err(Unknown)` otherwise.

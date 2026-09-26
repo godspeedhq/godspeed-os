@@ -25,7 +25,7 @@ real fields. The names say what they do with no POSIX heritage to learn (§ conv
 They are **pipe-only stages** - there is no `where /file`. They appear in a pipeline after a
 record producer (`status | where …`, `dir | where …`) or after `from`
 (`read x.json | from json | where …`). The record producers so far are all shell-side:
-**`status`** (task roster, `slot`/`name`/`core`/`state`/`mem`/`queue`/`restarts`), **`ls`**
+**`status`** (task roster, `slot`/`name`/`core`/`state`/`mem`/`queue`/`restarts`), **`dir`**
 (`name`/`type`/`size`), **`caps`** (`resource`/`rights`), **`drives`**
 (`index`/`label`/`status`/`size_mib`/`free_mib`), **`find`** (`name`/`type`/`path`), and
 **`observe now`** (the roster plus a `ticks` cumulative-cpu-time column - `observe now | sort
@@ -41,7 +41,7 @@ to     0.4.0 - render records to a format
 from   0.4.0 - parse text into records
 
 usage:
-  <records> | where <col><op><val>   ops: = != > < >= <= ~ (contains)
+  <records> | where <col><op><val>   ops: = != > < >= <=, and the word `contains`
       e.g. status | where mem>0
   <records> | select <col> [col…]    project the named columns, in order
       e.g. status | select name core state
@@ -100,7 +100,7 @@ or kernel surface: these operate on data already in the pipeline.
 - A JSON string-escaper; `from yaml`; record streams larger than one IPC message (chunked
   `encode`). The **SDK record API** and the bounded **wire codec** (`encode`/`decode`) are
   **done** - `examples/roster` is a record-producing *service* (`roster | where role=core`, no
-  `from json`). `status`/`ls`/`caps`/`drives`/`find`/`observe now` (shell-side) are done.
+  `from json`). `status`/`dir`/`caps`/`drives`/`find`/`observe now` (shell-side) are done.
 - `from yaml`; a JSON string-escaper (values are plain ASCII today).
 - The bounded **wire codec** - only when a record first needs to cross a *service* boundary
   (today every producer is shell-side, so records pass by value). Emphatically not JSON on the

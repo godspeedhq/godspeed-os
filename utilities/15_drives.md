@@ -116,7 +116,7 @@ entirely:
 `cd` is **not** an unwanted import - a "where am I" pointer is inherent to any hierarchical
 namespace (DOS and Windows have `cd` too), and real directories were a deliberate GSFS
 choice. `cd` is a **file-command utility** (its own doc, step 3-file-commands), not a
-`drives` subcommand - `drives` manages *drives*; `cd`/`ls`/`read` navigate within and across
+`drives` subcommand - `drives` manages *drives*; `cd`/`dir`/`read` navigate within and across
 them. The one thing the old `drives use default` would have added - *persisting* a starting
 drive across boots (a session `cd` does not) - is **deferred** (§26.2): decided when file
 commands + multi-drive exist, not invented now.
@@ -157,6 +157,8 @@ from the boot default - you might boot off drive 0 yet work on drive 1.)
 | `drives flash <drive> [label]` | format `<drive>` as a GSFS data drive (asks `[y/N]` - it ERASES); optional label; usable at once | data: yes | **3** |
 | `drives label <drive> <name>` | name / rename a drive - rewrites the superblock (duplicates allowed, §3) | data: yes | **3** |
 | `drives reset <drive>` | un-format a drive back to raw (asks `[y/N]` - it ERASES the GSFS marker); the inverse of `flash`. NOT a secure wipe (data blocks remain) - a quick clean slate, mainly for re-testing the raw→flash path | data: yes | **3** |
+| `drives check [drive]` | verify (fsck): rebuild the bitmap/free count, report CRC failures | data: yes | **3** |
+| `drives scrub [drive]` | read-only integrity sweep: verify every block's CRC, change nothing | - | **3** |
 | `drives godspeed install <drive>` | install bootable GodspeedOS onto the drive (Prime) | **yes** | 6 |
 | `drives godspeed update <drive>` | A/B kernel update of an installed drive | **yes** | 6 |
 | `drives godspeed default <drive>` | which installed GodspeedOS the machine boots | **yes** | 6 |
@@ -164,7 +166,7 @@ from the boot default - you might boot off drive 0 yet work on drive 1.)
 | `drives version` | print the version | - | **3** |
 | `drives help` | print usage | - | **3** |
 
-Drive *contents* (`ls` / `read` / `write` / `cd` / `mkdir`) are **their own utilities**, not
+Drive *contents* (`dir` / `read` / `write` / `cd` / `mkdir`) are **their own utilities**, not
 `drives` subcommands - they operate on paths within a drive, addressable as
 `[index:]label/path` or `/abs` / `rel` on the current drive (`docs/drives.md` §4.1).
 
@@ -203,7 +205,7 @@ single narrow `ipc_send = ["fs"]` cap (plus its own endpoint for the reply-cap p
   to the shell creates no new dangerous combination; the shell's `spawn`/`kill`/`restart`
   caps are unchanged. (Contrast `observe`, which needed isolation because it would
   otherwise hold introspection *alongside* the lifecycle caps.)
-- **Per-command services would be absurd.** A standalone `read`/`write`/`ls`/… each needs
+- **Per-command services would be absurd.** A standalone `read`/`write`/`dir`/… each needs
   console + `fs` caps + a way to receive its arguments - ten services where one narrow
   send-cap on the shell suffices. The least-authority *win* is illusory once `fs` is the
   gatekeeper.
@@ -225,7 +227,7 @@ persistence (the bytes survive a power-cycle); it is never part of the workflow.
    the OS format its own SSD (which unblocks on-hardware persistence verification).
    Needs: `block-driver` capacity request (IDENTIFY sectors → size the filesystem);
    `fs` raw-tolerant (serve the drives API even with no filesystem) + in-OS `format()`.
-3. **File commands** - `ls` / `read` / `write` / `cd` / `mkdir` on the current drive; `cd`
+3. **File commands** - `dir` / `read` / `write` / `cd` / `mkdir` on the current drive; `cd`
    is the single current-location pointer (drive + dir).
 4. **Multi-drive** - enumerate all SATA disks; per-drive block IPC; `cd [index:]label/path`
    cross-drive addressing read on demand; duplicate labels disambiguated by index;
@@ -236,7 +238,7 @@ persistence (the bytes survive a power-cycle); it is never part of the workflow.
 ## 9. `help` / `version` (convention shape, `0_conventions.md`)
 
 ```
-drives 0.4.0 - manage attached disks (format, name, select)
+drives 0.4.0 - manage attached disks (records when piped)
 
 usage:
   drives                        list attached drive(s)

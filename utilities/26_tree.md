@@ -8,7 +8,7 @@ GSFS (`docs/persistence.md`). Trails `CLAUDE.md`; does not amend it.
 ## 1. What it is
 
 `tree [path]` prints the directory hierarchy under `path` (default: the current directory) as
-an indented tree - the read-only companion to `ls` for seeing structure at a glance. It keeps
+an indented tree - the read-only companion to `dir` for seeing structure at a glance. It keeps
 the same name as the POSIX/util `tree` because the name is already plain and not cryptic.
 
 ## 2. Usage
@@ -54,7 +54,7 @@ gsh> tree /docs
 
 ## 4. Implementation
 
-Read-only, so no capability beyond the `fs` `ListDir` (op 14) it already uses for `ls`/`find`.
+Read-only, so no capability beyond the `fs` `ListDir` (op 14) it already uses for `dir`/`find`.
 It adds **no new `fs` surface**: the hierarchy is reconstructed client-side with the **same
 bounded-walk discipline** `find` uses (§26.6) - a fixed-capacity explicit stack, depth-first,
 **no recursion**. Every child (file or dir) is pushed so siblings nest correctly, and a
@@ -72,7 +72,7 @@ storage.
 ## 5. Later (separate doc so it can grow)
 
 - A depth limit flag (`tree <path> depth <n>`) if deep trees get noisy.
-- Sizes / a `-s`-style column, reusing the size `ls` already shows.
+- A size column, reusing the size `dir` already shows.
 
 ## 6. Conformance
 

@@ -62,8 +62,8 @@ main proposal in this document:
 
 | | Mechanism | Cost when unused | New kernel state |
 |---|---|---|---|
-| **A. Blocked-chain** (`trace blocked`, `trace task`, `trace service`) | a **state query** | **zero** - nothing runs until asked | one `u64` per task (blocked-since), for the `FOR` column |
-| **B. Event history** (`events ipc`, `trace tree`, `events failures`) | a **bounded ring** written at the IPC routing point | one relaxed atomic load + predicted branch | a fixed ring + counters |
+| **A. Blocked-chain** (`trace blocked`, `trace chain`) | a **state query** | **zero** - nothing runs until asked | one `u64` per task (blocked-since), for the `FOR` column |
+| **B. Event history** (`events ipc`, `events failures`) | a **bounded ring** written at the IPC routing point | one relaxed atomic load + predicted branch | a fixed ring + counters |
 
 **A answers the question. B explains what led up to it.** A is cheap enough to always be available; B
 is the part that needs a switch. Building A first is not a staging convenience - it is where the value
@@ -326,7 +326,7 @@ A task that is **not** blocked prints one line saying so. That is a real answer,
 
 ## 8. Proposed order
 
-1. **Mechanism A** - `trace blocked`, `trace task`, `trace service`. New kernel surface: two
+1. **Mechanism A** - `trace blocked`, `trace chain`. New kernel surface: two
    `InspectKernel` queries (awaited endpoint per slot; blocked-since per slot) plus one `u64` per task.
    No ring, no switch, no cost. Answers the question.
 2. **Use it.** Find out whether B is needed. §26.2 - features are pulled into existence.
@@ -360,11 +360,11 @@ Verified in QEMU (`osdev test shell`, 136/0/2):
 ```
 gsh> trace blocked
 no task is blocked on another task.
-gsh> trace service shell
+gsh> trace chain shell
 task 7 "shell" Running (-)
    root: awaits no task - it is runnable, so the chain is not stuck here
-gsh> trace service nosuchsvc
-trace service: no live task named 'nosuchsvc'
+gsh> trace chain nosuchsvc
+trace chain: no live task named 'nosuchsvc'
 ```
 
 **The multi-hop walk is proven** - `osdev test trace`, 10/10. A healthy machine has nothing blocked, so
@@ -378,7 +378,7 @@ gsh> trace blocked
 slot  name   blocked  awaiting  held_by
 9     asker  call     116       reply-server
 
-gsh> trace service asker
+gsh> trace chain asker
 task 9 "asker" BlockRecv (call)
    awaiting endpoint 116
    `- task 8 "reply-server" BlockRecv (recv)
@@ -482,7 +482,7 @@ service-to-service with the kernel uninvolved.
 ## The instrument must not hang on what it measures
 
 Every ask to `events` is bounded at 5 seconds and escapable with `q`, advertising `(q to quit)` once
-the wait lingers. That matters more here than for an ordinary command: `events blocked` is what you
+the wait lingers. That matters more here than for an ordinary command: `events failures` is what you
 reach for WHEN something is wedged, so an instrument that can itself wedge takes the prompt with it
 and leaves you with a power button. It used to use a bare `request_with_reply`, which parks the shell
 inside the syscall where it cannot read the keyboard (`backlog/29`, conventions rule 10).

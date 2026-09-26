@@ -474,7 +474,7 @@ Real traffic, named, with no kernel involvement of any kind.
 
 ### What hardware caught that QEMU did not: the ring was empty
 
-The first cut instrumented `request_with_reply`. On the Wyse, after a `selfcheck` and two `ls`
+The first cut instrumented `request_with_reply`. On the Wyse, after a `selfcheck` and two `dir`
 commands, `events ipc` still said **no events recorded** - while `fs` was demonstrably answering.
 
 The SDK has **eight** request/reply variants, each an independent implementation, and the shell talks
@@ -577,7 +577,7 @@ A service that never declares itself reads `?`, which is the honest answer rathe
 
 ### Reading it: pages, pipes, and a legend
 
-`events ipc` is a **record source**, like `status` or `ls` - one producer feeding three uses, rather
+`events ipc` is a **record source**, like `status` or `dir` - one producer feeding three uses, rather
 than a printer plus a serialiser that drift apart:
 
 - **Console**: a grid, with a two-line legend above it.

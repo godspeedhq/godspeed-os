@@ -81,5 +81,5 @@ noting that `help`/`version` answer for whatis itself and that both names are sh
 
 Conforms: `whatis help` / `whatis version`; listed by top-level `help` under **System**; in
 `NO_PATH_CMDS` (its argument is a name, never a file path); its argument tab-completes from
-the command-name set; a pipe producer (`whatis ls | write /k.txt`). Pinned by `selfcheck`
+the command-name set; a pipe producer (`whatis dir | write /k.txt`). Pinned by `selfcheck`
 (built-in / service / pipe-stage lines, loud unknown, usage refusal).

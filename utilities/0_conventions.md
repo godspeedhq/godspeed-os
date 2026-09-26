@@ -125,7 +125,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     deadline was not the fix and adding one first was not enough** - it made the freeze 20 seconds
     instead of forever, and 20 seconds of a dead prompt is still a dead prompt. Only polling `q` while
     waiting returns the machine to its operator. The `events` channel (`trace_ask`) had the same shape
-    and was worse for it, since `events blocked` is the instrument you reach for WHEN something is
+    and was worse for it, since `events failures` is the instrument you reach for WHEN something is
     wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
 11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
     escape must abort the actual WORK the utility set in motion - not merely stop the shell from
