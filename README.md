@@ -223,7 +223,9 @@ under a "figures below are from the current tree" line that made three-month-old
 
 **Want to write a service?** See [**GETTING_STARTED.md**](GETTING_STARTED.md) - a 5-minute, copy-`examples/00-hello` walkthrough. The rest of this section is about building and booting the OS itself.
 
-**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (`nightly-2026-05-16`; rustup installs it for you), QEMU on your PATH, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (`nightly-2026-05-16`; rustup installs it for you), QEMU on your PATH, **Python 3.8 or newer on your PATH as `python`**, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+
+**Python is not optional, so it is stated plainly rather than discovered.** `osdev build` runs the enforcement layer - the checkers in `scripts/` that hold the Ten Commandments, the contracts, the arch boundary and the documentation - and it **refuses to build** if it cannot run one of them, because a checker that cannot run is not a checker that passed. Building for a non-x86 board needs it too: `scripts/board.py` and the three per-board scripts are the only way to produce a Raspberry Pi or VisionFive image. The floor is **3.8**, set by one walrus operator in `scripts/commandments.py`; `docs/conformance.md` records how that was measured and why the `list[str]` annotations in four checkers do NOT raise it to 3.9.
 
 **Set up Limine (once).** GodspeedOS boots via the Limine bootloader, whose binaries are not committed (`tools/` is gitignored). Download a Limine binary release (https://github.com/limine-bootloader/limine/releases - the project tracks the 12.x line) and copy these into `tools/limine/`:
 
