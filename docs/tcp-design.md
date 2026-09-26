@@ -6,11 +6,11 @@
 
 ## What is already here, measured rather than remembered
 
-`services/net-stack/src/main.rs` is 2,174 lines and implements ARP (resolve and reply), IPv4 with
+`services/net-stack/src/main.rs` is 3,652 lines (this said 2,174, under a heading reading "measured rather than remembered") and implements ARP (resolve and reply), IPv4 with
 checksum, ICMP echo, UDP, DHCP (discover / request / lease), DNS and SNTP. All hardware-proven on four
 boards.
 
-**There is no TCP.** The only occurrence of the string in the service is its own header comment,
+**CORRECTED 2026-09-26 - there IS TCP** (`services/net-stack/src/tcp.rs`, 1,745 lines); this paragraph asserted the opposite of this file's own line 3 and is kept only so the design reasoning below reads in order. The only occurrence of the string in the service is its own header comment,
 claiming "ARP/IPv4/ICMP/UDP/TCP over those frames". That comment is corrected in the same change as
 this document: a file that asserts a protocol it does not implement is the defect this project spent a
 week removing from its checkers, and it should not survive in the service being extended.

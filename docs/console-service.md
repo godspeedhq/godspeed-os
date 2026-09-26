@@ -315,7 +315,7 @@ font renderer and is serial-blind") is answered below.
 
 ### 9.2 The split
 
-| | Kernel (`bootcon/`, ~330 lines) | `console` service (~1,100 lines) |
+| | Kernel (`bootcon/`, 536 lines) | `console` service (1,756 lines) |
 |---|---|---|
 | Serial | owns it, unchanged - **still the source of truth** | never touches it |
 | Framebuffer | a minimal boot/panic blit | the whole terminal |

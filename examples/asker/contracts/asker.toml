@@ -1,6 +1,7 @@
 # Service contract for `asker` - the request/reply CLIENT (the request side of the RPC pattern;
-# `reply-server` is the reply side). The supervisor reads this at spawn and the kernel mints
-# EXACTLY these capabilities; `asker` can do ONLY what is listed here (Commandment VII).
+# `reply-server` is the reply side). This is a BUILD-TIME declaration, not what the kernel
+# reads at spawn - nothing parses TOML there (13.6). `asker` can do only what the SPAWN
+# REQUEST granted, and this file is reconciled against it (Commandment VII).
 name    = "asker"
 version = "0.1.0"
 

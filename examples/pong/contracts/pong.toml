@@ -1,5 +1,6 @@
-# Service contract for `pong` - the demo server. The supervisor reads this at spawn and the
-# kernel mints EXACTLY these capabilities; `pong` can do only what is listed here (Commandment VII).
+# Service contract for `pong` - the demo server. This is a BUILD-TIME declaration, not what the
+# kernel reads at spawn - nothing parses TOML there (13.6). `pong` can do only what the SPAWN
+# REQUEST granted; this file is reconciled against it (Commandment VII).
 name    = "pong"
 version = "0.1.0"
 

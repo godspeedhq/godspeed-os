@@ -10,7 +10,7 @@ Trails `CLAUDE.md`; does not amend it.
 `<producer> | paginate` shows a long stream one screenful at a time, with keys to scroll.
 
 ```
-paginate 0.1.0 - read long output a screenful at a time
+paginate 0.4.0 - read long output a screenful at a time
 
 usage:
   <producer> | paginate    page the piped stream (text or records)

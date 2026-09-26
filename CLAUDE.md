@@ -363,7 +363,7 @@ os/
     unsafe_check.py      #   the unsafe audit matches the source
     doc_refs.py          #   no doc points at a file that does not exist
     facts_check.py       #   a number a doc restates matches the code that owns it
-    site_check.py        #   the 4 hand-written site pages still match the repository
+    site_check.py        #   the 5 hand-written site pages still match the repository
     arch_boundary_check.py #  neutral layers reach hardware ONLY through the `arch::imp` seam
     arch_seam_check.py   #   ...and every arch ANSWERS every member of it (the other direction)
     scaffold_check.py    #   ...and the BOUNDED-PORT TEST: how far a fresh ISA gets with only
@@ -398,7 +398,7 @@ os/
     arm_build.py  pi4_build.py  riscv_build.py  arm_run.py  pi4_run.py  riscv_run.py
 
   utilities/             # the SPEC for every shell utility, one file each, plus 0_conventions
-    0_conventions.md     #   the 13 rules every utility obeys
+    0_conventions.md     #   the 14 rules every utility obeys
   website/               # the published book (mdBook); pages `{{#include}}` the
                          #   sources above, so a doc and its page cannot drift
   backlog/               # open items - recorded rather than closed (§26.7)
@@ -681,7 +681,9 @@ official, not the runtime behaviour.
 > **What confinement actually covers today, stated as fact rather than intent:**
 > - **`xhci` is the only confined driver in the system.** `ehci` and `block-driver` keep a stale
 >   firmware DMA pointer that confinement would fault, so both run in deliberate passthrough
->   (`kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``); `nic-driver` is spawned `confine=false`.
+>   (`kernel/src/task/mod.rs`, the `confine` flag on `HwClass::Pci` - this cited a `DeviceSpec` type that
+>   has never existed, and it was introduced to replace a rotting line number on the grounds that a
+>   field name cannot drift); `nic-driver` is spawned `confine=false`.
 > - **AMD-Vi is x86-only.** Every `iommu::` entry point on `arm`, `aarch64` and `riscv64` is a stub and
 >   `confine_device` returns `false`. Three of the four shipping ports are therefore entirely in the
 >   "without an IOMMU" case, with no confined driver at all.
@@ -1325,7 +1327,7 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 
 ### 11.4 Logging Before Any Service Exists
 
-The kernel maintains a 16 KiB ring buffer (per-core view, single shared sink). Anything logged writes to the ring buffer and the serial console - **always**, not only before a service is up. `events` drains the accumulated buffer once, at its own startup.
+The kernel maintains a 16 KiB ring buffer (a single shared sink). Anything logged writes to the ring buffer and the serial console - **always**, not only before a service is up. **Nothing drains it**, deliberately: `drain_to_events` has zero callers and `kernel/src/log.rs` says so in its first line. (This body previously said "per-core view" - there is one `static RING` - and that `events` "drains the accumulated buffer once, at its own startup". It never has; `backlog/06` is open, and the 2026-09-04 amendment below establishes non-drainage as the design.)
 
 > **Amendment 2026-09-04 (`logger` -> `events`): the service is renamed, and this section's title was
 > wrong in a second way that matters more than the name.** The title read "Logging Before Logger
@@ -2655,7 +2657,7 @@ The system continues running.
 
 GodspeedOS has booted on real x86_64 hardware (4-core CPU, 4 GB RAM) via UEFI USB boot (2026-05-21).
 
-- `osdev image` produces a UEFI GPT disk image at `build/os.img`.
+- `osdev image` produces a UEFI GPT disk image at `build/os-usb.img`. (This said `build/os.img`, which is the QEMU/BIOS image - `osdev/src/disk_image.rs` notes the two are named apart on purpose, and §17 has it right.)
 - Image written to USB with Cygwin `dd`; boots via `BOOTX64.EFI` (Limine 12.x).
 - All 4 cores come up; cross-core IPC (ping core 0 → pong core 1) runs continuously on hardware.
 - Null modem serial (115200 8N1, PuTTY) confirms boot output; log appended to `build/putty_serial_output.log`.

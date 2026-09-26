@@ -11,7 +11,7 @@ Trails `CLAUDE.md`; does not amend it.
 can rely on. It is a document you read; `help` is a reference you consult.
 
 ```
-docs 0.1.0 - GodspeedOS
+docs 0.4.0 - GodspeedOS
 
   What this is
   MISCIS - the whole of what the kernel does

@@ -26,9 +26,9 @@ Every service is a tiny `no_std` crate with **four files**. The minimal one is
 
 | File | Role |
 |------|------|
-| `Cargo.toml` | the crate; depends on `godspeed-sdk` (the only way to reach the OS) |
+| `Cargo.toml` | the crate; depends on **`godspeed`** - the standard library, imported as `gs`. That is the only dependency a first service needs. `godspeed-sdk` is the layer underneath, for drivers |
 | `build.rs` | links `services/user.ld` and sets the ELF entry point to `service_main` |
-| `contracts/<name>.toml` | declares what the service may do - it gets **only** these capabilities |
+| `contracts/<name>.toml` | declares what the service may do. A build-time DECLARATION, schema-validated and reconciled against what is really granted by `scripts/contract_check.py` - nothing parses TOML at spawn (CLAUDE.md 13.6) |
 | `src/main.rs` | `service_main(ctx: ServiceContext) -> !`, the function the kernel calls at spawn |
 
 The entire `src/main.rs` for `hello`:
@@ -36,15 +36,24 @@ The entire `src/main.rs` for `hello`:
 ```rust
 #![no_std]
 #![no_main]
+#![deny(unsafe_code)]                           // REQUIRED of every service crate (18.2)
 
-use godspeed_sdk::ServiceContext;
+use godspeed::{self as gs, ServiceContext};     // the STANDARD LIBRARY, not the SDK
 
+#[allow(unsafe_code)]                           // the ONE sanctioned exception: the entry symbol
 #[no_mangle]                                    // REQUIRED, directly on the entry - see the gotcha below
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("hello: starting");                // ctx is the ONE gateway to the OS
-    loop { ctx.yield_cpu(); }                   // a real service would block on recv here
+    ctx.log("hello: starting");                 // ctx is the ONE gateway to the OS
+    loop { gs::task::yield_now(&ctx); }         // a real service would block on recv here
 }
 ```
+
+> **Corrected 2026-09-26.** This snippet used to read `use godspeed_sdk::ServiceContext;` and
+> `loop { ctx.yield_cpu(); }`, and omitted both `unsafe_code` attributes. That is the SDK layer and
+> the context method - the two things `examples/00-hello` was written to show you never need. Its
+> own source says so at the yield: *"`gs::task::yield_now`, NOT `ctx.yield_cpu()`. Both work, and
+> reaching for the context method is reaching past the standard library to the layer underneath."*
+> Reach for `godspeed-sdk` only if you are writing a driver.
 
 To make it *your* service, edit just two files:
 

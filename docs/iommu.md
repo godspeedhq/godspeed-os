@@ -246,9 +246,14 @@ amendment fixed:
 2. **The no-IOMMU machine.** The conditional trust posture above means the TCB is
    *machine-dependent*. That is honest but novel for this project; it deserves a
    deliberate decision rather than a default.
-3. **block-driver / fs.** These remain trusted for v1 for reasons unrelated to
-   DMA (they own persistent state). H1 does not change that; the v2 plan in §6.3
-   still stands.
+3. **block-driver / fs.** CORRECTED 2026-09-26: both LEFT the TCB on 2026-06-17
+   (§6.1's Phase D amendment) once `fs` gained crash-consistent recovery, and §6.3's
+   goal is reached at its floor - the non-restartable set is `{kernel}` alone. This
+   said they "remain trusted for v1" and that the §6.3 v2 plan "still stands".
+   `block-driver` is nonetheless trust-critical on any machine that cannot confine
+   its DMA arena, which is every machine today (§6.4's 2026-09-12 census).
 
-Until sign-off, the drivers remain in their current trust posture and H1 is a
-pure hardening mechanism that confines them without yet re-classifying them.
+Phase 2 was signed off and is now §6.4 (see the header). This closing paragraph used
+to read "Until sign-off, the drivers remain in their current trust posture and H1 is a
+pure hardening mechanism that confines them without yet re-classifying them" - which
+negated the header of its own document.

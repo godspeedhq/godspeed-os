@@ -1,6 +1,7 @@
 # Service contract for `hello` - the minimal service (your first one; copy this folder).
-# The supervisor reads this at spawn and the kernel mints EXACTLY these capabilities. A
-# service can do ONLY what its contract grants, nothing else (Commandment VII).
+# This is a BUILD-TIME declaration. Nothing parses TOML at spawn (13.6) - authority comes from
+# the spawn request, and this file is reconciled against it by `scripts/contract_check.py`. A service
+# can do ONLY what it was granted, and this states what that should be (Commandment VII).
 name    = "hello"
 version = "0.1.0"
 

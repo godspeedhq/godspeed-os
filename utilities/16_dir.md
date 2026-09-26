@@ -212,7 +212,7 @@ mechanism exists to remove.
 
 ## 6. Conformance
 
-Conforms: `ls help` (usage with a real example per row) and `ls version` (number +
+Conforms: `dir help` (usage with a real example per row) and `dir version` (number +
 creator credit) per `0_conventions.md` (the shared `help_block` helper).
 
 Also conforms to **rule 10** (`0_conventions.md` §1.10): the `fs` request is **q-abortable** via

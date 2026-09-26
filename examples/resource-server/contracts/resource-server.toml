@@ -1,6 +1,7 @@
 # Service contract for `resource-server` - demonstrates MINTING delegated resource capabilities
-# (§7.10, "a file is a capability"). The supervisor reads this at spawn and the kernel mints
-# EXACTLY these capabilities (Commandment VII, no ambient authority).
+# (§7.10, "a file is a capability"). This is a BUILD-TIME declaration, not what the kernel
+# reads at spawn - nothing parses TOML there (13.6). It is reconciled against the authority
+# really granted by `scripts/contract_check.py` (Commandment VII, no ambient authority).
 name    = "resource-server"
 version = "0.1.0"
 

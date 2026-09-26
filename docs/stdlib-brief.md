@@ -56,7 +56,7 @@ and determining what abstractions naturally fit Godspeed.
 > **STATUS: two parts of that snippet cannot exist, and the inspection is why.**
 >
 > - `fn main()` has no meaning yet. Every runnable thing is a service entered at
->   `service_main(ctx) -> !`, all 14 examples return `!`, and of 52 syscalls the only one that ends a
+>   `service_main(ctx) -> !`, all 15 examples return `!`, and of 52 syscalls the only one that ends a
 >   task is `Kill` - gated behind `service_control`, which no application should hold. **This is the
 >   STOP condition the brief names below**, and it is open: `stdlib-design.md` §1 sets out three
 >   options and recommends adding an `Exit(status)` syscall as its own reviewed change.
@@ -98,11 +98,14 @@ are suggestions only. Do not create empty modules.** Every abstraction must corr
 demonstrated application need. Prefer small stable primitives plus composable helpers over a large
 speculative framework.
 
-> **STATUS: shipped - `error`, `call`, `fs`, `io`, `net`, `cap`, `addr`, and a private `resource`.**
-> 51 public functions. `cap` was recorded as "not built" for a day and then built: the blocker was
+> **STATUS: shipped - 13 PUBLIC MODULES:** `addr`, `call`, `cap`, `error`, `file`, `fs`, `io`, `ipc`,
+> `net`, `record`, `resource`, `task`, `trace`. (This listed seven plus "a private `resource`";
+> `resource` is public now, and `file`/`ipc`/`task`/`trace`/`record` all arrived after it was written.)
+> 101 `pub fn` across the crate (149 public items in all - README.md states the counting rule). `cap` was recorded as "not built" for a day and then built: the blocker was
 > that the file-capability protocol carried no correlation tag, which is a protocol property and was
-> fixed in userspace. `task` and `time` are still left out - no repeated plumbing was found for
-> either, and inventing some would be the speculative abstraction 26.2 forbids.
+> fixed in userspace. `task` SHIPPED, and carries the clock surface that answers "time":
+> `uptime_secs`, `epoch_secs_monotonic`, `datetime`, `clock_source`, `clock_is_set`. This said both
+> were left out for want of repeated plumbing - true when written, and the plumbing turned up.
 
 ## Rust model
 

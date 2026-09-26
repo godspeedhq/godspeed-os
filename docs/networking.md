@@ -1,6 +1,6 @@
 # Networking: a Capability-Mediated Userspace Service
 
-> **Status: BUILT and shipping.** `net-stack` and `nic-driver` are services on x86_64 and Pi 2; DHCP,
+> **Status: BUILT and shipping.** `net-stack` and `nic-driver` are services on all four shipping ports - x86_64, Pi 2 (LAN9514), Pi 4 (GENET) and VisionFive 2 (dwmac); DHCP,
 > ARP, ICMP, DNS and the shell's `net`/`ping` all work on real hardware. This header said "design,
 > being built" until 2026-08-25. **v2** (networking is out of v1 scope -
 > §23.4). Non-normative until built and pinned by an identity test, at which point the relevant
@@ -113,7 +113,7 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
   **DMA arena** for the TX/RX descriptor rings + packet buffers.
 - **NOT IOMMU-confined (§6.4).** This said the opposite, and the correction matters because it is a
   trust claim. `nic-driver` is spawned `hwclass::pci(0x02_00_00, BAR_AUTO, false)` - the third argument
-  is `confine`, and it is `false` (`services/supervisor/src/main.rs:383`). **`xhci` is the only confined
+  is `confine`, and it is `false` (`services/supervisor/src/main.rs`, the `nic-driver` spawn row). **`xhci` is the only confined
   driver in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
   keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs, the `confine` flag on `HwClass::Pci``). So the
   NIC driver's DMA is unconfined: a *buggy* one is bounded by the arena it was granted, but a

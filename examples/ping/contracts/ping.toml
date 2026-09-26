@@ -1,5 +1,6 @@
-# Service contract for `ping` - the demo client. The supervisor reads this at spawn and the
-# kernel mints EXACTLY these capabilities; `ping` can do only what is listed here (Commandment VII).
+# Service contract for `ping` - the demo client. This is a BUILD-TIME declaration, not what the
+# kernel reads at spawn - nothing parses TOML there (13.6). `ping` can do only what the SPAWN
+# REQUEST granted; this file is reconciled against it (Commandment VII).
 name    = "ping"
 version = "0.1.0"
 

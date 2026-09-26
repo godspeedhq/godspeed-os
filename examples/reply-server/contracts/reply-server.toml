@@ -1,5 +1,5 @@
 # Service contract for `reply-server` - demonstrates the request/reply (RPC) IPC pattern. The
-# supervisor reads this at spawn and the kernel mints EXACTLY these capabilities (Commandment VII).
+# supervisor declares this at BUILD time; nothing parses TOML at spawn (13.6). These capabilities (Commandment VII).
 name    = "reply-server"
 version = "0.1.0"
 
