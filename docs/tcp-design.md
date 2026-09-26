@@ -1,6 +1,6 @@
 # TCP for GodspeedOS: the design, and the two facts that shaped it
 
-> **Status: design, being built** on `feat/tcp`. `docs/networking.md` recorded the commitment on
+> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,745 lines; `OP_LISTEN`, the shell's `tcp` and `serve`, `tcp selftest` (53 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
 > 2026-07-04 ("TCP/IPv4 is committed from the start, not far-future"); this is how it gets built, and
 > why it is not a port of anyone else's stack.
 

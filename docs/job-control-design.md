@@ -1,6 +1,6 @@
 # Job control: `jobs`, `background`, `foreground` - work that outlives the prompt
 
-**Status:** **BUILT** (`osdev test jobs`, 25/0, QEMU with a real disk). Written before any code so
+**Status:** **BUILT** (`osdev test jobs`, 58/0, QEMU with a real disk - the tally read 25/0, which never matched: `run_jobs` has 58 top-level `check!` sites, none nested). Written before any code so
 the structural decision below could be argued with rather than discovered; kept as written, with a
 section 9 recording what the building changed. Trails `CLAUDE.md`; does not amend it. The as-built
 reference is `utilities/55_background.md`.

@@ -39,8 +39,12 @@ A pipeline is **one producer, zero or more filters, one sink**:
   recognised sink, the buffer is printed.
 
 The shell threads a bounded buffer down the chain: stage 1 fills it, each filter transforms it,
-the sink consumes it. Each inter-stage buffer is **64 KiB** (loud on overflow, §26.6); it lives
-on the user stack - two coexist for a middle filter (input + output ≈ 128 KiB), within the
+the sink consumes it. Each inter-stage buffer is **16 KiB** (loud on overflow, §26.6); it lives
+> **Corrected 2026-09-26: this document claimed 64 KiB in nine places** (a tenth names it as history, below, and is kept). The buffer is
+> `CAP_MAX = 16 * 1024` (`services/shell/src/main.rs`), and the comment above that constant
+> records the history - "Cost, unchanged from when this was 64 KiB". It was shrunk for stack
+> headroom and this page never followed, so the two-coexisting figure was wrong by 4x too.
+on the user stack - two coexist for a middle filter (input + output ≈ 32 KiB), within the
 256 KiB user stack.
 
 Examples:
@@ -73,8 +77,8 @@ pipe source iff its job is to *emit data*. That splits the command set three way
 - **Live / interactive → NOT sources.** The full-screen `observe` live view and `edit` own the
   screen and never yield a discrete stream; piping them is a loud refusal (use `observe now`).
 - **Orchestrators (`run` / `selfcheck`) → NOT sources.** They run the suite's *own* sub-pipelines,
-  so capturing one through a pipe would nest a `pipe_run` (which holds a 64 KiB `Stream` on the
-  stack) inside another - two coexisting 64 KiB buffers overflow the tight user stack (HW-proven).
+  so capturing one through a pipe would nest a `pipe_run` (which holds a 16 KiB `Stream` on the
+  stack) inside another - two coexisting 16 KiB buffers overflow the tight user stack (HW-proven).
   They refuse loudly as non-producers. **To save an orchestrator's output, it writes its OWN file:**
   `selfcheck save <path>` / `run <script> save <path>` streams the report straight to a file
   (direct, no pipe - a small bounded buffer, not a nesting capture), then `read <path> | …` brings
@@ -193,7 +197,7 @@ empty body. A filter (`upper`) forwards EOT downstream; the shell stops draining
 
 ## Bounds and failure (loud, never silent - §26.6 / §3.12)
 
-- Each inter-stage buffer is 64 KiB; overflow is reported, not silently truncated.
+- Each inter-stage buffer is 16 KiB; overflow is reported, not silently truncated.
 - A pipeline is capped at `MAX_STAGES` (8); more is refused.
 - **Stage 1 must be a producer.** A non-producer service in stage 1 would block the shell on a
   `recv` that never comes (no non-blocking `recv` in v1), so producer services are an explicit
@@ -203,12 +207,12 @@ empty body. A filter (`upper`) forwards EOT downstream; the shell stops draining
 - A buffer larger than a **service** stage can take (4 KiB, one message) is refused loudly with
   the actual size and the reason - never silently clipped. (The **`write` sink** is *not* limited
   this way: it streams the captured buffer to a multi-block file via `WriteNew`/`WriteAt`, so it
-  can save up to the full 64 KiB capture.)
+  can save up to the full 16 KiB capture.)
 
 ## Why store-and-forward, and the chain of real limits
 
 This is **store-and-forward**, not a true stream: each stage runs to completion, its whole
-output is materialised into the 64 KiB buffer, and *then* the next stage runs. Stages run
+output is materialised into the 16 KiB buffer, and *then* the next stage runs. Stages run
 **sequentially**, one at a time - never concurrently. That is a deliberate v1 choice: it
 sidesteps the hardest part of real pipes - §8.9, where the kernel will *not* detect or break a
 deadlock, and a concurrent producer/consumer needs backpressure. Store-and-forward has exactly
@@ -221,13 +225,13 @@ same "no streaming / no multi-block" limitation:
 | Limit | Value | Set by |
 |-------|-------|--------|
 | IPC message | 4 KiB | `MAX_PAYLOAD` (§8.5) - a stage through a *service* is one message |
-| Capture buffer | 64 KiB | the inter-stage buffer; a builtin-only pipeline is bounded by this |
+| Capture buffer | 16 KiB | the inter-stage buffer; a builtin-only pipeline is bounded by this |
 | Concurrency | none | stages run sequentially; data is materialised, not flowing |
 
 (The `\| write` sink is no longer a ~3.5 KiB ceiling: it streams the buffer to a multi-block file
 via `WriteNew`/`WriteAt`. The remaining hard cap is the 4 KiB *service*-stage message.)
 
-So a *builtin-only* capture can fill 64 KiB, but it can only reach a sink that can take it -
+So a *builtin-only* capture can fill 16 KiB, but it can only reach a sink that can take it -
 which today nothing beyond 4 KiB can. Lifting this is the streaming work, not a constant.
 
 ## Future: true streaming (design intent - not built)
@@ -259,7 +263,7 @@ shape - only *who drains whom, and when*.
 
 A **filter built-in** consumes the previous stage's buffer and emits to the next - it runs
 in-process, so it is **not** subject to the 4 KiB service-boundary cap and can filter a full
-64 KiB buffer. Built so far: **`match`** (grep - `utilities/27_match.md`), **`count`** (wc -
+16 KiB buffer. Built so far: **`match`** (grep - `utilities/27_match.md`), **`count`** (wc -
 `utilities/28_count.md`), **`sort`** (`utilities/29_sort.md`), and **`first`/`last`** (head/tail -
 `utilities/30_first-last.md`): `read /log | match error | sort | last 20`. Piping into command
 arguments is the remaining Appendix-D work; new filters drop into the same middle FILTER slot.

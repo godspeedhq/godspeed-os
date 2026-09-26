@@ -295,7 +295,7 @@ smsc95xx TX:  TX_CMD_A = len | FIRST_SEG(0x2000) | LAST_SEG(0x1000)   (4 bytes L
 CDC-ECM  TX:  the raw frame, and a trailing ZERO-LENGTH PACKET when the length is an
               exact multiple of the bulk max packet size - the short packet is what
               delimits a datagram, so an exact multiple has no boundary without it.
-              (smsc95xx carries an explicit length, so it needs no ZLP.)
+              (**CORRECTED 2026-09-26: a ZLP IS NEEDED.** This said smsc95xx carries an explicit length so it needs none. Linux sets `FLAG_SEND_ZLP` for this device, and without the terminating zero-length packet a frame whose length is an exact multiple of the max packet size leaves the device's receive buffer open forever, NAKing every later OUT - transmit works for hundreds of frames and then dies permanently. See `services/dwc2/src/net.rs`, which quotes this very sentence and refutes it.)
 ```
 
 The RX side has its own status header and has NOT been read yet - do that before writing the receive
@@ -435,7 +435,7 @@ smsc95xx TX:  TX_CMD_A = len | FIRST_SEG(0x2000) | LAST_SEG(0x1000)   (4 bytes L
 CDC-ECM  TX:  the raw frame, and a trailing ZERO-LENGTH PACKET when the length is an
               exact multiple of the bulk max packet size - the short packet is what
               delimits a datagram, so an exact multiple has no boundary without it.
-              (smsc95xx carries an explicit length, so it needs no ZLP.)
+              (**CORRECTED 2026-09-26: a ZLP IS NEEDED.** This said smsc95xx carries an explicit length so it needs none. Linux sets `FLAG_SEND_ZLP` for this device, and without the terminating zero-length packet a frame whose length is an exact multiple of the max packet size leaves the device's receive buffer open forever, NAKing every later OUT - transmit works for hundreds of frames and then dies permanently. See `services/dwc2/src/net.rs`, which quotes this very sentence and refutes it.)
 ```
 
 The RX side has its own status header and has NOT been read yet - do that before writing the receive
