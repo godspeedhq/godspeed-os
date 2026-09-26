@@ -609,7 +609,7 @@ extern "C" fn aarch64_sync_current_dispatch(vector: u64, frame: *mut TrapFrame) 
 
 /// Synchronous exception from a lower EL. Today that means `svc` from EL0.
 ///
-/// **The syscall number comes from `x8`, not from the instruction's `imm16`.**
+/// **The syscall number comes from a REGISTER, not from the instruction's `imm16` - and that register is `x16`, not `x8` (see below).**
 ///
 /// Milestone 6 read it from `ESR_EL1.imm16` and justified that as userspace being unable to lie about
 /// which call it made. That justification was wrong twice over. First, `svc #N` encodes `N` in the

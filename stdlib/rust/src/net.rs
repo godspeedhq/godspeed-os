@@ -10,12 +10,13 @@
 //!
 //! 2. **Invocations of a delegated resource capability** (§7.10) - a UDP socket or a TCP listener is
 //!    a real kernel capability that `net-stack` mints and grants, and using one means invoking it
-//!    with an operation and a right. **That is not here**, because the machinery it needs is shared
-//!    with file capabilities and belongs in its own module rather than being half-built twice.
-//!    `docs/stdlib-design.md` §8 has the argument.
+//!    with an operation and a right. **That is here now** - `docs/stdlib-design.md` §8 argued for
+//!    leaving it out, and the implementation has since crossed that boundary.
 //!
-//! So: this module gets you a name resolved, a host pinged, and a TCP request answered. It does not
-//! get you a listening socket. That boundary is deliberate and is stated rather than discovered.
+//! So: this module gets you a name resolved, a host pinged, a TCP request answered - AND a listening
+//! socket. [`Net::socket`], [`Net::listen`], [`Listener::accept`] and [`Conn`] are all here. This
+//! header said "It does not get you a listening socket. That boundary is deliberate", which was true
+//! when written and is the opposite of the module below it now.
 //!
 //! # A caution the rest of this library does not need
 //!

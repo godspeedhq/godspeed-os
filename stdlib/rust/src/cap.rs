@@ -25,7 +25,8 @@
 //!
 //! **A capability can go stale.** Every one carries a generation, and the resource bumps its own when
 //! it dies or is replaced. The next use of a stale capability fails with
-//! [`Error::EndpointDead`](crate::Error) or `CapRevoked` rather than reaching the new instance. That
+//! [`Error::Unreachable`](crate::Error) or [`Error::Revoked`](crate::Error) rather than reaching the
+//! new instance - `gs::Error` has no `EndpointDead` variant, so there is nothing else to match. That
 //! is not a fault to route around: it is the system telling you the thing you held is gone, and
 //! [`reacquire`] is how you answer it.
 //!
@@ -108,7 +109,7 @@ pub fn acquire_grantable(ctx: &ServiceContext, name: &str) -> Result<Cap, Error>
 
 /// Re-acquire a service by name after its previous instance died.
 ///
-/// The answer to a [`Error::EndpointDead`](crate::Error): the name is stable, the instance is not
+/// The answer to an [`Error::Unreachable`](crate::Error): the name is stable, the instance is not
 /// (CLAUDE.md invariant 11). Returns `true` if a fresh capability was installed.
 ///
 /// **Re-acquiring the endpoint is necessary and not sufficient.** Anything you derived from the DEAD

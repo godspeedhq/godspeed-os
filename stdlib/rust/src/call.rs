@@ -6,9 +6,10 @@
 //! The SDK offers twelve `request_with_reply*` functions across three outcome enums. They are all
 //! correct; the problem is which one is shortest to type. `request_with_reply_deadline` returns
 //! `Option<Message>`, so "the request never left" and "the deadline passed" arrive as the same
-//! `None` - and those two demand opposite responses. Five services
-//! (`block-driver`, `control`, `copier`, `nic-driver`, `recorder`) reached for the longer
-//! `_call_err` variant to get the distinction back.
+//! `None` - and those two demand opposite responses. Three services
+//! (`block-driver`, `control`, `nic-driver`) reach for the longer `_call_err` variant to get the
+//! distinction back. (This said five, naming `copier` and `recorder` too; both have since migrated to
+//! `gs::fs` / `gs::call` and make no `request_with_reply*` call at all.)
 //!
 //! This module offers ONE function. It keeps the distinction, and it does the one retry that is
 //! provably safe, so that the easy path and the correct path are the same path.

@@ -9,7 +9,7 @@
 //! | ISA | trap | number + args |
 //! |-----|------|---------------|
 //! | arm (ARMv7-A) | `svc #0` | r0-r3, **each 32 bits** - see the truncation note on that body |
-//! | aarch64 | `svc #0` | x8 = number, x0-x2 = args |
+//! | aarch64 | `svc #0` | **x16** = number, x0-x2 = args   (NOT x8 - see the note on the aarch64 body) |
 //! | riscv64 | `ecall` | a7 = number, a0-a2 = args |
 //! | x86-64 | `ud2` | rax = number, rdi/rsi/rdx = args |
 //!

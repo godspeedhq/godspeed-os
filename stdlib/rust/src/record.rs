@@ -6,7 +6,7 @@
 //! Everything else in this crate wraps the SDK because there is something to translate: a capability
 //! to hold, an error to map onto one type, a protocol to hide. A [`Table`] has none of that. It is a
 //! bounded arena and some arithmetic - no syscall, no capability, no failure mode that a program
-//! should be told about differently. Wrapping sixteen methods to change nothing would be exactly the
+//! should be told about differently. Wrapping twenty-three methods to change nothing would be exactly the
 //! speculative layer CLAUDE.md 26.2 warns against, and it would add a second name for one thing
 //! (Commandment III).
 //!

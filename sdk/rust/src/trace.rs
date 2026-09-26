@@ -53,7 +53,11 @@ pub const TRACE_OP_DUMP: u8 = 2;
 /// Ask for ring capacity / accepted / dropped.
 pub const TRACE_OP_STATUS: u8 = 3;
 
-/// Publish a METRIC sample: `[4][owner:12][name:12][value(8, le)]`.
+/// Publish a METRIC sample: `[4][owner:12][name:20][value(8, le)]` - value at offset 33.
+///
+/// The name field is [`MET_NAME_LEN`] = 20, not 12. This line said 12, which is the bug the
+/// note on that constant records fixing (a metric truncated to `ring.recorde`); decoding by the
+/// old layout reads eight bytes of NAME as the u64 value.
 ///
 /// A metric is a SET, not an increment. The emitting service already holds the counter - it is that
 /// service's own state, with an owner (§3.8) - and publishes the current value; `events` remembers the

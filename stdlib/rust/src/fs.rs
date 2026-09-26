@@ -805,7 +805,7 @@ impl<'a> Fs<'a> {
             return Ok(());
         }
         // Larger than one message: create it, then fill it positionally. `WRITE_AT` at a fixed
-        // offset is one of the two operations `services/fs` documents as positionally idempotent,
+        // offset is positionally idempotent: the same bytes at the same offset land the same way twice (`services/fs` does not enumerate such a pair - this cited one that does not exist),
         // which is what makes a chunked write safe to resume at all.
         self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], self.secs())?;
         let mut off = IO_CHUNK;
@@ -858,7 +858,7 @@ impl<'a> Fs<'a> {
     ///
     /// **Blocks. Changes state.** Unusually among the write operations, a positional write at a
     /// FIXED offset into an already-allocated extent is idempotent: repeating it puts the same bytes
-    /// in the same place. `services/fs` names it as one of exactly two operations safe to re-send,
+    /// in the same place. it is safe to re-send because it is positional, not appending (this claimed `services/fs` names it one of exactly two such operations; it names no such set),
     /// which is what makes a chunked write resumable at all.
     ///
     /// Even so this returns [`Error::OutcomeUnknown`] honestly on a timeout, because the DECISION to

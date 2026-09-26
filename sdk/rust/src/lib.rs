@@ -46,9 +46,12 @@
 //!
 //! # Where the unsafe lives
 //!
-//! Service code contains none. The syscall ABI and the MMIO/DMA accessors need it, so it is confined
-//! to `syscall.rs`, `mmio.rs` and `dma.rs` behind safe wrappers, each block carrying a SAFETY
-//! argument (CLAUDE.md §18.1). `scripts/unsafe_check.py` fails the build on an `unsafe` in any
+//! Service code contains none. §18.1 designates `syscall.rs`, `mmio.rs`, `dma.rs` and
+//! `adversarial.rs`; in practice the largest holder is `service_context.rs` (82 lines) with `ipc.rs`
+//! (8), both recorded as GRANDFATHERED FLOORS by §18.5's 2026-09-12 amendment - 86 of those 90 are
+//! `unsafe { raw_syscall(..) }` call sites, and they may only fall. Every block carries a SAFETY
+//! argument. (This said the unsafe "is confined to `syscall.rs`, `mmio.rs` and `dma.rs`", which left
+//! the largest holder unnamed.) `scripts/unsafe_check.py` fails the build on an `unsafe` in any
 //! service, which is what keeps that true rather than merely intended.
 
 // `no_std` for the real (target) build; under `cargo test` we build for the host with

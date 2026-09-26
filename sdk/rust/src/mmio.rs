@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Memory-mapped I/O access for userspace driver services (§12, §18).
 //!
-//! This is the SDK's audited hardware-access layer - one of the two places
-//! outside the kernel where `unsafe` is permitted (the other being the syscall
-//! ABI, `raw_syscall`). Driver services use the safe [`Mmio`] wrapper and never
+//! This is the SDK's audited hardware-access layer - one of the places outside
+//! the kernel where `unsafe` is permitted. §18.1 names this file alongside
+//! `dma.rs`, the syscall ABI (`raw_syscall`) and `adversarial.rs`; this said
+//! "one of the two places", which `dma.rs`'s own header already contradicted. Driver services use the safe [`Mmio`] wrapper and never
 //! write `unsafe` themselves; every volatile access below carries a SAFETY
 //! argument, and `Mmio` is only constructable inside this crate (from a
 //! kernel-granted mapping), so its base pointer is always valid by construction.
