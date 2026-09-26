@@ -2729,8 +2729,8 @@ pub mod interrupts {
         // no liveness stamp. Unplugging a stick did exactly that. The idle loop is interruptible, so
         // the tick keeps running underneath and the work simply takes as long as it takes.
         //
-        // Exclusion is `USB_CLAIM`, not masking - see its comment. Rate-limited to one visit a second
-        // inside, so an idle machine spends nothing here.
+        // Exclusion was a claim flag rather than masking, and the visit was rate-limited to one a
+        // second, so an idle machine spent nothing here.
         //
         // Hot-plug is the driver's own outer `'reenum` loop, which is preemptible because it is a
         // task rather than the idle path of a core. Nothing to poll here.

@@ -64,6 +64,24 @@ SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "stdlib/rust/src", "osdev/
 EXTRA_CODE = ["scripts", "contracts"]
 
 TOKEN = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)`")
+
+# A PATH-QUALIFIED citation, checked on its FINAL segment: `control::process_pending`,
+# `dwc2::hotplug_poll`. Added after the first sweep, because `TOKEN` requires the whole backtick
+# content to be one identifier and so could not see either - and `kernel/CLAUDE.md` says in as many
+# words that `control::process_pending` "does not exist". A path inside backticks is an identifier by
+# construction and never prose, so this is the cheap half of the widening: it found 5 names in 8
+# sites, with no false alarms to baseline.
+PATH_TOKEN = re.compile(r"`(?:[A-Za-z_][A-Za-z0-9_]*::)+([A-Za-z_][A-Za-z0-9_]*)`")
+
+# STILL A BLIND SPOT, measured and recorded rather than half-enabled (§26.2, §26.7): a CamelCase
+# name in backticks - a type or an enum variant - matches neither pattern, because `TOKEN` requires
+# an underscore. `UsbExclusive` was dead, cited in a live comment, and invisible for exactly this
+# reason. Measured cost of turning it on: 15 names over 23 sites, and roughly half are NOT ours and
+# never will be - `AttrIndx`, `DminLine`, `IminLine` are ARM register FIELDS, `HubAddr`, `PrtAddr`,
+# `SplEna` are DWC2 ones, `GenuineIntel` is a CPUID vendor string. The other half look like real
+# rot (`SetClock`, `CreateEndpoint`, `UnknownSyscall`, `ReclaimBuffer`). So enabling it is a
+# triage pass, not a regex change, and doing it in the same commit would mean baselining findings to
+# keep the gate green - which is the one thing a ratchet must not be used for. `backlog/58`.
 LINE_COMMENT = re.compile(r"^\s*(///|//!|//)\s?(.*)$")
 
 
@@ -168,10 +186,11 @@ def scan():
     for p, comments in per_file:
         rel = os.path.relpath(p, ROOT).replace(os.sep, "/")
         for lineno, ctext in comments:
-            for m in TOKEN.finditer(ctext):
-                tok = m.group(1)
-                if tok not in code_text:
-                    hits[tok].append((rel, lineno))
+            for rx in (TOKEN, PATH_TOKEN):
+                for m in rx.finditer(ctext):
+                    tok = m.group(1)
+                    if tok not in code_text:
+                        hits[tok].append((rel, lineno))
     return hits, nfiles
 
 

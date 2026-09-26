@@ -7,10 +7,10 @@
 //! so every transfer here is a direct one. Split transactions are only needed to reach a device
 //! BEHIND the hub, where a full/low-speed device hangs off a high-speed bus and the hub's transaction
 //! translator has to be microframe-scheduled. That is the part flagged from the start as the risk of
-//! this port - `split_txn_periodic` moves from ring 0 with interrupts masked into a PREEMPTIBLE task,
-//! and a preemption in the wrong microframe does not fail cleanly, it transfers nothing. Enumerating
-//! the hub first means that risk is faced on its own, against a device tree already known to be
-//! reachable, rather than tangled with "does addressing even work".
+//! this port - the periodic split (`chan::periodic_split_in`) moves from ring 0 with interrupts
+//! masked into a PREEMPTIBLE task, and a preemption in the wrong microframe does not fail cleanly, it
+//! transfers nothing. Enumerating the hub first means that risk is faced on its own, against a device
+//! tree already known to be reachable, rather than tangled with "does addressing even work".
 
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 

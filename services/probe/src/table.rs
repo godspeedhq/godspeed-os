@@ -6,8 +6,14 @@
 //! supervisor, which already decides which probes to run and when, supplies the rest at spawn.
 //!
 //! What is deliberately NOT here: `probe-11a`'s IRQ-33 route and `probe-5a-send`'s grantable peer
-//! caps. Those are AUTHORITY, not settings, and the kernel keeps them keyed by name
-//! (`task::probe_authority`). A caller may say what a probe IS; it may not assert what it may DO.
+//! caps. Those are AUTHORITY, not settings, and they travel in the SUPERVISOR's spawn request
+//! (`probes::privileges_of`), refused by the kernel unless the supervisor may delegate them itself.
+//! A caller may say what a probe IS; it may not assert what it may DO.
+//!
+//! This said the kernel "keeps them keyed by name (`task::probe_authority`)". It does not, and that
+//! is the whole point of the step-C move: a name-keyed authority in the kernel is what let a spawn
+//! cap obtain INTROSPECT by choosing a string (`kernel/src/task/mod.rs`, the note at the privilege
+//! word). The kernel no longer infers authority from a name.
 //!
 //! Bounded and flat (§26.6): a `const` slice in rodata, no heap, no lookup structure. A linear scan
 //! of 193 rows happens once per spawn, which is already the most expensive thing in the system.

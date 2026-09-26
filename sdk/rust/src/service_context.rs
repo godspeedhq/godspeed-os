@@ -2181,7 +2181,9 @@ impl ServiceContext {
                 // mounted disk as absent. `request_with_reply_abortable` avoids this with a DRAIN at its
                 // own top; this variant cannot drain blindly, because a service that also SERVES on this
                 // endpoint (net-stack) would discard live client requests. So a caller that can time out
-                // must reclaim the late reply itself - see the shell's `reclaim_late_fs_reply`.
+                // must deal with the late reply itself - see the shell's `drain_stale_fs_replies`, which
+                // discards leftovers BEFORE sending rather than chasing one afterwards (a race that
+                // cannot be won: if the late reply has not arrived yet, the NEXT command eats it).
                 return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();
@@ -2831,40 +2833,50 @@ impl ServiceContext {
         }
     }
 
-    /// Move the console's scrolled-back view, returning `(lines back, most it can go back)`.
-    ///
-    /// `action` is one of the `SCROLL_*` values in `services/console/src/term.rs`: 0 live, 1 line
-    /// up, 2 line down, 3 page up, 4 page down, 5 oldest kept.
-    ///
-    /// The framebuffer console has no scrollback of its own - reaching the bottom of the screen used
-    /// to mean the top was gone permanently - and this is how a holder of the keyboard asks to look
-    /// back. The console does the arithmetic, because only it knows how many lines it is holding and
-    /// how tall the screen is; a second copy of either number here would be a second thing to drift.
-    ///
-    /// **THE SCROLL IS A REQUEST, NOT AN ESCAPE SEQUENCE.** Console output is untrusted content: a
-    /// file being `read` can hold any bytes, so a scroll expressed in the byte stream would let a
-    /// file scroll the view of the terminal showing it. A request carries a reply cap and output
-    /// does not, so the two channels are separated by construction.
-    ///
-    /// **`None` MEANS THE CONSOLE DID NOT ANSWER, and that is not the same as `(0, 0)`.**
-    ///
-    /// It returned `(0, 0)` for both "the view is at live" and "I could not reach the console",
-    /// and the caller could not tell them apart. On a Dell Wyse, 2026-09-18, that turned a timed-out
-    /// request into a plausible success: the shell believed it had scrolled back to live, left the
-    /// scrollback view, and returned to the prompt **while the screen was still showing history** -
-    /// the two disagreeing about what was on the display, with nothing said. A failure wearing a
-    /// valid value is the exact shape invariant 12 and 26.7 exist to forbid, and it is worth the
-    /// `Option` to make it unrepresentable.
-    ///
-    /// **ONE SECOND, AND NO RETRY - because this is a KEYSTROKE.** It used to be the same two
-    /// seconds plus a reacquire-and-retry that `console_dims` uses, which is right for a
-    /// once-per-command lookup and wrong here: it let a single press of an arrow key block the
-    /// shell for four seconds, which the operator experiences as the machine locking up. Nothing
-    /// above the kernel may hang on a peer (Commandment V); a scroll that cannot be served quickly
-    /// must FAIL quickly and say so.
-    ///
-    /// Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
-    /// console that has just restarted is rebuilding the screen anyway; the next `console_dims`
+    // RETAINED REASONING FROM THE DELETED `console_scroll`, and it is `//` rather than `///` on
+    // purpose. A `///` run attaches to the item BELOW it, and the item below this one is
+    // `console_history` - so while these lines were doc comments, rustdoc documented
+    // `console_history` as "Move the console's scrolled-back view" and handed the reader a
+    // deleted method's contract as if it were that method's. The words are kept because two of
+    // the lessons in them were expensive and are still true of anything that asks the console a
+    // question: a failure must not wear a valid value, and a KEYSTROKE may not wait seconds.
+    // The last sentence below stops mid-clause; its tail went with the code, and it is left
+    // truncated rather than completed by guess.
+    //
+    // Move the console's scrolled-back view, returning `(lines back, most it can go back)`.
+    //
+    // `action` is one of the `SCROLL_*` values in `services/console/src/term.rs`: 0 live, 1 line
+    // up, 2 line down, 3 page up, 4 page down, 5 oldest kept.
+    //
+    // The framebuffer console has no scrollback of its own - reaching the bottom of the screen used
+    // to mean the top was gone permanently - and this is how a holder of the keyboard asks to look
+    // back. The console does the arithmetic, because only it knows how many lines it is holding and
+    // how tall the screen is; a second copy of either number here would be a second thing to drift.
+    //
+    // **THE SCROLL IS A REQUEST, NOT AN ESCAPE SEQUENCE.** Console output is untrusted content: a
+    // file being `read` can hold any bytes, so a scroll expressed in the byte stream would let a
+    // file scroll the view of the terminal showing it. A request carries a reply cap and output
+    // does not, so the two channels are separated by construction.
+    //
+    // **`None` MEANS THE CONSOLE DID NOT ANSWER, and that is not the same as `(0, 0)`.**
+    //
+    // It returned `(0, 0)` for both "the view is at live" and "I could not reach the console",
+    // and the caller could not tell them apart. On a Dell Wyse, 2026-09-18, that turned a timed-out
+    // request into a plausible success: the shell believed it had scrolled back to live, left the
+    // scrollback view, and returned to the prompt **while the screen was still showing history** -
+    // the two disagreeing about what was on the display, with nothing said. A failure wearing a
+    // valid value is the exact shape invariant 12 and 26.7 exist to forbid, and it is worth the
+    // `Option` to make it unrepresentable.
+    //
+    // **ONE SECOND, AND NO RETRY - because this is a KEYSTROKE.** It used to be the same two
+    // seconds plus a reacquire-and-retry that `console_dims` uses, which is right for a
+    // once-per-command lookup and wrong here: it let a single press of an arrow key block the
+    // shell for four seconds, which the operator experiences as the machine locking up. Nothing
+    // above the kernel may hang on a peer (Commandment V); a scroll that cannot be served quickly
+    // must FAIL quickly and say so.
+    //
+    // Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
+    // console that has just restarted is rebuilding the screen anyway; the next `console_dims`
         // `console_scroll` IS GONE, and it is the mechanism `backlog/37` was about.
     //
     // It asked the console to move its own view, and the console could not answer until it had

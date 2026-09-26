@@ -23,7 +23,6 @@ EHCI_BDF
 EHCI_FOUND
 EHCI_IRQ
 EHCI_MMIO_BASE
-EL0_SHIM_LIMIT
 EMMC_DATA
 ETH_P_8021Q
 FB_READBACK_CHEAP
@@ -34,13 +33,10 @@ GMAC_CONFIG_ACS
 IA32_KERNEL_GS_BASE
 INTRL2_0
 INT_EP_CTL
-KERNEL_PT_PROTECTED
-LAST_FAIL
 LED_GPIO_CFG
 MAC_ADDR0
 MAIR_EL1
 MPIDR_EL1
-MSC_READY
 NIC_BDF
 NIC_FOUND
 NIC_MMIO_BASE
@@ -55,7 +51,6 @@ TCR_EL1
 TLB_ACK
 TLB_SHOOTDOWN_ADDR
 TX_DROPPED
-USB_CLAIM
 VIDEO_INPUT_8BITS
 VOUT_AXI
 XHCI_BDF
@@ -77,7 +72,6 @@ bcmgenet_rbuf_ctrl_set
 bcmgenet_rx_counters
 bcmgenet_tx_counters
 boot_cpuid_phys
-boot_service
 brcm_pcie_perst_set_generic
 bytes_sent
 civil_from_days
@@ -106,16 +100,13 @@ f_apic
 fb_barrier
 file_record
 fix_mac_speed
-flush_dcache
 fs_index
-fs_request_q
 genet_dma_ring_regs_v4
 gmac0_rmii_refin
 gmac0_tx
 goto_addr
 have_mac
 hdmitx0_pixelclk
-hotplug_poll
 hub_irq
 hw_mmio_of
 hw_params
@@ -127,13 +118,11 @@ missing_caps
 net_dispatch
 net_rx_isr
 note_io_error
-ns_request
 paint_view
 params_bcm2835
 phy_intf_sel
 ping_state
 quiet_waits
-reclaim_late_fs_reply
 reset_type
 reset_umac
 rst_ahb
@@ -154,8 +143,6 @@ smsc95xx_reset
 smsc95xx_set_multicast
 smsc95xx_tx_fixup
 smsc_read_or0
-sock_invoke
-split_txn_periodic
 starfive_dwmac_probe
 stmmac_dma_operation_mode
 stmmac_dvr_probe
@@ -176,3 +163,8 @@ vs_dc_enable
 workflow_dispatch
 yt8531_link_change_notify
 ytphy_get_delay_reg_value
+hotplug_poll                       # arch/arm/mod.rs - the in-kernel dwc2's exclusion protocol, named as history at the point a reader asks why masking was rejected
+msc_sync_cache                     # arch/arm/mod.rs - 'went with arch/arm/dwc2.rs'; the record must name what went
+process_pending                    # 3 sites, each saying in terms that it 'no longer exists' - the COM2 channel is services/control now (C1-6)
+probe_authority                    # services/probe/src/table.rs - CORRECTED: authority never was keyed by name in the kernel after step C; the name is kept naming the thing that is gone
+probe_mass_storage                 # kernel/src/syscall/dispatch.rs - CORRECTED: the kernel claims no USB device now; the name records the helper that went with arch/arm/dwc2.rs

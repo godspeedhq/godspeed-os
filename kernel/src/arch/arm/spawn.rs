@@ -28,7 +28,8 @@ pub(super) const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 pub(super) const USER_STACK_TOP: u32 = 0x8000_0000;
 
 /// A service loaded into a fresh address space with a task slot reserved and its cap installed, ready
-/// either to enter directly (`boot_service`) or to commit to the scheduler (`sched_user`).
+/// either to enter directly or to commit to the scheduler. (The two bring-up paths that did each of
+/// those were deleted with C1-1 - the kernel spawns the supervisor and nothing else.)
 pub(super) struct LoadedService {
     pub entry: u32,
     pub pt_root: u32,
@@ -140,7 +141,8 @@ pub(super) fn load_service_raw(elf: &[u8], extra_caps: &[Capability]) -> Option<
 
 
 /// Drop to PL0 at `entry` with user stack `sp` (the fabricated exception return from `usermode.rs`).
-/// The TTBR0 switch already happened in `boot_service`. Does not return - the service runs.
+/// The caller must already have switched TTBR0 to the service's page table. Does not return - the
+/// service runs.
 ///
 /// # Safety
 /// `entry` must be mapped USER-executable and `sp` USER-writable in the active address space.

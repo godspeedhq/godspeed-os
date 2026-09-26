@@ -3026,8 +3026,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // The badge names the socket FOR THIS SERVICE. It does nothing for the CLIENT, which waits
         // on its own single endpoint and cannot tell our reply from any other message landing there
         // - so the client is the only party with an ambiguity, and it was the one left without the
-        // means to resolve it. The cost was a DRAIN in `services/shell`'s `sock_invoke`, safe only
-        // because the shell serves nobody, plus the cap-reclaim that drain made necessary (SEC-35).
+        // means to resolve it. The cost was a DRAIN in the shell's own socket-invoke helper - retired
+        // when `sock` moved onto `gs::net`, since the stdlib's `gs::resource` HOLDS a message that is
+        // not its reply rather than destroying it - safe only because the shell serves nobody, plus
+        // the cap-reclaim that drain made necessary (SEC-35).
         //
         // THE SAME TWO HEADER BYTES AS A NAMED REQUEST: the tag to echo, and how long the client
         // will wait. An earlier cut of this took only the tag, on the reasoning that "patience is the

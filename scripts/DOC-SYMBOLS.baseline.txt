@@ -51,3 +51,7 @@ take_output_snap                   # backlog/37 post-mortem - DELETED by bbd2447
 NET_TXN_SECS                       # backlog/29 + docs/stdlib-design.md - RETIRED with the shell's hand-rolled net path; both are records of what it did
 drain_stale_net_replies            # backlog/29 post-mortem - REMOVED once the correlation tag made a pre-emptive drain unnecessary; the record must name what went
 fs_request_bounded                 # docs/stdlib-design.md 22 - DELETED by the dogfood; the table says what each commit removed and must name it
+ns_request                         # backlog/29 + docs/stdlib-design.md + utilities/0_conventions.md - DELETED by 00b273ea when `tcp`/`sock`/`serve` moved onto gs::net; all three are records of what it did
+sock_invoke                        # docs/stdlib-design.md 16 - DELETED by 00b273ea, replaced by gs::resource's held-not-drained invoke; the section records the design it had
+split_txn                          # docs/arm32-usb-userspace.md - the IN-KERNEL dwc2 driver's split path, deleted with arch/arm/dwc2.rs; the port journal names what it was read against
+split_txn_periodic                 # docs/arm32-usb-userspace.md - ditto; `periodic_split_in` in services/dwc2 is what it became

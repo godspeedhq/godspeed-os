@@ -1298,9 +1298,10 @@ pub fn liveness_deadline_cycles() -> u64 {
 }
 
 pub fn usb_disk_busy() -> bool { false }
-/// Is there no USB disk attached at all? Answered from PRESENT state (`MSC_READY`), not from the last
-/// transfer's outcome - which is exactly why it is a separate question. See `USB_DISK_ABSENT` in the
-/// syscall dispatch for what conflating the two cost.
+/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
+/// dispatch. Slice 5 took the USB stack out of the kernel (`services/dwc2` owns the controller), so
+/// no request reaches a backend here and the question is moot; the read/write primitives already
+/// answer false.
 pub fn usb_disk_absent() -> bool { true }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
@@ -2516,9 +2517,12 @@ pub mod interrupts {
         //
         // Masking here would be worse, not better: an enumeration runs ~100 ms, and suppressing the tick
         // that long stops core 0's liveness stamp and lets another core panic the machine. So the
-        // exclusion is a PROTOCOL instead - `dwc2::hotplug_poll` takes `UsbExclusive` and every other
-        // shared-selection path stands aside for the duration (storage answers BUSY and re-asks, which it
+        // exclusion was a PROTOCOL instead - the hot-plug poll took an exclusion token and every other
+        // shared-selection path stood aside for the duration (storage answers BUSY and re-asks, which it
         // already knows how to do). Interrupts stay on, the tick keeps running, and nothing races.
+        // (The two names this cited, `dwc2::hotplug_poll` and `UsbExclusive`, went with the in-kernel
+        // driver in slice 5. The REASONING is why masking is still the wrong answer here, which is what
+        // this paragraph is for; the mechanism now lives in `services/dwc2`.)
         // NOTE: handing the vector back does NOT restore USB. Reboot to get the devices back.
         //
         // Releasing the route on death unmasks the line, but it cannot hand back DEVICE
@@ -2532,17 +2536,20 @@ pub mod interrupts {
         // happen in a tick handler - spent on a recovery path for a driver that Slice 5 deletes.
         // Rebooting costs twenty seconds and no code. Left as a documented limitation rather than
         // dead code implying a capability that does not exist.
-        // Both of these stand down for a userspace owner, for the reason above: one controller, one
-        // driver. `hotplug_poll` in particular takes the exclusive bulk claim and rewrites the shared
-        // device selection, which is precisely what must not happen underneath another driver.
+        // Both of the calls that were here stood down for a userspace owner, for the reason above:
+        // one controller, one driver. The hub poll in particular took the exclusive bulk claim and
+        // rewrote the shared device selection, which is precisely what must not happen underneath
+        // another driver. Slice 5 deleted both with the in-kernel DWC2 driver, which is why the block
+        // below is empty; `services/dwc2` owns the controller now.
         if !super::irq::usb_owned_by_userspace() {
-        // Watch the ethernet cable for the same reason, on the same terms. The PHY read was already
-        // written and already correct - but nothing CALLED it unless a service asked (`net`, `ping`), so
-        // unplugging the cable on an idle machine was silent while unplugging the keyboard was not.
-        // Polling it here makes the cable report itself live, like every other plug. It is a separate call
-        // rather than folded into `hotplug_poll` because it must run OUTSIDE that function's exclusive
-        // section: it takes the same bulk claim, and nesting would make it stand aside from itself. Both
-        // are individually rate-limited to ~1 s and both yield to storage, so idle stays cheap.
+        // The ethernet cable was watched here for the same reason, on the same terms. The PHY read was
+        // already written and already correct - but nothing CALLED it unless a service asked (`net`,
+        // `ping`), so unplugging the cable on an idle machine was silent while unplugging the keyboard
+        // was not. Polling it here made the cable report itself live, like every other plug. It was a
+        // separate call rather than folded into the hub poll because it had to run OUTSIDE that
+        // function's exclusive section: it takes the same bulk claim, and nesting would make it stand
+        // aside from itself. Both were individually rate-limited to ~1 s and both yielded to storage,
+        // so idle stayed cheap.
         }
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }

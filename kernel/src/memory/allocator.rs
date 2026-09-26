@@ -115,7 +115,7 @@ struct BitmapAllocator {
     /// stray device DMA (if the kill-path bus-master quiesce ever fails) lands in a reserved DMA frame,
     /// corrupting only DMA data (caught by AHCI/USB CRC), never a page table or kernel struct. The
     /// per-driver arena is reused across respawns, so this is bounded (one arena per driver). Each entry
-    /// is (base_frame_index, n_frames); (0, 0) = empty. Mirrors the KERNEL_PT_PROTECTED guard below.
+    /// is (base_frame_index, n_frames); (0, 0) = empty. Mirrors the `KPT` (kernel-PT-protected) guard.
     dma_reserves: [(usize, usize); MAX_DMA_RESERVES],
 }
 
@@ -789,12 +789,12 @@ unsafe fn pt_read(hhdm: u64, table_phys: u64, idx: usize) -> u64 {
 }
 
 /// Clear the free bit for the frame at `phys` if it is currently marked free,
-/// and permanently mark it in `KERNEL_PT_PROTECTED` so `free_frame` can never
+/// and permanently mark it in the `KPT` bitmap so `free_frame` can never
 /// reclaim it.  `alloc_lock` must be held.
 ///
 /// # Safety
 /// `ALLOC_LOCKED` must be held; this mutates `BITMAP`, `ALLOCATOR`, and
-/// `KERNEL_PT_PROTECTED`.
+/// `KPT`.
 #[inline]
 unsafe fn mark_pt_frame_used(phys: u64) {
     let idx = (phys / FRAME_SIZE) as usize;

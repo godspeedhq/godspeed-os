@@ -405,7 +405,7 @@ pub fn enable() -> u64 {
 }
 
 /// Was `allow_el0` - REMOVED. It patched `AP` on the live map and flushed, and the flush was fatal
-/// (see `EL0_SHIM_LIMIT`). EL0 access is now decided when the tables are built, so there is no live
+/// (see `el0_region`). EL0 access is now decided when the tables are built, so there is no live
 /// mutation and no maintenance to get wrong. Kept as a note rather than dead code so the next person
 /// does not reinvent it.
 /// Move the running kernel into the high half: `SP` and `PC` both, in one step.

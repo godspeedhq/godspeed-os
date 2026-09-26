@@ -629,8 +629,9 @@ fn clean_invalidate_dcache_range(addr: u32, len: u32) {
     let mut p = addr & !31;
     let end = addr.saturating_add(len);
     // `p >= addr` is the wrap guard: at the very top of the address space `p += 32` overflows to 0
-    // and, with overflow checks off in release, would loop forever. The sibling `flush_dcache` uses
-    // wrapping arithmetic and exits naturally; this one did not.
+    // and, with overflow checks off in release, would loop forever. (The DWC2 driver had a sibling
+    // sweep that used wrapping arithmetic and exited naturally; this one did not. That driver left the
+    // kernel in Slice 5, so the guard here is the only surviving record of the hazard.)
     while p < end && p >= addr {
         // SAFETY: `DCCIMVAC` (`c7, c14, 1`) cleans+invalidates one line by MVA to the PoC. No memory is
         // modified; identity-mapped physical addresses are valid MVAs on this port.

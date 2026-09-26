@@ -193,8 +193,8 @@ a USERSPACE driver.
 That one line exercises the entire transfer path: channel programming, a DMA the controller performs
 against the service's own granted arena, the `DMA_BUS_ALIAS` translation **on real silicon**, and all
 three control stages. It also confirms the no-cache-maintenance reasoning empirically rather than by
-argument - the arena is Device/uncached, so the `flush_dcache` calls the kernel driver needs for its
-cached buffers have no counterpart here.
+argument - the arena is Device/uncached, so the cache-maintenance calls the in-kernel driver needed
+for its cached buffers have no counterpart here.
 
 **Two slices, two first-try passes on hardware.** Both because the code was LIFTED with its comments
 rather than re-derived: the sequence, the register order, the odd-frame rule and the short-packet
@@ -548,8 +548,10 @@ Everything underneath it is now proven: the controller, the channels, control tr
 split, enumeration, addressing, the hub, and the keyboard's own binding. So when 2b misbehaves it
 will misbehave for one reason, which is the whole point of having got here in slices.
 
-**Read `split_txn_periodic` before writing it.** That has been the cheapest move five times in this
-port - most recently the multi-packet split, where the answer was in a comment written by someone who
+**Read the periodic split path before writing it** - `periodic_split_in` in
+`services/dwc2/src/chan.rs`, which is where this logic ended up once the driver left the kernel (it
+was `split_txn_periodic` in `arch/arm/dwc2.rs` when this was written). That has been the cheapest
+move five times in this port - most recently the multi-packet split, where the answer was in a comment written by someone who
 had already paid for the same symptom on the same board.
 
 ## SLICE 1 COMPLETE
@@ -607,9 +609,11 @@ known-harder case: each packet needs its own start-split/complete-split pair, an
 currently issues one pair for the whole transfer.
 
 Next step, and it is a comparison rather than a guess: the kernel driver reads full descriptors from
-this same low-speed keyboard successfully, so the working answer is in `split_txn` /
-`chan_dma` - specifically how the packet count in HCTSIZ interacts with a split, and whether the
-controller re-issues the split per packet or the driver must. Read that before changing anything.
+this same low-speed keyboard successfully, so the working answer is in its split and DMA paths -
+today `periodic_split_in` and its callers in `services/dwc2/src/chan.rs`, then the in-kernel
+`split_txn` / `chan_dma` this sentence was written against - specifically how the packet count in
+HCTSIZ interacts with a split, and whether the controller re-issues the split per packet or the
+driver must. Read that before changing anything.
 
 ### How the earlier STALL was resolved
 

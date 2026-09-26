@@ -9905,7 +9905,7 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
 /// the reader - which is congestion, not absence, and the two must not be reported the same way
 /// (the same distinction `KIND_QUEUE_FULL` exists for). Bounded: three attempts, then it says so.
 fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> ReqOutcome {
-    // BOUNDED AND `q`-ABORTABLE, for the same reason as `ns_request` and `fs_request_q` - and with
+    // BOUNDED AND `q`-ABORTABLE, for the same reason as `ns_query` and `fs_request` - and with
     // more force here than either. `request_with_reply` parks the caller inside the syscall where it
     // cannot poll the console, so an `events` that is alive but not answering froze the prompt with
     // no way out. THIS COMMAND IS THE INSTRUMENT YOU REACH FOR WHEN SOMETHING IS WEDGED: `events
@@ -13557,7 +13557,7 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// exactly what happened on the Pi 2, whose FUA-per-write stick makes a full-tree fsck genuinely slow.
 /// Conventions rule 9 (a blocking command stays q-abortable) is not optional for the longest commands in
 /// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
-/// (`fs_request_q` would append a path-length byte).
+/// (`fs_request` would append a path-length byte).
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "[q] quit" only once the wait lingers
     const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE, not the volume - a real bound

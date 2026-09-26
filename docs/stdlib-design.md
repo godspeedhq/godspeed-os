@@ -908,8 +908,10 @@ branch was never the external case; it is the local one. The assertion now requi
 The framing itself is shared: one strip site, one echo site, common to all three capability kinds, so
 the UDP test does exercise the framing that `serve` relies on. What is untested is the op-specific
 behaviour - and no op arm was modified. The residual risk is concentrated in one place: the
-mismatch branch of `sock_invoke`, which reclaims embedded capabilities, and which only an ACCEPT
-exercises. That wants a real listener, which means hardware.
+mismatch branch - now `gs::resource`'s held-message path in `stdlib/rust/src/resource.rs`, which
+reclaims embedded capabilities rather than dropping them - and which only an ACCEPT exercises.
+(This named the shell's `sock_invoke`, deleted when `sock` moved onto `gs::net`; the risk is the
+same one, in the code that inherited it.) That wants a real listener, which means hardware.
 
 ## 17. `gs::net::Socket`, and two deadline bugs the dogfood found
 

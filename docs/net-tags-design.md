@@ -305,7 +305,7 @@ cannot bound its own serve time, and it does not know the client's deadline.
 **Correlation on the CLIENT hop** - net-stack <-> its clients - which is a different hop from the one
 this whole document is about. The client tags its request, net-stack echoes the tag, and the client
 discards a reply to a question it is no longer asking. That is exactly what `fs` carries
-(the shell's `drain_stale_fs_replies` / `reclaim_late_fs_reply`),
+(the shell's `drain_stale_fs_replies`),
 and exactly what this hop does not.
 
 Until then, deferral is unsafe and dropping is correct: the client times out, retries, and exactly

@@ -2701,8 +2701,11 @@ fn handle_gpio(op: u64, pin: u64) -> i64 {
     crate::arch::imp::gpio_op(op as u32, pin as u32)
 }
 
-/// One block of the USB mass-storage device. The whole storage stack is 512-byte blocks, and the kernel
-/// only claims a device whose sectors are that size (`dwc2::probe_mass_storage`), so this is fixed.
+/// One block of the USB mass-storage device. The whole storage stack is 512-byte blocks, and the
+/// `dwc2` SERVICE is what reads and writes at that size (`services/dwc2/src/msc.rs`), so this is
+/// fixed. It said the KERNEL "only claims a device whose sectors are that size" via
+/// `dwc2::probe_mass_storage`; the kernel claims no USB device on any port now - every arch's
+/// `usb_disk_sectors()` returns 0 - and that helper went with `arch/arm/dwc2.rs` in slice 5.
 const USB_DISK_BLOCK: usize = 512;
 
 /// UsbDiskInfo (46): capacity of the attached USB mass-storage device in 512-byte sectors, 0 if none.
@@ -2734,9 +2737,9 @@ const USB_DISK_BUSY: i64 = -20;
 /// every request, and then reported "the device stayed busy, it did not fail" - a statement that was not
 /// true of a stick sitting on the desk.
 ///
-/// The conflation was structural, not a missing branch. `usb_disk_busy()` reads `LAST_FAIL`, which
-/// records the last TRANSFER's outcome - and a refusal short-circuits before any transfer, so it left
-/// whatever the previous one wrote. A stick pulled mid-command leaves a NAK there, so "absent" inherited
+/// The conflation was structural, not a missing branch. `usb_disk_busy()` answered from the last
+/// TRANSFER's outcome - and a refusal short-circuits before any transfer, so it left whatever the
+/// previous one wrote. A stick pulled mid-command leaves a NAK there, so "absent" inherited
 /// "busy" from the transfer that was in flight when it was pulled. The state was stale rather than wrong,
 /// which is why it read as plausible (§26.4 - a derived value must reduce to a current truth).
 const USB_DISK_ABSENT: i64 = -21;

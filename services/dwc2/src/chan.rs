@@ -4,12 +4,13 @@
 //! and compose the three of them into a USB control transfer. Everything here goes through the SDK's
 //! safe `Mmio`/`Dma` wrappers, so the service still carries no `unsafe` (§18.2).
 //!
-//! **No cache maintenance, and that is a property of the grant rather than an omission.** The kernel
-//! driver brackets every transfer with `flush_dcache` (DCCIMVAC) because it DMAs to and from CACHED
-//! kernel buffers on a non-coherent Cortex-A7. This service's DMA arena is mapped **Device/uncached**
-//! (`DMA_ARENA_UNCACHED = true` on arm32 sets `PCD`, which the ARM encoder maps to TEX=0b000, C=0,
-//! B=1), so CPU writes reach memory directly and the device's writes are visible without an
-//! invalidate. Ring-0 cache ops are not available to a service, and this is why they are not needed.
+//! **No cache maintenance, and that is a property of the grant rather than an omission.** The
+//! in-kernel driver this replaced (`arch/arm/dwc2.rs`, since deleted) bracketed every transfer with a
+//! DCCIMVAC clean+invalidate because it DMAed to and from CACHED kernel buffers on a non-coherent
+//! Cortex-A7. This service's DMA arena is mapped **Device/uncached** (`DMA_ARENA_UNCACHED = true`
+//! on arm32 sets `PCD`, which the ARM encoder maps to TEX=0b000, C=0, B=1), so CPU writes reach
+//! memory directly and the device's writes are visible without an invalidate. Ring-0 cache ops are
+//! not available to a service, and this is why they are not needed.
 
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -339,9 +340,9 @@ fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
 /// It brute-forces a landing microframe by SWEEPING 0..7 across retries rather than scheduling one
 /// precisely, because a non-periodic split has no fixed schedule. That makes it tolerant of being
 /// preempted: a badly-timed attempt simply retries at a different microframe. The PERIODIC path
-/// (`split_txn_periodic` in the kernel driver) does need microframe-accurate scheduling and is the
-/// genuinely risky part of moving this driver out of ring 0 - it is needed only for the keyboard's
-/// interrupt endpoint, so it belongs to Slice 2, faced on its own.
+/// (`periodic_split_in`, below) does need microframe-accurate scheduling and was the genuinely risky
+/// part of moving this driver out of ring 0 - it is needed only for the keyboard's interrupt
+/// endpoint, so it was faced on its own, in Slice 2.
 #[allow(clippy::too_many_arguments)]
 fn stage_split_one(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,

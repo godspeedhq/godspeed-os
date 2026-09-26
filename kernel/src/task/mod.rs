@@ -902,8 +902,8 @@ fn service_hw(name: &str) -> (HwClass, bool) {
 /// separate `name == "shell" || name == "supervisor" || ...` blocks scattered down the spawn path, each
 /// its own drift risk. Centralizing them here mirrors the `service_hw` doctrine (§26.4 no scattered
 /// authority; IV honor contracts declaratively): the spawn path reads these booleans, never a re-derived
-/// `name ==` check. `is_probe` (the caller's ELF is `PROBE_ELF`) covers the whole test-probe family by
-/// identity, so no probe is missed by name.
+/// `name ==` check. The test-probe family is not named here at all: a probe's privileges travel in the
+/// supervisor's spawn request (`probes::privileges_of`), so none of them is missed by name.
 /// Bit positions for `SpawnRequest::privileges`. One bit per field of `Privileges` below, in
 /// declaration order, so the wire form and the struct cannot drift apart silently.
 ///
