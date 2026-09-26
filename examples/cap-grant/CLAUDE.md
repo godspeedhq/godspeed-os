@@ -87,5 +87,5 @@ GRANT. To receive a delegated cap, pair `gs::ipc::recv` with `gs::ipc::take_sent
 - **Commandments VI, VII, IX, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §7.4 (the GRANT right), §7.6 (the transfer rule), §8.5 (embedded capabilities).
 - `examples/00-hello` (the service skeleton), `examples/ping` (IPC + restart recovery).
-- `examples/resource-server` (planned) - minting *new* resource capabilities a service owns (the
+- `examples/resource-server` - minting *new* resource capabilities a service owns (the
   "a file is a capability" mechanism, §7.10).

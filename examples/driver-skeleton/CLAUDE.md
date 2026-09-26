@@ -97,8 +97,14 @@ core = 1   # the device's interrupt routes to the core the driver runs on; pinni
 Copy this folder for your device. Replace the illustrative register map with your datasheet's
 offsets, fill in `bring_up` (reset, identity, ring/buffer setup) and `handle_request`, and declare
 your real `hw_mmio`/`hw_interrupt` (and a DMA arena if the device needs one) in the contract. To make
-it actually run, add the kernel-side hook that recognises your driver and maps its BAR - that one
-step is shown working in `examples/e1000`.
+it actually run, give it a row in the supervisor's spawn table naming its device CLASS - the kernel
+resolves that against its own bus scan and hands back the MMIO window, the DMA arena, the BDF and the
+interrupt vector.
+
+> **Corrected 2026-09-26.** This said "add the kernel-side hook that recognises your driver and maps
+> its BAR". There is no such hook: `service_hw` in `kernel/src/task/mod.rs` has no arms left, and its
+> comment says "Nothing is left to look up by name here." A driver needs NO kernel source change,
+> which is the whole point of Commandment I and what `README.md` claims.
 
 ## See also
 

@@ -25,12 +25,12 @@ The owner side, using only real `ServiceContext` methods:
 
 | Step | Call | What happens |
 |------|------|--------------|
-| Mint | `ctx.resource_mint(READ\|WRITE\|GRANT)` | the kernel allocates a fresh opaque `ResourceId` at generation 0, records THIS service as its owner, and mints a real cap for it - returns `(resource_id, cap)` |
+| Mint | `gs::resource::mint(&ctx, gs::cap::READ \| gs::cap::GRANT)` | the kernel allocates a fresh opaque `ResourceId` at generation 0, records THIS service as its owner, and mints a real cap for it - returns `(resource_id, cap)` |
 | Make a copy to give | `gs::cap::duplicate(&ctx, cap)` | a derived copy; rights can only narrow, never widen (§7.3) |
 | Hand it to a client | `gs::ipc::send_granting(&ctx, client, copy, &note)` | the kernel **moves** the copy into the client's table (§7.6, §8.5); we drop our own cap and serve via the badge |
-| Serve a use | `ctx.last_recv_badge()` -> `(resource_id, right)` | a holder's `resource_invoke` is kernel-validated and routed here, **badged** with which resource and the right the kernel already checked |
+| Serve a use | `gs::resource::last_badge(&ctx)` -> `(resource_id, right)` | a holder's `resource_invoke` is kernel-validated and routed here, **badged** with which resource and the right the kernel already checked |
 | Enforce non-escalation | `op <= right` | a READ-validated cap must never drive a WRITE - the owner's matching check (§7.3) |
-| Revoke | `ctx.resource_revoke(resource_id)` | a generation bump makes EVERY outstanding cap to the resource go stale: next use is `CapRevoked` (§7.5) |
+| Revoke | `gs::resource::revoke(&ctx, resource_id)` | a generation bump makes EVERY outstanding cap to the resource go stale: next use is `CapRevoked` (§7.5) |
 
 A holder USES the cap with `ctx.resource_invoke(cap, right, reply, &msg)`; the kernel validates it and
 routes it here badged. `fs` does exactly this: `Open` mints a file cap, an invoke reads/writes the
@@ -38,10 +38,18 @@ file, and delete/close revokes it.
 
 ## Minting is gated (this is the point)
 
-`resource_mint` is **not** ambient. It requires a `RESOURCE_MINT` authority granted **by name inside
-the kernel** only to authorized minters (today: `fs`) - the same by-name kernel-grant mechanism
-`examples/e1000` uses for its NIC BAR. It is deliberately NOT a contract capability field (not in the
-schema): a service cannot ask for it; the kernel decides who may issue resources. The kernel grants it
+`resource_mint` is **not** ambient. It requires a `RESOURCE_MINT` authority, which arrives in the
+SPAWN REQUEST and is refused unless the SUPERVISOR itself may delegate it
+(`SUPERVISOR_DELEGATABLE`) - so a spawner passes on what it has and never mints authority into
+existence (§3.1). It IS declarable in the contract (`resource_mint = true`, and this example's own
+contract carries it), as the build-time statement of that grant, reconciled by
+`IV-contract-authority`.
+
+> **Corrected 2026-09-26.** This said RESOURCE_MINT is "granted by name inside the kernel" to
+> minters "(today: `fs`)" and is "deliberately NOT a contract capability field (not in the schema)".
+> The schema has `resource_mint`, this example's contract declares it, and the `service_hw` arm the
+> claim rested on has no arms left. Three places in this file said it and the contract said it a
+> fourth time, nine lines below its own `resource_mint = true`. The kernel grants it
 to `resource-server` too - but ONLY in the `resource-test` build (`osdev test resource-server`), the
 only build that spawns this service - so the grant is effectively test-only, exactly as
 `reply-server`/`asker` are spawned only in the `reply-test` build (the kernel always embeds them; the
@@ -86,9 +94,10 @@ endpoint cap:
 
 ## What you must NOT do
 
-- **Do not try to request `RESOURCE_MINT` in the contract.** It is not a contract field and the schema
-  has no slot for it. Minting authority is granted by name in the kernel, deliberately - working around
-  that is exactly the ambient authority **Commandment VII** forbids.
+- **Do not assume declaring `resource_mint` GRANTS it.** The contract is a build-time declaration;
+  the authority arrives in the spawn request and is refused unless the supervisor may delegate it.
+  Declaring it and finding the call denied means the spawn row, not the contract, is what to look at
+  (§13.6 exists because a model got this exactly backwards). **Commandment VII.**
 - **Do not teach the kernel what your resource means.** Keep `ResourceId -> meaning` in the service.
   The moment the kernel knows it is a file, the anti-scope (§4.4) is broken and **Commandment III**
   with it.
@@ -100,10 +109,10 @@ endpoint cap:
 
 ## How to adapt this
 
-To serve any resource-as-capability: get the kernel to grant your service a `RESOURCE_MINT` authority
-by name (the e1000 BAR hook is the template for that kind of by-name grant), `resource_mint` a
-resource per client, hand each client a `gs::cap::duplicate` copy, then serve invocations off
-`last_recv_badge()` - resolving the `ResourceId` to your own meaning, enforcing `op <= right`, and
+To serve any resource-as-capability: have the supervisor's spawn row grant your service
+`RESOURCE_MINT` (and declare it in your contract so the two agree), `gs::resource::mint` a resource
+per client, hand each client a `gs::cap::duplicate` copy, then serve invocations off
+`gs::resource::last_badge` - resolving the `ResourceId` to your own meaning, enforcing `op <= right`, and
 `resource_revoke`-ing when the resource goes away. `services/fs` is this exact shape, fully grown.
 
 ## See also

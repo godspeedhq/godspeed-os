@@ -19,7 +19,7 @@ log_write   = true               # may write the kernel log ring + serial (sysca
 
 # NO `ipc_send` - and that is the point. A request/reply server has NO named peer to send to: it
 # replies over the REPLY capability the client embeds in each request (retrieved with
-# `take_pending_cap`), not over a SEND cap wired from this contract. The server's only authority to
+# `gs::ipc::take_sent_cap`), not over a SEND cap wired from this contract. The server's only authority to
 # call anyone back is the cap it was handed (Commandment VII, §7.10/§8.5). A one-way producer (see
 # examples/ping) declares `ipc_send`; a reply server does not.
 

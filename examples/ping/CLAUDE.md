@@ -11,7 +11,7 @@ Demonstration service - sends one message to `pong` per second (§23.1).
 
 ## Spawn order
 
-Ping is spawned by the supervisor **before** any probe services - second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 178 probe services compete for scheduler quanta on Core 0.
+Ping is spawned by the supervisor **before** any probe services - second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 193 probe services compete for scheduler quanta on Core 0.
 
 ## Cap-rebinding pattern
 

@@ -319,7 +319,7 @@ API references under `/api`:
 Two sections worth knowing about:
 [**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
 may *not* do, and diagrams of how they reach each other over endpoints - and
-[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 47 of them, each with
+[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 55 of them, each with
 its full specification.
 
 The docs in this repo also render as a browsable site built with

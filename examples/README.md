@@ -41,7 +41,7 @@ now runs somewhere, and this is where:
 
 | Example | What runs it | What that proves |
 |---|---|---|
-| `ping` / `pong` | `osdev test identity` (Tests 3, 6, 9, 10) | cross-core IPC, restart, cap rebinding |
+| `ping` / `pong` | `osdev test identity` (Tests 6, 8, 9, 10 - 8B asserts `ping: sent 20 messages`; Test 3 uses the probes, not these) | cross-core IPC, restart, cap rebinding |
 | `counter` | `osdev test counter` | persisted a count, was killed, recovered it on respawn |
 | `reply-server` / `asker` | `osdev test reply-server` | the round trip closed and the reply echoed the request |
 | `resource-server` / `holder` | `osdev test resource-server` | mint, use, non-escalation refused, `CapRevoked` after revoke |

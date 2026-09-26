@@ -23,7 +23,7 @@ Two halves, using only real `ServiceContext` methods:
 
 | Half | Call | What happens |
 |------|------|--------------|
-| Reach `fs` | `ctx.acquire_send_cap("fs")` | resolve `fs` by name via the kernel directory; `None` -> degrade |
+| Reach `fs` | `gs::cap::acquire(&ctx, "fs")` | resolve `fs` by name via the kernel directory; `None` -> degrade |
 | **Load-on-spawn** | `ctx.request_with_reply("fs", read_op)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
 | **Save-on-change** | `ctx.request_with_reply("fs", write_op)` | after each increment, overwrite `/counter.dat` with the new count |
 | Recover from `fs` restart | `gs::cap::reacquire(&ctx, "fs")` | on a missed reply (cap went `EndpointDead`), reacquire by name and retry once (§14.3) |

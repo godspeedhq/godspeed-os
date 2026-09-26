@@ -14,12 +14,15 @@ limit   = "16MiB"
 # `contracts/schema/service.schema.json` (validated by `osdev validate`) and `contracts/CLAUDE.md`:
 # ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
 #
-# This driver declares NO hw_mmio: its NIC BAR is granted by the kernel BY NAME at spawn - declared
-# in the kernel's `service_hw` table (kernel/src/task/mod.rs: `"nic-driver" | "e1000" => HwClass::Nic`),
-# the ONE place a driver's device class is named (the same table the xhci/ehci/block-driver controllers
-# use; not a scattered `if name ==` branch), gated on the discovered NIC actually being an Intel e1000.
-# Reach it via ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC driver
-# would add both (see driver-skeleton).
+# This driver declares NO hw_mmio: its NIC BAR is granted at spawn because the SUPERVISOR's spawn row
+# for this service names a device CLASS, which the kernel resolves against its own bus scan (the same
+# route xhci, ehci and block-driver take). Reach the window via ctx.mmio(). A read-only driver needs no
+# DMA arena and no hw_interrupt; a full NIC driver would add both (see driver-skeleton).
+#
+# CORRECTED 2026-09-26: this said the BAR is granted "BY NAME ... declared in the kernel's
+# `service_hw` table", gated on the NIC "actually being an Intel e1000". `service_hw` has no arms left
+# and the vendor whitelist is gone - step D removed both, so the kernel need not have been taught your
+# device. A driver needs no kernel source change.
 log_write = true   # may write the kernel log ring + serial (syscall 5); NOT to any service
 
 [placement]

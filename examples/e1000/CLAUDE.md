@@ -8,9 +8,10 @@ the whole thing fits in one screen and the discipline stays visible.
 
 ## Purpose
 
-Prove that a contributor can drive **new** hardware on GodspeedOS end to end: declare a service, add
-one small kernel hook to grant its BAR, read device registers through the safe SDK wrapper, and run -
-all without writing `unsafe` and without expanding the kernel's responsibilities.
+Prove that a contributor can drive **new** hardware on GodspeedOS end to end: declare a service, name
+its device CLASS in the supervisor's spawn row, read device registers through the safe SDK wrapper, and
+run - all without writing `unsafe`, without expanding the kernel's responsibilities, and **without a
+kernel source change of any kind**.
 
 ## What it demonstrates
 
@@ -27,19 +28,33 @@ so the driver contains **no `unsafe`**.
 
 ## Why it is built this way (the Commandments)
 
-- **Commandment I + X (a driver is a service, not a kernel change).** The only kernel change this
-  example needs is one entry in the `service_hw` table in `kernel/src/task/mod.rs`
-  (`"nic-driver" | "e1000" => HwClass::Nic`) - the single, centralized place a driver's device class is
-  named, not a scattered `if name ==` branch (audit M7/T1 moved it there; the non-hardware privileges
-  live in the sibling `service_privileges` table, audit U15). That is the kernel doing its one job -
-  granting a hardware capability - and nothing more. All device logic lives here, in userspace, and the
-  volatile-register `unsafe` stays isolated in the SDK `Mmio` layer (§18.1). *(COMMANDMENTS.md I, X;
+- **Commandment I + X (a driver is a service, and needs NO kernel change at all).** This example
+  needs none: a driver names its device CLASS in the SPAWN REQUEST the supervisor sends, and the
+  kernel resolves that against its own bus scan. `README.md` says the same - "It needs no kernel
+  source change."
+
+  > **Corrected 2026-09-26.** This said the example needs "one entry in the `service_hw` table in
+  > `kernel/src/task/mod.rs` (`"nic-driver" | "e1000" => HwClass::Nic`)". That table has NO ARMS
+  > left - only `_ => (HwClass::None, false)`, under a comment reading "EVERY driver has moved to
+  > the supervisor (step C) ... Nothing is left to look up by name here." Following the old
+  > instruction meant editing ring 0 to add a name to a table that no longer reads names. The
+  > vendor whitelist this document also described (`0x100E_8086`) went the same way: step D
+  > removed it, so the kernel no longer needs to have been taught your device.
+
+  The kernel still does its one job - granting a hardware capability - and nothing more. All device
+  logic lives here, in userspace, and the volatile-register `unsafe` stays isolated in the SDK
+  `Mmio` layer (§18.1). *(COMMANDMENTS.md I, X;
   CLAUDE.md §4.3, §12, §18.1, §26.10.)*
-- **Commandment VII (no ambient authority, made concrete).** The kernel maps the BAR
-  `if name == "e1000" && the discovered NIC is actually an Intel e1000 (vendor/device 0x100E8086)`.
-  That one gate IS the no-ambient-authority discipline: the driver reaches the NIC's registers only
-  because it was granted them, only for the device it was written for. On any other NIC the grant
-  never happens, so `ctx.mmio()` returns `None` and the driver touches no foreign hardware. With an
+- **Commandment VII (no ambient authority, made concrete).** The driver reaches the NIC's registers
+  only because its spawn row asked for that device CLASS and the kernel's own bus scan found one. It
+  is granted a window, never given the bus. Where no matching device is found the grant never
+  happens, so `ctx.mmio()` returns `None` and the driver touches no foreign hardware.
+
+  > **Corrected 2026-09-26.** This said the kernel maps the BAR `if name == "e1000" && the
+  > discovered NIC is actually an Intel e1000 (vendor/device 0x100E8086)`. That vendor whitelist is
+  > gone - step D removed it precisely so the kernel need not have been taught your device - and the
+  > by-name gate went with `service_hw`'s arms. The no-ambient-authority property is unchanged and
+  > now rests on the class the spawn request names. With an
   IOMMU present a full driver's DMA would be confined to its arena too (§6.4 / H1).
   *(COMMANDMENTS.md VII; CLAUDE.md §12.3, §6.4, Invariant 1.)*
 - **Commandment V (no service is special).** When no e1000 is mapped - it is absent, or the machine
@@ -63,11 +78,11 @@ so the driver contains **no `unsafe`**.
 ```toml
 [capabilities]
 log_write = true
-# The NIC's MMIO BAR is granted by the kernel BY NAME at spawn - declared in the `service_hw` table
-# (kernel/src/task/mod.rs), the one centralized place a driver's device class is named (the same table
-# xhci/ehci/block-driver use), gated on the discovered NIC being a real Intel e1000. Reach it via
-# ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC driver would add
-# both (see examples/driver-skeleton for that shape).
+# The NIC's MMIO BAR is granted at spawn because the supervisor's spawn row for this service names a
+# device CLASS, which the kernel resolves against its own bus scan (the same route xhci, ehci and
+# block-driver take). NOT by name, and NOT from this file: nothing parses TOML at spawn (13.6). Reach
+# the window via ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC
+# driver would add both (see examples/driver-skeleton for that shape).
 
 [placement]
 core = 1
@@ -104,17 +119,19 @@ of it on every restart (Commandments V + IX). `docs/networking.md` sketches that
   pointers break §18.2 and **Commandment X**.
 - **Do not assume the NIC is an e1000.** The kernel gate already enforces this; mirror it in spirit -
   degrade when `ctx.mmio()` is `None` rather than reading garbage and trusting it (**Commandment V**).
-- **Do not widen the kernel hook into "map any NIC's BAR for anyone".** Grant the specific device to
-  the specific driver; a broad grant is ambient authority (**Commandment VII**).
+- **Do not widen the device class into "any NIC's BAR for anyone".** Ask for the specific class your
+  driver was written for; a broad grant is ambient authority (**Commandment VII**).
 - **Do not panic on a down link or a zero MAC.** Report it and carry on; loud, bounded behaviour over
   a crash (§3.12).
 
 ## How to adapt this
 
-To drive a different PCI device: have the kernel record it in the PCI scan (`pci.rs`), add a
-`HwClass` variant and a `service_hw` table entry in `task/mod.rs` for your driver's name (gated on the
-device actually being yours), write the service against `ctx.mmio()` (and `ctx.dma_region()` /
-`ctx.irq_unmask()` if it needs DMA or interrupts), and add it to the workspace + a supervisor spawn.
+To drive a different PCI device: give it a row in the supervisor's spawn table naming its device
+class - or its PCI class CODE, which is how AHCI is addressed - write the service against
+`ctx.mmio()` (and `ctx.dma_region()` / `ctx.irq_unmask()` if it needs DMA or interrupts), and add it
+to the workspace. **No kernel edit.** If your device needs a `HwClass` variant that does not exist
+yet, that is the one case that touches `kernel/`, and it is a new device CLASS rather than a new
+name.
 `examples/driver-skeleton` is the full template for the device-bringup shape.
 
 ## See also

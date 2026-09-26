@@ -11,7 +11,7 @@ Demonstration service - receives messages from `ping` (§23.1).
 
 ## Spawn order
 
-Pong is the **first** service spawned by the supervisor - before ping and before all 178 probe services. This ensures pong's endpoint is registered and ready before ping starts sending, and before probe services compete for scheduler quanta. Cross-core IPC between ping and pong is established within ~10 s of boot.
+Pong is spawned early - after `events` and `console`, before ping, and before all 193 probe services. (This said "the **first** service spawned" and "178 probe services": `events` and `console` come first, and the probe table says 193.) This ensures pong's endpoint is registered and ready before ping starts sending, and before probe services compete for scheduler quanta. Cross-core IPC between ping and pong is established within ~10 s of boot.
 
 ## Why pong has no placement
 
