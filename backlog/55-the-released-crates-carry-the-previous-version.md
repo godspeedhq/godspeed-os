@@ -1,6 +1,6 @@
 # 55 - v0.20.0 shipped every crate labelled `0.19.0`, and the published API docs say so
 
-**Status:** OPEN - a release-process gap, not a code defect. Found by an audit, not by a user.
+**Status:** CLOSED 2026-09-26, by option (1) - both halves. `workspace.package.version` is `0.21.0`, matching the v0.21.0 tag, and `release.yml` now compares the tag against the manifest in the step that resolves the tag and FAILS before anything is published. Verified both directions: a v0.20.0 tag against a 0.21.0 manifest is refused, and `v0.21.0-rc1` is still accepted (only the leading vMAJOR.MINOR.PATCH is compared, so a pre-release suffix does not fail for a reason nobody intended).
 **Found:** 2026-09-25, during the documentation audit of `feat/stdlib-complete`, from a line of
 ordinary build output.
 
