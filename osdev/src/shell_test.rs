@@ -291,6 +291,59 @@ pub fn run(image_path: &Path, smp: u32) {
     let netver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(netver.contains(&format!("net {ver}")), "net: version reports the current version");
 
+    // ---- `wifi` (utilities/56_wifi.md): the wireless link verb ---------------------------------
+    //
+    // THE RADIO DOES NOT EXIST YET (`docs/wifi.md` has the phases), and what is asserted here is only
+    // what is already permanent. A QEMU x86 guest has no wireless hardware and never will, so the
+    // absence line is the FINAL answer on this machine rather than an interim one - the same status the
+    // T630 and the Wyse have. Nothing below would break by finishing phase 1.
+    send(&mut write_half, b"wifi\r");
+    let wifi_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_out.contains("no wireless radio on this machine"),
+           "wifi: says there is no radio, on a machine that has none");
+    // It must say WHY, not only what: a reader on a board that HAS a radio needs to know where to look.
+    check!(wifi_out.contains("wifi-driver"),
+           "wifi: names the service whose absence it is reporting");
+
+    // ASKING IS NOT AN ERROR. `wifi` on a radioless machine is a legitimate question with a definite
+    // answer, so it must not report failure - `result` would otherwise read as a fault where there is
+    // none, and a suite that accepts that teaches the reader to discount the result model.
+    send(&mut write_half, b"wifi\rresult\r");
+    let wifi_res = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    let wifi_res2 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(!format!("{wifi_res}{wifi_res2}").contains("1"),
+           "wifi: asking about wireless on a radioless machine is not an error");
+
+    // THE SECURITY ASSERTION, and the one most worth having. A passphrase given as an argument would be
+    // recalled by up-arrow and written to /.gsh_history, so `connect` takes an SSID and nothing else.
+    // If this ever stops refusing, somebody has added a convenience that leaks a secret to disk.
+    send(&mut write_half, b"wifi connect SomeSSID hunter2\r");
+    let wifi_pw = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_pw.contains("passphrase is asked for"),
+           "wifi: refuses a passphrase on the command line (it would land in /.gsh_history)");
+
+    // Usage and unknown-word refusals, which are permanent on every board.
+    send(&mut write_half, b"wifi connect\r");
+    let wifi_usage = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_usage.contains("usage: wifi connect <ssid>"),
+           "wifi: connect with no SSID prints usage rather than guessing");
+    send(&mut write_half, b"wifi nonsense\r");
+    let wifi_bogus = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_bogus.contains("unknown subcommand"),
+           "wifi: an unknown subcommand is refused by name, not silently treated as status");
+    send(&mut write_half, b"wifi radio sideways\r");
+    let wifi_radio = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_radio.contains("radio takes `on` or `off`"),
+           "wifi: radio takes on or off and says so");
+
+    // Conventions rules 1 and 5: every utility self-documents.
+    send(&mut write_half, b"wifi version\r");
+    let wifiver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifiver.contains(&format!("wifi {ver}")), "wifi: version reports the current version");
+    send(&mut write_half, b"wifi help\r");
+    let wifihelp = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifihelp.contains("wifi connect <ssid>"), "wifi: help lists the connect row with an example");
+
     // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
     // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the
     // command ran end to end and produced a well-formed line, EITHER a resolved IP ("example.com is

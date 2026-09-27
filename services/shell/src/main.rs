@@ -919,6 +919,10 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
     "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve",
+    // An SSID is not a path. Completing one from the filesystem would be nonsense, and
+    // completing it from the last scan would leak the names of networks in range into a shell
+    // that records its history - so `wifi` offers keywords and nothing else.
+    "wifi",
     // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
     // directory listing for a position that accepts neither a path nor a keyword.
     "paginate",
@@ -946,6 +950,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
+    ("wifi",    &["list", "connect", "disconnect", "status", "forget", "stored", "radio"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -1005,6 +1010,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("chaos",  "max-carnage",  CHAOS_RESTARTABLE),
     ("trace",  "deps",         CHAOS_RESTARTABLE),
     ("trace",  "chain",        CHAOS_RESTARTABLE),
+    ("wifi",   "radio",        &["on", "off"]),
 ];
 
 /// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
@@ -1941,6 +1947,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "trace"   => cmd_trace(ctx, s["trace".len()..].trim()),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
+        "wifi"    => cmd_wifi(ctx, s["wifi".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -4919,6 +4926,7 @@ const UTILS: &[&str] = &[
     // `events ipc` still reach their own dispatch untouched.
     "events", "trace", "docs", "scrollback",
     "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
+    "wifi",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5128,6 +5136,16 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net scan", "ARP-sweep the local /24 for live hosts", "net scan"),
             ("net renew", "re-run DHCP/ARP after plugging in a cable (recover without a reboot)", "net renew"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
+        ], true),
+        "wifi" => help_block(ctx, "wifi", "join and inspect a wireless network", &[
+            ("wifi", "radio state and which network is joined", "wifi"),
+            ("wifi list", "scan and list the networks in range", "wifi list"),
+            ("wifi connect <ssid>", "join a network (prompts for the passphrase; never takes it as an argument)", "wifi connect Bankole-WiFi"),
+            ("wifi disconnect", "leave the current network; the radio stays up", "wifi disconnect"),
+            ("wifi status", "the same as bare `wifi`", "wifi status"),
+            ("wifi stored", "which networks a passphrase is held for (names only, never secrets)", "wifi stored"),
+            ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
+            ("wifi radio on|off", "power the radio; `off` disconnects first and says so", "wifi radio off"),
         ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
             ("ping <ip>", "ping continuously (round-trip time + TTL per reply); q quits, then stats", "ping 192.168.4.1"),
@@ -5487,6 +5505,7 @@ static HELP: &[HelpRow] = &[
     Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
+    Row("wifi [list|connect <ssid>]", "wireless: what is in range, and join one"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
@@ -7245,6 +7264,94 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     net_status(ctx, out)
+}
+
+/// The service that owns the radio, when there is one (`docs/wifi.md`). Named to the same
+/// convention as `nic-driver` and `block-driver`.
+const WIFI_DRIVER: &str = "wifi-driver";
+
+/// `wifi` - join and inspect a wireless network (`docs/wifi-commands.md` is the full surface).
+///
+/// **AS BUILT THIS ANSWERS ONE QUESTION, TRUTHFULLY: is there a radio at all.** There is no
+/// `wifi-driver` in the tree yet, so every verb below reports its absence rather than sending an
+/// opcode the other end never agreed to - a protocol invented against no implementation is
+/// speculative surface, and 26.2 calls that architectural debt. The verbs, the help, the version and
+/// the completion are real now; the frame path lands behind them when the driver does.
+///
+/// **On three of the five machines this is not a stub, it is the answer.** The T630 and the Wyse have
+/// no radio and never will, so "no wireless radio on this machine" is final there. That is why the
+/// absence path was built first rather than last: it is the only part that is correct on every board.
+///
+/// **Absence is told apart from a wedge**, because `docs/wifi-commands.md` section 5 says the user's
+/// real question is whose fault it is. `slot_of` - the same introspection `caps` uses - answers it: no
+/// live task by that name means no radio; a live task that will not answer is a different sentence and
+/// gets one. Neither is a timer: Commandment VIII wants the reply or the loud fact, never a guess.
+fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let arg = arg.trim();
+
+    // Argument shape first, because it does not depend on hardware and a usage error should not be
+    // reported as a missing radio. `connect` taking no passphrase argument is a SECURITY decision, not
+    // an ergonomic one (it would land in /.gsh_history, where an up-arrow recovers it), so a second
+    // word here is refused by name rather than ignored.
+    match arg {
+        "connect" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi connect <ssid>  (e.g. wifi connect Bankole-WiFi)"));
+            return Err(ShellError::Unknown);
+        }
+        "forget" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi forget <ssid>  (e.g. wifi forget Bankole-WiFi)"));
+            return Err(ShellError::Unknown);
+        }
+        "radio" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi radio on   or   wifi radio off"));
+            return Err(ShellError::Unknown);
+        }
+        _ => {}
+    }
+    if let Some(rest) = arg.strip_prefix("connect ") {
+        if rest.trim().split_whitespace().count() > 1 {
+            out.line_fmt(ctx, format_args!(
+                "wifi: connect takes only an SSID - the passphrase is asked for, never typed on the"));
+            out.line_fmt(ctx, format_args!(
+                "      command line, because a command line is recalled by up-arrow and written to"));
+            out.line_fmt(ctx, format_args!("      /.gsh_history. Try: wifi connect {}", rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
+            return Err(ShellError::Unknown);
+        }
+    }
+    if let Some(word) = arg.strip_prefix("radio ") {
+        let word = word.trim();
+        if word != "on" && word != "off" {
+            out.line_fmt(ctx, format_args!("wifi: radio takes `on` or `off`, not '{}'", word));
+            return Err(ShellError::Unknown);
+        }
+    }
+    let known = arg.is_empty()
+        || matches!(arg, "list" | "status" | "disconnect" | "stored")
+        || arg.starts_with("connect ") || arg.starts_with("forget ") || arg.starts_with("radio ");
+    if !known {
+        out.line_fmt(ctx, format_args!(
+            "wifi: unknown subcommand - try wifi, wifi list, wifi connect <ssid>, wifi disconnect,"));
+        out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off, or wifi help"));
+        return Err(ShellError::Unknown);
+    }
+
+    // Then the hardware question, which every verb shares.
+    match slot_of(ctx, WIFI_DRIVER) {
+        None => {
+            out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
+            // Say WHY rather than only what, so a reader on a board that HAS a radio knows where to
+            // look. Asking is never an error (`docs/wifi-commands.md` section 5), so this is Ok.
+            out.line_fmt(ctx, format_args!("  (no `{}` is running - this machine has no radio, or none is driven yet)", WIFI_DRIVER));
+            Ok(())
+        }
+        Some(_) => {
+            // The driver exists and this shell does not yet speak to it. Loud and specific: the one
+            // thing this must never do is imply the radio failed.
+            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell cannot talk to it yet", WIFI_DRIVER));
+            out.line_fmt(ctx, format_args!("  (the frame and control path is not built - `docs/wifi.md` has the phases)"));
+            Err(ShellError::Unknown)
+        }
+    }
 }
 
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
@@ -11550,6 +11657,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, "", out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
+        "wifi"         => { let _ = cmd_wifi(ctx, arg, out); }
         "ping"         => { let _ = cmd_ping(ctx, arg, out); }
         "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),

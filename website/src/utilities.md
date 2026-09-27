@@ -103,6 +103,7 @@ fails.
 | | |
 |---|---|
 | [`net`](utilities/net.md) | am I on the network? |
+| [`wifi`](utilities/wifi.md) | what wireless networks are there, and join one |
 | [`sock`](utilities/sock.md) | a UDP socket as a capability |
 | [`ping`](utilities/ping.md) | continuous ICMP echo |
 | [`tcp`](utilities/tcp.md) | one TCP transaction: connect, send, read, close |

@@ -62,6 +62,7 @@
   - [`chaos`](utilities/chaos.md)
   - [`fmt`](utilities/fmt.md)
   - [`net`](utilities/net.md)
+  - [`wifi`](utilities/wifi.md)
   - [`sock`](utilities/sock.md)
   - [`tcp`](utilities/tcp.md)
   - [`serve`](utilities/serve.md)

@@ -1,27 +1,35 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
-# The `wifi` command surface (design; the verb does not exist yet)
-
-**Status: DESIGN, nothing built.** `docs/wifi.md` is the driver and credential design; this is the
-command surface, written first so the shape is settled before any SDIO register is touched. Every
-invocation below is a PROPOSAL, and none is written as a `gsh>` prompt, because a prompt in this
-repository asserts that something was typed and worked.
-
-**Why this is in `docs/` and not in `utilities/`, which is where a command surface normally lives.**
-It was first written as a numbered spec under `utilities/`, and the enforcement layer refused it
-within a minute:
-`X-user-vocabulary` (Commandment X) reported that `wifi` has a utility spec and the shell answers no
-such verb. That is not pedantry - it is the invariant that makes the directory worth trusting. A spec
-under `utilities/` asserts the verb EXISTS, which is what lets `doc_command_check` read the shell's own
-completion table and hold every document to it. The check offers three ways out: implement it, delete
-it, or title it "not provided" as `utilities/14_poweroff.md` does. None fits a verb we fully intend to
-build, and the fourth option - adding `wifi` to `utility_vocab_debt` - is exactly the baseline abuse
-`CONTRIBUTING.md` names as weakening a gate. So the document was in the wrong place, not wrong.
-`docs/tcp-design.md` and `utilities/48_tcp.md` are the same split: design here, surface there once it
-answers. This file moves to `utilities/` the day the shell does.
+# `wifi` - join and inspect a wireless network
 
 Version reported by `wifi version`. Implementation shape: **shell built-in for `connect`, standalone
 service for everything else** - see section 7, where the reason is a constraint rather than a
 preference.
+
+## Status, as built and honest (2026-09-27)
+
+**The verb answers. The radio does not exist.** What works today, on every board:
+
+- `wifi`, `wifi list`, `wifi connect <ssid>`, `wifi disconnect`, `wifi status`, `wifi stored`,
+  `wifi forget <ssid>`, `wifi radio on|off` all parse, and every one of them reports **whether there
+  is a radio at all** - which is the answer, permanently, on the T630 and the Wyse, and until a driver
+  exists everywhere else. Asking on a machine with no radio is not an error.
+- Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one
+  that will not answer gets a different sentence. Neither is a timer.
+- `wifi help`, `wifi version`, tab completion including `radio on|off`, and a row in `help`.
+
+What does NOT exist: the radio. No scanning, no association, no credential, no frames -
+`docs/wifi.md` has the phases and what each one needs. No opcode in this file is sent to anything
+yet, deliberately: a protocol invented against no implementation is speculative surface (§26.2), so
+the verbs below describe the intended surface and the shell currently answers all of them with the
+truth about the hardware.
+
+**Why this file moved here, which is a small lesson about the gates.** It was written as
+`utilities/56_wifi.md` and Commandment X refused it: a spec under `utilities/` asserts the shell
+answers that verb, and it did not. So it lived in `docs/` as a design note. The moment the verb was
+implemented **the same check fired in the opposite direction** - the shell answers `wifi` and no spec
+in `utilities/` describes it, which is complexity discoverable only by reading source (§26.11). The
+pair makes this directory mean exactly one thing, and the document's home is decided by whether the
+verb answers rather than by anyone's preference.
 
 ---
 
@@ -142,7 +150,7 @@ not do is keep the secret: it reads it, sends it to the keyring, and drops it.
 
 ## 8. Tab completion (rule 9)
 
-`wifi` will complete from the command table; its subcommands from `SUBCMD_FIRST` in
+`wifi` completes from the command table; its subcommands from `SUBCMD_FIRST` in
 `services/shell/src/main.rs`, which is also what `doc_command_check.py` reads - so this document
 cannot come to show a subcommand the shell does not offer. `radio` completes one level further, to
 `on` and `off`. An SSID argument completes from `wifi stored`, never from the last scan, because

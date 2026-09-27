@@ -70,7 +70,7 @@ presents those three ops carries DHCP, ARP, ICMP, DNS and TCP with no change to 
 
 ### Four names, and why there is no `wifi-stack`
 
-- **`wifi`** - the utility, the verb a person types (`docs/wifi-commands.md`).
+- **`wifi`** - the utility, the verb a person types (`utilities/56_wifi.md`).
 - **`wifi-driver`** - the service that owns the radio, named to the same convention as `nic-driver`
   and `block-driver`.
 - **`keyring`** - the service that owns the credential.
@@ -303,7 +303,7 @@ typed. That is the SEC-2 residual - `CONSOLE_PUSH` holders sit inside the shell'
 because keystrokes *are* commands - and IOMMU confinement bounds that driver's DMA, not what it reads.
 Recorded here at the place a reader would otherwise assume otherwise.
 
-**The command surface is `docs/wifi-commands.md`**, which settles the shape this implies: `connect` must
+**The command surface is `utilities/56_wifi.md`**, which settles the shape this implies: `connect` must
 be a shell built-in, because there is one console input ring with one reader slot and the shell is the
 reader, so a spawned service cannot prompt at all.
 
