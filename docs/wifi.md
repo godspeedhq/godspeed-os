@@ -545,3 +545,71 @@ register tables, IQ calibration, a firmware blob, an 802.11 management state mac
 host-side in a tree with no cryptography. The Pi 4's full-MAC part needs a fraction of it. Milestone 1
 was worth doing first on either board because it is cheap and decisive; the order of everything after
 it is still the one section 3 argues for.
+
+---
+
+## 14. The Pi 4 blocker is CLOSED - the radio is on the Arasan, confirmed 2026-09-27
+
+Section 4 rested the whole phase-1 estimate on one board fact and section 11 listed it as the first thing
+needing sign-off: **is the CYW43455 behind the Arasan controller `services/block-driver/src/sdhci.rs`
+already drives, with the SD card on the other one.** It is. From the vendor's own device tree, which is
+what the firmware and Linux both act on:
+
+```text
+arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts
+    &mmcnr  { pinctrl-names = "default"; pinctrl-0 = <&sdio_pins>;
+              bus-width = <4>; status = "okay"; };        <- the WiFi
+    &emmc2  { vqmmc-supply = <&sd_io_1v8_reg>; vmmc-supply = <&sd_vcc_reg>;
+              broken-cd; status = "okay"; };              <- the SD card
+    &sdhost { status = "disabled"; };
+
+arch/arm/boot/dts/broadcom/bcm270x.dtsi
+    mmcnr: mmcnr@7e300000 { compatible = "brcm,bcm2835-mmc", "brcm,bcm2835-sdhci";
+                            reg = <0x7e300000 0x100>; }
+    sdhci: mmc@7e300000   { compatible = "brcm,bcm2835-mmc", "brcm,bcm2835-sdhci";
+                            reg = <0x7e300000 0x100>; }
+
+arch/arm/boot/dts/broadcom/bcm2711.dtsi
+    emmc2 ... compatible = "brcm,bcm2711-emmc2"; reg = <0x0 0x7e340000 0x100>;
+```
+
+**`mmcnr` and `sdhci` are one controller described twice** - identical `reg`, differing only in which
+driver claims it (`brcm,bcm2835-mmc` for the non-removable SDIO case, `brcm,bcm2835-sdhci` for a card).
+Bus `0x7e300000` is ARM physical `0xFE30_0000` in low-peripheral mode.
+
+| node | bus | ARM physical | holds |
+|---|---|---|---|
+| `mmcnr` = `sdhci` | `0x7e300000` | **`0xFE30_0000`** | **the CYW43455 radio**, 4-bit bus, `sdio_pins` |
+| `emmc2` | `0x7e340000` | `0xFE34_0000` | the SD card |
+| `sdhost` | `0x7e202000` | - | disabled on this board |
+
+### What this buys, stated exactly
+
+**The Arasan is not the boot medium on this board.** That is the whole objection that kept `sdhci.rs`
+uncompiled - on the Pi 2 the Arasan *is* the card the machine boots from, so driving it risked writing
+GSFS over the boot partition. Here the card is on `emmc2`, so the 25 KB of working polled SD-host code
+can be compiled for aarch64 and pointed at `0xFE30_0000` without going anywhere near the boot medium.
+
+What it does **not** buy is a driver. `sdhci.rs` speaks SD, not SDIO: CMD52/CMD53 (IO direct and
+extended), function enumeration and the CIS tuple walk are all absent, and those are phase 1's actual
+deliverable. The controller half is the part that was already written.
+
+### What is still true, and what is now the next fact needed
+
+Section 3's sizing argument is untouched: full-MAC means the firmware runs the 802.11 state machine and
+can perform the WPA2 handshake, so the host side is transport plus a command protocol. That remains the
+reason this board is the right one.
+
+The next thing that needs a source rather than a guess is the **firmware**: `brcmfmac43455-sdio.bin`, its
+CLM blob and a board-specific NVRAM text file, which is section 8's licensing decision and is unchanged
+by any of this.
+
+### And the census stays
+
+`arch/aarch64/sdio.rs` now CONFIRMS the device tree rather than guessing at it, and that is worth
+keeping: a document is not a board, and a disagreement between the two would be the most interesting
+thing the probe could find. Its first run also earned its place a different way - it read physical
+addresses through a high-half mapping, reported "neither answered", and was wrong in the conservative
+direction. Both addresses it probes turn out to be correct, including the one that was labelled
+UNVERIFIED. That label was still right to be there: it described the EVIDENCE, not the value, and being
+lucky about a number is not the same as knowing it.

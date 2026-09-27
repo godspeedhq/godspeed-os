@@ -19,12 +19,31 @@
 //!     `PERIPHERAL_BASE + 0x30_0000` on the BCM2836, and `sdhci.rs` documents the same offset. The
 //!     peripheral base for this SoC, `0xFE00_0000`, is likewise already here (`mmu.rs`, and `PL011_BASE`
 //!     is derived from it).
-//!   * `+0x34_0000` is **NOT** an in-repo fact. It is where this author believes the BCM2711's second
-//!     controller lives, from memory, and memory is exactly what this project does not let stand as a
-//!     claim. So it is PROBED and labelled, never granted on that basis.
+//!   * `+0x34_0000` was **NOT** an in-repo fact when this was written - it was recollection, and it was
+//!     probed and labelled UNVERIFIED rather than granted on that basis.
 //!
-//! Probing settles it without either address having to be trusted: a controller that answers with a
-//! plausible SDHCI capabilities word is there, and one that aborts or reads all-ones is not.
+//! **Both are settled now, from the vendor's own device tree** (Raspberry Pi kernel `rpi-6.6.y`), which
+//! is what the firmware and Linux both act on:
+//!
+//! ```text
+//! bcm2711-rpi-4-b.dts:  &mmcnr { pinctrl-0 = <&sdio_pins>; bus-width = <4>; status = "okay"; }  <- WiFi
+//!                       &emmc2 { ... status = "okay"; }                                    <- SD card
+//!                       &sdhost { status = "disabled"; }
+//! bcm270x.dtsi:         mmcnr: mmcnr@7e300000 { reg = <0x7e300000 0x100>; }
+//!                       sdhci: mmc@7e300000   { reg = <0x7e300000 0x100>; }   SAME CONTROLLER, twice
+//! bcm2711.dtsi:         emmc2 ... reg = <0x0 0x7e340000 0x100>;
+//! ```
+//!
+//! `mmcnr` and `sdhci` are ONE controller described by two nodes - same `reg`, differing only in which
+//! driver claims it. Bus `0x7e300000` is ARM physical `0xFE30_0000` in low-peripheral mode. So **the
+//! radio is on the Arasan block `sdhci.rs` already drives**, and the SD card is on `emmc2` - which is
+//! `docs/wifi.md` section 4's central claim, confirmed rather than assumed.
+//!
+//! The UNVERIFIED label was still right to have been there. It described the EVIDENCE, not the value,
+//! and being lucky about a number is not the same as knowing it.
+//!
+//! The census stays, because a document is not a board: it now CONFIRMS what the device tree says, and
+//! a disagreement between the two would be the most interesting thing this probe could find.
 //!
 //! **NOTHING IS GRANTED BY THIS FILE**, deliberately. It reads, it prints, it returns. The
 //! `map_fixed_driver_mmio` table stays as it is until the boot log says which window to name, because
@@ -64,13 +83,13 @@ struct Candidate {
 const CANDIDATES: &[Candidate] = &[
     Candidate {
         off: 0x30_0000,
-        what: "Arasan (the block sdhci.rs already drives; WiFi expected here)",
+        what: "Arasan - THE RADIO (dt: mmcnr@7e300000, bus-width 4, sdio_pins)",
         grounded: true,
     },
     Candidate {
         off: 0x34_0000,
-        what: "emmc2 (SD card expected here) - OFFSET FROM MEMORY, unverified",
-        grounded: false,
+        what: "emmc2 - the SD CARD (dt: emmc2@7e340000, brcm,bcm2711-emmc2)",
+        grounded: true,
     },
 ];
 
