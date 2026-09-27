@@ -191,3 +191,11 @@ TM_DAT_DIR                         # SDHCI SPEC CMDTM field (bit 4, transfer dir
 brcmf_sdiod_set_backplane_window   # Linux brcmfmac, cited because its write-only-what-CHANGED behaviour is what services/wifi-driver copies and WHY - external, 26.14
 sdhci_set_transfer_mode            # Linux sdhci.c, cited because it sets SDHCI_TRNS_BLK_CNT_EN for ANY data command - the bit CMD53 was missing - external, 26.14
 TM_BLKCNT_EN                       # SDHCI SPEC CMDTM field (bit 1, block count enable) - the bit CMD53 was missing; sits beside CMD_ISDATA and TM_DAT_DIR, one CMD53 word sets all three
+brcmf_sdiod_abort                  # Linux brcmfmac, cited because IO_ABORT after a failed transfer is the write this driver was missing - external, 26.14
+sdhci_iproc_writew                 # Linux sdhci-iproc, cited for the SHADOW-FLUSH ORDER it imposes (block regs written when COMMAND is) - external, 26.14
+sdhci_send_command                 # Linux sdhci.c, cited because it is where the command FLAGS come from - CMD_CRC and CMD_INDEX were missing - external, 26.14
+mmc_io_rw_extended                 # Linux mmc core, cited for the CMD53 argument and byte-mode block registers this driver reimplements - external, 26.14
+sdio_io_rw_ext_helper              # Linux mmc core, cited because it is what chooses BYTE mode for a 4-byte SDIO read - external, 26.14
+CMD_CRC                            # SDHCI SPEC command-register flag (check the response CRC7); the spec's name for a bit set numerically - external, 26.14
+CMD_INDEX                          # SDHCI SPEC command-register flag (check the response index) - ditto, cited beside CMD_CRC because one word sets both
+IO_CURRENT_STATE                   # SDIO SPEC R5 response field (bits 5:4: DIS/CMD/TRN); reading TRN is what proved the card was left mid-transfer

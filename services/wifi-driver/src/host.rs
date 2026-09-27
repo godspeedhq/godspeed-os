@@ -105,6 +105,10 @@ pub struct Host<'a> {
     base_clock: u32,
     /// `INTERRUPT` captured at the moment a command failed, before the line reset that clears it.
     last_int: core::cell::Cell<u32>,
+    /// `BLKSIZECNT` as it read back after being written for the last data command.
+    last_blk: core::cell::Cell<u32>,
+    /// `CMDTM` as it read back after the last command was issued.
+    last_cmdtm: core::cell::Cell<u32>,
     /// `RESP0` from the last command a DATA transfer issued.
     ///
     /// **This was being thrown away, and it is the answer to the failure it was hiding.** `cmd_data`
@@ -122,6 +126,8 @@ impl<'a> Host<'a> {
             base_clock,
             last_int: core::cell::Cell::new(0),
             last_resp: core::cell::Cell::new(0),
+            last_blk: core::cell::Cell::new(0),
+            last_cmdtm: core::cell::Cell::new(0),
         }
     }
 
@@ -152,6 +158,12 @@ impl<'a> Host<'a> {
     /// `RESP0` from the last command a data transfer issued - the R5 for a CMD53.
     pub fn last_resp(&self) -> u32 {
         self.last_resp.get()
+    }
+
+    /// `BLKSIZECNT` and `CMDTM` as they READ BACK - what the controller is actually holding, rather than
+    /// what this driver believes it wrote.
+    pub fn last_setup(&self) -> (u32, u32) {
+        (self.last_blk.get(), self.last_cmdtm.get())
     }
 
     /// The ten-bit SDHCI clock divider for a target clock, from the controller's REAL base clock.
@@ -265,11 +277,27 @@ impl<'a> Host<'a> {
 
     /// Issue one command and wait for it to complete. Returns `RESP0`, or `None` with `last_int` set.
     ///
-    /// `code` is the SDHCI `CMDTM` word: `index << 24 | RSPNS_TYPE << 16 | flags`. CRC and index
-    /// checking are deliberately left OFF (bits 19/20 clear) because two of the responses this driver
-    /// reads - R4 from CMD5 and R3 from an OCR query - carry neither a CRC7 nor a command index, so
-    /// asking the controller to verify them fails a correct response.
+    /// `code` is the SDHCI `CMDTM` word: `index << 24 | flags << 16 | transfer mode`.
+    ///
+    /// **Whether CRC and index checking are on is PER COMMAND, and this used to get it wrong.** The
+    /// comment here said they were "deliberately left OFF because two of the responses this driver reads
+    /// - R4 from CMD5 and R3 - carry neither a CRC7 nor a command index". That is true of CMD5, and it
+    /// was applied to every command through one shared template. **R5 carries both**, and Linux sets
+    /// both for it from `MMC_RSP_R5 = PRESENT | CRC | OPCODE` - see the per-command constants in
+    /// `sdio.rs`, which now carry the values `sdhci_send_command` computes.
     pub fn cmd(&self, code: u32, arg: u32) -> Option<u32> {
+        self.cmd_inner(code, arg, None)
+    }
+
+    /// The one command path. `blk` is the `BLKSIZECNT` word for a command that carries data.
+    ///
+    /// **`BLKSIZECNT` is written HERE, between the argument and the command**, because that is the order
+    /// this controller actually sees from Linux: `sdhci_iproc_writew` defers the block registers into a
+    /// shadow and flushes them when the COMMAND register is written, and `sdhci_send_command` writes
+    /// ARGUMENT then COMMAND. It was previously written by the caller, before the status clear and the
+    /// argument. Both are before the write that starts the transfer, so this is unlikely to matter - it
+    /// is here because matching the reference where there is no reason to differ is the method.
+    fn cmd_inner(&self, code: u32, arg: u32, blk: Option<u32>) -> Option<u32> {
         let mut t = 0u32;
         while self.rd(STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) != 0 {
             t += 1;
@@ -280,7 +308,19 @@ impl<'a> Host<'a> {
         }
         self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear stale status
         self.wr(ARG1, arg);
+        if let Some(b) = blk {
+            self.wr(BLKSIZECNT, b);
+            // READ IT BACK. If the block registers did not take, everything after this is a transfer
+            // the controller was never set up for - and a zero block size gives it nothing to move and
+            // no reason to report an error, which is exactly what a silent data phase looks like.
+            // Recorded rather than acted on: the value is evidence for the caller's log line.
+            self.last_blk.set(self.rd(BLKSIZECNT));
+        }
         self.wr(CMDTM, code);
+        // And the command word as the controller holds it, for the same reason: SDHCI starts a transfer
+        // when a command with Data Present Select completes, so a controller that started nothing either
+        // has a zero block size or does not have that bit set.
+        self.last_cmdtm.set(self.rd(CMDTM));
         let mut t = 0u32;
         loop {
             let i = self.rd(INTERRUPT);
@@ -345,16 +385,18 @@ impl<'a> Host<'a> {
             }
         }
         // ONE block of `bytes`: block count in the high half, block size in the low. A four-byte
-        // register read is a single block of four, which is what byte-mode CMD53 asks for.
-        self.wr(BLKSIZECNT, (1 << 16) | (bytes as u32 & 0xFFFF));
+        // register read is a single block of four, which is what byte-mode CMD53 asks for - and it is
+        // handed to `cmd_inner` rather than written here, so it lands between the argument and the
+        // command exactly as the reference's shadow-flush order puts it.
+        let blk = (1 << 16) | (bytes as u32 & 0xFFFF);
 
-        // THE COMMAND PHASE IS THE PROVEN ONE. It clears stale status, writes ARG1/CMDTM, polls
-        // CMD_DONE, captures `last_int` on failure and resets the lines - all of it already exercised
-        // by every other command this driver issues.
-        // KEEP THE RESPONSE. For a CMD53 this is the R5, whose flag byte says whether the card
-        // accepted the transfer - and a refusal is indistinguishable, from the controller's side, from
-        // the data phase simply not happening.
-        match self.cmd(code, arg) {
+        // THE COMMAND PHASE IS THE ONE EVERY OTHER COMMAND USES. It clears stale status, writes ARG1,
+        // the block registers, CMDTM, polls CMD_DONE, captures `last_int` on failure and resets the
+        // lines.
+        // KEEP THE RESPONSE. For a CMD53 this is the R5, whose flag byte says whether the card accepted
+        // the transfer - and a refusal is indistinguishable, from the controller's side, from the data
+        // phase simply not happening.
+        match self.cmd_inner(code, arg, Some(blk)) {
             Some(r) => self.last_resp.set(r),
             None => return Err("the command itself did not complete"),
         }

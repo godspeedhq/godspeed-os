@@ -37,8 +37,25 @@ const CMD_IO_SEND_OP_COND: u32 = 0x0502_0000; // CMD5  -> R4
 const CMD_SEND_REL_ADDR: u32 = 0x0302_0000; // CMD3  -> R6
 const CMD_SELECT_CARD: u32 = 0x0703_0000; // CMD7  -> R1b
 const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
-/// CMD53 (`IO_RW_EXTENDED`), read. Index 53 (0x35), 48-bit response, `CMD_ISDATA` (bit 21 - this command
-/// has a data phase), `TM_DAT_DIR` (bit 4 - the data comes toward us) and `TM_BLKCNT_EN` (bit 1).
+/// CMD53 (`IO_RW_EXTENDED`), read: `0x353A_0012`.
+///
+/// **Every field here was read off Linux rather than reasoned about, after two flashes lost to
+/// reasoning.** `sdhci_send_command` builds the command flags from the mmc response flags and
+/// `sdhci_set_transfer_mode` builds the transfer mode, and for a single-block PIO read of an SDIO
+/// register that comes to command flags `0x3A` and transfer mode `0x0012`:
+///
+/// ```text
+///   0x3A = RESP_SHORT (0x02) | CMD_CRC (0x08) | CMD_INDEX (0x10) | CMD_DATA (0x20)
+///   0x12 = TM_BLKCNT_EN (0x02) | TM_DAT_DIR read (0x10)
+/// ```
+///
+/// **`CMD_CRC` and `CMD_INDEX` were missing**, because `cmd`'s old comment left them off for every
+/// command on the grounds that CMD5's R4 carries neither a CRC7 nor an index. True of R4; R5 carries
+/// both, and `MMC_RSP_R5 = PRESENT | CRC | OPCODE` is where Linux gets them. One template, applied to a
+/// command it did not fit.
+///
+/// The transfer mode already matched exactly, which is why the previous flash's `TM_BLKCNT_EN` was right
+/// and did not help.
 ///
 /// **`TM_BLKCNT_EN` was missing and is the fix this constant exists to record.** The spec's wording
 /// invites you to leave it off for a single block - the block count is "not used" there - and on hardware
@@ -54,10 +71,18 @@ const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
 /// `block-driver`'s CMD17 gets away without it on a 512-byte block, which is why the shape was copied
 /// from there and came up short. The two differ in exactly two ways - the index and the block size - and
 /// that made this the only bit worth suspecting.
-const CMD_IO_RW_EXTENDED_READ: u32 = 0x3522_0012;
-/// CMD53, write. As above without the direction bit.
+const CMD_IO_RW_EXTENDED_READ: u32 = 0x353A_0012;
+/// CMD53, write: the same command flags (the data-present bit is set either way) without the direction
+/// bit in the transfer mode.
 #[allow(dead_code)] // arrives with the firmware upload; the read is what this phase needs
-const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x3522_0002;
+const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x353A_0002;
+
+// THE OTHER COMMANDS ARE LEFT ALONE, DELIBERATELY. Their R5/R6/R1b responses carry a CRC7 and an index
+// too, so by the same reading their check bits should be on as well - `0x341A_0000` for CMD52,
+// `0x031A_0000` for CMD3, `0x071B_0000` for CMD7, with CMD5's `0x0502_0000` correct as it stands because
+// R4 genuinely has neither. But all of them WORK, and changing a working command in the same image as
+// the fix for a broken one makes the result unattributable. Recorded here so the next reader knows the
+// inconsistency is a choice and what the values would be (§26.7).
 
 /// The voltage window to ask for: the 3.2-3.4 V bits of the OCR.
 ///
@@ -344,6 +369,35 @@ pub fn cis_pointer(h: &Host, ctx: &ServiceContext) -> Option<u32> {
     Some(p)
 }
 
+/// Tell the card to abandon a transfer on `func` - CCCR `IO_ABORT`, written to function 0.
+///
+/// **Without this, one failed data transfer poisons every command after it.** A CMD53 the card ACCEPTS
+/// moves it into the transfer state, and `Host` resetting its own lines says nothing to the card - so the
+/// card sits holding the transfer open and refuses what comes next. Measured, not supposed: the CMD52
+/// after a failed CMD53 came back with R5 flags `0x28`, ERROR set and `IO_CURRENT_STATE` reading TRN. It
+/// is also why that CMD52's refusal had nothing to do with the address it was reading.
+///
+/// That is a recovery that does not recover (§26.7) - the driver treated the failure as handled while
+/// leaving the device in a state that broke everything downstream. `brcmf_sdiod_abort` makes the same
+/// write for the same reason.
+///
+/// Its own failure is reported rather than propagated: the caller is already on a failure path with
+/// something more useful to say, but an abort that is itself refused means the card has stopped listening
+/// altogether, and that is worth seeing.
+pub fn abort(h: &Host, func: u8, ctx: &ServiceContext) {
+    /// CCCR `IO_ABORT`. Bits 2:0 name the function to abort; bit 3 would reset the card outright, which
+    /// is a bigger hammer than a failed register read deserves.
+    const CCCR_IO_ABORT: u32 = 0x06;
+    if write_reg(h, 0, CCCR_IO_ABORT, func & 0x7).is_none() {
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   and the IO_ABORT for function {} was itself refused - INT={:#010x}. The card \
+             may be left mid-transfer, so later commands can fail for that reason rather than their own",
+            func,
+            h.last_int()
+        ));
+    }
+}
+
 /// Read one 32-bit register through CMD53 in byte mode.
 ///
 /// **CMD52 cannot do this.** It carries a single byte in its RESPONSE, on the command line, with no
@@ -367,6 +421,7 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
     // like while the FIFO is awaited. The sentence now says which of the four waits expired.
     if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, &mut word, true) {
         let resp = h.last_resp();
+        let (blk, cmdtm) = h.last_setup();
         ctx.log_fmt(format_args!(
             "wifi-driver: CMD53 read of function {} address {:#07x} failed - {} (STATUS={:#010x} \
              INT={:#010x} arg={:#010x})",
@@ -376,6 +431,20 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
             h.status(),
             h.last_int(),
             arg
+        ));
+        // WHAT THE CONTROLLER IS ACTUALLY HOLDING, which is the question "no DAT line activity" raises:
+        // SDHCI starts a transfer when a command with Data Present Select completes, so a controller
+        // that started nothing either has a zero block size or does not have that bit set. Both are read
+        // back, with the wanted values beside them so a reader need not know the encoding to see a
+        // mismatch.
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   the controller holds BLKSIZECNT={:#010x} (want {:#010x}) CMDTM={:#010x} \
+             (want {:#010x}, data-present {})",
+            blk,
+            0x0001_0004u32,
+            cmdtm,
+            CMD_IO_RW_EXTENDED_READ,
+            if cmdtm & (1 << 21) != 0 { "set" } else { "CLEAR - the controller has no data phase" }
         ));
         // THE R5 IS THE PART THAT CAN SAY WHY, and it was being discarded. Its flag byte is
         // `RESP0[15:8]`; a set bit there is the CARD refusing, which from the controller's side is
@@ -401,6 +470,11 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
                 (flags >> 4) & 0x3
             ));
         }
+        // THE CARD IS STILL HOLDING THE TRANSFER OPEN. Resetting the host's lines does not tell it to
+        // stop, so without this every later command meets a card in the transfer state and is refused
+        // for that reason rather than its own - which is how the CMD52 fallback came to report a refusal
+        // that had nothing to do with the address it was reading.
+        abort(h, func, ctx);
         return None;
     }
     // The FIFO delivers the four bytes in transfer order, which for a little-endian register is its
