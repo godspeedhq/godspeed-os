@@ -36,6 +36,7 @@ mod hub;
 mod msc;
 mod net;
 mod regs;
+mod rtl;
 
 use godspeed_sdk::ServiceContext;
 
@@ -378,6 +379,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                     nic_port = p;   // the port this came from - see the removal handler
                                                     nic = Some((n, dt));
                                                 }
+                                            } else if dvid == rtl::VID && dpid == rtl::PID {
+                                                // The RTL8188CUS WiFi dongle. Matched by VID:PID for
+                                                // the same reason the LAN9514 above is: it reports
+                                                // class 0xff, so there is no class to match on.
+                                                //
+                                                // MILESTONE 1 ONLY - this reads two registers and says
+                                                // whether the chip answers. It binds nothing and serves
+                                                // nothing; `wifi` still reports no radio,
+                                                // correctly, because no driver claims this device
+                                                // yet (docs/wifi.md has the phases above it).
+                                                let _ = rtl::probe(&ctx, &m, &d, &dt);
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver does:
                                                 // ask the device its size, then read block 0. Capacity
