@@ -475,10 +475,35 @@ pub fn enumerate_downstream(
     t.mps = mps0;
     let addr = *next_addr;
     *next_addr += 1;
+    // ONE XACTERR MUST NOT ABANDON THE DEVICE, which is what this did.
+    //
+    // Pi 2, 2026-09-27: the WiFi dongle on hub port 5 was detected, reset, sized and ADDRESSED - four
+    // transfers that all worked - and then one SETUP came back `HCINT=0x00000082 XACTERR` and it was
+    // dropped. `bugs/3` recorded this same dongle enumerating on this same board, and the T630's xhci
+    // read its descriptors twice the same afternoon, so it is not an unreadable device.
+    //
+    // The log says what it probably contended with: `dwc2-svc: sector 0 first bytes 47 53 46 53` lands
+    // immediately before the failure, so `block-driver` was pushing mass-storage I/O through this one
+    // DWC2 core while the SETUP went out. A single transaction error on a contended single-channel
+    // controller is flaky, not broken - and `ehci` had the identical defect at its own longest transfer
+    // (`backlog/63`), fixed the same day.
+    //
+    // Bounded (26.6) and loud: the attempt count is named when it finally gives up, so a device that
+    // needed two tries and a device that is genuinely unreadable do not read the same.
+    const ENUM_TRIES: u32 = 4;
     let sa = [0x00, 0x05, addr, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];
-    if !chan::control_split(ctx, mmio, dma, &t, &sa, &mut none, false, 0, splt) {
-        ctx.log_fmt(format_args!("dwc2-svc: port {} SET_ADDRESS {} FAILED", port, addr));
+    let mut addressed = false;
+    for _ in 0..ENUM_TRIES {
+        if chan::control_split(ctx, mmio, dma, &t, &sa, &mut none, false, 0, splt) {
+            addressed = true;
+            break;
+        }
+        ctx.sleep(ctx.duration_cycles(5)); // let the bus settle before trying again
+    }
+    if !addressed {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: port {} SET_ADDRESS {} FAILED after {} tries", port, addr, ENUM_TRIES));
         return None;
     }
     ctx.sleep(ctx.duration_cycles(5)); // USB 2.0 9.2.6.3: 2 ms to commit the new address
@@ -486,8 +511,21 @@ pub fn enumerate_downstream(
 
     let mut full = [0u8; 18];
     let getall = [0x80, 0x06, 0, 0x01, 0, 0, 18, 0];
-    if !chan::control_split(ctx, mmio, dma, &t, &getall, &mut full, true, 18, splt) {
-        ctx.log_fmt(format_args!("dwc2-svc: port {} full descriptor read FAILED at address {}", port, addr));
+    // The ADDRESS is deliberately not re-issued between attempts: the device already took it (9.2.6.3
+    // above), so re-sending SET_ADDRESS would be addressing a device that has already moved. Only the
+    // read repeats.
+    let mut got = false;
+    for _ in 0..ENUM_TRIES {
+        if chan::control_split(ctx, mmio, dma, &t, &getall, &mut full, true, 18, splt) {
+            got = true;
+            break;
+        }
+        ctx.sleep(ctx.duration_cycles(5));
+    }
+    if !got {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: port {} full descriptor read FAILED at address {} after {} tries",
+            port, addr, ENUM_TRIES));
         return None;
     }
 
