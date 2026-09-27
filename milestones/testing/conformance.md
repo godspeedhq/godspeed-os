@@ -99,6 +99,13 @@ Multi-file plants also work (`--- plant: <path> <mode> ---`, repeatable, unwound
 `finally`) - but they were **not** what the last three rules needed, which is recorded in
 `docs/conformance.md` because it was a wrong guess worth keeping.
 
+**A plant DECLARES any byte the surrounding tooling would normalise**, as `\uXXXX`: an em-dash by
+codepoint because the dash gate would otherwise fail the fixture itself, and a carriage return as
+`\u000d` because git rewrites line endings on checkout. The case file's own endings are structure and
+are normalised. That distinction is not decoration - the CRLF case spent a day planting whatever
+endings the checkout happened to give it, so it fired on Windows and would have found nothing in CI.
+`.gitattributes` pins `*.case` to `eol=lf` as well, the same argument it already makes for `*.gsh`.
+
 **The five codes without an entry are absent for stated reasons**, and the coverage list is COMPUTED
 from the rule set minus what the cases rendered - so an absence nobody explained is reported as a
 defect rather than mistaken for coverage. `GS0008` can never fire at all: Commandment VIII has no
@@ -119,5 +126,7 @@ mechanical check, and `--list` says so.
 
 ## Evidence
 
-`conform --check`: 18 checks ran, 18 passed. `--selftest`: 24 of 24 cases render as expected.
-All 18 checkers pass individually. `cargo check -p osdev` clean. No shipping binary changed.
+`conform --check`: 18 checks ran, 18 passed. `--selftest`: 24 of 24 cases render as expected - and
+that now holds on a CRLF checkout as well as an LF one, which it did not on the day it was first
+claimed. All 18 checkers pass individually. `cargo check -p osdev` clean. No shipping binary
+changed.

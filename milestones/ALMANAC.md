@@ -1553,6 +1553,16 @@ docstring cited `XHCI_FOUND` and `CNTP_TVAL` as examples of dead names, its own 
 prose, and so every name it mentioned resolved BY being mentioned. Fourteen names passed, including the
 two dead statics that had motivated writing it at all.
 
+And the last one arrived after the merge, which is the one worth remembering longest. The fixture that
+plants a CRLF boot config planted its carriage returns by INHERITING them from its own file - and
+`.gitattributes` gives a Windows checkout CRLF and everyone else LF. So it fired here and would have
+found nothing in CI, where `--bless` would have written "no finding" down as the truth for the third
+time. **A fixture that inherits bytes from the checkout measures the checkout.** Both numbers were
+green on the machine that produced them, and neither could have revealed it; what revealed it was
+deleting the files and checking them out again. The bytes a plant needs are declared now, and the
+fixtures are pinned to LF, and the proof is that forcing all 24 to CRLF leaves exactly one failure -
+the gate correctly reporting 24 files full of carriage returns.
+
 ### What a catalogue is for
 
 The answer to "have I seen every message?" was no - fifteen of twenty-seven codes, and **two of the
