@@ -470,6 +470,11 @@ PCI_CFG            = 16
 "aarch64/mmu.rs"              = "mmu"
 "aarch64/mod.rs"              = "arch-entry"
 "aarch64/pcie.rs"             = "discovery"
+# Reads two SD-host-controller windows at boot and prints what answered, so that WHICH controller
+# the CYW43455 radio sits behind is measured rather than read off a specification. Discovery, and
+# deliberately nothing more: it grants no window and touches no card. The SD driver is
+# `services/block-driver` and the radio driver will be a service too (docs/wifi.md).
+"aarch64/sdio.rs"             = "discovery"
 "aarch64/ptables.rs"          = "mmu"
 "aarch64/sched_demo.rs"       = "scheduler-entry"
 "aarch64/sched_supervisor.rs" = "scheduler-entry"

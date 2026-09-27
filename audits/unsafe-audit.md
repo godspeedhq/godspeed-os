@@ -41,6 +41,32 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-09-27 - Pi 4: which SD host controller is the WiFi radio behind (feat/wifi-driver)
+
+`docs/wifi.md` section 4 rests the whole Pi 4 phase-1 estimate on one board fact: the CYW43455 sitting
+behind the older Arasan controller - the block `services/block-driver/src/sdhci.rs` already drives - with
+the SD card on the other one. That was recorded as needing a device-tree read. It does not: the machine
+can be asked.
+
+`arch/aarch64/sdio.rs` asks it. Two candidate windows, two read-only SDHCI registers each, printed with
+which answered. It is `discovery` in `COMMANDMENTS.baseline.toml`, beside `genet.rs` and `pcie.rs`, and
+Commandment I's role check is what made that classification explicit rather than assumed.
+
+**It grants nothing.** `map_fixed_driver_mmio` is untouched until the boot log says which window to name,
+because that table's own comment records the cost of guessing: a service handed a range whose first
+register read aborts dies on that read, and the supervisor respawns it forever.
+
+One of the two offsets is an in-repo fact (`arch/arm/mod.rs` grants the Arasan at `PERIPHERAL_BASE +
+0x30_0000`, and `sdhci.rs` documents the same); the other is this author's recollection and is **labelled
+UNVERIFIED in the log line itself**, because a probe that cannot be told apart from a claim is worth less
+than no probe.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/sdio.rs` | 0 -> 2 (+2) | Two `uaccess::probe_read32` calls, the same abort-catching read `genet::probe` and `pcie::init` use and for the same reason: on this SoC an address that decodes to nothing is an external abort, and one taken outside the boot probe window surfaces later as an SError blaming an unrelated userspace task. Each carries its own SAFETY comment noting 4-byte alignment and that the address is inside the peripheral Device mapping the kernel built at boot. Reads only; no write, no side effect intended, and the registers chosen are SDHCI's read-only ones. |
+
+---
+
 ## 2026-09-03 - arm32: the drainer waits for the wire rather than dropping bytes out of a line
 
 Measurement, not reasoning, produced this one. With the line ring and the single-writer rule in place
@@ -2492,6 +2518,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 70 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
+| arch/aarch64/sdio.rs | 2 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |

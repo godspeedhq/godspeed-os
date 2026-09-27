@@ -41,6 +41,7 @@ pub mod uart_rx;
 pub mod genet;
 #[cfg(feature = "pi4")]
 pub mod pcie;
+pub mod sdio;
 // Always compiled, even when SMP is off: `_start` branches secondaries here, and a `naked_asm!` symbol
 // reference cannot be conditional. With the feature off nothing ever sets `AP_TABLES_READY`, so a
 // secondary that reaches it simply parks in `wfe` - exactly the behaviour it had before, and reached by
@@ -889,6 +890,22 @@ extern "C" fn boot_high() -> ! {
         let ram_top = bi.memory_map.iter().map(|r| r.base + r.len).max().unwrap_or(0);
         // The on-board ethernet controller. Identified here, next to the other device probes, and
         // inside the same window: an absent controller answers with an abort, not a value.
+        // WHICH SD HOST CONTROLLER IS THE WIFI RADIO BEHIND - a census, not a driver.
+        //
+        // `docs/wifi.md` section 4 rests its whole phase-1 estimate on the CYW43455 sitting behind the
+        // older Arasan block (the one `services/block-driver/src/sdhci.rs` already drives) with the SD
+        // card on the other controller. That was recorded as needing a device-tree read; it does not.
+        // The machine can be asked, and asking is both safer and more honest than believing a
+        // specification.
+        //
+        // READS AND PRINTS, GRANTS NOTHING. `map_fixed_driver_mmio` is untouched until the boot log says
+        // which window to name, because that table's comment records what getting it wrong costs: a
+        // service handed a range whose first read aborts dies on that read, forever.
+        //
+        // Inside the probe window on purpose - one of the two addresses is this author's recollection
+        // rather than an in-repo fact, and it is labelled as such in the log.
+        #[cfg(feature = "pi4")]
+        sdio::census();
         if genet::probe().is_some() {
             // The controller answered, and that is the LAST thing this kernel does about ethernet.
             // Commandment I: an ethernet driver is not the kernel's business (§4.4). The kernel
