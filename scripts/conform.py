@@ -502,6 +502,12 @@ def render_commandments(output):
             # got printed as the `why`. A reason that restates the location says nothing.
             if site and d.rstrip(":").strip() in (site, site.split(":")[0]):
                 continue
+            # A bare PATH with no prose is a location, not a reason - and when the checker printed no
+            # line number there was no `site` to compare it against, so it slipped through and became
+            # the `why`. A `why` that restates where says nothing.
+            bare = d.rstrip(":").strip()
+            if " " not in bare and "/" in bare:
+                continue
             if d.startswith(FOOTER):
                 continue
             useful.append(d)
@@ -708,9 +714,20 @@ def _parse_case(path):
     """
     text = io.open(path, encoding="utf-8", newline="").read()
     meta, plant, expect, where = {}, [], [], "head"
+    plants = []          # [(target, mode, [lines])] for a MULTI-FILE case
     for line in text.split("\n"):
         if line.strip() == "--- plant ---":
             where = "plant"
+            continue
+        # MULTI-FILE: `--- plant: <path> [append|write|create] ---`, repeatable. Some rules are
+        # properties of a RELATIONSHIP between files - an `arch::imp` member every arch must answer, a
+        # grant table against a service, a peer a service cannot reacquire - and no single-file plant
+        # expresses one honestly. The single-plant header still works, so a case pays for this syntax
+        # only when it needs it.
+        m_p = re.match(r"^---\s*plant:\s*(\S+)\s*(append|write|create|replace)?\s*---$", line.strip())
+        if m_p:
+            plants.append((m_p.group(1), m_p.group(2) or "append", []))
+            where = "plants"
             continue
         if line.strip() == "--- expect ---":
             where = "expect"
@@ -720,14 +737,20 @@ def _parse_case(path):
             if m:
                 k, v = m.group(1), m.group(2).rstrip()
                 meta[k] = (meta.get(k, "") + " " + v).strip() if k == "why" else v
+        elif where == "plants":
+            plants[-1][2].append(line)
         elif where == "plant":
             plant.append(line)
         else:
             expect.append(line)
+
     # `\uXXXX` is decoded so a case can plant a character it must not CONTAIN literally.
-    body = "\n".join(plant)
-    body = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), body)
-    return meta, body, "\n".join(expect).strip()
+    def _decode(s):
+        return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+
+    if plants:
+        meta["plants"] = [(tgt, mode, _decode("\n".join(b))) for tgt, mode, b in plants]
+    return meta, _decode("\n".join(plant)), "\n".join(expect).strip()
 
 
 def _norm(s):
@@ -744,39 +767,80 @@ def _dirty_paths():
     return dirty
 
 
+def _apply(target, mode, body):
+    """Write one plant. Returns an undo thunk that restores this one file exactly."""
+    p = os.path.join(ROOT, target)
+    if mode == "create":
+        if os.path.exists(p):
+            raise ValueError("mode: create but the target already exists: %s" % target)
+        d = os.path.dirname(p)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        io.open(p, "w", encoding="utf-8", newline="").write(body)
+
+        def undo_created():
+            if os.path.exists(p):
+                os.remove(p)
+        return undo_created
+
+    if not os.path.isfile(p):
+        raise ValueError("target does not exist: %s" % target)
+    original = io.open(p, "rb").read()
+
+    if mode == "replace":
+        # IN-PLACE SUBSTITUTION, body = `OLD` + a `--- with ---` line + `NEW`. This is what the last
+        # three unrepresented rules actually need, and multi-file was NOT it: Commandment II derives
+        # who escapes chaos from `is_transient()`, VII from the supervisor's grant table, IX from
+        # whether a service with a peer grant CALLS a reacquire. Each is tripped by changing or
+        # REMOVING an existing construct, which no amount of appending or adding files can express.
+        if "\n--- with ---\n" not in body:
+            raise ValueError("mode: replace needs a `--- with ---` line between the old and new text")
+        old, new = body.split("\n--- with ---\n", 1)
+        old, new = old.strip("\n"), new.strip("\n")
+        text = original.decode("utf-8")
+        # Exactly one occurrence, or the plant is ambiguous and the case would be measuring luck.
+        if text.count(old) != 1:
+            raise ValueError("mode: replace matched %d times in %s (needs exactly 1)"
+                             % (text.count(old), target))
+        io.open(p, "w", encoding="utf-8", newline="").write(text.replace(old, new))
+    else:
+        io.open(p, "w", encoding="utf-8", newline="").write(
+            original.decode("utf-8") + body if mode == "append" else body)
+
+    def undo_written():
+        io.open(p, "wb").write(original)
+    return undo_written
+
+
 def _run_case(meta, plant):
     """Plant, render, restore. Returns (rendered_diagnostic_or_empty, error_or_None).
+
+    `meta["plants"]` is a list of `(target, mode, body)` for a MULTI-FILE case; a single-file case is
+    the one-element form of the same thing.
 
     RESTORE IS IN A `finally` AND COMES FROM MEMORY, never from git. `mode: create` deletes the file it
     made, for the same reason: a crash mid-case must not leave a planted violation or a stray file
     behind. `commandments_redteam.py` restores with `git checkout`, and that has eaten uncommitted work
     in this repository once already.
     """
-    target = os.path.join(ROOT, meta.get("target", ""))
     checker = meta.get("checker", "")
-    mode = meta.get("mode", "append")
     if not checker:
         return None, "case is malformed: needs `# checker:`"
 
-    created = mode == "create"
-    original = None
-    if not created:
-        if not os.path.isfile(target):
-            return None, "target does not exist: %s" % meta.get("target")
-        original = io.open(target, "rb").read()
-    elif os.path.exists(target):
-        return None, "mode: create but the target already exists: %s" % meta.get("target")
+    spec = meta.get("plants") or [(meta.get("target", ""), meta.get("mode", "append"), plant)]
+    if not all(tgt for tgt, _m, _b in spec):
+        return None, "case is malformed: needs `# target:` or a `--- plant: <path> ---` block"
 
+    # EVERY applied plant is unwound, in reverse, in a `finally` - even if a later one raised. A
+    # half-applied multi-plant left behind is worse than a single one, because a contributor would not
+    # know how many files to go and look at.
+    undos = []
     try:
-        if created:
-            d = os.path.dirname(target)
-            if d and not os.path.isdir(d):
-                os.makedirs(d)
-            io.open(target, "w", encoding="utf-8", newline="").write(plant)
-        else:
-            text = original.decode("utf-8")
-            io.open(target, "w", encoding="utf-8", newline="").write(
-                text + plant if mode == "append" else plant)
+        try:
+            for tgt, mode, body in spec:
+                undos.append(_apply(tgt, mode, body))
+        except ValueError as e:
+            return None, str(e)
 
         rc, out = run_one(checker)
         if rc is None:
@@ -785,17 +849,18 @@ def _run_case(meta, plant):
             return "", None
         return render(checker, out, [rel for rel, _ in fix_decidable(apply=False)]), None
     finally:
-        if created:
-            if os.path.exists(target):
-                os.remove(target)
-        else:
-            io.open(target, "wb").write(original)
+        for undo in reversed(undos):
+            undo()
 
 
 def _guard(parsed):
     """Refuse if a case TARGET has uncommitted work. Scoped to the targets, not the tree."""
     dirty = _dirty_paths()
-    at_risk = sorted({m.get("target", "") for _, (m, _, _) in parsed} & dirty)
+    targets = set()
+    for _fn, (m, _p, _e) in parsed:
+        for tgt, _mode, _b in (m.get("plants") or [(m.get("target", ""), "", "")]):
+            targets.add(tgt)
+    at_risk = sorted(targets & dirty)
     if at_risk:
         print("conform: these case TARGETS have uncommitted changes, and a case plants a violation")
         print("into them to measure it:")
@@ -868,20 +933,7 @@ NO_CASE_REASON = {
     "GS0008": "Commandment VIII has NO mechanical check at all, so this code can never fire. It is in "
               "the not-mechanised list as \"[static heuristic, not built] Wait on truth\". Listed here "
               "rather than quietly absent, because a code nothing can produce reads as coverage.",
-    "GS0002": "Commandment II's check derives who may escape chaos from `is_transient()` and from "
-              "chaos's own spawn calls - deliberately NOT from a list, so there is nothing to append "
-              "to. Tripping it means editing that function, which a single-file case cannot express "
-              "honestly.",
-    "GS0003": "Commandment III wants the same module-level constant in two files of one crate. Probed "
-              "four shapes - including duplicating a real `const` from `dwc2/src/chan.rs` into "
-              "`hid.rs`, same crate, same value - and none fired. The precise shape it wants was not "
-              "established, and a case that passes for the wrong reason is worse than none.",
-    "GS0007": "Commandment VII pins what each service may REACH, which lives in the supervisor's "
-              "spawn table. Tripping it means changing a grant there, not appending to a file.",
-    "GS0009": "Commandment IX wants a service that sends to a peer and cannot reacquire it. That is a "
-              "property of a whole service, so the plant would be a new service rather than a line.",
-    "GS0203": "`arch_seam_check` needs a NEW `arch::imp::` member called from neutral code, which every "
-              "arch then fails to answer - a multi-file edit by construction.",
+    "GS0203": "Needs a NEW `arch::imp` member CALLED from neutral code, so every one of the seven arch directories then fails to answer it. Multi-file plants exist now and would express the call site, but the case would have to stay correct as arches are added - it would assert a fact about how many exist. Left out rather than made fragile.",
     "GS0405": "`facts_check` needs a doc that restates a number the code owns. Picking one means "
               "hard-coding a pairing the checker DISCOVERS, so the case would rot exactly as the "
               "checker exists to prevent.",
@@ -940,9 +992,15 @@ def gallery():
         if why:
             out.append(why)
             out.append("")
-        out.append("*Planted in `%s` (`%s`), caught by `%s`.*"
-                   % (meta.get("target", "?"), meta.get("mode", "append"),
-                      meta.get("checker", "?")))
+        if meta.get("plants"):
+            where = ", ".join("`%s` (`%s`)" % (tgt, mode) for tgt, mode, _b in meta["plants"])
+            out.append("*Planted in %s - a MULTI-FILE case, because this rule is a property of the "
+                       "RELATIONSHIP between those files rather than of any one of them. Caught by "
+                       "`%s`.*" % (where, meta.get("checker", "?")))
+        else:
+            out.append("*Planted in `%s` (`%s`), caught by `%s`.*"
+                       % (meta.get("target", "?"), meta.get("mode", "append"),
+                          meta.get("checker", "?")))
         out.append("")
         if err:
             out.append("```")

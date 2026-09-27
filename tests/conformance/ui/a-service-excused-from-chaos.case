@@ -1,0 +1,34 @@
+# checker: scripts/commandments.py
+# why: Commandment II: nothing escapes Maximum Carnage but chaos's own apparatus. Chaos keeps no target
+# why: LIST - it scans the live task table, so a new service is a candidate automatically - and all the
+# why: risk sits in `is_transient()`, three lines naming who never faces the storm.
+# why:
+# why: What may legitimately be there is DERIVED, not declared, and that is the whole design: any
+# why: declaration is a knob. A list can be appended to, a boolean can be flipped, and a config entry is
+# why: a second copy of a fact the code already states (Commandment III), free to drift in whichever
+# why: direction someone wants. Chaos excluding ITSELF is not an exclusion, it is the definition of the
+# why: instrument - a storm that storms itself stops measuring anything - and anything chaos SPAWNS is
+# why: its ammunition, derived by reading its own spawn calls, so the permission evaporates on its own
+# why: if chaos ever stops spawning it. No config entry could ever do that.
+# why:
+# why: Needs `mode: replace`: the violation is an added CONDITION inside an existing function, which is
+# why: neither an append nor a new file.
+--- plant: services/chaos/src/main.rs replace ---
+    name == "chaos" || name == "mem-pressure"
+--- with ---
+    name == "chaos" || name == "mem-pressure" || name == "observe"
+--- expect ---
+error[GS0002]: nothing escapes Maximum Carnage but chaos's own apparatus
+   --> services/chaos/src/main.rs
+    |
+    = commandment: II - Thou shalt love Chaos and trust in it. Thy service shall pass through
+                   Maximum Carnage.
+    = why: 'observe' is excluded from Maximum Carnage. It is not chaos itself, and chaos does
+           not spawn it, so it is a SERVICE escaping the storm - special, while every suite
+           still reports green (Commandment V). There is nothing to configure here and
+           nowhere to record an exception: stop excluding it, or amend CLAUDE.md and cite the
+           amendment in an [[exemption]].
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0002` for the long form

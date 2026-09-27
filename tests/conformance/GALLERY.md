@@ -155,6 +155,40 @@ error[GS0404]: a `path:line` citation no longer points at what it claims
   | (4 more lines of explanation, which the frame above covers - `py scripts/line_ref_check.py` for all of it)
 ```
 
+## a peer granted with no way to reacquire it
+
+TWO Commandments from one realistic mistake: you give a service a new peer and forget that the peer is restartable. IX asks whether the service can REACQUIRE it; VII asks whether the grant was pinned. Both fire, which is the honest render - a single edit really does break two rules. Why IX matters more than it looks: every peer here is restartable, chaos kills them all, so a send cap is a WASTING ASSET - the instant the peer respawns the generation moves and the cap is dead forever. `find_send_slot` never resolves a name. And the failure is SILENT: a stale cap does not crash the holder and does not log. It returns `EndpointDead` to a caller that usually discards it, and the service runs on, correct in every other respect, quietly talking to nobody. The recorded fingerprint from the last time this bit was a driver "enumerated and UP" with zero register reads even ATTEMPTED. THIS CASE IS WHY `mode: replace` EXISTS, and it answers a question worth recording: multi-file support does NOT unlock the last three rules. II derives who escapes chaos from `is_transient()`, VII from the supervisor's grant table, IX from whether a service with a peer grant calls a reacquire - every one of them is tripped by CHANGING an existing construct, which no amount of appending or adding files can express. An in-place substitution can.
+
+*Planted in `services/supervisor/src/main.rs` (`replace`) - a MULTI-FILE case, because this rule is a property of the RELATIONSHIP between those files rather than of any one of them. Caught by `scripts/commandments.py`.*
+
+```
+error[GS0009]: a service that sends to a peer can reacquire it after the peer restarts
+    |
+    = commandment: IX - Thou shalt always plan for recovery, for thy service shall fail.
+    = why: 'observe' sends to [fs] and has NO reacquisition path. Every peer here is
+           restartable and chaos kills them all, so this cap dies the first time its peer
+           respawns - and the death is silent, because a discarded `try_send` error looks
+           exactly like success. Reacquire by name on `Err` (never on `Ok(None)`, which is a
+           deadline, not a dead peer).
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0009` for the long form
+
+error[GS0007]: what each service may reach is pinned, not just that it has a name
+   --> services/supervisor/src/main.rs
+    |
+    = commandment: VII - Thou shalt not introduce ambient authority.
+    = why: 'observe' is granted peer:fs, which is not pinned. Commandment VII: authority is
+           granted deliberately or not at all, and a service's reach may SHRINK freely but
+           may only grow by pinning it here in a commit that says why. If this grant is
+           right, add "peer:fs" to [kernel.service_grants]."observe" and say what it is for.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0007` for the long form
+```
+
 ## a posix word used as a command
 
 The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`, `count` - and a foreign word is a HINT, never an alias: `ls` does not run, it answers ``try `dir` ``. The `ls` to `dir` rename reached the shell, the specs and the help text and missed TEN worked examples, which is why this is gated from the shell's own FOREIGN_HINTS rather than a list.
@@ -178,6 +212,29 @@ error[GS0406]: a document shows a POSIX or DOS word being used as a command
   | foreign words: 1 example(s) use a word the shell REFUSES
   |   docs/pipes.md:271
   | (5 more lines of explanation, which the frame above covers - `py scripts/foreign_word_check.py` for all of it)
+```
+
+## a service excused from chaos
+
+Commandment II: nothing escapes Maximum Carnage but chaos's own apparatus. Chaos keeps no target LIST - it scans the live task table, so a new service is a candidate automatically - and all the risk sits in `is_transient()`, three lines naming who never faces the storm. What may legitimately be there is DERIVED, not declared, and that is the whole design: any declaration is a knob. A list can be appended to, a boolean can be flipped, and a config entry is a second copy of a fact the code already states (Commandment III), free to drift in whichever direction someone wants. Chaos excluding ITSELF is not an exclusion, it is the definition of the instrument - a storm that storms itself stops measuring anything - and anything chaos SPAWNS is its ammunition, derived by reading its own spawn calls, so the permission evaporates on its own if chaos ever stops spawning it. No config entry could ever do that. Needs `mode: replace`: the violation is an added CONDITION inside an existing function, which is neither an append nor a new file.
+
+*Planted in `services/chaos/src/main.rs` (`replace`) - a MULTI-FILE case, because this rule is a property of the RELATIONSHIP between those files rather than of any one of them. Caught by `scripts/commandments.py`.*
+
+```
+error[GS0002]: nothing escapes Maximum Carnage but chaos's own apparatus
+   --> services/chaos/src/main.rs
+    |
+    = commandment: II - Thou shalt love Chaos and trust in it. Thy service shall pass through
+                   Maximum Carnage.
+    = why: 'observe' is excluded from Maximum Carnage. It is not chaos itself, and chaos does
+           not spawn it, so it is a SERVICE escaping the storm - special, while every suite
+           still reports green (Commandment V). There is nothing to configure here and
+           nowhere to record an exception: stop excluding it, or amend CLAUDE.md and cite the
+           amendment in an [[exemption]].
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0002` for the long form
 ```
 
 ## a service that can halt the machine
@@ -405,6 +462,27 @@ error[GS0202]: neutral kernel code names an ISA, or contains inline assembly
   | 2 violation(s). The neutral layers must reach hardware only through the `arch::imp` seam (docs/aarch64.md); add an `arch::imp` primitive rather than inlining asm or naming a specific arch. This keeps the NEXT port BOUNDED.
 ```
 
+## one fact declared in two files
+
+Commandment III: one fact, one place. The same module-level constant in two files of one crate is one fact stored twice, free to drift with nothing to say which copy is right. `use` the other. THIS CASE TOOK THREE ATTEMPTS AND THE FIRST TWO FAILED FOR DIFFERENT REASONS, both worth knowing before writing another. `const HCCHAR_CHENA: u32 = 1 << 31;` did not fire because `_CONST_DECL` matches only a plain decimal or hex LITERAL, so an expression-valued const is invisible to this check - a narrow real blind spot. `const CH_KBD: u8 = 1;` did not fire because that pair is already in `duplicate_const_debt` in COMMANDMENTS.baseline.toml, and a baselined duplicate is exempt by design. Both were recorded as "no finding" by `--bless` until someone looked.
+
+*Planted in `services/net-stack/src/tcp.rs` (`append`), caught by `scripts/commandments.py`.*
+
+```
+error[GS0003]: one fact, one place - no constant declared twice in a crate
+   --> services/net-stack/src/main.rs
+    |
+    = commandment: III - Thou shalt not duplicate truth. Store irreducible facts. Derive the
+                   rest.
+    = why: `DANCE_SECS` is declared in 2 files of `svc/net-stack` with the same value
+           (services/net-stack/src/main.rs, services/net-stack/src/tcp.rs). One fact, stored
+           twice, free to drift with nothing to say which is right - `use` the other.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0003` for the long form
+```
+
 ## python newer than the declared floor
 
 README.md tells a contributor they need Python 3.8. A hand-measured number is right on the day it is taken and silently wrong afterwards, and the drift arrives as a SyntaxError FROM A CHECKER - the worst first experience this repository can offer. So the floor is held mechanically, and raising it means changing `FLOOR` and the README together, deliberately.
@@ -478,18 +556,14 @@ error[GS0201]: the unsafe inventory does not match the source
 
 ## Coverage, and where this catalogue stops
 
-19 of 28 codes have an entry above. The rest are named here with a reason each, and this list is
+23 of 28 codes have an entry above. The rest are named here with a reason each, and this list is
 COMPUTED from the rule set minus what the cases actually rendered - so it cannot go stale when a
 case is added, and an absence nobody explained is reported as a defect rather than left to be
 mistaken for coverage.
 
 - **`GS0000`** - The deliberate FALLBACK for a Commandment failure `conform` cannot attribute. Producing it means breaking `commandments.py`'s report format, which is not a violation of anything - it is a bug in this tool, and the frame says so when it happens.
-- **`GS0002`** - Commandment II's check derives who may escape chaos from `is_transient()` and from chaos's own spawn calls - deliberately NOT from a list, so there is nothing to append to. Tripping it means editing that function, which a single-file case cannot express honestly.
-- **`GS0003`** - Commandment III wants the same module-level constant in two files of one crate. Probed four shapes - including duplicating a real `const` from `dwc2/src/chan.rs` into `hid.rs`, same crate, same value - and none fired. The precise shape it wants was not established, and a case that passes for the wrong reason is worse than none.
-- **`GS0007`** - Commandment VII pins what each service may REACH, which lives in the supervisor's spawn table. Tripping it means changing a grant there, not appending to a file.
 - **`GS0008`** - Commandment VIII has NO mechanical check at all, so this code can never fire. It is in the not-mechanised list as "[static heuristic, not built] Wait on truth". Listed here rather than quietly absent, because a code nothing can produce reads as coverage.
-- **`GS0009`** - Commandment IX wants a service that sends to a peer and cannot reacquire it. That is a property of a whole service, so the plant would be a new service rather than a line.
-- **`GS0203`** - `arch_seam_check` needs a NEW `arch::imp::` member called from neutral code, which every arch then fails to answer - a multi-file edit by construction.
+- **`GS0203`** - Needs a NEW `arch::imp` member CALLED from neutral code, so every one of the seven arch directories then fails to answer it. Multi-file plants exist now and would express the call site, but the case would have to stay correct as arches are added - it would assert a fact about how many exist. Left out rather than made fragile.
 - **`GS0405`** - `facts_check` needs a doc that restates a number the code owns. Picking one means hard-coding a pairing the checker DISCOVERS, so the case would rot exactly as the checker exists to prevent.
 - **`GS0409`** - `site_check` needs a hand-written website page to disagree with the repository - again a two-file relationship.
 
