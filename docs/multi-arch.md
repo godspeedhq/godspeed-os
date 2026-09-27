@@ -85,14 +85,31 @@ every ISA that has one (x86/x86-64, ARMv7, all 64-bit arches) and a small lock-b
 | Arch | Rust target | Word | 64-bit atomics? | Status |
 |------|-------------|------|-----------------|--------|
 | **ARM (32-bit)** | `armv7a-none-eabi` | 32 | Native (LDREXD) | **RUNS MULTI-SERVICE IPC ON HARDWARE** (`ping`->`pong`, 6192 messages, 0 faults) - Raspberry Pi 2 Model B v1.1 (BCM2836, Cortex-A7), 2026-07-21. See below. |
-| **RISC-V (32-bit)** | `riscv32imac-unknown-none-elf` | 32 | No (RV32A) → `portable-atomic` shim | **Compiles - 0 errors** (shim proves the shim path) |
+| **RISC-V (32-bit)** | `riscv32imac-unknown-none-elf` | 32 | No (RV32A) → `portable-atomic` shim | **Compiled with 0 errors when measured; it does not today** - the shim path is proven and that conclusion stands, but the stub has fallen behind the seam (`backlog/60`). `scripts/arch_seam_check.py` prints the live gap on every run |
 | **x86 (32-bit)** | (no upstream `i686-none`) | 32 | Native (CMPXCHG8B) | **Provable, tooling-gated:** the code is word-size-clean (proven by the two above) and has native 64-bit atomics, but rustc ships no bare-metal `i686-none` target; it needs a custom target-spec JSON (a known, small artifact), which hit stable-toolchain friction here. Not a code gap. |
 
-Two 32-bit ISAs compiling with **0 errors** - one native-atomic (ARM), one shim (RISC-V) - covers both
+Two 32-bit ISAs compiled with **0 errors** - one native-atomic (ARM), one shim (RISC-V) - covering both
 word-size cases end to end: the neutral kernel is 32-bit-clean. x86-32 is the same code with the same
 native-atomic story as ARM; only the missing upstream target stands in the way, and that is a
 toolchain matter, not a boundary leak. Recorded here so a future 32-bit port starts from "add the
 target spec," not "find out whether the kernel is even word-size-portable."
+
+> **Past tense on the RISC-V half, corrected 2026-09-27: the riscv32 stub no longer compiles - 37
+> errors - and this section asserted 0 in two places for months.** Nothing was hiding it;
+> `arch_seam_check.py` reports `scaffold: riscv32 12 member(s) behind` on every run, and the scaffolds
+> are tracked rather than gated on purpose, because holding a size study to the seam would tax every
+> neutral-kernel addition for a port nobody intends to boot. What failed is that a MEASUREMENT was
+> written into prose as though it were a property, where nothing could keep it current - the same
+> defect as the hand-counted arch-conditional sites in `CLAUDE.md` §4.1, and corrected the same way:
+> point at the instrument, not at a number.
+>
+> **The conclusion above is not weakened, and that distinction is the reason this is a correction
+> rather than a retraction.** Every one of the 37 is a missing `arch::imp` member the neutral kernel
+> grew later (`PciDevice`, `find_by_class`, `note_irq`, `copy_user_to_kernel`, the MSI pool constants);
+> not one is a word-size failure, and `portable-atomic`'s shim path is untouched. The kernel being
+> 32-bit-clean was established twice, and arm32 went on to run userspace on real hardware. `backlog/60`
+> carries the errors, a 64-bit store still sitting in the riscv32 boot stub, and the decision this now
+> needs: bring the study back to compiling, or retire it and say what it showed.
 
 ### arm32 RUNS USERSPACE on hardware: `logger: ready` (2026-07-21)
 
