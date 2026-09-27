@@ -37,13 +37,27 @@ const CMD_IO_SEND_OP_COND: u32 = 0x0502_0000; // CMD5  -> R4
 const CMD_SEND_REL_ADDR: u32 = 0x0302_0000; // CMD3  -> R6
 const CMD_SELECT_CARD: u32 = 0x0703_0000; // CMD7  -> R1b
 const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
-/// CMD53 (`IO_RW_EXTENDED`), read. Index 53 (0x35), 48-bit response, plus `CMD_ISDATA` (bit 21 - this
-/// command has a data phase) and `TM_DAT_DIR` (bit 4 - the data comes toward us). Same encoding shape
-/// as `block-driver`'s CMD17.
-const CMD_IO_RW_EXTENDED_READ: u32 = 0x3522_0010;
+/// CMD53 (`IO_RW_EXTENDED`), read. Index 53 (0x35), 48-bit response, `CMD_ISDATA` (bit 21 - this command
+/// has a data phase), `TM_DAT_DIR` (bit 4 - the data comes toward us) and `TM_BLKCNT_EN` (bit 1).
+///
+/// **`TM_BLKCNT_EN` was missing and is the fix this constant exists to record.** The spec's wording
+/// invites you to leave it off for a single block - the block count is "not used" there - and on hardware
+/// the consequence was exact: the card ACCEPTED the transfer (R5 flags clean) and the controller ran no
+/// data phase at all, leaving `STATUS` with no DAT activity and no buffer to read. A controller whose
+/// block count is not enabled is entitled to read that count as zero and move nothing, which is what
+/// this looked like.
+///
+/// Linux is unambiguous about it: `sdhci_set_transfer_mode` opens with `mode = SDHCI_TRNS_BLK_CNT_EN` for
+/// **any** command that carries data, and only then adds the multi-block bits. Cited per §26.14; the bit
+/// is the silicon's requirement, not their design.
+///
+/// `block-driver`'s CMD17 gets away without it on a 512-byte block, which is why the shape was copied
+/// from there and came up short. The two differ in exactly two ways - the index and the block size - and
+/// that made this the only bit worth suspecting.
+const CMD_IO_RW_EXTENDED_READ: u32 = 0x3522_0012;
 /// CMD53, write. As above without the direction bit.
 #[allow(dead_code)] // arrives with the firmware upload; the read is what this phase needs
-const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x3522_0000;
+const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x3522_0002;
 
 /// The voltage window to ask for: the 3.2-3.4 V bits of the OCR.
 ///
@@ -119,18 +133,58 @@ impl Manfid {
     }
 }
 
-/// Read one register byte through CMD52. `None` means the card did not answer or refused.
-pub fn read_reg(h: &Host, func: u8, addr: u32) -> Option<u8> {
+/// Why a CMD52 did not produce a byte. **Two different facts that `None` used to conflate**, which is
+/// the same gap CMD53 had one layer up: a command that never completed and a card that refused need
+/// different fixes, and a caller that cannot tell them apart cannot say which it hit.
+#[derive(Clone, Copy)]
+pub enum ReadFail {
+    /// The command did not complete - the controller's problem, or nothing listening.
+    NoAnswer,
+    /// The card answered and refused, carrying its R5 flag byte.
+    Refused(u32),
+}
+
+impl ReadFail {
+    /// One phrase naming the failure, for a caller's log line.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ReadFail::NoAnswer => "the command never completed",
+            ReadFail::Refused(_) => "the card REFUSED it",
+        }
+    }
+    /// The R5 flag byte, or 0 when the card never answered to set one.
+    pub fn flags(&self) -> u32 {
+        match self {
+            ReadFail::NoAnswer => 0,
+            ReadFail::Refused(f) => *f,
+        }
+    }
+}
+
+/// Read one register byte through CMD52, saying WHICH way it failed.
+pub fn read_reg_detail(h: &Host, func: u8, addr: u32) -> Result<u8, ReadFail> {
     // CMD52 argument: bit31 R/W (0 = read), bits30:28 function, bit27 RAW, bits25:9 address,
     // bits7:0 write data.
     let arg = ((func as u32 & 0x7) << 28) | ((addr & 0x1_FFFF) << 9);
-    let resp = h.cmd(CMD_IO_RW_DIRECT, arg)?;
+    let resp = match h.cmd(CMD_IO_RW_DIRECT, arg) {
+        Some(r) => r,
+        None => return Err(ReadFail::NoAnswer),
+    };
     // R5 occupies response bits [39:8], which is exactly RESP0 - so the read DATA is the low byte and
     // the flags are the next one up.
-    if (resp >> 8) & R5_ERRORS != 0 {
-        return None;
+    let flags = (resp >> 8) & 0xFF;
+    if flags & R5_ERRORS != 0 {
+        return Err(ReadFail::Refused(flags));
     }
-    Some((resp & 0xFF) as u8)
+    Ok((resp & 0xFF) as u8)
+}
+
+/// Read one register byte through CMD52. `None` means the card did not answer or refused.
+///
+/// The short form, for the callers that only need the byte. Reach for `read_reg_detail` where WHICH
+/// failure it was decides what to say next.
+pub fn read_reg(h: &Host, func: u8, addr: u32) -> Option<u8> {
+    read_reg_detail(h, func, addr).ok()
 }
 
 /// Write one register byte through CMD52. `None` means the card did not answer or refused.

@@ -302,17 +302,30 @@ pub fn chip_id_via_cmd52(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Opti
     let base = CHIPCOMMON_BASE & OFFSET_MASK;
     let mut raw = 0u32;
     for i in 0..4u32 {
-        match sdio::read_reg(h, 1, base + i) {
-            Some(b) => raw |= (b as u32) << (8 * i),
-            None => {
+        match sdio::read_reg_detail(h, 1, base + i) {
+            Ok(b) => raw |= (b as u32) << (8 * i),
+            Err(why) => {
+                // WHAT THIS DOES AND DOES NOT TELL US, because the first version of this line
+                // overstated it badly. It said "CMD52 cannot reach this window either, and the WINDOW
+                // or the ADDRESS is the suspect" - a conclusion the evidence does not support. A plain
+                // single-byte read INSIDE the window is not a shape any reference performs: brcmfmac
+                // uses byte reads only for the `0x1000x` control block and always sets the wide-access
+                // flag for a window address. So this fallback may simply be invalid on its own terms,
+                // and its failure says nothing about whether the window is set correctly.
                 ctx.log_fmt(format_args!(
                     "wifi-driver: the CMD52 fallback could not read byte {} of the identity register \
-                     (function 1 address {:#07x}) - INT={:#010x}. So CMD52 cannot reach this window \
-                     either, and the WINDOW or the ADDRESS is the suspect rather than the data phase",
+                     (function 1 address {:#07x}) - {} (R5 flags {:#04x}, INT={:#010x})",
                     i,
                     base + i,
+                    why.describe(),
+                    why.flags(),
                     h.last_int()
                 ));
+                ctx.log(
+                    "wifi-driver:   this does NOT indict the window. A plain byte read inside it is not \
+                     a shape any reference uses - the wide-access flag exists so the bridge does one \
+                     32-bit fetch - so the fallback may be invalid rather than the address wrong",
+                );
                 return None;
             }
         }
