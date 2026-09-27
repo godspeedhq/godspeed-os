@@ -889,3 +889,93 @@ boot and a debugging session.
 `recv`, queue empty, burning no core - the serve loop doing what it claims. `wifi` at the prompt
 answered exactly as section 12 specifies, that the driver is running and the shell cannot talk to it
 yet, and `wifi about` still gets the subcommand list rather than an unhandled error.
+
+---
+
+## 17. Phase 1 step 2: reach the chip's own bus - the prediction
+
+**A PREDICTION, written and committed before the flash.** Nothing here is a result.
+
+### What this step is for
+
+Section 16 left one question, and it decides which firmware blob phase 2 uploads: the CIS said device
+`0xA9A6` (43430 decimal) where the part this board is documented to carry answers `0xA9BF` (43455). The
+CIS cannot settle that - it IS the disputed reading. The chip can, and the register that does it is the
+first one a firmware upload has to read anyway.
+
+### What was built
+
+| where | what |
+|---|---|
+| `host.rs` | `cmd_data` - a bounded PIO data transfer. CMD52 carries one byte in its RESPONSE and cannot read a 32-bit register at all; CMD53 moves bytes through the controller's FIFO. This is also the path a 600 KB firmware image rides, so it is on the list regardless |
+| `sdio.rs` | `read32` - CMD53 in byte mode, incrementing address, four bytes |
+| `backplane.rs` | the window mechanism (three control bytes, written only where they CHANGE), the clock handshake, and the chipcommon identity read |
+| `main.rs` | stage 6 gets a numbered line of its own, and stage 7 is the new one |
+
+PIO rather than DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
+coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware upload
+wants DMA is a MEASUREMENT for the phase that does one, not a guess for this one.
+
+### How a host reaches inside this chip, since nothing else in this tree works this way
+
+The radio's internal bus is not memory-mapped anywhere the host can see. It is reached through SDIO
+function 1, whose 17-bit address space is split three ways:
+
+```text
+  0x00000 .. 0x07FFF   a 32 KiB WINDOW onto the backplane, wherever the window currently points
+  0x08000              the same window, flagged as a 2-or-4-byte access rather than a single byte
+  0x1000A .. 0x1000F   the function's own control registers, which is where the window is SET
+```
+
+So one 32-bit backplane read is: point the window with up to three `CMD52` writes, then `CMD53` at
+`(addr & 0x7FFF) | 0x8000`. The window is only rewritten where a byte actually changes, because each
+write is a command on the bus and three per register would dominate a firmware upload made of thousands.
+
+### The prediction
+
+```text
+wifi-driver: stage 6 - opening function 1, the backplane
+wifi-driver: function 1 enabled and READY (IOE 0x00 -> 0x02, after 1 read(s) of IOR)
+wifi-driver: stage 7 - waking the backplane to read the chip's own identity
+wifi-driver: backplane awake - CHIPCLKCSR 0x68, ALP available after <N> read(s)
+wifi-driver: CHIP SAYS id 0xa9a6 (BCM43430 ...) rev <R> package <P> type <T> [raw 0x????????]
+wifi-driver: the silicon AGREES with the CIS - this is a 43430, not the 43455 ...
+```
+
+**`CHIPCLKCSR 0x68` is arithmetic, not a guess:** the driver writes `0x28`
+(`FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ`), requires that exact value to read back, and then waits for
+`ALP_AVAIL` (`0x40`) to appear on top of it. `0xE8` would mean the HT clock is up too, which says
+something about the state the firmware left the chip in and is not a problem.
+
+### The chip id is a two-way fork, and this commits to the less comfortable side
+
+| if the chip says | then |
+|---|---|
+| **`0xA9A6` (43430)** | the silicon agrees with the CIS. The board carries a 2.4 GHz-only part, `nonfree/brcm43455/` is the WRONG blob, and phase 2 needs the 43430 firmware |
+| `0x4345` | the CIS device code is NOT the chip id on this part, the board does carry a 4345-family radio, and the vendored blob is right after all. Which 4345 variant is then the revision field |
+| anything else | a finding, reported with its id and revision |
+
+**`0xA9A6` is the prediction**, and it is deliberately the uncomfortable one. A 43430 on a Pi 4 rev 1.5
+contradicts the product being sold as dual-band, so the comfortable answer is `0x4345` - and the reason
+not to pick it is section 16: the last prediction got the device code wrong by preferring a document to
+the chip, and the only MEASUREMENT taken so far says 43430. The supporting reasoning is weaker than the
+measurement and is flagged as such: Linux's SDIO device table appears to carry `0xa9a6` and `0xa9bf` as
+SEPARATE entries, which would be pointless if one part reported both - but that is recollection, and
+recollection is exactly what this read replaces.
+
+### What each failure would mean
+
+| stops after | what it means |
+|---|---|
+| stage 6, function 1 not open | the first WRITE to the card failed. Everything before it was a read, so this is the one line that tests the other direction |
+| `CHIPCLKCSR wrote 0x28 and read back ...` | the write was accepted and did not stick, so the bus is talking to something that is not that register - and no read below it would mean anything. This check exists for exactly that case and is Linux's own first question of a chip it has just enabled |
+| `never reported the ALP clock available` | the register answers, so the chip is there and its clock is not coming up |
+| `could not set the backplane window` | one of the three window bytes was refused. The window is then PARTLY written, so the cached value is discarded rather than left to make the next read silently skip a write it needed |
+| `the register reads 0x00000000` or `0xffffffff` | the bus answering with nothing rather than a chip identifying itself. Refused by name, because a chip id of 0 would otherwise be reported as "a part this driver has no name for" - a wrong answer instead of an error |
+
+### Also in this image: the two findings from the last boot
+
+The CIS tuple ceiling is 256 rather than 64, so the chain can be seen to reach its END tuple instead of
+running out of bound; the per-tuple report limit is 24 rather than 8 for the same reason. And the generic
+"CIS tuple" line now prints BEFORE the branches that decode a tuple's contents, so `CIS FUNCID` no
+longer appears above its own header and read as belonging to the tuple before it.

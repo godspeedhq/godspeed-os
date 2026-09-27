@@ -40,6 +40,7 @@
 #![no_std]
 #![no_main]
 
+mod backplane;
 mod host;
 mod sdio;
 
@@ -194,19 +195,80 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Function 1 specifically, because that is the backplane on this part - what `brcmfmac` enables
     // first, before any firmware exists inside the chip to answer. Not fatal: identification already
     // succeeded, and saying which half failed is worth more than stopping.
-    if card.funcs >= 1 {
-        if !sdio::enable_function(&h, 1, &ctx) {
-            ctx.log(
-                "wifi-driver: function 1 (the backplane) is not open, so no firmware could be written \
-                 through it. Identification succeeded, so the card is there and reachable for reads",
-            );
+    ctx.log("wifi-driver: stage 6 - opening function 1, the backplane");
+    let backplane_open = card.funcs >= 1 && sdio::enable_function(&h, 1, &ctx);
+    if !backplane_open {
+        ctx.log(
+            "wifi-driver: function 1 (the backplane) is not open, so no firmware could be written \
+             through it. Identification succeeded, so the card is there and reachable for reads",
+        );
+        serve(&ctx);
+    }
+
+    // ---- Stage 7: ask the SILICON what it is. -----------------------------------------------------
+    // The CIS device code and this board's documented part disagree, and that disagreement decides
+    // which firmware blob phase 2 must upload. The CIS cannot settle it - it IS the disputed reading -
+    // so this asks the chip's own identity register, reached through the backplane that stage 6 opened.
+    //
+    // Not a detour: the same register carries the chip TYPE, which is what says how a later phase walks
+    // the core list to find where the chip's RAM is. The firmware upload needs this read anyway.
+    ctx.log("wifi-driver: stage 7 - waking the backplane to read the chip's own identity");
+    if !backplane::wake(&h, &ctx) {
+        ctx.log(
+            "wifi-driver: the backplane is not answering, so the chip cannot be asked what it is. \
+             Everything through stage 6 stands: the card is on the bus, identified, and function 1 \
+             reported ready",
+        );
+        serve(&ctx);
+    }
+    let mut window = backplane::Window::new();
+    match backplane::chip_id(&h, &mut window, &ctx) {
+        Some(id) => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: CHIP SAYS id {:#06x} ({}) rev {} package {} type {} [raw {:#010x}]",
+                id.id,
+                id.describe(),
+                id.rev,
+                id.package,
+                id.chip_type,
+                id.raw
+            ));
+            // THE COMPARISON IS THE POINT, so it is made here rather than left to a reader with two
+            // numbers in different bases. The CIS device code and the silicon's chip id are DIFFERENT
+            // fields - Broadcom does not oblige them to match, and 0xA9BF/0x4345 for the 43455 is the
+            // worked example - so agreement and disagreement both mean something specific.
+            if id.id == 43430 {
+                ctx.log(
+                    "wifi-driver: the silicon AGREES with the CIS - this is a 43430, not the 43455 \
+                     this board is documented to carry. `nonfree/brcm43455/` is then the WRONG blob \
+                     and phase 2 needs the 43430 firmware",
+                );
+            } else if id.id == 0x4345 {
+                ctx.log(
+                    "wifi-driver: the silicon says 4345 while the CIS said 43430 - so the CIS device \
+                     code is NOT the chip id on this part, the board does carry a 4345-family radio, \
+                     and `nonfree/brcm43455/` is right after all. Which 4345 variant is the revision \
+                     above",
+                );
+            } else {
+                ctx.log(
+                    "wifi-driver: the silicon names a part this driver has no name for, which is a \
+                     finding rather than a failure - report the id and revision above",
+                );
+            }
         }
+        None => ctx.log(
+            "wifi-driver: the chip's identity register could not be read, so the firmware question is \
+             still open. The backplane woke, so this is the read rather than the bus",
+        ),
     }
 
     // ---- The honest end of phase 1 step 1. --------------------------------------------------------
     ctx.log(
-        "wifi-driver: phase 1 step 1 complete. NO firmware is uploaded and no 802.11 exists yet - the \
-         chip runs no MAC until a host uploads one into it - so every request is answered `unavailable`",
+        "wifi-driver: phase 1 complete - the radio is on the bus, identified by BOTH its CIS and its \
+         own silicon, and its backplane is open. NO firmware is uploaded and no 802.11 exists yet - \
+         the chip runs no MAC until a host uploads one into it - so every request is answered \
+         `unavailable`",
     );
     serve(&ctx)
 }

@@ -37,6 +37,13 @@ const CMD_IO_SEND_OP_COND: u32 = 0x0502_0000; // CMD5  -> R4
 const CMD_SEND_REL_ADDR: u32 = 0x0302_0000; // CMD3  -> R6
 const CMD_SELECT_CARD: u32 = 0x0703_0000; // CMD7  -> R1b
 const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
+/// CMD53 (`IO_RW_EXTENDED`), read. Index 53 (0x35), 48-bit response, plus `CMD_ISDATA` (bit 21 - this
+/// command has a data phase) and `TM_DAT_DIR` (bit 4 - the data comes toward us). Same encoding shape
+/// as `block-driver`'s CMD17.
+const CMD_IO_RW_EXTENDED_READ: u32 = 0x3522_0010;
+/// CMD53, write. As above without the direction bit.
+#[allow(dead_code)] // arrives with the firmware upload; the read is what this phase needs
+const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x3522_0000;
 
 /// The voltage window to ask for: the 3.2-3.4 V bits of the OCR.
 ///
@@ -283,6 +290,39 @@ pub fn cis_pointer(h: &Host, ctx: &ServiceContext) -> Option<u32> {
     Some(p)
 }
 
+/// Read one 32-bit register through CMD53 in byte mode.
+///
+/// **CMD52 cannot do this.** It carries a single byte in its RESPONSE, on the command line, with no
+/// data phase at all - which is why the CCCR and CIS reads above use it and why a 32-bit backplane
+/// register cannot. CMD53 moves bytes through the controller's FIFO, and four of them is one block of
+/// four.
+///
+/// `addr` is a function-1 address, and for a backplane access the caller has already ORed in the
+/// wide-access flag that tells the chip this is not a single-byte read (see `backplane`).
+///
+/// Byte mode rather than block mode (bit 27 clear) because the transfer is four bytes and block mode
+/// would mean declaring a block size the card has not been given. Incrementing address (bit 26 set),
+/// so the four bytes come from consecutive register bytes rather than four reads of the same one.
+pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32> {
+    // CMD53 argument: bit31 R/W (0 = read), bits30:28 function, bit27 block mode, bit26 OP code
+    // (1 = incrementing), bits25:9 address, bits8:0 count (0 means 512 in byte mode, so 4 is 4).
+    let arg = ((func as u32 & 0x7) << 28) | (1 << 26) | ((addr & 0x1_FFFF) << 9) | 4;
+    let mut word = [0u32; 1];
+    if h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, &mut word, true).is_none() {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CMD53 read of function {} address {:#07x} failed - INT={:#010x}",
+            func,
+            addr,
+            h.last_int()
+        ));
+        return None;
+    }
+    // The FIFO delivers the four bytes in transfer order, which for a little-endian register is its
+    // value as read. No byte swap: the controller hands over a 32-bit word already assembled that way,
+    // which is the same assumption `block-driver` makes about its own 512-byte blocks.
+    Some(word[0])
+}
+
 /// Enable one I/O function and wait for the card to say it is ready.
 ///
 /// **A function that is not enabled does nothing at all**, which makes this the difference between a
@@ -404,8 +444,14 @@ pub fn report_cccr(h: &Host, ctx: &ServiceContext) {
 /// byte otherwise walks forever, and the thing being walked is a radio whose firmware is not loaded
 /// yet - which is precisely when its registers are least trustworthy.
 pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
-    /// Tuples in a function-0 CIS. Real cards use a handful; 64 is generous and finite.
-    const MAX_TUPLES: u32 = 64;
+    /// Tuples in a function-0 CIS.
+    ///
+    /// 64 was "generous and finite" and it was only the second of those: the Pi 4's radio ran the bound
+    /// out without reaching an END tuple, because a Broadcom CIS carries a long run of `0x80`
+    /// vendor-specific tuples after the three standard ones. That cost nothing - `CISTPL_MANFID` is the
+    /// FIRST tuple, so identification was already done - and the bound firing and NAMING ITSELF is the
+    /// bound working rather than a wasting asset. Raised so the chain can actually be seen to end.
+    const MAX_TUPLES: u32 = 256;
     /// How far past the CIS pointer the walk will follow. The CIS lives in the card's common register
     /// space, so this is a bound on a 17-bit address rather than on memory.
     const MAX_SPAN: u32 = 0x800;
@@ -450,6 +496,18 @@ pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
         };
         let body = addr + 2;
 
+        // ANNOUNCED BEFORE IT IS DECODED. This line used to sit at the BOTTOM of the loop, below the
+        // branches that decode a tuple's contents - so on hardware the decoded `CIS FUNCID` line
+        // printed ABOVE its own tuple header and read as though it belonged to the tuple before it.
+        // Cheap to misread, cheaper to reorder.
+        if reported < 24 {
+            reported += 1;
+            ctx.log_fmt(format_args!(
+                "wifi-driver: CIS tuple {:#04x} len {} at {:#07x}",
+                code, len, addr
+            ));
+        }
+
         if code == cistpl::MANFID && len >= 4 {
             let b: [Option<u8>; 4] = [
                 read_reg(h, 0, body),
@@ -476,15 +534,6 @@ pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
             }
         }
 
-        // Only the first few tuples are worth a line each; past that the log is noise and the two
-        // tuples that matter are already reported by name above.
-        if reported < 8 {
-            reported += 1;
-            ctx.log_fmt(format_args!(
-                "wifi-driver: CIS tuple {:#04x} len {} at {:#07x}",
-                code, len, addr
-            ));
-        }
         addr = body + len;
     }
 

@@ -41,6 +41,8 @@ const BLKSIZECNT: usize = 0x04;
 const ARG1: usize = 0x08;
 const CMDTM: usize = 0x0C;
 const RESP0: usize = 0x10;
+/// The PIO data FIFO - 32 bits wide, which is why every transfer length here is a multiple of 4.
+const DATA: usize = 0x20;
 const STATUS: usize = 0x24;
 const CONTROL0: usize = 0x28;
 const CONTROL1: usize = 0x2C;
@@ -60,6 +62,13 @@ const SR_DAT_INHIBIT: u32 = 1 << 1;
 
 // INTERRUPT bits.
 const INT_CMD_DONE: u32 = 1 << 0;
+/// Transfer complete. NOT the same as the last FIFO access: the controller still has to finish on the
+/// bus, and starting the next command before it does is a line conflict.
+const INT_DATA_DONE: u32 = 1 << 1;
+/// The FIFO can take a word.
+const INT_WRITE_RDY: u32 = 1 << 4;
+/// The FIFO has a word.
+const INT_READ_RDY: u32 = 1 << 5;
 /// The error mask `sdhci.rs` uses, which follows its own reference driver.
 const INT_ERR: u32 = 0x017E_8000;
 /// Command Timeout - the card did not respond to the command AT ALL. Kept out of `INT_ERR` above (as
@@ -283,6 +292,121 @@ impl<'a> Host<'a> {
             spin();
         }
         Some(self.rd(RESP0))
+    }
+
+    /// Issue a command that carries a DATA phase, and move `words` through the FIFO by PIO.
+    ///
+    /// `bytes` is the transfer length, which must be a multiple of 4 because the controller's `DATA`
+    /// register is 32 bits wide and this driver does not need the partial-word case: every transfer
+    /// here is a 32-bit register or a firmware block. Refused rather than silently rounded, because a
+    /// rounded length would read or write memory the caller did not ask about.
+    ///
+    /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
+    /// coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware
+    /// upload wants DMA is a MEASUREMENT for the phase that does one, not a guess for this one.
+    ///
+    /// Every wait is bounded and the result is returned. On any failure the lines are reset, because
+    /// after a data error both stay inhibited (SDHCI 3.10) and every later command would otherwise
+    /// spin to its own bound.
+    pub fn cmd_data(&self, code: u32, arg: u32, buf: &mut [u32], read: bool) -> Option<()> {
+        let bytes = buf.len() * 4;
+        if buf.is_empty() || bytes > 0xFFFF {
+            return None;
+        }
+        let mut t = 0u32;
+        while self.rd(STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) != 0 {
+            t += 1;
+            if t > 1_000_000 {
+                self.last_int.set(self.rd(INTERRUPT));
+                return None;
+            }
+        }
+        self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear stale status
+        // ONE block of `bytes`. Block count in the high half, block size in the low - so a four-byte
+        // register read is a single block of four, which is what byte-mode CMD53 asks for.
+        self.wr(BLKSIZECNT, (1 << 16) | (bytes as u32 & 0xFFFF));
+        self.wr(ARG1, arg);
+        self.wr(CMDTM, code);
+
+        // The command completes first; the data phase follows it.
+        let mut t = 0u32;
+        loop {
+            let i = self.rd(INTERRUPT);
+            if i & INT_CMD_DONE != 0 {
+                break;
+            }
+            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                self.last_int.set(i);
+                self.reset_cmd_dat();
+                return None;
+            }
+            t += 1;
+            if t > 2_000_000 {
+                self.last_int.set(self.rd(INTERRUPT));
+                self.reset_cmd_dat();
+                return None;
+            }
+        }
+        self.wr(INTERRUPT, INT_CMD_DONE);
+
+        // Then the FIFO, one word at a time, waiting for the controller to say a word is available (or
+        // that it can take one). The ready bit is latched, so it is cleared before each word rather
+        // than once - otherwise the first word's flag would satisfy every later wait and the loop would
+        // read the FIFO faster than the controller fills it.
+        let ready = if read { INT_READ_RDY } else { INT_WRITE_RDY };
+        for w in buf.iter_mut() {
+            let mut t = 0u32;
+            loop {
+                let i = self.rd(INTERRUPT);
+                if i & ready != 0 {
+                    break;
+                }
+                if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                    self.last_int.set(i);
+                    self.reset_cmd_dat();
+                    return None;
+                }
+                t += 1;
+                if t > 2_000_000 {
+                    self.last_int.set(self.rd(INTERRUPT));
+                    self.reset_cmd_dat();
+                    return None;
+                }
+            }
+            self.wr(INTERRUPT, ready);
+            if read {
+                *w = self.rd(DATA);
+            } else {
+                self.wr(DATA, *w);
+            }
+        }
+
+        // TRANSFER COMPLETE, waited for rather than assumed. The last FIFO access is not the end of the
+        // transaction - the controller still has to finish on the bus - and issuing the next command
+        // before it does is a line conflict.
+        let mut t = 0u32;
+        loop {
+            let i = self.rd(INTERRUPT);
+            if i & INT_DATA_DONE != 0 {
+                break;
+            }
+            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                self.last_int.set(i);
+                self.reset_cmd_dat();
+                return None;
+            }
+            t += 1;
+            if t > 2_000_000 {
+                self.last_int.set(self.rd(INTERRUPT));
+                self.reset_cmd_dat();
+                return None;
+            }
+        }
+        self.wr(INTERRUPT, INT_DATA_DONE);
+        for _ in 0..10 {
+            spin(); // Ncc, as in `cmd`
+        }
+        Some(())
     }
 
     /// After a command error both lines stay inhibited (SDHCI 3.10), so every later command would spin
