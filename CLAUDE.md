@@ -1863,6 +1863,7 @@ A PR is rejected without further review if it:
 - Changes the IPC fast path without a benchmark.
 - Edits CLAUDE.md without a rationale in the commit message.
 - Introduces an em-dash (U+2014) or en-dash (U+2013) anywhere - in prose, code, comments, string literals, commit messages, or docs. Only the plain ASCII hyphen (-) is permitted as a dash; box-drawing characters are fine. This is a house writing convention, enforced repo-wide for consistency.
+- **Weakens a gate rather than the rule it enforces.** Deleting a checker or removing one from `EXTRA_CHECKS`, widening a path exemption, adding a baseline entry instead of fixing what it found, using a `conform-ok` marker to go quiet rather than to record an exception, or making a diagnostic vaguer (22.7). The enforcement layer is open to contribution like everything else and a rule may be repealed - by amending this document with a written rationale, so that the law and the gate change together. What is rejected is the version where the law still says one thing and the gate has stopped noticing. `CONTRIBUTING.md` carries the long form.
 
 Reviewers ask: does this respect the constitution, leave the kernel small, present a convincing unsafe argument, include a test, make the system more or less understandable?
 

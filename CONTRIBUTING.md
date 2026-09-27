@@ -92,9 +92,58 @@ A pull request is rejected without further review if it:
 - Changes the IPC fast path without a benchmark, or edits `CLAUDE.md` without a rationale in the commit.
 - Uses an em-dash or en-dash anywhere - only the plain hyphen is permitted (a house writing convention,
   enforced repo-wide).
+- Weakens a gate instead of the rule it enforces - un-wires a checker, widens an exemption, baselines a
+  finding rather than fixing it, or makes a diagnostic vaguer. See the next section.
 
 See section 21 for the full list. Reviewers ask: does this respect the constitution, leave the kernel
 small, present a convincing unsafe argument, include a test, and make the system more understandable?
+
+## Contribute anywhere; a gate may only get stronger
+
+**Every part of this project is open to you, `scripts/` included.** The enforcement layer is written in
+Python rather than Rust, and that makes it neither second-class nor off limits: it is the code that
+decides whether the next change is allowed, so improving it is among the most useful things you can do
+here. Close a blind spot, make a diagnostic clearer, mechanise a rule the constitution states and
+nothing checks, retire a baseline entry that is no longer needed. `osdev conform --list` names every
+rule and its code, and `py scripts/conform.py --explain GS0403` gives the long form for one.
+
+**What you may not do is make a gate weaker.** That is the whole of it, and it is an asymmetry rather
+than a prohibition: a rule may be improved, argued with, or repealed. It may not be quietly taught to
+stop noticing. Each of these is a weakening, however reasonable it looks in a diff:
+
+- **Deleting a checker, or removing one from `EXTRA_CHECKS`** in `osdev/src/main.rs`. A checker on one
+  build path is a checker on none - eight documentation checks ran only at release once, which meant
+  they ran too late to help anybody.
+- **Widening a path exemption** so a rule stops looking at the code it was written for.
+- **Adding a baseline entry instead of fixing what it found.** Baselines ratchet one way: a count may
+  fall freely and may not rise without a recorded reason. Putting a finding in a baseline to get a
+  green run is the one thing a ratchet must never be used for.
+- **Using a `conform-ok` marker to silence a rule** rather than to record a genuine exception. A marker
+  must name its rule and carry a real reason, and every honoured suppression is counted and printed -
+  they are built to be visible, so do not treat one as a way to go quiet.
+- **Making a diagnostic vaguer.** `CLAUDE.md` 22.7 puts it in terms: **a gate that fires with an
+  unhelpful message is a finding, not a pass.** That is why `tests/conformance/ui/` holds the exact
+  text of every diagnostic and `py scripts/conform.py --selftest` compares the render against it. If
+  you change a message, run it and read the diff.
+
+**One question settles a hard case:** after your change, does the gate still refuse what it was written
+to refuse? A green run is not the answer to that - a check that has stopped working is also green, and
+this project has caught its own instruments agreeing with it more than once.
+`scripts/commandments_redteam.py` exists to answer it properly: it breaks each rule on purpose, so a
+dead check is caught rather than mistaken for a clean tree. Run it deliberately and on a **committed**
+tree, because it plants violations in real files and restores them with `git checkout`.
+
+**And if a rule is genuinely wrong, the door is open - it is a different door.** The rules are written
+down in [`CLAUDE.md`](CLAUDE.md) and [`COMMANDMENTS.md`](COMMANDMENTS.md) precisely so they can be
+changed on the record: amend the text with a written rationale, and the checker follows it. That is how
+most rules here reached their present form, and several have been narrowed or corrected outright when
+the machine disagreed with the document. What the project will not take is the other version - the law
+still saying one thing, the gate no longer noticing, and nobody finding out until someone trusts the
+document.
+
+Before you open a pull request, run **`osdev conform --check`**. It runs every gate a build runs and
+gives you one verdict instead of eighteen. It needs Python 3.8 or newer on your `PATH` as `python`,
+which is a declared dependency of this project alongside Rust and QEMU.
 
 ## A note on scope
 
