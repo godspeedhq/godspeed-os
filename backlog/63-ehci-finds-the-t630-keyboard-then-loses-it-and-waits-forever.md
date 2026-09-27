@@ -1,6 +1,6 @@
 # 63 - `ehci` finds the T630 keyboard, fails to configure it, then waits for an event that cannot come
 
-**Status: CLOSED 2026-09-27, fixed the same day it was opened - awaiting the confirming boot.** The cause
+**Status: CLOSED 2026-09-27 - FIXED AND CONFIRMED ON THE HP T630 THE SAME DAY.** The cause
 turned out to be one line, and one of the two "defects" was not a defect at all. It still puts the
 sentence that CLOSED `backlog/11` in doubt, and that part stands.
 **Found:** 2026-09-27 on the HP T630, by the operator: *"ehci with the keyboard didn't work. hotplug
@@ -130,3 +130,45 @@ distinguishable in the log for exactly that reason.
 behind the hub still works afterwards" - did not reproduce, and whether 2026-09-21 was a lucky pass or a
 regression is still unmeasured. If the confirming boot works, the most likely reading is that the single
 attempt sometimes succeeded and sometimes did not, which is what the code always said about this hub.
+
+---
+
+## Confirming boot, HP T630, 2026-09-27 14:33
+
+Keyboard back in a BACK (EHCI) port. The predicted line, and nothing else:
+
+```
+ehci: hub port 4: status=0x0301 connected=1 low_speed=1
+ehci: SPLIT device (hub port 4): VID=0x046d PID=0xc30a
+ehci: port 4 HID iface=0 class=0x3 protocol=1 (1=kbd 2=mouse) int_ep=0x81 interval=10
+ehci: *** boot KEYBOARD on hub port 4 ***
+ehci: keyboard configured (addr 2, cfg 1, boot protocol)
+ehci: polling 1 device(s) - type at the gsh> prompt
+```
+
+**And what is ABSENT is the diagnosis.** No `config descriptor failed after 5 tries`, and no
+`a connected device did not come up - re-scanning` lines. So it succeeded inside the five retries on the
+FIRST whole enumeration - which means the cause was exactly and only the missing retry, and the bounded
+re-scan was not needed. The two fixes were made distinguishable in the log for this reason, and the log
+distinguished them.
+
+**Hot-plug works in both directions now**, which was the operator second symptom:
+
+```
+USB: keyboard disconnected (ehci)
+ehci: no boot keyboard/mouse attached - waiting for a connection
+ehci: hub port 4: status=0x0301 connected=1 low_speed=1
+ehci: *** boot KEYBOARD on hub port 4 ***
+USB: keyboard connected (ehci)
+```
+
+An unplug is a real connection change, so `wait_for_connection` returns as designed and the re-scan now
+configures the device instead of losing it. The park was never the problem; the abandoned enumeration was.
+
+**The `backlog/11` doubt is resolved by this, in the most likely direction.** Its closing claim held on
+2026-09-21 and failed on 2026-09-27 on unchanged code, which is what an intermittent single-attempt
+transfer does. Not a regression - the code always said this endpoint was flaky, and one attempt was a coin
+toss. It is five attempts now.
+
+Serial: `build/t630-ehci-fixed-2026-09-27.log` (appended to the earlier capture; the second boot starts at
+14:33:14).
