@@ -45,6 +45,18 @@ const RESP0: usize = 0x10;
 const DATA: usize = 0x20;
 const STATUS: usize = 0x24;
 const CONTROL0: usize = 0x28;
+/// The DMA-select field of Host Control (`0x28` bits 3-4), which **must be zero for PIO**.
+///
+/// Linux clears this before EVERY transfer - `sdhci_config_dma`, called from `sdhci_prepare_data` - and
+/// says why in as many words: *"Always adjust the DMA selection as some controllers (e.g. JMicron) can't
+/// do PIO properly when the selection is ADMA."* Not an init-time setting; a per-transfer one.
+///
+/// **Why this port and not the Pi 2.** There the firmware BOOTS from this controller, so `CONTROL0` is
+/// left in a working PIO state and `block-driver`'s CMD17 inherits it. Here the firmware boots from
+/// `emmc2` and never touches the Arasan, so the register holds whatever reset left - and `SRST_HC` is not
+/// specified to clear this field. Copying a driver that is correct on a pre-configured controller is not
+/// enough on one nothing has configured.
+const CONTROL0_DMA_SELECT: u32 = 0x18;
 const CONTROL1: usize = 0x2C;
 const INTERRUPT: usize = 0x30;
 const INT_MASK: usize = 0x34;
@@ -105,6 +117,8 @@ pub struct Host<'a> {
     base_clock: u32,
     /// `INTERRUPT` captured at the moment a command failed, before the line reset that clears it.
     last_int: core::cell::Cell<u32>,
+    /// `CONTROL0` as it stood before the last data command cleared its DMA-select field.
+    last_ctrl0: core::cell::Cell<u32>,
     /// `BLKSIZECNT` as it read back after being written for the last data command.
     last_blk: core::cell::Cell<u32>,
     /// `CMDTM` as it read back after the last command was issued.
@@ -128,6 +142,7 @@ impl<'a> Host<'a> {
             last_resp: core::cell::Cell::new(0),
             last_blk: core::cell::Cell::new(0),
             last_cmdtm: core::cell::Cell::new(0),
+            last_ctrl0: core::cell::Cell::new(0),
         }
     }
 
@@ -164,6 +179,11 @@ impl<'a> Host<'a> {
     /// what this driver believes it wrote.
     pub fn last_setup(&self) -> (u32, u32) {
         (self.last_blk.get(), self.last_cmdtm.get())
+    }
+
+    /// `CONTROL0` as it stood going into the last data command, before its DMA-select field was cleared.
+    pub fn last_ctrl0(&self) -> u32 {
+        self.last_ctrl0.get()
     }
 
     /// The ten-bit SDHCI clock divider for a target clock, from the controller's REAL base clock.
@@ -251,11 +271,23 @@ impl<'a> Host<'a> {
         if !self.set_clock(id_div, ctx) {
             return false;
         }
-        // 1-bit bus and no high-speed for now: every command this phase issues rides the CMD line
-        // alone (CMD52 carries its one byte in the response), so 4-bit DAT and the 50 MHz mode are
-        // work with nothing yet to carry. Written explicitly rather than inherited from whatever the
-        // firmware left, so the starting state is a fact rather than a hope.
-        self.wr(CONTROL0, self.rd(CONTROL0) & !((1 << 1) | (1 << 2)));
+        // 1-bit bus, no high-speed, and NO DMA SELECTION. Every command this phase issues rides the
+        // CMD line alone, so 4-bit DAT and the 50 MHz mode are work with nothing yet to carry - and the
+        // DMA-select field must be zero for PIO to work at all on some controllers (see
+        // `CONTROL0_DMA_SELECT`). Written explicitly rather than inherited from whatever the firmware
+        // left, which on this board is nothing at all: it boots from the other controller.
+        //
+        // LOGGED BEFORE AND AFTER, because whether those bits were set is the question. A reader should
+        // not have to take "cleared it" on trust when "it was already clear" means something different.
+        let c0_before = self.rd(CONTROL0);
+        self.wr(CONTROL0, c0_before & !((1 << 1) | (1 << 2) | CONTROL0_DMA_SELECT));
+        let c0_after = self.rd(CONTROL0);
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CONTROL0 {:#010x} -> {:#010x} (DMA select was {:#x}, must be 0 for PIO)",
+            c0_before,
+            c0_after,
+            (c0_before & CONTROL0_DMA_SELECT) >> 3
+        ));
         // Latch every status bit so `cmd` can read them; the controller is polled, not interrupt
         // driven, so nothing is unmasked to the CPU.
         self.wr(INT_EN, 0xFFFF_FFFF);
@@ -309,6 +341,14 @@ impl<'a> Host<'a> {
         self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear stale status
         self.wr(ARG1, arg);
         if let Some(b) = blk {
+            // PER TRANSFER, not once at init, because that is where Linux does it: `sdhci_config_dma`
+            // runs from `sdhci_prepare_data`. The pre-clear value is kept so a failure can report
+            // whether the field had drifted back.
+            let c0 = self.rd(CONTROL0);
+            self.last_ctrl0.set(c0);
+            if c0 & CONTROL0_DMA_SELECT != 0 {
+                self.wr(CONTROL0, c0 & !CONTROL0_DMA_SELECT);
+            }
             self.wr(BLKSIZECNT, b);
             // READ IT BACK. If the block registers did not take, everything after this is a transfer
             // the controller was never set up for - and a zero block size gives it nothing to move and

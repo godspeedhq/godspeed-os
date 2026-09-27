@@ -199,3 +199,5 @@ sdio_io_rw_ext_helper              # Linux mmc core, cited because it is what ch
 CMD_CRC                            # SDHCI SPEC command-register flag (check the response CRC7); the spec's name for a bit set numerically - external, 26.14
 CMD_INDEX                          # SDHCI SPEC command-register flag (check the response index) - ditto, cited beside CMD_CRC because one word sets both
 IO_CURRENT_STATE                   # SDIO SPEC R5 response field (bits 5:4: DIS/CMD/TRN); reading TRN is what proved the card was left mid-transfer
+sdhci_config_dma                   # Linux sdhci.c, cited because it CLEARS the DMA-select field for PIO on every transfer and says some controllers cannot do PIO otherwise - external, 26.14
+sdhci_prepare_data                 # Linux sdhci.c, cited as WHERE sdhci_config_dma is called from - per transfer, not once at init - external, 26.14

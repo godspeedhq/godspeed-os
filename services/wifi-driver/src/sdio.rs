@@ -446,6 +446,21 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
             CMD_IO_RW_EXTENDED_READ,
             if cmdtm & (1 << 21) != 0 { "set" } else { "CLEAR - the controller has no data phase" }
         ));
+        // AND WHAT CONTROL0 HELD GOING IN. Its DMA-select field must be zero for PIO - Linux clears it
+        // before every transfer and says some controllers cannot do PIO at all while it names ADMA. On
+        // this board nothing has configured this controller (the firmware boots from the other one), so
+        // whether those bits were set is a real question rather than a formality.
+        let c0 = h.last_ctrl0();
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   CONTROL0 was {:#010x} going in, DMA select {:#x} ({})",
+            c0,
+            (c0 & 0x18) >> 3,
+            if c0 & 0x18 != 0 {
+                "NON-ZERO - this is why PIO did nothing, and it is now cleared per transfer"
+            } else {
+                "already zero, so the DMA selection was never the problem"
+            }
+        ));
         // THE R5 IS THE PART THAT CAN SAY WHY, and it was being discarded. Its flag byte is
         // `RESP0[15:8]`; a set bit there is the CARD refusing, which from the controller's side is
         // indistinguishable from the data phase never happening.
