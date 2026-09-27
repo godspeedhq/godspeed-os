@@ -490,6 +490,13 @@ pub fn enumerate_downstream(
     //
     // Bounded (26.6) and loud: the attempt count is named when it finally gives up, so a device that
     // needed two tries and a device that is genuinely unreadable do not read the same.
+    //
+    // WHY `xhci` NEEDS NO EQUIVALENT, so nobody adds one and nobody removes this for symmetry: every
+    // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at five sites), so
+    // the xHCI CONTROLLER retries a transaction three times in hardware before it reports a Transaction
+    // Error at all. The failure this retry exists for never reaches its `control()`. The rule is "retry
+    // where the controller does not", NOT "every USB driver retries" - and the evidence is on this very
+    // device: 2026-09-27, the same dongle enumerated cleanly on xhci twice and needed a retry here.
     const ENUM_TRIES: u32 = 4;
     let sa = [0x00, 0x05, addr, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];

@@ -609,6 +609,14 @@ fn scan_devices(
         // Observed on the HP T630 (2026-09-27): a Logitech 046d:c30a behind the AMD hub `0438:7900`
         // had its device descriptor read fine and then vanished here, and the operator had to move the
         // keyboard to a front xHCI port. Same five tries as `setup_hid` uses, for the same reason.
+        //
+        // WHY `xhci` NEEDS NO EQUIVALENT, so nobody adds one and nobody removes this for symmetry: every
+        // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at five sites),
+        // so the xHCI CONTROLLER retries a transaction three times in hardware before it reports a
+        // Transaction Error at all. The failure this retry exists for never reaches its `control()`. The
+        // rule is "retry where the controller does not", NOT "every USB driver retries" - and the
+        // 2026-09-27 evidence is that the same WiFi dongle enumerated cleanly on xhci twice while dwc2
+        // needed a retry for it.
         if control_retry(ctx, mmio, dma, op, &kep, &setup, 64, true, 5).is_none() {
             ctx.log_fmt(format_args!(
                 "ehci: hub port {} config descriptor failed after 5 tries - skipping this device", port));
