@@ -1604,6 +1604,10 @@ fn read_config_and_bind(
     let mut hid_proto = 0u8;
     let mut kbd_iface = 0u8;
     let mut cur_hid = false;
+    // The FIRST interface class seen, kept only so the give-up path below can say what this was. The
+    // loop already reads it to decide `cur_hid`; nothing else needed it until a device nothing claims
+    // had to be reported rather than dropped.
+    let mut first_iclass: Option<u8> = None;
     while i + 2 <= total && i < 200 {
         let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
         let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
@@ -1615,6 +1619,9 @@ fn read_config_and_bind(
             4 => {
                 let iclass = dma.read8(CONFIG_BUF_OFF + i + 5);
                 let iproto = dma.read8(CONFIG_BUF_OFF + i + 7);
+                if first_iclass.is_none() {
+                    first_iclass = Some(iclass);
+                }
                 cur_hid = iclass == 3 && (iproto == 1 || iproto == 2);
                 if cur_hid {
                     hid_proto = iproto;
@@ -1663,6 +1670,27 @@ fn read_config_and_bind(
             return (None, disk, cfg_val);
         }
         // A hub (the caller walks it with cfg_val) or a device this driver does not speak for.
+        //
+        // SAY SO. This returned silently, so a device could be addressed, have its descriptors read,
+        // be found undriveable and produce no output at all - the enumeration line above names its
+        // class/VID/PID, then nothing. A reader could not tell a rejected device from a driver that
+        // had crashed part way, which is an unreported observation rather than a failure but has the
+        // same cost (26.7): a decision nobody can see.
+        //
+        // A HUB IS NOT A PROBLEM and must not read like one - the caller walks it next, using the
+        // `cfg_val` returned here - so hubs are named as hubs and everything else says plainly that
+        // this driver has nothing for it. Informational either way; the device is left configured and
+        // harmless, and a later driver can claim it without anything being undone here.
+        match first_iclass {
+            Some(9) => ctx.log_fmt(format_args!(
+                "xhci: hub on port {} (slot {}) - walking it for downstream devices", port, slot)),
+            Some(c) => ctx.log_fmt(format_args!(
+                "xhci: device on port {} (slot {}) has interface class {:#04x} and NO DRIVER here - \
+                 enumerated and left alone (xhci drives boot-HID and mass storage only)", port, slot, c)),
+            None => ctx.log_fmt(format_args!(
+                "xhci: device on port {} (slot {}) exposed no interface descriptor - nothing to bind",
+                port, slot)),
+        }
         return (None, None, cfg_val);
     }
     let is_mouse = hid_proto == 2;
