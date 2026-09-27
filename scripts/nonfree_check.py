@@ -34,6 +34,7 @@ import hashlib
 import io
 import os
 import re
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,12 +46,33 @@ META = {"LICENCE", "LICENSE", "PROVENANCE"}
 SHA_RE = re.compile(r"\b([0-9a-f]{64})\b")
 
 
+def tracked_files():
+    """The set of paths git actually tracks under `nonfree/`, as forward-slash relatives.
+
+    WHY THIS EXISTS, because it was learned by this check passing when it should not have. The guarantee
+    wanted here is a property of the REPOSITORY - that a blob this project DISTRIBUTES carries its notice -
+    and the first version of this file read only the filesystem. A pre-existing `*.bin` rule in
+    `.gitignore` kept the firmware out of its own commit while its licence and provenance went in, and this
+    check reported three blobs all correctly licensed. A file nobody clones distributes nothing, and the
+    author is the one person who cannot notice, because it works on their machine.
+    """
+    try:
+        out = subprocess.run(["git", "ls-files", "nonfree"], cwd=ROOT,
+                             capture_output=True, text=True, check=True).stdout
+    except Exception:  # noqa: BLE001 - no git, or not a checkout
+        # Said rather than assumed: without git this check is weaker, and a reader should know which
+        # guarantee they are getting.
+        print("nonfree: WARNING - cannot ask git what is tracked; licence and digest are still checked")
+        return None
+    return {line.strip().replace("\\", "/") for line in out.splitlines() if line.strip()}
+
+
 def read(path):
     with io.open(path, "rb") as fh:
         return fh.read()
 
 
-def check_dir(rel, path, out):
+def check_dir(rel, path, out, tracked):
     names = sorted(os.listdir(path))
     files = [n for n in names if os.path.isfile(os.path.join(path, n))]
     payload = [n for n in files if n not in META]
@@ -75,6 +97,14 @@ def check_dir(rel, path, out):
     listed = set(SHA_RE.findall(prov))
 
     for n in payload:
+        # TRACKED FIRST, because an untracked file makes every other check here meaningless: the licence
+        # it is paired with ships to nobody, and the digest describes bytes no clone receives. Named
+        # separately because "not committed" and "no licence" need different fixes.
+        if tracked is not None and "%s/%s" % (rel, n) not in tracked:
+            out.append("%s/%s: present on disk but NOT TRACKED BY GIT. Its licence and digest then "
+                       "guarantee nothing - a file nobody clones distributes nothing. Check .gitignore."
+                       % (rel, n))
+            continue
         digest = hashlib.sha256(read(os.path.join(path, n))).hexdigest()
         if digest not in listed:
             # Named separately from "absent from PROVENANCE" because the two mean different things: a
@@ -93,6 +123,7 @@ def main():
         print("nonfree: no `nonfree/` directory - nothing to check")
         return 0
 
+    tracked = tracked_files()
     out = []
     dirs = 0
     payloads = 0
@@ -105,7 +136,7 @@ def main():
             continue
         dirs += 1
         before = len(out)
-        check_dir("nonfree/" + entry, path, out)
+        check_dir("nonfree/" + entry, path, out, tracked)
         if len(out) == before:
             payloads += len([n for n in sorted(os.listdir(path))
                              if os.path.isfile(os.path.join(path, n)) and n not in META])

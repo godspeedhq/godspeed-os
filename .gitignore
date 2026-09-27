@@ -84,3 +84,11 @@ screendump*
 # a PROVENANCE record carrying the upstream URL and a SHA-256 per file. `scripts/nonfree_check.py` enforces
 # both on every build, so the policy is mechanical rather than remembered. Firmware whose licence does NOT
 # permit redistribution stays out and is fetched on the owner's machine by `scripts/get_firmware.py`.
+#
+# THE EXCEPTION BELOW IS LOAD-BEARING. A pre-existing `*.bin` rule above this line silently kept
+# `nonfree/brcm43455/brcmfmac43455-sdio.bin` out of its own commit: the licence, the provenance and the
+# two smaller files went in, the firmware did not, and the gate certified all three because it was
+# reading the filesystem rather than git. Both halves are fixed - this un-ignore, and a tracked-file
+# check in `nonfree_check.py` so the same omission cannot pass again.
+!nonfree/
+!nonfree/**
