@@ -76,7 +76,19 @@ const CANDIDATES: &[Candidate] = &[
 
 /// Read one candidate and say what answered. Returns true if something plausibly SDHCI is there.
 fn ask(c: &Candidate) -> bool {
-    let base = PERIPHERAL_BASE + c.off;
+    let phys = PERIPHERAL_BASE + c.off;
+
+    // TRANSLATED, because peripherals are not reached at their physical address once this kernel has
+    // relocated. mmio() adds MMIO_OFF, which mmio_go_high() sets to mmu::KERNEL_VA_BASE, and the low
+    // map is retired afterwards - so a raw physical address is UNMAPPED and every read of one aborts.
+    // genet.rs does exactly this; its reg() is the pattern.
+    //
+    // The first version read the physical address directly, and on the Pi 4 it reported NEITHER
+    // candidate answering - which looked like a finding about the board and was a finding about this
+    // function. Kept because the RESULT was the tell: this board boots from an SD card, so it has a
+    // working SD host controller by construction and zero was never a possible true answer. An
+    // implausible reading is an instrument to check before it is a fact to act on.
+    let base = super::mmio(phys as usize) as u64;
 
     // PROBED, not read, for the reason `genet::probe` and `pcie::init` are: an address that decodes to
     // nothing is an external abort here, and an abort during boot surfaces later as an SError blaming
@@ -87,7 +99,7 @@ fn ask(c: &Candidate) -> bool {
     let ver = unsafe { uaccess::probe_read32(base + SDHCI_SLOTINT_VERSION) };
 
     super::put_str(b"sdio: ");
-    super::put_hex(base);
+    super::put_hex(phys);
     super::put_str(b" ");
     super::put_str(c.what.as_bytes());
     if !c.grounded {
@@ -134,9 +146,15 @@ pub fn census() {
     }
     // The COUNT is the finding, not either individual line, and the three cases mean different things.
     match found {
+        // ZERO IS AN INSTRUMENT FAULT BEFORE IT IS A BOARD FACT, and this line exists because the
+        // first version of this census printed it while the fault was its own address translation.
+        // A Pi 4 boots from an SD card, so it has a working host controller by construction and zero
+        // cannot be a true reading. Presenting an impossible reading as a board fact is what sends
+        // the next reader down the wrong path.
         0 => super::put_str(
-            b"sdio: NEITHER candidate answered - both addresses are wrong, or this board \
-              differs from the assumption docs/wifi.md phase 1 rests on\r\n",
+            b"sdio: NEITHER answered - but this board BOOTED FROM AN SD CARD, so zero controllers \
+              is not a possible truth. Suspect THIS PROBE first (address translation, the probe \
+              window) before concluding anything about the hardware\r\n",
         ),
         1 => super::put_str(
             b"sdio: exactly ONE answered - if that is the Arasan, sdhci.rs is pointed at the \
