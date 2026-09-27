@@ -62,13 +62,67 @@ That second half is **policy** by this constitution's own definition (§26.10), 
 cannot go: not the kernel. It is also not obviously part of the driver. Section 6 argues it should be
 split out, and that the split is what keeps a credential away from a device driver.
 
-**And above BOTH of them, nothing changes.** `docs/networking.md` §5 states the contract: *"Raw frames
-only... The frame interface is the entire contract."* The ops are `0x10` INFO, `0x11` TX, `0x12` RX,
-and they are already proven agnostic across four drivers on four ISAs - e1000, RTL8168, LAN9514 and
-GENET - with `dwc2` serving them alongside the block protocol on one endpoint. A WiFi service that
-presents those three ops binds to `net-stack` with **zero** changes above it: DHCP, ARP, ICMP, DNS and
-TCP all work the moment a frame moves. Protecting that property is the single most important design
-constraint in this document.
+**And above BOTH of them, the PROTOCOL does not change.** `docs/networking.md` §5 states the contract:
+*"Raw frames only... The frame interface is the entire contract."* The ops are `0x10` INFO, `0x11` TX,
+`0x12` RX, and they are already proven agnostic across four drivers on four ISAs - e1000, RTL8168,
+LAN9514 and GENET - with `dwc2` serving them alongside the block protocol on one endpoint. A radio that
+presents those three ops carries DHCP, ARP, ICMP, DNS and TCP with no change to any of them.
+
+### The three names, and the one place the claim above was too strong
+
+**Corrected 2026-09-27, before anyone relied on it.** This section first said `net-stack` binds to a
+WiFi service with **zero** changes. That is true of the protocol and **false of the name**, and the
+difference is small but real:
+
+- **`wifi`** - the utility, the verb a person types (`docs/wifi-commands.md`).
+- **`wifi-driver`** - the service that owns the radio, named to the same convention as `nic-driver`
+  and `block-driver`.
+- **`keyring`** - the service that owns the credential.
+
+`net-stack` does not discover its link. It carries the literal string `"nic-driver"` in three code
+paths - `ctx.reacquire_by_name("nic-driver")`, the peer-death recovery that §14.3 requires - and again
+in its contract's `ipc_send` list. So a second link driver needs `net-stack` edited, and the honest
+statement is: **the frame interface needs no change; the peer name does.**
+
+**How to change it, and how NOT to.** The tempting fix is a `#[cfg(target_arch)]` or a per-board
+constant selecting the link name. That is arch-conditional code above the kernel, which
+`shared_surface_check.py` ratchets at 44 sites - it may fall freely and may not rise without a
+recorded reason - so the tempting fix would have to argue with a gate, and would deserve to lose.
+
+The cheap correct version needs no kernel change and no conditional: **`net-stack` keeps an ordered
+list of candidate link names and reacquires whichever one resolves.** The same list on every board; a
+driver that is not present simply never resolves, which is already how a dead peer behaves. It is
+strictly better than what is there now, because today the code asserts there is exactly one link and
+names it.
+
+The more elegant version - `net-stack` asking for its link by ROLE, with the supervisor's spawn row
+deciding whether `link` means `nic-driver` or `wifi-driver` - is the one this project's own naming
+design points at, since the supervisor IS the name authority and wires every peer from a name to cap
+map. It needs the kernel's name directory to hold two names for one endpoint, which is a kernel change
+and therefore a re-verification cost (§14.1). **Recorded as the better shape, not chosen**, per §26.2:
+the list works, and a role indirection with one caller is speculative until a third link exists.
+
+### What "link up" means for a radio, which genuinely costs nothing
+
+This is the part where the design pays off. Op `0x10` INFO already reports a MAC and a link state, and
+`net-stack` already **self-configures on link-up** - hardware-proven on the T630, where `ping` rides an
+unplug and replug. So:
+
+**Associated IS link-up.** Before association `wifi-driver` reports link-down; the moment association
+completes it reports link-up, and `net-stack`'s existing path fires DHCP without knowing why the link
+appeared. No new op, no new field, no new state machine - a radio looks exactly like a cable being
+plugged in, which is what it is.
+
+It also settles who initiates. **Not `net-stack`**: association is driven by the `wifi` utility talking
+to `wifi-driver`, and `net-stack` is purely reactive. It never learns that wireless exists.
+
+### One link at a time, deliberately
+
+The Pi 4 has GENET ethernet **and** a radio, so both drivers can run at once. Two simultaneous links is
+routing: interface selection, source-address selection, metrics, and a policy for which one wins.
+That is a real feature and §26.2 says it is not pulled into existence by anything here, so **v1 has one
+active link at a time**, chosen explicitly - `wifi connect` means "make the radio the link". Multi-homing
+is out of scope with that as the reason, rather than unmentioned.
 
 ---
 
