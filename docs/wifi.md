@@ -486,3 +486,62 @@ That any of the wireless design works. There is no SDIO code, no firmware, no as
 no crypto - sections 4 through 8 are all unstarted. This flash proves the surface exists on every machine
 and that adding it cost nothing elsewhere. **Phase 1 still needs what section 11 asks for**: the Pi 4
 device tree read for the `mmc` versus `emmc2` question, and the firmware-blob decision.
+
+---
+
+## 13. Pi 2 (soft-MAC), milestone 1: the chip answers - PASSED 2026-09-27
+
+The operator asked for the Pi 2 first, which is the soft-MAC path section 3 defers as phase 6. Taken in
+the order that makes each step decidable, the first question is not a design question at all: **can we
+talk to this chip.**
+
+```
+dwc2-svc: port 5 DEVICE direct - VID:PID=0bda:8176 class=0x00 speed=high addr=5
+dwc2-svc: RTL8188CUS at 0bda:8176 - SYS_CFG(0xF0)=0x04400735 ISO_CTRL(0x00)=0x541c82f8
+dwc2-svc: RTL8188CUS register reads OK - the chip answers
+```
+
+Two vendor control reads, 13 ms, first boot, no retry needed. The RTL8192CU family exposes its whole
+register file through one vendor request (`bRequest` 0x05, `wValue` = offset, direction in
+`bmRequestType`) rather than through MMIO, so this needed only the control path `dwc2` already had.
+
+**All three criteria set in advance are met**, which is what makes this a pass rather than an
+impression: both values are non-zero, neither is `0xFFFFFFFF`, and **they differ from each other** - so
+the device is answering from a register file rather than returning one latched value. A floating bus and
+a dead chip both read as all-zeros or all-ones, and the probe counts either as a failure for that
+reason.
+
+**The values are recorded undecoded, on purpose.** `SYS_CFG`'s version and vendor bits are decodable,
+but doing it from memory rather than from the register map would put a confident wrong number in this
+document, and a wrong decode is worse than none because the next reader trusts it.
+
+### Where it lives, and the honest note attached to that
+
+Inside `dwc2`, as `services/dwc2/src/rtl.rs`. On this board `dwc2` owns the USB bus - no other service
+can issue a control transfer - and inventing a bus-passthrough surface to host one driver is the
+speculative abstraction §26.2 forbids. The precedent is `net.rs`, the LAN9514's ethernet function,
+matched by VID:PID for the same reason this is (class 0xff, nothing to match on).
+
+But a radio is far larger than `smsc95xx`, and an 802.11 MAC plus a supplicant do **not** belong in the
+service that also owns the keyboard and the disk. The likely end state is a `wifi-driver` service plus a
+narrow USB-transfer protocol in `dwc2`, following section 2's split. Not built for one register read.
+
+### What gates milestone 2, stated rather than guessed around
+
+Milestone 2 is the **write** path: write a register and read the value back, which every init table
+above it depends on. It needs a register that is safe to write, and **choosing one from memory on real
+hardware is how a device gets wedged.** §26.14 is explicit that a reference implementation is read as
+an executable datasheet; that reading has not happened, so this is a blocker and not a task.
+
+So the Pi 2 path now has the same shape of blocker as the Pi 4 path, and both are one fact each:
+
+| board | blocked on |
+|---|---|
+| **Pi 2** | the RTL8192CU register map - which registers are writable, what the PHY/RF tables contain, which firmware blob the part wants |
+| **Pi 4** | the BCM2711 device tree - is the CYW43455 behind the Arasan controller `sdhci.rs` already drives |
+
+**And the sizing argument from section 3 has not changed.** Above milestone 2 the Pi 2 needs PHY/RF
+register tables, IQ calibration, a firmware blob, an 802.11 management state machine and WPA2-PSK
+host-side in a tree with no cryptography. The Pi 4's full-MAC part needs a fraction of it. Milestone 1
+was worth doing first on either board because it is cheap and decisive; the order of everything after
+it is still the one section 3 argues for.
