@@ -188,6 +188,46 @@ impl Window {
             }
         }
         self.0 = Some(base);
+        // READ ALL THREE BACK. A clean R5 on the writes above means only that the CARD TOOK THE BYTE -
+        // not that the window points where this driver believes. That distinction went unexamined for
+        // several boots while the data phase was blamed, and it matters: if the window is wrong the
+        // chip's internal read goes nowhere, and a card that accepted the command with nothing to send
+        // produces exactly the observed shape (a transfer that starts, stops, and delivers nothing).
+        //
+        // These sit in the same function-1 control block as `CHIPCLKCSR`, which reads back perfectly, so
+        // there was never a reason not to ask.
+        let rb = [
+            sdio::read_reg(h, 1, f1::SBADDRLOW),
+            sdio::read_reg(h, 1, f1::SBADDRMID),
+            sdio::read_reg(h, 1, f1::SBADDRHIGH),
+        ];
+        let want = [
+            ((base >> 8) & 0xFF) as u8,
+            ((base >> 16) & 0xFF) as u8,
+            ((base >> 24) & 0xFF) as u8,
+        ];
+        match rb {
+            [Some(lo), Some(mid), Some(hi)] => {
+                let got = (u32::from(lo) << 8) | (u32::from(mid) << 16) | (u32::from(hi) << 24);
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: backplane window reads back {:#04x}/{:#04x}/{:#04x} = {:#010x} \
+                     (wrote {:#04x}/{:#04x}/{:#04x} for {:#010x}) - {}",
+                    lo, mid, hi, got, want[0], want[1], want[2], base,
+                    if got == base {
+                        "the window IS set, so the chip is looking where we think"
+                    } else {
+                        "MISMATCH - the window is NOT where we think, and the chip has been reading \
+                         somewhere else entirely"
+                    }
+                ));
+            }
+            _ => ctx.log_fmt(format_args!(
+                "wifi-driver: the backplane window could not be READ BACK (INT={:#010x}), so whether it \
+                 is set is still unknown - which is itself worth knowing, since CHIPCLKCSR in the same \
+                 register block reads fine",
+                h.last_int()
+            )),
+        }
         true
     }
 

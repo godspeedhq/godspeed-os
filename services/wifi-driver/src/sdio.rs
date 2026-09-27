@@ -473,6 +473,19 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
             if ss & 0x0000_0300 != 0 { "SEEN" } else { "never" },
             if ss & 0x0000_0C00 != 0 { "SEEN" } else { "never" }
         ));
+        let (first, last) = h.dat_window();
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   the data phase was active from poll {} to poll {} of 2000000 ({})",
+            first,
+            last,
+            if first == 0 {
+                "never active at all"
+            } else if last < 10_000 {
+                "it gave up almost at once - a data timeout the controller declined to latch"
+            } else {
+                "it stayed active, so it was waiting on a card that never sent"
+            }
+        ));
         // THE R5 IS THE PART THAT CAN SAY WHY, and it was being discarded. Its flag byte is
         // `RESP0[15:8]`; a set bit there is the CARD refusing, which from the controller's side is
         // indistinguishable from the data phase never happening.

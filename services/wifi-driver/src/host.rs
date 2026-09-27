@@ -91,6 +91,8 @@ const INT_READ_RDY: u32 = 1 << 5;
 const ST_BUF_READ_ENABLE: u32 = 1 << 11;
 /// Buffer Write Enable, the write-side twin.
 const ST_BUF_WRITE_ENABLE: u32 = 1 << 10;
+/// DAT Line Active, in STATUS. The bit that says a data phase is in progress at all.
+const ST_DAT_ACTIVE: u32 = 1 << 2;
 /// The error mask `sdhci.rs` uses, which follows its own reference driver.
 const INT_ERR: u32 = 0x017E_8000;
 /// Command Timeout - the card did not respond to the command AT ALL. Kept out of `INT_ERR` above (as
@@ -137,6 +139,9 @@ pub struct Host<'a> {
     /// all, and no amount of adjusting the setup is the answer.
     seen_int: core::cell::Cell<u32>,
     seen_status: core::cell::Cell<u32>,
+    /// The poll iteration at which DAT Line Active was first and last seen. 0 = never.
+    dat_first: core::cell::Cell<u32>,
+    dat_last: core::cell::Cell<u32>,
     /// `BLKSIZECNT` as it read back after being written for the last data command.
     last_blk: core::cell::Cell<u32>,
     /// `CMDTM` as it read back after the last command was issued.
@@ -163,6 +168,8 @@ impl<'a> Host<'a> {
             last_ctrl0: core::cell::Cell::new(0),
             seen_int: core::cell::Cell::new(0),
             seen_status: core::cell::Cell::new(0),
+            dat_first: core::cell::Cell::new(0),
+            dat_last: core::cell::Cell::new(0),
         }
     }
 
@@ -209,6 +216,11 @@ impl<'a> Host<'a> {
     /// Every bit ever seen in `INTERRUPT` and in `STATUS` while waiting for the FIFO.
     pub fn seen(&self) -> (u32, u32) {
         (self.seen_int.get(), self.seen_status.get())
+    }
+
+    /// The poll iterations at which the data phase was first and last seen active. `(0, 0)` = never.
+    pub fn dat_window(&self) -> (u32, u32) {
+        (self.dat_first.get(), self.dat_last.get())
     }
 
     /// The ten-bit SDHCI clock divider for a target clock, from the controller's REAL base clock.
@@ -490,6 +502,16 @@ impl<'a> Host<'a> {
                 // went in, nothing about the data phase happened.
                 self.seen_int.set(self.seen_int.get() | i);
                 self.seen_status.set(self.seen_status.get() | s);
+                // WHEN, not just whether. A controller that goes active and inactive within a few
+                // hundred polls gave up almost at once - a data timeout it declined to latch. One that
+                // stays active for most of two million was waiting on a card that never spoke. Those
+                // are different faults and only the timing separates them.
+                if s & ST_DAT_ACTIVE != 0 {
+                    if self.dat_first.get() == 0 {
+                        self.dat_first.set(t + 1);
+                    }
+                    self.dat_last.set(t + 1);
+                }
                 if i & ready != 0 || s & ready_st != 0 {
                     break;
                 }
