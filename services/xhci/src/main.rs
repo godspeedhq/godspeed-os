@@ -1671,25 +1671,30 @@ fn read_config_and_bind(
         }
         // A hub (the caller walks it with cfg_val) or a device this driver does not speak for.
         //
-        // SAY SO. This returned silently, so a device could be addressed, have its descriptors read,
-        // be found undriveable and produce no output at all - the enumeration line above names its
-        // class/VID/PID, then nothing. A reader could not tell a rejected device from a driver that
-        // had crashed part way, which is an unreported observation rather than a failure but has the
-        // same cost (26.7): a decision nobody can see.
+        // NAME THE INTERFACE CLASS, which no line in the log did. The VERDICT was never missing - the
+        // caller already prints "port N device is not a keyboard, mouse, hub or disk - releasing it",
+        // and it has for as long as that path existed. What was missing is the one byte that says what
+        // the device IS, and the T630 shows why it matters:
         //
-        // A HUB IS NOT A PROBLEM and must not read like one - the caller walks it next, using the
-        // `cfg_val` returned here - so hubs are named as hubs and everything else says plainly that
-        // this driver has nothing for it. Informational either way; the device is left configured and
-        // harmless, and a later driver can claim it without anything being undone here.
+        //     xhci: DEVICE DESCRIPTOR class=0x00 VID=0x0bda PID=0x8176      <- pre-existing
+        //     xhci: port 7 (slot 2) interface class 0xff - no driver ...     <- this line
+        //
+        // `class=0x00` in a DEVICE descriptor is not a class at all: it means "read the INTERFACE
+        // descriptor for it". So for a composite or vendor-specific device the pre-existing line says
+        // nothing about what was plugged in, and an operator identifying hardware (`docs/wifi.md`
+        // phase 0 is exactly this task) had no way to get the class off the console.
+        //
+        // The verdict is deliberately NOT repeated here - the caller gives it, and two lines saying
+        // "I cannot drive this" is noise. A hub is named as a hub because the caller walks it next
+        // using the `cfg_val` returned here, so it must not read as a rejection.
         match first_iclass {
             Some(9) => ctx.log_fmt(format_args!(
-                "xhci: hub on port {} (slot {}) - walking it for downstream devices", port, slot)),
+                "xhci: port {} (slot {}) is a hub - walking it for downstream devices", port, slot)),
             Some(c) => ctx.log_fmt(format_args!(
-                "xhci: device on port {} (slot {}) has interface class {:#04x} and NO DRIVER here - \
-                 enumerated and left alone (xhci drives boot-HID and mass storage only)", port, slot, c)),
+                "xhci: port {} (slot {}) interface class {:#04x} - no driver here for that class",
+                port, slot, c)),
             None => ctx.log_fmt(format_args!(
-                "xhci: device on port {} (slot {}) exposed no interface descriptor - nothing to bind",
-                port, slot)),
+                "xhci: port {} (slot {}) exposed no interface descriptor", port, slot)),
         }
         return (None, None, cfg_val);
     }
