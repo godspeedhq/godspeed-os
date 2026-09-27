@@ -127,18 +127,43 @@ fn ask(c: &Candidate) -> bool {
 
     match (caps, ver) {
         (Some(cap), Some(v)) => {
-            // All-ones and all-zeros are the two ways "nothing is there" presents, exactly as
-            // `genet::probe` says. Neither is a capabilities word.
-            let plausible = cap != 0 && cap != 0xFFFF_FFFF;
+            // PRESENCE IS THE VERSION REGISTER, NOT CAPABILITIES - and that is a correction, not a
+            // preference. The first version of this test read CAPABILITIES alone and reported the
+            // Arasan as "nothing there" on `CAPS=0x0` while its version register was answering
+            // `0x99020000`. The device tree says a controller is there; the probe said otherwise; the
+            // probe was wrong.
+            //
+            // `drivers/mmc/host/sdhci-iproc.c` says why: `bcm2835_data` carries
+            // `.missing_caps = true` and supplies `.caps`/`.caps1` from the DRIVER, because the
+            // hardware CAPABILITIES register cannot be relied upon on this family. So a zero there is
+            // expected behaviour for this part, and building a presence test on it was building it on
+            // the one register the silicon does not populate. (Behaviour cited per 26.14; no code
+            // taken.)
+            //
+            // A 32-bit read at 0xFC spans SLOT_INT_STATUS (0xFC) and HOST_CONTROLLER_VERSION (0xFE), so
+            // the upper half is the version: vendor in the high byte, SDHCI spec revision in the low.
+            // A spec revision of 0, 1 or 2 (1.00 / 2.00 / 3.00) from a register that is neither all-zeros
+            // nor all-ones is a controller identifying itself.
+            let spec_rev = (v >> 16) & 0xFF;
+            let present = v != 0 && v != 0xFFFF_FFFF && spec_rev <= 2;
             super::put_str(b" CAPS=");
             super::put_hex(cap as u64);
             super::put_str(b" VER=");
             super::put_hex(v as u64);
-            if plausible {
-                super::put_str(b" - A CONTROLLER ANSWERED\r\n");
+            if present {
+                super::put_str(b" - A CONTROLLER ANSWERED");
+                // Said, not silently tolerated: a zero here is normal for the Arasan and would be odd
+                // for anything else, so it is worth a reader's attention either way.
+                if cap == 0 {
+                    super::put_str(
+                        b" (CAPS reads 0 - expected on this part; sdhci-iproc supplies them in \
+                          software)",
+                    );
+                }
+                super::put_str(b"\r\n");
                 true
             } else {
-                super::put_str(b" - all-zeros or all-ones, nothing there\r\n");
+                super::put_str(b" - no plausible SDHCI version, nothing there\r\n");
                 false
             }
         }
