@@ -451,14 +451,42 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     // suppressed (keeps the boot screen clean); every later connect/disconnect is
     // announced on the console.
     let mut announce = false;
+    // Re-scans spent on a device that IS connected and did not come up. See the bounded-retry note
+    // below; reset every time a scan succeeds, so it bounds one failure episode and not the driver's
+    // lifetime.
+    let mut failed_rescans = 0u32;
+    const MAX_FAILED_RESCANS: u32 = 3;
     loop {
-        let (devs, ndev) = scan_devices(ctx, mmio, &dma, op, mps0, nports);
+        let (devs, ndev, any_failed) = scan_devices(ctx, mmio, &dma, op, mps0, nports);
         if ndev == 0 {
+            // A BOUND, where this used to be a binary choice between two wrong answers.
+            //
+            // `wait_for_connection` deliberately ignores ports that were ALREADY connected - its own
+            // comment explains why, and the reason is sound: otherwise a connected-but-unusable device
+            // makes this loop spin (re-scan -> fails -> wait -> still connected -> re-scan ...) and
+            // burns a core. But parking loses a device that is sitting right there, which is what the
+            // T630 did: the keyboard was found, failed one transfer, and was then waited past forever.
+            //
+            // Neither answer is 26.6's: the choice was between UNBOUNDED retrying and none. So a
+            // connected device that did not come up gets a few more whole-enumeration attempts with a
+            // settle between, and then the park happens exactly as before. With the config-descriptor
+            // retry added above this should rarely be reached - it is here for a transfer that is
+            // flaky rather than broken, which is what this hub's TT demonstrably is.
+            if any_failed && failed_rescans < MAX_FAILED_RESCANS {
+                failed_rescans += 1;
+                ctx.log_fmt(format_args!(
+                    "ehci: a connected device did not come up - re-scanning ({} of {})",
+                    failed_rescans, MAX_FAILED_RESCANS));
+                delay_cycles(ctx, DEBOUNCE_CYCLES);
+                continue;
+            }
             ctx.log("ehci: no boot keyboard/mouse attached - waiting for a connection");
             wait_for_connection(ctx, mmio, &dma, op, mps0, nports);
             announce = true; // whatever connects after a wait is a real plug event
+            failed_rescans = 0; // a real plug event starts a fresh episode
             continue;
         }
+        failed_rescans = 0; // something came up: this episode is over
         if announce {
             for d in &devs[..ndev] {
                 notify(ctx, if d.is_mouse { "mouse connected (ehci)" } else { "keyboard connected (ehci)" });
@@ -479,7 +507,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 fn scan_devices(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
     op: usize, mps0: u32, nports: u8,
-) -> ([HidDev; MAX_HID], usize) {
+) -> ([HidDev; MAX_HID], usize, bool) {
     // Power every downstream port (the hub does individual power switching), let
     // power settle, then enumerate each connected port.
     for port in 1..=nports {
@@ -572,7 +600,21 @@ fn scan_devices(
         // HID interface number/class/protocol (1=keyboard, 2=mouse) and the
         // interrupt-IN endpoint.
         let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Config), 64
-        if control(ctx, mmio, dma, op, &kep, &setup, 64, true).is_none() { continue; }
+        // RETRY, like every other transfer in this sequence. This is 64 bytes over an 8-byte low-speed
+        // control endpoint - EIGHT split transactions, where the device descriptor above was two or
+        // three - so it is the transfer most likely to lose one, and it was the only one calling bare
+        // `control`. A single failure then `continue`d past the device, which is exactly what
+        // `control_retry`'s own comment forbids: "one failed SETUP must not abandon the device".
+        //
+        // Observed on the HP T630 (2026-09-27): a Logitech 046d:c30a behind the AMD hub `0438:7900`
+        // had its device descriptor read fine and then vanished here, and the operator had to move the
+        // keyboard to a front xHCI port. Same five tries as `setup_hid` uses, for the same reason.
+        if control_retry(ctx, mmio, dma, op, &kep, &setup, 64, true, 5).is_none() {
+            ctx.log_fmt(format_args!(
+                "ehci: hub port {} config descriptor failed after 5 tries - skipping this device", port));
+            any_failed = true;
+            continue;
+        }
         let cfg_val = dma.read8(DATA_BUF + 5);
         let mut o = 0usize;
         let (mut iface, mut iclass, mut iproto, mut ep_addr, mut ep_int) = (0u8, 0u8, 0u8, 0u8, 0u8);
@@ -627,7 +669,9 @@ fn scan_devices(
     if any_failed && ndev == 0 {
         notify(ctx, "a back-port device didn't enumerate (faulty port - try another)");
     }
-    (devs, ndev)
+    // `any_failed` is returned now so the hot-plug loop can tell "nothing is plugged in" from "something
+    // is plugged in and would not come up". Those need opposite responses and used to get the same one.
+    (devs, ndev, any_failed)
 }
 
 /// Poll the hub's downstream ports until one reports a *newly* connected device,

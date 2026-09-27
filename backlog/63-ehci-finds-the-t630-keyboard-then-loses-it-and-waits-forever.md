@@ -1,7 +1,8 @@
 # 63 - `ehci` finds the T630 keyboard, fails to configure it, then waits for an event that cannot come
 
-**Status:** OPEN. Two defects, one observed on hardware and one read from the code and consistent with the
-reported symptom. It also puts the sentence that CLOSED `backlog/11` in doubt.
+**Status: CLOSED 2026-09-27, fixed the same day it was opened - awaiting the confirming boot.** The cause
+turned out to be one line, and one of the two "defects" was not a defect at all. It still puts the
+sentence that CLOSED `backlog/11` in doubt, and that part stands.
 **Found:** 2026-09-27 on the HP T630, by the operator: *"ehci with the keyboard didn't work. hotplug
 didn't work. I had to connect it to xhci (in front)."* Serial evidence below, from a boot that was
 otherwise clean.
@@ -31,11 +32,20 @@ failure is between reading the device descriptor and reading the configuration d
 control endpoint has an 8-byte maximum packet, so a ~60-byte configuration descriptor is eight split
 transactions where the device descriptor was two or three.
 
-## Defect 1: the split configuration read fails (OBSERVED)
+## Defect 1: the configuration read had NO RETRY (OBSERVED, FIXED)
 
-The code already knows this endpoint is unreliable - `control_retry` exists with a five-try budget and its
-doc comment says *"this hub's split control endpoint is intermittently flaky"*. Five tries were not
-enough here.
+**The cause is one line, and it is not a budget or a mechanism.** The configuration-descriptor read called
+bare `control`, and on failure `continue`d to the next port - abandoning the device. It is the **only**
+transfer in the sequence that did not use `control_retry`, and it is the one most likely to fail: 64 bytes
+over an 8-byte low-speed control endpoint is EIGHT split transactions, where the device descriptor above
+was two or three.
+
+`control_retry`'s own doc comment states the rule that call site was breaking: *"this hub's split control
+endpoint is intermittently flaky - one failed SETUP must not abandon the device."* Every transfer in
+`setup_hid` obeys it. The longest one did not.
+
+Fixed: five tries, same as the rest, and a line naming the device if all five fail rather than a silent
+`continue`.
 
 **And it is the same FAMILY as `bugs/3`**, which is worth more than the resemblance suggests, because that
 one was root-caused and fixed. `bugs/3_DWC2_SPLIT_XACTERR_LOWSPEED_KBD.md` is a low-speed keyboard behind
@@ -52,7 +62,22 @@ enough to name the device, so what fails is the transfer path, not the socket. T
 "dead port" is somebody else's fault and needs no work, which is exactly why a wrong diagnosis of that
 shape is expensive.
 
-## Defect 2: after the failure it waits for an event that cannot arrive (READ FROM CODE)
+## Defect 2: NOT A DEFECT - a deliberate trade with no bound (CORRECTED, then BOUNDED)
+
+**This was wrongly characterised when the entry was written, and the correction matters more than the
+fix.** I called it "a driver parked on an edge that cannot occur", which reads as an oversight. It is
+not. `wait_for_connection`'s doc comment says it snapshots the already-connected ports on purpose,
+*"otherwise a connected-but-unusable device would make the hot-plug loop spin (re-scan -> fails -> wait
+-> still connected -> re-scan ...)"*. The author saw this exact case and chose losing a device over
+burning a core.
+
+What was genuinely missing is the third option, and 26.6 names it: the choice was between UNBOUNDED
+retrying and none. A connected device that fails to come up now gets three more whole-enumeration
+attempts with a settle between, and then parks exactly as before. With defect 1 fixed this path should
+rarely be reached; it exists for a transfer that is flaky rather than broken, which is what this hub's
+transaction translator demonstrably is.
+
+The original description follows, as written.
 
 ```rust
 loop {
@@ -89,17 +114,19 @@ not evidence of a property - which is the same trap `backlog/62` is open about.
 **Not reopening 11 blindly:** its subject is the handoff and that stands. But its closing sentence should
 not be read as "the keyboard works on EHCI", and this entry is the reason.
 
-## Next step
+## What remains
 
-1. **Count it.** Boot the T630 with the keyboard on a back (EHCI) port five times and record how many
-   configure. The code claims intermittency and two observations disagree; a rate is the missing fact.
-2. **Widen the budget before changing the mechanism**, because it is the cheap experiment: raise
-   `control_retry`'s tries and the per-transfer budget for the CONFIGURATION read specifically, and see
-   whether it ever completes. If it does, the fix is a budget; if it never does, it is `bugs/3`'s
-   per-packet sequencing and that is real work.
-3. **Fix defect 2 regardless**, since it is a logic error independent of the transfer: after a failed
-   configure of a device that is still connected, retry the device rather than waiting for a connection
-   change that cannot arrive. Bound the retries and say so, per 26.6.
-4. The workaround is real and should be written where an operator reads it: **on the T630 the keyboard
-   belongs in a front (xHCI) port.** `xhci` bound it without trouble on this boot - `1 HID device(s)
-   bound`.
+**The confirming boot.** Put the keyboard back in a T630 back port and check for
+`ehci: *** boot KEYBOARD on hub port 4 ***` instead of `no boot keyboard/mouse attached`. Predicted: it
+configures, because the transfer that failed now gets five attempts instead of one, and the device
+descriptor read over the same endpoint already succeeded.
+
+If it still fails, the retry line will say so by name (`config descriptor failed after 5 tries`) and the
+re-scan lines will show three more whole attempts - at which point it IS `bugs/3`'s per-packet
+sequencing and this entry should be reopened with that evidence. The two fixes are deliberately
+distinguishable in the log for exactly that reason.
+
+**The `backlog/11` doubt stands** and is not closed by this. That entry's collateral claim - "the keyboard
+behind the hub still works afterwards" - did not reproduce, and whether 2026-09-21 was a lucky pass or a
+regression is still unmeasured. If the confirming boot works, the most likely reading is that the single
+attempt sometimes succeeded and sometimes did not, which is what the code always said about this hub.
