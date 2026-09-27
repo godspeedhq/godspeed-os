@@ -41,6 +41,39 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-09-27 - Pi 4: routing the radio's pins, and the clock its controller needs (feat/wifi-driver)
+
+The census below established WHICH controller the radio is behind and deliberately granted nothing. This
+is the grant, and the two board-level facts that have to be true before a driver can use it.
+
+`map_fixed_driver_mmio` now names `0xFE30_0000` to `wifi-driver`, gated on the census having seen that
+controller ANSWER - not on a constant, because QEMU's `raspi4b` emulates no Arasan and an ungated grant
+would hand the service a window whose first register read aborts, forever.
+
+**The new `unsafe` is the first WRITE in this file**, which is why it gets its own row rather than being
+folded into the reads below. GPIO 34-39 in ALT3 is the Arasan's SD1 interface - the only path to the
+radio - and pin muxing is a BOARD fact rather than a driver's business: a driver service is granted its
+own controller's registers and nothing else (§12.3), so it cannot route the pins that connect it to the
+part it drives. arm32 makes exactly this argument at `sd_route_to_emmc`, one SoC generation earlier and
+with the older BCM2835 pull-strobe sequence instead of the BCM2711's direct pull registers.
+
+The read-back is logged BEFORE the write, for the same reason arm32 logs it: it is the one fact that
+separates "the radio was muxed away from us" from "it is ours and something else is wrong". On this
+board the firmware is expected to have done it already, so reading back ALT3 is the predicted case and a
+disagreement is the interesting one.
+
+Two mailbox calls come with it and need no `unsafe` at all - `mailbox::property_call` is a safe
+function - so the SD power domain and the Arasan's base clock are asked for and PRINTED rather than
+assumed. The clock matters more than it looks: `emmc_base_clock_hz` returned a flat 0 on this port, and
+0 is a refusal rather than a default, so without it the driver would correctly decline to set any card
+clock at all.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/sdio.rs` | 2 -> 3 (+1) | `route_pins_to_arasan` - a read-modify-write of the BCM2711 GPIO block's `GPFSEL3` and `GPIO_PUP_PDN_CNTRL_REG2`, touching only GPIO34-39's fields in each, on the single-threaded boot path, through the kernel's Device peripheral mapping (`mmio()`, so it holds on both sides of the jump to the high half). One block covering both registers plus the read-back that is logged before either write; it carries its own SAFETY comment. No allocation, no loop bound to anything device-supplied, and the six pins are a compile-time range. |
+
+---
+
 ## 2026-09-27 - Pi 4: which SD host controller is the WiFi radio behind (feat/wifi-driver)
 
 `docs/wifi.md` section 4 rests the whole Pi 4 phase-1 estimate on one board fact: the CYW43455 sitting
@@ -2518,7 +2551,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 70 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/sdio.rs | 2 | permitted |
+| arch/aarch64/sdio.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |

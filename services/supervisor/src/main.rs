@@ -250,6 +250,11 @@ static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
 static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
 #[cfg(has_dwc2)]
 static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
+// The onboard radio, which only the Pi 4 has. Same shape as the USB gates above and for the same
+// reason: `build.rs` decides what it embedded and sets the cfg, so this is that one fact rather than a
+// second copy of it.
+#[cfg(has_wifi_driver)]
+static WIFI_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_DRIVER_ELF"));
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -532,6 +537,29 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
          godspeed_sdk::service_context::hwclass::pci(
              0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
      } else { godspeed_sdk::service_context::hwclass::NIC }),
+    // The Pi 4's onboard CYW43455 radio, over SDIO (docs/wifi.md). `hwclass::NONE` is not an
+    // omission: the Arasan SD host controller this drives is at a FIXED SoC address on no enumerable
+    // bus, so the window comes from `map_fixed_driver_mmio` - which the spawn path consults BY NAME
+    // whenever the class path yields nothing - and only where the kernel's boot census saw that
+    // controller answer. A new hardware class would be a kernel enum arm, an SDK constant and a schema
+    // enum member all to restate what the name already says.
+    //
+    // No DMA arena and no interrupt, deliberately: every command this phase issues rides the SDIO
+    // command line and completes in microseconds. Both arrive with the firmware upload that needs
+    // them, which is how a capability stays something granted for a reason (§3.1).
+    // NO SEND PEERS. The obvious one to grant is `events`, and every other driver here has it - but
+    // it buys exactly one thing, automatic IPC tracing, and this service makes almost no IPC calls in
+    // this phase. Everything it reports goes through `ctx.log()`, which is the kernel ring and the
+    // serial line and needs no capability at all (§11.4). A grant that buys nothing is standing
+    // authority a compromise inherits (§3.1, §26.9), and it would also be a cap with no reacquisition
+    // path - Commandment IX - for a peer chaos restarts. It comes back with the phase that has traffic
+    // worth tracing, and with the reacquire-and-retry that then means something.
+    //
+    // `0` for the device class, like every other row with no class to name. It is not an omission: see
+    // the paragraph above about `map_fixed_driver_mmio`.
+    #[cfg(has_wifi_driver)]
+    ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 3, &[], 0, 0, 0),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -1036,7 +1064,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 13;
+const MANAGED_N: usize = 14;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1051,7 +1079,12 @@ const MANAGED: [&str; MANAGED_N] =
      // Hardware discovery in userspace (step D2). x86-only in practice - the image is embedded only
      // there - and reconcile skips any name absent from the map, so listing it unconditionally costs
      // the ARM ports nothing, exactly as `dwc2` above costs x86 nothing.
-     "hw-enumerator"];
+     "hw-enumerator",
+     // The Pi 4's radio. Listed unconditionally for the reason `dwc2` and `hw-enumerator` above are:
+     // reconcile skips any name absent from the name-cap map, so a service only one board spawns costs
+     // the others nothing - and being absent from this list is what left arm32's storage, keyboard and
+     // network down with no backstop when a death notification was dropped.
+     "wifi-driver"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -1578,6 +1611,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // spawn gave it - they live in its own table and a supervisor restart does not touch them.
     ensure_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
 
+    // wifi-driver: the onboard radio (docs/wifi.md). Gated on the IMAGE being embedded and nothing
+    // else - the kernel is the one that decides whether this board actually has the controller, and it
+    // refuses the MMIO grant where its census found none. So on a radioless aarch64 machine this
+    // service starts, reports "no radio to drive on this machine", and serves; it does not die on a
+    // register read, and it does not need a second presence question here that could disagree with the
+    // kernel's.
+    //
+    // Not in the test-build feature list that guards `xhci`: those builds are x86 harness images and
+    // never carry this image at all, so the cfg above already excludes them.
+    //
+    // `ensure_mapped` ADOPTS a running instance rather than spawning a second. The supervisor is
+    // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one SD host
+    // controller is a worse failure than the one it would be fixing.
+    #[cfg(has_wifi_driver)]
+    ensure_mapped(&ctx, &mut name_map, "wifi-driver", 0xFFFF);
+
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
     // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
     // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).
@@ -1698,6 +1747,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("supervisor: net-stack died, restarting");
                 if respawn_retry(&ctx, &mut name_map, "net-stack") { ctx.log("supervisor: net-stack restarted"); }
                 else { ctx.log("supervisor: net-stack restart FAILED"); }
+            }
+            // The radio is restartable like any other driver: the respawn re-grants its SDIO register
+            // window (by name, subject to the same census gate) and the service re-runs identification
+            // from CMD0, which is a re-init rather than a resume - the card is put back into the idle
+            // state and re-selected, so a half-finished transaction on the old instance is not
+            // inherited (§14.2).
+            "wifi-driver" => {
+                ctx.log("supervisor: wifi-driver died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "wifi-driver") { ctx.log("supervisor: wifi-driver restarted"); }
+                else { ctx.log("supervisor: wifi-driver restart FAILED"); }
             }
             _ => {}
         }

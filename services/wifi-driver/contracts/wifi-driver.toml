@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# AARCH64 (Raspberry Pi 4) ONLY. The onboard CYW43455 radio, reached over SDIO.
+#
+# The device this drives is not on a bus anything enumerates: it is the Arasan SD host controller at a
+# fixed SoC address, wired on this board to the radio rather than to a card slot (the vendor device
+# tree's `mmcnr@7e300000`). So there is no PCI class code to name, and the window is granted BY NAME at
+# spawn - `arch::aarch64::map_fixed_driver_mmio`, the §12.3 fixed-peripheral grant - and only where the
+# kernel's boot census saw that controller answer. `hw_mmio` below declares the window truthfully; it is
+# a reviewable statement of what this service may reach (§13.3), not the mechanism that grants it, which
+# is the spawn request (§13.6).
+name    = "wifi-driver"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# The Arasan SDHCI register block: 0x100 of registers, so one page. Reached through the SDK's safe
+# `Mmio` wrapper via `ctx.mmio()`, which is what keeps this service free of `unsafe` (§18.1/§18.2).
+hw_mmio     = ["0xfe300000+0x1000"]
+ipc_receive = ["wifi-driver"]
+log_write   = true
+#
+# NO `ipc_send`, and the omission is the point. Every other driver here declares `events` - the
+# observability sink - which turns automatic IPC tracing on. This service makes almost no IPC calls in
+# this phase, and everything it reports goes through `log_write` above, which reaches the kernel ring
+# and the serial line and depends on no service at all (§11.4). So the grant would buy nothing while
+# being standing authority a compromise inherits (§3.1, §26.9), and it would be a send cap with no
+# reacquisition path for a peer chaos restarts (Commandment IX). It arrives with the phase that has
+# traffic worth tracing.
+#
+# NO `hw_interrupt`, deliberately. The driver POLLS: every command in phase 1 rides the CMD line and
+# completes in microseconds, and the SDIO card interrupt is what a FIRMWARE-driven control channel needs
+# rather than what identification needs. Asking for a vector this service would not service is the
+# failure invariant 12 exists to prevent, and a capability granted to nobody's benefit is standing
+# authority a compromise inherits (§3.1, §26.9).
+#
+# NO DMA arena either. CMD52 carries its single byte in the response on the command line; there is no
+# data transfer in this phase at all. The block transfers a firmware upload needs (CMD53) arrive with
+# that phase, and the arena with them.
+
+[placement]
+# Core 3, which on this four-core board is the one the boot roster leaves quietest: the shell and the
+# console are on core 0, `block-driver` on 1, `xhci` on 2. This is a PREFERENCE - the supervisor falls
+# back to round-robin if that core is not ready - so it costs nothing on a machine that comes up with
+# fewer cores.
+core = 3

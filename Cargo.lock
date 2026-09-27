@@ -1906,6 +1906,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi-driver"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

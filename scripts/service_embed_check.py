@@ -40,6 +40,10 @@ ARCH_EXEMPT = {
     "arm": {
         "ehci": "x86-only USB2 controller driver; the Pi 2 has no EHCI",
         "xhci": "the Pi 2 has no PCIe and no xHCI controller; its USB host is dwc2",
+        "wifi-driver": "the Pi 2's WiFi is a USB DONGLE, not an SDIO part on an SD host "
+                       "controller - a soft-MAC device behind `dwc2` where the host runs the whole "
+                       "802.11 state machine. That is a different driver, not this one ported "
+                       "(docs/wifi.md, phase 6).",
         "hw-enumerator": "its authority is legacy PCI CF8/CFC PORT I/O, and ARM has no port I/O "
                          "address space at all - `in`/`out` are x86 instructions with no equivalent. "
                          "Not 'not ported yet': there is nothing here for it to read. A hardware "
@@ -52,6 +56,9 @@ ARCH_EXEMPT = {
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
     },
     "riscv64": {
+        "wifi-driver": "the VisionFive 2 Lite has no onboard radio wired up in this tree; its WiFi "
+                       "header is unpopulated on the board we run. Nothing to drive, so nothing to "
+                       "embed.",
         "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
                 "whose host half is an xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver",

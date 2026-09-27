@@ -41,6 +41,12 @@ pub mod uart_rx;
 pub mod genet;
 #[cfg(feature = "pi4")]
 pub mod pcie;
+// Every address in this module is a BCM2711 fact - the peripheral base, the two SD controller
+// offsets, the GPIO block - and it reaches the machine through `uaccess` and `mailbox`, both of which
+// are pi4-gated themselves. It was declared unconditionally, so on the QEMU `virt` variant it failed to
+// compile against two modules that are not there: an ungated module whose every dependency is gated
+// only ever looks correct on the board it was written for.
+#[cfg(feature = "pi4")]
 pub mod sdio;
 // Always compiled, even when SMP is off: `_start` branches secondaries here, and a `naked_asm!` symbol
 // reference cannot be conditional. With the feature off nothing ever sets `AP_TABLES_READY`, so a
@@ -1248,6 +1254,16 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
             // register files (the RDMA/TDMA rings sit at +0x2000 and +0x4000), and the hardware
             // filter block at +0x8000 that has to be cleared before a frame can reach the DMA.
             "nic-driver" if genet::present() => (0xFD58_0000, 16),
+            // The Arasan SD host controller, which on THIS board is the CYW43455 WiFi radio's SDIO
+            // bus - the vendor device tree's `mmcnr@7e300000` (bus-width 4, `sdio_pins`), the same
+            // controller as `sdhci@7e300000` under a different driver's name. 0x100 of registers, so
+            // one page.
+            //
+            // Gated on the census having SEEN it answer, for the reason this function's header gives
+            // and QEMU makes concrete: `raspi4b` emulates no Arasan, so an ungated grant would hand
+            // the service a window whose first read aborts, and the supervisor would respawn it
+            // forever. The census runs earlier in the same boot (`sdio::census`).
+            "wifi-driver" if sdio::radio_present() => (0xFE30_0000, 1),
             _ => return None,
         };
 
@@ -1281,6 +1297,20 @@ pub fn hw_random() -> Option<u32> { None }
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.
+/// The Arasan's base clock in Hz, as the VideoCore reported it at boot (InspectKernel query 20).
+///
+/// This returned a flat 0, which on this port meant `wifi-driver` could not set a card clock at all -
+/// and 0 is a REFUSAL, not a default, so the honest consequence was a driver that declined to start.
+/// The mailbox knows the answer and is asked for it beside the SD census; arm32 has asked the same
+/// question (clock id 1 = EMMC) since its card worked.
+///
+/// Zero still means "the firmware declined to say", and a driver reading it must refuse rather than
+/// guess: every card clock derives from this, and a divider from a wrong base runs the identification
+/// clock at the wrong speed so that nothing answers - silently, and on hardware only.
+#[cfg(feature = "pi4")]
+pub fn emmc_base_clock_hz() -> u32 { sdio::base_clock_hz() }
+/// No Pi peripherals on the QEMU `virt` variant, so no SD controller and no clock to report.
+#[cfg(not(feature = "pi4"))]
 pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
 pub fn board_mac_packed() -> Option<u64> { None }

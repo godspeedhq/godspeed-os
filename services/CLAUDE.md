@@ -33,6 +33,7 @@ is the kernel itself** (`{kernel}`). Pinned by §22 Test 15.
 | `nic-driver/` | The ethernet driver (e1000 / RTL8168 / GENET / smsc95xx by port). Restartable; a respawn re-initialises the controller and re-establishes the link |
 | `net-stack/` | ARP/ICMP/UDP-DHCP/DNS/TCP. Restartable; a respawn re-configures from the link (or stays unconfigured and RESPONSIVE if there is none) and clients reacquire by name |
 | `counter/` | An `examples/` service, but it IS in the kernel's `matches!` and has its own supervisor death-loop arm, so it accrues restarts and is respawned like the rest. Listed here because this table's rule is that the kernel's set and this set agree |
+| `wifi-driver/` | The Pi 4's onboard CYW43455 radio, over SDIO (`docs/wifi.md`). Restartable: a respawn re-grants its SDIO register window by name and re-runs identification from CMD0 - a re-init, not a resume, so a half-finished transaction on the old instance is not inherited. aarch64 only; on any other board the image is not embedded |
 | `console/`   | The terminal - owns the display (`docs/console-service.md` §9). A respawn re-maps the framebuffer grant, clears it, and renders from the next byte on; scrollback is lost because it lived in the dead instance's grid (a re-init, not a resume). While it is dead the kernel's `bootcon` floor takes the screen back, so the machine is never mute |
 
 `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn). The kernel notifies

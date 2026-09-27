@@ -702,3 +702,90 @@ addresses through a high-half mapping, reported "neither answered", and was wron
 direction. Both addresses it probes turn out to be correct, including the one that was labelled
 UNVERIFIED. That label was still right to be there: it described the EVIDENCE, not the value, and being
 lucky about a number is not the same as knowing it.
+
+---
+
+## 15. Phase 1 step 1: BUILT, awaiting the board - and what the first boot should print
+
+**Status: code complete, zero hardware evidence.** Everything below is a PREDICTION, written before the
+image was flashed so that it can be wrong. Nothing in this section is a result.
+
+### What was built
+
+| where | what |
+|---|---|
+| `kernel/src/arch/aarch64/sdio.rs` | the census now also asks the firmware to power the SD domain, asks it for the Arasan's base clock, and routes GPIO34-39 to ALT3 (the Arasan's SD1 interface, which is the only path to the radio). It caches whether the Arasan answered |
+| `kernel/src/arch/aarch64/mod.rs` | `map_fixed_driver_mmio` gains one arm - `"wifi-driver" => (0xFE30_0000, 1)`, gated on the census having seen the controller answer - and `emmc_base_clock_hz` returns the clock instead of a flat 0 |
+| `services/wifi-driver/` | the service: `host.rs` (the SDHCI host controller, reset/clock/`cmd`) and `sdio.rs` (CMD0, CMD5 twice, CMD3, CMD7, CMD52, the CIS walk, function enable) |
+| registration | workspace member, `aarch64_built`, the supervisor's embed list and `has_wifi_driver` cfg, its `IMAGES` row, `MANAGED`, the boot spawn, the death-notification arm, and the kernel's two restart lists |
+
+### Why the pin mux and the clock are in the kernel
+
+Both are BOARD facts, and a driver service is granted its own controller's registers and nothing else
+(§12.3) - so it cannot route the pins that connect it to the part it drives, and it cannot ask the
+VideoCore anything. arm32 makes exactly this argument at `sd_route_to_emmc`, one SoC generation earlier.
+The clock matters more than it looks: `emmc_base_clock_hz` returned 0 on this port, and 0 is a REFUSAL
+rather than a default, so without it the driver would correctly decline to set any card clock at all.
+
+### The authority, stated plainly
+
+One page of MMIO, granted by name and only where the census saw the controller answer. **No DMA arena,
+no interrupt, and no send peers** - not even `events`, which every other driver here declares. Each
+absence is in `services/wifi-driver/contracts/wifi-driver.toml` with its reason; the short form is that every command in this
+phase rides the SDIO command line, and a capability that buys nothing is standing authority a compromise
+inherits (§3.1, §26.9). They arrive with the phase that needs them.
+
+### The prediction
+
+**The kernel, before any service starts** (the census, which already ran on the previous image - these
+four lines are new):
+
+```text
+sdio: SET_POWER_STATE(SD, ON|WAIT) -> on
+sdio: Arasan base clock <N> Hz
+sdio: GPIO34-39 fsel=777777 (ALT3 = Arasan SD1, the firmware already routed the radio to us)
+sdio: the Arasan answered, so `wifi-driver` will be granted 0xFE300000 at spawn.
+spawn[mmio]: 'wifi-driver' fixed peripheral -> VA 0x60000000 (4096 B)
+```
+
+**The service**, in this order, each stage reachable only through the one before it:
+
+```text
+wifi-driver: stage 1 - granted 4096 byte(s) of SDIO host registers
+wifi-driver: stage 2 - SLOTISR_VER=0x99020000 (the kernel's census read this same register)
+wifi-driver: base clock <N> Hz, identification divisor <D> (target 400 kHz)
+wifi-driver: CMD5 answered R4=0x... - 2 I/O function(s), memory absent, I/O OCR 0x...
+wifi-driver: card selected, RCA 0x...
+wifi-driver: stage 3 - an SDIO card with 2 function(s) at RCA 0x..., I/O OCR 0x...
+wifi-driver: CCCR rev 0x... , caps 0x... , bus iface 0x...
+wifi-driver: stage 5 - walking the CIS from 0x...
+wifi-driver: the radio is CONFIRMED ON THE BUS - manufacturer 0x02d0 (Broadcom), device 0xa9bf (CYW43455)
+wifi-driver: function 1 enabled and READY
+wifi-driver: phase 1 step 1 complete
+```
+
+**The specific numbers being predicted, because a prediction with no numbers cannot be wrong:** two I/O
+functions, no memory, manufacturer `0x02D0`, device `0xA9BF`, and `SLOTISR_VER` matching what the
+census printed on the line above it.
+
+### What each failure would mean, so one boot log is the diagnosis
+
+The stages exist for this. The LAST line printed names the layer that failed:
+
+| stops after | what it means | where to look next |
+|---|---|---|
+| stage 1 absent, "no SDIO register window was granted" | the census did not see the Arasan answer, so the kernel refused the grant | the `sdio:` census lines - this is the correct outcome on a board without the controller |
+| stage 2, "SRST_HC never cleared" | the window is mapped but the controller is not behind it | the grant address against the census address |
+| stage 2, "the platform reported NO base clock" | the mailbox `GET_CLOCK_RATE` gave nothing | the `sdio: Arasan base clock` line - it will say UNKNOWN |
+| stage 3, "CMD5 got NO ANSWER" | the controller is ours and nothing is on its bus | **the two lines the kernel prints for exactly this**: the power domain and the GPIO mux. If `fsel` was not `777777` before the write, the firmware had the radio muxed elsewhere and this is the first boot that claims it |
+| stage 3, "never reported READY" | the card is there and answering; the voltage window was refused | the I/O OCR in the CMD5 line against the window asked for |
+| stage 5, an unexpected manufacturer/device | something is on the bus and it is not what this board is documented to carry | a finding, not a failure - report the two codes |
+| function 1 not open | reads work and the first WRITE did not | everything before that line is a read, so this is the one line that tests the other direction |
+
+### What this step does NOT do
+
+No firmware upload, so **no 802.11 of any kind** - the chip runs no MAC until a host uploads one into
+it (section 8). `wifi list` therefore still cannot work, and the shell still answers that it cannot talk
+to the driver yet. `net-stack` is untouched and the radio is not in any frame path. Every request the
+service receives is ANSWERED with one byte meaning "unavailable", never queued and never dropped: a
+missing capability must return loudly rather than hang.

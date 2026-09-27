@@ -2512,7 +2512,12 @@ pub fn kill_task_by_slot(slot: usize) {
             | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
             // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
             // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
-            | "hw-enumerator")
+            | "hw-enumerator"
+            // wifi-driver: the Pi 4's radio, MANAGED like every other driver. Present on one board and
+            // listed unconditionally, exactly as `dwc2` is: a name that never runs here never dies
+            // here, so the cost is nothing, and the alternative is a board-specific omission in a
+            // neutral file.
+            | "wifi-driver")
         {
             bump_name_restart(task_name);
         }
@@ -2560,7 +2565,11 @@ pub fn kill_task_by_slot(slot: usize) {
             // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
             // still come back - on the next reconcile sweep - which is exactly why the omission hides:
             // not dead forever, just dead for a while, and nothing says so.
-            | "hw-enumerator") {
+            | "hw-enumerator"
+            // wifi-driver: see the restart-counter list above. Both halves or neither - a death that
+            // notifies but is not counted, or is counted but does not notify, is the exact split that
+            // cost `time` and `control` a hardware session each.
+            | "wifi-driver") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

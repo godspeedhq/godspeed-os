@@ -238,6 +238,10 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         &["events", "recorder", "copier", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
+          // The Pi 4's onboard radio, over SDIO. aarch64-only: it is the ONE board in this tree with a
+          // WiFi part soldered to an SD host controller, and the Pi 2's dongle is a different problem
+          // (a USB soft-MAC part, docs/wifi.md phase 6).
+          "wifi-driver",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
@@ -245,6 +249,9 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         &["events", "recorder", "copier", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
+          // See the demo arm above. Present in BOTH arms because both can ship, which is the trap
+          // `service_embed_check.embedded_arms` refuses to union away.
+          "wifi-driver",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace

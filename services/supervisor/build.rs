@@ -78,6 +78,18 @@ fn main() {
         &[]
     };
 
+    // The onboard WiFi radio, which on this board sits on an SD host controller rather than any bus
+    // that enumerates. aarch64 alone: the Pi 4 is the one machine here with a full-MAC part soldered to
+    // SDIO. Split out as its own list rather than added to `usb` for the same reason `enumerator` is -
+    // it answers a different question about the board, and a list that answers two questions stops
+    // being readable as either.
+    //
+    // A BOARD fact, not an ISA one, exactly as `nic_on_pci` is: another aarch64 machine with no radio
+    // would want this empty, and would get that by saying so here rather than by becoming an exception
+    // inside `main.rs`. The kernel still refuses the MMIO grant on a board whose census found no
+    // controller, so an embedded-but-radioless build reports "no radio" and serves rather than dying.
+    let radio: &[&str] = if arch == "aarch64" { &["wifi-driver"] } else { &[] };
+
     // ---- ONE CFG PER IMAGE THIS BUILD ACTUALLY EMBEDS. ------------------------------------------
     //
     // Derived from the SAME two lists that decide the embedding, three lines above - so `main.rs`
@@ -99,10 +111,11 @@ fn main() {
     // a board that has never had an EHCI image embedded.
     //
     // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
-    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "xhci_msi", "nic_on_pci"] {
+    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver",
+                 "xhci_msi", "nic_on_pci"] {
         println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
     }
-    for name in usb.iter().chain(enumerator.iter()) {
+    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
     }
     // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
@@ -143,7 +156,8 @@ fn main() {
                                    cannot locate the profile directory"))
         .to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(probe.iter()).chain(examples.iter()) {
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter())
+                        .chain(probe.iter()).chain(examples.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing
         // would produce a supervisor that cannot start the service, failing far from the cause.

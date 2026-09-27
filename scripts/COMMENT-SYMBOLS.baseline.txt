@@ -184,3 +184,5 @@ SetClock                           # a syscall that never existed after clock sl
 HOST_CONTROLLER_VERSION            # SDHCI SPEC register (2.2.26), cited so a reader with the spec can follow the offset arch/aarch64/sdio.rs reads - external, 26.14
 SLOT_INT_STATUS                    # SDHCI SPEC register (2.2.25); cited beside the version because ONE 32-bit read spans both - external, 26.14
 bcm2835_data                       # Linux sdhci-iproc platform data, cited because its .missing_caps=true is WHY the Arasan CAPABILITIES register reads 0 - external, 26.14
+CISTPL_MANFID                      # SDIO SPEC tuple code (CIS encoding) - the manufacturer/device pair that proves WHICH part is on the bus; external, 26.14
+mmc_attach_sdio                    # Linux's SDIO attach sequence, cited because its ORDER is what services/wifi-driver reimplements (CMD5 ask, CMD5 commit, CMD3, CMD7) - external, 26.14
