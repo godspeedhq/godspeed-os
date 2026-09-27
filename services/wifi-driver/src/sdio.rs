@@ -441,7 +441,7 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
             "wifi-driver:   the controller holds BLKSIZECNT={:#010x} (want {:#010x}) CMDTM={:#010x} \
              (want {:#010x}, data-present {})",
             blk,
-            0x0001_0004u32,
+            0x0001_7004u32,
             cmdtm,
             CMD_IO_RW_EXTENDED_READ,
             if cmdtm & (1 << 21) != 0 { "set" } else { "CLEAR - the controller has no data phase" }
@@ -460,6 +460,18 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
             } else {
                 "already zero, so the DMA selection was never the problem"
             }
+        ));
+        // DID THE CONTROLLER MOVE AT ALL? The accumulated OR of everything seen while waiting. Reporting
+        // the registers after a timeout cannot tell "never moved" from "moved and settled back"; this
+        // can, and it is the question the last four changes were each guessing at.
+        let (si, ss) = h.seen();
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   while waiting, INTERRUPT was ever {:#010x} and STATUS ever {:#010x} - \
+             transfer-active {}, buffer-enable {}",
+            si,
+            ss,
+            if ss & 0x0000_0300 != 0 { "SEEN" } else { "never" },
+            if ss & 0x0000_0C00 != 0 { "SEEN" } else { "never" }
         ));
         // THE R5 IS THE PART THAT CAN SAY WHY, and it was being discarded. Its flag byte is
         // `RESP0[15:8]`; a set bit there is the CARD refusing, which from the controller's side is

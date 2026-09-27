@@ -77,10 +77,20 @@ const INT_CMD_DONE: u32 = 1 << 0;
 /// Transfer complete. NOT the same as the last FIFO access: the controller still has to finish on the
 /// bus, and starting the next command before it does is a line conflict.
 const INT_DATA_DONE: u32 = 1 << 1;
-/// The FIFO can take a word.
+/// The FIFO can take a word (interrupt status).
 const INT_WRITE_RDY: u32 = 1 << 4;
-/// The FIFO has a word.
+/// The FIFO has a word (interrupt status).
 const INT_READ_RDY: u32 = 1 << 5;
+/// **Buffer Read Enable, in STATUS - a different register from the interrupt status above.**
+///
+/// u-boot's polled `sdhci_transfer_data` checks BOTH: the interrupt status for `DATA_AVAIL` and then
+/// `PRESENT_STATE` for `SDHCI_DATA_AVAILABLE` (`0x800`). Linux cannot - it is interrupt-driven and must
+/// wait on the status bit - but a polled driver can read either, and waiting only on the interrupt flag
+/// means a controller that raises this bit without latching that flag is waited on forever. Which is
+/// precisely what a wrong interrupt-status-enable would produce.
+const ST_BUF_READ_ENABLE: u32 = 1 << 11;
+/// Buffer Write Enable, the write-side twin.
+const ST_BUF_WRITE_ENABLE: u32 = 1 << 10;
 /// The error mask `sdhci.rs` uses, which follows its own reference driver.
 const INT_ERR: u32 = 0x017E_8000;
 /// Command Timeout - the card did not respond to the command AT ALL. Kept out of `INT_ERR` above (as
@@ -119,6 +129,14 @@ pub struct Host<'a> {
     last_int: core::cell::Cell<u32>,
     /// `CONTROL0` as it stood before the last data command cleared its DMA-select field.
     last_ctrl0: core::cell::Cell<u32>,
+    /// The OR of every `INTERRUPT` value seen while waiting for the FIFO, and the same for `STATUS`.
+    ///
+    /// **This is the measurement four hypotheses were substituting for.** Reporting the registers AFTER
+    /// a timeout cannot distinguish "the controller never moved" from "it moved and settled back"; an
+    /// accumulated OR can. If these read the same as they did going in, the data phase did not happen at
+    /// all, and no amount of adjusting the setup is the answer.
+    seen_int: core::cell::Cell<u32>,
+    seen_status: core::cell::Cell<u32>,
     /// `BLKSIZECNT` as it read back after being written for the last data command.
     last_blk: core::cell::Cell<u32>,
     /// `CMDTM` as it read back after the last command was issued.
@@ -143,6 +161,8 @@ impl<'a> Host<'a> {
             last_blk: core::cell::Cell::new(0),
             last_cmdtm: core::cell::Cell::new(0),
             last_ctrl0: core::cell::Cell::new(0),
+            seen_int: core::cell::Cell::new(0),
+            seen_status: core::cell::Cell::new(0),
         }
     }
 
@@ -184,6 +204,11 @@ impl<'a> Host<'a> {
     /// `CONTROL0` as it stood going into the last data command, before its DMA-select field was cleared.
     pub fn last_ctrl0(&self) -> u32 {
         self.last_ctrl0.get()
+    }
+
+    /// Every bit ever seen in `INTERRUPT` and in `STATUS` while waiting for the FIFO.
+    pub fn seen(&self) -> (u32, u32) {
+        (self.seen_int.get(), self.seen_status.get())
     }
 
     /// The ten-bit SDHCI clock divider for a target clock, from the controller's REAL base clock.
@@ -424,11 +449,17 @@ impl<'a> Host<'a> {
                 return Err("the DAT line never came out of inhibit");
             }
         }
-        // ONE block of `bytes`: block count in the high half, block size in the low. A four-byte
-        // register read is a single block of four, which is what byte-mode CMD53 asks for - and it is
-        // handed to `cmd_inner` rather than written here, so it lands between the argument and the
-        // command exactly as the reference's shadow-flush order puts it.
-        let blk = (1 << 16) | (bytes as u32 & 0xFFFF);
+        // ONE block of `bytes`: block count in the high half, block size in the low - plus the SDMA
+        // buffer-boundary field in bits 12-14, which BOTH references write and we did not. Linux uses
+        // `SDHCI_MAKE_BLKSZ(host->sdma_boundary, blksz)` and u-boot `SDHCI_MAKE_BLKSZ(
+        // SDHCI_DEFAULT_BOUNDARY_ARG, blocksize)`, and both come to 7. The BCM2835 datasheet calls those
+        // bits reserved and a four-byte transfer cannot reach any boundary, so this is unlikely to
+        // matter - it is written because being the only one of three implementations that puts something
+        // different there is not a position worth defending.
+        //
+        // Handed to `cmd_inner` rather than written here, so it lands between the argument and the
+        // command exactly as the references' shadow-flush order puts it.
+        let blk = (1 << 16) | (7 << 12) | (bytes as u32 & 0xFFFF);
 
         // THE COMMAND PHASE IS THE ONE EVERY OTHER COMMAND USES. It clears stale status, writes ARG1,
         // the block registers, CMDTM, polls CMD_DONE, captures `last_int` on failure and resets the
@@ -444,12 +475,22 @@ impl<'a> Host<'a> {
         // Then the FIFO, one word at a time. The ready bit is latched, so it is cleared before each
         // word rather than once - otherwise the first word's flag would satisfy every later wait and
         // this would read the FIFO faster than the controller fills it.
+        // EITHER SIGNAL SATISFIES THE WAIT, which is what u-boot's polled loop effectively does: the
+        // interrupt status flag, or the buffer-enable bit in STATUS. Two registers, and a controller
+        // need only say so in one of them.
         let ready = if read { INT_READ_RDY } else { INT_WRITE_RDY };
+        let ready_st = if read { ST_BUF_READ_ENABLE } else { ST_BUF_WRITE_ENABLE };
         for w in buf.iter_mut() {
             let mut t = 0u32;
             loop {
                 let i = self.rd(INTERRUPT);
-                if i & ready != 0 {
+                let s = self.rd(STATUS);
+                // ACCUMULATE EVERYTHING SEEN, so a timeout can say whether the controller moved AT ALL.
+                // Four hypotheses have been guessing at that; this asks it. If these come back as they
+                // went in, nothing about the data phase happened.
+                self.seen_int.set(self.seen_int.get() | i);
+                self.seen_status.set(self.seen_status.get() | s);
+                if i & ready != 0 || s & ready_st != 0 {
                     break;
                 }
                 if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
