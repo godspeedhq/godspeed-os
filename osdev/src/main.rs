@@ -463,6 +463,11 @@ const EXTRA_CHECKS: &[&str] = &[
     // a name as resolved if it appears anywhere in the source INCLUDING comments, which applied to
     // comments is circular - the comment would satisfy itself. Here a cited name must be in CODE.
     "scripts/comment_symbol_check.py",
+    // Every vendor blob under `nonfree/` carries its LICENCE and a PROVENANCE digest that matches
+    // its content. The notice must travel with every copy and a repository IS a copy, so a missing
+    // licence is a violation in git history rather than an oversight - and a binary with no
+    // recorded origin is one nobody can check. See `docs/wifi.md` 8.
+    "scripts/nonfree_check.py",
 
     // The declared Python floor must be the TRUE one. `README.md` tells a contributor they need 3.8,
     // and a hand-measured number is right on the day it is taken and silently wrong afterwards - the

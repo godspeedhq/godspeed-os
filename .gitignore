@@ -67,25 +67,20 @@ screendump*
 *.core
 *.dmp
 
-# ─── VENDOR FIRMWARE BLOBS - never in this repository (docs/wifi.md 8) ────────
+# ─── VENDOR FIRMWARE: COMMITTED, NOT IGNORED (docs/wifi.md 8) ─────────────────
 #
-# Some devices are not fixed-function silicon. The Pi 4's CYW43455 radio contains its own processor with
-# no ROM firmware for the MAC, so it does nothing until a host uploads Broadcom's binary into it. That
-# binary is not driver code anyone writes - not Linux, not the Pi's firmware, not Windows - and its
-# licence permits redistributing it while explicitly forbidding any attempt to "modify in any way,
-# reverse engineer, decompile or disassemble" it.
+# This block used to ignore `*.bin` firmware patterns, on the reasoning that Linux keeps no blobs in its
+# kernel tree. THAT DECISION WAS REVERSED THE SAME DAY, and the patterns are gone rather than left to
+# forbid what the policy now requires - a guard that contradicts its own rule is worse than none, because
+# the next person trusts it.
 #
-# THE DECISION, which is Linux's: the OS tree carries no blobs. Linux moved theirs out years ago into a
-# separate `linux-firmware` repository that distributions package (Debian ships `non-free-firmware`; the
-# Pi set is `RPi-Distro/firmware-nonfree`), and the driver reads the file off the FILESYSTEM at runtime.
-# Here the blob lives on the machine's own data disk, supplied by whoever owns the machine, and
-# `wifi-driver` opens it through `fs` like any other client - no kernel involvement at all, which is one
-# place this architecture is simpler than Linux's `request_firmware()` callback.
+# What changed: Linux's separation is Debian's social contract and the DFSG, not a technical conclusion,
+# and a fetch-at-setup script has to reimplement someone else's packaging logic. Proven the hard way in
+# one sitting - the board-specific name is a symlink, into a SIBLING directory, to a filename that does
+# not exist in the tree because the packaging rules create it at build time. Every one of those failures
+# would have been a user's failure with a silent radio.
 #
-# A decision in a document is honoured by whoever read it; a pattern here is honoured by everyone.
-# `git add -f` still works, which is the right shape: possible deliberately, never by accident.
-*.clm_blob
-brcmfmac*.bin
-brcmfmac*.txt
-rtl8*fw*.bin
-firmware/**/*.bin
+# So redistributable device firmware IS committed, under `nonfree/<part>/`, with its LICENCE beside it and
+# a PROVENANCE record carrying the upstream URL and a SHA-256 per file. `scripts/nonfree_check.py` enforces
+# both on every build, so the policy is mechanical rather than remembered. Firmware whose licence does NOT
+# permit redistribution stays out and is fetched on the owner's machine by `scripts/get_firmware.py`.

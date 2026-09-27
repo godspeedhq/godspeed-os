@@ -330,7 +330,7 @@ before anything touches a secret.
 
 ---
 
-## 8. The firmware blob: why one exists, and why it is NOT in this repository
+## 8. The firmware blob: why one exists, and why it IS in this repository
 
 **DECIDED 2026-09-27.** This section used to pose the licensing question as open. It is closed, and by
 following what Linux does rather than by inventing a policy.
@@ -376,34 +376,58 @@ So for this chip, unlike every other device here, there is **no source to read A
 the binary**. §26.14's method - read a working driver as an executable datasheet, reimplement, never
 translate - has nothing to be applied to. We hand the chip its program and use the documented protocol.
 
-### Not in this repository, which is exactly what Linux does
+### In this repository, in `nonfree/` - and why that is not Linux's answer
 
-The Linux **kernel tree contains no firmware blobs.** They were moved out years ago into a separate
-`linux-firmware` repository that distributions package, and the naming is not coy about what it is:
-Debian ships `non-free-firmware`, and the Raspberry Pi set is `RPi-Distro/firmware-nonfree`. At runtime
-the in-kernel driver calls `request_firmware()`, which reads the file **off the filesystem**; the kernel
-binary never carries it.
+**This section first concluded the opposite**, on the reasoning that the Linux kernel tree carries no
+blobs: they live in a separate `linux-firmware` that distributions package, and the driver calls
+`request_firmware()` to read one off the filesystem. A `.gitignore` guard went in to enforce it.
 
-GodspeedOS follows that model:
+**Reversed the same day, and by trying it.** `scripts/get_firmware.py` was written to fetch the files on
+the owner's machine. It failed three times on one file:
+
+1. the board-specific name is a **symlink**, so the raw URL returns the target path as text - 31 bytes
+   which, written to a disk as firmware, is a radio that never starts and says nothing about why;
+2. the target is `../cypress/...` - a **sibling directory**, where the resolver had taken a basename;
+3. that target, `cyfmac43455-sdio.bin`, **does not exist in the tree at all.** The repository is Debian
+   *packaging source*; the unsuffixed name is produced by the packaging rules at build time, and choosing
+   between `-minimal` and `-standard` is a decision the packaging makes.
+
+So a fetch script must reimplement somebody else's packaging logic and re-breaks whenever they change it.
+Three failures in one sitting, by someone reading the API responses directly - every one of them would
+have been a user's failure on a Tuesday with a silent radio and no clue.
+
+**And Linux's separation is not a technical conclusion.** It is Debian's social contract and the DFSG.
+Shipping a non-linked binary beside GPL code is mere aggregation, Linux itself did it in-tree for years,
+and GodspeedOS is not a distribution with a package manager to lean on. The earlier claim that "not
+redistributing takes on nothing" was simply false: it takes on fetch fragility, and pushes it onto every
+user rather than absorbing it once.
 
 | | decision |
 |---|---|
-| **In this repository** | **No.** Not the image, not git history. A `.gitignore` guard makes an accidental commit harder than a deliberate one |
-| **A separate GodspeedOS firmware repo** | **Not yet.** One blob for one board is not a repository (§26.2), and redistributing takes on the notice obligation while not redistributing takes on nothing. If a second radio ever appears, that is what pulls one into existence |
-| **Where it lives** | On the machine's own data disk, supplied by whoever owns the machine - who already has it, because Raspberry Pi OS ships it |
-| **How the driver gets it** | Opens a file through `fs`, like any other client |
+| **In this repository** | **Yes.** `nonfree/brcm43455/`, committed. A plain `git clone` gets them - no submodule, no separate repo, no git-lfs, no fetch at setup |
+| **What goes beside them** | `LICENCE`, because the notice must travel with every copy and a repository is a copy; and `PROVENANCE` - upstream URL, retrieval date, SHA-256 per file |
+| **Who enforces it** | `scripts/nonfree_check.py`, in `EXTRA_CHECKS`, so every build refuses a blob that lacks either or whose digest does not match its content |
+| **Size** | ~614 KB for this board. A repository that carries `.rs`, `.md`, `.py` and now `.bin` is a repository that is honest about what the hardware needs |
+| **Firmware that may NOT be redistributed** | Stays out. `scripts/get_firmware.py` fetches it on the owner's machine, and the gate is what keeps the two legal situations from being confused |
 
-**And one way this architecture is better than Linux's here.** `request_firmware()` exists because the
-Linux driver is IN the kernel and the kernel cannot read files, so it needs a callback into userspace and
-a loader path. `wifi-driver` is a userspace service, so it just opens a file. No new mechanism, no kernel
-involvement, and the blob never touches ring 0.
+**The digest is the load-bearing part.** A binary cannot be read, cannot be usefully diffed, and cannot be
+told apart from something a contributor built. A SHA-256 is 64 characters, cannot be nearly right, and
+lets anyone verify this copy against upstream **without trusting this project**. Recording a fact about a
+binary is the opposite of recording the binary and hoping.
+
+**And a contributor gets an obvious place to put one.** A driver that needs a blob adds
+`nonfree/<part>/`, and the gate makes them declare the licence and the provenance or the build fails. The
+policy is mechanical rather than remembered, which is the only kind this project keeps.
 
 ### What that costs, and the part that is not built yet
 
-**WiFi then depends on `fs`**, which on the Pi 4 means a USB stick. Commandment VIII governs it: the
-driver waits on `fs`'s reply or on the loud fact of its absence, never on a timer, and reports "firmware
-unavailable" rather than hanging. The rule above the rules applies - no missing dependency may wedge the
-machine.
+**WiFi still depends on `fs`** - the blob is in the repository, but the driver is a userspace service
+reading a file, and on the Pi 4 that file is on a USB stick. Commandment VIII governs it: wait on `fs`'s
+reply or on the loud fact of its absence, never on a timer, and report "firmware unavailable" rather than
+hanging. The rule above the rules applies - no missing dependency may wedge the machine.
+
+What the vendoring removed is the SETUP problem, not the runtime one: nobody has to find the file, but it
+still has to reach a disk the OS can read.
 
 **Getting the file onto a Godspeed disk needs one small addition**, and this is a correction to an earlier
 draft of this section: `osdev mkfs` only FORMATS an empty GSFS image. The host-side bake path does exist -
