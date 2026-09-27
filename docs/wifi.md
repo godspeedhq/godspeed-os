@@ -330,33 +330,98 @@ before anything touches a secret.
 
 ---
 
-## 8. The firmware blob, which is genuinely new for this project
+## 8. The firmware blob: why one exists, and why it is NOT in this repository
 
-The CYW43455 needs `brcmfmac43455-sdio.bin` (roughly 600 KB), a CLM blob carrying regulatory data, and
-a board-specific NVRAM text file. **This project has never shipped a binary blob**, and the question is
-not technical:
+**DECIDED 2026-09-27.** This section used to pose the licensing question as open. It is closed, and by
+following what Linux does rather than by inventing a policy.
 
-- **Licensing.** The OS is GPL-2.0-only. Broadcom/Cypress firmware is redistributable under its own
-  permissive-but-not-GPL terms. Whether it belongs in this repository at all is a licensing decision
-  for the owner, not a design choice, and `docs/licensing.md` is where the answer belongs.
-- **If embedded in the image**, it follows the path a service ELF takes and the driver has no
-  filesystem dependency. It grows the image by ~600 KB and puts a non-GPL artefact in git history,
-  permanently.
-- **If loaded from the filesystem**, the repository stays clean and the user supplies the file - but
-  then **WiFi depends on `fs`, which on the Pi 4 depends on a USB stick being plugged in.** That is a
-  dependency with teeth, and Commandment VIII governs it: the driver waits on `fs`'s reply or on the
-  loud fact of its absence, never on a timer, and reports "firmware unavailable" rather than hanging.
-  The rule above the rules applies - no missing dependency may wedge the machine.
+### Why this device needs a file when no other one did
 
-There is a third option worth weighing: **load it over the network**, which is absurd for a network
-driver on a machine with no other link, and merely awkward on the Pi 4, which has ethernet. Recorded
-only so nobody proposes it as though it were new.
+Every device this project drives is fixed-function silicon: `e1000`, `RTL8168`, `GENET`, `dwmac`, AHCI,
+xHCI, EHCI, DWC2, the LAN9514. For all of them **the registers are the interface** - write a descriptor
+ring address, set a bit, frames move - and the state machine is in gates. Our driver is the whole driver.
 
-**Restartability has a cost here that is worth naming now.** §6.2 requires a driver's death to be a
-supervisor restart. A WiFi driver's restart means re-uploading 600 KB over SDIO and re-associating,
-which is on the order of a second, during which the link is down and `net-stack` sees a dead peer. That
-is acceptable - it is exactly the `EndpointDead`, reacquire-by-name, retry path (§14.3) - but it must be
-measured rather than assumed, and `chaos max-carnage` will find out.
+The CYW43455 is a different kind of thing. **It contains its own processor and RAM, and no ROM firmware
+for the MAC.** Until a host uploads code into it, there is no 802.11 inside to talk to: it cannot scan,
+associate or encrypt. And the register-level interface to the radio is not published at all; what is
+published is the protocol you speak to the firmware once it is running.
+
+So the blob is not driver code being borrowed instead of written. **It is the program for a second CPU**,
+and nobody writes it - not Linux, not the Pi's own firmware, not Windows. Everyone uploads Broadcom's.
+
+**This project already depends on three of these**, which is the clearest way to see it is not a new
+category. `scripts/deploy_pi.ps1` verifies them on every flash:
+
+```text
+pi4 firmware present: start4.elf, fixup4.dat
+pi2 firmware present: bootcode.bin, start.elf, fixup.dat
+```
+
+Those are closed vendor blobs for the VideoCore processor - which on a Pi is what actually boots the
+machine and hands control to this kernel. Nobody had to think about them because the Imager put them
+there.
+
+**The mental model does not change.** Enumeration finds a radio, the supervisor spawns `wifi-driver`, our
+driver drives it. The only addition is what the driver does first: **`wifi-driver` is to the CYW43455 what
+Limine is to this kernel.** Limine does not implement the OS, it loads it and gets out of the way. Our
+driver does not implement 802.11, it loads the firmware that does and then speaks to it over SDIO.
+
+### The licence closes a door, and that is worth knowing before anyone hopes otherwise
+
+`LICENCE.broadcom_bcm43xx` in `linux-firmware` permits **redistributing the binary** with the Broadcom
+copyright notice attached, and explicitly forbids attempting to *"modify in any way, reverse engineer,
+decompile or disassemble any portion of the software."*
+
+So for this chip, unlike every other device here, there is **no source to read AND no permission to study
+the binary**. §26.14's method - read a working driver as an executable datasheet, reimplement, never
+translate - has nothing to be applied to. We hand the chip its program and use the documented protocol.
+
+### Not in this repository, which is exactly what Linux does
+
+The Linux **kernel tree contains no firmware blobs.** They were moved out years ago into a separate
+`linux-firmware` repository that distributions package, and the naming is not coy about what it is:
+Debian ships `non-free-firmware`, and the Raspberry Pi set is `RPi-Distro/firmware-nonfree`. At runtime
+the in-kernel driver calls `request_firmware()`, which reads the file **off the filesystem**; the kernel
+binary never carries it.
+
+GodspeedOS follows that model:
+
+| | decision |
+|---|---|
+| **In this repository** | **No.** Not the image, not git history. A `.gitignore` guard makes an accidental commit harder than a deliberate one |
+| **A separate GodspeedOS firmware repo** | **Not yet.** One blob for one board is not a repository (§26.2), and redistributing takes on the notice obligation while not redistributing takes on nothing. If a second radio ever appears, that is what pulls one into existence |
+| **Where it lives** | On the machine's own data disk, supplied by whoever owns the machine - who already has it, because Raspberry Pi OS ships it |
+| **How the driver gets it** | Opens a file through `fs`, like any other client |
+
+**And one way this architecture is better than Linux's here.** `request_firmware()` exists because the
+Linux driver is IN the kernel and the kernel cannot read files, so it needs a callback into userspace and
+a loader path. `wifi-driver` is a userspace service, so it just opens a file. No new mechanism, no kernel
+involvement, and the blob never touches ring 0.
+
+### What that costs, and the part that is not built yet
+
+**WiFi then depends on `fs`**, which on the Pi 4 means a USB stick. Commandment VIII governs it: the
+driver waits on `fs`'s reply or on the loud fact of its absence, never on a timer, and reports "firmware
+unavailable" rather than hanging. The rule above the rules applies - no missing dependency may wedge the
+machine.
+
+**Getting the file onto a Godspeed disk needs one small addition**, and this is a correction to an earlier
+draft of this section: `osdev mkfs` only FORMATS an empty GSFS image. The host-side bake path does exist -
+`gsfs_add_file`, which `osdev script-disk` uses to put a `.gsh` script on a flashable disk - but no CLI
+verb takes an arbitrary binary. Its constraints matter to anyone planning on it: a name of at most 38
+bytes, a single root directory block holding **seven** entries, and one contiguous extent per file. The
+firmware set is three files with short names, so it fits; the verb is a phase-2 job.
+
+**Loading it over the network** is recorded only so nobody proposes it as new: absurd for a network driver
+on a machine with no other link, merely awkward on a Pi 4, which has ethernet.
+
+### Restartability has a cost here worth naming now
+
+§6.2 requires a driver's death to be a supervisor restart. A WiFi driver's restart means re-uploading
+~600 KB over SDIO and re-associating - on the order of a second, during which the link is down and
+`net-stack` sees a dead peer. That is acceptable, and it is exactly the `EndpointDead`,
+reacquire-by-name, retry path (§14.3). But it must be measured rather than assumed, and
+`chaos max-carnage` will find out.
 
 ---
 

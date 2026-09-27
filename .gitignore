@@ -66,3 +66,26 @@ screendump*
 *.temp
 *.core
 *.dmp
+
+# ─── VENDOR FIRMWARE BLOBS - never in this repository (docs/wifi.md 8) ────────
+#
+# Some devices are not fixed-function silicon. The Pi 4's CYW43455 radio contains its own processor with
+# no ROM firmware for the MAC, so it does nothing until a host uploads Broadcom's binary into it. That
+# binary is not driver code anyone writes - not Linux, not the Pi's firmware, not Windows - and its
+# licence permits redistributing it while explicitly forbidding any attempt to "modify in any way,
+# reverse engineer, decompile or disassemble" it.
+#
+# THE DECISION, which is Linux's: the OS tree carries no blobs. Linux moved theirs out years ago into a
+# separate `linux-firmware` repository that distributions package (Debian ships `non-free-firmware`; the
+# Pi set is `RPi-Distro/firmware-nonfree`), and the driver reads the file off the FILESYSTEM at runtime.
+# Here the blob lives on the machine's own data disk, supplied by whoever owns the machine, and
+# `wifi-driver` opens it through `fs` like any other client - no kernel involvement at all, which is one
+# place this architecture is simpler than Linux's `request_firmware()` callback.
+#
+# A decision in a document is honoured by whoever read it; a pattern here is honoured by everyone.
+# `git add -f` still works, which is the right shape: possible deliberately, never by accident.
+*.clm_blob
+brcmfmac*.bin
+brcmfmac*.txt
+rtl8*fw*.bin
+firmware/**/*.bin
