@@ -979,3 +979,88 @@ The CIS tuple ceiling is 256 rather than 64, so the chain can be seen to reach i
 running out of bound; the per-tuple report limit is 24 rather than 8 for the same reason. And the generic
 "CIS tuple" line now prints BEFORE the branches that decode a tuple's contents, so `CIS FUNCID` no
 longer appears above its own header and read as belonging to the tuple before it.
+
+---
+
+## 18. Phase 1 step 2, boot 1: the chip was fine and the GUARD was wrong
+
+Same board, 2026-09-27. Stages 1 through 6 repeated exactly, including the pin mux reporting
+`fsel=000000` a second time - so the firmware reliably does not route those pins and the kernel reliably
+does. Stage 7 stopped one line in:
+
+```text
+wifi-driver: stage 7 - waking the backplane to read the chip's own identity
+wifi-driver: CHIPCLKCSR wrote 0x28 and read back 0x68 - the write was accepted and did not stick ...
+```
+
+**That diagnosis is wrong, and the arithmetic says so immediately.** `0x68` is `0x28 | 0x40`. Both bits
+the driver wrote are present, so the write DID stick. The extra `0x40` is `ALP_AVAIL` - a **read-only
+status bit the hardware sets** - which means the chip had already granted the clock the driver was about
+to ask for. `0x68` is the success value, and the check rejected it.
+
+### The contradiction was inside one commit
+
+`CHIPCLKCSR` mixes bits a host WRITES with bits the hardware REPORTS. Comparing the whole register for
+equality with what was written therefore asks it a question it cannot answer: a chip that grants a clock
+sets a status bit, so a healthy readback is legitimately different from the write. A *working* chip is
+what breaks that assertion.
+
+Worse, both halves of the mistake are in the same change. The commit message singled this check out as
+earning its place. Section 17, one paragraph below the assertion, **predicted `CHIPCLKCSR 0x68` as the
+healthy reading** - and called it arithmetic rather than a guess, correctly. The prediction and the
+assertion disagreed with each other and neither noticed, which is a more useful thing to know about this
+process than the bug itself: a prediction is only a check on the code if something compares them.
+
+### The fix is the mask, not the deletion
+
+The check stays. A write that is accepted and does not stick means the bus is talking to something that
+is not this register, and every later read would silently inherit that - a real failure worth catching,
+and the reason Linux asks this question of a chip it has just enabled. What changes is that it asks about
+**the bits this driver owns**:
+
+```text
+REQUEST_BITS = FORCE_ALP | FORCE_HT | FORCE_ILP | ALP_AVAIL_REQ | HT_AVAIL_REQ | FORCE_HW_CLKREQ_OFF
+```
+
+and requires `read & REQUEST_BITS == written`. `ALP_AVAIL` and `HT_AVAIL` sit above that mask because
+they are not ours to predict. The failure message now prints the masked value AND the whole register, so
+the next reader can see which half disagreed.
+
+Every writable bit is in the mask even though this step sets only two of them, because a mask that
+covered just the bits we happen to use would forgive a real failure in the ones we do not.
+
+### A second bound that exited in silence
+
+Found while checking the above rather than from a failure, which is the only reason it is here: the CIS
+walk is bounded twice - a tuple count and a byte span - and **only the count reported**. The span
+condition failing dropped out of the loop with nothing printed. That is the thing `arch/CLAUDE.md` rule 2
+names outright: every bound must return a result the caller reads.
+
+All four exits are named now - an END tuple, the count, the span, and a failed read - and it earns its
+keep immediately, because it explains a disagreement that would otherwise have been invisible.
+
+### Two boots of one chip disagreed about where its CIS ends
+
+Both runs read **identical tuples** through `0x010d3`: `MANFID`, `FUNCID`, `FUNCE`, then five
+vendor-specific `0x80` tuples. Then they part:
+
+| boot | outcome |
+|---|---|
+| section 16 | ran to its **64-tuple ceiling** without reaching an END tuple |
+| this one | reached an **END tuple after 8**, with the report limit raised to 24 so a longer chain would have been visible |
+
+So the byte at `0x010d8` read as `0xFF` on one boot and as something else on the other. **This section
+does not explain that**, and the honest reason is that no instrument in either run could tell "the chain
+ends here" from "the walk is reading past the chain" - the span exit was silent and the END break said
+nothing either. Both are fixed above, so the next boot distinguishes them.
+
+It affects nothing that has been concluded: `CISTPL_MANFID` is the FIRST tuple, so identification
+happened before either boot diverged, and both paths are bounded. Recorded rather than chased, because a
+reading that changes between boots of one chip is not something to assume away - and because the next run
+will now say which of the two it is.
+
+### Still open: the chip identity, and therefore the firmware
+
+Stage 7 never reached the identity register, so section 16's question stands untouched: the CIS says
+`0xA9A6` (43430) and the board is documented to carry a part that answers `0xA9BF` (43455). Section 17's
+prediction - `0xA9A6`, the uncomfortable side - is unresolved and is carried forward unchanged.

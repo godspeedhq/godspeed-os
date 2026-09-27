@@ -58,8 +58,17 @@ mod f1 {
 
 /// `CHIPCLKCSR` bits. Only the four this step uses are named.
 mod clk {
+    /// Force the ALP clock on. Not used here; named because it is one of the writable bits, and the
+    /// mask below has to cover every bit a host can write or it would forgive a real failure.
+    pub const FORCE_ALP: u8 = 0x01;
+    /// Force the HT clock on. As above.
+    pub const FORCE_HT: u8 = 0x02;
+    /// Force the ILP clock on. As above.
+    pub const FORCE_ILP: u8 = 0x04;
     /// Request the ALP (active low power) clock, which is what the backplane needs to answer.
     pub const ALP_AVAIL_REQ: u8 = 0x08;
+    /// Request the HT clock. Not requested here, and part of the writable mask for the same reason.
+    pub const HT_AVAIL_REQ: u8 = 0x10;
     /// Stop the hardware asserting its own clock request, so ours is the only one in play.
     pub const FORCE_HW_CLKREQ_OFF: u8 = 0x20;
     /// The ALP clock is available.
@@ -70,6 +79,18 @@ mod clk {
 
     /// What to write first: request ALP, and take the hardware's own request out of the picture.
     pub const INIT: u8 = FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ;
+
+    /// The bits of this register a HOST WRITES. Everything above them - `ALP_AVAIL` and `HT_AVAIL` - is
+    /// read-only status the hardware sets.
+    ///
+    /// **This mask is the whole correction.** The readback used to be compared for exact equality with
+    /// what was written, which asks the register a question it cannot answer: a working chip grants the
+    /// clock, which SETS a status bit, so the value read back is legitimately different from the value
+    /// written. On the Pi 4 the driver wrote `0x28`, read `0x68`, and reported that the write had not
+    /// stuck - when `0x68` is `0x28` plus `ALP_AVAIL`, i.e. the request stuck AND the clock was already
+    /// granted. That is the success case, rejected.
+    pub const REQUEST_BITS: u8 = FORCE_ALP | FORCE_HT | FORCE_ILP
+        | ALP_AVAIL_REQ | HT_AVAIL_REQ | FORCE_HW_CLKREQ_OFF;
 }
 
 /// The window is 32 KiB, so an address's low 15 bits are the offset within it.
@@ -197,17 +218,23 @@ pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
         ));
         return false;
     }
-    // READ IT BACK AND REQUIRE IT. This is the check Linux makes here, and it earns its place: a
-    // write that is accepted and does not stick means the bus is talking to something that is not
-    // this register, which every later read would silently inherit.
+    // READ IT BACK AND REQUIRE THE BITS WE WROTE - not the whole register. A write that is accepted
+    // and does not stick means the bus is talking to something that is not this register, and every
+    // later read would silently inherit that; so the check stays. But `CHIPCLKCSR` mixes our request
+    // bits with the hardware's status bits, and comparing the whole register asks it a question it
+    // cannot answer: a chip that GRANTS the clock sets a status bit, so the readback is legitimately
+    // different from the write. Exactly that happened on the Pi 4 - wrote 0x28, read 0x68 - and the
+    // success case was reported as a failure.
     match sdio::read_reg(h, 1, f1::CHIPCLKCSR) {
-        Some(v) if v == clk::INIT => {}
+        Some(v) if v & clk::REQUEST_BITS == clk::INIT => {}
         Some(v) => {
             ctx.log_fmt(format_args!(
-                "wifi-driver: CHIPCLKCSR wrote {:#04x} and read back {:#04x} - the write was accepted \
-                 and did not stick, so the backplane is not reachable and no register read below it \
-                 would mean anything",
-                clk::INIT, v
+                "wifi-driver: CHIPCLKCSR wrote {:#04x} and the request bits read back {:#04x} (whole \
+                 register {:#04x}) - the write was accepted and did not stick, so the backplane is not \
+                 reachable and no register read below it would mean anything",
+                clk::INIT,
+                v & clk::REQUEST_BITS,
+                v
             ));
             return false;
         }

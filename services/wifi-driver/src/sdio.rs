@@ -460,6 +460,14 @@ pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
     let mut found: Option<Manfid> = None;
     let mut tuples = 0u32;
     let mut reported = 0u32;
+    // WHY THE WALK STOPPED, tracked rather than inferred afterwards. There are four ways out of the
+    // loop below and only one of them used to say so: the tuple count. The SPAN condition simply
+    // dropped out of the `while` with nothing printed, which is the failure `arch/CLAUDE.md` rule 2
+    // names outright - a bound that does not return a result the caller reads. It matters here for a
+    // concrete reason: two boots of the same chip disagreed about where this chain ends, and a silent
+    // exit is why that was hard to see.
+    let mut reached_end = false;
+    let mut read_failed = false;
 
     while tuples < MAX_TUPLES && addr < start + MAX_SPAN {
         tuples += 1;
@@ -472,10 +480,12 @@ pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
                     addr,
                     h.last_int()
                 ));
+                read_failed = true;
                 break;
             }
         };
         if code == cistpl::END {
+            reached_end = true;
             break;
         }
         if code == cistpl::NULL {
@@ -491,6 +501,7 @@ pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
                     "wifi-driver: the CIS walk could not read the length of tuple {:#04x} at {:#07x}",
                     code, addr
                 ));
+                read_failed = true;
                 break;
             }
         };
@@ -537,11 +548,28 @@ pub fn walk_cis(h: &Host, start: u32, ctx: &ServiceContext) -> Option<Manfid> {
         addr = body + len;
     }
 
-    if tuples >= MAX_TUPLES {
+    // ONE LINE PER WAY OUT, so the walk never ends without saying how.
+    if reached_end {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: the CIS ended properly at {:#07x} after {} tuple(s)", addr, tuples - 1
+        ));
+    } else if read_failed {
+        // Already reported in detail at the point of failure; named here so the summary is complete.
+        ctx.log_fmt(format_args!(
+            "wifi-driver: the CIS walk stopped after {} tuple(s) because a read failed", tuples
+        ));
+    } else if tuples >= MAX_TUPLES {
         ctx.log_fmt(format_args!(
             "wifi-driver: the CIS walk stopped at its {}-tuple bound without reaching an END tuple. \
              The chain is longer than expected or a link byte is wrong",
             MAX_TUPLES
+        ));
+    } else {
+        // THE BOUND THAT USED TO EXIT IN SILENCE.
+        ctx.log_fmt(format_args!(
+            "wifi-driver: the CIS walk stopped at its {:#x}-byte span bound ({:#07x}, from {:#07x}) \
+             without reaching an END tuple - so it was reading past the real chain",
+            MAX_SPAN, addr, start
         ));
     }
     found
