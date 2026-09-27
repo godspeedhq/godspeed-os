@@ -164,10 +164,68 @@ the chip, so it passes through the driver. The honest phase-4 position is that t
 persisting, logging, or re-reading it - and the log rule is worth stating as an absolute, because a PSK
 in the kernel ring buffer is a PSK in `build/putty_serial_output.log`, committed.
 
-**Who prompts?** The shell is where authority is decided (Appendix D.4), so `wifi join <ssid>` typed at
-`gsh>` is the natural place a human hands over a secret, with a shell that does not echo it and does not
-put it in history. Persisting it across reboots means putting it on the filesystem, which is a separate
-decision with its own open question in section 9.
+**Who prompts?** The shell is where authority is decided (Appendix D.4), so the passphrase is typed at
+the prompt - and **the invisible-entry path already exists**: `input secret` (`docs/scripting.md` §8)
+gives keystrokes that do not echo, a line excluded from both the recall ring and `/.gsh_history`, taint
+that propagates across assignment, and `echo` refused and masked as `[secret]`. `input secret sealed` is
+already reserved for the escalation that additionally forbids write and assignment, which is exactly
+what a passphrase wants. So the prompt half of this is built; what was missing is somewhere to put the
+answer.
+
+### Decided 2026-09-27
+
+The three questions this section left open are settled, and the reasoning is recorded because each
+answer is narrower than the obvious one.
+
+**1. Not "encrypted at rest" - capability-protected, and it SAYS so.** Encrypted with what key? A key
+beside the ciphertext is decoration; a key in hardware is a TPM the Pis do not have, so the guarantee
+would vary silently by board; a key derived from a master passphrase is the only honest option and it
+only pays for itself at several credentials, since you would type one password to avoid typing one
+password. So phase 1 stores the credential in the clear, protected by the thing this OS actually
+enforces - a capability - and **prints which case it is in**, exactly as §6.4 prints the IOMMU posture
+rather than assuming it:
+
+```
+keyring: 1 credential, capability-protected, NOT encrypted at rest (no master passphrase set)
+```
+
+What that protects against is any other service reading it: nothing without a capability to that
+resource can. What it does not survive is someone taking the card out, and that belongs in the boot log
+rather than in a footnote. A master-passphrase mode can be added later without changing the interface,
+and until it is, nothing here claims a property it does not have (§26.7).
+
+**2. A `keyring` SERVICE, not a file under `fs`.** The honest minimal alternative was to let `fs` hold
+it and give the driver a file capability - zero new services, reusing the machinery §22 Test 14 already
+pins on hardware. It loses on three counts: a file cap grants READ (the bytes, not "use without
+reading"), PBKDF2 would have nowhere to live, and it makes credentials depend on a filesystem the
+diskless case does not have. The service wins for one reason that is functional rather than aesthetic:
+**a credential must outlive the driver.** If the PSK lives in the radio driver, a driver restart loses
+it and re-prompts a human, which turns a supervisor restart into an outage. It is also revocable by
+generation bump without killing anything.
+
+**NOT named `credentials`.** That is the trap the `logger` -> `events` rename was about: a service
+named after an abstract property becomes the dumping ground §4.4 and §26.2 exist to prevent. `keyring`
+is a thing, house style is one short word, and nobody is tempted to put session management in it.
+
+**3. Diskless means a SESSION credential, and that is a different failure model rather than a lesser
+one.** Services are restartable, so a RAM-held credential dies with the keyring and the supervisor
+restarts it empty - after which the radio cannot reassociate without a human. §15 is explicit that
+state which must survive restart persists externally, and this cannot. That is acceptable only because
+it is declared: the failure is a loud "network credential lost, retype it", never a hang, and `chaos
+max-carnage` is what proves it. Declared it is a design; left implicit it is a chaos finding.
+
+**One thing that follows from all three, worth stating as an absolute:** the passphrase is never
+logged. A PSK in the kernel ring buffer is a PSK on the serial console, and this project commits
+`build/putty_serial_output.log` as hardware evidence (§23.3).
+
+**And one residual that cannot be engineered away.** A USB keyboard driver sees the passphrase as it is
+typed. That is the SEC-2 residual - `CONSOLE_PUSH` holders sit inside the shell's trust perimeter
+because keystrokes *are* commands - and IOMMU confinement bounds that driver's DMA, not what it reads.
+Recorded here at the place a reader would otherwise assume otherwise.
+
+**The command surface is `docs/wifi-commands.md`**, which settles the shape this implies: `connect` must
+be a shell built-in, because there is one console input ring with one reader slot and the shell is the
+reader, so a spawned service cannot prompt at all.
 
 ---
 
