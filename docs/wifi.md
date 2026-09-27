@@ -68,39 +68,65 @@ split out, and that the split is what keeps a credential away from a device driv
 LAN9514 and GENET - with `dwc2` serving them alongside the block protocol on one endpoint. A radio that
 presents those three ops carries DHCP, ARP, ICMP, DNS and TCP with no change to any of them.
 
-### The three names, and the one place the claim above was too strong
-
-**Corrected 2026-09-27, before anyone relied on it.** This section first said `net-stack` binds to a
-WiFi service with **zero** changes. That is true of the protocol and **false of the name**, and the
-difference is small but real:
+### Four names, and why there is no `wifi-stack`
 
 - **`wifi`** - the utility, the verb a person types (`docs/wifi-commands.md`).
 - **`wifi-driver`** - the service that owns the radio, named to the same convention as `nic-driver`
   and `block-driver`.
 - **`keyring`** - the service that owns the credential.
+- **`nic-driver`** - unchanged, and it is the one that matters here: the link front end the radio sits
+  behind.
 
-`net-stack` does not discover its link. It carries the literal string `"nic-driver"` in three code
-paths - `ctx.reacquire_by_name("nic-driver")`, the peer-death recovery that §14.3 requires - and again
-in its contract's `ipc_send` list. So a second link driver needs `net-stack` edited, and the honest
-statement is: **the frame interface needs no change; the peer name does.**
+**And there is deliberately no `wifi-stack`.** A second stack means a second ARP, a second IPv4, a
+second ICMP and eventually a second TCP - two implementations of one protocol, which is Commandment III
+broken at the largest scale available: two sources of truth that will drift, with every bug needing
+fixing twice. `docs/networking.md` already names the property that forbids it - *"the NIC-agnostic frame
+interface is exactly what makes this clean, the stack never knows the difference"* - and describes it as
+load-bearing rather than theoretical. Nothing about a radio pulls a second stack into existence (§26.2),
+and the coupling a fork would route around turns out not to exist at all.
 
-**How to change it, and how NOT to.** The tempting fix is a `#[cfg(target_arch)]` or a per-board
-constant selecting the link name. That is arch-conditional code above the kernel, which
-`shared_surface_check.py` ratchets at 44 sites - it may fall freely and may not rise without a
-recorded reason - so the tempting fix would have to argue with a gate, and would deserve to lose.
+`net-stack` carries the literal string `"nic-driver"` in three code paths -
+`ctx.reacquire_by_name("nic-driver")`, the peer-death recovery §14.3 requires - and again in its
+contract's `ipc_send` list. From that it looks as though a second link driver must mean editing
+`net-stack`.
 
-The cheap correct version needs no kernel change and no conditional: **`net-stack` keeps an ordered
-list of candidate link names and reacquires whichever one resolves.** The same list on every board; a
-driver that is not present simply never resolves, which is already how a dead peer behaves. It is
-strictly better than what is there now, because today the code asserts there is exactly one link and
-names it.
+**It does not, and the reason is already in the tree. `nic-driver` is not the Ethernet driver - it is
+the LINK FRONT END, and on the Pi 2 it owns no registers at all.** That board's ethernet is a CDC-ECM
+USB adapter behind the **`dwc2` service**, and `nic-driver` reaches it **by IPC over ops `0x10`/`0x11`/
+`0x12` - the very interface it serves upward.** It is a client of the frame interface and a server of
+the frame interface at the same time, and its own source says so.
 
-The more elegant version - `net-stack` asking for its link by ROLE, with the supervisor's spawn row
-deciding whether `link` means `nic-driver` or `wifi-driver` - is the one this project's own naming
-design points at, since the supervisor IS the name authority and wires every peer from a name to cap
-map. It needs the kernel's name directory to hold two names for one endpoint, which is a kernel change
-and therefore a re-verification cost (§14.1). **Recorded as the better shape, not chosen**, per §26.2:
-the list works, and a role indirection with one caller is speculative until a third link exists.
+So the shape is this, and it has been in production on four boards:
+
+```text
+  net-stack                        IP and up. One implementation. Always asks for "nic-driver"
+      |  frame interface           0x10 INFO / 0x11 TX / 0x12 RX
+  nic-driver                       the LINK front end - one name, per-board backend
+      |- e1000 / RTL8168           MMIO directly            (x86)
+      |- GENET                     MMIO directly            (Pi 4)
+      |- dwmac                     MMIO directly            (VisionFive)
+      `- IPC to `dwc2`             no registers at all      (Pi 2)
+```
+
+**`wifi-driver` is the fifth row of that table**, and it is the row the Pi 2 already demonstrates. No
+change to `net-stack`, no second name above the front end, no kernel change, and no new abstraction -
+the indirection the question is reaching for **exists and is called `nic-driver`.** It is a role name
+that happens to read like a device name.
+
+**Two earlier claims in this document were wrong and are withdrawn here rather than quietly edited.**
+The first said `net-stack` needed zero changes, which was right by luck and wrong by reasoning. The
+second said it needed a name change after all, and proposed a candidate-name list or a supervisor-wired
+role indirection. Both proposals are unnecessary: they were answers to a coupling problem this project
+solved when the USB ethernet adapter arrived, and I reached them by reading `net-stack`'s contract and a
+top-level grep instead of following what the Pi 2 actually does. The candidate list and the role name
+stay recorded as the shapes to reach for **if** two simultaneous links are ever wanted, because that is
+the one thing the front-end pattern does not answer.
+
+**What it costs, stated honestly.** On the Pi 4 both GENET and a radio exist, so `nic-driver` must
+choose a backend at RUNTIME rather than at compile time - the Pi 2's choice is settled by the
+architecture it is built for. That runtime choice is the "one link at a time" policy, and it landing in
+a driver is worth a second look during phase 5: the supervisor is the natural home for a wiring
+decision, and `nic-driver` is the convenient one. Flagged rather than settled.
 
 ### What "link up" means for a radio, which genuinely costs nothing
 
