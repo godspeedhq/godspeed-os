@@ -1,0 +1,48 @@
+# checker: scripts/commandments.py
+# why: TWO Commandments from one realistic mistake: you give a service a new peer and forget that the
+# why: peer is restartable. IX asks whether the service can REACQUIRE it; VII asks whether the grant
+# why: was pinned. Both fire, which is the honest render - a single edit really does break two rules.
+# why:
+# why: Why IX matters more than it looks: every peer here is restartable, chaos kills them all, so a
+# why: send cap is a WASTING ASSET - the instant the peer respawns the generation moves and the cap is
+# why: dead forever. `find_send_slot` never resolves a name. And the failure is SILENT: a stale cap does
+# why: not crash the holder and does not log. It returns `EndpointDead` to a caller that usually
+# why: discards it, and the service runs on, correct in every other respect, quietly talking to nobody.
+# why: The recorded fingerprint from the last time this bit was a driver "enumerated and UP" with zero
+# why: register reads even ATTEMPTED.
+# why:
+# why: THIS CASE IS WHY `mode: replace` EXISTS, and it answers a question worth recording: multi-file
+# why: support does NOT unlock the last three rules. II derives who escapes chaos from `is_transient()`,
+# why: VII from the supervisor's grant table, IX from whether a service with a peer grant calls a
+# why: reacquire - every one of them is tripped by CHANGING an existing construct, which no amount of
+# why: appending or adding files can express. An in-place substitution can.
+--- plant: services/supervisor/src/main.rs replace ---
+("observe", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
+--- with ---
+("observe", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &["fs"],
+--- expect ---
+error[GS0009]: a service that sends to a peer can reacquire it after the peer restarts
+    |
+    = commandment: IX - Thou shalt always plan for recovery, for thy service shall fail.
+    = why: 'observe' sends to [fs] and has NO reacquisition path. Every peer here is
+           restartable and chaos kills them all, so this cap dies the first time its peer
+           respawns - and the death is silent, because a discarded `try_send` error looks
+           exactly like success. Reacquire by name on `Err` (never on `Ok(None)`, which is a
+           deadline, not a dead peer).
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0009` for the long form
+
+error[GS0007]: what each service may reach is pinned, not just that it has a name
+   --> services/supervisor/src/main.rs
+    |
+    = commandment: VII - Thou shalt not introduce ambient authority.
+    = why: 'observe' is granted peer:fs, which is not pinned. Commandment VII: authority is
+           granted deliberately or not at all, and a service's reach may SHRINK freely but
+           may only grow by pinning it here in a commit that says why. If this grant is
+           right, add "peer:fs" to [kernel.service_grants]."observe" and say what it is for.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0007` for the long form

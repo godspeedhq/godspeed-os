@@ -1,0 +1,34 @@
+# target: scripts/test_report.py
+# mode: append
+# checker: scripts/python_floor_check.py
+# why: README.md tells a contributor they need Python 3.8. A hand-measured number is right on the day
+# why: it is taken and silently wrong afterwards, and the drift arrives as a SyntaxError FROM A
+# why: CHECKER - the worst first experience this repository can offer. So the floor is held
+# why: mechanically, and raising it means changing `FLOOR` and the README together, deliberately.
+--- plant ---
+
+
+def _probe(x):
+    match x:
+        case 1:
+            return "one"
+    return None
+--- expect ---
+error[GS0103]: a script uses a Python feature newer than the declared floor
+   --> scripts/test_report.py:154
+    |
+    = rule: README.md, Requirements
+    = why: `README.md` tells a contributor they need Python 3.8. That number was measured by
+           hand, and a hand-measured number is right on the day it is taken and silently
+           wrong afterwards. A contributor on the floor version would meet the drift as a
+           SyntaxError from a CHECKER, which is the worst first experience this repository
+           can offer.
+    = help: Rewrite it to work on the floor, or RAISE the floor deliberately - `FLOOR` in
+            `scripts/python_floor_check.py` and the Requirements line in `README.md`,
+            together. Never let the number drift upward by accident.
+    = note: `py scripts/conform.py --explain GS0103` for the long form
+
+  python_floor_check.py reported:
+  | python floor: 1 use(s) of a feature newer than the declared floor (3.8):
+  |   scripts/test_report.py:154 needs Python 3.10 - a `match` statement
+  | (5 more lines of explanation, which the frame above covers - `py scripts/python_floor_check.py` for all of it)

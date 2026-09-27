@@ -49,6 +49,7 @@ The seven trials by fire (§22) plus the verification apparatus and CI that keep
 | [Unsafe audit](testing/unsafe-audit.md) | The CI check that every `unsafe` block is accounted for |
 | [Static analysis](testing/static-analysis.md) | Static-analysis CI |
 | [Static-analysis audit](testing/static-analysis-audit.md) | A combined static-analysis + unsafe-audit cleanup pass |
+| [Conformance](testing/conformance.md) | `osdev conform` - one front door to all eighteen checkers, rendering like `rustc`, with a GALLERY of what every violation prints |
 | [Mutation testing](testing/mutation-testing.md) | Mutation testing of the suite |
 | [Subsystem property tests](testing/property-subsystem.md) | Property tests at the subsystem boundary |
 | [Subsystem-level property tests](testing/property-subsystem-level.md) | A deeper subsystem-level property pass |

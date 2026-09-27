@@ -1,0 +1,30 @@
+# target: utilities/99_probequux.md
+# mode: create
+# checker: scripts/commandments.py
+# why: Commandment X, in the one part of it a machine can decide: the user-facing vocabulary and its
+# why: documentation must agree. `docs/x-residue.md` records honestly what this does NOT prove - "place
+# why: complexity in the layer that owns it" is a judgement about layers that no pattern reads - so
+# why: that "10 of 10 mechanised" cannot be read as a stronger claim than it is.
+# why:
+# why: Why this shape matters: a utility spec is a reference a reader TYPES from. The `ls` to `dir`
+# why: rename reached the shell, the specs and the help text and still missed ten worked examples.
+--- plant ---
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
+# `probequux`
+
+## 1. What it is
+
+`probequux <path>` prints nothing, because it does not exist.
+--- expect ---
+error[GS0010]: the user-facing vocabulary and its documentation agree
+   --> utilities/99_probequux.md
+    |
+    = commandment: X - Thou shalt place complexity where it belongs.
+    = why: `probequux` has a utility spec and the shell answers no such verb. A documented
+           command that does not exist costs the user more than a missing feature: they learn
+           the documentation cannot be trusted. Implement it, delete the spec, or rewrite the
+           spec to document the ABSENCE (as utilities/14_poweroff.md does).
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0010` for the long form

@@ -61,6 +61,14 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELL = os.path.join(ROOT, "services", "shell", "src", "main.rs")
 SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs")
+# `tests/conformance/` is the UI-fixture corpus and the GENERATED gallery, which quote
+# violations VERBATIM - a rotted citation and a POSIX word used as a command are in there on
+# purpose, because that is what they catalogue. Same genre as the `audits/` exemption above:
+# evidence of what was seen, not a claim about the code now. A path prefix rather than a
+# SKIP_DIRS entry because it is a subtree, and narrow on purpose - `tests/` at large is still
+# scanned.
+FIXTURE_SUBTREE = "tests/conformance/"
+
 
 # `gsh> ls ...`, or a bare command line inside a fence, or `` `ls | ...` ``.
 PROMPT = re.compile(r"(?:^|`)\s*gsh>\s+([a-z][a-z0-9_-]*)")
@@ -104,6 +112,8 @@ def main():
     bad = []
     for root, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        if FIXTURE_SUBTREE in os.path.relpath(root, ROOT).replace(os.sep, "/") + "/":
+            continue
         for name in files:
             if not name.endswith(".md"):
                 continue

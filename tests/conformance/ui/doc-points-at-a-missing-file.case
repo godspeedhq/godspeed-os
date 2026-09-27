@@ -1,0 +1,27 @@
+# target: docs/pipes.md
+# mode: append
+# checker: scripts/doc_refs.py
+# why: A citation of a file that was deleted sends a reader after nothing. A citation of a BACKLOG
+# why: entry that was never written is worse: it reads as though the limitation has been recorded,
+# why: which is the opposite of what 26.7 asks. This gate caught exactly that while `conform` itself
+# why: was being written - a `backlog/58` cited one commit before it existed.
+--- plant ---
+
+The full treatment is in `docs/pipes-internals-that-do-not-exist.md`.
+--- expect ---
+error[GS0401]: a document points at a path that does not exist
+   --> docs/pipes.md
+    |
+    = rule: CLAUDE.md 26.7
+    = why: A citation of a file that was deleted sends a reader after nothing. A citation of
+           a backlog entry that was never written is worse: it reads as though the limitation
+           HAS been recorded, which is the opposite of what 26.7 asks.
+    = help: Re-point it, or write the entry you cited. If the target is genuinely gone, say
+            so where the citation was rather than deleting the sentence.
+    = note: `py scripts/conform.py --explain GS0401` for the long form
+
+  doc_refs.py reported:
+  | doc refs: 1 reference(s) point at files that do not exist
+  |   docs/pipes.md
+  |       -> docs/pipes-internals-that-do-not-exist.md
+  | (3 more lines of explanation, which the frame above covers - `py scripts/doc_refs.py` for all of it)

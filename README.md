@@ -223,7 +223,9 @@ under a "figures below are from the current tree" line that made three-month-old
 
 **Want to write a service?** See [**GETTING_STARTED.md**](GETTING_STARTED.md) - a 5-minute, copy-`examples/00-hello` walkthrough. The rest of this section is about building and booting the OS itself.
 
-**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (`nightly-2026-05-16`; rustup installs it for you), QEMU on your PATH, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (`nightly-2026-05-16`; rustup installs it for you), QEMU on your PATH, **Python 3.8 or newer on your PATH as `python`**, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+
+**Python is not optional, so it is stated plainly rather than discovered.** `osdev build` runs the enforcement layer - the checkers in `scripts/` that hold the Ten Commandments, the contracts, the arch boundary and the documentation - and it **refuses to build** if it cannot run one of them, because a checker that cannot run is not a checker that passed. Building for a non-x86 board needs it too: `scripts/board.py` and the three per-board scripts are the only way to produce a Raspberry Pi or VisionFive image. The floor is **3.8**, set by one walrus operator in `scripts/commandments.py`; `docs/conformance.md` records how that was measured and why the `list[str]` annotations in four checkers do NOT raise it to 3.9.
 
 **Set up Limine (once).** GodspeedOS boots via the Limine bootloader, whose binaries are not committed (`tools/` is gitignored). Download a Limine binary release (https://github.com/limine-bootloader/limine/releases - the project tracks the 12.x line) and copy these into `tools/limine/`:
 
@@ -247,6 +249,38 @@ cargo run -p osdev -- test property
 # Force a peer outage and watch the system recover from it
 cargo run -p osdev -- test peer-storm
 ```
+
+**Before you commit: `conform`.** One command over the whole enforcement layer - the checkers that
+hold the Ten Commandments, the contracts, the arch boundary and the documentation. It fixes what is
+DECIDABLE and reports what needs JUDGEMENT, naming which Commandment a violation breaks and what to do
+about it:
+
+```bash
+# Fix what is decidable, report what needs a decision
+py scripts/conform.py
+
+# Report both and change nothing - this is what CI wants
+py scripts/conform.py --check
+
+# What a rule means, why it exists, and whether it is auto-fixable
+py scripts/conform.py --explain GS0403
+
+# Every rule, its code and its Commandment
+py scripts/conform.py --list
+```
+
+A clean tree says `0 would be fixed, 0 need a decision - 18 checks ran, 18 passed`. The count of checks
+that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
+the failure the whole thing exists to prevent.
+
+**The codes are readable.** `GS0001`..`GS0010` are the Ten Commandments - the number IS the numeral, so
+`GS0004` is Commandment IV. Above that, `GS01xx` is house writing conventions, `GS02xx` the kernel
+boundary and unsafe, `GS03xx` contracts and authority, `GS04xx` documentation and comments.
+`conform --list` prints the legend and every rule; `docs/conformance.md` has the reasoning.
+
+`osdev build` runs the same checkers and refuses to build if any fails, so `conform` is not an extra
+gate - it is the same gate, askable. It is `py scripts/conform.py` rather than `osdev conform` because
+the shim is not written yet; `docs/conformance.md` is the spec and records why.
 
 The build is pure Cargo plus the `osdev` CLI - identical on every platform. The full `osdev` CLI reference is in `CLAUDE.md §17` and `osdev/CLAUDE.md`.
 

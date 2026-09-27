@@ -1,0 +1,28 @@
+# target: docs/pipes.md
+# mode: append
+# checker: scripts/doc_command_check.py
+# why: Names resolving and numbers matching is not enough - nothing asked whether a documented PROMPT
+# why: actually runs. `dir long /` lists a directory NAMED `long` and discards the path, which is a
+# why: WRONG ANSWER rather than an error, and it shipped. The accepted words are read from the shell's
+# why: own SUBCMD_FIRST, so this cannot drift from what the shell really takes.
+--- plant ---
+
+```
+gsh> drives incinerate 0
+```
+--- expect ---
+error[GS0407]: a documented invocation does not work
+   --> docs/pipes.md:271
+    |
+    = rule: CLAUDE.md 26.7
+    = why: Names resolving and numbers matching is not enough: nothing asked whether a
+           documented PROMPT runs. `dir long /` lists a directory NAMED `long` and discards
+           the path, which is a WRONG ANSWER rather than an error, and it shipped.
+    = help: Run it and paste what it does. The accepted words are read from the shell's
+            `SUBCMD_FIRST` and osdev's own `match suite`, so this cannot drift from either.
+    = note: `py scripts/conform.py --explain GS0407` for the long form
+
+  doc_command_check.py reported:
+  | doc commands: 1 documented invocation(s) the code does not answer
+  |   docs/pipes.md:271
+  | (5 more lines of explanation, which the frame above covers - `py scripts/doc_command_check.py` for all of it)

@@ -57,6 +57,7 @@
 - [2026-09-06 - The day the second core stopped being an answer](#2026-09-06---the-day-the-second-core-stopped-being-an-answer)
 - [2026-09-12 to 2026-09-13 - The day "it boots" stopped being the standard](#2026-09-12-to-2026-09-13---the-day-it-boots-stopped-being-the-standard)
 - [2026-09-13 to 2026-09-14 - The day the enforcement layer was pointed at itself](#2026-09-13-to-2026-09-14---the-day-the-enforcement-layer-was-pointed-at-itself)
+- [2026-09-26 to 2026-09-27 - The day a rule nobody could read stopped counting as enforced](#2026-09-26-to-2026-09-27---the-day-a-rule-nobody-could-read-stopped-counting-as-enforced)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -1493,3 +1494,82 @@ remembered by name.*
 produced.*
 
 *Godspeed.*
+
+---
+
+## 2026-09-26 to 2026-09-27 - The day a rule nobody could read stopped counting as enforced
+
+The previous entry ends at 10 of 10 commandments mechanised. This one starts with what that number
+hides: **a rule is not enforced when a machine can check it. It is enforced when a contributor can
+understand why it said no.** Eighteen checkers ran on every build, and there was no way to ASK them
+anything. You learned the rules by failing a build, which is precisely what 22.7 says the repository
+must not require of a stranger - and 22.7 had said so, in writing, for months, with nothing holding it:
+
+> *"A gate that fires with an unhelpful message is a finding, not a pass."*
+
+That is a claim about rendered TEXT. Nothing in the project had ever read the text.
+
+**The realization: the enforcement layer had been built as a wall and needed to be a door.** Not a
+second gate - the same gates, askable, with one verdict, naming which of the Ten a violation breaks and
+what to do about it. `osdev conform`, rendering like `rustc`: a stable code, the commandment, `= why`
+before `= help`, both escape routes stated including the legitimate one, and a count of how many checks
+RAN - because a run that silently skipped twelve and printed a clean verdict is the failure the whole
+thing exists to prevent.
+
+### The line that turned out to be the design
+
+Two kinds of finding, and conflating them would have produced a tool nobody could trust:
+
+- **Decidable** - one right answer, no reader needed. An em-dash must be a hyphen.
+- **Judgement** - the fix is not determined by the violation. A comment naming a dead symbol might want
+  correcting, or might be correctly RECORDING a removal and want baselining, and **half of what the
+  comment sweep of the day before had found was the second kind.**
+
+So `conform` fixes the first, reports the second, and always says which it did. A clean run prints
+`fixed 3, 0 need a decision`, never a bare `ok`: "I changed your files and said nothing" is what makes
+people distrust a formatter. And the rule that fell out - *`conform` may only fix what a gate would
+fail you for, and it takes the scope FROM that gate* - is why it imports `dash_check` and reads the
+checker list out of `osdev/src/main.rs` rather than restating either. Nothing restated cannot drift.
+
+### The instrument agreed with me, again
+
+Twelve defects were found in this work and **every one by running the thing rather than reading it**.
+The one worth keeping is the golden-file harness, `--bless`, which writes the observed diagnostic into
+each test case so nobody hand-copies twenty-four of them. On its first real use it produced a green
+suite of eighteen containing **five tests that proved nothing**: two plants aimed at `examples/` when
+the checkers scan `services/`, one writing back bytes identical to what was already there, one citing a
+line in a sentence with no word to anchor on, and one appending a duplicate TOML table.
+
+It recorded "no finding" as the truth, five times, and reported 18 of 18.
+
+**A golden file defends a judgement; it cannot make one.** That sentence was in the docstring before it
+cost anything, which is the only reason anybody looked - and it is the same shape as every instrument
+in this project that has ever lied: the counter declared inside its loop, the flush verdict that could
+not tell a refusing device from an absent one, the health line reading `disk yes` while 400 of 412
+probes failed. **An instrument that agrees with you is the one to distrust.**
+
+The same day, a checker written that morning exempted itself from the problem it describes: its
+docstring cited `XHCI_FOUND` and `CNTP_TVAL` as examples of dead names, its own corpus included its own
+prose, and so every name it mentioned resolved BY being mentioned. Fourteen names passed, including the
+two dead statics that had motivated writing it at all.
+
+### What a catalogue is for
+
+The answer to "have I seen every message?" was no - fifteen of twenty-seven codes, and **two of the
+Ten**, which is the primary vocabulary. So the messages are written down:
+`tests/conformance/GALLERY.md`, one entry per rule, generated by planting a real violation from the same
+corpus the selftest verifies. One corpus, two views, and the coverage list COMPUTED - so an absence
+nobody explained is reported as a defect rather than mistaken for coverage.
+
+Two honest results came out of insisting on that. `GS0008` **can never fire**: Commandment VIII has no
+mechanical check at all, and a code advertised in `--list` that nothing can produce reads as coverage,
+so it says so. And Commandment III's check has a narrow real blind spot - it matches a plain integer
+literal, so an expression-valued constant duplicated across two files is invisible to it. Both were
+found by trying to write a test for something and failing.
+
+### What did not change
+
+Not one byte of any shipping binary. Eighteen checkers before, eighteen after; the same rules, the same
+verdicts. What changed is that a contributor can now ask, and be answered in words that name the law
+and the fix - and that the answer itself is held to a standard, because it is written down where a diff
+can see it.

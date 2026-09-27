@@ -1,0 +1,28 @@
+# target: boot/pi2/config.txt
+# mode: write
+# checker: scripts/line_ending_check.py
+# why: Also decidable, and gated because the failure LOOKS like success. `.gitattributes` declares
+# why: `boot/**` as `eol=lf` since U-Boot reads a trailing CR as part of every FILENAME: every entry
+# why: fails while the menu renders perfectly, because a trailing CR in a display string just returns
+# why: the cursor. Two card reflashes and two wrong theories (backlog/26).
+# why:
+# why: The plant must DIFFER from what is on disk - writing the same bytes back changes nothing, which
+# why: is how the first draft got blessed to "no finding".
+--- plant ---
+# A probe config planted by a conformance case.
+kernel=kernel7.img
+arm_64bit=0
+enable_uart=1
+--- expect ---
+error[GS0102]: a tracked text file carries CRLF line endings
+    |
+    = rule: backlog/26
+    = why: A CRLF in a boot config boots NOTHING while showing a perfect menu: U-Boot reads
+           the trailing CR as part of every filename. It cost two reflashes before it was
+           gated.
+    = help: `conform` fixes this by rewriting the file with LF endings.
+    = note: `py scripts/conform.py --explain GS0102` for the long form
+
+  line_ending_check.py reported:
+  | CARRIAGE RETURNS in files that must be LF:
+  | (7 more lines of explanation, which the frame above covers - `py scripts/line_ending_check.py` for all of it)

@@ -1,0 +1,32 @@
+# target: services/observe/contracts/observe.toml
+# mode: append
+# checker: scripts/contract_check.py
+# why: The kernel is no_std and cannot parse TOML, so a contract is a build-time DECLARATION reconciled
+# why: against what the supervisor's spawn row actually grants. This is the gate that keeps the two from
+# why: drifting, and it covers the memory limit, the placement core and the send peers.
+# why:
+# why: Note it reconciles the MANAGED services only - an `examples/` contract is not its business, and
+# why: the first draft of this case planted one and passed. Authority claimed in an example contract is
+# why: `IV-contract-authority`'s job, which is a separate case in this gallery.
+--- plant ---
+
+ipc_send = ["fs", "time"]
+--- expect ---
+error[GS0301]: a service contract disagrees with what the spawn request actually grants
+   --> kernel/src/task/mod.rs
+    |
+    = commandment: IV - CLAUDE.md 13.6
+    = why: The kernel is no_std and cannot parse TOML: authority comes from the SPAWN
+           REQUEST, never from the contract. The contract is the reviewable declaration, and
+           this is what keeps the two from drifting. 13.6 exists because a model added a
+           capability to a contract, reported that the kernel would grant it, and was wrong
+           in a way nothing caught.
+    = help: Change the supervisor's spawn row and the contract together. If the contract says
+            a service may do something the spawn row does not grant, the service cannot do it
+            - and will say it did.
+    = note: `py scripts/conform.py --explain GS0301` for the long form
+
+  contract_check.py reported:
+  | Contract reconcile - FAILURES (a .toml disagrees with the kernel service_config):
+  | 1 mismatch(es). The contract is the source of truth (Commandment III / audit T1): fix the .toml AND kernel/src/task/mod.rs to agree.
+  | (1 more line of explanation, which the frame above covers - `py scripts/contract_check.py` for all of it)

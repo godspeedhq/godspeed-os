@@ -1,0 +1,28 @@
+# target: services/net-stack/src/tcp.rs
+# mode: append
+# checker: scripts/commandments.py
+# why: Commandment III: one fact, one place. The same module-level constant in two files of one crate is
+# why: one fact stored twice, free to drift with nothing to say which copy is right. `use` the other.
+# why:
+# why: THIS CASE TOOK THREE ATTEMPTS AND THE FIRST TWO FAILED FOR DIFFERENT REASONS, both worth knowing
+# why: before writing another. `const HCCHAR_CHENA: u32 = 1 << 31;` did not fire because `_CONST_DECL`
+# why: matches only a plain decimal or hex LITERAL, so an expression-valued const is invisible to this
+# why: check - a narrow real blind spot. `const CH_KBD: u8 = 1;` did not fire because that pair is
+# why: already in `duplicate_const_debt` in COMMANDMENTS.baseline.toml, and a baselined duplicate is
+# why: exempt by design. Both were recorded as "no finding" by `--bless` until someone looked.
+--- plant ---
+
+const DANCE_SECS: i64 = 2;
+--- expect ---
+error[GS0003]: one fact, one place - no constant declared twice in a crate
+   --> services/net-stack/src/main.rs
+    |
+    = commandment: III - Thou shalt not duplicate truth. Store irreducible facts. Derive the
+                   rest.
+    = why: `DANCE_SECS` is declared in 2 files of `svc/net-stack` with the same value
+           (services/net-stack/src/main.rs, services/net-stack/src/tcp.rs). One fact, stored
+           twice, free to drift with nothing to say which is right - `use` the other.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0003` for the long form

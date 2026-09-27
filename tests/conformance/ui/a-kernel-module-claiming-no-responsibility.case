@@ -1,0 +1,27 @@
+# target: kernel/src/probe_telemetry.rs
+# mode: create
+# checker: scripts/commandments.py
+# why: Commandment I, mechanised against MISCIS - the kernel's SIX responsibilities: Memory isolation,
+# why: IPC, Scheduling, Capabilities, Interrupts, SMP routing. A seventh is not a feature, it is a
+# why: change to what this kernel IS, so every module must claim one of the six and the list is derived
+# why: from CLAUDE.md 4.3 itself rather than copied into config.
+# why:
+# why: `fbcon` was the last standing violation here and it left the kernel for `services/console`;
+# why: 1,172 lines of terminal emulation, because rendering a shell prompt is policy. `mode: create`
+# why: because a new responsibility arrives as a new FILE, which is exactly how one sneaks in.
+--- plant ---
+//! A probe module that claims no MISCIS responsibility.
+
+pub fn nothing() {}
+--- expect ---
+error[GS0001]: the kernel has six responsibilities, and every module claims one
+   --> kernel/src/probe_telemetry.rs
+    |
+    = commandment: I - Thou shalt not expand the responsibilities of the kernel. It is
+                   complete. Use a service.
+    = why: this module claims no kernel responsibility. Name which of the six (4.3) it
+           serves, or which sanctioned support role and where the constitution sanctions it.
+    = help: `COMMANDMENTS.md` is the law and `docs/anti-patterns.md` has the correct pattern
+            for this category. An exemption is legitimate ONLY if a CLAUDE.md amendment
+            already accepts it - not a baseline entry.
+    = note: `py scripts/conform.py --explain GS0001` for the long form
