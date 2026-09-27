@@ -355,7 +355,7 @@ error[GS0004]: a contract's claim of authority matches what is actually granted
 
 ## crlf in a boot config
 
-Also decidable, and gated because the failure LOOKS like success. `.gitattributes` declares `boot/**` as `eol=lf` since U-Boot reads a trailing CR as part of every FILENAME: every entry fails while the menu renders perfectly, because a trailing CR in a display string just returns the cursor. Two card reflashes and two wrong theories (backlog/26). The plant must DIFFER from what is on disk - writing the same bytes back changes nothing, which is how the first draft got blessed to "no finding".
+Also decidable, and gated because the failure LOOKS like success. `.gitattributes` declares `boot/**` as `eol=lf` since U-Boot reads a trailing CR as part of every FILENAME: every entry fails while the menu renders perfectly, because a trailing CR in a display string just returns the cursor. Two card reflashes and two wrong theories (backlog/26). The plant must DIFFER from what is on disk - writing the same bytes back changes nothing, which is how the first draft got blessed to "no finding". The carriage returns are DECLARED as `\u000d`, not written literally. Spelled literally they would be the case FILE's own line endings, and `* text=auto` made those CRLF on a Windows checkout and LF everywhere else - so the fixture would measure the checkout rather than the checker, passing here and finding nothing on Linux CI. `.gitattributes` now pins `*.case` to `eol=lf` as well; both halves are needed, because an editor can still hand back CRLF.
 
 *Planted in `boot/pi2/config.txt` (`write`), caught by `scripts/line_ending_check.py`.*
 

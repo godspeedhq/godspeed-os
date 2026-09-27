@@ -19,8 +19,14 @@ Two constraints, and they point the same way.
 **The fixtures must not be scanned by the checkers they provoke.** A file containing a dead symbol and
 a stale line number, sitting in the tree, is a violation - and would fail the very gates these cases
 exist to exercise. Exempting the directory in all seventeen checkers would mean seventeen edits and
-seventeen chances to widen an exemption by accident. Naming the file `.case` instead means no checker
-looks at it, because none of them scans that extension.
+seventeen chances to widen an exemption by accident. Naming the file `.case` instead means almost no
+checker looks at it, because almost none of them scans that extension.
+
+The exception is `line_ending_check.py`, which scans every tracked text file whatever it is called -
+and that is right, not a leak. A `.case` file holding CRLF is a real defect: the fixture would plant
+whatever endings the checkout happened to give it rather than the bytes it declares. `.gitattributes`
+pins `*.case` to `eol=lf` for the same reason it pins `*.gsh` and `boot/**` - a file whose bytes are
+asserted must not depend on who checked the repository out.
 
 **A reviewer must be able to read the whole case at once.** The violation and its expected output in
 one file, in a diff, is the thing that makes a wording regression visible in a pull request rather than
@@ -34,10 +40,22 @@ the file, and diffs the render against `expected`.
 `commandments_redteam.py` restores with `git checkout`, and that is how an hour of uncommitted work
 gets eaten. This does not do that:
 
-- **`--selftest` refuses to run on a dirty tree.** If `git status` is not empty it stops and says so,
-  because the whole mechanism writes to real paths.
+- **`--selftest` refuses to plant into a file you have uncommitted work in.** It compares the case
+  TARGETS against `git status` and stops, naming them, if any overlap - and only then: everything else
+  in the tree may be dirty, so the harness stays usable while you are working on it.
 - **Restore is byte-for-byte from an in-memory copy**, not from git. The plant never touches the index.
 - **Every case restores in a `finally`**, so a crash mid-case cannot leave a planted violation behind.
+
+## Bytes a plant needs are DECLARED, never written literally
+
+A plant that needs a character the surrounding tooling normalises away spells it `\uXXXX`, and the
+loader decodes it: an em-dash is a codepoint escape because the dash gate would otherwise fail this
+very file, and a carriage return is `\u000d` because git rewrites line endings on checkout.
+
+The CRLF case learned this the hard way. Its plant body was plain text, so the carriage returns it
+planted were the case FILE's own line endings - CRLF on a Windows checkout, LF everywhere else. The
+fixture was measuring the checkout: it fired on one machine and would have found nothing in CI. The
+loader now normalises the file's own endings, which are structure, and decodes what the plant declares.
 
 ## The case format
 

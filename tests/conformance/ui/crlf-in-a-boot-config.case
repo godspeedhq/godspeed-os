@@ -8,11 +8,17 @@
 # why:
 # why: The plant must DIFFER from what is on disk - writing the same bytes back changes nothing, which
 # why: is how the first draft got blessed to "no finding".
+# why:
+# why: The carriage returns are DECLARED as `\u000d`, not written literally. Spelled literally they
+# why: would be the case FILE's own line endings, and `* text=auto` made those CRLF on a Windows
+# why: checkout and LF everywhere else - so the fixture would measure the checkout rather than the
+# why: checker, passing here and finding nothing on Linux CI. `.gitattributes` now pins `*.case` to
+# why: `eol=lf` as well; both halves are needed, because an editor can still hand back CRLF.
 --- plant ---
-# A probe config planted by a conformance case.
-kernel=kernel7.img
-arm_64bit=0
-enable_uart=1
+# A probe config planted by a conformance case.\u000d
+kernel=kernel7.img\u000d
+arm_64bit=0\u000d
+enable_uart=1\u000d
 --- expect ---
 error[GS0102]: a tracked text file carries CRLF line endings
     |

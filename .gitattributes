@@ -35,6 +35,16 @@
 *.gsh    text eol=lf
 *.gs     text eol=lf
 
+# Conformance UI fixtures, for the SAME reason as the two rules above: a `.case` file is a
+# FIXTURE whose bytes are asserted, not source this machine reads. `scripts/conform.py` parses
+# one with `newline=""` deliberately - `crlf-in-a-boot-config.case` PLANTS a CRLF file, and
+# universal newlines destroyed that plant once - so the `--- plant ---` / `--- with ---`
+# separators are compared exactly. Under `* text=auto` alone a Windows checkout turns them into
+# CRLF, `--- with ---` stops matching, and both `mode: replace` cases fail with a confusing
+# error on a machine where nothing is wrong with the source. The repo held LF throughout, so
+# Linux CI saw nothing: `--selftest` reported 24 of 24 there and 21 of 24 here.
+*.case   text eol=lf
+
 # ─── BOOT CONFIGS, read by a BOOTLOADER rather than by this machine ───────────
 #
 # Same class as `*.sh` above and for a sharper reason: nothing here is ever read by

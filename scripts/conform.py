@@ -707,15 +707,24 @@ UI_DIR = os.path.join(ROOT, "tests", "conformance", "ui")
 def _parse_case(path):
     """(meta, plant, expect) from a `.case` file. See tests/conformance/ui/README.md.
 
-    `newline=""` IS LOAD-BEARING. With default universal-newline handling Python translates `\r\n` to
-    `\n` on read, which silently destroyed the carriage returns the CRLF case exists to plant - the
-    checker then found nothing and `--bless` recorded that as expected. A fixture loader must not
-    normalise, because some fixtures are ABOUT bytes.
+    THE FILE'S OWN LINE ENDINGS ARE STRUCTURE AND ARE NORMALISED; BYTES A PLANT NEEDS ARE DECLARED.
+    That distinction was learned the hard way twice. This loader used to read with `newline=""` and
+    let whatever endings the file happened to carry become part of the plant, on the argument that
+    "some fixtures are ABOUT bytes" - and one is: the CRLF case plants a boot config with carriage
+    returns. But `* text=auto` gives a Windows checkout CRLF and everyone else LF, so that fixture
+    measured the CHECKOUT rather than the checker: it fired here and would have found nothing in CI.
+    And a CRLF case file breaks `--- with ---`, so two `mode: replace` cases reported a malformed
+    case on a machine where nothing was malformed.
+
+    So a plant that needs a carriage return declares `\u000d`, the way the em-dash case names its
+    dash by codepoint - a fixture must not CONTAIN the thing it plants when the surrounding
+    tooling normalises it. `.gitattributes` pins `*.case` to `eol=lf` as well; both halves are needed, because that
+    pins git and this pins an editor.
     """
     text = io.open(path, encoding="utf-8", newline="").read()
     meta, plant, expect, where = {}, [], [], "head"
     plants = []          # [(target, mode, [lines])] for a MULTI-FILE case
-    for line in text.split("\n"):
+    for line in [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]:
         if line.strip() == "--- plant ---":
             where = "plant"
             continue
