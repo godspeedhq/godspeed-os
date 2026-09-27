@@ -705,10 +705,11 @@ lucky about a number is not the same as knowing it.
 
 ---
 
-## 15. Phase 1 step 1: BUILT, awaiting the board - and what the first boot should print
+## 15. Phase 1 step 1: the prediction, written before the flash
 
-**Status: code complete, zero hardware evidence.** Everything below is a PREDICTION, written before the
-image was flashed so that it can be wrong. Nothing in this section is a result.
+**Everything below is the PREDICTION**, written and committed before the image was flashed so that it could
+be wrong. It is left exactly as written; section 16 has what the board said, including the three
+numbers this got wrong. Nothing in THIS section is a result.
 
 ### What was built
 
@@ -789,3 +790,102 @@ it (section 8). `wifi list` therefore still cannot work, and the shell still ans
 to the driver yet. `net-stack` is untouched and the radio is not in any frame path. Every request the
 service receives is ANSWERED with one byte meaning "unavailable", never queued and never dropped: a
 missing capability must return loudly rather than hang.
+
+---
+
+## 16. Phase 1 step 1: PASSED on hardware 2026-09-27 - and the part is not the one expected
+
+Raspberry Pi 4 Model B **rev 1.5, 2 GB** (board revision `0xb03115`), booted from a plain image, no
+crash-window, serial at 115200. Every stage of section 15 passed in order. No kernel panic, no liveness
+wedge; the machine stayed healthy for the rest of the session (xhci 6157 passes, keyboard, disk,
+network, SNTP clock set).
+
+```text
+sdio: SET_POWER_STATE(SD, ON|WAIT) -> on
+sdio: Arasan base clock 250000000 Hz
+sdio: GPIO34-39 fsel=000000 (NOT all ALT3 - the radio was muxed away from the Arasan; routing it back)
+sdio: 0xfe300000 Arasan ... CAPS=0x0 VER=0x99020000 - A CONTROLLER ANSWERED
+sdio: 0xfe340000 emmc2  ... CAPS=0x45ee6432 VER=0x10020000 - A CONTROLLER ANSWERED
+spawn[mmio]: 'wifi-driver' fixed peripheral -> VA 0x60000000 (4096 B)
+wifi-driver: stage 2 - SLOTISR_VER=0x99020000 (the kernel's census read this same register)
+wifi-driver: base clock 250000000 Hz, identification divisor 313 (target 400 kHz)
+wifi-driver: CMD5 answered R4=0x30ffff00 - 3 I/O function(s), memory absent, I/O OCR 0xffff00
+wifi-driver: card selected, RCA 0x0001
+wifi-driver: CCCR rev 0x32 (CCCR fmt 2, SDIO spec 3), caps 0x02, bus iface 0x40, IOE 0x00, IOR 0x00
+wifi-driver: stage 5 - walking the CIS from 0x010ac
+wifi-driver: CIS FUNCID 0x0c (0x0c = network adapter)
+wifi-driver: function 1 enabled and READY (IOE 0x00 -> 0x02, after 1 read(s) of IOR)
+```
+
+The clock arithmetic checks out both times, which is worth stating because it is the number the whole
+bring-up rests on: 250 MHz / (2 x 313) = 399,361 Hz for identification, and 250 MHz / (2 x 5) = 25 MHz
+for operation. `SLOTISR_VER` matched between the kernel's census and the service, so the grant is
+pointed where the census looked.
+
+### THE FIRMWARE ASSUMPTION IS BROKEN: the part reports 43430, not 43455
+
+```text
+wifi-driver: an SDIO part answered but it is NOT the expected radio -
+             manufacturer 0x02d0, device 0xa9a6 (expected 0x02d0/0xa9bf)
+```
+
+**The manufacturer is exactly right and the device is not.** Broadcom's SDIO device codes for this
+family are the decimal part number written in hex, which makes this arithmetic rather than
+recollection:
+
+| code | decimal | part |
+|---|---|---|
+| `0xA9BF` | 43455 | CYW43455 - what section 4 and section 8 assume, and what `nonfree/brcm43455/` holds |
+| `0xA9A6` | **43430** | BCM43430 - what this board actually reported |
+
+**The reading is trustworthy, and for a reason independent of the reading.** Manufacturer came back as
+exactly `0x02D0`. Both values come out of the same four-byte CISTPL_MANFID body at consecutive offsets,
+so a wrong tuple offset or a swapped byte order would have produced garbage for the manufacturer too.
+It did not, so the offsets and the endianness are right and the device code is what the chip published.
+
+**The consequence is concrete and it lands on section 8.** Linux matches on this exact id to choose a
+firmware file, and `0xa9a6` selects `brcmfmac43430-sdio.bin`. The blob vendored in this repository is
+the 43455 one. So the firmware upload in phase 2 would very likely have failed against a board that
+wants a different file - which is the failure this step existed to find BEFORE building the upload path
+on top of a guess.
+
+**What is NOT settled, stated rather than reasoned away.** A 43430 is a 2.4 GHz-only 802.11n part, and a
+Pi 4 is sold as dual-band. That tension is real and this section does not resolve it: either later Pi 4
+revisions carry a different radio than the product page implies, or a 43455 variant publishes a
+different SDIO device code than its part number. Picking whichever answer is more comfortable would be
+explaining away a reading, so it stays open until something measures it.
+
+**And it is cheaply settleable, from the chip rather than from its CIS.** Function 1 is the backplane and
+it is now open. The chipcommon core sits at backplane address `0x18000000` and its register 0 is
+`chipid` - the silicon's own id and revision. That read is needed by the firmware upload anyway (it is
+what says where the chip's RAM is and where its cores live), so the next step answers the firmware
+question as a side effect of work already on the list.
+
+### The pin mux was NOT redundant, which the prediction got backwards
+
+Section 15 predicted `fsel=777777` and said the firmware would already have routed the radio to the
+Arasan. **It reported `000000`** - GPIO34-39 left as plain inputs. So the firmware does NOT do this, and
+the kernel's `route_pins_to_arasan` is what made the radio reachable at all.
+
+Had that been left out as "the firmware surely handles it", CMD5 would have timed out and the log would
+have pointed at the power domain and the bus - the two suspects the failure table names - while the real
+cause sat in a register nobody was printing. It cost eleven lines and it was the difference between this
+boot and a debugging session.
+
+### Two findings in our own code, both benign here
+
+- **The CIS walk hit its 64-tuple bound without reaching an END tuple**, and said so. Identification was
+  unaffected because `CISTPL_MANFID` is the very first tuple at `0x010ac`; what follows is a long run of
+  `0x80` vendor-specific tuples, and the addresses advance correctly through every one of them
+  (`0x010ac` +2+4 -> `0x010b2` +2+2 -> `0x010b6` ...), so the walk is right and the ceiling is just low.
+  The bound firing and NAMING ITSELF is the bound working. Raise the ceiling, and raise the per-tuple
+  report limit so the rest of the chain is visible.
+- **A log-ordering wart:** the decoded `CIS FUNCID 0x0c` line prints ABOVE its own `CIS tuple 0x21`
+  header, because the decode branch logs before the generic line does. Cosmetic, and it misreads.
+
+### Everything else behaved
+
+`observe` showed `wifi-driver C3 BlockRecv 292 KiB/16 MiB 1% 0/16 0%` for the whole session: blocked on
+`recv`, queue empty, burning no core - the serve loop doing what it claims. `wifi` at the prompt
+answered exactly as section 12 specifies, that the driver is running and the shell cannot talk to it
+yet, and `wifi about` still gets the subcommand list rather than an unhandled error.
