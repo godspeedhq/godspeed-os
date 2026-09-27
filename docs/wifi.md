@@ -431,3 +431,58 @@ someone reading it fresh.
    interface even though the full-MAC shortcut sends the secret through the driver anyway.
 6. **Is `ping` over WiFi on the Pi 4 the finish line for v1 of this work?** Naming the finish line now is
    what stopped the networking effort sprawling, and phases 0-5 are already a substantial body of work.
+
+---
+
+## 12. Hardware test 1: the verb, before there is a radio
+
+**Written before the boards booted, per the one-change-per-flash rule.** One logical change - the `wifi`
+shell verb (`1602f3df`) - and a prediction per machine that is specific enough to be wrong. Nothing here
+touches a radio; what is being tested is that a new verb reached four ISAs without breaking anything and
+that its one truthful answer is the same on all of them.
+
+**Already verified in QEMU before any flash**, so the boards are being asked a narrower question than
+"does it work": `osdev test shell` 215 passed / 0 failed (206 before, so all nine new assertions ran and
+passed), `osdev test identity` 24 of 24, `conform --check` 18 of 18, and all four boards build -
+`kernel8.img` 3,718,080 bytes for the Pi 4, `kernel7.img` 2,087,344 for the Pi 2,
+`godspeed-riscv64-visionfive.img` 3,107,752 for the VisionFive.
+
+### What each machine should print
+
+| Board | `wifi` | `help` | Anything else |
+|---|---|---|---|
+| **HP T630** (x86-64) | `no wireless radio on this machine` + the `wifi-driver` line | a `wifi [list\|connect <ssid>]` row | nothing changes anywhere else |
+| **Dell Wyse 5070** (x86-64) | identical to the T630 | same row | same |
+| **Raspberry Pi 2** (ARMv7) | identical | same row | same |
+| **Raspberry Pi 4** (AArch64) | identical - **the radio exists in silicon and no driver claims it** | same row | same |
+| **VisionFive 2** (RISC-V 64) | identical | same row | same |
+
+**The Pi 4 line is the one worth reading carefully.** That board HAS a CYW43455 on the board, and the
+prediction is still the absence line - because absence is measured by whether a service named
+`wifi-driver` is running, not by whether silicon is present. If the Pi 4 ever prints something different
+from the T630 here, something is wrong with this change, not right.
+
+### What would falsify this
+
+Each of these means stop and investigate rather than shrug:
+
+- **Any board printing a different sentence from the others.** The verb is arch-neutral shell code; a
+  per-board difference means something arch-conditional leaked in.
+- **`wifi` reporting an error** (a non-zero `result`). Asking about wireless on a machine with no radio is
+  a legitimate question with a definite answer, and reporting it as a fault is the silent-failure inversion
+  invariant 12 forbids. Pinned in QEMU; if hardware disagrees, the pin is wrong.
+- **`wifi connect Some hunter2` being ACCEPTED.** It must refuse, by name, with the reason. If any board
+  takes it, a passphrase reaches `/.gsh_history` and this is a security regression, not a cosmetic one.
+- **`help` missing the row.** Then the verb exists and nobody can find it, which is what `facts_check`
+  caught in QEMU.
+- **Tab after `wifi ` listing a directory.** It must offer the seven subcommands; a path menu means
+  `NO_PATH_CMDS` did not take effect on that build.
+- **Any selfcheck or chaos regression.** The change adds a verb and touches nothing else, so a fall in
+  either count is a real finding and not noise.
+
+### What this test does NOT establish
+
+That any of the wireless design works. There is no SDIO code, no firmware, no association, no keyring and
+no crypto - sections 4 through 8 are all unstarted. This flash proves the surface exists on every machine
+and that adding it cost nothing elsewhere. **Phase 1 still needs what section 11 asks for**: the Pi 4
+device tree read for the `mmc` versus `emmc2` question, and the firmware-blob decision.
