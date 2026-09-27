@@ -105,11 +105,24 @@ pub struct Host<'a> {
     base_clock: u32,
     /// `INTERRUPT` captured at the moment a command failed, before the line reset that clears it.
     last_int: core::cell::Cell<u32>,
+    /// `RESP0` from the last command a DATA transfer issued.
+    ///
+    /// **This was being thrown away, and it is the answer to the failure it was hiding.** `cmd_data`
+    /// calls `cmd()`, which returns the response, and discarded it - so when a CMD53 completed and no
+    /// data followed there was no way to see whether the CARD had refused. A refusal looks exactly like
+    /// that: the command completes, the card answers with its flags set, and no data comes. Same shape
+    /// as `last_int` and kept for the same reason.
+    last_resp: core::cell::Cell<u32>,
 }
 
 impl<'a> Host<'a> {
     pub fn new(m: &'a Mmio, base_clock: u32) -> Self {
-        Host { m, base_clock, last_int: core::cell::Cell::new(0) }
+        Host {
+            m,
+            base_clock,
+            last_int: core::cell::Cell::new(0),
+            last_resp: core::cell::Cell::new(0),
+        }
     }
 
     fn rd(&self, off: usize) -> u32 {
@@ -134,6 +147,11 @@ impl<'a> Host<'a> {
     /// `INTERRUPT` as it was when the last command failed. 0 if none has.
     pub fn last_int(&self) -> u32 {
         self.last_int.get()
+    }
+
+    /// `RESP0` from the last command a data transfer issued - the R5 for a CMD53.
+    pub fn last_resp(&self) -> u32 {
+        self.last_resp.get()
     }
 
     /// The ten-bit SDHCI clock divider for a target clock, from the controller's REAL base clock.
@@ -333,8 +351,12 @@ impl<'a> Host<'a> {
         // THE COMMAND PHASE IS THE PROVEN ONE. It clears stale status, writes ARG1/CMDTM, polls
         // CMD_DONE, captures `last_int` on failure and resets the lines - all of it already exercised
         // by every other command this driver issues.
-        if self.cmd(code, arg).is_none() {
-            return Err("the command itself did not complete");
+        // KEEP THE RESPONSE. For a CMD53 this is the R5, whose flag byte says whether the card
+        // accepted the transfer - and a refusal is indistinguishable, from the controller's side, from
+        // the data phase simply not happening.
+        match self.cmd(code, arg) {
+            Some(r) => self.last_resp.set(r),
+            None => return Err("the command itself did not complete"),
         }
 
         // Then the FIFO, one word at a time. The ready bit is latched, so it is cleared before each

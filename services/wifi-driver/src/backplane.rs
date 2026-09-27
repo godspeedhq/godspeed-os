@@ -281,6 +281,64 @@ pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
     false
 }
 
+/// Read the identity register as FOUR single-byte CMD52 reads. **A diagnostic, not the way to do this.**
+///
+/// The wide-access flag exists precisely so the bridge performs one 32-bit fetch, and a byte read may or
+/// may not assemble a 32-bit register correctly - so this is not how a driver should read the backplane
+/// and it is not proposed as one. It is here because CMD52 is the command that demonstrably works on this
+/// bus, and it splits the remaining question in two:
+///
+///   * a plausible id means the WINDOW and the ADDRESS are right, the fault is confined to the CMD53 data
+///     phase, and the firmware question is answered as a side effect of finding that out;
+///   * garbage or a refusal means the window or the address is wrong, and the data phase was never the
+///     problem.
+///
+/// Note the address has NO wide-access flag: these are genuine single-byte reads at consecutive window
+/// offsets, which is the only shape CMD52 has.
+pub fn chip_id_via_cmd52(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ChipId> {
+    if !w.set(h, CHIPCOMMON_BASE, ctx) {
+        return None;
+    }
+    let base = CHIPCOMMON_BASE & OFFSET_MASK;
+    let mut raw = 0u32;
+    for i in 0..4u32 {
+        match sdio::read_reg(h, 1, base + i) {
+            Some(b) => raw |= (b as u32) << (8 * i),
+            None => {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: the CMD52 fallback could not read byte {} of the identity register \
+                     (function 1 address {:#07x}) - INT={:#010x}. So CMD52 cannot reach this window \
+                     either, and the WINDOW or the ADDRESS is the suspect rather than the data phase",
+                    i,
+                    base + i,
+                    h.last_int()
+                ));
+                return None;
+            }
+        }
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: the CMD52 fallback read {:#010x} from the identity register - so the window and \
+         the address ARE right, and the fault is confined to the CMD53 data phase",
+        raw
+    ));
+    if raw == 0 || raw == 0xFFFF_FFFF {
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   but {:#010x} is the bus answering with nothing rather than a chip \
+             identifying itself, so this says the bytes arrived and not that they are the register",
+            raw
+        ));
+        return None;
+    }
+    Some(ChipId {
+        raw,
+        id: (raw & 0xFFFF) as u16,
+        rev: ((raw >> 16) & 0xF) as u8,
+        package: ((raw >> 20) & 0xF) as u8,
+        chip_type: ((raw >> 28) & 0xF) as u8,
+    })
+}
+
 /// Read the chipcommon core's identity register - the answer this whole module is for.
 pub fn chip_id(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ChipId> {
     let raw = match w.read32(h, CHIPCOMMON_BASE, ctx) {

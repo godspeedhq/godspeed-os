@@ -20,6 +20,14 @@ use godspeed_sdk::ServiceContext;
 const MAX_SLOTS:      u32 = 224;
 const YIELD_INTERVAL: u32 = 500;
 const FRAME_SIZE:     u64 = 4096;
+/// How many bytes of a task's name the table SORTS on.
+///
+/// 32 because that is the whole name - `task_stat` returns at most 32 bytes - so this key orders every
+/// name it can ever be given and never has to fall back on the tie-break. Distinct from `NAME_COL`,
+/// which is how much of the name is DISPLAYED; those are different questions and were worth not
+/// conflating, since the column is narrower than the name can be.
+const NAME_KEY: usize = 32;
+
 /// Width of the TASK NAME column.
 ///
 /// Sized to the longest service name in the tree (`resource-server` / `driver-skeleton`, 15). It is
@@ -308,10 +316,51 @@ fn print_state(
     // --- Task table ---
     ctx.console_line_fmt(live, format_args!(
         "{}TASK NAME             CORE STATE      MEM_USED/LIMIT/%     RESTARTS  QUEUE  CPU%  UPTIME", p));
+    // ---- COLLECT, then SORT BY NAME, then print. ------------------------------------------------
+    //
+    // This loop used to print as it walked slots, so the table was in SLOT order - which is BOOT order,
+    // so a service moves up and down between runs depending on what spawned when, and finding one by eye
+    // means reading every row. The slot keeps its own column; it just stops deciding the order.
+    //
+    // Stack-only and bounded (26.6.1): a fixed slot array, a fixed key array, and an insertion sort. The
+    // key is the first `NAME_KEY` bytes of the name, which is all of it - `task_stat` cannot return more.
+    let mut order = [0u8; MAX_SLOTS as usize];
+    let mut keys = [[0u8; NAME_KEY]; MAX_SLOTS as usize];
+    let mut nrows = 0usize;
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid {
             prev_task_ticks[slot as usize] = 0; // slot empty - reset its baseline
+            continue;
+        }
+        let nm = stat.name_str().as_bytes();
+        let take = nm.len().min(NAME_KEY);
+        keys[nrows][..take].copy_from_slice(&nm[..take]);
+        // `MAX_SLOTS` is 224, so a slot number fits a byte and the array costs 224 of them rather than
+        // four times that. Asserted at compile time so raising the ceiling cannot silently truncate.
+        const _: () = assert!(MAX_SLOTS <= 256, "a slot number no longer fits the u8 `order` array");
+        order[nrows] = slot as u8;
+        nrows += 1;
+    }
+    // INSERTION SORT, and STABLE on purpose: rows whose keys are equal keep slot order, so the table has
+    // a defined shape even for names this key cannot separate. Bounded by `nrows`, which is bounded by
+    // `MAX_SLOTS`, on arrays that cannot grow.
+    for i in 1..nrows {
+        let mut j = i;
+        while j > 0 && keys[j - 1] > keys[j] {
+            keys.swap(j - 1, j);
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+
+    for &slot8 in order[..nrows].iter() {
+        let slot = slot8 as u32;
+        let stat = ctx.task_stat(slot);
+        // READ TWICE, so RE-CHECKED. The name was read in the pass above and the row is rendered from
+        // this read, and a task can die in between. A row that vanishes mid-frame is not drawn rather
+        // than drawn from a stale struct.
+        if !stat.valid {
             continue;
         }
 

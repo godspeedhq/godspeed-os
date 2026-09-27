@@ -222,7 +222,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         serve(&ctx);
     }
     let mut window = backplane::Window::new();
-    match backplane::chip_id(&h, &mut window, &ctx) {
+    // The proper read first - one CMD53, one 32-bit fetch by the bridge. If it fails, fall back to four
+    // CMD52 byte reads, which is NOT how this should be done and is the command known to work on this
+    // bus: whichever answers tells us something we do not have yet. See `chip_id_via_cmd52`.
+    let found = backplane::chip_id(&h, &mut window, &ctx)
+        .or_else(|| backplane::chip_id_via_cmd52(&h, &mut window, &ctx));
+    match found {
         Some(id) => {
             ctx.log_fmt(format_args!(
                 "wifi-driver: CHIP SAYS id {:#06x} ({}) rev {} package {} type {} [raw {:#010x}]",
@@ -258,8 +263,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         None => ctx.log(
-            "wifi-driver: the chip's identity register could not be read, so the firmware question is \
-             still open. The backplane woke, so this is the read rather than the bus",
+            "wifi-driver: neither CMD53 nor the CMD52 fallback could read the chip's identity, so the \
+             firmware question is still open. The backplane woke and its clock is granted, so this is \
+             the register access rather than the chip",
         ),
     }
 

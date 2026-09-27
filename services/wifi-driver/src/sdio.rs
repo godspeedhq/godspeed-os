@@ -312,6 +312,7 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
     // nothing: `CMD_DONE` is cleared once the command lands, so zero is what a healthy command looks
     // like while the FIFO is awaited. The sentence now says which of the four waits expired.
     if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, &mut word, true) {
+        let resp = h.last_resp();
         ctx.log_fmt(format_args!(
             "wifi-driver: CMD53 read of function {} address {:#07x} failed - {} (STATUS={:#010x} \
              INT={:#010x} arg={:#010x})",
@@ -322,6 +323,30 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
             h.last_int(),
             arg
         ));
+        // THE R5 IS THE PART THAT CAN SAY WHY, and it was being discarded. Its flag byte is
+        // `RESP0[15:8]`; a set bit there is the CARD refusing, which from the controller's side is
+        // indistinguishable from the data phase never happening.
+        let flags = (resp >> 8) & 0xFF;
+        if flags & R5_ERRORS != 0 {
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   the CARD REFUSED it - R5 flags {:#04x} (R5 {:#010x}): {}{}{}{}{}",
+                flags,
+                resp,
+                if flags & 0x01 != 0 { "out-of-range " } else { "" },
+                if flags & 0x02 != 0 { "bad-function " } else { "" },
+                if flags & 0x08 != 0 { "error " } else { "" },
+                if flags & 0x40 != 0 { "illegal-command " } else { "" },
+                if flags & 0x80 != 0 { "crc " } else { "" },
+            ));
+        } else {
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   the card ACCEPTED it - R5 flags {:#04x} are clean (R5 {:#010x}, IO \
+                 state {}), so the card agreed to the transfer and the CONTROLLER did not run it",
+                flags,
+                resp,
+                (flags >> 4) & 0x3
+            ));
+        }
         return None;
     }
     // The FIFO delivers the four bytes in transfer order, which for a little-endian register is its
