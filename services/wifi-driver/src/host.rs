@@ -294,65 +294,52 @@ impl<'a> Host<'a> {
         Some(self.rd(RESP0))
     }
 
-    /// Issue a command that carries a DATA phase, and move `words` through the FIFO by PIO.
+    /// Issue a command that carries a DATA phase, and move `buf` through the FIFO by PIO.
     ///
-    /// `bytes` is the transfer length, which must be a multiple of 4 because the controller's `DATA`
-    /// register is 32 bits wide and this driver does not need the partial-word case: every transfer
-    /// here is a 32-bit register or a firmware block. Refused rather than silently rounded, because a
-    /// rounded length would read or write memory the caller did not ask about.
+    /// `Err` names WHICH wait expired, because they mean different things and the interrupt register
+    /// cannot tell them apart: `CMD_DONE` is cleared once the command lands, so a register reading zero
+    /// while waiting for the FIFO is exactly what a healthy command looks like. "The command never
+    /// issued" and "the command was fine and no data came" need different fixes.
+    ///
+    /// **The command phase is `cmd()`**, the same function CMD0, CMD3, CMD5, CMD7 and CMD52 all go
+    /// through. This used to inline its own copy of that logic - the inhibit wait, the stale-status
+    /// clear, the ARG1/CMDTM writes, the CMD_DONE poll - which is four chances to differ subtly from
+    /// code already proven on this silicon. `block-driver`'s backend has the shape that works on this
+    /// controller and this now matches it: wait DAT, set the block registers, `cmd()`, then the data.
     ///
     /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
     /// coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware
     /// upload wants DMA is a MEASUREMENT for the phase that does one, not a guess for this one.
-    ///
-    /// Every wait is bounded and the result is returned. On any failure the lines are reset, because
-    /// after a data error both stay inhibited (SDHCI 3.10) and every later command would otherwise
-    /// spin to its own bound.
-    pub fn cmd_data(&self, code: u32, arg: u32, buf: &mut [u32], read: bool) -> Option<()> {
+    pub fn cmd_data(&self, code: u32, arg: u32, buf: &mut [u32], read: bool)
+        -> Result<(), &'static str>
+    {
         let bytes = buf.len() * 4;
         if buf.is_empty() || bytes > 0xFFFF {
-            return None;
+            return Err("the caller asked for a transfer this driver will not do");
         }
+        // The DAT line before the block registers, which is the order the working backend uses.
         let mut t = 0u32;
-        while self.rd(STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) != 0 {
+        while self.rd(STATUS) & SR_DAT_INHIBIT != 0 {
             t += 1;
             if t > 1_000_000 {
                 self.last_int.set(self.rd(INTERRUPT));
-                return None;
+                return Err("the DAT line never came out of inhibit");
             }
         }
-        self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear stale status
-        // ONE block of `bytes`. Block count in the high half, block size in the low - so a four-byte
+        // ONE block of `bytes`: block count in the high half, block size in the low. A four-byte
         // register read is a single block of four, which is what byte-mode CMD53 asks for.
         self.wr(BLKSIZECNT, (1 << 16) | (bytes as u32 & 0xFFFF));
-        self.wr(ARG1, arg);
-        self.wr(CMDTM, code);
 
-        // The command completes first; the data phase follows it.
-        let mut t = 0u32;
-        loop {
-            let i = self.rd(INTERRUPT);
-            if i & INT_CMD_DONE != 0 {
-                break;
-            }
-            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
-                self.last_int.set(i);
-                self.reset_cmd_dat();
-                return None;
-            }
-            t += 1;
-            if t > 2_000_000 {
-                self.last_int.set(self.rd(INTERRUPT));
-                self.reset_cmd_dat();
-                return None;
-            }
+        // THE COMMAND PHASE IS THE PROVEN ONE. It clears stale status, writes ARG1/CMDTM, polls
+        // CMD_DONE, captures `last_int` on failure and resets the lines - all of it already exercised
+        // by every other command this driver issues.
+        if self.cmd(code, arg).is_none() {
+            return Err("the command itself did not complete");
         }
-        self.wr(INTERRUPT, INT_CMD_DONE);
 
-        // Then the FIFO, one word at a time, waiting for the controller to say a word is available (or
-        // that it can take one). The ready bit is latched, so it is cleared before each word rather
-        // than once - otherwise the first word's flag would satisfy every later wait and the loop would
-        // read the FIFO faster than the controller fills it.
+        // Then the FIFO, one word at a time. The ready bit is latched, so it is cleared before each
+        // word rather than once - otherwise the first word's flag would satisfy every later wait and
+        // this would read the FIFO faster than the controller fills it.
         let ready = if read { INT_READ_RDY } else { INT_WRITE_RDY };
         for w in buf.iter_mut() {
             let mut t = 0u32;
@@ -364,13 +351,13 @@ impl<'a> Host<'a> {
                 if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
                     self.last_int.set(i);
                     self.reset_cmd_dat();
-                    return None;
+                    return Err("the controller reported an error during the data phase");
                 }
                 t += 1;
                 if t > 2_000_000 {
                     self.last_int.set(self.rd(INTERRUPT));
                     self.reset_cmd_dat();
-                    return None;
+                    return Err("the FIFO never became ready - the command completed and no data came");
                 }
             }
             self.wr(INTERRUPT, ready);
@@ -393,20 +380,20 @@ impl<'a> Host<'a> {
             if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
                 self.last_int.set(i);
                 self.reset_cmd_dat();
-                return None;
+                return Err("the controller reported an error after the data moved");
             }
             t += 1;
             if t > 2_000_000 {
                 self.last_int.set(self.rd(INTERRUPT));
                 self.reset_cmd_dat();
-                return None;
+                return Err("the data moved and the transfer never reported complete");
             }
         }
         self.wr(INTERRUPT, INT_DATA_DONE);
         for _ in 0..10 {
             spin(); // Ncc, as in `cmd`
         }
-        Some(())
+        Ok(())
     }
 
     /// After a command error both lines stay inhibited (SDHCI 3.10), so every later command would spin

@@ -1039,28 +1039,103 @@ names outright: every bound must return a result the caller reads.
 All four exits are named now - an END tuple, the count, the span, and a failed read - and it earns its
 keep immediately, because it explains a disagreement that would otherwise have been invisible.
 
-### Two boots of one chip disagreed about where its CIS ends
+### CORRECTED: the two boots did NOT disagree, and this paragraph invented an anomaly
 
-Both runs read **identical tuples** through `0x010d3`: `MANFID`, `FUNCID`, `FUNCE`, then five
-vendor-specific `0x80` tuples. Then they part:
+**What this section claimed, and it was wrong.** It said two boots of one chip disagreed about where its
+CIS ends, that the byte at `0x010d8` read as `0xFF` on one boot and something else on the other, and that
+the reading was unexplained. The next boot measured it: **176 tuples, ending properly at `0x01180`**, and
+the arithmetic settles it completely.
 
-| boot | outcome |
+212 bytes for 176 tuples is 1.2 bytes each, and a `cistpl::NULL` tuple is **one byte** - it has no length byte at
+all, which is the one special case the walk handles. So the chain is 8 real tuples followed by **168 bytes
+of NULL padding**, and a NULL hits `continue` BEFORE the print, which is also why only 8 tuple lines
+appear however high the report limit goes.
+
+So the three boots were consistent throughout:
+
+| boot | what happened |
 |---|---|
-| section 16 | ran to its **64-tuple ceiling** without reaching an END tuple |
-| this one | reached an **END tuple after 8**, with the report limit raised to 24 so a longer chain would have been visible |
+| section 16 | hit the **64-tuple ceiling** - correct, because the chain needs 176 |
+| section 18 (this one) | ceiling raised to 256, so it **reached the END tuple and said nothing**, because the "ended properly" line did not exist yet |
+| section 19 | same walk, and now it SAYS `the CIS ended properly at 0x01180 after 176 tuple(s)` |
 
-So the byte at `0x010d8` read as `0xFF` on one boot and as something else on the other. **This section
-does not explain that**, and the honest reason is that no instrument in either run could tell "the chain
-ends here" from "the walk is reading past the chain" - the span exit was silent and the END break said
-nothing either. Both are fixed above, so the next boot distinguishes them.
+**The diagnosis in this section was right and the story told beside it was invented.** A bound that exits
+in silence was indeed the gap, and naming every exit was indeed the fix. But having found a mute
+instrument, this section then wrote up a hardware anomaly to explain readings the instrument had simply
+failed to report - which is the error it was warning about, committed one paragraph later. The rule is to
+suspect the instrument before the board; the rule was quoted and then not applied.
 
-It affects nothing that has been concluded: `CISTPL_MANFID` is the FIRST tuple, so identification
-happened before either boot diverged, and both paths are bounded. Recorded rather than chased, because a
-reading that changes between boots of one chip is not something to assume away - and because the next run
-will now say which of the two it is.
+Nothing downstream depended on it. What follows in this section is unchanged and still stands.
 
 ### Still open: the chip identity, and therefore the firmware
 
 Stage 7 never reached the identity register, so section 16's question stands untouched: the CIS says
 `0xA9A6` (43430) and the board is documented to carry a part that answers `0xA9BF` (43455). Section 17's
 prediction - `0xA9A6`, the uncomfortable side - is unresolved and is carried forward unchanged.
+
+---
+
+## 19. Phase 1 step 2, boot 2: two fixes land, and CMD53 is the one thing left
+
+Same board. Both corrections from section 18 worked on the first try:
+
+```text
+wifi-driver: backplane awake - CHIPCLKCSR 0x68, ALP available after 1 read(s)
+wifi-driver: the CIS ended properly at 0x01180 after 176 tuple(s)
+```
+
+The first is the masked check accepting the value the exact compare rejected, and `ALP available after 1
+read` says the chip had granted the clock before it was asked - which is what `0x68` meant all along. The
+second is the walk naming its own exit, and it immediately paid for itself by disproving the anomaly
+section 18 had invented (corrected in place, above).
+
+### The last failure: the data phase
+
+```text
+wifi-driver: CMD53 read of function 1 address 0x08000 failed - INT=0x00000000
+wifi-driver: the chipcommon identity register could not be read
+```
+
+So the backplane window was set (three CMD52 writes, all accepted) and the 32-bit read did not happen.
+
+**`INT=0x00000000` narrows nothing, and that is the first thing wrong.** `cmd_data` has four bounded
+waits and all four reported the same sentence - and the register is AMBIGUOUS between them by
+construction, because `CMD_DONE` is cleared once the command lands. A zero there is exactly what a
+healthy command looks like while the FIFO is being awaited. "The command never issued" and "the command
+was fine and no data came" are different bugs, and the log could not tell them apart.
+
+### Two fixes, and the second is the one this project's own rules asked for first
+
+**Every wait names itself**, and STATUS and the CMD53 argument print beside INTERRUPT.
+
+**And `cmd_data` no longer reimplements the command phase.** `block-driver`'s sdhci backend drives this
+exact Arasan block, and its data path is:
+
+```text
+wait DAT_INHIBIT  ->  write BLKSIZECNT  ->  cmd()  ->  poll READ_RDY  ->  drain DATA  ->  DATA_DONE
+```
+
+where `cmd()` is the same function every non-data command uses. `cmd_data` had inlined its own copy of
+that logic - the inhibit wait, the stale-status clear, the ARG1/CMDTM writes, the CMD_DONE poll, the
+error handling - which is four chances to differ subtly from code known to work on this silicon. It calls
+`cmd()` now, so a CMD53's command phase is literally the path CMD0, CMD3, CMD5, CMD7 and CMD52 all take
+successfully on this board, and only the data phase is new.
+
+That is the porting rule this repository states for itself: diff against the working code before
+debugging on hardware. The reimplementation was worth removing whether or not it is the fault - and if
+the read still fails, the failure is now confined to the data phase and will say so.
+
+### What the next boot distinguishes
+
+| the line says | what it means |
+|---|---|
+| `the command itself did not complete` | CMD53 is not being accepted, though CMD52 is. The command encoding or the block registers |
+| `the FIFO never became ready` | the command was fine and the card sent nothing. A four-byte block size, byte mode, or the DAT line in a state the transfer needs |
+| `the DAT line never came out of inhibit` | something earlier left the line busy |
+| `the data moved and the transfer never reported complete` | the read worked and only the completion signal is missing - the value would be in hand |
+
+### Still open, and unchanged
+
+The chip identity, and therefore which firmware blob phase 2 needs. Section 17's prediction of `0xA9A6`
+remains unresolved. Everything up to it stands: the radio is on the bus, identified by its CIS, its
+backplane is awake, and its clock is granted.

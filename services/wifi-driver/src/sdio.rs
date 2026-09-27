@@ -308,12 +308,19 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
     // (1 = incrementing), bits25:9 address, bits8:0 count (0 means 512 in byte mode, so 4 is 4).
     let arg = ((func as u32 & 0x7) << 28) | (1 << 26) | ((addr & 0x1_FFFF) << 9) | 4;
     let mut word = [0u32; 1];
-    if h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, &mut word, true).is_none() {
+    // THE PHASE IS THE DIAGNOSIS, and STATUS is printed beside INTERRUPT. `INT=0` alone narrowed
+    // nothing: `CMD_DONE` is cleared once the command lands, so zero is what a healthy command looks
+    // like while the FIFO is awaited. The sentence now says which of the four waits expired.
+    if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, &mut word, true) {
         ctx.log_fmt(format_args!(
-            "wifi-driver: CMD53 read of function {} address {:#07x} failed - INT={:#010x}",
+            "wifi-driver: CMD53 read of function {} address {:#07x} failed - {} (STATUS={:#010x} \
+             INT={:#010x} arg={:#010x})",
             func,
             addr,
-            h.last_int()
+            phase,
+            h.status(),
+            h.last_int(),
+            arg
         ));
         return None;
     }
