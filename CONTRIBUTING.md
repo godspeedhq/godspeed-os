@@ -126,6 +126,10 @@ stop noticing. Each of these is a weakening, however reasonable it looks in a di
   text of every diagnostic and `py scripts/conform.py --selftest` compares the render against it. If
   you change a message, run it and read the diff.
 
+**Adding a user-facing command?** `utilities/0_conventions.md` §2a lists the eight places a new verb has
+to be registered and the rule that decides whether its spec belongs in `utilities/` or in `docs/` - both
+are enforced by checkers, and both were written down only after a verb was implemented without them.
+
 **One question settles a hard case:** after your change, does the gate still refuse what it was written
 to refuse? A green run is not the answer to that - a check that has stopped working is also green, and
 this project has caught its own instruments agreeing with it more than once.

@@ -11,20 +11,29 @@ including two nobody would have caught by review: that the verb existed while no
 it, and that the surface spec's home is decided by whether the shell answers the verb. The process
 worked. What follows is where it cost more than it needed to.
 
-## 1. x86 has no `--cmd`, so the only platform available had no exploratory loop
+## 1. x86 has no SCRIPTED command driving, only an interactive prompt
 
-`scripts/arm_run.py`, `scripts/pi4_run.py` and `scripts/riscv_run.py` all take `--cmd "<line>"` and type
-it into the shell in QEMU. **`osdev run` takes `--smp` and nothing else.** So on x86 - the one port that
-needs no board - there is no way to try a command by hand.
+`scripts/arm_run.py`, `scripts/pi4_run.py` and `scripts/riscv_run.py` all take a repeatable
+`--cmd "<line>"` and type it into the shell in QEMU with nobody present. Nothing on x86 does:
+`osdev run` takes `--smp` and nothing else, and `osdev shell` takes `--smp` too.
 
-The capability exists: `osdev/src/shell_test.rs` types commands over serial all day. It is simply not
-exposed. The cost here was that the first version of the verb could not be tried at all before being
-committed to a suite; the only way to see it run was to write assertions, which is the right END state
-but a poor way to find out that a message reads badly.
+**Corrected within a minute of writing this, because the first version of this item overstated it.** It
+said there was "no way to try a command by hand" on x86, and that is simply wrong - `osdev shell` puts
+COM1 on **stdio, bidirectionally**, and its own banner says *"type 'help' at the gsh> prompt"*. A human
+can drive the x86 shell interactively and always could.
 
-**Next step:** expose what `shell_test.rs` already does as `osdev run --cmd`, repeatable, matching the
-three scripts' flag exactly so muscle memory transfers. This is the "gate the path I actually use" family
-of problem, one layer up: the convenience exists on three ports and not on the one used for development.
+The real gap is narrower and sharper: **scripted** driving. An agent, a CI job, or a loop cannot sit at
+an interactive stdio prompt, so on x86 there is no way to say "boot, type these four lines, show me what
+came back" without writing suite assertions first. That is what cost time here - the first version of the
+verb could only be seen running by committing assertions about it, which is the right END state but a
+poor way to discover that a message reads badly.
+
+The capability exists twice over: `shell_test.rs` types commands over serial all day, and `run_shell`
+already has a bidirectional pipe. It is only unexposed.
+
+**Next step:** `osdev shell --cmd "<line>"`, repeatable, matching the three port scripts' flag exactly so
+muscle memory transfers. This is the "gate the path I actually use" family of problem one layer up: the
+convenience exists on three ports and not on the one used for development.
 
 ## 2. A new utility has eight registration sites, and you find the ones you missed by failing
 
@@ -65,9 +74,17 @@ the judgement side of the line.
 This is a restated derived number, which is the Commandment III shape. It is *reconciled*, so it is the
 legitimate kind of derived view - but it is reconciled by a human doing arithmetic in words.
 
-**Next step:** either generate the sentence, or describe the counts instead of stating them ("almost
-every page here is a rendered view of a file in the repository"), which is what `GS0405`'s own help text
-recommends: *"If the number should not be restated at all, describe it instead so it cannot rot again."*
+**Considered and REJECTED the same day, which is why this item stays open rather than closing.** The
+obvious fix is GS0405's own advice - describe the counts instead of stating them, so they cannot rot. I
+started to, and stopped: **the number is reconciled by a working gate, so it never lies**, and it tells a
+reader something real (this site is almost entirely derived, not hand-written). Replacing a verified fact
+with a vague phrase would trade away a check for convenience, and removing a check to save an edit is
+precisely what `CONTRIBUTING.md` now calls weakening a gate - by its author, on the same day, which is
+the useful part of this note.
+
+So the friction is real and the cost is one numeral per new page, paid by a human doing arithmetic in
+words. If it is ever fixed, it must be by GENERATING the sentence from the filesystem - keeping the fact
+and removing the handwork - not by softening it. Left open at that price, deliberately.
 
 ## 5. The gate cascade costs iterations, and some of them were avoidable
 

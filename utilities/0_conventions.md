@@ -208,6 +208,41 @@ the same domain as `spawn`/`kill`/`restart`, prefer a standalone service.
 
 ---
 
+## 2a. Adding a utility: the eight sites, and where its spec lives
+
+Written down because it was learned by failing. Implementing one verb (`wifi`, 2026-09-27) needed eight
+registrations in `services/shell/src/main.rs`, and the two that were missed were reported by two
+different checkers rather than by any list - which works, but late. The knowledge lived only in the
+checkers that enforce it.
+
+| Site | What it gives you | What fails if you miss it |
+|---|---|---|
+| `SUBCMD_FIRST` | tab completion of the first argument | rule 9; Tab falls through to a directory listing |
+| `SUBCMD_SECOND` | completion one level deeper, where the surface has one | rule 9, silently |
+| `NO_PATH_CMDS` | Tab offers keywords, not paths, where no argument is a path | a path menu for a keyword position |
+| `UTILS` | the `<util> help` / `<util> version` intercept | rules 1 and 5 |
+| the command dispatch | the verb runs at all | nothing runs |
+| the producer dispatch | `<util> \| write <path>` captures it | rules 12 and 13 |
+| a `help_block` arm | `<util> help` prints something | caught by `util_help_coverage_problems` |
+| a `Row` in the `help` listing | anybody can DISCOVER the verb | caught by `facts_check` - *"an omission ships the feature to nobody who was not watching it being built"* |
+
+**And where the spec goes, which is not a preference.** A spec under `utilities/` **asserts that the
+shell answers that verb**, and `X-user-vocabulary` (Commandment X) enforces it in both directions:
+
+- A spec here for a verb the shell does not answer fails. Implement it, delete it, or document the
+  ABSENCE (`14_poweroff.md` is the worked example, and the head must say "not provided" or "removed").
+- A verb the shell DOES answer with no spec here also fails - a verb discoverable only by reading the
+  source is complexity pushed onto the user (CLAUDE.md 26.11).
+
+So a surface designed before its verb exists belongs in `docs/` and moves here the day the shell answers
+it. `docs/tcp-design.md` against `48_tcp.md` is that split; `docs/wifi.md` against `56_wifi.md` is the
+same, and the file moved three times before anyone wrote this paragraph.
+
+**Do not reach for `utility_vocab_debt` to make either direction quiet.** A baseline entry instead of a
+fix is what `CONTRIBUTING.md` names as weakening a gate.
+
+---
+
 ## 3. Conformance status (as-built, honest)
 
 **As of 2026-06-14, every utility conforms.** Each one implements its own
