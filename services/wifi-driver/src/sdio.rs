@@ -469,6 +469,19 @@ pub fn write_extended(
              (arg={:#010x} BLKSIZECNT={:#010x} CMDTM={:#010x} R5 flags {:#04x} STATUS={:#010x})",
             words.len(), func, addr, phase, arg, rb, cmdtm, (resp >> 8) & 0xFF, h.status()
         ));
+        // WHAT WAS ACTUALLY OBSERVED, which the line above cannot say. `h.status()` is read AFTER
+        // the line reset, so it describes a controller that has already been cleaned up; these are
+        // the OR of every bit seen DURING the wait, and whether the data phase ever went active.
+        // `dat=(0, 0)` is the decisive reading: the controller never started a data phase, so the
+        // fault is in the command setup rather than in the FIFO loop that reports it.
+        let (si, ss) = h.seen();
+        let (df, dl) = h.dat_window();
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   during the wait: INT bits seen {:#010x}, STATUS bits seen {:#010x}, \
+             data phase active at poll {}..{} ({})",
+            si, ss, df, dl,
+            if df == 0 { "NEVER - no data phase ever started" } else { "it did start" }
+        ));
         abort(h, func, ctx);
         return false;
     }

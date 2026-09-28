@@ -474,6 +474,13 @@ impl<'a> Host<'a> {
         if buf.is_empty() || bytes > 0xFFFF {
             return Err("the caller asked for a transfer this driver will not do");
         }
+        // RESET THE INSTRUMENTS, so they describe THIS transfer. They accumulate with `|=`, and
+        // without this they carried every bit seen since boot - which reads as an answer and is
+        // not one. A stale instrument is worse than no instrument, because it is believed.
+        self.seen_int.set(0);
+        self.seen_status.set(0);
+        self.dat_first.set(0);
+        self.dat_last.set(0);
         // The DAT line before the block registers, which is the order the working backend uses.
         let mut t = 0u32;
         while self.rd(STATUS) & SR_DAT_INHIBIT != 0 {

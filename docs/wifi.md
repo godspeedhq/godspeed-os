@@ -1419,3 +1419,103 @@ is one of three outcomes, in order of what each would mean:
 
 What is **not** predicted is a working radio. Even a clean release only means the firmware is running; there
 is no control channel to it yet, so `wifi list` still cannot work. Phase 3 is that conversation.
+
+## 23. The per-block fix was correct and was not the cause
+
+The next boot produced the identical failure, byte for byte. That is worth stating plainly rather than
+softening: **the diagnosis in section 22 was wrong.**
+
+The per-block change was a real bug and worth keeping - it would have deadlocked at block 2 of every
+transfer. But it cannot have been *this* failure, and the message said so all along. "The FIFO never became
+ready" is the **first** wait timing out, and the first wait is the one rung the change did not touch. A fix
+that addresses what happens after the first block cannot fix a failure that occurs before it.
+
+### What the log actually established
+
+- The command completed (`CMD_DONE` was observed, or `cmd_inner` would have returned a different error).
+- `INT_ERR` never tripped. That mask is `0x017E_8000`, which includes bit 20 `DATA_TIMEOUT` and the bit 15
+  error summary, so **no timeout, no CRC fault, nothing**. This also eliminated a genuine difference from
+  the reference found while reading it: u-boot writes `sdhci_writeb(host, 0xe, SDHCI_TIMEOUT_CONTROL)`
+  before every data command and this driver never writes that register at all. Worth fixing, but not this,
+  because a data timeout would have been reported.
+- The card accepted the command (`R5 flags 0x10`, no error bits, `IO_CURRENT_STATE` in transfer).
+- `cmd_inner` acknowledges only `INT_CMD_DONE`, so it is not consuming the ready bit before the FIFO loop
+  can see it.
+
+So the host controller **never started the data phase**, and nothing said why.
+
+### The instrument that was collected and never printed
+
+`STATUS=0x01ef0000` was quoted in section 22 and a conclusion drawn from its DAT0 bit. That was worthless:
+`h.status()` is a **live read taken after the timeout and after `reset_cmd_dat()`**, so it describes a
+controller that has already been cleaned up. Reading meaning into it was the same mistake as trusting a
+stale counter.
+
+The registers that would answer the question were already being collected - `seen()` is the OR of every bit
+ever seen in `INTERRUPT` and `STATUS` during the wait, and `dat_window()` records whether `DAT_ACTIVE` was
+ever observed - and **neither was ever printed**. They were also never reset between transfers, so they
+described every transfer since boot at once, which reads as an answer and is not one. Both are fixed: reset
+per transfer, printed on failure. `dat=(0, 0)` will say, in one line, that no data phase ever began.
+
+### Reading the working code before the foreign reference
+
+`services/block-driver/src/sdhci.rs` is a **working** SDHCI driver in this repository, on this controller
+family, and it validates the section 22 structure exactly - wait once, clear the flag, then move 128 words
+with no re-check:
+
+```rust
+        self.wr(INTERRUPT, INT_WRITE_RDY);
+        for i in 0..128 {
+            ...
+            self.wr(DATA, w);
+        }
+```
+
+But its command words are `CMD_READ_SINGLE = 0x1122_0010` and `CMD_WRITE_SINGLE = 0x1822_0000`: transfer
+mode `0x10` and `0x00`, so **`BLK_CNT_EN` is not set** and neither is `MULTI`. It only ever moves one block,
+of 512 bytes.
+
+That is the finding. **Nothing in this project has ever issued a multi-block PIO transfer on this
+controller**, and the firmware write fails precisely there. Single-block PIO is proven at 512 bytes, and
+byte-mode CMD53 is proven at 4 bytes; the failing case differs in three ways at once.
+
+### Bisect, do not guess again
+
+Three separable candidates remain, and testing them one per boot would cost three flashes:
+
+1. the 64-byte block **size** (the working driver only ever used 512),
+2. the **`MULTI`** bit,
+3. the block **count**.
+
+So the upload now opens with a ladder, smallest difference first, and the first rung to fail names the
+culprit:
+
+| rung | mode  | MULTI | blocks | if this is the first to fail             |
+|------|-------|-------|--------|------------------------------------------|
+| 1    | byte  | no    | -      | the bus or the window, not block mode    |
+| 2    | block | no    | 1      | the 64-byte block **size**              |
+| 3    | block | yes   | 2      | the **`MULTI`** bit                     |
+| 4    | block | yes   | 16     | the block **count**                     |
+
+Every rung writes a distinct marker and **reads the first word back**, because a write that reports success
+and lands nothing is a silent failure and worse than a loud one (§26.7) - and it would send the bulk write
+off on a false green light. The ladder writes into the halted ARM's TCM at the firmware's own load address,
+which is where the image goes next, so it needs no scratch region.
+
+### Prediction
+
+One of five outcomes, and each names its own cause:
+
+1. **All four rungs pass and the upload proceeds.** Then the fault was in `write_bytes`'s chunking
+   arithmetic rather than in the data path, and the bulk write's own failure message carries the byte offset
+   and backplane address to place it.
+2. **Rung 2 fails** - the 64-byte block size. The working driver's 512 would then be the difference, and the
+   fix is to raise the transfer block size rather than to match function 1's 64-byte SDIO block size to it.
+3. **Rung 3 fails** - `MULTI`. The controller does not do multi-block PIO, and the upload becomes a loop of
+   single-block writes: slower, and correct.
+4. **Rung 4 fails** - the block count. Some smaller maximum applies, and the chunk size comes down to it.
+5. **Rung 1 fails** - the bus or the window, and everything above about block mode is beside the point.
+
+Whichever it is, the new `INT bits seen` / `STATUS bits seen` / `data phase active at poll` line should
+accompany it, and `dat=(0, 0)` versus a real window is the difference between a data phase that never
+started and one that started and stalled.

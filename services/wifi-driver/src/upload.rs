@@ -57,7 +57,7 @@ use godspeed_sdk::ServiceContext;
 
 use crate::aicore;
 use crate::armcr4::Ram;
-use crate::backplane::Window;
+use crate::backplane::{Window, ACCESS_WIDE, OFFSET_MASK};
 use crate::firmware;
 use crate::host::{blk_block_mode, blk_byte_mode, Host};
 use crate::sdio;
@@ -219,6 +219,103 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 /// Halt the ARM, write the firmware and the NVRAM, and let it run.
+/// Find out WHICH of three things a failing block write is, in one boot rather than three.
+///
+/// **What is already known.** `services/block-driver/src/sdhci.rs` does single-block PIO on this same
+/// controller family and works, at 512 bytes a block. Our own byte-mode CMD53 moves 4 bytes and works.
+/// Nothing in this repository has ever issued a MULTI-block transfer on it, and that is exactly where the
+/// firmware write fails - with the command accepted, no error bit set, and no data phase ever starting.
+///
+/// **So there are three separable candidates**, and guessing between them costs a flash each:
+///
+/// 1. the 64-byte block SIZE (the working driver only ever used 512),
+/// 2. the `SDHCI_TRNS_MULTI` bit,
+/// 3. the block COUNT.
+///
+/// This walks them in order, smallest difference first. The first rung to fail names the culprit:
+///
+/// | rung | mode  | MULTI | blocks | means, if this is the first to fail             |
+/// |------|-------|-------|--------|--------------------------------------------------|
+/// | 1    | byte  | no    | -      | the bus or the window is wrong, not block mode    |
+/// | 2    | block | no    | 1      | the 64-byte BLOCK SIZE is the problem             |
+/// | 3    | block | yes   | 2      | the MULTI bit is the problem                      |
+/// | 4    | block | yes   | 16     | the block COUNT is the problem                    |
+///
+/// **Every rung reads back the first word it wrote**, because a write that reports success and lands
+/// nothing is a silent failure and worse than a loud one (§26.7). The read-back uses byte mode, which rung
+/// 1 has just proved on this very address.
+///
+/// It writes into the halted ARM's TCM at the firmware's own load address - where the bulk write is about
+/// to go anyway - so it needs no scratch region and costs nothing but the transfers themselves.
+fn ladder(h: &Host, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
+    // Distinct per rung, so a read-back cannot pass on a stale value another rung left behind.
+    const MARKS: [u32; 4] = [0xA1A1_0001, 0xB2B2_0002, 0xC3C3_0003, 0xD4D4_0004];
+    // (name, blocks-or-none, words, what a failure here means)
+    let rungs: [(&str, Option<u32>, usize, &str); 4] = [
+        ("byte mode, 4 bytes", None, 1, "the bus or the window - not block mode at all"),
+        ("block mode, ONE 64-byte block, no MULTI", Some(1), BLOCK / 4,
+         "the 64-BYTE BLOCK SIZE (the working SD driver only ever used 512)"),
+        ("block mode, TWO 64-byte blocks, MULTI", Some(2), 2 * BLOCK / 4,
+         "the MULTI bit"),
+        ("block mode, SIXTEEN 64-byte blocks, MULTI", Some(16), 16 * BLOCK / 4,
+         "the block COUNT"),
+    ];
+
+    ctx.log("wifi-driver: probing the data path before the bulk write - four rungs, smallest first");
+    for (rung, (name, blocks, words, means)) in rungs.iter().enumerate() {
+        if !w.set_for(h, addr, ctx) {
+            ctx.log("wifi-driver:   the window would not set, so the probe says nothing about block mode");
+            return false;
+        }
+        let off = addr & OFFSET_MASK;
+        let mut buf = [0u32; CHUNK / 4];
+        for (i, word) in buf[..*words].iter_mut().enumerate() {
+            *word = MARKS[rung] ^ (i as u32);
+        }
+        let blk = match blocks {
+            Some(n) => blk_block_mode(*n, BLOCK as u32),
+            None => blk_byte_mode(*words as u32 * 4),
+        };
+        let ok = sdio::write_extended(
+            h, 1, off | ACCESS_WIDE, &mut buf[..*words], blk, *blocks, ctx,
+        );
+        if !ok {
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   rung {} FAILED ({}), and it is the first to fail - so the fault is {}",
+                rung + 1, name, means
+            ));
+            return false;
+        }
+        // AND IT MUST HAVE LANDED. A rung that reports success and wrote nothing would send the bulk
+        // write off with a false green light.
+        match w.read32(h, addr, ctx) {
+            Some(v) if v == MARKS[rung] => ctx.log_fmt(format_args!(
+                "wifi-driver:   rung {} ok ({}) - and {:#010x} read back",
+                rung + 1, name, v
+            )),
+            Some(v) => {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver:   rung {} ({}) reported success but {:#010x} came back where {:#010x} \
+                     was written - the transfer is being ACCEPTED and DISCARDED, which no error bit says",
+                    rung + 1, name, v, MARKS[rung]
+                ));
+                return false;
+            }
+            None => {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver:   rung {} ({}) wrote without error but the read-back itself failed, so \
+                     whether it landed is unknown",
+                    rung + 1, name
+                ));
+                return false;
+            }
+        }
+    }
+    ctx.log("wifi-driver: all four rungs pass, so the data path carries 16 blocks of 64 - the bulk write \
+             should work");
+    true
+}
+
 pub fn run(
     h: &Host,
     w: &mut Window,
@@ -234,12 +331,25 @@ pub fn run(
         return false;
     }
 
-    // 2. The image, at the load address the chip's family table gives.
+    // 2. PROVE THE DATA PATH before committing 609 KB to it. This is a bisection, not a precaution: a
+    //    block write is failing with the command accepted and no error reported, and there are three
+    //    separable candidates. The ladder names which one in a single boot, and writing into the halted
+    //    core's TCM at the load address costs nothing because that is where the image goes next.
+    if !ladder(h, w, ram.base, ctx) {
+        ctx.log(
+            "wifi-driver: the data path does not carry what the upload needs, so no firmware is written. \
+             The rung that failed, just above, says which of block size, the MULTI bit, or the block \
+             count is the fault",
+        );
+        return false;
+    }
+
+    // 3. The image, at the load address the chip's family table gives.
     if !write_bytes(h, w, ram.base, firmware::IMAGE, "firmware", ctx) {
         return false;
     }
 
-    // 3. The NVRAM, transformed, just below the top of RAM, with the token as the last four bytes.
+    // 4. The NVRAM, transformed, just below the top of RAM, with the token as the last four bytes.
     let mut nv = [0u8; 4096];
     let len = match nvram_prepare(firmware::NVRAM, &mut nv) {
         Some(l) => l,
@@ -265,7 +375,7 @@ pub fn run(
         return false;
     }
 
-    // 4. RELEASE. `halt = false`, so the CPU runs.
+    // 5. RELEASE. `halt = false`, so the CPU runs.
     ctx.log("wifi-driver: releasing the ARM");
     if !aicore::reset(h, w, arm_wrapper, false, ctx) {
         ctx.log(

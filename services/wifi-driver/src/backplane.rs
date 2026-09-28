@@ -120,9 +120,9 @@ mod clk {
 
 /// The window is 32 KiB, so an address's low 15 bits are the offset within it.
 const WINDOW_MASK: u32 = 0xFFFF_8000;
-const OFFSET_MASK: u32 = 0x0000_7FFF;
+pub const OFFSET_MASK: u32 = 0x0000_7FFF;
 /// Set on the function-1 address to say "this is a 2-or-4-byte access, not a single byte".
-const ACCESS_WIDE: u32 = 0x0000_8000;
+pub const ACCESS_WIDE: u32 = 0x0000_8000;
 
 /// The chipcommon core, which is at a fixed backplane address on every part in this family. Its first
 /// register is the one worth all of the above.
