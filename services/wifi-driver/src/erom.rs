@@ -369,12 +369,19 @@ impl Cores {
     /// Say what the table means for the upload, in the terms the next step needs.
     pub fn report(&self, ctx: &ServiceContext) {
         match self.arm {
-            // A WRAPPER OF 0 IS A BLOCKER, not a cosmetic gap, and it is said so here rather than left
-            // as a zero in a table. Read from the reference: `brcmf_chip_disable_arm` takes the CR4 path
-            // through `read32(cpu->wrapbase + BCMA_IOCTL)`, and `brcmf_chip_ai_coredisable` /
-            // `brcmf_chip_ai_resetcore` compute `wrapbase + BCMA_RESET_CTL` and `wrapbase + BCMA_IOCTL`
-            // throughout. `brcmf_chip_add_core` stores a zero with no validation, so the reference
-            // simply relies on the EROM supplying one - with 0 those accesses land at address 0x0.
+            // A WRAPPER OF 0 BLOCKS *HALTING* THE CPU, AND ONLY THAT - a correction to what this said
+            // before, which called it a blocker for the firmware upload outright.
+            // `brcmf_chip_get_raminfo`'s CR4 branch reads through `brcmf_chip_core_read32`, which is
+            // `core->pub.base + reg` - the core's BASE - so the RAM size and the firmware address are
+            // obtainable without a wrapper. What needs one is `brcmf_chip_disable_arm`, via
+            // `wrapbase + BCMA_IOCTL` and `wrapbase + BCMA_RESET_CTL`.
+            //
+            // AND IT IS NOT A DEFECT IN THIS WALK. The descriptor dump settled it: this core's entry
+            // opens with a `MASTER_PORT` descriptor, so `get_regaddr` requires a MASTER wrapper, and the
+            // only wrapper the chip publishes for it is `0x18105185` - a SLAVE wrapper at `0x18105000`.
+            // The reference's logic is identical, so it reads 0 here too. The `0x18102000` that the other
+            // cores' base/wrapper pattern predicted was wrong, which is why a pattern was never going
+            // into the code.
             Some(c) if c.wrap == 0 => ctx.log_fmt(format_args!(
                 "wifi-driver: the ARM core is {} rev {} at {:#010x} but its WRAPPER IS 0, which \
                  blocks the firmware upload: the core is halted and reset through `wrapbase + \

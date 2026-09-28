@@ -295,6 +295,17 @@ impl Window {
         }
         sdio::read32(h, 1, (addr & OFFSET_MASK) | ACCESS_WIDE, ctx)
     }
+
+    /// Write one 32-bit backplane register.
+    ///
+    /// Same window discipline as the read, and the same wide-access flag: the bridge is being asked for a
+    /// four-byte access rather than a single byte.
+    pub fn write32(&mut self, h: &Host, addr: u32, val: u32, ctx: &ServiceContext) -> Option<()> {
+        if !self.set(h, addr, ctx) {
+            return None;
+        }
+        sdio::write32(h, 1, (addr & OFFSET_MASK) | ACCESS_WIDE, val, ctx)
+    }
 }
 
 /// Wake the backplane and confirm it is actually answering.

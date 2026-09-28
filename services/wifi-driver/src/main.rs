@@ -40,6 +40,7 @@
 #![no_std]
 #![no_main]
 
+mod armcr4;
 mod backplane;
 mod erom;
 mod host;
@@ -281,11 +282,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // write to. So this comes before the upload rather than beside it, and it is verifiable on
             // its own: it prints a table that is either a plausible CYW43455 or it is not.
             ctx.log("wifi-driver: stage 8 - walking the EROM to find the ARM core and the RAM");
-            match erom::scan(&h, &mut window, &ctx) {
+            let cores = erom::scan(&h, &mut window, &ctx);
+            match &cores {
                 Some(cores) => cores.report(&ctx),
                 None => ctx.log(
                     "wifi-driver: the core table could not be walked, so phase 2 has no address to                      write firmware to. Everything through stage 7 stands - the chip is identified and                      its backplane reads",
                 ),
+            }
+
+            // ---- Stage 9: how much RAM, and where the firmware goes. ---------------------------------
+            // The upload needs an address and a size. The CR4 reports its TCM as a set of BANKS through
+            // its own registers - reached by the core's BASE, not its wrapper, which is why a wrapper of
+            // 0 does not block this - and the firmware's start address is a per-part constant the
+            // reference keeps in a table rather than a formula.
+            ctx.log("wifi-driver: stage 9 - asking the ARM core how much TCM it has");
+            match cores.as_ref().and_then(|c| c.arm) {
+                Some(arm) => match armcr4::probe(&h, &mut window, arm.base, id.id, &ctx) {
+                    Some(ram) => ram.report(&ctx),
+                    None => ctx.log("wifi-driver: the ARM core memory could not be sized, so the upload has no destination yet"),
+                },
+                None => ctx.log("wifi-driver: no ARM core was found, so there is nothing to ask about TCM"),
             }
         }
         None => ctx.log(

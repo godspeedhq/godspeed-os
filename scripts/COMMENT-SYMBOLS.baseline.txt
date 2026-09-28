@@ -232,3 +232,14 @@ brcmf_chip_ai_resetcore            # Linux brcmfmac chip.c - as above; both are 
 brcmf_chip_add_core                # Linux brcmfmac chip.c - stores a wrapbase of 0 with NO validation, so the reference relies on the EROM supplying one
 BCMA_IOCTL                         # BCMA SPEC register offset inside a core wrapper (io control); external, named as the reference does
 BCMA_RESET_CTL                     # BCMA SPEC register offset inside a core wrapper (reset control); external, named as the reference does
+brcmf_chip_get_raminfo             # Linux brcmfmac chip.c - its CR4 branch reads through the core BASE, which is why a zero wrapper does not block sizing the RAM - external, 26.14
+brcmf_chip_tcm_ramsize             # Linux brcmfmac chip.c - the bank walk services/wifi-driver/src/armcr4.rs reimplements - external, 26.14
+brcmf_chip_tcm_rambase             # Linux brcmfmac chip.c - a per-part TABLE of firmware load addresses, not a formula; 0x198000 for the 4345 - external, 26.14
+brcmf_chip_core_read32             # Linux brcmfmac chip.c - `core->pub.base + reg`, which is the fact that settles the wrapper question
+brcmf_chip_cores_check             # Linux brcmfmac chip.c - logs wrapbase and does nothing with it, checked before blaming the walk
+brcmf_chip_recognition             # Linux brcmfmac chip.c - the caller of the EROM scan; read to confirm no post-scan wrapbase fixup exists
+INVALID_RAMBASE                    # Linux brcmfmac chip.c sentinel for "no RAM base known for this part"; ours returns None instead
+ARMCR4_CAP                         # ARM CR4 core register 0x04 (bank counts) - external, named as the reference does
+ARMCR4_BANKIDX                     # ARM CR4 core register 0x40 (selects the bank BANKINFO describes) - external
+ARMCR4_BANKINFO                    # ARM CR4 core register 0x44 (the selected bank size and flags) - external
+BRCM_CC_4345_CHIP_ID               # Linux brcm80211 chip-id constant (0x4345); cited beside our literal so the table entry is traceable to its source line - external, 26.14

@@ -73,8 +73,7 @@ const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
 /// that made this the only bit worth suspecting.
 const CMD_IO_RW_EXTENDED_READ: u32 = 0x353A_0012;
 /// CMD53, write: the same command flags (the data-present bit is set either way) without the direction
-/// bit in the transfer mode.
-#[allow(dead_code)] // arrives with the firmware upload; the read is what this phase needs
+/// bit in the transfer mode. Used by `write32`.
 const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x353A_0002;
 
 // THE OTHER COMMANDS ARE LEFT ALONE, DELIBERATELY. Their R5/R6/R1b responses carry a CRC7 and an index
@@ -395,6 +394,38 @@ pub fn cis_pointer(h: &Host, ctx: &ServiceContext) -> Option<u32> {
         return None;
     }
     Some(p)
+}
+
+/// Write one 32-bit register through CMD53 in byte mode - the twin of `read32`.
+///
+/// Same argument shape with the write bit set, same four-byte byte-mode transfer, same wide-access
+/// flag expectation on the caller's address. The constant it uses already existed with
+/// `#[allow(dead_code)]` waiting for a caller; selecting a CR4 memory bank is the first one, and the
+/// firmware upload is the reason the path had to exist at all.
+pub fn write32(h: &Host, func: u8, addr: u32, val: u32, ctx: &ServiceContext) -> Option<()> {
+    // Bit 31 set = write. Otherwise identical to the read: byte mode, incrementing address, four
+    // bytes.
+    let arg = (1 << 31) | ((func as u32 & 0x7) << 28) | (1 << 26) | ((addr & 0x1_FFFF) << 9) | 4;
+    let mut word = [val];
+    if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_WRITE, arg, &mut word, false) {
+        let resp = h.last_resp();
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CMD53 write of {:#010x} to function {} address {:#07x} failed - {} \
+             (STATUS={:#010x} INT={:#010x} R5 flags {:#04x})",
+            val,
+            func,
+            addr,
+            phase,
+            h.status(),
+            h.last_int(),
+            (resp >> 8) & 0xFF
+        ));
+        // Same reason as the read path: a transfer the card ACCEPTED leaves it holding the
+        // transaction open, and every later command then fails for that reason rather than its own.
+        abort(h, func, ctx);
+        return None;
+    }
+    Some(())
 }
 
 /// Tell the card to abandon a transfer on `func` - CCCR `IO_ABORT`, written to function 0.
