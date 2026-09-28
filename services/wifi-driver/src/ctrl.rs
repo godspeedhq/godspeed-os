@@ -189,6 +189,43 @@ const DCMD_SET: u32 = 0x02;
 /// `BRCMF_C_SET_VAR`.
 const SET_VAR: u32 = 263;
 
+/// The two counters an exchange carries, owned by whoever runs it.
+///
+/// **Both of these were constants, and that was a bug.** `set_cmd` hardcoded `reqid = 2` and SDPCM sequence
+/// 0, so every command in the driver shared one identity - which makes id matching useless, and it silently
+/// let `interface up` match a reply that was not its own and report success. Observed on hardware: the
+/// command logged nothing, then the firmware said the interface was still down.
+///
+/// Owned and passed rather than global (§3.8, and §3.9 forbids the shortcut). `query_iovar` already took
+/// `seq: &mut u8` for this reason; the request id now gets the same treatment.
+pub struct Session {
+    /// The SDPCM sequence number, one per frame sent.
+    seq: u8,
+    /// The BCDC request id, one per command, echoed by the firmware in its reply.
+    reqid: u16,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        // brcmf_proto_bcdc_query_dcmd pre-increments, so the first request is 1 rather than 0.
+        Session { seq: 0, reqid: 0 }
+    }
+
+    /// The next request id. Wraps at 16 bits because that is the width of the field; a wrap can only
+    /// collide with an exchange 65535 commands old, which no reply outlives.
+    fn next_id(&mut self) -> u16 {
+        self.reqid = self.reqid.wrapping_add(1);
+        self.reqid
+    }
+
+    /// The next SDPCM sequence number.
+    fn next_seq(&mut self) -> u8 {
+        let s = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        s
+    }
+}
+
 /// One control frame, bounded. A `cur_etheraddr` exchange is 48 bytes; 512 is a whole block and covers
 /// every control message this driver sends.
 ///
@@ -218,12 +255,12 @@ fn round_to(len: usize) -> usize {
 fn query_iovar(
     h: &Host,
     w: &mut Window,
-    seq: &mut u8,
-    reqid: u16,
+    s: &mut Session,
     name: &str,
     out: &mut [u8],
     ctx: &ServiceContext,
 ) -> Option<usize> {
+    let reqid = s.next_id();
     let mut frame = [0u8; FRAME];
 
     // The payload of a GET_VAR is the variable's name, NUL-terminated, followed by room for the answer.
@@ -249,7 +286,7 @@ fn query_iovar(
     // ---- Software header. `dataoff` points AT the BCDC header - past the SDIO headers and no
     // further - which is what `sizeof(*hwhdr) + sizeof(*swhdr)` means. This comment used to say
     // "past all three headers" and cite the reference for it, while the reference says two. ----
-    frame[4] = *seq;
+    frame[4] = s.next_seq();
     frame[5] = CHANNEL_CONTROL;
     frame[6] = 0; // nextlen: a hint, and zero means "no hint"
     // `dataoff` points AT the BCDC header, not past it. See `DATA_OFF`.
@@ -282,7 +319,7 @@ fn query_iovar(
     }
     ctx.log_fmt(format_args!(
         "wifi-driver: asking the firmware for `{}` - {} byte frame padded to {}, seq {}, request id {}",
-        name, len, padded, *seq, reqid
+        name, len, padded, frame[4], reqid
     ));
     if !sdio::write_extended(
         h,
@@ -295,7 +332,6 @@ fn query_iovar(
     ) {
         return None;
     }
-    *seq = seq.wrapping_add(1);
 
     // ---- The reply, read with the ONE frame reader. ----------------------------------------------
     // This used to hand-roll the header read and the two-step body read, and the copy went stale: it
@@ -597,6 +633,7 @@ pub fn read_frame(
 pub fn set_iovar(
     h: &Host,
     w: &mut Window,
+    s: &mut Session,
     name: &str,
     value: &[u8],
     ctx: &ServiceContext,
@@ -621,7 +658,7 @@ pub fn set_iovar(
     ctx.log_fmt(format_args!(
         "wifi-driver: setting `{}` - {} byte value", name, value.len()
     ));
-    set_cmd(h, w, SET_VAR, &payload[..n], name, ctx)
+    set_cmd(h, w, s, SET_VAR, &payload[..n], name, ctx)
 }
 
 /// Send one BCDC command with a payload, and wait for the firmware to accept or refuse it.
@@ -634,6 +671,7 @@ pub fn set_iovar(
 pub fn set_cmd(
     h: &Host,
     w: &mut Window,
+    s: &mut Session,
     cmd: u32,
     value: &[u8],
     what: &str,
@@ -653,11 +691,13 @@ pub fn set_cmd(
     let len = PAYLOAD_AT + payload;
     let r = round_to(len);
     let padded = (len + r - 1) / r * r;
-    let reqid: u16 = 2;
+    // ONE ID PER COMMAND. This was the constant 2 for every command in the driver, which made a reply
+    // unattributable and let `interface up` report a success it never received.
+    let reqid = s.next_id();
 
     frame[0..2].copy_from_slice(&(len as u16).to_le_bytes());
     frame[2..4].copy_from_slice(&(!(len as u16)).to_le_bytes());
-    frame[4] = 0;
+    frame[4] = s.next_seq();
     frame[5] = CHANNEL_CONTROL;
     // `dataoff` points AT the BCDC header, not past it. See `DATA_OFF`.
     frame[7] = DATA_OFF as u8;
@@ -680,8 +720,9 @@ pub fn set_cmd(
         ]);
     }
     ctx.log_fmt(format_args!(
-        "wifi-driver: sending `{}` - command {}, {} byte payload, {} byte frame padded to {}",
-        what, cmd, payload, len, padded
+        "wifi-driver: sending `{}` - command {}, {} byte payload, {} byte frame padded to {}, seq {}, \
+         request id {}",
+        what, cmd, payload, len, padded, frame[4], reqid
     ));
     if !sdio::write_extended(
         h,
@@ -720,6 +761,12 @@ pub fn set_cmd(
                 ));
                 return false;
             }
+            // SAY SO. Success used to be silent, which is exactly why a command that matched the
+            // wrong reply looked identical to one that worked.
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   the firmware ACCEPTED `{}` (request id {} matched, status {})",
+                what, reqid, status as i32
+            ));
             return true;
         }
         ctx.sleep_ms(1);
@@ -736,8 +783,8 @@ pub fn set_cmd(
 ///
 /// Without this the firmware refuses a scan with `BCME_NOTUP` (-4), which is exactly what it did. brcmfmac
 /// issues this during bring-up before anything else touches the radio.
-pub fn interface_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
-    set_cmd(h, w, CMD_UP, &[], "interface up", ctx)
+pub fn interface_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
+    set_cmd(h, w, s, CMD_UP, &[], "interface up", ctx)
 }
 
 /// Ask the firmware for its own MAC address - the first thing only a running radio can answer.
@@ -748,9 +795,9 @@ pub fn interface_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
 pub fn report_mac(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     ctx.log("wifi-driver: stage 13 - the first question put to the firmware");
 
-    let mut seq = 0u8;
+    let mut session = Session::new();
     let mut mac = [0u8; 6];
-    let n = match query_iovar(h, w, &mut seq, 1, "cur_etheraddr", &mut mac, ctx) {
+    let n = match query_iovar(h, w, &mut session, "cur_etheraddr", &mut mac, ctx) {
         Some(n) => n,
         None => return false,
     };

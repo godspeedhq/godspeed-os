@@ -422,13 +422,14 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
 
     // THE INTERFACE MUST BE UP FIRST. A scan on a down interface is refused with `BCME_NOTUP` (-4), which
     // is exactly what this driver was told the first time it tried.
-    if !ctrl::interface_up(h, w, ctx) {
+    let mut session = ctrl::Session::new();
+    if !ctrl::interface_up(h, w, &mut session, ctx) {
         ctx.log("wifi-driver: the interface would not come up, so no scan is attempted");
         return false;
     }
 
     let mut scan = Scan::new();
-    if !ctrl::set_iovar(h, w, "escan", &request, ctx) {
+    if !ctrl::set_iovar(h, w, &mut session, "escan", &request, ctx) {
         // NO VERSION HINT HERE. This message used to say the params VERSION was the first thing to change,
         // which was written for the "accepted but silent" case and is wrong for a refusal: the firmware
         // states what it objected to, and the decoded error is printed one line above. The version matters
