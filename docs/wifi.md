@@ -1311,3 +1311,111 @@ from the vendor driver's equivalent.
 No firmware has been uploaded, so there is still no 802.11 of any kind: `wifi list` cannot work and the
 shell still answers that it cannot talk to the driver. Phase 2 delivers the transport and the destination;
 phase 3 is the radio actually running.
+
+## 22. The first block write, and the difference between a word and a block
+
+The upload ran for the first time. The halt worked, which is the part that had never been exercised:
+
+```
+wifi-driver: core wrapper 0x18102000 held in reset after 1 read(s), CPU halted
+```
+
+That is the derived wrapper being used for something real rather than merely agreeing with a published
+value, so 0x18102000 is now confirmed twice over.
+
+Then the first block-mode write failed:
+
+```
+wifi-driver: CMD53 write of 256 word(s) to function 1 address 0x08000 failed - the FIFO never
+  became ready - the command completed and no data came (arg=0x9d000010 BLKSIZECNT=0x00107040
+  CMDTM=0x353a0022 R5 flags 0x10 STATUS=0x01ef0000)
+```
+
+**Every register in that line is correct, which is why the diagnostic mattered more than the failure.**
+`arg=0x9d000010` decodes as write, function 1, block mode, incrementing address, address 0x08000, count 16.
+`BLKSIZECNT=0x00107040` is 16 blocks of 64 bytes with boundary 7. `CMDTM=0x353a0022` is index 53 with
+`BLK_CNT_EN | MULTI` and no READ. `R5 flags 0x10` is the card accepting the command. And
+`STATUS=0x01ef0000` has the DAT[3:0] field reading `0b1110`: **DAT0 low, which is the card signalling busy,
+waiting for data.**
+
+So the command was right and the card was waiting. The fault was in how the FIFO was fed - and per the rule
+this effort has been run on since the `FORCE_ALP` bug, the answer came from reading the reference rather
+than from reasoning about what the controller might want.
+
+### What the reference does, quoted
+
+`u-boot`'s `sdhci_transfer_pio`, in full, because it is four lines and the whole answer is in them:
+
+```c
+static void sdhci_transfer_pio(struct sdhci_host *host, struct mmc_data *data)
+{
+	int i;
+	char *offs;
+	for (i = 0; i < data->blocksize; i += 4) {
+		offs = data->dest + i;
+		if (data->flags == MMC_DATA_READ)
+			*(u32 *)offs = sdhci_readl(host, SDHCI_BUFFER);
+		else
+			sdhci_writel(host, *(u32 *)offs, SDHCI_BUFFER);
+	}
+}
+```
+
+It moves exactly **one block** - `data->blocksize` bytes - and it re-checks **nothing** while doing so. Its
+caller supplies the discipline around it:
+
+```c
+	do {
+		stat = sdhci_readl(host, SDHCI_INT_STATUS);
+		...
+		if (stat & rdy) {
+			if (!(sdhci_readl(host, SDHCI_PRESENT_STATE) & mask))
+				continue;
+			sdhci_writel(host, rdy, SDHCI_INT_STATUS);
+			sdhci_transfer_pio(host, data);
+			data->dest += data->blocksize;
+			if (++block >= data->blocks)
+				break;
+		}
+	} while (!(stat & SDHCI_INT_DATA_END));
+```
+
+The ready flag is cleared **before** the block moves, once per block, and the next wait happens between
+blocks.
+
+### The bug
+
+This driver waited for the ready bit **per word** and cleared it **per word**.
+
+For a four-byte byte-mode transfer that is accidentally correct, because one word *is* one block - which is
+exactly why every register read in phases 1 and 2 worked, and why nothing caught this until a 64-byte block
+was attempted. For a block it deadlocks: the controller raises the ready bit once when the block buffer is
+free, one word goes in, the flag is cleared, and the loop then waits for a bit that cannot set again until
+the block completes, which it cannot, because the transfer stopped after 4 of 64 bytes. The card holds DAT0
+low waiting for the other 60. That is precisely the state `STATUS=0x01ef0000` reported.
+
+**The instrument told the truth and the conclusion drawn from it was still wrong for one boot**, because
+"the FIFO never became ready" is a true statement that invites a theory about the FIFO rather than about the
+loop reading it. The fix is structural: wait once per block, clear once per block, then move
+`blocksize / 4` words with no further checks. The block geometry is taken from the `BLKSIZECNT` word the
+caller already supplies, so the loop and the controller cannot disagree about how big a block is.
+
+### Prediction
+
+With the FIFO fed a block at a time, stage 11 should get past the first write and the next thing observed
+is one of three outcomes, in order of what each would mean:
+
+1. **The upload completes.** 609 KB at 0x198000, the NVRAM at the top of RAM, the ARM released, and
+   `RESETCTRL 0x00000000 ... RUNNING`. That is phase 2 complete. It would be the first time the chip's own
+   processor has executed anything.
+2. **A later write fails**, with the byte count and backplane address in the message saying where. A
+   failure at a 32 KiB boundary points at the window set; a failure at a chunk boundary points at the
+   block-count arithmetic. The message carries both numbers deliberately so the two cannot be confused.
+3. **Every write succeeds and the core does not come out of reset** - `STILL IN RESET` on the last line.
+   That is the outcome `aicore.rs` already names in its own documentation: it would mean
+   `brcmf_sdio_buscore_activate`'s reset-vector write (the image's first four bytes to backplane address 0)
+   is required and missing. It is recorded as unimplemented rather than guessed at, so this outcome is
+   expected to be legible rather than mysterious.
+
+What is **not** predicted is a working radio. Even a clean release only means the firmware is running; there
+is no control channel to it yet, so `wifi list` still cannot work. Phase 3 is that conversation.

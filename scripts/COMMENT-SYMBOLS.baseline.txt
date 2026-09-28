@@ -269,3 +269,4 @@ SBSDIO_SB_OFT_ADDR_LIMIT           # Linux brcmfmac chunk bound, the 32 KiB back
 SBSDIO_SB_OFT_ADDR_MASK            # Linux brcmfmac 0x07FFF, the window offset mask; ours is OFFSET_MASK in backplane.rs - external, 26.14
 AI_IOCTRL                          # BCMA/cyw43 SPEC register at wrapper offset 0x408; ours is off::IOCTRL - external, 26.14
 AI_RESETCTRL                       # BCMA/cyw43 SPEC register at wrapper offset 0x800; ours is off::RESETCTRL - external, 26.14
+sdhci_transfer_pio                 # u-boot sdhci.c - the mover sdhci_transfer_data calls; cited because it moves ONE BLOCK per call with NO ready-bit re-check inside, which is the fault it fixed here - external, 26.14

@@ -502,25 +502,38 @@ impl<'a> Host<'a> {
         // Then the FIFO, one word at a time. The ready bit is latched, so it is cleared before each
         // word rather than once - otherwise the first word's flag would satisfy every later wait and
         // this would read the FIFO faster than the controller fills it.
-        // EITHER SIGNAL SATISFIES THE WAIT, which is what u-boot's polled loop effectively does: the
-        // interrupt status flag, or the buffer-enable bit in STATUS. Two registers, and a controller
-        // need only say so in one of them.
+        // ONE BLOCK BETWEEN WAITS, which is the whole shape of a PIO transfer and was wrong here.
+        //
+        // u-boot's `sdhci_transfer_pio` moves `data->blocksize` bytes per call - `for (i = 0; i <
+        // data->blocksize; i += 4)` - with NO re-check of any ready bit inside that loop, and its
+        // caller clears the flag BEFORE calling it and waits again for the next block.
+        //
+        // This waited for the ready bit per WORD and cleared it per word. For a four-byte byte-mode
+        // transfer that is accidentally right, because one word IS one block - which is why every
+        // register read worked. For a 64-byte block it deadlocks: the controller raises the flag once
+        // when the block buffer is free, one word goes in, the flag is cleared, and the loop then
+        // waits for a flag that cannot set again until a block completes. Observed exactly, with the
+        // card holding DAT0 low waiting for the other 60 bytes.
+        //
+        // The geometry comes from the `BLKSIZECNT` word the caller already gave, so the two cannot
+        // disagree about how big a block is.
         let ready = if read { INT_READ_RDY } else { INT_WRITE_RDY };
         let ready_st = if read { ST_BUF_READ_ENABLE } else { ST_BUF_WRITE_ENABLE };
-        for w in buf.iter_mut() {
+        let blocks = (blk >> 16).max(1) as usize;
+        let words_per_block = ((blk & 0xFFF) as usize).max(4) / 4;
+        let mut done = 0usize;
+
+        for _ in 0..blocks {
+            if done >= buf.len() {
+                break;
+            }
+            // WAIT ONCE PER BLOCK.
             let mut t = 0u32;
             loop {
                 let i = self.rd(INTERRUPT);
                 let s = self.rd(STATUS);
-                // ACCUMULATE EVERYTHING SEEN, so a timeout can say whether the controller moved AT ALL.
-                // Four hypotheses have been guessing at that; this asks it. If these come back as they
-                // went in, nothing about the data phase happened.
                 self.seen_int.set(self.seen_int.get() | i);
                 self.seen_status.set(self.seen_status.get() | s);
-                // WHEN, not just whether. A controller that goes active and inactive within a few
-                // hundred polls gave up almost at once - a data timeout it declined to latch. One that
-                // stays active for most of two million was waiting on a card that never spoke. Those
-                // are different faults and only the timing separates them.
                 if s & ST_DAT_ACTIVE != 0 {
                     if self.dat_first.get() == 0 {
                         self.dat_first.set(t + 1);
@@ -542,12 +555,18 @@ impl<'a> Host<'a> {
                     return Err("the FIFO never became ready - the command completed and no data came");
                 }
             }
+            // CLEARED BEFORE THE BLOCK MOVES, as the reference does, not after each word.
             self.wr(INTERRUPT, ready);
-            if read {
-                *w = self.rd(DATA);
-            } else {
-                self.wr(DATA, *w);
+            // THEN THE WHOLE BLOCK, with no further checks. This is the part that was missing.
+            let end = (done + words_per_block).min(buf.len());
+            for w in buf[done..end].iter_mut() {
+                if read {
+                    *w = self.rd(DATA);
+                } else {
+                    self.wr(DATA, *w);
+                }
             }
+            done = end;
         }
 
         // TRANSFER COMPLETE, waited for rather than assumed. The last FIFO access is not the end of the
