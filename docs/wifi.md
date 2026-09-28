@@ -2608,3 +2608,24 @@ Linux and look was worth more than any hypothesis of mine that day.
 - No association, no credential path, no data frames - phases 4 and 5.
 - The glommed frames (10 of 22 this boot) are counted and dropped. The reference does the same and its
   scans work, so nothing waits on them; it is recorded rather than left implied.
+
+### Second boot, 22:11 - it reproduces, and a smaller count is not a regression
+
+```
+listening ended: complete (236 empty poll(s) of a 500 bound)
+the scan window saw 10 event/data frame(s), 10 escan-result event(s), 11 glommed frame(s) ignored
+7 network(s) from 10 escan-result event(s)
+```
+
+Seven networks this time, not ten. **That is a different room, not a worse driver**, and it is worth writing
+down because this project's own rule is that a number lower than last time is a truncation until proven a
+difference. Here it is proven: two networks appeared that the first scan did not see at all (a BT hub and a
+FRITZ box, at -78 and -83 dBm), and the three radios that reported -30 dBm in the first scan did not beacon
+inside this window - the same access point appeared instead on two other BSSIDs at -80 on 5 GHz. Every
+result was again a PARTIAL event followed by SUCCESS, and every wait ended on the firmware's word.
+
+A scan is a sample of who happened to transmit while the radio listened on each channel. Two scans of the same
+room differ; that is what makes the result real rather than replayed.
+
+Both message fixes hold: stage 14 no longer announces itself unverified, and the closing line describes the
+shell's state rather than contradicting the ten lines above it.
