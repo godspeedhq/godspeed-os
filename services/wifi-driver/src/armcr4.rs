@@ -193,24 +193,10 @@ impl Ram {
             self.banks,
             self.base
         ));
-        // DOES THE IMAGE FIT? The vendored blob is 609,309 bytes (nonfree/brcm43455/PROVENANCE), and it
-        // is written from `base` upward, so the question is whether the TCM reaches that far. Asked here
-        // because finding out during a 600 KB transfer is the wrong time.
-        const IMAGE_BYTES: u32 = 609_309;
-        if self.size >= IMAGE_BYTES {
-            ctx.log_fmt(format_args!(
-                "wifi-driver: the {} byte image fits in {} KiB with {} KiB to spare",
-                IMAGE_BYTES,
-                self.size / 1024,
-                (self.size - IMAGE_BYTES) / 1024
-            ));
-        } else {
-            ctx.log_fmt(format_args!(
-                "wifi-driver: the {} byte image does NOT fit in {} KiB of TCM, which means either the \
-                 bank walk is wrong or this is the wrong firmware for this part",
-                IMAGE_BYTES,
-                self.size / 1024
-            ));
-        }
+        // THE FIT CHECK LIVES WITH THE FIRMWARE NOW, in `firmware::report`, because that module has
+        // the actual image and this one had a COPY of its size - `IMAGE_BYTES: u32 = 609_309`, taken
+        // out of `nonfree/brcm43455/PROVENANCE`. A number copied from a document is a second truth
+        // (Commandment III), and this one would have gone stale silently the moment the blob changed,
+        // reporting a comfortable fit for an image of the wrong size.
     }
 }

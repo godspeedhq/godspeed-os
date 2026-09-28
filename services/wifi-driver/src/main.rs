@@ -42,6 +42,7 @@
 
 mod armcr4;
 mod backplane;
+mod firmware;
 mod erom;
 mod host;
 mod sdio;
@@ -304,7 +305,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("wifi-driver: stage 9 - asking the ARM core how much TCM it has");
             match cores.as_ref().and_then(|c| c.arm) {
                 Some(arm) => match armcr4::probe(&h, &mut window, arm.base, id.id, &ctx) {
-                    Some(ram) => ram.report(&ctx),
+                    Some(ram) => {
+                        ram.report(&ctx);
+                        // ---- Stage 10: what this build actually carries. ----------------------------
+                        // Checked against the size the CHIP just reported rather than against a number
+                        // from a document, and stated before any transfer starts: finding out mid-upload
+                        // that 600 KB does not fit is the wrong time.
+                        ctx.log("wifi-driver: stage 10 - the firmware this build carries");
+                        firmware::report(ram.size, ram.base, &ctx);
+                    }
                     None => ctx.log("wifi-driver: the ARM core memory could not be sized, so the upload has no destination yet"),
                 },
                 None => ctx.log("wifi-driver: no ARM core was found, so there is nothing to ask about TCM"),
