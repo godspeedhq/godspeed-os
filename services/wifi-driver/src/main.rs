@@ -162,20 +162,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Some(ptr) => {
             ctx.log_fmt(format_args!("wifi-driver: stage 5 - walking the CIS from {:#07x}", ptr));
             match sdio::walk_cis(&h, ptr, &ctx) {
-                Some(id) if id.is_expected_radio() => ctx.log_fmt(format_args!(
-                    "wifi-driver: the radio is CONFIRMED ON THE BUS - manufacturer {:#06x} (Broadcom), \
-                     device {:#06x} (CYW43455). Asked of the part, not read from a device tree",
+                // REPORTED, NOT JUDGED. The manufacturer is a meaningful check; the device code is the
+                // SDIO id, which is NOT the field that identifies the part for anything this driver does
+                // - see the note in `sdio::Manfid`. The verdict is stage 7's, from the chip id.
+                Some(id) if id.is_broadcom() => ctx.log_fmt(format_args!(
+                    "wifi-driver: a BROADCOM part is on the bus - manufacturer {:#06x}, SDIO device \
+                     code {:#06x}. Which part it is comes from the chip id below, not from this code",
                     id.manf, id.device
                 )),
                 Some(id) => ctx.log_fmt(format_args!(
-                    "wifi-driver: an SDIO part answered but it is NOT the expected radio - \
-                     manufacturer {:#06x}, device {:#06x} (expected {:#06x}/{:#06x}). That is a \
-                     finding, not a failure: something is on this bus and it is not what this board \
-                     is documented to carry",
+                    "wifi-driver: the part on this bus is NOT Broadcom - manufacturer {:#06x} (expected \
+                     {:#06x}), SDIO device code {:#06x}. That is a finding, not a failure",
                     id.manf,
-                    id.device,
                     sdio::Manfid::BROADCOM,
-                    sdio::Manfid::CYW43455
+                    id.device
                 )),
                 None => ctx.log(
                     "wifi-driver: the CIS walk found no MANFID tuple, so the part on the bus is \
@@ -256,24 +256,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // numbers in different bases. The CIS device code and the silicon's chip id are DIFFERENT
             // fields - Broadcom does not oblige them to match, and 0xA9BF/0x4345 for the 43455 is the
             // worked example - so agreement and disagreement both mean something specific.
-            if id.id == 43430 {
-                ctx.log(
-                    "wifi-driver: the silicon AGREES with the CIS - this is a 43430, not the 43455 \
-                     this board is documented to carry. `nonfree/brcm43455/` is then the WRONG blob \
-                     and phase 2 needs the 43430 firmware",
-                );
-            } else if id.id == 0x4345 {
-                ctx.log(
-                    "wifi-driver: the silicon says 4345 while the CIS said 43430 - so the CIS device \
-                     code is NOT the chip id on this part, the board does carry a 4345-family radio, \
-                     and `nonfree/brcm43455/` is right after all. Which 4345 variant is the revision \
-                     above",
-                );
-            } else {
-                ctx.log(
-                    "wifi-driver: the silicon names a part this driver has no name for, which is a \
-                     finding rather than a failure - report the id and revision above",
-                );
+            // WHICH FIRMWARE, selected from the chip id and revision exactly as brcmfmac's table does
+            // (the revision field there is a BITMASK - see `ChipId::firmware`). This is the answer the
+            // whole of phase 1 existed to get, because it is what phase 2 uploads.
+            match id.firmware() {
+                Some(fw) => ctx.log_fmt(format_args!(
+                    "wifi-driver: this part wants firmware `{}` - so `nonfree/{}/` is the blob to \
+                     upload, chosen from the chip id and revision rather than from the board's \
+                     documentation",
+                    fw,
+                    if fw.contains("43455") { "brcm43455" } else { "<not vendored>" }
+                )),
+                None => ctx.log(
+                    "wifi-driver: no firmware is mapped for this chip id and revision, so phase 2 has \
+                     nothing to upload. A finding rather than a failure - report the id and revision",
+                ),
             }
         }
         None => ctx.log(

@@ -955,6 +955,13 @@ something about the state the firmware left the chip in and is not a problem.
 | `0x4345` | the CIS device code is NOT the chip id on this part, the board does carry a 4345-family radio, and the vendored blob is right after all. Which 4345 variant is then the revision field |
 | anything else | a finding, reported with its id and revision |
 
+> **WRONG, and corrected here rather than only in section 20.** The chip answered `0x4345` rev 6: the
+> comfortable side. The reasoning below was sound about METHOD and wrong about the FACT, and the fact it
+> missed is that the CIS device code and the silicon chip id are **different fields** which nothing
+> requires to name the same part - so `0xA9A6` was never evidence about which part this is. Neither option
+> in the table above said that, which is why both were framed as a contradiction to be resolved rather
+> than as two readings of two different things.
+
 **`0xA9A6` is the prediction**, and it is deliberately the uncomfortable one. A 43430 on a Pi 4 rev 1.5
 contradicts the product being sold as dual-band, so the comfortable answer is `0x4345` - and the reason
 not to pick it is section 16: the last prediction got the device code wrong by preferring a document to
@@ -1139,3 +1146,93 @@ the read still fails, the failure is now confined to the data phase and will say
 The chip identity, and therefore which firmware blob phase 2 needs. Section 17's prediction of `0xA9A6`
 remains unresolved. Everything up to it stands: the radio is on the bus, identified by its CIS, its
 backplane is awake, and its clock is granted.
+
+---
+
+## 20. Phase 1 COMPLETE: the radio is identified from its own silicon, 2026-09-28
+
+```text
+wifi-driver: backplane awake - CHIPCLKCSR 0x69, ALP available after 1 read(s), FORCE_ALP held
+wifi-driver: CHIP SAYS id 0x4345 (the 4345 family - CYW43455 at rev 6) rev 6 package 2 type 1
+             [raw 0x15264345]
+```
+
+The CYW43455 is confirmed **by asking the part**, not by reading a device tree or a product page. Its
+backplane is reachable, its clock is running, and a 32-bit register read through the SDIO window works.
+
+### What was actually wrong: one bit
+
+`SBSDIO_FORCE_ALP`, `0x01`, missing from the chip clock word. `cyw43-driver` - Infineon's own driver for
+this chip family - branches on the transport:
+
+```c
+#if !CYW43_USE_SPI
+    SBSDIO_FORCE_HW_CLKREQ_OFF | SBSDIO_ALP_AVAIL_REQ | SBSDIO_FORCE_ALP      /* 0x29, SDIO */
+#else
+    SBSDIO_ALP_AVAIL_REQ                                                      /* 0x08, SPI  */
+#endif
+```
+
+This driver wrote `0x28`, which is **neither**: the SPI form plus one bit. `ALP_AVAIL` (`0x40`) reports
+that the clock is AVAILABLE; `FORCE_ALP` is what RUNS it. Without it the backplane had no clock, so a
+backplane read could not be serviced - the card accepted the command and never produced data, which is
+exactly what six boots measured.
+
+### The firmware question is CLOSED
+
+brcmfmac's table, quoted:
+
+```c
+BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0x00000200, 43456),
+BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0xFFFFFDC0, 43455),
+```
+
+The second field is a **bitmask over revisions**, which does not look like one: bit N set means revision N
+matches. `0xFFFFFDC0` excludes revs 0-5 and rev 9 (rev 9 being the 43456), so rev 6 is bit `0x40`, set.
+
+**`0x4345` rev 6 selects `brcmfmac43455-sdio`, so `nonfree/brcm43455/` is the right blob.** Section 8's
+vendoring decision stands, and section 16's alarm about it is resolved: the wrong field was being
+consulted.
+
+### The check that caused that alarm is gone
+
+`Manfid::is_expected_radio` compared the **CIS device code** against `0xA9BF` and announced on every boot
+that the part "is NOT the expected radio". The CIS device code is the SDIO id - what a host matches a
+DRIVER on - and firmware is selected from the CHIP ID read over the backplane. On this board those
+disagree (`0xA9A6` versus `0x4345` rev 6), and nothing requires them to name the same part number, so the
+comparison was asking a question it could not answer. It is removed; the manufacturer check stays (it is
+meaningful, and confirmed the tuple was being read correctly all along) and the verdict moved to the chip
+id.
+
+Why a 4345 part advertises a 43430 SDIO code is left open. It has no bearing on anything this driver does.
+
+### What six boots cost, and what they bought
+
+Every element of the setup was verified along the way, each by a measurement rather than an argument:
+
+| verified | how |
+|---|---|
+| CMD53 argument, byte mode | read off `mmc_io_rw_extended` and `sdio_io_rw_ext_helper` |
+| `BLKSIZECNT`, `CMDTM` | read BACK from the controller, and matching Linux's words exactly |
+| `CONTROL0` / DMA select | read back, zero |
+| backplane window | read back, `0x18000000` |
+| function 1 enabled and ready, both function block sizes | read back, held |
+| GPIO 34-39 mux | read back, `34=f7/p1 ... 39=f7/p1` - all six ALT3 |
+| card accepted the transfer | R5 flags clean |
+| the host DID run a data phase | `STATUS` accumulated: DAT Line Active and Read Transfer Active both seen |
+
+Five hypotheses died to those: a reimplemented command path, `TM_BLKCNT_EN`, `CMD_CRC`/`CMD_INDEX`, the DMA
+selection, and the pin mux. **The fault was in the one part of the sequence assembled from bit names that
+looked sufficient rather than copied from a reference for the transport in use** - and one read of the
+vendor driver found it.
+
+The instruction to stop guessing and read the implementation was given twice before that read happened.
+Recorded here because it is the most useful thing in this section: the accumulated-OR instrument and the
+register readbacks were each worth more than the hypothesis they replaced, and the vendor driver was worth
+more than all of them.
+
+### What phase 1 does NOT include
+
+No firmware upload, so still no 802.11 of any kind. `wifi list` cannot work and the shell still answers
+that it cannot talk to the driver. What phase 1 delivers is the transport: the radio identified, its
+backplane readable, and the correct firmware blob named from the silicon.

@@ -161,15 +161,29 @@ pub struct Manfid {
 }
 
 impl Manfid {
-    /// Broadcom's manufacturer code, and the CYW43455's device code, so the log can say whether this
-    /// is the part the board is documented to carry or something else entirely. Naming the EXPECTED
-    /// value is what makes an unexpected one a finding rather than a number nobody can judge.
+    /// Broadcom's SDIO manufacturer code, which is the part of this tuple worth checking.
     pub const BROADCOM: u16 = 0x02D0;
-    pub const CYW43455: u16 = 0xA9BF;
 
-    pub fn is_expected_radio(&self) -> bool {
-        self.manf == Self::BROADCOM && self.device == Self::CYW43455
+    /// Is the manufacturer Broadcom? The only verdict this tuple can actually support.
+    pub fn is_broadcom(&self) -> bool {
+        self.manf == Self::BROADCOM
     }
+
+    // WHAT THIS TUPLE DOES *NOT* DECIDE, and why a check here was misleading for five boots.
+    //
+    // This used to carry a `CYW43455 = 0xA9BF` constant and an `is_expected_radio` that compared the CIS
+    // device code against it - so on a board reporting `0xA9A6` it announced on every boot that the part
+    // "is NOT the expected radio", and that was taken seriously enough to drive a prediction.
+    //
+    // **The CIS device code is not the field that identifies the part for any purpose this driver has.**
+    // brcmfmac matches a DRIVER to a device on the SDIO id and selects FIRMWARE from the CHIP ID read
+    // over the backplane, and on this board those disagree: the CIS says `0xA9A6` while the silicon says
+    // `0x4345` rev 6. Nothing requires the two to name the same part number, so comparing the CIS code
+    // to an expected value was asking a question it cannot answer.
+    //
+    // So the manufacturer is checked (it is meaningful, and it confirmed the tuple was being read
+    // correctly all along) and the device code is REPORTED. The verdict lives with `ChipId`, which is
+    // the field that decides.
 }
 
 /// Why a CMD52 did not produce a byte. **Two different facts that `None` used to conflate**, which is

@@ -142,6 +142,36 @@ pub struct ChipId {
 }
 
 impl ChipId {
+    /// Which firmware blob this part wants, selected the way brcmfmac selects it.
+    ///
+    /// Its table, quoted:
+    ///
+    /// ```text
+    /// BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0x00000001, 43430A0),
+    /// BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0x00000002, 43430A1),
+    /// BRCMF_FW_ENTRY(BRCM_CC_43430_CHIP_ID, 0xFFFFFFFC, 43430B0),
+    /// BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID,  0x00000200, 43456),
+    /// BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID,  0xFFFFFDC0, 43455),
+    /// ```
+    ///
+    /// **The second field is a BITMASK OVER REVISIONS** - bit N set means revision N matches - which is
+    /// worth saying because it does not look like one. `0xFFFFFDC0` excludes revs 0-5 and rev 9 (rev 9
+    /// being the 43456), so rev 6 is bit `0x40`, set, and selects `43455`.
+    ///
+    /// Returns the blob basename, which is also the directory name under `nonfree/`.
+    pub fn firmware(&self) -> Option<&'static str> {
+        match self.id {
+            // 0x4345: rev 9 is the 43456, everything from rev 6 up otherwise is the 43455.
+            0x4345 if (0x0000_0200u32 >> self.rev) & 1 != 0 => Some("brcmfmac43456-sdio"),
+            0x4345 if (0xFFFF_FDC0u32 >> self.rev) & 1 != 0 => Some("brcmfmac43455-sdio"),
+            // 43430: rev 0 is A0, rev 1 is A1, rev 2 and up are B0.
+            43430 if (0x0000_0001u32 >> self.rev) & 1 != 0 => Some("brcmfmac43430-sdio"),
+            43430 if (0x0000_0002u32 >> self.rev) & 1 != 0 => Some("brcmfmac43430-sdio"),
+            43430 if (0xFFFF_FFFCu32 >> self.rev) & 1 != 0 => Some("brcmfmac43430b0-sdio"),
+            _ => None,
+        }
+    }
+
     /// What this id means, named rather than left as a number.
     ///
     /// **The two candidates are the whole point.** `43430` is the part the CIS device code pointed at
@@ -153,7 +183,9 @@ impl ChipId {
         match self.id {
             43430 => "BCM43430 - 2.4 GHz only, the Pi 3 / Zero W part",
             43439 => "BCM43439",
-            0x4345 => "the 4345 family - CYW43455 is this chip at a particular revision",
+            // Rev 6 of this family IS the CYW43455, which the firmware table confirms: rev 6 falls in
+            // the `0xFFFFFDC0` mask that selects the `43455` blob.
+            0x4345 => "the 4345 family - CYW43455 at rev 6",
             0x4335 => "BCM4335/4339",
             0x4359 => "BCM4359",
             0x4373 => "BCM4373",

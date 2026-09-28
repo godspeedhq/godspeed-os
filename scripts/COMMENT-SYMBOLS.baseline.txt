@@ -218,3 +218,4 @@ SBSDIO_FORCE_HW_CLKREQ_OFF         # cyw43-driver/brcmfmac bit 0x20 - take the h
 SBSDIO_ALP_AVAIL                   # cyw43-driver/brcmfmac bit 0x40 - hardware STATUS saying ALP is available
 CYW43_USE_SPI                      # cyw43-driver build switch; cited because the SDIO branch of that #if writes a DIFFERENT clock word from the SPI branch, which is the whole finding
 buscoreprep                        # Linux brcmfmac function (brcmf_sdio_buscoreprep) that brings the backplane clock up and clears the SDIO pull-ups - external, 26.14
+is_expected_radio                  # REMOVED - it compared the CIS device code, which is not the field that identifies the part. The comment records what went and why, which is exactly what this baseline is for

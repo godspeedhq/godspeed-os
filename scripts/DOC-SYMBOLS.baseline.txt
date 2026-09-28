@@ -10,6 +10,8 @@
 CONSOLE_RENDER                     # docs/console-service.md
 FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
+mmc_io_rw_extended                 # docs/wifi.md - Linux mmc core, EXTERNAL; cited for the CMD53 argument this driver reimplements
+sdio_io_rw_ext_helper              # docs/wifi.md - Linux mmc core, EXTERNAL; cited for why a 4-byte read uses BYTE mode
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
 async_bulk_watchdog                # docs/arm32-usb-userspace.md
 bot_command                        # docs/arm32-status.md, docs/arm32-usb-userspace.md
