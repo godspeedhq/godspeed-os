@@ -2311,3 +2311,72 @@ against - so discarding it and waiting is the point, not an error.
 
 What is no longer possible is the outcome that actually happened: a real frame being called impossible and
 ending the exchange.
+
+## 32. A control frame arrived and did not match
+
+The duplicate parser is gone and the exchange got further. It did not succeed, but it failed with a census
+rather than a shrug:
+
+```
+asking the firmware for `cur_etheraddr` - 42 byte frame padded to 44, seq 0, request id 1
+no reply to `cur_etheraddr` across 200 reads. 3 frame(s) DID arrive:
+  0 header-only (flow control), 2 on another channel, 1 from another exchange
+```
+
+Read that carefully, because it is a large step forward disguised as a failure:
+
+- **Three frames arrived.** The transport carries frames in both directions. That was never proven before.
+- **Zero were header-only.** So the thing that broke the last boot is not even occurring here - the frames
+  arriving now have real payloads.
+- **Two were on another channel.** Event or data frames. The firmware is volunteering traffic.
+- **One was on the CONTROL channel, long enough to hold a BCDC header, and its request id was not 1.**
+
+Nothing else in this boot issues a BCDC command. **That frame is almost certainly the reply**, and its id is
+being read from somewhere other than where the firmware wrote it.
+
+### Three hypotheses, and the counters distinguish none of them
+
+1. The id is at a different offset within the BCDC header.
+2. The BCDC header does not start where this driver assumes - the reply's `dataoff` is not the 12 a request
+   uses, so `read_frame` hands back bytes that begin somewhere else.
+3. The firmware uses a different id convention than the one `brcmf_proto_bcdc_query_dcmd` implies.
+
+All three produce exactly the line above. The census counts frames; it does not describe them, and that is
+the gap.
+
+### So this boot describes them
+
+For the first four frames of an exchange - whatever channel they arrive on, and **before** any rule decides
+whether they match - the driver now prints the channel, the length, the BCDC fields as this driver would
+decode them, and the leading 32 bytes as hex.
+
+The hex is the part that settles it, because every decoded field above it assumes an offset and the bytes
+assume nothing. `cur_etheraddr` is `BRCMF_C_GET_VAR`, which is **262** - `0x00000106` little-endian, so
+`06 01 00 00`. Wherever that pattern appears in the dump is where the BCDC header actually starts, and the
+answer is then arithmetic rather than a theory. If it appears at offset 0, hypothesis 2 is dead and the id
+field is the problem. If it appears later, hypothesis 2 is right and the offset is measurable directly.
+
+One flash to separate three hypotheses, instead of three flashes to test them in turn. That is the §23
+ladder reasoning, which falsified all three of its own candidates at once and has been the most productive
+single change in this effort.
+
+**Describing happens before the channel check on purpose.** A frame skipped by a rule that is itself wrong
+would otherwise never be seen, which is how the header-only bug survived a whole boot in §31.
+
+**Bounded, because an instrument that floods is not an instrument.** Only the first four frames of an
+exchange are described; a 200-iteration loop that dumped every frame would bury the answer in its own
+output, and a console flood jams the queue the shell reads from.
+
+### Prediction
+
+1. **`06 01 00 00` appears at offset 0** of the control frame, with a readable `len` and `status`, and the id
+   field holds something other than 1. Then the header is where this driver thinks and the id convention or
+   offset is wrong - a one-line fix, and the dump will show which byte pair carries it.
+2. **`06 01 00 00` appears at some other offset** - hypothesis 2. The reply's `dataoff` differs from a
+   request's, and the fix is to honour it rather than assume 12. The offset is read straight off the dump.
+3. **It does not appear at all**, and the control frame is something else entirely - an asynchronous status
+   message the firmware sends unprompted. Then the reply genuinely never came, and the 2 frames on another
+   channel become the interesting ones, because one of them may be carrying it.
+
+In all three cases the next change is determined by the output rather than chosen from a list, which is the
+only thing that has reliably worked here.

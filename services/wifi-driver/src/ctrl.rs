@@ -258,6 +258,13 @@ fn query_iovar(
         match read_frame(h, w, &mut rbuf, ctx) {
             Some((chanflag, len)) => {
                 frames += 1;
+                // DESCRIBE THE FIRST FEW, before any judgement about whether they match. The point is to
+                // find out what the firmware is sending, and a frame skipped by a rule that is itself
+                // wrong would otherwise never be seen.
+                const DUMP_FRAMES: u32 = 4;
+                if frames <= DUMP_FRAMES {
+                    describe_frame(frames, chanflag, &rbuf, len, ctx);
+                }
                 if chanflag & 0x0F != CHANNEL_CONTROL {
                     // An event or a data frame. Not this exchange's business.
                     other_channel += 1;
@@ -309,6 +316,67 @@ fn query_iovar(
         name, REPLY_TRIES, frames, headers_only, other_channel, wrong_id
     ));
     None
+}
+
+/// Describe a frame that arrived, so a mismatch says WHAT it was rather than only that it happened.
+///
+/// The frame census - how many frames arrived, how many matched - is enough to prove the wire works and not
+/// enough to say why a reply was not recognised. Three hypotheses fit "a control frame arrived whose id was
+/// wrong": the id is at a different offset, the BCDC header starts at a different offset, or the firmware
+/// uses a different id convention. This tells them apart in one boot.
+///
+/// Bounded deliberately: the caller prints only the first few frames. A 200-iteration loop that described
+/// every frame would bury the answer in its own output, and a flood jams the console queue.
+fn describe_frame(which: u32, chanflag: u8, buf: &[u8], len: usize, ctx: &ServiceContext) {
+    let channel = chanflag & 0x0F;
+    let kind = match channel {
+        CHANNEL_CONTROL => "CONTROL",
+        1 => "EVENT",
+        2 => "DATA",
+        3 => "GLOM",
+        _ => "(unknown channel)",
+    };
+    ctx.log_fmt(format_args!(
+        "wifi-driver:   frame {}: channel {:#04x} ({}), {} byte(s) after the SDPCM headers",
+        which, chanflag, kind, len
+    ));
+    if len >= DCMD {
+        let cmd = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let dlen = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let flags = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let status = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        ctx.log_fmt(format_args!(
+            "wifi-driver:     read as BCDC: cmd {} len {} flags {:#010x} status {:#010x} -> id {}, \
+             set {}, error {}",
+            cmd,
+            dlen,
+            flags,
+            status,
+            (flags & DCMD_ID_MASK) >> DCMD_ID_SHIFT,
+            flags & DCMD_SET != 0,
+            flags & DCMD_ERROR != 0
+        ));
+    }
+    // THE BYTES THEMSELVES, because every decode above assumes an offset and the bytes assume nothing. If
+    // the header starts elsewhere, `cmd 262` will be visible at some other position here.
+    let show = core::cmp::min(len, 32);
+    let mut i = 0;
+    while i < show {
+        let end = core::cmp::min(i + 8, show);
+        ctx.log_fmt(format_args!(
+            "wifi-driver:     [{:02}] {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            i,
+            buf[i],
+            if i + 1 < end { buf[i + 1] } else { 0 },
+            if i + 2 < end { buf[i + 2] } else { 0 },
+            if i + 3 < end { buf[i + 3] } else { 0 },
+            if i + 4 < end { buf[i + 4] } else { 0 },
+            if i + 5 < end { buf[i + 5] } else { 0 },
+            if i + 6 < end { buf[i + 6] } else { 0 },
+            if i + 7 < end { buf[i + 7] } else { 0 }
+        ));
+        i = end;
+    }
 }
 
 /// Read one frame off function 2, whatever channel it is on.
