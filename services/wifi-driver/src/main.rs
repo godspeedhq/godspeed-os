@@ -45,6 +45,7 @@ mod armcr4;
 mod backplane;
 mod bus;
 mod ctrl;
+mod scan;
 mod firmware;
 mod erom;
 mod host;
@@ -347,7 +348,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // frame sent into a data function that never came up
                                                 // would time out for a reason that has nothing to do
                                                 // with the protocol being built here.
-                                                let _ = ctrl::report_mac(&h, &mut window, &ctx);
+                                                if ctrl::report_mac(&h, &mut window, &ctx) {
+                                                    // ---- Stage 14: scan. -----------------
+                                                    // ONLY ONCE THE CONTROL CHANNEL HAS
+                                                    // ANSWERED. A scan is a set plus a
+                                                    // stream of events, so running it
+                                                    // against a channel that has never
+                                                    // replied would confuse "the scan is
+                                                    // wrong" with "nothing works yet".
+                                                    let _ = scan::run(&h, &mut window, &ctx);
+                                                }
                                             }
                                         }
                                         None => ctx.log(

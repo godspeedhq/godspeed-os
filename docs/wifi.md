@@ -2057,3 +2057,186 @@ backplane read is a single word. A reply header is twelve.
    the framing, an error status at the iovar name, zeros at the payload offset arithmetic.
 
 Outcome 1 is the first moment this is a radio rather than a loaded chip.
+
+## 30. Phase 3 designed at the desk: the event path and `escan`
+
+Written away from the bench, so nothing here is claimed to work. It is the mechanism, read out of the
+references, with the offsets computed from the declarations rather than from memory - and, kept separate
+on purpose, the parts that are **our** design decisions rather than the chip's requirements (§26.14).
+
+### 30.1 A scan is not a request with a reply
+
+Everything the driver does so far is synchronous: send a BCDC command, read the answer. **A scan is not
+that shape.** `escan` is a *set* that returns immediately, and the results arrive afterwards as a stream of
+**events** the firmware sends unprompted. That is the new mechanism in phase 3, and it is the whole reason
+this phase is the one with real unknowns in it.
+
+The SDIO receive path tells the three cases apart by the software header's channel:
+
+```c
+switch (swhdr->chanflag & BWFM_SDIO_SWHDR_CHANNEL_MASK) {
+case BWFM_SDIO_SWHDR_CHANNEL_CONTROL:
+	sc->sc_sc.sc_proto_ops->proto_rxctl(...);
+case BWFM_SDIO_SWHDR_CHANNEL_EVENT:
+case BWFM_SDIO_SWHDR_CHANNEL_DATA:
+	sc->sc_sc.sc_proto_ops->proto_rx(&sc->sc_sc, m, &ml);
+```
+
+So channel 0 is a control reply - what `ctrl.rs` already reads - and channels 1 and 2 are frames. An event
+is a **pseudo-ethernet frame** carrying ethertype `BWFM_ETHERTYPE_LINK_CTL` (`0x886c`), not a bare struct.
+
+### 30.2 The layouts, quoted, and the offsets computed from them
+
+The event frame, from the quoted declarations:
+
+```c
+struct bwfm_ethhdr {
+	uint16_t subtype;  uint16_t length;  uint8_t version;
+	uint8_t oui[3];    uint16_t usr_subtype;
+} __packed;
+
+struct bwfm_event_msg {
+	uint16_t version;  uint16_t flags;    uint32_t event_type;
+	uint32_t status;   uint32_t reason;   uint32_t auth_type;
+	uint32_t datalen;  struct ether_addr addr;
+	char ifname[IFNAMSIZ];  uint8_t ifidx;  uint8_t bsscfgidx;
+} __packed;
+```
+
+| field | offset in frame | how |
+|---|---|---|
+| ethernet destination / source | 0, 6 | `ether_header` is 14 bytes |
+| ethertype (`0x886c`) | 12 | |
+| `bwfm_ethhdr` | 14 | 2+2+1+3+2 = **10 bytes** packed |
+| `bwfm_event_msg` | 24 | 2+2+4+4+4+4+4+6+16+1+1 = **48 bytes** packed |
+| `event_type` | 24 + 4 = **28** | |
+| `status` | **32** | |
+| `datalen` | **44** | |
+| event payload | 24 + 48 = **72** | `datalen` bytes |
+
+Event codes, quoted: `BWFM_E_ESCAN_RESULT = 69`, `BWFM_E_LINK = 16`, `BWFM_E_SET_SSID = 0`,
+`BWFM_E_ASSOC = 7`.
+
+The payload of an escan-result event:
+
+```c
+struct bwfm_escan_results {
+	uint32_t buflen;  uint32_t version;
+	uint16_t sync_id; uint16_t bss_count;
+	struct bwfm_bss_info bss_info[];
+};
+```
+
+so `buflen` at 0, `bss_count` at **10**, and the first `bss_info` at **12**.
+
+And each result, with offsets computed from the quoted declaration (`BWFM_MAX_SSID_LEN 32`,
+`BWFM_MCSSET_LEN 16`):
+
+| field | offset | type |
+|---|---|---|
+| `version` | 0 | `uint32_t` |
+| `length` | **4** | `uint32_t` - **step to the next entry with THIS, never `sizeof`** |
+| `bssid` | **8** | `uint8_t[6]` |
+| `capability` | 16 | `uint16_t` |
+| `ssid_len` | **18** | `uint8_t` |
+| `ssid` | **19** | `uint8_t[32]` |
+| `chanspec` | **72** | `uint16_t` |
+| `rssi` | **78** | `uint16_t` on the wire, read as **signed** dBm |
+| `ie_offset` | 116 | `uint16_t` |
+| `ie_length` | 120 | `uint32_t` |
+| total | 126 | |
+
+**`length` at offset 4 is the one that matters for correctness.** The struct has versions, so iterating by a
+compiled-in `sizeof` would walk off alignment the moment the firmware sends a longer one. The reference's own
+field is the answer, and using it costs nothing.
+
+### 30.3 What to send, values quoted from Linux
+
+```c
+params_le->bss_type = DOT11_BSSTYPE_ANY;
+params_le->scan_type = cpu_to_le32(BRCMF_SCANTYPE_ACTIVE);
+params_le->nprobes = cpu_to_le32(-1);
+params_le->active_time = cpu_to_le32(-1);
+params_le->passive_time = cpu_to_le32(-1);
+params_le->home_time = cpu_to_le32(-1);
+eth_broadcast_addr(params_le->bssid);
+params->action = cpu_to_le16(WL_ESCAN_ACTION_START);
+params->sync_id = cpu_to_le16(0x1234);
+```
+
+set through the iovar `"escan"`. `WL_ESCAN_ACTION_START` is 1, `BWFM_SCANTYPE_ACTIVE` is 0,
+`DOT11_BSSTYPE_ANY` is 2. The `-1`s mean "firmware default", which is what we want: a scan tuned by hand is
+an optimisation of something that does not work yet.
+
+The request struct, offsets computed from OpenBSD's declarations plus the confirmed
+`struct bwfm_ssid { uint32_t len; uint8_t ssid[32]; }` (36 bytes):
+
+| field | offset |
+|---|---|
+| `version` | 0 |
+| `action` | 4 |
+| `sync_id` | 6 |
+| `ssid.len` | 8 |
+| `ssid.ssid[32]` | 12 |
+| `bssid[6]` | **44** |
+| `bss_type` | 50 |
+| `scan_type` | 51 |
+| `nprobes` | 52 |
+| `active_time` | 56 |
+| `passive_time` | 60 |
+| `home_time` | 64 |
+| `channel_num` | 68 |
+| total (no channel list) | **72** |
+
+### 30.4 A conflict between the two references, recorded rather than resolved
+
+OpenBSD declares `uint8_t bss_type; uint8_t scan_type;`. Linux's quoted assignment is
+`params_le->scan_type = cpu_to_le32(BRCMF_SCANTYPE_ACTIVE)` - a **32-bit** store. Those cannot both describe
+the same struct, and the explanation is that **there are versioned variants**: OpenBSD has `bwfm_scan_v0` and
+`bwfm_scan_v2` and dispatches between them, and newer brcmfmac has a v2 params struct too.
+
+This is not resolvable from the desk, so it is written down instead of decided: the plan is **v0, the layout
+quoted above**, because the 43455 with this firmware revision is the older part that OpenBSD's v0 path
+serves. If a scan is accepted and returns no results, **the params version is the first thing to change**,
+not the values. Recorded here so that boot is a two-minute change rather than a fresh investigation
+(§26.7).
+
+### 30.5 The Godspeed half - what we deliberately do NOT borrow
+
+The mechanism above is the firmware's requirement and is copied exactly. Everything in *how Linux organises
+a scan* is that system's answer to that system's constraints, and none of it comes along (§26.14).
+
+| Linux does | Godspeed does | why |
+|---|---|---|
+| Accumulates results in a dynamically grown list | A **fixed array of 32 results**, on the stack, and says loudly when it is full | §26.6.1 - no heap; the bound is readable off the source |
+| Delivers results by callback into `cfg80211` through a workqueue | The driver **reads frames in its own loop**; there is no callback and no work queue | §26.4 - no hidden control flow; and there is no `cfg80211` to deliver to (a stated non-goal, §9) |
+| Keeps scan state in driver-wide structures | Scan state is **owned by the one call doing the scan** | §3.8 - state is explicit and owned |
+| Wakes waiters on an unbounded wait | A **deadline**, and whatever arrived by then is reported as a partial result | §26.6 - every wait is bounded, and a partial answer labelled partial is honest |
+| Returns `-ETIMEDOUT` and discards | Reports **how many events arrived and how many results were kept**, always | §26.7 - a failed recovery stays as visible as the original failure |
+
+The one place this is a genuine judgement rather than a rule: **a scan has a real duration** - the radio must
+dwell on each channel - so a deadline here is not the "wait on time instead of truth" that Commandment VIII
+forbids. The truth being waited on is *the firmware saying the scan is complete* (an escan-result event with
+`status` marking completion); the deadline is the bound underneath it, and which of the two ended the wait is
+printed.
+
+### 30.6 The ladder, because this is three unknowns again
+
+The same discipline as §23, which falsified all three of its hypotheses at once. Three things could be wrong
+here - the event framing offsets, the escan request layout, and the result parsing - so they are separated:
+
+| rung | proves | needs |
+|---|---|---|
+| **A** | An event frame can be received and its header parsed at all - print `event_type`, `status`, `datalen` for **any** event | the §30.2 offsets only |
+| **B** | `escan` is accepted and the firmware answers with `BWFM_E_ESCAN_RESULT` (69) events - count them | the §30.3 layout |
+| **C** | Results parse - print SSID, BSSID, channel, RSSI | the `bss_info` offsets |
+
+Rung A is worth its own flash: it needs no scan at all, and a `BWFM_E_SET_SSID` or link event may well arrive
+unprompted. **A `datalen` consistent with the frame length is the self-check** - if the offsets are wrong,
+`datalen` is nonsense, so the arithmetic checks itself the way the `frmlen ^ cksum` test does.
+
+### 30.7 What this does NOT design
+
+The credential path for phase 4 is still open, and it is the one decision that is genuinely the operator's
+rather than mine - §6 has the question. Nothing in phase 3 touches a secret, which is exactly why §7 put a
+scan before association.

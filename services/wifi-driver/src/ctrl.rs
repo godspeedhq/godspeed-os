@@ -128,10 +128,17 @@ const DCMD_ERROR: u32 = 0x01;
 const DCMD_ID_SHIFT: u32 = 16;
 /// `BCDC_DCMD_ID_MASK`.
 const DCMD_ID_MASK: u32 = 0xFFFF_0000;
+/// `BCDC_DCMD_SET` - the flag that makes a command a write rather than a read.
+const DCMD_SET: u32 = 0x02;
+/// `BRCMF_C_SET_VAR`.
+const SET_VAR: u32 = 263;
 
 /// One control frame, bounded. A `cur_etheraddr` exchange is 48 bytes; 512 is a whole block and covers
 /// every control message this driver sends.
-const FRAME: usize = 512;
+///
+/// Public because the scan path reads frames into a buffer of the same size. Two constants for one wire
+/// limit is the duplicated fact the enforcement layer rejects, and rightly.
+pub const FRAME: usize = 512;
 
 /// The frame FIFO's address: function 2, with the window set to chipcommon, offset 0, wide access.
 fn frame_offset() -> u32 {
@@ -337,6 +344,195 @@ fn query_iovar(
     let n = core::cmp::min(avail, out.len());
     out[..n].copy_from_slice(&body[off..off + n]);
     Some(n)
+}
+
+/// Read one frame off function 2, whatever channel it is on.
+///
+/// Returns `(chanflag, len)`, where `buf[..len]` is the frame **after** the SDIO hardware and software
+/// headers - so for an event that is the pseudo-ethernet frame, starting at its destination address. The
+/// caller decides what the channel means; this function only delivers bytes.
+///
+/// `None` means no frame was there. That is a normal, frequent answer rather than an error: the hardware
+/// header validates itself (`frmlen ^ cksum == 0xFFFF`), so a read that does not validate is how an empty
+/// FIFO looks, and the reference treats it the same way. It is therefore SILENT - logging every empty poll
+/// would bury the frames that do arrive.
+pub fn read_frame(
+    h: &Host,
+    w: &mut Window,
+    buf: &mut [u8; FRAME],
+    ctx: &ServiceContext,
+) -> Option<(u8, usize)> {
+    let mut hdr = [0u32; (HWHDR + SWHDR) / 4];
+    if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
+        return None;
+    }
+    if !sdio::read_extended(
+        h,
+        DATA_FUNC,
+        frame_offset(),
+        &mut hdr,
+        blk_byte_mode((HWHDR + SWHDR) as u32),
+        None,
+        ctx,
+    ) {
+        return None;
+    }
+    let b0 = hdr[0].to_le_bytes();
+    let b1 = hdr[1].to_le_bytes();
+    let frmlen = u16::from_le_bytes([b0[0], b0[1]]);
+    let cksum = u16::from_le_bytes([b0[2], b0[3]]);
+    if frmlen == 0 || (frmlen ^ cksum) != 0xFFFF {
+        return None;
+    }
+    let frmlen = frmlen as usize;
+    let chanflag = b1[1];
+    let dataoff = b1[3] as usize;
+    if frmlen > FRAME || dataoff < HWHDR + SWHDR || dataoff > frmlen {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a frame validated its checksum but describes an impossible shape - frmlen {}, \
+             dataoff {}, channel {:#04x} (headers are {}, buffer is {})",
+            frmlen, dataoff, chanflag, HWHDR + SWHDR, FRAME
+        ));
+        return None;
+    }
+
+    let rest = frmlen - (HWHDR + SWHDR);
+    if rest == 0 {
+        // A header-only frame is legitimate - the chip uses them for flow control - and carries no payload.
+        return Some((chanflag, 0));
+    }
+    let words = (rest + 3) / 4;
+    let mut rbuf = [0u32; FRAME / 4];
+    if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
+        return None;
+    }
+    if !sdio::read_extended(
+        h,
+        DATA_FUNC,
+        frame_offset(),
+        &mut rbuf[..words],
+        blk_byte_mode((words * 4) as u32),
+        None,
+        ctx,
+    ) {
+        return None;
+    }
+    let mut body = [0u8; FRAME];
+    for i in 0..words {
+        body[i * 4..i * 4 + 4].copy_from_slice(&rbuf[i].to_le_bytes());
+    }
+    // `dataoff` is measured from the start of the whole frame; the header read already took the first
+    // twelve bytes, so the payload starts that far into what just arrived.
+    let off = dataoff - (HWHDR + SWHDR);
+    let len = rest - off;
+    buf[..len].copy_from_slice(&body[off..off + len]);
+    Some((chanflag, len))
+}
+
+/// Write an iovar - `BRCMF_C_SET_VAR` with the name, a NUL, and the value.
+///
+/// The wire form of a set is the same frame as a get with `BCDC_DCMD_SET` in the flags; the payload is the
+/// variable's name, NUL-terminated, immediately followed by its value. This is what starts a scan.
+///
+/// The reply is read and its request id checked, because a set that the firmware refuses must not look like
+/// one it accepted (§26.7) - the whole point of asking is to find out.
+pub fn set_iovar(
+    h: &Host,
+    w: &mut Window,
+    name: &str,
+    value: &[u8],
+    ctx: &ServiceContext,
+) -> bool {
+    let mut frame = [0u8; FRAME];
+    let payload = name.len() + 1 + value.len();
+    if PAYLOAD_AT + payload > FRAME {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: setting `{}` would need {} payload bytes, over this driver's {} byte frame",
+            name, payload, FRAME
+        ));
+        return false;
+    }
+    frame[PAYLOAD_AT..PAYLOAD_AT + name.len()].copy_from_slice(name.as_bytes());
+    // The NUL is already in place - the buffer is zeroed.
+    let at = PAYLOAD_AT + name.len() + 1;
+    frame[at..at + value.len()].copy_from_slice(value);
+
+    let len = PAYLOAD_AT + payload;
+    let r = round_to(len);
+    let padded = (len + r - 1) / r * r;
+    let reqid: u16 = 2;
+
+    frame[0..2].copy_from_slice(&(len as u16).to_le_bytes());
+    frame[2..4].copy_from_slice(&(!(len as u16)).to_le_bytes());
+    frame[4] = 0;
+    frame[5] = CHANNEL_CONTROL;
+    frame[7] = PAYLOAD_AT as u8;
+    let flags = ((reqid as u32) << DCMD_ID_SHIFT) | DCMD_SET;
+    frame[HWHDR + SWHDR..HWHDR + SWHDR + 4].copy_from_slice(&SET_VAR.to_le_bytes());
+    frame[HWHDR + SWHDR + 4..HWHDR + SWHDR + 8].copy_from_slice(&(payload as u32).to_le_bytes());
+    frame[HWHDR + SWHDR + 8..HWHDR + SWHDR + 12].copy_from_slice(&flags.to_le_bytes());
+
+    if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
+        return false;
+    }
+    let words = padded / 4;
+    let mut wbuf = [0u32; FRAME / 4];
+    for i in 0..words {
+        wbuf[i] = u32::from_le_bytes([
+            frame[i * 4],
+            frame[i * 4 + 1],
+            frame[i * 4 + 2],
+            frame[i * 4 + 3],
+        ]);
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: setting `{}` - {} byte value, {} byte frame padded to {}",
+        name, value.len(), len, padded
+    ));
+    if !sdio::write_extended(
+        h,
+        DATA_FUNC,
+        frame_offset(),
+        &mut wbuf[..words],
+        blk_byte_mode(padded as u32),
+        None,
+        ctx,
+    ) {
+        return false;
+    }
+
+    // THE REPLY DECIDES. A set whose refusal is discarded is a silent failure, and this one starts a scan -
+    // so "accepted" has to mean the firmware said so.
+    const SET_TRIES: u32 = 200;
+    let mut rbuf = [0u8; FRAME];
+    for _ in 0..SET_TRIES {
+        if let Some((chanflag, len)) = read_frame(h, w, &mut rbuf, ctx) {
+            if chanflag & 0x0F != CHANNEL_CONTROL || len < 16 {
+                continue;
+            }
+            let rflags = u32::from_le_bytes([rbuf[8], rbuf[9], rbuf[10], rbuf[11]]);
+            let status = u32::from_le_bytes([rbuf[12], rbuf[13], rbuf[14], rbuf[15]]);
+            let rid = ((rflags & DCMD_ID_MASK) >> DCMD_ID_SHIFT) as u16;
+            if rid != reqid {
+                continue;
+            }
+            if rflags & DCMD_ERROR != 0 {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: the firmware REFUSED `{}` - status {:#010x} ({})",
+                    name, status, status as i32
+                ));
+                return false;
+            }
+            return true;
+        }
+        ctx.sleep_ms(1);
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: `{}` was sent and the firmware never acknowledged it across {} reads. It is NOT \
+         reported as set, because a set nobody confirmed is indistinguishable from one that was refused",
+        name, SET_TRIES
+    ));
+    false
 }
 
 /// Ask the firmware for its own MAC address - the first thing only a running radio can answer.

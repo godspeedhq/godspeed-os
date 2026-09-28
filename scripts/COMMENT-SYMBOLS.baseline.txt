@@ -304,3 +304,27 @@ bwfm_sdio_backplane                # OpenBSD bwfm - its window setter, the twin 
 BWFM_SDIO_SB_OFT_ADDR_MASK         # OpenBSD bwfm - the 15-bit window offset mask; named OFFSET_MASK here - external, 26.14
 BWFM_SDIO_SB_ACCESS_2_4B_FLAG      # OpenBSD bwfm - the wide-access flag 0x8000; named ACCESS_WIDE here - external, 26.14
 BRCMF_C_SET_VAR                    # Linux brcmfmac fwil.h - 263, writing an iovar; not used yet, cited beside GET_VAR - external, 26.14
+BWFM_ETHERTYPE_LINK_CTL            # OpenBSD bwfm - 0x886c, the ethertype marking a frame as an event rather than traffic; named ETHERTYPE_LINK_CTL here - external, 26.14
+BWFM_E_ASSOC                       # OpenBSD bwfm - event code 7; named code::ASSOC here - external, 26.14
+BWFM_E_ESCAN_RESULT                # OpenBSD bwfm - event code 69, a scan result; named code::ESCAN_RESULT here - external, 26.14
+BWFM_E_LINK                        # OpenBSD bwfm - event code 16; named code::LINK here - external, 26.14
+BWFM_E_SET_SSID                    # OpenBSD bwfm - event code 0; named code::SET_SSID here - external, 26.14
+BWFM_MAX_SSID_LEN                  # OpenBSD bwfm - 32; named MAX_SSID here - external, 26.14
+BWFM_MCSSET_LEN                    # OpenBSD bwfm - 16, the basic_mcs array length; only used to COMPUTE the bss_info offsets - external, 26.14
+BWFM_SCANTYPE_ACTIVE               # OpenBSD bwfm - 0; named SCANTYPE_ACTIVE here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_DATA       # OpenBSD bwfm - SDPCM channel 2; named CHANNEL_DATA here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_EVENT      # OpenBSD bwfm - SDPCM channel 1; named CHANNEL_EVENT here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_MASK       # OpenBSD bwfm - 0x0F, the channel field of the software header; named CHANNEL_MASK here - external, 26.14
+DOT11_BSSTYPE_ANY                  # OpenBSD bwfm - 2, scan for any BSS type; named BSSTYPE_ANY here - external, 26.14
+WL_ESCAN_ACTION_START              # OpenBSD bwfm - 1, start a scan; named ACTION_START here - external, 26.14
+brcmf_escan_prep                   # Linux brcmfmac cfg80211.c - where the scan parameter DEFAULTS are quoted from - external, 26.14
+bwfm_ethhdr                        # OpenBSD bwfm - the 10-byte packed header between the ethernet header and the event message - external, 26.14
+bwfm_event_msg                     # OpenBSD bwfm - the 48-byte packed event message; scan.rs reads it by offset rather than as a struct - external, 26.14
+bwfm_escan_results                 # OpenBSD bwfm - the escan result payload header (buflen/version/sync_id/bss_count) - external, 26.14
+bwfm_bss_info                      # OpenBSD bwfm - the per-network record; scan.rs reads it by offset and steps by its own length field - external, 26.14
+bwfm_scan_params_v0                # OpenBSD bwfm - the v0 scan parameter layout scan.rs builds - external, 26.14
+bwfm_escan_params_v0               # OpenBSD bwfm - version/action/sync_id wrapping the v0 scan params - external, 26.14
+bwfm_ssid                          # OpenBSD bwfm - u32 len plus a 32-byte array, 36 bytes, which fixes every offset after it - external, 26.14
+channel_num                        # OpenBSD bwfm scan params field - 0 means every channel; scan.rs names the offset req::CHANNEL_NUM - external, 26.14
+ether_header                       # the standard 14-byte BSD ethernet header struct, which an event frame begins with; scan.rs reads it by offset - external, 26.14
+sync_id                            # OpenBSD bwfm scan params/result field, echoed back in every result; scan.rs names the constant SYNC_ID and the offset req::SYNC_ID - external, 26.14

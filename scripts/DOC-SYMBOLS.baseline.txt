@@ -70,3 +70,12 @@ DATA_TIMEOUT                       # SDHCI SPEC interrupt-status bit 20 - this d
 WRITE_TRANSFER_ACTIVE              # SDHCI SPEC present-state bit 8 - this driver has no constant for it and reads it only as part of the measured STATUS word; cited by its spec name where that word is decoded - external, 26.14
 brcmf_sdio_download_firmware       # Linux brcmfmac sdio.c - the whole download sequence; cited as where to look next if the reset vector proves necessary but not sufficient - external, 26.14
 BRCMF_C_UP                         # Linux brcmfmac fwil.h - 2, the dongle command that brings the firmware up; not implemented here, cited as what to read next if the firmware does not answer a query - external, 26.14
+active_time                        # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+bss_type                           # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+home_time                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+passive_time                       # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+scan_type                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+ie_length                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+ie_offset                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+bwfm_scan_v0                       # OpenBSD bwfm - the v0 scan path this driver targets; cited in the recorded v0-vs-v2 conflict - external, 26.14
+bwfm_scan_v2                       # OpenBSD bwfm - the v2 scan path, the first thing to try if a v0 scan returns nothing - external, 26.14
