@@ -168,16 +168,36 @@ const CMD_SET_AP: u32 = 118;
 /// the interface was up) and `-24` (`BCME_BADLEN`, which is what the firmware said when a wrong `dataoff`
 /// made it read an iovar name as a header).
 fn err_name(status: i32) -> &'static str {
+    // Indices 0-25, each quoted WITH its index comment from the reference table. Two fetches of that table
+    // disagreed by one about where NOTREADY sits (25 or 26), so the three entries past 25 that were here are
+    // gone: a wrong name is worse than a number, and the number still prints.
     match -status {
         0 => "BCME_OK",
         1 => "BCME_ERROR",
         2 => "BCME_BADARG",
         3 => "BCME_BADOPTION",
         4 => "BCME_NOTUP - the interface is down; BRCMF_C_UP must be issued first",
+        5 => "BCME_NOTDOWN",
+        6 => "BCME_NOTAP",
+        7 => "BCME_NOTSTA",
+        8 => "BCME_BADKEYIDX",
+        9 => "BCME_RADIOOFF",
+        10 => "BCME_NOTBANDLOCKED",
+        11 => "BCME_NOCLK",
+        12 => "BCME_BADRATESET",
+        13 => "BCME_BADBAND",
+        14 => "BCME_BUFTOOSHORT",
+        15 => "BCME_BUFTOOLONG",
+        16 => "BCME_BUSY",
+        17 => "BCME_NOTASSOCIATED",
+        18 => "BCME_BADSSIDLEN",
+        19 => "BCME_OUTOFRANGECHAN",
+        20 => "BCME_BADCHAN",
+        21 => "BCME_BADADDR",
+        22 => "BCME_NORESOURCE",
+        23 => "BCME_UNSUPPORTED - this firmware does not take that command or iovar in that form",
         24 => "BCME_BADLEN",
-        26 => "BCME_NOTREADY",
-        27 => "BCME_EPERM",
-        28 => "BCME_NOMEM",
+        25 => "BCME_NOTREADY",
         _ => "(not a code this driver names)",
     }
 }

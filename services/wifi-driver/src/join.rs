@@ -70,6 +70,28 @@ const WPA2_AUTH_PSK: u32 = 0x0080;
 const AES_ENABLED: u32 = 0x0004;
 /// `brcmf_set_auth_type`, open system: `val = 0`.
 const AUTH_OPEN_SYSTEM: u32 = 0;
+/// The firmware supplicant switch, in the form THIS firmware accepts.
+///
+/// The plain `sup_wpa` iovar - Linux's `brcmf_fil_iovar_int_set(ifp, "sup_wpa", 1)` - was refused with
+/// `BCME_UNSUPPORTED` (-23), three times out of three, on hardware. cyw43-driver, written for this firmware
+/// family, uses the bsscfg-indexed form:
+///
+/// ```c
+/// cyw43_write_iovar_u32_u32(self, "bsscfg:sup_wpa", 0, auth_type == 0 ? 0 : 1, WWD_STA_INTERFACE);
+/// ```
+///
+/// whose payload is the name, its NUL, then two little-endian u32s - the bsscfg INDEX first, the VALUE
+/// second:
+///
+/// ```c
+/// cyw43_put_le32(buf + len, val0);
+/// cyw43_put_le32(buf + len + 4, val1);
+/// ```
+///
+/// Index 0 is the primary interface; value 1 turns the supplicant on. `set_iovar` writes the name and NUL and
+/// then this value verbatim, which is exactly that layout.
+const SUP_WPA_ON: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
+
 /// `BRCMF_WSEC_PASSPHRASE` - `BIT(0)`; cyw43 writes it as `1`.
 const WSEC_PASSPHRASE: u16 = 1;
 /// `CYW43_WPA_MAX_PASSWORD_LEN`.
@@ -115,7 +137,7 @@ pub fn join(
     if !ctrl::set_cmd_int(h, w, s, CMD_SET_WPA_AUTH, WPA2_AUTH_PSK, "wpa_auth WPA2-PSK", ctx)
         || !ctrl::set_cmd_int(h, w, s, CMD_SET_AUTH, AUTH_OPEN_SYSTEM, "auth open-system", ctx)
         || !ctrl::set_cmd_int(h, w, s, CMD_SET_WSEC, AES_ENABLED, "wsec AES", ctx)
-        || !ctrl::set_iovar(h, w, s, "sup_wpa", &1u32.to_le_bytes(), ctx)
+        || !ctrl::set_iovar(h, w, s, "bsscfg:sup_wpa", &SUP_WPA_ON, ctx)
     {
         return Outcome::Failed;
     }
