@@ -259,12 +259,20 @@ fn frame_offset() -> u32 {
 ///
 /// `round_to` already pads anything over 512 to a multiple of 512 - that is the reference's own rule - so a
 /// large frame is block-aligned before it gets here and only needs asking for correctly.
-fn transfer_mode(padded: usize) -> (u32, Option<u32>) {
-    if padded > DATA_BLOCK as usize {
-        let blocks = (padded as u32) / DATA_BLOCK as u32;
-        (blk_block_mode(blocks, DATA_BLOCK as u32), Some(blocks))
+fn transfer_mode(bytes: usize) -> (u32, Option<u32>, usize) {
+    if bytes > DATA_BLOCK as usize {
+        // ROUNDED UP. Block mode cannot express a partial block, and a frame is not a block multiple: a
+        // 1436-byte body is 2.8 blocks, and `bytes / DATA_BLOCK` truncates to 2 and silently loses 412
+        // bytes. So this asks for three and the caller uses what it needs.
+        let block = DATA_BLOCK as usize;
+        let blocks = ((bytes + block - 1) / block) as u32;
+        (
+            blk_block_mode(blocks, DATA_BLOCK as u32),
+            Some(blocks),
+            blocks as usize * block,
+        )
     } else {
-        (blk_byte_mode(padded as u32), None)
+        (blk_byte_mode(bytes as u32), None, bytes)
     }
 }
 
@@ -351,7 +359,10 @@ fn query_iovar(
         "wifi-driver: asking the firmware for `{}` - {} byte frame padded to {}, seq {}, request id {}",
         name, len, padded, frame[4], reqid
     ));
-    let (blk, blocks) = transfer_mode(padded);
+    // The third value is what the controller will actually move. For a write `round_to` has already
+    // padded to a block multiple, so it equals `padded` - guaranteed by one function now rather than
+    // assumed by two.
+    let (blk, blocks, _moved) = transfer_mode(padded);
     if !sdio::write_extended(
         h,
         DATA_FUNC,
@@ -614,7 +625,18 @@ pub fn read_frame(
             len: 0,
         });
     }
-    let words = (rest + 3) / 4;
+    // BLOCK MODE OVER 512 BYTES, rounded up. A frame body is not a block multiple, so this may read more
+    // than the frame holds; only `rest` bytes are used. Byte mode here carried 1436 bytes with a nine-bit
+    // count field and the controller errored without ever starting a data phase.
+    let (blk, blocks, moved) = transfer_mode(rest);
+    let words = moved / 4;
+    if words > FRAME / 4 {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a {} byte frame body rounds to {} bytes, over this driver's {} byte buffer",
+            rest, moved, FRAME
+        ));
+        return None;
+    }
     let mut rbuf = [0u32; FRAME / 4];
     if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
         return None;
@@ -624,8 +646,8 @@ pub fn read_frame(
         DATA_FUNC,
         frame_offset(),
         &mut rbuf[..words],
-        blk_byte_mode((words * 4) as u32),
-        None,
+        blk,
+        blocks,
         ctx,
     ) {
         return None;
@@ -634,6 +656,7 @@ pub fn read_frame(
     for i in 0..words {
         body[i * 4..i * 4 + 4].copy_from_slice(&rbuf[i].to_le_bytes());
     }
+    // Everything past `rest` is over-read from rounding to a whole block and is not part of this frame.
     // THE WHOLE BODY GOES IN `buf`, and the Frame says where the payload is inside it. The reader used to
     // slice here and hand back only the payload, discarding the bytes before `dataoff` - which are exactly
     // the ones needed to explain a frame that does not parse.
@@ -755,7 +778,10 @@ pub fn set_cmd(
          request id {}",
         what, cmd, payload, len, padded, frame[4], reqid
     ));
-    let (blk, blocks) = transfer_mode(padded);
+    // The third value is what the controller will actually move. For a write `round_to` has already
+    // padded to a block multiple, so it equals `padded` - guaranteed by one function now rather than
+    // assumed by two.
+    let (blk, blocks, _moved) = transfer_mode(padded);
     if !sdio::write_extended(
         h,
         DATA_FUNC,
