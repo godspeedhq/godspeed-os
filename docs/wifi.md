@@ -1788,3 +1788,152 @@ address 0`. Then:
 
 Outcome 1 is still not a working radio. It is a chip that has booted its own firmware with nothing yet
 talking to it.
+
+## 27. Phase 2 complete - the radio is running its own firmware
+
+The reset vector was the last missing step, and the chip confirmed it on the first read:
+
+```
+reset vector 0xb83ef198 (the image's first four bytes) going to backplane address 0
+  - the CR4 fetches from there on release, not from 0x198000
+reset vector written - 4 bytes to 0x000000 in 1 command(s)
+releasing the ARM
+core wrapper 0x18102000 out of reset: RESETCTRL 0x00000000, IOCTRL 0x00000001
+  - CORE RUNNING, CPU EXECUTING
+THE FIRMWARE IS ALIVE - it overwrote our NVRAM token with 0x00201cc0 after 1 read(s),
+  and its shared structure reports flags 0x00000001 (SDPCM version 1, up to 3 understood)
+PHASE 2 COMPLETE
+```
+
+**Why this is evidence and not a claim.** The value that changed was a token *this driver wrote* -
+`0xfe4b01b4`, the NVRAM length the firmware needed in order to find its own calibration - so nothing else in
+the system could have produced the change. It changed to `0x00201cc0`, inside the chip's RAM
+(`0x198000..0x260000`), which the check range-tests before believing. Reading `flags` at that address gave
+`0x00000001`: SDPCM version 1, with no trap or assert bits set. And it happened on the **first** read,
+needing none of the twenty bounded retries.
+
+Two independent windowed reads are in the log with their readbacks verified - the window to `0x258000` for
+the token at `0x25FFFC`, then to `0x200000` for `flags` at `0x201cc0`.
+
+### Where phase 2 stands, as measured
+
+| fact | value |
+|------|-------|
+| chip | `0x4345` rev 6 pkg 2, identified from its own silicon |
+| firmware | `brcmfmac43455-sdio`, chosen from brcmfmac's revision bitmask |
+| image | 609,309 bytes to `0x198000` in 596 commands |
+| NVRAM | 2,074 bytes of text stripped to 1,748, at `0x25f92c..0x260000` |
+| reset vector | `0xb83ef198` to backplane address 0 |
+| ARM CR4 | rev 9 at `0x18002000`, wrapper `0x18102000` (derived, self-checked) |
+| TCM | 800 KiB in 8 banks |
+| shared structure | `0x00201cc0`, flags `0x00000001` |
+| upload time | about 1.13 s |
+
+### The scoreboard on method, since it is the point
+
+Seven boots from the first upload attempt to a running firmware. What each one cost is worth recording,
+because the pattern is one-sided:
+
+- **One boot lost to theorising.** Section 22 reasoned from the symptom to a per-block FIFO fix. The fix was a
+  real latent bug and kept, but it was not the cause, and the failure message had said so all along.
+- **Every fix that worked came from a quoted source.** The halt level from `brcmf_chip_disable_arm`'s CR4
+  branch; the liveness test from the reference's own comment; the reset vector from OpenBSD's `bwfm` after
+  Linux's `sdio.c` truncated three times.
+- **The one instrument change was worth three boots.** The ladder was built to choose between three
+  candidates and instead falsified all three at once, because it reproduced the failure in the simplest mode.
+  A bisection that eliminates every hypothesis is more useful than a fix that confirms one.
+- **Three stale log messages** were found and corrected, each asserting a state rather than reporting one it
+  had read. That class of bug is now named rather than treated as three accidents.
+
+### What is NOT done
+
+There is no control channel, so nothing has asked the firmware anything. `wifi list` cannot work and the
+shell still answers `unavailable`. A chip running its own firmware is not a usable radio; it is a
+prerequisite.
+
+Phase 3 is that conversation: enable SDIO function 2, bring the chip to its HT clock, and speak SDPCM/BCDC
+over it. The first verifiable result will be a value only the firmware can supply - its own MAC address.
+
+## 28. Stage 12 - the bus, and a limitation that was never real
+
+Phase 3 begins with the four steps between a running firmware and a bus that could carry a frame. All four
+come from OpenBSD's `bwfm`, quoted:
+
+```c
+bwfm_sdio_clkctl(sc, CLK_AVAIL, 0);
+bwfm_sdio_write_1(sc, BWFM_SDIO_FUNC1_CHIPCLKCSR, clk |
+    BWFM_SDIO_FUNC1_CHIPCLKCSR_FORCE_HT);
+bwfm_sdio_dev_write(sc, SDPCMD_TOSBMAILBOXDATA,
+    SDPCM_PROT_VERSION << SDPCM_PROT_VERSION_SHIFT);
+sdmmc_io_set_blocklen(sc->sc_sf[2], 512);
+sdmmc_io_function_enable(sc->sc_sf[2])
+```
+
+with the offsets and values from its header:
+
+```c
+#define SDPCM_PROT_VERSION			4
+#define SDPCM_PROT_VERSION_SHIFT		16
+#define SDPCMD_INTSTATUS			0x020
+#define SDPCMD_TOSBMAILBOXDATA			0x048
+```
+
+That header also gave the `CHIPCLKCSR` bits - `FORCE_ALP 0x01`, `FORCE_HT 0x02`, `ALP_AVAIL_REQ 0x08`,
+`HT_AVAIL_REQ 0x10`, `ALP_AVAIL 0x40`, `HT_AVAIL 0x80` - which **match this driver's `clk` module exactly**.
+A third independent confirmation of the constants that cost six boots to get right in section 19.
+
+### Every step is checked by something the chip says
+
+1. **The HT clock.** The whole upload ran on ALP, the low-power clock the backplane needed. Frames need HT.
+   Confirmed by `CHIPCLKCSR` reporting `HT_AVAIL` (0x80) - the chip saying the clock is up, not that the
+   request was accepted - and `FORCE_HT` is written only after that, which is the reference's order.
+2. **The SDIO core's `INTSTATUS`, cleared**, discarding bits the firmware's own start-up left set.
+3. **The protocol version to the mailbox**: `4 << 16` = `0x0004_0000`.
+4. **Function 2**, at 512-byte blocks, checked by the `IOR` ready bit that `enable_function` already polls.
+
+The HT clock is **reported but not required**. The entire upload ran on ALP, so a chip that will not raise HT
+is degraded rather than dead, and refusing to continue would erase that distinction. Function 2 coming ready
+is required, because it is the one outcome that makes a frame possible.
+
+### Two version numbers that are not the same number
+
+The firmware reported shared-structure **version 1**; the host announces protocol **version 4**. Those are
+the shared-memory *layout* version and the *framing* protocol version, and nothing but the names suggests
+they should agree. Recorded because conflating them is a mistake available to the next reader for free.
+
+### A limitation I recorded that the log had already disproved
+
+Section 26 omitted the `INTSTATUS` clear and justified it: *"the EROM walk has not identified the SDIOD
+core's base."* **That was false when it was written.** The same boot log contains:
+
+```
+core 0x829 rev 21  base 0x18004000 wrap 0x18104000  SDIO device
+```
+
+The walk found it, `core_id::SDIO_DEV` already existed, and the driver printed its name. What was actually
+true is narrower and duller: the walk found the core and **nothing held on to it**, because `Cores` kept only
+`arm` and `mem`. I reached for a limitation instead of checking, and §26.7 is explicit that a recorded gap is
+supposed to be a real one - a false limitation is worse than an unrecorded one, because the next reader
+believes it and stops looking.
+
+`Cores` now keeps `sdiod`, the clear is implemented where the reference puts it, and the note in `upload.rs`
+is corrected at the point it was made rather than quietly deleted.
+
+That is the fourth self-contradicting statement in this effort, and the first three all had the same
+shape - a message asserting a state instead of reporting a read one. This one is the same error one level
+up: **a claim about the system made without querying the system.** The instrument was right there in the log.
+
+### Prediction
+
+1. **The bus comes up.** `CHIPCLKCSR` gains `HT_AVAIL`, the mailbox write succeeds, and function 2 reports
+   ready - `the bus is up for frames - function 2 ready at 512 bytes a block`. Then the next step is the
+   SDPCM and BCDC headers, and the first thing worth asking the firmware is its own MAC address.
+2. **HT never arrives.** The line says so and the bus continues on ALP, which is what carried 609 KB, so
+   function 2 should still come ready. A degraded-but-working bus is a legitimate outcome here, not a
+   failure.
+3. **Function 2 never reports ready.** Then the data path is the problem while the firmware and backplane are
+   demonstrably fine, and the next reads are whether the firmware must be given something more before it
+   enables its own data function - the SDPCM shared structure's other fields become relevant, and this
+   driver can already reach them at `0x201cc0`.
+
+None of these sends a frame. This stage ends with a bus that could carry one.

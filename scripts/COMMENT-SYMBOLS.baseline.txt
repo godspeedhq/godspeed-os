@@ -279,3 +279,10 @@ bwfm_sdio_buscore_activate         # OpenBSD bwfm (clean-room brcmfmac reimpleme
 bwfm_sdio_ram_read_write           # OpenBSD bwfm - its windowed backplane write, the twin of brcmf_sdiod_ramrw; cited in the quoted reset-vector call - external, 26.14
 bwfm_chip_set_active               # OpenBSD bwfm - passes *(uint32_t *)ucode, confirming the reset vector is the image first four bytes - external, 26.14
 BWFM_SDPCMD_INTSTATUS              # OpenBSD bwfm - the SDIO device core INTSTATUS the reference clears first; deliberately NOT written here (this driver is polled) - external, 26.14
+SDPCMD_INTSTATUS                   # OpenBSD bwfm - offset 0x020 in the SDIO device core register block; this driver names it sdpcmd::INTSTATUS - external, 26.14
+SDPCMD_TOSBMAILBOXDATA             # OpenBSD bwfm - offset 0x048, the host-to-chip mailbox; this driver names it sdpcmd::TOSBMAILBOXDATA - external, 26.14
+SDPCM_PROT_VERSION                 # OpenBSD bwfm - 4, the SDPCM FRAMING version the host announces (not the shared-structure layout version); named PROT_VERSION here - external, 26.14
+SDPCM_PROT_VERSION_SHIFT           # OpenBSD bwfm - 16, the shift for the mailbox word; named PROT_VERSION_SHIFT here - external, 26.14
+sdmmc_io_set_blocklen              # OpenBSD sdmmc core - sets a function block size; the twin of this driver set_block_size, cited in the quoted bring-up sequence - external, 26.14
+sdmmc_io_function_enable           # OpenBSD sdmmc core - enables an SDIO function; the twin of this driver enable_function - external, 26.14
+bwfm_sdio_clkctl                   # OpenBSD bwfm - its clock request helper, the source of the HT-clock step in bus::ht_clock - external, 26.14

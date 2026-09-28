@@ -45,7 +45,7 @@ use crate::host::Host;
 use crate::sdio;
 
 /// Function 1's own control registers. Above the window, so reaching them never disturbs it.
-mod f1 {
+pub mod f1 {
     /// Backplane window, address bits [15:8].
     pub const SBADDRLOW: u32 = 0x1_000A;
     /// Backplane window, address bits [23:16].
@@ -63,7 +63,7 @@ mod f1 {
 }
 
 /// `CHIPCLKCSR` bits. Only the four this step uses are named.
-mod clk {
+pub mod clk {
     /// **Force the ALP clock ON**, as opposed to merely requesting that it become available. Part of
     /// `INIT` below, and the bit whose absence stalled every backplane read.
     pub const FORCE_ALP: u8 = 0x01;

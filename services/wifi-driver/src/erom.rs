@@ -184,6 +184,14 @@ pub struct Cores {
     pub arm: Option<Core>,
     /// The memory core the firmware is written into, if there is one.
     pub mem: Option<Core>,
+    /// The SDIO device core (`0x829`), whose register block carries `INTSTATUS` and the host-to-chip
+    /// mailbox the firmware reads its protocol version from.
+    ///
+    /// The walk already FOUND and NAMED this core - `core 0x829 rev 21 base 0x18004000` is in every boot
+    /// log. Nothing held on to it, and `docs/wifi.md` §26 then recorded "the EROM walk has not identified
+    /// the SDIOD core's base" as a limitation, which the same log disproved. Kept now, so the claim cannot
+    /// be made again.
+    pub sdiod: Option<Core>,
     /// How many cores the table described in total.
     pub count: u32,
     /// `(id, base, wrapper AS PUBLISHED)` for each core found, for the derivation self-check.
@@ -339,6 +347,7 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
     let mut out = Cores {
         arm: None,
         mem: None,
+        sdiod: None,
         count: 0,
         seen: [(0, 0, 0); MAX_CORES as usize],
     };
@@ -418,6 +427,9 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
         }
         if out.mem.is_none() && (id == core_id::INTERNAL_MEM || id == core_id::SYS_MEM) {
             out.mem = Some(core);
+        }
+        if out.sdiod.is_none() && id == core_id::SDIO_DEV {
+            out.sdiod = Some(core);
         }
     }
 

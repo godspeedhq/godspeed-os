@@ -43,6 +43,7 @@
 mod aicore;
 mod armcr4;
 mod backplane;
+mod bus;
 mod firmware;
 mod erom;
 mod host;
@@ -330,6 +331,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         "wifi-driver: PHASE 2 COMPLETE - firmware and NVRAM are in the \
                                          chip and its processor is running them",
                                     );
+
+                                    // ---- Stage 12: bring the bus up for frames. -----------------------
+                                    // ONLY REACHED WITH A CONFIRMED-RUNNING FIRMWARE, because `upload::run`
+                                    // ends by asking the chip rather than by asserting. Enabling a data
+                                    // function against a dead firmware would produce a bus that looks
+                                    // ready and answers nothing, which is the failure mode this driver
+                                    // keeps refusing to build.
+                                    match cores.as_ref().and_then(|c| c.sdiod.as_ref()) {
+                                        Some(sdiod) => {
+                                            let _ = bus::bring_up(
+                                                &h, &mut window, sdiod.base, &ctx,
+                                            );
+                                        }
+                                        None => ctx.log(
+                                            "wifi-driver: the EROM described no SDIO device core, so \
+                                             there is no mailbox to announce the protocol version to - \
+                                             the bus cannot be brought up for frames",
+                                        ),
+                                    }
                                 } else {
                                     ctx.log(
                                         "wifi-driver: the upload did not complete. Everything through \

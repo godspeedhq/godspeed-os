@@ -513,11 +513,12 @@ pub fn run(
     //    ORDER IS THE REFERENCE'S: `brcmf_chip_cr4_set_active` calls `activate(..., rstvec)` and only THEN
     //    `resetcore(core, ARMCR4_BCMA_IOCTL_CPUHALT, 0, 0)`, so this happens before the release below.
     //
-    //    DIVERGENCE, recorded rather than dropped (§26.14): the reference first clears the SDIO device
-    //    core's `INTSTATUS` with `0xFFFFFFFF`. That is housekeeping for an interrupt path this driver does
-    //    not have - every transfer here is polled - and stale bits in a register nobody reads cannot
-    //    affect it. Omitted deliberately; it becomes required the moment this driver takes SDIO
-    //    interrupts.
+    //    DIVERGENCE, corrected: the reference first clears the SDIO device core's `INTSTATUS` with
+    //    `0xFFFFFFFF`. This was originally skipped here on the stated grounds that the EROM walk had not
+    //    identified the SDIOD core's base - which was simply FALSE, and the same boot log disproved it
+    //    (`core 0x829 rev 21 base 0x18004000 wrap 0x18104000 SDIO device`). The walk found it and this
+    //    driver even printed its name. The clear now happens in `bus::bring_up`, where the reference also
+    //    puts it: immediately before the protocol version goes to the mailbox.
     if firmware::IMAGE.len() < 4 {
         ctx.log("wifi-driver: the embedded image is too short to contain a reset vector");
         return false;
