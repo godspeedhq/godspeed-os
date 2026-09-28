@@ -226,3 +226,9 @@ bp_addrlow                         # brcm80211 struct chipcregs field at 0xD0 - 
 bp_addrhigh                        # struct chipcregs field at 0xD4 - as above
 bp_data                            # struct chipcregs field at 0xD8 - as above
 DMP_COMP_REVISION                  # Linux brcmfmac chip.c mask name, cited because ours is suffixed _MASK to avoid colliding with cccr::REVISION - external, 26.14
+brcmf_chip_disable_arm             # Linux brcmfmac chip.c - the CR4/CA7 path reads wrapbase + BCMA_IOCTL, which is WHY a wrapper of 0 blocks the upload - external, 26.14
+brcmf_chip_ai_coredisable          # Linux brcmfmac chip.c - computes wrapbase + BCMA_RESET_CTL and + BCMA_IOCTL throughout - external, 26.14
+brcmf_chip_ai_resetcore            # Linux brcmfmac chip.c - as above; both are why wrapbase is load-bearing rather than informational
+brcmf_chip_add_core                # Linux brcmfmac chip.c - stores a wrapbase of 0 with NO validation, so the reference relies on the EROM supplying one
+BCMA_IOCTL                         # BCMA SPEC register offset inside a core wrapper (io control); external, named as the reference does
+BCMA_RESET_CTL                     # BCMA SPEC register offset inside a core wrapper (reset control); external, named as the reference does

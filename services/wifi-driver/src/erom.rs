@@ -171,6 +171,15 @@ fn get_regaddr(h: &Host, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> 
         *at -= 4;
         return None;
     };
+    // WHICH WRAPPER TYPE THIS ENTRY IS LOOKING FOR, said out loud. A leading `MASTER_PORT` descriptor
+    // means the wrapper will be published as a MASTER wrapper; a leading `ADDRESS` means a SLAVE one. An
+    // entry that publishes the other kind yields a wrapper of 0, and distinguishing that from a walk that
+    // skipped one is exactly why this and the per-descriptor lines below exist.
+    ctx.log_fmt(format_args!(
+        "wifi-driver:     entry opens with {}, so the wrapper must be a {} wrapper",
+        if wraptype == slave::TYPE_MWRAP { "MASTER_PORT" } else { "ADDRESS" },
+        if wraptype == slave::TYPE_MWRAP { "MASTER" } else { "SLAVE" }
+    ));
 
     let mut regbase = 0u32;
     let mut wrapbase = 0u32;
@@ -203,6 +212,31 @@ fn get_regaddr(h: &Host, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> 
             get_desc(h, w, at, ctx)?;
         }
         let sztype = (val & slave::SIZE_TYPE) >> slave::SIZE_TYPE_S;
+        let stype_raw = (val & slave::TYPE) >> slave::TYPE_S;
+        // RAW AND DECODED, both, and BOUNDED so a malformed table cannot flood the console. This is the
+        // measurement that says whether a missing wrapper is absent from the chip's table or was skipped
+        // by this walk - the two have different fixes and a zero in a summary line cannot tell them apart.
+        if seen <= 6 {
+            ctx.log_fmt(format_args!(
+                "wifi-driver:     addr desc {:#010x}: base {:#010x} type {} ({}) size {} ({})",
+                val,
+                val & slave::ADDR_BASE,
+                stype_raw,
+                match stype_raw {
+                    0 => "slave",
+                    1 => "bridge",
+                    2 => "swrap",
+                    _ => "mwrap",
+                },
+                sztype,
+                match sztype {
+                    0 => "4K",
+                    1 => "8K",
+                    2 => "16K",
+                    _ => "described separately",
+                }
+            ));
+        }
         if sztype == slave::SIZE_DESC {
             let (szd, _) = get_desc(h, w, at, ctx)?;
             if szd & desc::ADDRSIZE_GT32 != 0 {
@@ -335,6 +369,21 @@ impl Cores {
     /// Say what the table means for the upload, in the terms the next step needs.
     pub fn report(&self, ctx: &ServiceContext) {
         match self.arm {
+            // A WRAPPER OF 0 IS A BLOCKER, not a cosmetic gap, and it is said so here rather than left
+            // as a zero in a table. Read from the reference: `brcmf_chip_disable_arm` takes the CR4 path
+            // through `read32(cpu->wrapbase + BCMA_IOCTL)`, and `brcmf_chip_ai_coredisable` /
+            // `brcmf_chip_ai_resetcore` compute `wrapbase + BCMA_RESET_CTL` and `wrapbase + BCMA_IOCTL`
+            // throughout. `brcmf_chip_add_core` stores a zero with no validation, so the reference
+            // simply relies on the EROM supplying one - with 0 those accesses land at address 0x0.
+            Some(c) if c.wrap == 0 => ctx.log_fmt(format_args!(
+                "wifi-driver: the ARM core is {} rev {} at {:#010x} but its WRAPPER IS 0, which \
+                 blocks the firmware upload: the core is halted and reset through `wrapbase + \
+                 BCMA_IOCTL` and `wrapbase + BCMA_RESET_CTL`, so there is no address to write. \
+                 The address descriptors dumped above say whether the chip published one",
+                core_id::name(c.id).unwrap_or("?"),
+                c.rev,
+                c.base
+            )),
             Some(c) => ctx.log_fmt(format_args!(
                 "wifi-driver: the ARM core is {} rev {} at {:#010x}, wrapper {:#010x} - the firmware \
                  is loaded the way that core wants it, and the wrapper is where it is halted",
