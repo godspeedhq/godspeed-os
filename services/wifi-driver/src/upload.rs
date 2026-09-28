@@ -19,7 +19,7 @@
 //!
 //! `Window::set` already caches, so a window write only costs commands when the window actually moves.
 //!
-//! **And it must be BLOCK mode, for an arithmetic reason.** A byte-mode CMD53 carries at most 512 bytes, and
+//! **And it must be F1_BLOCK mode, for an arithmetic reason.** A byte-mode CMD53 carries at most 512 bytes, and
 //! the `write32` this driver had moves four - 609 KB that way is about 152,000 transactions. Block mode
 //! moves `blocks x 64` bytes in one command, so a 2 KiB chunk is one transaction and the whole image is
 //! about 300. Function 1's 64-byte block size was set in step 2 for exactly this.
@@ -63,11 +63,11 @@ use crate::host::{blk_block_mode, blk_byte_mode, Host};
 use crate::sdio;
 
 /// Function 1's block size, as set in step 2 and as `SDIO_FUNC1_BLOCKSIZE` in brcmfmac.
-const BLOCK: usize = 64;
+const F1_BLOCK: usize = 64;
 
 /// How much is moved per CMD53. Sixteen blocks, so the whole image is about 600 transactions rather than
 /// 152,000 - and 1 KiB of stack for the word-aligned copy, which is bounded and visible (§26.6.1).
-const CHUNK: usize = 16 * BLOCK;
+const CHUNK: usize = 16 * F1_BLOCK;
 
 /// The backplane window, from `SBSDIO_SB_OFT_ADDR_MASK` being `0x07FFF`.
 const WINDOW: u32 = 0x8000;
@@ -100,9 +100,9 @@ pub fn write_bytes(
 
         // Whole blocks where possible; the tail goes byte mode, which is what `sdio_io_rw_ext_helper` does
         // (block mode for the bulk, byte mode for the remainder).
-        let (n, blocks) = if want >= BLOCK {
-            let blocks = want / BLOCK;
-            (blocks * BLOCK, blocks)
+        let (n, blocks) = if want >= F1_BLOCK {
+            let blocks = want / F1_BLOCK;
+            (blocks * F1_BLOCK, blocks)
         } else {
             (want, 0)
         };
@@ -128,7 +128,7 @@ pub fn write_bytes(
         let win_off = (at & (WINDOW - 1)) | WINDOW; // the wide-access flag, as every backplane access needs
         let ok = if blocks > 0 {
             sdio::write_extended(h, 1, win_off, &mut buf[..words],
-                                 blk_block_mode(blocks as u32, BLOCK as u32),
+                                 blk_block_mode(blocks as u32, F1_BLOCK as u32),
                                  Some(blocks as u32), ctx)
         } else {
             sdio::write_extended(h, 1, win_off, &mut buf[..words],
@@ -237,7 +237,7 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
 /// | rung | mode  | MULTI | blocks | means, if this is the first to fail             |
 /// |------|-------|-------|--------|--------------------------------------------------|
 /// | 1    | byte  | no    | -      | the bus or the window is wrong, not block mode    |
-/// | 2    | block | no    | 1      | the 64-byte BLOCK SIZE is the problem             |
+/// | 2    | block | no    | 1      | the 64-byte F1_BLOCK SIZE is the problem             |
 /// | 3    | block | yes   | 2      | the MULTI bit is the problem                      |
 /// | 4    | block | yes   | 16     | the block COUNT is the problem                    |
 ///
@@ -350,11 +350,11 @@ fn ladder(h: &Host, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
     // (name, blocks-or-none, words, what a failure here means)
     let rungs: [(&str, Option<u32>, usize, &str); 4] = [
         ("byte mode, 4 bytes", None, 1, "the bus or the window - not block mode at all"),
-        ("block mode, ONE 64-byte block, no MULTI", Some(1), BLOCK / 4,
-         "the 64-BYTE BLOCK SIZE (the working SD driver only ever used 512)"),
-        ("block mode, TWO 64-byte blocks, MULTI", Some(2), 2 * BLOCK / 4,
+        ("block mode, ONE 64-byte block, no MULTI", Some(1), F1_BLOCK / 4,
+         "the 64-BYTE F1_BLOCK SIZE (the working SD driver only ever used 512)"),
+        ("block mode, TWO 64-byte blocks, MULTI", Some(2), 2 * F1_BLOCK / 4,
          "the MULTI bit"),
-        ("block mode, SIXTEEN 64-byte blocks, MULTI", Some(16), 16 * BLOCK / 4,
+        ("block mode, SIXTEEN 64-byte blocks, MULTI", Some(16), 16 * F1_BLOCK / 4,
          "the block COUNT"),
     ];
 
@@ -370,7 +370,7 @@ fn ladder(h: &Host, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
             *word = MARKS[rung] ^ (i as u32);
         }
         let blk = match blocks {
-            Some(n) => blk_block_mode(*n, BLOCK as u32),
+            Some(n) => blk_block_mode(*n, F1_BLOCK as u32),
             None => blk_byte_mode(*words as u32 * 4),
         };
         let ok = sdio::write_extended(

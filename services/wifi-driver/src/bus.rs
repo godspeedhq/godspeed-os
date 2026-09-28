@@ -60,7 +60,7 @@ use godspeed_sdk::ServiceContext;
 use crate::backplane::{clk, f1, Window};
 use crate::host::Host;
 use crate::sdio;
-use crate::sdio::DATA_FUNC;
+use crate::sdio::{DATA_BLOCK, DATA_FUNC};
 
 /// Register offsets inside the SDIO device core's register block, quoted above.
 mod sdpcmd {
@@ -75,8 +75,6 @@ const PROT_VERSION: u32 = 4;
 /// `SDPCM_PROT_VERSION_SHIFT`.
 const PROT_VERSION_SHIFT: u32 = 16;
 
-/// `sdmmc_io_set_blocklen(sc->sc_sf[2], 512)`.
-const DATA_BLOCK: u16 = 512;
 
 /// Move the chip from its ALP clock to HT, and confirm the chip says HT is available.
 ///

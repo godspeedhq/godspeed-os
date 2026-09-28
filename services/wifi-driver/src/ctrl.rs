@@ -102,9 +102,9 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::{Window, ACCESS_WIDE, CHIPCOMMON_BASE, OFFSET_MASK};
-use crate::host::{blk_byte_mode, Host};
+use crate::host::{blk_block_mode, blk_byte_mode, Host};
 use crate::sdio;
-use crate::sdio::DATA_FUNC;
+use crate::sdio::{DATA_BLOCK, DATA_FUNC};
 
 
 /// `sizeof(struct bwfm_sdio_hwhdr)`.
@@ -250,6 +250,24 @@ fn frame_offset() -> u32 {
     (CHIPCOMMON_BASE & OFFSET_MASK) | ACCESS_WIDE
 }
 
+/// How to ask for a transfer of `padded` bytes: byte mode, or block mode with this many blocks.
+///
+/// **A byte-mode CMD53 carries at most 512 bytes**, because its count field is nine bits wide and a count of
+/// zero means 512. Asking for more produced a malformed transfer - the argument said 512 while `BLKSIZECNT`
+/// said 2048, and the controller errored after moving what it had been told. Every control frame was under
+/// 512 until the buffer grew, so this surfaced the moment it mattered and not before.
+///
+/// `round_to` already pads anything over 512 to a multiple of 512 - that is the reference's own rule - so a
+/// large frame is block-aligned before it gets here and only needs asking for correctly.
+fn transfer_mode(padded: usize) -> (u32, Option<u32>) {
+    if padded > DATA_BLOCK as usize {
+        let blocks = (padded as u32) / DATA_BLOCK as u32;
+        (blk_block_mode(blocks, DATA_BLOCK as u32), Some(blocks))
+    } else {
+        (blk_byte_mode(padded as u32), None)
+    }
+}
+
 /// `roundto` from the reference: four bytes, unless the frame is both over a block and not a whole
 /// number of blocks.
 fn round_to(len: usize) -> usize {
@@ -333,13 +351,14 @@ fn query_iovar(
         "wifi-driver: asking the firmware for `{}` - {} byte frame padded to {}, seq {}, request id {}",
         name, len, padded, frame[4], reqid
     ));
+    let (blk, blocks) = transfer_mode(padded);
     if !sdio::write_extended(
         h,
         DATA_FUNC,
         frame_offset(),
         &mut wbuf[..words],
-        blk_byte_mode(padded as u32),
-        None,
+        blk,
+        blocks,
         ctx,
     ) {
         return None;
@@ -736,13 +755,14 @@ pub fn set_cmd(
          request id {}",
         what, cmd, payload, len, padded, frame[4], reqid
     ));
+    let (blk, blocks) = transfer_mode(padded);
     if !sdio::write_extended(
         h,
         DATA_FUNC,
         frame_offset(),
         &mut wbuf[..words],
-        blk_byte_mode(padded as u32),
-        None,
+        blk,
+        blocks,
         ctx,
     ) {
         return false;
@@ -894,9 +914,24 @@ pub fn download_blob(
     /// constants list says what exists, not what is required.
     const DL_HANDLER_VER_1: u16 = 1 << 12;
 
+    /// `MAX_CHUNK_LEN` in brcmfmac, `BWFM_DLOAD_MAX_LEN` in OpenBSD - the same 1400 in both.
+    ///
+    /// **This is the PROTOCOL's limit, not a buffer size.** The previous version of this function argued
+    /// that 1400 was "the reference's buffer limit rather than the protocol's" and chunked to whatever the
+    /// frame allowed; with a 2048-byte frame that became 2000-byte chunks and the firmware refused them.
+    ///
+    /// Two codebases that share no source do not pick the same buffer size by coincidence - their agreement
+    /// WAS the evidence, and it was reasoned past. The same mistake as assembling the download flag from bit
+    /// names: preferring an inference to what the sources say.
+    const MAX_CHUNK: usize = 1400;
+
     // What is left of a frame once the SDPCM and BCDC headers, the iovar name and the download header have
-    // taken their share. Rounded down to four so every chunk is a whole number of words.
-    let room = (FRAME - PAYLOAD_AT - (iovar.len() + 1) - DLOAD_HDR) & !3;
+    // taken their share, and never more than the protocol allows. Rounded down to four so every chunk is a
+    // whole number of words.
+    let room = core::cmp::min(
+        FRAME - PAYLOAD_AT - (iovar.len() + 1) - DLOAD_HDR,
+        MAX_CHUNK,
+    ) & !3;
     if room == 0 {
         ctx.log_fmt(format_args!(
             "wifi-driver: `{}` leaves no room for blob data in a {} byte frame", iovar, FRAME

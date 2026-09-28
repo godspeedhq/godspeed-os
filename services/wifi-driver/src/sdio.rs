@@ -78,6 +78,15 @@ const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
 /// gate refused it, correctly: one fact, one place.
 pub const DATA_FUNC: u8 = 2;
 
+/// Function 2's block size. Set on the card in `bus::bring_up`, and the threshold above which a
+/// CMD53 must be asked for in BLOCK mode - byte mode's count field is nine bits, so it cannot
+/// express more than this.
+///
+/// Declared HERE with `DATA_FUNC` because it is one fact about the card that three modules need.
+/// It was `BLOCK` in `ctrl.rs` at 512 and `BLOCK` in `upload.rs` at 64 - function 2's and function
+/// 1's - which the duplicate-constant gate refused as two facts wearing one name. It was right.
+pub const DATA_BLOCK: u16 = 512;
+
 const CMD_IO_RW_EXTENDED_READ: u32 = 0x353A_0012;
 /// CMD53 READ in BLOCK mode - the read twin of `CMD_IO_RW_EXTENDED_WRITE_MULTI`.
 ///
