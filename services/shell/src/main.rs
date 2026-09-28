@@ -7345,15 +7345,120 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             Ok(())
         }
         Some(_) => {
-            if arg != "list" {
-                // The driver exists and answers exactly one question so far. Loud and specific: the one
-                // thing this must never do is imply the radio failed.
-                out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell can only ask it to `list` so far", WIFI_DRIVER));
-                out.line_fmt(ctx, format_args!("  (`wifi {}` arrives with the phase that needs it - `docs/wifi.md` has the phases)",
-                    arg.split_whitespace().next().unwrap_or("status")));
-                return Err(ShellError::Unknown);
+            if arg == "list" {
+                return wifi_list(ctx, out);
             }
-            wifi_list(ctx, out)
+            if let Some(ssid) = arg.strip_prefix("connect ") {
+                return wifi_connect(ctx, out, ssid.trim());
+            }
+            // The driver exists and answers two questions so far. Loud and specific: the one thing this
+            // must never do is imply the radio failed.
+            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell can ask it to `list` and `connect` so far", WIFI_DRIVER));
+            out.line_fmt(ctx, format_args!("  (`wifi {}` arrives with the phase that needs it - `docs/wifi.md` has the phases)",
+                arg.split_whitespace().next().unwrap_or("status")));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `wifi connect <ssid>` - ask for the passphrase invisibly, hand both to the driver, report how it went.
+///
+/// The passphrase is read through `read_input_line(.., secret = true, ..)` - the same invisible-entry path
+/// `input secret` uses, which never echoes and is excluded from the recall ring and `/.gsh_history`
+/// (`utilities/56_wifi.md` §2 says why this is a security decision and not an ergonomic one). It lives in
+/// one stack buffer here and one request buffer, both zeroed before this returns, and is never printed.
+///
+/// The sentences are the spec's (§5): a network that is not there is named, a refused passphrase says so
+/// rather than "connection failed", and a driver that does not answer says that after a bounded wait.
+/// Association is reported here; addressing is `net`'s to report, and neither editorialises about the other.
+fn wifi_connect(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellError> {
+    /// Request op byte the driver understands: join.
+    const OP_CONNECT: u8 = 2;
+    /// `IEEE80211_MAX_SSID_LEN`.
+    const MAX_SSID: usize = 32;
+    /// `CYW43_WPA_MAX_PASSWORD_LEN`, the buffer the firmware's supplicant takes.
+    const MAX_PASS: usize = 64;
+    /// A WPA2 passphrase is 8 to 63 characters (IEEE 802.11i). Refused here, before anything is sent.
+    const MIN_PASS: usize = 8;
+    const MAX_PASS_CHARS: usize = 63;
+    /// Request layout: `[op, ssid_len, ssid[32], pass_len, pass[64]]`.
+    const REQ: usize = 1 + 1 + MAX_SSID + 1 + MAX_PASS;
+    /// The bound under the wait. A join with a right passphrase completes in a few seconds; the firmware's
+    /// own handshake timeouts fire well inside this, so a wrong one is named rather than waited out.
+    const MAX_SECS: i64 = 30;
+
+    if ssid.is_empty() || ssid.len() > MAX_SSID {
+        out.line_fmt(ctx, format_args!("wifi: an SSID is 1 to {} bytes", MAX_SSID));
+        return Err(ShellError::Unknown);
+    }
+
+    ctx.console_write("passphrase (not shown): ");
+    let mut pass = [0u8; INPUT_MAX];
+    let n = read_input_line(ctx, true, &mut pass);
+    if n < MIN_PASS || n > MAX_PASS_CHARS {
+        for b in pass.iter_mut() { *b = 0; }
+        out.line_fmt(ctx, format_args!("wifi: a WPA2 passphrase is {} to {} characters - nothing was sent", MIN_PASS, MAX_PASS_CHARS));
+        return Err(ShellError::Unknown);
+    }
+
+    let mut req = [0u8; REQ];
+    req[0] = OP_CONNECT;
+    req[1] = ssid.len() as u8;
+    req[2..2 + ssid.len()].copy_from_slice(ssid.as_bytes());
+    req[2 + MAX_SSID] = n as u8;
+    req[3 + MAX_SSID..3 + MAX_SSID + n].copy_from_slice(&pass[..n]);
+    for b in pass.iter_mut() { *b = 0; }
+
+    out.line_fmt(ctx, format_args!("joining {}  [q] quit", ssid));
+    // Reacquire on a failed send, then ask once more - the same shape as `wifi list` and `ns_abortable`.
+    let first = ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS);
+    let outcome = match first {
+        ReqOutcome::Timeout if ctx.reacquire_by_name(WIFI_DRIVER) => {
+            ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS)
+        }
+        other => other,
+    };
+    for b in req.iter_mut() { *b = 0; }
+
+    match outcome {
+        ReqOutcome::Reply(r) => match r.payload_bytes().first().copied() {
+            Some(10) => {
+                out.line_fmt(ctx, format_args!("joined {} - the link is up and the handshake completed", ssid));
+                out.line_fmt(ctx, format_args!("  (addressing is `net`'s to report: `net status`)"));
+                Ok(())
+            }
+            Some(11) => {
+                out.line_fmt(ctx, format_args!("no network named {} in range", ssid));
+                Err(ShellError::Unknown)
+            }
+            Some(12) => {
+                out.line_fmt(ctx, format_args!("{} refused the passphrase", ssid));
+                Err(ShellError::Unknown)
+            }
+            Some(13) => {
+                out.line_fmt(ctx, format_args!("wifi: the join failed before the network answered - the driver's log names the command"));
+                Err(ShellError::Unknown)
+            }
+            Some(14) => {
+                out.line_fmt(ctx, format_args!("wifi: no decision from {} - not joined (the driver's log has what it heard)", ssid));
+                Err(ShellError::Unknown)
+            }
+            Some(2) => {
+                out.line_fmt(ctx, format_args!("wifi: the radio is not up - it did not come up at boot, and the driver's log says which stage stopped it"));
+                Err(ShellError::Unknown)
+            }
+            _ => {
+                out.line_fmt(ctx, format_args!("wifi: the radio driver gave a reply this shell does not understand"));
+                Err(ShellError::Unknown)
+            }
+        },
+        ReqOutcome::Aborted => {
+            out.line_fmt(ctx, format_args!("wifi connect: aborted - the radio is not associated"));
+            Ok(())
+        }
+        ReqOutcome::Timeout => {
+            out.line_fmt(ctx, format_args!("wifi: the radio driver is not answering"));
+            Err(ShellError::Unknown)
         }
     }
 }
@@ -7362,8 +7467,8 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
 ///
 /// Fields, in the spec's order: `ssid signal band security`. Signal is dBm, a raw fact (rule 7). `band`
 /// is derived from the firmware's chanspec, whose 802.11ac layout puts the band in bits 15:14 - `0x0` is
-/// 2.4 GHz and `0x3` is 5 GHz - and every value seen on hardware decodes under it. `security` prints
-/// `unknown`, honestly: it needs the beacon's RSN/WPA information elements parsed, which is not built.
+/// 2.4 GHz and `0x3` is 5 GHz - and every value seen on hardware decodes under it. `security` is the
+/// driver's reading of the beacon's information elements, carried in each record's last byte.
 ///
 /// Waits on the DRIVER'S REPLY or on the loud fact of its death, never on a timer (spec §5, Commandment
 /// VIII): a dead peer says so, a `q` abandons the wait. What `q` does NOT yet do is stop the radio's sweep
@@ -7438,8 +7543,18 @@ fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                     shown[k] = if (0x20..0x7F).contains(&c) { c } else { b'.' };
                 }
                 let ssid = core::str::from_utf8(&shown[..len]).unwrap_or("(unprintable)");
-                out.line_fmt(ctx, format_args!("{} {} {} unknown",
-                    if len == 0 { "(hidden)" } else { ssid }, rssi, band));
+                // The record's last byte is the driver's classification of the beacon: an RSN element is
+                // WPA2, a Microsoft-OUI type-1 vendor element is WPA, the Privacy bit with neither is WEP.
+                let security = match rec[43] {
+                    0 => "open",
+                    1 => "WEP",
+                    2 => "WPA",
+                    3 => "WPA2",
+                    4 => "WPA2/WPA",
+                    _ => "unknown",
+                };
+                out.line_fmt(ctx, format_args!("{} {} {} {}",
+                    if len == 0 { "(hidden)" } else { ssid }, rssi, band, security));
             }
             Ok(())
         }

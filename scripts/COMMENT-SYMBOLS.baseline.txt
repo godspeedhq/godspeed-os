@@ -393,3 +393,36 @@ BWFM_E_STATUS_TIMEOUT              # OpenBSD bwfm event status 2, timed out insi
 BWFM_E_STATUS_NO_NETWORKS          # OpenBSD bwfm event status 3, complete with nothing found; status::NO_NETWORKS - external, 26.14
 BWFM_E_STATUS_ABORT                # OpenBSD bwfm event status 4; status::ABORT - external, 26.14
 BWFM_E_STATUS_PARTIAL              # OpenBSD bwfm event status 8, one batch of results; status::PARTIAL is what every result-bearing event carried on hardware - external, 26.14
+BRCMF_C_SET_AUTH                   # Linux brcmfmac fwil.h - 22, agreeing with cyw43 WLC_SET_AUTH - external, 26.14
+BRCMF_C_SET_SSID                   # Linux brcmfmac fwil.h - 26, the join command - external, 26.14
+BRCMF_C_SET_WSEC                   # Linux brcmfmac fwil.h - 134 - external, 26.14
+BRCMF_C_SET_WSEC_PMK               # Linux brcmfmac fwil.h - 268, the passphrase/PMK command - external, 26.14
+BRCMF_E_REASON_FWSUP_WPA_PSK_TMO   # Linux brcmfmac fweh.h - 15, the 4-way handshake timed out: how a wrong passphrase presents - external, 26.14
+BRCMF_E_REASON_FWSUP_WPA_PSK_M1_TMO # Linux brcmfmac fweh.h - 16 - external, 26.14
+BRCMF_E_REASON_FWSUP_WPA_PSK_M3_TMO # Linux brcmfmac fweh.h - 17 - external, 26.14
+BRCMF_E_STATUS_FWSUP_COMPLETED     # Linux brcmfmac fweh.h - 6, the firmware supplicant finished the handshake - external, 26.14
+BRCMF_E_STATUS_FWSUP_TIMEOUT       # Linux brcmfmac fweh.h - 7 - external, 26.14
+BRCMF_EVENT_MSG_LINK               # Linux brcmfmac fweh.h - 0x01 in a LINK event flags: link up - external, 26.14
+brcmf_set_auth_type                # Linux brcmfmac cfg80211.c - sets auth to 0 for open system - external, 26.14
+BRCMF_WSEC_PASSPHRASE              # Linux brcmfmac fwil_types.h - BIT(0): the key field holds a passphrase, not a derived PMK - external, 26.14
+brcmf_wsec_pmk_le                  # Linux brcmfmac fwil_types.h - { le16 key_len; le16 flags; u8 key[] } - external, 26.14
+BWFM_E_AUTH                        # OpenBSD bwfm - event 3 - external, 26.14
+BWFM_E_DEAUTH                      # OpenBSD bwfm - event 5 - external, 26.14
+BWFM_E_DEAUTH_IND                  # OpenBSD bwfm - event 6, the AP deauthenticated us - external, 26.14
+BWFM_E_DISASSOC                    # OpenBSD bwfm - event 11 - external, 26.14
+BWFM_E_DISASSOC_IND                # OpenBSD bwfm - event 12 - external, 26.14
+BWFM_E_JOIN                        # OpenBSD bwfm - event 1 - external, 26.14
+BWFM_E_PSK_SUP                     # OpenBSD bwfm - event 46, the supplicant reporting - external, 26.14
+cyw43_ll_wifi_join                 # cyw43-driver (Pico W) - the passphrase-based join a host with no crypto uses; the reference of record for that one step - external, 26.14
+CYW43_WPA_MAX_PASSWORD_LEN         # cyw43-driver - 64, the passphrase buffer the firmware takes - external, 26.14
+IEEE80211_CAPINFO_PRIVACY          # OpenBSD net80211 ieee80211.h - 0x0010, the Privacy capability bit - external, 26.14
+IEEE80211_ELEMID_RSN               # OpenBSD net80211 ieee80211.h - 48, the RSN (WPA2) element - external, 26.14
+IEEE80211_ELEMID_VENDOR            # OpenBSD net80211 ieee80211.h - 221, the vendor element WPA rides in - external, 26.14
+IEEE80211_MAX_SSID_LEN             # IEEE 802.11 - 32 - external, 26.14
+WLC_SET_AUTH                       # cyw43-driver - 22 - external, 26.14
+WLC_SET_SSID                       # cyw43-driver - 26 - external, 26.14
+WLC_SET_WPA_AUTH                   # cyw43-driver - 165; Linux uses the wpa_auth iovar for the same setting - external, 26.14
+WLC_SET_WSEC                       # cyw43-driver - 134 - external, 26.14
+WLC_SET_WSEC_PMK                   # cyw43-driver - 268 - external, 26.14
+ie_length                          # OpenBSD bwfm bss_info field - the IE run length; this driver names the offset bss::IE_LENGTH - external, 26.14
+ie_offset                          # OpenBSD bwfm bss_info field - where the beacon IEs start, from the START of the record (the reference copies bss + iesoff); this driver names the offset bss::IE_OFFSET - external, 26.14

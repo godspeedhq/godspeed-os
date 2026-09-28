@@ -49,6 +49,7 @@ mod scan;
 mod firmware;
 mod erom;
 mod host;
+mod join;
 mod sdio;
 mod upload;
 
@@ -108,23 +109,50 @@ fn serve_radio(
             Some(r) => r,
             None => continue, // nothing to answer on
         };
-        let op = req.payload_bytes().first().copied().unwrap_or(0);
-        let n = if op != scan::reply::OP_LIST {
-            out[0] = scan::reply::UNKNOWN_OP;
-            1
-        } else {
-            match radio.as_mut() {
+        let payload = req.payload_bytes();
+        let op = payload.first().copied().unwrap_or(0);
+        let n = match (op, radio.as_mut()) {
+            (scan::reply::OP_LIST, None) | (scan::reply::OP_CONNECT, None) => {
+                out[0] = scan::reply::RADIO_DOWN;
+                1
+            }
+            (scan::reply::OP_LIST, Some(session)) => match scan::scan_once(h, w, session, ctx) {
+                Some(scan) => scan::write_reply(&scan, &mut out),
                 None => {
-                    out[0] = scan::reply::RADIO_DOWN;
+                    out[0] = scan::reply::SCAN_FAILED;
                     1
                 }
-                Some(session) => match scan::scan_once(h, w, session, ctx) {
-                    Some(scan) => scan::write_reply(&scan, &mut out),
-                    None => {
-                        out[0] = scan::reply::SCAN_FAILED;
-                        1
-                    }
-                },
+            },
+            (scan::reply::OP_CONNECT, Some(session)) => {
+                // `[op, ssid_len, ssid[32], pass_len, pass[64]]`. Lengths are checked against the fixed
+                // fields, and the passphrase bytes are used from the request buffer and never copied
+                // anywhere that outlives this arm.
+                const SSID_LEN_AT: usize = 1;
+                const SSID_AT: usize = 2;
+                const PASS_LEN_AT: usize = 2 + join::MAX_SSID;
+                const PASS_AT: usize = PASS_LEN_AT + 1;
+                const TOTAL: usize = PASS_AT + join::MAX_PASSPHRASE;
+                if payload.len() < TOTAL {
+                    out[0] = scan::reply::JOIN_FAILED;
+                    1
+                } else {
+                    let ssid_len = core::cmp::min(payload[SSID_LEN_AT] as usize, join::MAX_SSID);
+                    let pass_len = core::cmp::min(payload[PASS_LEN_AT] as usize, join::MAX_PASSPHRASE);
+                    let ssid = &payload[SSID_AT..SSID_AT + ssid_len];
+                    let pass = &payload[PASS_AT..PASS_AT + pass_len];
+                    out[0] = match join::join(h, w, session, ssid, pass, ctx) {
+                        join::Outcome::Joined => scan::reply::JOINED,
+                        join::Outcome::NotFound => scan::reply::NOT_FOUND,
+                        join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,
+                        join::Outcome::Failed => scan::reply::JOIN_FAILED,
+                        join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
+                    };
+                    1
+                }
+            }
+            _ => {
+                out[0] = scan::reply::UNKNOWN_OP;
+                1
             }
         };
         // `try_send`, never `send`: the shell may have given up on this reply (`q`, or its own deadline),

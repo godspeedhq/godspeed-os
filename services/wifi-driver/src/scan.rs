@@ -119,7 +119,7 @@ const BDC_HEADER: usize = 4;
 const BDC_DATA_OFFSET: usize = 3;
 
 /// Offsets into an event frame, computed from the quoted declarations. See `docs/wifi.md` §30.2.
-mod ev {
+pub(crate) mod ev {
     /// `ether_header` is 14 bytes; the ethertype is its last field.
     pub const ETHERTYPE: usize = 12;
     /// `bwfm_ethhdr` follows the ethernet header.
@@ -128,8 +128,12 @@ mod ev {
     pub const MSG: usize = ETHHDR + 10;
     /// `event_type`, 4 bytes into the message.
     pub const EVENT_TYPE: usize = MSG + 4;
+    /// `flags`, `__be16`, 2 bytes into the message.
+    pub const FLAGS: usize = MSG + 2;
     /// `status`.
     pub const STATUS: usize = MSG + 8;
+    /// `reason`.
+    pub const REASON: usize = MSG + 12;
     /// `datalen`.
     pub const DATALEN: usize = MSG + 20;
     /// The event payload - 2+2+4+4+4+4+4+6+16+1+1 = 48 bytes of message.
@@ -137,7 +141,7 @@ mod ev {
 }
 
 /// Event codes, quoted from `bwfmreg.h`.
-mod code {
+pub(crate) mod code {
     /// `BWFM_E_SET_SSID`.
     pub const SET_SSID: u32 = 0;
     /// `BWFM_E_ASSOC`.
@@ -146,13 +150,34 @@ mod code {
     pub const LINK: u32 = 16;
     /// `BWFM_E_ESCAN_RESULT`.
     pub const ESCAN_RESULT: u32 = 69;
+    /// `BWFM_E_JOIN`.
+    pub const JOIN: u32 = 1;
+    /// `BWFM_E_AUTH`.
+    pub const AUTH: u32 = 3;
+    /// `BWFM_E_DEAUTH`.
+    pub const DEAUTH: u32 = 5;
+    /// `BWFM_E_DEAUTH_IND` - the access point deauthenticated us.
+    pub const DEAUTH_IND: u32 = 6;
+    /// `BWFM_E_DISASSOC`.
+    pub const DISASSOC: u32 = 11;
+    /// `BWFM_E_DISASSOC_IND`.
+    pub const DISASSOC_IND: u32 = 12;
+    /// `BWFM_E_PSK_SUP` - the firmware's own supplicant reporting on the 4-way handshake.
+    pub const PSK_SUP: u32 = 46;
 
     /// A name for the log, so an unexpected event is legible rather than a bare number.
     pub fn name(c: u32) -> &'static str {
         match c {
             SET_SSID => "SET_SSID",
+            JOIN => "JOIN",
+            AUTH => "AUTH",
+            DEAUTH => "DEAUTH",
+            DEAUTH_IND => "DEAUTH_IND",
             ASSOC => "ASSOC",
+            DISASSOC => "DISASSOC",
+            DISASSOC_IND => "DISASSOC_IND",
             LINK => "LINK",
+            PSK_SUP => "PSK_SUP",
             ESCAN_RESULT => "ESCAN_RESULT",
             _ => "(not an event this driver names)",
         }
@@ -161,7 +186,7 @@ mod code {
 
 /// Event status values, quoted from `bwfmreg.h`. An `ESCAN_RESULT` carrying `PARTIAL` is a batch of networks;
 /// one carrying `SUCCESS` says the scan is over. Both were observed on hardware in exactly that order.
-mod status {
+pub(crate) mod status {
     /// `BWFM_E_STATUS_SUCCESS`.
     pub const SUCCESS: u32 = 0;
     /// `BWFM_E_STATUS_FAIL`.
@@ -203,8 +228,15 @@ mod bss {
     pub const BSSID: usize = 8;
     pub const SSID_LEN: usize = 18;
     pub const SSID: usize = 19;
+    /// `capability`, `__le16`: the 802.11 capability information field. Bit 0x0010 is Privacy.
+    pub const CAPABILITY: usize = 16;
     pub const CHANSPEC: usize = 72;
     pub const RSSI: usize = 78;
+    /// `ie_offset`, `__le16`: where the beacon's information elements start, FROM THE START OF THIS RECORD.
+    /// The reference copies `((uint8_t *)bss) + iesoff` for `ieslen` bytes, and that is the base used here.
+    pub const IE_OFFSET: usize = 116;
+    /// `ie_length`, `__le32`.
+    pub const IE_LENGTH: usize = 120;
     /// The shortest entry this driver will read a full record out of.
     pub const MIN: usize = 80;
 }
@@ -236,10 +268,24 @@ const BSSTYPE_ANY: u8 = 2;
 /// The `sync_id` the reference uses, echoed back in every result so a stale scan's events are recognisable.
 const SYNC_ID: u16 = 0x1234;
 
-/// `BWFM_MAX_SSID_LEN`.
-const MAX_SSID: usize = 32;
+/// `BWFM_MAX_SSID_LEN` / `IEEE80211_MAX_SSID_LEN`. The ONE home for this fact; `join` re-exports it.
+pub const MAX_SSID: usize = 32;
 /// How many networks to keep. Bounded on purpose: a fixed array whose limit is readable here (§26.6.1).
 const MAX_RESULTS: usize = 32;
+
+/// What a network's beacon says about how it is secured. Wire value in a `wifi list` record's last byte.
+pub mod sec {
+    /// No Privacy bit, no RSN element, no WPA element.
+    pub const OPEN: u8 = 0;
+    /// Privacy bit set and neither WPA nor RSN element - which leaves WEP.
+    pub const WEP: u8 = 1;
+    /// A WPA vendor element (Microsoft OUI, type 1) and no RSN element.
+    pub const WPA: u8 = 2;
+    /// An RSN element (WPA2).
+    pub const WPA2: u8 = 3;
+    /// Both elements: a mixed-mode network.
+    pub const WPA2_WPA: u8 = 4;
+}
 
 /// One network, as much of it as this driver reports.
 #[derive(Clone, Copy)]
@@ -249,11 +295,63 @@ pub struct Network {
     pub ssid_len: u8,
     pub chanspec: u16,
     pub rssi: i16,
+    /// A `sec::` value.
+    pub security: u8,
 }
 
 impl Network {
     fn blank() -> Self {
-        Network { bssid: [0; 6], ssid: [0; MAX_SSID], ssid_len: 0, chanspec: 0, rssi: 0 }
+        Network { bssid: [0; 6], ssid: [0; MAX_SSID], ssid_len: 0, chanspec: 0, rssi: 0, security: sec::OPEN }
+    }
+}
+
+/// `IEEE80211_ELEMID_RSN`.
+const ELEMID_RSN: u8 = 48;
+/// `IEEE80211_ELEMID_VENDOR`.
+const ELEMID_VENDOR: u8 = 221;
+/// `MICROSOFT_OUI` - `{ 0x00, 0x50, 0xf2 }` - followed by the type byte `1` for a WPA element:
+/// `if (memcmp(frm + 2, MICROSOFT_OUI, 3) == 0) { if (frm[5] == 1) wpaie = frm;`
+const MICROSOFT_OUI: [u8; 3] = [0x00, 0x50, 0xf2];
+const WPA_TYPE: u8 = 1;
+/// `IEEE80211_CAPINFO_PRIVACY`.
+const CAPINFO_PRIVACY: u16 = 0x0010;
+
+/// Classify a network from its beacon's information elements and capability field.
+///
+/// The elements are a walk of `[id][len][body]` records, quoted from the reference exactly as net80211
+/// does it: an RSN element is WPA2; a vendor element whose body opens with the Microsoft OUI and type 1 is
+/// WPA; the Privacy capability bit with neither element is WEP; nothing is open. A walk that runs off the
+/// end stops rather than reads past it - the length bytes come from the air and are not trusted.
+fn classify(ies: &[u8], capability: u16) -> u8 {
+    let mut rsn = false;
+    let mut wpa = false;
+    let mut at = 0usize;
+    while at + 2 <= ies.len() {
+        let id = ies[at];
+        let len = ies[at + 1] as usize;
+        let body_end = at + 2 + len;
+        if body_end > ies.len() {
+            break;
+        }
+        let body = &ies[at + 2..body_end];
+        if id == ELEMID_RSN {
+            rsn = true;
+        } else if id == ELEMID_VENDOR && body.len() >= 4 && body[..3] == MICROSOFT_OUI && body[3] == WPA_TYPE {
+            wpa = true;
+        }
+        at = body_end;
+    }
+    match (rsn, wpa) {
+        (true, true) => sec::WPA2_WPA,
+        (true, false) => sec::WPA2,
+        (false, true) => sec::WPA,
+        (false, false) => {
+            if capability & CAPINFO_PRIVACY != 0 {
+                sec::WEP
+            } else {
+                sec::OPEN
+            }
+        }
     }
 }
 
@@ -325,6 +423,21 @@ pub mod reply {
     pub const RECORD: usize = 44;
     /// Request op byte: scan and list.
     pub const OP_LIST: u8 = 1;
+    /// Request op byte: join a network. Payload: `ssid_len, ssid[32], pass_len, pass[64]`.
+    pub const OP_CONNECT: u8 = 2;
+
+    // CONNECT statuses start at 10 so they never share a byte with the list statuses above:
+    // RADIO_DOWN (2) is answered to BOTH ops and must mean one thing.
+    /// Reply status for `OP_CONNECT`: associated and the handshake completed.
+    pub const JOINED: u8 = 10;
+    /// No network of that name answered the join.
+    pub const NOT_FOUND: u8 = 11;
+    /// The network refused the passphrase - the handshake timed out or the AP deauthenticated us.
+    pub const PASSPHRASE_REFUSED: u8 = 12;
+    /// A command in the join sequence was refused; the driver's log names it.
+    pub const JOIN_FAILED: u8 = 13;
+    /// Nothing decisive arrived within the bound.
+    pub const JOIN_TIMEOUT: u8 = 14;
 }
 
 /// Serialise a scan into a reply: `[status, count, record * count]`. Returns the bytes written.
@@ -344,7 +457,8 @@ pub fn write_reply(scan: &Scan, out: &mut [u8]) -> usize {
         out[at + 8..at + 10].copy_from_slice(&n.chanspec.to_le_bytes());
         out[at + 10] = n.ssid_len;
         out[at + 11..at + 11 + MAX_SSID].copy_from_slice(&n.ssid);
-        out[at + 43] = 0;
+        // The last byte was a pad; it carries the `sec::` value now. Same record size, same offsets.
+        out[at + 43] = n.security;
         at += reply::RECORD;
     }
     at
@@ -412,7 +526,19 @@ fn be32(b: &[u8], at: usize) -> u32 {
 /// **The self-check is `datalen`.** If the offsets in `ev` are wrong, `datalen` is nonsense against the
 /// frame length, so the arithmetic checks itself the way `frmlen ^ cksum` checks a frame's existence. A
 /// frame that fails it is reported rather than parsed.
-fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<(u32, u32, usize, usize)> {
+/// One decoded event: the header fields the driver acts on, and where its payload sits in the body.
+pub(crate) struct Event {
+    pub event_type: u32,
+    pub status: u32,
+    pub reason: u32,
+    /// `flags`: for `LINK`, bit 0x01 is link up (`BRCMF_EVENT_MSG_LINK`).
+    pub flags: u16,
+    /// Payload offset within the body handed in, BDC header included.
+    pub at: usize,
+    pub datalen: usize,
+}
+
+pub(crate) fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<Event> {
     // THE BDC HEADER FIRST. A data or event frame is not an ethernet frame: it carries four bytes of BDC
     // header and then `data_offset << 2` more before the ethernet header starts.
     if body.len() < BDC_HEADER {
@@ -465,6 +591,8 @@ fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<(u32, u3
     // BIG-ENDIAN. See `be32`: the header is network byte order, the body it carries is not.
     let event_type = be32(frame, ev::EVENT_TYPE);
     let status = be32(frame, ev::STATUS);
+    let reason = be32(frame, ev::REASON);
+    let flags = u16::from_be_bytes([frame[ev::FLAGS], frame[ev::FLAGS + 1]]);
     let datalen = be32(frame, ev::DATALEN) as usize;
     let avail = frame.len() - ev::PAYLOAD;
     if datalen > avail {
@@ -478,7 +606,7 @@ fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<(u32, u3
     }
     // The payload offset is reported relative to the BODY the caller holds, not to the ethernet frame, so
     // the BDC skip is included rather than left for the caller to remember.
-    Some((event_type, status, eth + ev::PAYLOAD, datalen))
+    Some(Event { event_type, status, reason, flags, at: eth + ev::PAYLOAD, datalen })
 }
 
 /// Pull the networks out of one escan-result payload.
@@ -517,6 +645,24 @@ fn parse_results(payload: &[u8], scan: &mut Scan, ctx: &ServiceContext) {
         }
         n.chanspec = le16(payload, at + bss::CHANSPEC);
         n.rssi = le16(payload, at + bss::RSSI) as i16;
+        // The information elements live INSIDE this record, at `ie_offset` from its start. Bounded by the
+        // record's own declared length and by the buffer, since both numbers came from the air.
+        if at + bss::IE_LENGTH + 4 <= payload.len() {
+            let capability = le16(payload, at + bss::CAPABILITY);
+            let ie_off = le16(payload, at + bss::IE_OFFSET) as usize;
+            let ie_len = le32(payload, at + bss::IE_LENGTH) as usize;
+            let entry_len = le32(payload, at + bss::LENGTH) as usize;
+            let start = at + ie_off;
+            let end = start.saturating_add(ie_len);
+            let limit = core::cmp::min(payload.len(), at.saturating_add(entry_len));
+            n.security = if ie_off >= bss::MIN && end <= limit {
+                classify(&payload[start..end], capability)
+            } else {
+                // Elements the record does not actually contain are not parsed; the Privacy bit alone
+                // still says whether the network is encrypted at all.
+                if capability & CAPINFO_PRIVACY != 0 { sec::WEP } else { sec::OPEN }
+            };
+        }
         scan.keep(n);
 
         if entry_len < bss::MIN || entry_len > payload.len() - at {
@@ -567,9 +713,8 @@ pub fn collect(
                 }
                 scan.events += 1;
                 let p = f.off;
-                if let Some((event_type, status, at, datalen)) =
-                    parse_event(&frame[p..p + f.len], scan.events, ctx)
-                {
+                if let Some(e) = parse_event(&frame[p..p + f.len], scan.events, ctx) {
+                    let (event_type, status, at, datalen) = (e.event_type, e.status, e.at, e.datalen);
                     ctx.log_fmt(format_args!(
                         "wifi-driver:   event {} ({}), status {}, {} byte payload",
                         event_type,
