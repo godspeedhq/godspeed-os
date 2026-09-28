@@ -328,3 +328,11 @@ bwfm_ssid                          # OpenBSD bwfm - u32 len plus a 32-byte array
 channel_num                        # OpenBSD bwfm scan params field - 0 means every channel; scan.rs names the offset req::CHANNEL_NUM - external, 26.14
 ether_header                       # the standard 14-byte BSD ethernet header struct, which an event frame begins with; scan.rs reads it by offset - external, 26.14
 sync_id                            # OpenBSD bwfm scan params/result field, echoed back in every result; scan.rs names the constant SYNC_ID and the offset req::SYNC_ID - external, 26.14
+bcm2835_mmc_writel                 # Raspberry Pi bcm2835-mmc.c - the DELAYING register write accessor for this exact controller; the source of write_settle - external, 26.14
+mmc_raw_writel                     # Raspberry Pi bcm2835-mmc.c - the NON-delaying accessor its PIO block writer uses for SDHCI_BUFFER; the source of wr_raw - external, 26.14
+SDHCI_TIMEOUT_CONTROL              # SDHCI SPEC offset 0x2E, which on this family lives inside CONTROL1 as DATA_TOUNIT bits 19:16 - external, 26.14
+BCM2835_SDHCI_WRITE_DELAY          # Raspberry Pi bcm2835-mmc.c - ((2 * 1000000) / f) + 1, the settling gap formula - external, 26.14
+MIN_FREQ                           # Raspberry Pi bcm2835-mmc.c - 400000, the clock floor the settling-gap formula is evaluated at, giving the 6 us worst case - external, 26.14
+TIMEOUT_VAL                        # Raspberry Pi bcm2835-mmc.c - the value it writes to SDHCI_TIMEOUT_CONTROL for a data command - external, 26.14
+bcm2835_mmc_writeb                 # Raspberry Pi bcm2835-mmc.c - wraps writel, which is why writing the timeout byte sets CONTROL1 bits 19:16 - external, 26.14
+SDHCI_BUFFER                       # SDHCI SPEC offset 0x20, the FIFO data port; this driver names it DATA - external, 26.14

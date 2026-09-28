@@ -142,6 +142,33 @@ fn spin() {
     }
 }
 
+/// The gap this controller requires after a register write, quoted from the driver written for it.
+///
+/// ```c
+/// #define MIN_FREQ 400000
+/// #define BCM2835_SDHCI_WRITE_DELAY(f)	(((2 * 1000000) / f) + 1)
+///
+/// static inline void bcm2835_mmc_writel(struct bcm2835_host *host, u32 val, int reg, int from)
+/// {
+/// 	writel(val, host->ioaddr + reg);
+/// 	udelay(BCM2835_SDHCI_WRITE_DELAY(max(host->clock, MIN_FREQ)));
+/// ```
+///
+/// Two card-clock periods, floored at 1 us, after EVERY register write. This driver had none.
+///
+/// **The worst case is used rather than the current clock's**: the formula's largest value is at the
+/// 400 kHz floor, which is 6 us. The card clock is not tracked here, and the requirement is a MINIMUM gap,
+/// so overshooting removes the need to know the clock and cannot err in the unsafe direction.
+///
+/// `spin()` is about 2 us on this machine, so four of them clear 6 us with room. A count is not a duration
+/// (`arch/CLAUDE.md`) - which is exactly why this is only ever used as a minimum gap and never as a
+/// timeout.
+fn write_settle() {
+    for _ in 0..4 {
+        spin();
+    }
+}
+
 pub struct Host<'a> {
     m: &'a Mmio,
     /// The controller's base clock in Hz, from the platform. **0 means refuse**, never guess: every
@@ -198,7 +225,22 @@ impl<'a> Host<'a> {
     fn rd(&self, off: usize) -> u32 {
         self.m.read32(off)
     }
+    /// Write a register, then wait out the controller's settling gap.
+    ///
+    /// The gap is the reference's `bcm2835_mmc_writel`. The FIFO is the one exception and uses `wr_raw`,
+    /// because the reference's PIO block writer uses `mmc_raw_writel`, which does not delay - so the split
+    /// here mirrors the split there rather than being a judgement about which writes "need" it.
     fn wr(&self, off: usize, v: u32) {
+        self.wr_raw(off, v);
+        write_settle();
+    }
+
+    /// Write a register with NO settling gap - the FIFO data port only.
+    ///
+    /// `mmc_raw_writel(host, scratch, SDHCI_BUFFER)` is what the reference's block writer uses, and it
+    /// applies no delay. Putting a 6 us gap on every FIFO word would also make a 512-byte block take
+    /// 768 us for no reason the reference recognises.
+    fn wr_raw(&self, off: usize, v: u32) {
         self.m.write32(off, v)
     }
 
@@ -351,6 +393,34 @@ impl<'a> Host<'a> {
         // driven, so nothing is unmasked to the CPU.
         self.wr(INT_EN, 0xFFFF_FFFF);
         self.wr(INT_MASK, 0xFFFF_FFFF);
+
+        // THE DATA TIMEOUT, which two references write and this driver did not.
+        //
+        // ```c
+        // if (data || (cmd->flags & MMC_RSP_BUSY)) {
+        // 	count = TIMEOUT_VAL;
+        // 	bcm2835_mmc_writeb(host, count, SDHCI_TIMEOUT_CONTROL);
+        // }
+        // ```
+        //
+        // and u-boot writes `0xe` to the same register before every data command. Left at whatever reset
+        // gives, a data phase can time out sooner than a slow device answers - and this controller would
+        // report that as a DATA_TIMEOUT, which `INT_ERR` covers, so it is not today's silent failure. It is
+        // still a requirement being ignored.
+        //
+        // `SDHCI_TIMEOUT_CONTROL` is offset 0x2E, which on this family is not a register of its own: it
+        // sits inside the 32-bit word at 0x2C (`CONTROL1`) as `DATA_TOUNIT`, bits 19:16. The reference's
+        // `writeb` wraps `writel`, so writing 0x0E there sets exactly these four bits - which is what this
+        // does directly, since 32-bit is the only access width this controller allows.
+        //
+        // SET ONCE rather than per command, deliberately: the field is sticky and `set_clock` masks with
+        // `!0x0000_FFE0`, which preserves bits 19:16. Equivalent to the reference's per-command write with
+        // three fewer writes per command, and stated here rather than left as a silent difference.
+        const DATA_TOUNIT_SHIFT: u32 = 16;
+        const DATA_TOUNIT_MASK: u32 = 0x000F_0000;
+        const TIMEOUT_VAL: u32 = 0x0E;
+        let c1 = (self.rd(CONTROL1) & !DATA_TOUNIT_MASK) | (TIMEOUT_VAL << DATA_TOUNIT_SHIFT);
+        self.wr(CONTROL1, c1);
         // No data transfers in this phase, but leave the block registers defined rather than at
         // whatever reset left: a stale block count is the kind of thing that makes the FIRST data
         // command behave oddly, long after this code is out of mind.
@@ -570,7 +640,8 @@ impl<'a> Host<'a> {
                 if read {
                     *w = self.rd(DATA);
                 } else {
-                    self.wr(DATA, *w);
+                    // RAW: no settling gap on the data port. See `wr_raw`.
+                    self.wr_raw(DATA, *w);
                 }
             }
             done = end;
