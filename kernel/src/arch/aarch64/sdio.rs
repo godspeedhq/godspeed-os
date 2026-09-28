@@ -259,9 +259,53 @@ fn route_pins_to_arasan() {
         let mut p = pud.read_volatile();
         for pin in 34..40u32 {
             let sh = (pin - 32) * 2;
+            // PULL-UP ON ALL SIX, which DIVERGES from the vendor's own pin config and is recorded rather
+            // than silently matched. The Pi device tree's `sdio_pins` sets `brcm,pull = <0 2 2 2 2 2>`:
+            // no pull on CLK (34), pull-up on CMD and DAT0-3. A pull-up on a line the controller DRIVES
+            // is unlikely to matter, and changing it in the same boot as the readback below would muddy
+            // that measurement. Known difference, not an oversight.
+            //
+            // Note the encodings are not the same either: `brcm,pull` uses BCM2835's 2 = up, while this
+            // BCM2711 register uses 01 = up. Porting the numbers rather than the meaning would set
+            // pull-DOWN on every line.
             p = (p & !(3 << sh)) | (1 << sh); // 01 = pull-up
         }
         pud.write_volatile(p);
+
+        // READ BOTH BACK. Writing a register and not checking it took is the mistake that cost several
+        // boots on the SDIO backplane window, and this is the same shape: the line above logs what the
+        // mux WAS and nothing confirmed what it BECAME.
+        //
+        // It also fits the fault being chased better than anything else left. CLK and CMD are evidently
+        // working - commands complete and responses arrive - and a card that accepted a read IS driving
+        // DAT0. If pin 36 did not take ALT3, the controller is not connected to that line: it starts the
+        // transfer, sees nothing, and sits in `DAT Line Active` forever, which is exactly what the
+        // driver measured (active from the first poll to the last, no data, no error, no timeout).
+        let fsel_after = fsel.read_volatile();
+        let pull_after = pud.read_volatile();
+        super::put_str(b"sdio: GPIO34-39 after: ");
+        let mut all_alt3 = true;
+        for pin in 34..40u32 {
+            let f = (fsel_after >> ((pin - 30) * 3)) & 7;
+            let pl = (pull_after >> ((pin - 32) * 2)) & 3;
+            // `34=f3/p1` - the pin, its function, its pull. One group per pin so a single wrong pin is
+            // visible rather than hidden in a digit string.
+            super::put_dec(pin as u64);
+            super::put_str(b"=f");
+            super::put_str(&[b'0' + (f as u8 & 7)]);
+            super::put_str(b"/p");
+            super::put_str(&[b'0' + (pl as u8 & 3)]);
+            super::put_str(b" ");
+            if f != 7 {
+                all_alt3 = false;
+            }
+        }
+        super::put_str(if all_alt3 {
+            b"- all six ALT3, so CLK/CMD/DAT0-3 are ALL connected to the Arasan\r\n" as &[u8]
+        } else {
+            b"- NOT all ALT3: a pin did not take, and if it is 36 then DAT0 is not wired to the \
+              controller at all, which is why a data phase waits forever\r\n"
+        });
     }
 }
 
