@@ -52,14 +52,20 @@ mod f1 {
     pub const SBADDRMID: u32 = 0x1_000B;
     /// Backplane window, address bits [31:24].
     pub const SBADDRHIGH: u32 = 0x1_000C;
-    /// Chip clock control and status.
+    /// Chip clock control and status. `0x1000E` in both references (`SBSDIO_FUNC1_CHIPCLKCSR` in
+    /// brcmfmac, `SDIO_CHIP_CLOCK_CSR` in `cyw43-driver`).
     pub const CHIPCLKCSR: u32 = 0x1_000E;
+    /// SDIO pull-up control. brcmfmac's `buscoreprep` writes **0** here in the same step that brings the
+    /// clock up, commented *"Also, disable the extra SDIO pull-ups"*; `cyw43-driver` defines the same
+    /// register as `SDIO_PULL_UP`. The host drives these lines and the board has its own pulls, so the
+    /// chip's internal ones are redundant at best.
+    pub const SDIOPULLUP: u32 = 0x1_000F;
 }
 
 /// `CHIPCLKCSR` bits. Only the four this step uses are named.
 mod clk {
-    /// Force the ALP clock on. Not used here; named because it is one of the writable bits, and the
-    /// mask below has to cover every bit a host can write or it would forgive a real failure.
+    /// **Force the ALP clock ON**, as opposed to merely requesting that it become available. Part of
+    /// `INIT` below, and the bit whose absence stalled every backplane read.
     pub const FORCE_ALP: u8 = 0x01;
     /// Force the HT clock on. As above.
     pub const FORCE_HT: u8 = 0x02;
@@ -77,8 +83,27 @@ mod clk {
     /// already has it says something about what state it was left in.
     pub const HT_AVAIL: u8 = 0x80;
 
-    /// What to write first: request ALP, and take the hardware's own request out of the picture.
-    pub const INIT: u8 = FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ;
+    /// The clock word for the **SDIO** transport, quoted from `cyw43_ll.c`'s bus init:
+    ///
+    /// ```text
+    /// #if !CYW43_USE_SPI
+    ///     SBSDIO_FORCE_HW_CLKREQ_OFF | SBSDIO_ALP_AVAIL_REQ | SBSDIO_FORCE_ALP      /* 0x29 */
+    /// #else
+    ///     SBSDIO_ALP_AVAIL_REQ                                                      /* 0x08 */
+    /// #endif
+    /// ```
+    ///
+    /// **`FORCE_ALP` was missing, and that is the whole bug this constant records.** `ALP_AVAIL` reports
+    /// that the clock is AVAILABLE; `FORCE_ALP` is what RUNS it. Without it the backplane has no clock,
+    /// so a backplane read cannot be serviced - the card accepts the command and never produces data,
+    /// which was the measured symptom precisely: the host's data phase active from the first poll to the
+    /// last, no data, no error, no timeout.
+    ///
+    /// The `#if` is the part to take to heart. The SPI transport writes `ALP_AVAIL_REQ` alone; SDIO needs
+    /// the other two bits. The value here was NEITHER - the SPI form plus one bit - which is what comes
+    /// of assembling a register word out of named bits that look sufficient instead of copying the one
+    /// the reference writes for the transport in use.
+    pub const INIT: u8 = FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ | FORCE_ALP;
 
     /// The bits of this register a HOST WRITES. Everything above them - `ALP_AVAIL` and `HT_AVAIL` - is
     /// read-only status the hardware sets.
@@ -295,11 +320,23 @@ pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
             Some(v) if v & clk::ALP_AVAIL != 0 => {
                 ctx.log_fmt(format_args!(
                     "wifi-driver: backplane awake - CHIPCLKCSR {:#04x}, ALP available after {} \
-                     read(s){}",
+                     read(s), FORCE_ALP {}{}",
                     v,
                     attempt + 1,
+                    if v & clk::FORCE_ALP != 0 { "held" } else { "DID NOT HOLD" },
                     if v & clk::HT_AVAIL != 0 { ", and HT too" } else { "" }
                 ));
+                // THE EXTRA PULL-UPS OFF, which brcmfmac's `buscoreprep` does in this same step. The host
+                // drives these lines and the board has its own pulls, so the chip's internal ones are
+                // redundant. Not fatal - reported and carried on, so it cannot mask what the read does
+                // next.
+                if sdio::write_reg(h, 1, f1::SDIOPULLUP, 0).is_none() {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: could not clear the chip's SDIO pull-ups (SDIOPULLUP) - \
+                         INT={:#010x}. Continuing; the board has its own pulls",
+                        h.last_int()
+                    ));
+                }
                 return true;
             }
             Some(_) => {}

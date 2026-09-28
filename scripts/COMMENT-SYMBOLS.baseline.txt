@@ -209,3 +209,12 @@ brcmf_sdiod_probe                  # Linux brcmfmac bcmsdh.c - the ordered seque
 sdio_max_byte_size                 # Linux mmc core - cited because it clamps a BYTE-mode transfer by the function block size, which is why the two are not independent - external, 26.14
 sdio_set_block_size                # Linux mmc core - cited for the FBR addresses this driver reimplements (base + 0x10, two bytes) - external, 26.14
 sdio_enable_func                   # Linux mmc core - cited for WHERE in the order function 1 is enabled, which is AFTER the block sizes - external, 26.14
+SBSDIO_FUNC1_CHIPCLKCSR            # Linux brcmfmac name for function-1 register 0x1000E, quoted from its sdio.h - external, 26.14
+SDIO_CHIP_CLOCK_CSR                # cyw43-driver (Infineon, same chip family) name for the SAME register; both cited so the two references can be compared
+SDIO_PULL_UP                       # cyw43-driver name for function-1 register 0x1000F, which brcmfmac calls SBSDIO_FUNC1_SDIOPULLUP and writes 0
+SBSDIO_FORCE_ALP                   # cyw43-driver/brcmfmac bit 0x01 of the chip clock CSR - FORCE the ALP clock on, the bit this driver was missing
+SBSDIO_ALP_AVAIL_REQ               # cyw43-driver/brcmfmac bit 0x08 - REQUEST that ALP become available, which is not the same as running it
+SBSDIO_FORCE_HW_CLKREQ_OFF         # cyw43-driver/brcmfmac bit 0x20 - take the hardware clock request out of play
+SBSDIO_ALP_AVAIL                   # cyw43-driver/brcmfmac bit 0x40 - hardware STATUS saying ALP is available
+CYW43_USE_SPI                      # cyw43-driver build switch; cited because the SDIO branch of that #if writes a DIFFERENT clock word from the SPI branch, which is the whole finding
+buscoreprep                        # Linux brcmfmac function (brcmf_sdio_buscoreprep) that brings the backplane clock up and clears the SDIO pull-ups - external, 26.14
