@@ -110,6 +110,36 @@ mod core_id {
     }
 }
 
+/// The most cores this walk will describe.
+///
+/// A chip of this family has on the order of a dozen; the walk is driven by descriptors the CHIP supplies,
+/// so it needs a bound, and the store below is sized by the same one so the two cannot disagree.
+const MAX_CORES: u32 = 32;
+
+/// How far a core's WRAPPER sits above its register base.
+///
+/// **A rule, not a pattern.** `cyw43-driver` - the chip vendor's own driver - does not read wrappers out of
+/// the EROM at all; it computes them:
+///
+/// ```c
+/// #define WRAPPER_REGISTER_OFFSET  (0x100000)
+///
+/// static uint32_t get_core_address(int core_id) {
+///     if (core_id == CORE_WLAN_ARM) {
+///         return WLAN_ARMCM3_BASE_ADDRESS + WRAPPER_REGISTER_OFFSET;
+///     ...
+/// }
+/// ```
+///
+/// Its own base constants are for a different part of the family, so the BASE still comes from this
+/// chip's EROM - which is per-chip - and only the offset is borrowed. That is the split §26.14 asks for:
+/// the offset is a property of the silicon, the bases are a property of this die.
+///
+/// **It is verified rather than trusted.** `Cores::check_wrappers` compares this against every wrapper the
+/// EROM did publish, so a wrong offset is caught on the boot it is introduced rather than at the first
+/// reset.
+const WRAPPER_OFFSET: u32 = 0x10_0000;
+
 /// One core, as the table describes it.
 #[derive(Clone, Copy)]
 pub struct Core {
@@ -117,12 +147,27 @@ pub struct Core {
     pub rev: u8,
     /// Register base on the backplane.
     pub base: u32,
-    /// Wrapper base, or 0 if the table gave none.
+    /// Wrapper base AS THE TABLE GAVE IT, or 0 if it gave none. Prefer `wrapper()`, which derives it.
     ///
     /// **A core is reset through its WRAPPER, not its register base**, so for the ARM core this is the
     /// address the next step needs in order to halt it before writing firmware into it. That is the whole
     /// reason the EROM walk bothers to find a second address per core.
     pub wrap: u32,
+}
+
+impl Core {
+    /// This core's wrapper address: its base plus `WRAPPER_OFFSET`.
+    ///
+    /// **Derived rather than read**, because the EROM does not publish one for every core - the ARM CR4 on
+    /// this chip is exactly such a case - while the vendor driver computes every wrapper it uses. `None`
+    /// only when the core has no register base at all, since there is then nothing to offset from.
+    pub fn wrapper(&self) -> Option<u32> {
+        if self.base == 0 {
+            None
+        } else {
+            Some(self.base + WRAPPER_OFFSET)
+        }
+    }
 }
 
 /// What the enumeration found that a firmware upload needs.
@@ -133,6 +178,11 @@ pub struct Cores {
     pub mem: Option<Core>,
     /// How many cores the table described in total.
     pub count: u32,
+    /// `(id, base, wrapper AS PUBLISHED)` for each core found, for the derivation self-check.
+    ///
+    /// Kept because the check needs the EROM's own answer to compare `base + WRAPPER_OFFSET` against, and
+    /// that answer is gone once the walk moves on. Fixed-size and stack-only: 32 entries of ten bytes.
+    seen: [(u16, u32, u32); MAX_CORES as usize],
 }
 
 /// Read one descriptor and advance, skipping EMPTY ones as `brcmf_chip_dmp_get_desc` does.
@@ -278,10 +328,12 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
     };
     ctx.log_fmt(format_args!("wifi-driver: EROM at {:#010x}, walking it", at));
 
-    let mut out = Cores { arm: None, mem: None, count: 0 };
-    /// Bounded: a chip of this family has on the order of a dozen cores, and the walk is driven by
-    /// descriptors the chip supplies.
-    const MAX_CORES: u32 = 32;
+    let mut out = Cores {
+        arm: None,
+        mem: None,
+        count: 0,
+        seen: [(0, 0, 0); MAX_CORES as usize],
+    };
 
     loop {
         if out.count >= MAX_CORES {
@@ -335,6 +387,9 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
         };
 
         let core = Core { id, rev, base, wrap };
+        // RECORD WHAT THE TABLE SAID, before anything derives anything. This is the evidence the wrapper
+        // rule is checked against, and it is only available here.
+        out.seen[out.count as usize] = (id, base, wrap);
         out.count += 1;
         ctx.log_fmt(format_args!(
             "wifi-driver:   core {:#05x} rev {:<3} base {:#010x} wrap {:#010x}  {}",
@@ -366,22 +421,58 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
 }
 
 impl Cores {
+    /// Check the derived wrapper rule against every wrapper the EROM actually published.
+    ///
+    /// **This is what stops `WRAPPER_OFFSET` being taken on the vendor driver's word.** Where the table
+    /// gave a wrapper, `base + WRAPPER_OFFSET` must equal it; those are independent data points from this
+    /// die, and a mismatch means the offset is wrong for this part and every derived wrapper with it. Kept
+    /// as a check rather than a fallback on purpose: silently preferring the published value where there
+    /// is one would hide the disagreement, and the disagreement is the interesting thing.
+    pub fn check_wrappers(&self, ctx: &ServiceContext) {
+        let mut agree = 0u32;
+        let mut disagree = 0u32;
+        for &(id, base, pub_wrap) in self.seen[..self.count as usize].iter() {
+            if pub_wrap == 0 || base == 0 {
+                continue;
+            }
+            if base + WRAPPER_OFFSET == pub_wrap {
+                agree += 1;
+            } else {
+                disagree += 1;
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: core {:#05x} publishes wrapper {:#010x} but base {:#010x} + {:#08x} is \
+                     {:#010x} - the wrapper OFFSET is wrong for this part and every derived wrapper with it",
+                    id, pub_wrap, base, WRAPPER_OFFSET, base + WRAPPER_OFFSET
+                ));
+            }
+        }
+        if disagree == 0 && agree > 0 {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: the wrapper rule (base + {:#08x}) agrees with all {} wrapper(s) the EROM \
+                 published, so deriving the ones it did not is sound on this die",
+                WRAPPER_OFFSET, agree
+            ));
+        } else if agree == 0 {
+            ctx.log(
+                "wifi-driver: the EROM published no wrappers to check the derivation against, so it rests \
+                 on the reference alone",
+            );
+        }
+    }
+
     /// Say what the table means for the upload, in the terms the next step needs.
     pub fn report(&self, ctx: &ServiceContext) {
         match self.arm {
-            // A WRAPPER OF 0 BLOCKS *HALTING* THE CPU, AND ONLY THAT - a correction to what this said
-            // before, which called it a blocker for the firmware upload outright.
-            // `brcmf_chip_get_raminfo`'s CR4 branch reads through `brcmf_chip_core_read32`, which is
-            // `core->pub.base + reg` - the core's BASE - so the RAM size and the firmware address are
-            // obtainable without a wrapper. What needs one is `brcmf_chip_disable_arm`, via
-            // `wrapbase + BCMA_IOCTL` and `wrapbase + BCMA_RESET_CTL`.
+            // THE WRAPPER IS DERIVED, and the EROM not publishing one for this core is expected
+            // rather than a defect. The entry opens with a `MASTER_PORT` descriptor so `get_regaddr`
+            // requires a MASTER wrapper, and the only one the chip publishes for this core is a SLAVE
+            // wrapper at `0x18105000` - which belongs to the entry's SECOND slave region (`0x18005000`
+            // + `WRAPPER_OFFSET`), not to its first. The reference's walk reads 0 here too.
             //
-            // AND IT IS NOT A DEFECT IN THIS WALK. The descriptor dump settled it: this core's entry
-            // opens with a `MASTER_PORT` descriptor, so `get_regaddr` requires a MASTER wrapper, and the
-            // only wrapper the chip publishes for it is `0x18105185` - a SLAVE wrapper at `0x18105000`.
-            // The reference's logic is identical, so it reads 0 here too. The `0x18102000` that the other
-            // cores' base/wrapper pattern predicted was wrong, which is why a pattern was never going
-            // into the code.
+            // A PREVIOUS VERSION OF THIS COMMENT CALLED THE DERIVED VALUE WRONG. It is not: the vendor
+            // driver computes every wrapper it uses as base + 0x100000, so the pattern was the rule and
+            // what was missing was a source for it. Refusing an unsourced pattern was right; calling it
+            // wrong was not.
             Some(c) if c.wrap == 0 => ctx.log_fmt(format_args!(
                 "wifi-driver: the ARM core is {} rev {} at {:#010x} and its wrapper is 0. That \
                  blocks HALTING it later, not reading its memory now: the RAM size and the load \

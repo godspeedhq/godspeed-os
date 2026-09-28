@@ -284,7 +284,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("wifi-driver: stage 8 - walking the EROM to find the ARM core and the RAM");
             let cores = erom::scan(&h, &mut window, &ctx);
             match &cores {
-                Some(cores) => cores.report(&ctx),
+                Some(cores) => {
+                    // CHECK THE WRAPPER RULE BEFORE TRUSTING IT. The scan collected what the EROM
+                    // published; this asks whether `base + WRAPPER_OFFSET` reproduces those, which is the
+                    // only evidence from THIS die that the derivation is right.
+                    cores.check_wrappers(&ctx);
+                    cores.report(&ctx);
+                }
                 None => ctx.log(
                     "wifi-driver: the core table could not be walked, so phase 2 has no address to                      write firmware to. Everything through stage 7 stands - the chip is identified and                      its backplane reads",
                 ),
