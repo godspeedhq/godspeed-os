@@ -79,3 +79,4 @@ ie_length                          # OpenBSD bwfm struct field named in the phas
 ie_offset                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
 bwfm_scan_v0                       # OpenBSD bwfm - the v0 scan path this driver targets; cited in the recorded v0-vs-v2 conflict - external, 26.14
 bwfm_scan_v2                       # OpenBSD bwfm - the v2 scan path, the first thing to try if a v0 scan returns nothing - external, 26.14
+brcmf_proto_bcdc_query_dcmd        # Linux brcmfmac bcdc.c - where the request-id convention and the reply validation are quoted from - external, 26.14
