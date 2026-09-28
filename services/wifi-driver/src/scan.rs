@@ -423,12 +423,29 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     // THE INTERFACE MUST BE UP FIRST. A scan on a down interface is refused with `BCME_NOTUP` (-4), which
     // is exactly what this driver was told the first time it tried.
     let mut session = ctrl::Session::new();
-    if !ctrl::interface_up(h, w, &mut session, ctx) {
-        ctx.log("wifi-driver: the interface would not come up, so no scan is attempted");
+
+    // THE CLM BLOB FIRST, and it is first for a reason rather than by habit. `bwfm_init` is preceded by
+    // `bwfm_preinit`, whose brcmfmac twin `brcmf_c_preinit_dcmds` calls `brcmf_c_process_clm_blob`. CLM is
+    // the Country Locale Matrix - which channels may be used at what power - and a radio with no regulatory
+    // data cannot lawfully transmit or scan. That is why every configuration command was accepted and
+    // `escan` still answered `BCME_NOTUP`.
+    if !ctrl::download_blob(
+        h,
+        w,
+        &mut session,
+        "clmload",
+        ctrl::DL_TYPE_CLM,
+        crate::firmware::CLM,
+        ctx,
+    ) {
+        ctx.log(
+            "wifi-driver: the CLM regulatory blob was refused, so the radio has no channel rules and will \
+             not come up - not attempting a scan",
+        );
         return false;
     }
 
-    // ASK FOR THE EVENTS FIRST. The firmware sends NONE until the host sets this mask, so a scan accepted
+    // ASK FOR THE EVENTS NEXT. The firmware sends NONE until the host sets this mask, so a scan accepted
     // without it would run and report nothing - which is indistinguishable from an empty room.
     if !ctrl::enable_events(
         h,
@@ -441,6 +458,19 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
             "wifi-driver: the event mask was not set, so a scan would produce no results even if accepted \
              - not attempting one",
         );
+        return false;
+    }
+
+    // THE BRING-UP CHAIN LAST, which is the order `bwfm_init` uses: the event mask and the scan timings are
+    // set BEFORE `BWFM_C_UP`, not after. Reading that function in full rather than asking for particular
+    // lines is what showed it - a list of call sites came back in the order they were found, not the order
+    // they run.
+    //
+    // Not sent, and each for a reason rather than for now (§26.2): `mpc`, `join_pref`, `txbf`, the three
+    // scan timings and `SET_PM` are all tuning of something that does not work yet, and the scan timings
+    // have firmware defaults this driver is content with.
+    if !ctrl::interface_up(h, w, &mut session, ctx) {
+        ctx.log("wifi-driver: the interface would not come up, so no scan is attempted");
         return false;
     }
 

@@ -46,6 +46,12 @@ fn main() {
     for (var, name, what) in [
         ("WIFI_FW_BIN", "brcmfmac43455-sdio.bin", "the firmware image the chip's processor runs"),
         ("WIFI_FW_NVRAM", "brcmfmac43455-sdio.txt", "the board-specific NVRAM calibration text"),
+        // The CLM (Country Locale Matrix) regulatory blob. Embedded now because the path to
+        // deliver it EXISTS now - `ctrl::download_blob`. Until it did, this was 2.6 KiB of image
+        // for nothing (26.2); without it the firmware accepts every configuration command and
+        // still reports BCME_NOTUP, because a radio with no regulatory data cannot lawfully
+        // transmit or scan.
+        ("WIFI_FW_CLM", "brcmfmac43455-sdio.clm_blob", "the CLM regulatory blob"),
     ] {
         let path = dir.join(name);
         // REFUSED, not silently skipped. A missing blob would otherwise produce a driver that compiles,

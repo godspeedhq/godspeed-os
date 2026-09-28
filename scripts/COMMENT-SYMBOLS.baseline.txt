@@ -355,3 +355,17 @@ bwfm_fwvar_cmd_set_data            # OpenBSD bwfm - what its int setter calls wi
 bwfm_fwvar_cmd_set_int             # OpenBSD bwfm - the integer-command helper; the source of set_cmd_int - external, 26.14
 bwfm_fwvar_var_set_data            # OpenBSD bwfm - how it writes the event_msgs mask back - external, 26.14
 brcmf_c_preinit_dcmds              # Linux brcmfmac common.c - the bring-up command sequence read to find what precedes a scan - external, 26.14
+brcmf_c_process_clm_blob           # Linux brcmfmac common.c - downloads the CLM regulatory blob via the clmload iovar; the step this driver was missing - external, 26.14
+brcmf_c_download_blob              # Linux brcmfmac - the chunked blob download download_blob reimplements - external, 26.14
+brcmf_dload_data_le                # Linux brcmfmac fwil_types.h - the 12-byte download header (flag/dload_type/len/crc) - external, 26.14
+bwfm_init                          # OpenBSD bwfm - the bring-up function whose FULL order showed that UP comes after the event mask - external, 26.14
+bwfm_preinit                       # OpenBSD bwfm - what runs before bwfm_init; its brcmfmac twin downloads the CLM blob - external, 26.14
+join_pref                          # OpenBSD bwfm iovar - RSSI-based AP preference; deliberately not sent (26.2) - external, 26.14
+MAX_CHUNK_LEN                      # Linux brcmfmac - 1400, its download buffer limit; this driver chunks to its own 512-byte frame instead - external, 26.14
+SET_PM                             # OpenBSD bwfm BWFM_C_SET_PM - power management; deliberately not sent (26.2) - external, 26.14
+DL_TYPE_CLM                        # Linux brcmfmac fwil_types.h - 2, the download type for a CLM blob - external, 26.14
+DL_BEGIN                           # Linux brcmfmac fwil_types.h - 0x0002, first chunk of a blob download - external, 26.14
+DL_END                             # Linux brcmfmac fwil_types.h - 0x0004, last chunk of a blob download - external, 26.14
+clmload_status                     # Linux brcmfmac - the companion iovar its blob download reads afterwards; not read here - external, 26.14
+mpc                                # OpenBSD bwfm iovar - minimum power consumption; deliberately not sent (26.2) - external, 26.14
+txbf                               # OpenBSD bwfm iovar - transmit beamforming; deliberately not sent (26.2) - external, 26.14

@@ -41,6 +41,17 @@ pub static IMAGE: &[u8] = include_bytes!(env!("WIFI_FW_BIN"));
 /// above.
 pub static NVRAM: &[u8] = include_bytes!(env!("WIFI_FW_NVRAM"));
 
+/// The CLM regulatory blob, delivered to the RUNNING firmware through the `clmload` iovar.
+///
+/// **Not written into RAM like the other two.** CLM is the Country Locale Matrix - which channels may be
+/// used at what power - and it goes to the firmware after it is running, in chunks.
+///
+/// This was deliberately left unembedded until the delivery path existed, and the note explaining that was
+/// correct about the mechanism. What did not happen is connecting it when the firmware began answering
+/// `BCME_NOTUP` to every scan: a radio with no regulatory data cannot lawfully transmit or scan, and "not
+/// up" is exactly how that presents.
+pub static CLM: &[u8] = include_bytes!(env!("WIFI_FW_CLM"));
+
 /// FNV-1a over a byte slice. Four lines, and the same four `build.rs` runs over the file on disk.
 ///
 /// **This is the check that actually works**, and the reason it does is that it READS every byte. A size
@@ -66,6 +77,7 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 /// IMAGE carries what the repository holds.
 const IMAGE_FNV: u32 = konst_u32(env!("WIFI_FW_BIN_FNV"));
 const NVRAM_FNV: u32 = konst_u32(env!("WIFI_FW_NVRAM_FNV"));
+const CLM_FNV: u32 = konst_u32(env!("WIFI_FW_CLM_FNV"));
 
 /// Parse a decimal `u32` at compile time, since `env!` yields a string and `no_std` has no `parse` in
 /// const context.
@@ -84,14 +96,17 @@ const fn konst_u32(s: &str) -> u32 {
 pub fn verify(ctx: &godspeed_sdk::ServiceContext) -> bool {
     let img = fnv1a(IMAGE);
     let nvr = fnv1a(NVRAM);
-    if img == IMAGE_FNV && nvr == NVRAM_FNV {
+    let clm = fnv1a(CLM);
+    if img == IMAGE_FNV && nvr == NVRAM_FNV && clm == CLM_FNV {
         ctx.log_fmt(format_args!(
             "wifi-driver: the embedded blobs VERIFY - image {} bytes fnv {:#010x}, NVRAM {} bytes fnv \
-             {:#010x}, both matching what the build measured on disk",
+             {:#010x}, CLM {} bytes fnv {:#010x}, all matching what the build measured on disk",
             IMAGE.len(),
             img,
             NVRAM.len(),
-            nvr
+            nvr,
+            CLM.len(),
+            clm
         ));
         return true;
     }
@@ -99,9 +114,9 @@ pub fn verify(ctx: &godspeed_sdk::ServiceContext) -> bool {
     // the failure the first guard was meant to catch and could not.
     ctx.log_fmt(format_args!(
         "wifi-driver: the embedded firmware does NOT match what the build measured - image fnv {:#010x} \
-         want {:#010x}, NVRAM fnv {:#010x} want {:#010x}. The binary is not carrying the vendored blob, \
-         so nothing is uploaded",
-        img, IMAGE_FNV, nvr, NVRAM_FNV
+         want {:#010x}, NVRAM fnv {:#010x} want {:#010x}, CLM fnv {:#010x} want {:#010x}. The binary is \
+         not carrying the vendored blob, so nothing is uploaded",
+        img, IMAGE_FNV, nvr, NVRAM_FNV, clm, CLM_FNV
     ));
     false
 }

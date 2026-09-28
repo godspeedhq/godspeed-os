@@ -826,6 +826,104 @@ pub fn set_cmd_int(
     set_cmd(h, w, s, cmd, &value.to_le_bytes(), what, ctx)
 }
 
+/// Download a blob to the running firmware through an iovar, in chunks.
+///
+/// This is how the CLM regulatory data reaches the chip - not written into RAM like the firmware image, but
+/// handed to the firmware that is already running.
+///
+/// ```c
+/// err = brcmf_c_download_blob(ifp, fw->data, fw->size, "clmload", "clmload_status");
+///
+/// dload_buf->flag = cpu_to_le16(flag);
+/// dload_buf->dload_type = cpu_to_le16(DL_TYPE_CLM);
+/// dload_buf->len = cpu_to_le32(len);
+/// dload_buf->crc = cpu_to_le32(0);
+/// ```
+///
+/// ```c
+/// struct brcmf_dload_data_le {
+/// 	__le16 flag;  __le16 dload_type;  __le32 len;  __le32 crc;  u8 data[];
+/// };
+/// #define DL_BEGIN	0x0002
+/// #define DL_END		0x0004
+/// #define DL_TYPE_CLM	2
+/// #define MAX_CHUNK_LEN	1400
+/// ```
+///
+/// **The CRC is explicitly zero, not computed.** Worth quoting, because computing one is the obvious wrong
+/// guess and the firmware would reject every chunk.
+///
+/// **Chunked to this driver's frame rather than to `MAX_CHUNK_LEN`.** 1400 exceeds the 512-byte control
+/// frame, and the reference's constant is its buffer's limit rather than the protocol's - a chunked download
+/// is chunked either way. `DL_BEGIN` marks the first chunk and `DL_END` the last; a blob small enough for one
+/// chunk carries both, which is what the reference does too.
+pub fn download_blob(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    iovar: &str,
+    dtype: u16,
+    blob: &[u8],
+    ctx: &ServiceContext,
+) -> bool {
+    /// `sizeof(struct brcmf_dload_data_le)` without its trailing data.
+    const DLOAD_HDR: usize = 12;
+    const DL_BEGIN: u16 = 0x0002;
+    const DL_END: u16 = 0x0004;
+
+    // What is left of a frame once the SDPCM and BCDC headers, the iovar name and the download header have
+    // taken their share. Rounded down to four so every chunk is a whole number of words.
+    let room = (FRAME - PAYLOAD_AT - (iovar.len() + 1) - DLOAD_HDR) & !3;
+    if room == 0 {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: `{}` leaves no room for blob data in a {} byte frame", iovar, FRAME
+        ));
+        return false;
+    }
+
+    ctx.log_fmt(format_args!(
+        "wifi-driver: downloading {} bytes to `{}` in chunks of up to {}",
+        blob.len(), iovar, room
+    ));
+
+    let mut buf = [0u8; FRAME];
+    let mut off = 0usize;
+    let mut chunks = 0u32;
+    while off < blob.len() {
+        let n = core::cmp::min(room, blob.len() - off);
+        let mut flag = 0u16;
+        if off == 0 {
+            flag |= DL_BEGIN;
+        }
+        if off + n == blob.len() {
+            flag |= DL_END;
+        }
+        buf[0..2].copy_from_slice(&flag.to_le_bytes());
+        buf[2..4].copy_from_slice(&dtype.to_le_bytes());
+        buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        // ZERO, quoted: `dload_buf->crc = cpu_to_le32(0);`
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+        buf[DLOAD_HDR..DLOAD_HDR + n].copy_from_slice(&blob[off..off + n]);
+
+        if !set_iovar(h, w, s, iovar, &buf[..DLOAD_HDR + n], ctx) {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: `{}` failed {} bytes in, on chunk {} of {} bytes (flag {:#06x})",
+                iovar, off, chunks + 1, n, flag
+            ));
+            return false;
+        }
+        chunks += 1;
+        off += n;
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: `{}` accepted all {} bytes in {} chunk(s)", iovar, blob.len(), chunks
+    ));
+    true
+}
+
+/// `DL_TYPE_CLM`.
+pub const DL_TYPE_CLM: u16 = 2;
+
 /// Ask the firmware to send the events this driver needs. Without this it sends NONE.
 ///
 /// Both references do the same three steps - read the mask, set bits in it, write it back:
