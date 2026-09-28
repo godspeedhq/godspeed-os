@@ -68,15 +68,69 @@ const OPERATING_HZ: u32 = 25_000_000;
 /// service that never recv's at all sits at 16/16 on its queue forever - the flood-endpoint disease.
 /// `recv` BLOCKS, so the core still reaches its idle path between messages and this costs nothing
 /// while nobody is calling.
-fn serve(ctx: &ServiceContext) -> ! {
+/// Serve with NO radio: every request is answered "radio down", loudly and at once, so a shell that asks
+/// gets a fact rather than a timeout. This is where the driver goes when any stage before the radio came
+/// up has failed - identification, upload, bus - and it is the rule above the rules (Commandment VIII): a
+/// dependency that cannot do the thing must RETURN with a loud unavailable, never hang.
+fn serve_unavailable(ctx: &ServiceContext) -> ! {
     loop {
         let _req = ctx.recv();
         // No reply cap means there is nothing to answer on, and dropping is all that is left.
         if let Some(reply) = ctx.take_pending_cap() {
             // One byte, not an empty message: the kernel refuses a zero-length send, so an "empty
             // reply" is no reply at all and the caller waits out its deadline.
-            let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&[1u8]));
+            let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&[scan::reply::RADIO_DOWN]));
         }
+    }
+}
+
+/// Serve `wifi list`. With a radio, a request scans and answers with the networks; without one, every
+/// request is answered "radio down" - the same loud fact `serve_unavailable` gives, so a shell can never
+/// tell the two apart by waiting.
+///
+/// **What this does NOT do, recorded rather than faked (§26.7):** `utilities/56_wifi.md` rule 11 says
+/// that `q` at the prompt must stop the SCAN, not just the shell's interest in it. This loop is single-
+/// threaded and sits inside `collect` while the radio sweeps, so it cannot hear an abort until the sweep
+/// ends. The shell's `q` therefore abandons its wait while the radio finishes (about 2.6 s on hardware),
+/// and the late reply is dropped by the shell's request matching. Meeting rule 11 needs the collect loop
+/// to poll the endpoint between frames; that is real work and is written down here rather than half done.
+fn serve_radio(
+    ctx: &ServiceContext,
+    h: &host::Host,
+    w: &mut backplane::Window,
+    mut radio: Option<ctrl::Session>,
+) -> ! {
+    // Bounded: 2 status bytes plus 32 records of 44 is 1410, inside this fixed buffer, inside a 4 KiB message.
+    let mut out = [0u8; 1536];
+    loop {
+        let req = ctx.recv();
+        let reply = match ctx.take_pending_cap() {
+            Some(r) => r,
+            None => continue, // nothing to answer on
+        };
+        let op = req.payload_bytes().first().copied().unwrap_or(0);
+        let n = if op != scan::reply::OP_LIST {
+            out[0] = scan::reply::UNKNOWN_OP;
+            1
+        } else {
+            match radio.as_mut() {
+                None => {
+                    out[0] = scan::reply::RADIO_DOWN;
+                    1
+                }
+                Some(session) => match scan::scan_once(h, w, session, ctx) {
+                    Some(scan) => scan::write_reply(&scan, &mut out),
+                    None => {
+                        out[0] = scan::reply::SCAN_FAILED;
+                        1
+                    }
+                },
+            }
+        };
+        // `try_send`, never `send`: the shell may have given up on this reply (`q`, or its own deadline),
+        // and a blocking send toward a peer that is not receiving is the mutual-blocking anti-pattern §8.9
+        // names. A failed reply here means nobody was waiting, which is not this driver's failure.
+        let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n]));
     }
 }
 
@@ -102,7 +156,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                  this machine. The kernel grants it only where its boot census saw the controller \
                  answer - look for the `sdio:` lines above",
             );
-            serve(&ctx);
+            serve_unavailable(&ctx);
         }
     };
     ctx.log_fmt(format_args!(
@@ -127,7 +181,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ));
     if !h.reset(&ctx) {
         ctx.log("wifi-driver: the host controller did not come up, so nothing further was attempted");
-        serve(&ctx);
+        serve_unavailable(&ctx);
     }
 
     // ---- Stage 3: what is on the bus. ------------------------------------------------------------
@@ -139,7 +193,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                  so the remaining suspects are the ones the kernel reports at boot: the SD power \
                  domain and the GPIO34-39 mux",
             );
-            serve(&ctx);
+            serve_unavailable(&ctx);
         }
     };
     ctx.log_fmt(format_args!(
@@ -224,7 +278,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             "wifi-driver: function 1 (the backplane) is not open, so no firmware could be written \
              through it. Identification succeeded, so the card is there and reachable for reads",
         );
-        serve(&ctx);
+        serve_unavailable(&ctx);
     }
 
     // ---- Stage 7: ask the SILICON what it is. -----------------------------------------------------
@@ -241,9 +295,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
              Everything through stage 6 stands: the card is on the bus, identified, and function 1 \
              reported ready",
         );
-        serve(&ctx);
+        serve_unavailable(&ctx);
     }
     let mut window = backplane::Window::new();
+    // The radio's session, if boot brings it up. The serving loop scans on it when the shell asks; `None`
+    // means every such request is answered "radio down" - loudly, and without pretending (§26.7).
+    let mut radio: Option<ctrl::Session> = None;
     // The proper read first - one CMD53, one 32-bit fetch by the bridge. If it fails, fall back to four
     // CMD52 byte reads, which is NOT how this should be done and is the command known to work on this
     // bus: whichever answers tells us something we do not have yet. See `chip_id_via_cmd52`.
@@ -356,7 +413,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                     // against a channel that has never
                                                     // replied would confuse "the scan is
                                                     // wrong" with "nothing works yet".
-                                                    let _ = scan::run(&h, &mut window, &ctx);
+                                                    radio = scan::run(&h, &mut window, &ctx);
                                                 }
                                             }
                                         }
@@ -403,9 +460,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // fetched. It no longer describes the radio's state at all - the stages above do that, each on its
         // own line, and they are read rather than asserted. What it says is the one thing still true: the
         // SHELL has no way to ask this driver for any of it yet.
-        "wifi-driver: the stages above are the radio's state, each reported as it was read. What does not \
-         exist yet is a way for the shell to ask for any of it, so `wifi` at the prompt is still answered \
-         `unavailable` - that is the next work, and this line will be wrong again when it lands",
+        // FIFTH TIME, and the last: it now reports the one fact the serving loop is about to act on.
+        if radio.is_some() {
+            "wifi-driver: the stages above are the radio's state, each reported as it was read. The \
+             radio is up and the shell may ask it to scan: `wifi list`"
+        } else {
+            "wifi-driver: the stages above are the radio's state, each reported as it was read. The \
+             radio did NOT come up, so `wifi list` will be answered `radio down` rather than left waiting"
+        },
     );
-    serve(&ctx)
+    serve_radio(&ctx, &h, &mut window, radio)
 }

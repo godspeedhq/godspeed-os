@@ -310,6 +310,46 @@ impl Scan {
     }
 }
 
+/// Reply status bytes for a `wifi list` request. One byte, first in the reply, read by the shell.
+pub mod reply {
+    /// Networks follow.
+    pub const OK: u8 = 0;
+    /// The scan ran and failed; the driver's log says where.
+    pub const SCAN_FAILED: u8 = 1;
+    /// The radio never came up at boot, so there is nothing to scan with.
+    pub const RADIO_DOWN: u8 = 2;
+    /// Not a request this driver understands.
+    pub const UNKNOWN_OP: u8 = 3;
+
+    /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] pad.
+    pub const RECORD: usize = 44;
+    /// Request op byte: scan and list.
+    pub const OP_LIST: u8 = 1;
+}
+
+/// Serialise a scan into a reply: `[status, count, record * count]`. Returns the bytes written.
+///
+/// A FIXED layout with no framing to parse on the far side - the shell indexes into it. 32 records of 44
+/// bytes plus two is 1410 bytes, well inside a 4096-byte message, and `Scan` already bounds the count.
+pub fn write_reply(scan: &Scan, out: &mut [u8]) -> usize {
+    out[0] = reply::OK;
+    out[1] = scan.count as u8;
+    let mut at = 2;
+    for n in scan.networks() {
+        if at + reply::RECORD > out.len() {
+            break;
+        }
+        out[at..at + 6].copy_from_slice(&n.bssid);
+        out[at + 6..at + 8].copy_from_slice(&n.rssi.to_le_bytes());
+        out[at + 8..at + 10].copy_from_slice(&n.chanspec.to_le_bytes());
+        out[at + 10] = n.ssid_len;
+        out[at + 11..at + 11 + MAX_SSID].copy_from_slice(&n.ssid);
+        out[at + 43] = 0;
+        at += reply::RECORD;
+    }
+    at
+}
+
 /// Build the `escan` request. Values quoted from `brcmf_escan_prep`; see `docs/wifi.md` §30.3.
 ///
 /// Every `-1` means "firmware default". A scan tuned by hand is an optimisation of something that does not
@@ -566,22 +606,19 @@ pub fn collect(
 ///
 /// Returns false when nothing was heard at all, which is a different outcome from "no networks here" and is
 /// reported as such.
-pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
-    /// The bound on EMPTY polls before giving up on a firmware that never says the scan is over. Not a
-    /// duration: each empty poll is one CMD53 and a 1 ms sleep, so this is on the order of tens of seconds
-    /// of silence, and the log says which of the two ended the wait. The scan itself ends when the firmware
-    /// says it does (`status::SUCCESS`), which on hardware was about 2.6 s after it started.
-    const MAX_EMPTY_POLLS: u32 = 500;
+/// The bound on EMPTY polls before giving up on a firmware that never says the scan is over. Not a
+/// duration: each empty poll is one CMD53 and a 1 ms sleep, so this is on the order of tens of seconds
+/// of silence, and the log says which of the two ended the wait. The scan itself ends when the firmware
+/// says it does (`status::SUCCESS`), which on hardware was about 2.6 s after it started.
+const MAX_EMPTY_POLLS: u32 = 500;
 
-    // The "UNVERIFIED ON HARDWARE" banner that stood here was true when written and would have been a
-    // lie from the first successful boot on. Ten networks, names and all, on 2026-09-28.
-    ctx.log("wifi-driver: stage 14 - scanning");
-
-    let mut request = [0u8; req::SIZE];
-    build_request(&mut request);
-
-    // THE INTERFACE MUST BE UP FIRST. A scan on a down interface is refused with `BCME_NOTUP` (-4), which
-    // is exactly what this driver was told the first time it tried.
+/// Bring the radio up for scanning - ONCE, at boot. Returns the session the rest of the driver's life
+/// runs on, so request ids keep counting across every later scan.
+///
+/// Split out of the boot self-test because `wifi list` runs a scan on request, and re-sending the CLM blob
+/// and the UP chain on every request would be wrong - the interface is already up. The bring-up happens
+/// here, once; `scan_once` does the part that repeats.
+pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::Session> {
     let mut session = ctrl::Session::new();
 
     // THE CLM BLOB FIRST, and it is first for a reason rather than by habit. `bwfm_init` is preceded by
@@ -602,7 +639,7 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
             "wifi-driver: the CLM regulatory blob was refused, so the radio has no channel rules and will \
              not come up - not attempting a scan",
         );
-        return false;
+        return None;
     }
 
     // ASK FOR THE EVENTS NEXT. The firmware sends NONE until the host sets this mask, so a scan accepted
@@ -618,7 +655,7 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
             "wifi-driver: the event mask was not set, so a scan would produce no results even if accepted \
              - not attempting one",
         );
-        return false;
+        return None;
     }
 
     // THE BRING-UP CHAIN LAST, which is the order `bwfm_init` uses: the event mask and the scan timings are
@@ -631,11 +668,26 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     // have firmware defaults this driver is content with.
     if !ctrl::interface_up(h, w, &mut session, ctx) {
         ctx.log("wifi-driver: the interface would not come up, so no scan is attempted");
-        return false;
+        return None;
     }
+    Some(session)
+}
+
+/// One scan, on a radio `bring_up` has already raised. This is what `wifi list` runs on every request.
+///
+/// Returns the `Scan` whatever it holds - an empty room is a result, not a failure - and `None` only when
+/// the firmware refused to start the scan at all, which its decoded error explains one line above.
+pub fn scan_once(
+    h: &Host,
+    w: &mut Window,
+    s: &mut ctrl::Session,
+    ctx: &ServiceContext,
+) -> Option<Scan> {
+    let mut request = [0u8; req::SIZE];
+    build_request(&mut request);
 
     let mut scan = Scan::new();
-    if !ctrl::set_iovar(h, w, &mut session, "escan", &request, ctx) {
+    if !ctrl::set_iovar(h, w, s, "escan", &request, ctx) {
         // NO VERSION HINT HERE. This message used to say the params VERSION was the first thing to change,
         // which was written for the "accepted but silent" case and is wrong for a refusal: the firmware
         // states what it objected to, and the decoded error is printed one line above. The version matters
@@ -644,7 +696,7 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
             "wifi-driver: the firmware refused the `escan` request, so no scan started. The decoded error \
              above says what it objected to",
         );
-        return false;
+        return None;
     }
     ctx.log("wifi-driver: `escan` accepted - listening until the firmware says the scan is over");
     collect(h, w, &mut scan, MAX_EMPTY_POLLS, ctx);
@@ -654,13 +706,31 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
          frame(s) ignored, {} on other channels",
         scan.events, scan.results, scan.glom, scan.other
     ));
+    Some(scan)
+}
+
+/// The boot self-test: bring the radio up, scan once, and print what it found to the log.
+///
+/// Returns the session on ANY outcome past bring-up, because a scan that found nothing - or whose results
+/// did not parse - is still a radio that is up and can be asked again by the shell. Only a failed bring-up
+/// returns `None`, and then there is genuinely nothing to serve.
+pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::Session> {
+    // The "UNVERIFIED ON HARDWARE" banner that stood here was true when written and would have been a
+    // lie from the first successful boot on. Ten networks, names and all, on 2026-09-28.
+    ctx.log("wifi-driver: stage 14 - scanning");
+
+    let mut session = bring_up(h, w, ctx)?;
+    let scan = match scan_once(h, w, &mut session, ctx) {
+        Some(s) => s,
+        None => return Some(session),
+    };
 
     if scan.events == 0 {
         ctx.log(
             "wifi-driver: the scan was accepted and NO event frame arrived at all. That is the event path, \
              not the scan: rung A of docs/wifi.md 30.6 is what to prove next, and it needs no scan",
         );
-        return false;
+        return Some(session);
     }
     if scan.results == 0 {
         ctx.log_fmt(format_args!(
@@ -670,7 +740,7 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
             scan.events,
             code::ESCAN_RESULT
         ));
-        return false;
+        return Some(session);
     }
     if scan.count == 0 {
         ctx.log_fmt(format_args!(
@@ -678,7 +748,7 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
              result offsets are what to check, docs/wifi.md 30.2",
             scan.results
         ));
-        return false;
+        return Some(session);
     }
 
     ctx.log_fmt(format_args!(
@@ -711,5 +781,5 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
             scan.dropped, MAX_RESULTS
         ));
     }
-    true
+    Some(session)
 }

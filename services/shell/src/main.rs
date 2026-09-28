@@ -7345,10 +7345,97 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             Ok(())
         }
         Some(_) => {
-            // The driver exists and this shell does not yet speak to it. Loud and specific: the one
-            // thing this must never do is imply the radio failed.
-            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell cannot talk to it yet", WIFI_DRIVER));
-            out.line_fmt(ctx, format_args!("  (the frame and control path is not built - `docs/wifi.md` has the phases)"));
+            if arg != "list" {
+                // The driver exists and answers exactly one question so far. Loud and specific: the one
+                // thing this must never do is imply the radio failed.
+                out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell can only ask it to `list` so far", WIFI_DRIVER));
+                out.line_fmt(ctx, format_args!("  (`wifi {}` arrives with the phase that needs it - `docs/wifi.md` has the phases)",
+                    arg.split_whitespace().next().unwrap_or("status")));
+                return Err(ShellError::Unknown);
+            }
+            wifi_list(ctx, out)
+        }
+    }
+}
+
+/// `wifi list` - ask the driver to scan, and print one record per network (`utilities/56_wifi.md` §3).
+///
+/// Fields, in the spec's order: `ssid signal band security`. Signal is dBm, a raw fact (rule 7). `band`
+/// is derived from the firmware's chanspec, whose 802.11ac layout puts the band in bits 15:14 - `0x0` is
+/// 2.4 GHz and `0x3` is 5 GHz - and every value seen on hardware decodes under it. `security` prints
+/// `unknown`, honestly: it needs the beacon's RSN/WPA information elements parsed, which is not built.
+///
+/// Waits on the DRIVER'S REPLY or on the loud fact of its death, never on a timer (spec §5, Commandment
+/// VIII): a dead peer says so, a `q` abandons the wait. What `q` does NOT yet do is stop the radio's sweep
+/// (rule 11) - the driver is single-threaded inside its scan, so it finishes and its late reply is dropped.
+/// Recorded in the driver rather than pretended here.
+fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    /// Request op byte the driver understands: scan and list.
+    const OP_LIST: u8 = 1;
+    /// Bytes per network record in the reply: bssid[6] rssi(i16) chanspec(u16) ssid_len ssid[32] pad.
+    const RECORD: usize = 44;
+    /// The bound under the wait, in seconds. A scan on hardware completes in about 3; this is the loud
+    /// "not answering" floor for a driver that has wedged, not the time a scan is expected to take.
+    const MAX_SECS: i64 = 20;
+
+    out.line_fmt(ctx, format_args!("scanning  [q] quit"));
+    match ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&[OP_LIST]), MAX_SECS) {
+        ReqOutcome::Reply(r) => {
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(0) => {}
+                Some(1) => {
+                    out.line_fmt(ctx, format_args!("wifi: the scan failed - the driver's log says where"));
+                    return Err(ShellError::Unknown);
+                }
+                Some(2) => {
+                    out.line_fmt(ctx, format_args!("wifi: the radio is not up - it did not come up at boot, and the driver's log says which stage stopped it"));
+                    return Err(ShellError::Unknown);
+                }
+                _ => {
+                    out.line_fmt(ctx, format_args!("wifi: the radio driver gave a reply this shell does not understand"));
+                    return Err(ShellError::Unknown);
+                }
+            }
+            let count = p.get(1).copied().unwrap_or(0) as usize;
+            if count == 0 {
+                out.line_fmt(ctx, format_args!("no networks in range"));
+                return Ok(());
+            }
+            for i in 0..count {
+                let at = 2 + i * RECORD;
+                if at + RECORD > p.len() {
+                    out.line_fmt(ctx, format_args!("wifi: the reply ended after {} of {} network(s)", i, count));
+                    break;
+                }
+                let rec = &p[at..at + RECORD];
+                let rssi = i16::from_le_bytes([rec[6], rec[7]]);
+                let chanspec = u16::from_le_bytes([rec[8], rec[9]]);
+                let len = core::cmp::min(rec[10] as usize, 32);
+                let band = match chanspec >> 14 {
+                    0 => "2.4GHz",
+                    3 => "5GHz",
+                    _ => "band?",
+                };
+                // The SSID is whatever the access point beacons and is NOT trusted to be text: bytes outside
+                // printable ASCII become dots rather than reaching the terminal as control codes.
+                let mut shown = [b'.'; 32];
+                for k in 0..len {
+                    let c = rec[11 + k];
+                    shown[k] = if (0x20..0x7F).contains(&c) { c } else { b'.' };
+                }
+                let ssid = core::str::from_utf8(&shown[..len]).unwrap_or("(unprintable)");
+                out.line_fmt(ctx, format_args!("{} {} {} unknown",
+                    if len == 0 { "(hidden)" } else { ssid }, rssi, band));
+            }
+            Ok(())
+        }
+        ReqOutcome::Aborted => {
+            out.line_fmt(ctx, format_args!("wifi list: aborted (the radio finishes its sweep; the late reply is dropped)"));
+            Ok(())
+        }
+        ReqOutcome::Timeout => {
+            out.line_fmt(ctx, format_args!("wifi: the radio driver is not answering"));
             Err(ShellError::Unknown)
         }
     }
