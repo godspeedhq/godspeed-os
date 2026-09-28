@@ -256,16 +256,18 @@ fn query_iovar(
 
     for _ in 0..REPLY_TRIES {
         match read_frame(h, w, &mut rbuf, ctx) {
-            Some((chanflag, len)) => {
+            Some(f) => {
                 frames += 1;
                 // DESCRIBE THE FIRST FEW, before any judgement about whether they match. The point is to
                 // find out what the firmware is sending, and a frame skipped by a rule that is itself
                 // wrong would otherwise never be seen.
                 const DUMP_FRAMES: u32 = 4;
                 if frames <= DUMP_FRAMES {
-                    describe_frame(frames, chanflag, &rbuf, len, ctx);
+                    describe_frame(frames, &f, &rbuf, ctx);
                 }
-                if chanflag & 0x0F != CHANNEL_CONTROL {
+                let len = f.len;
+                let p = f.off;
+                if f.chanflag & 0x0F != CHANNEL_CONTROL {
                     // An event or a data frame. Not this exchange's business.
                     other_channel += 1;
                     continue;
@@ -275,8 +277,8 @@ fn query_iovar(
                     headers_only += 1;
                     continue;
                 }
-                let rflags = u32::from_le_bytes([rbuf[8], rbuf[9], rbuf[10], rbuf[11]]);
-                let status = u32::from_le_bytes([rbuf[12], rbuf[13], rbuf[14], rbuf[15]]);
+                let rflags = u32::from_le_bytes([rbuf[p + 8], rbuf[p + 9], rbuf[p + 10], rbuf[p + 11]]);
+                let status = u32::from_le_bytes([rbuf[p + 12], rbuf[p + 13], rbuf[p + 14], rbuf[p + 15]]);
                 let rid = ((rflags & DCMD_ID_MASK) >> DCMD_ID_SHIFT) as u16;
                 if rid != reqid {
                     // ANOTHER EXCHANGE'S ANSWER. Skipped rather than parsed, and skipped rather than
@@ -296,7 +298,7 @@ fn query_iovar(
                 // The payload follows the 16-byte BCDC header. `read_frame` has already applied `dataoff`.
                 let avail = len - DCMD;
                 let n = core::cmp::min(avail, out.len());
-                out[..n].copy_from_slice(&rbuf[DCMD..DCMD + n]);
+                out[..n].copy_from_slice(&rbuf[p + DCMD..p + DCMD + n]);
                 if frames > 1 {
                     ctx.log_fmt(format_args!(
                         "wifi-driver:   the reply arrived after {} other frame(s) - {} header-only, {} on \
@@ -318,6 +320,31 @@ fn query_iovar(
     None
 }
 
+/// What one received frame's headers actually said.
+///
+/// `read_frame` used to return `(chanflag, len)`, which is the two facts its callers needed and none of the
+/// four that decide where the payload starts. A frame whose header was surprising therefore produced a
+/// surprising slice with no way to see why - the state the section 32 boot ended in. The reader now reports
+/// what it read and the caller decides what to do with it.
+pub struct Frame {
+    /// The software header's channel byte, unmasked.
+    pub chanflag: u8,
+    /// The sequence number the chip put on it.
+    pub seq: u8,
+    /// The chip's hint at the next frame's length, in 16-byte units (`swhdr->nextlen << 4`). 0 means none.
+    pub nextlen: u8,
+    /// `hwhdr->frmlen` - the WHOLE frame including its 12 bytes of headers.
+    pub frmlen: u16,
+    /// `swhdr->dataoff` - where the payload starts, measured from the start of the whole frame.
+    pub dataoff: u8,
+    /// How many bytes of body arrived: `frmlen - 12`. `buf[..body]` is all of it.
+    pub body: usize,
+    /// Where the payload starts within `buf`: `dataoff - 12`.
+    pub off: usize,
+    /// How many payload bytes there are: `body - off`.
+    pub len: usize,
+}
+
 /// Describe a frame that arrived, so a mismatch says WHAT it was rather than only that it happened.
 ///
 /// The frame census - how many frames arrived, how many matched - is enough to prove the wire works and not
@@ -327,8 +354,8 @@ fn query_iovar(
 ///
 /// Bounded deliberately: the caller prints only the first few frames. A 200-iteration loop that described
 /// every frame would bury the answer in its own output, and a flood jams the console queue.
-fn describe_frame(which: u32, chanflag: u8, buf: &[u8], len: usize, ctx: &ServiceContext) {
-    let channel = chanflag & 0x0F;
+fn describe_frame(which: u32, f: &Frame, buf: &[u8], ctx: &ServiceContext) {
+    let channel = f.chanflag & 0x0F;
     let kind = match channel {
         CHANNEL_CONTROL => "CONTROL",
         1 => "EVENT",
@@ -336,10 +363,23 @@ fn describe_frame(which: u32, chanflag: u8, buf: &[u8], len: usize, ctx: &Servic
         3 => "GLOM",
         _ => "(unknown channel)",
     };
+    // THE HEADER FIELDS FIRST, because they are what decide every offset below and were invisible.
     ctx.log_fmt(format_args!(
-        "wifi-driver:   frame {}: channel {:#04x} ({}), {} byte(s) after the SDPCM headers",
-        which, chanflag, kind, len
+        "wifi-driver:   frame {}: channel {:#04x} ({}), frmlen {}, dataoff {}, seq {}, nextlen {} -> {} \
+         byte(s) of body, payload at +{} for {} byte(s)",
+        which, f.chanflag, kind, f.frmlen, f.dataoff, f.seq, f.nextlen, f.body, f.off, f.len
     ));
+    if f.dataoff as usize != HWHDR + SWHDR {
+        // Worth saying out loud: a reply whose payload does not start right after the headers is the case
+        // this driver has never seen, and the one that would explain a slice nobody can account for.
+        ctx.log_fmt(format_args!(
+            "wifi-driver:     NOTE dataoff is {}, not the {} a request uses - so the payload does NOT \
+             start immediately after the SDPCM headers",
+            f.dataoff,
+            HWHDR + SWHDR
+        ));
+    }
+    let len = f.len;
     if len >= DCMD {
         let cmd = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let dlen = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -358,8 +398,13 @@ fn describe_frame(which: u32, chanflag: u8, buf: &[u8], len: usize, ctx: &Servic
         ));
     }
     // THE BYTES THEMSELVES, because every decode above assumes an offset and the bytes assume nothing. If
-    // the header starts elsewhere, `cmd 262` will be visible at some other position here.
-    let show = core::cmp::min(len, 32);
+    // the header starts elsewhere, `cmd 262` (`06 01 00 00`) will be visible at some other position here.
+    //
+    // THE WHOLE BODY, from frame byte 12 - not the payload slice. The bytes before `dataoff` used to be
+    // discarded inside the reader before anyone could look at them, which is how a frame that made no sense
+    // stayed that way for a boot. Offsets shown are from the start of the body, so `dataoff - 12` is where
+    // the payload is claimed to begin.
+    let show = core::cmp::min(f.body, 48);
     let mut i = 0;
     while i < show {
         let end = core::cmp::min(i + 8, show);
@@ -394,7 +439,7 @@ pub fn read_frame(
     w: &mut Window,
     buf: &mut [u8; FRAME],
     ctx: &ServiceContext,
-) -> Option<(u8, usize)> {
+) -> Option<Frame> {
     let mut hdr = [0u32; (HWHDR + SWHDR) / 4];
     if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
         return None;
@@ -432,7 +477,16 @@ pub fn read_frame(
     let rest = frmlen - (HWHDR + SWHDR);
     if rest == 0 {
         // A header-only frame is legitimate - the chip uses them for flow control - and carries no payload.
-        return Some((chanflag, 0));
+        return Some(Frame {
+            chanflag,
+            seq: b1[0],
+            nextlen: b1[2],
+            frmlen: frmlen as u16,
+            dataoff: dataoff as u8,
+            body: 0,
+            off: 0,
+            len: 0,
+        });
     }
     let words = (rest + 3) / 4;
     let mut rbuf = [0u32; FRAME / 4];
@@ -454,12 +508,24 @@ pub fn read_frame(
     for i in 0..words {
         body[i * 4..i * 4 + 4].copy_from_slice(&rbuf[i].to_le_bytes());
     }
-    // `dataoff` is measured from the start of the whole frame; the header read already took the first
-    // twelve bytes, so the payload starts that far into what just arrived.
+    // THE WHOLE BODY GOES IN `buf`, and the Frame says where the payload is inside it. The reader used to
+    // slice here and hand back only the payload, discarding the bytes before `dataoff` - which are exactly
+    // the ones needed to explain a frame that does not parse.
+    //
+    // `flen = hwhdr->frmlen - (sizeof(*hwhdr) + sizeof(*swhdr))` and
+    // `off = swhdr->dataoff - (sizeof(*hwhdr) + sizeof(*swhdr))`, both quoted from the reference.
     let off = dataoff - (HWHDR + SWHDR);
-    let len = rest - off;
-    buf[..len].copy_from_slice(&body[off..off + len]);
-    Some((chanflag, len))
+    buf[..rest].copy_from_slice(&body[..rest]);
+    Some(Frame {
+        chanflag,
+        seq: b1[0],
+        nextlen: b1[2],
+        frmlen: frmlen as u16,
+        dataoff: dataoff as u8,
+        body: rest,
+        off,
+        len: rest - off,
+    })
 }
 
 /// Write an iovar - `BRCMF_C_SET_VAR` with the name, a NUL, and the value.
@@ -539,12 +605,13 @@ pub fn set_iovar(
     const SET_TRIES: u32 = 200;
     let mut rbuf = [0u8; FRAME];
     for _ in 0..SET_TRIES {
-        if let Some((chanflag, len)) = read_frame(h, w, &mut rbuf, ctx) {
-            if chanflag & 0x0F != CHANNEL_CONTROL || len < 16 {
+        if let Some(f) = read_frame(h, w, &mut rbuf, ctx) {
+            if f.chanflag & 0x0F != CHANNEL_CONTROL || f.len < DCMD {
                 continue;
             }
-            let rflags = u32::from_le_bytes([rbuf[8], rbuf[9], rbuf[10], rbuf[11]]);
-            let status = u32::from_le_bytes([rbuf[12], rbuf[13], rbuf[14], rbuf[15]]);
+            let p = f.off;
+            let rflags = u32::from_le_bytes([rbuf[p + 8], rbuf[p + 9], rbuf[p + 10], rbuf[p + 11]]);
+            let status = u32::from_le_bytes([rbuf[p + 12], rbuf[p + 13], rbuf[p + 14], rbuf[p + 15]]);
             let rid = ((rflags & DCMD_ID_MASK) >> DCMD_ID_SHIFT) as u16;
             if rid != reqid {
                 continue;

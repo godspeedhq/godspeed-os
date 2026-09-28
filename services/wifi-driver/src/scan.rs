@@ -376,14 +376,17 @@ pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &Service
     let mut frame = [0u8; ctrl::FRAME];
     for _ in 0..ms {
         match ctrl::read_frame(h, w, &mut frame, ctx) {
-            Some((channel, len)) => {
-                if channel & CHANNEL_MASK != CHANNEL_EVENT
-                    && channel & CHANNEL_MASK != CHANNEL_DATA
+            Some(f) => {
+                if f.chanflag & CHANNEL_MASK != CHANNEL_EVENT
+                    && f.chanflag & CHANNEL_MASK != CHANNEL_DATA
                 {
                     continue;
                 }
                 scan.events += 1;
-                if let Some((event_type, status, at, datalen)) = parse_event(&frame[..len], ctx) {
+                let p = f.off;
+                if let Some((event_type, status, at, datalen)) =
+                    parse_event(&frame[p..p + f.len], ctx)
+                {
                     ctx.log_fmt(format_args!(
                         "wifi-driver:   event {} ({}), status {}, {} byte payload",
                         event_type,
@@ -393,7 +396,7 @@ pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &Service
                     ));
                     if event_type == code::ESCAN_RESULT {
                         scan.results += 1;
-                        parse_results(&frame[at..at + datalen], scan, ctx);
+                        parse_results(&frame[p + at..p + at + datalen], scan, ctx);
                     }
                 }
             }
