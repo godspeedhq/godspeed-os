@@ -145,6 +145,10 @@ const CHANNEL_CONTROL: u8 = 0x00;
 const GET_VAR: u32 = 262;
 /// `BRCMF_C_UP` - raise the interface. A scan on a down interface is refused with `BCME_NOTUP`.
 const CMD_UP: u32 = 2;
+/// `BWFM_C_SET_INFRA` - infrastructure mode, which a station needs.
+const CMD_SET_INFRA: u32 = 20;
+/// `BWFM_C_SET_AP` - access-point mode, which a station does not want.
+const CMD_SET_AP: u32 = 118;
 
 /// Name a firmware error code, because a number teaches nothing and a name teaches the fix.
 ///
@@ -784,7 +788,96 @@ pub fn set_cmd(
 /// Without this the firmware refuses a scan with `BCME_NOTUP` (-4), which is exactly what it did. brcmfmac
 /// issues this during bring-up before anything else touches the radio.
 pub fn interface_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
-    set_cmd(h, w, s, CMD_UP, &[], "interface up", ctx)
+    // UP takes the VALUE 0, which reads oddly and is what the reference passes.
+    if !set_cmd_int(h, w, s, CMD_UP, 0, "interface up", ctx) {
+        return false;
+    }
+    // Infrastructure mode on, access-point mode off: a station.
+    if !set_cmd_int(h, w, s, CMD_SET_INFRA, 1, "infrastructure mode", ctx) {
+        return false;
+    }
+    if !set_cmd_int(h, w, s, CMD_SET_AP, 0, "access-point mode off", ctx) {
+        return false;
+    }
+    // `BWFM_C_SET_PM` (power management) is deliberately NOT sent: it is an optimisation of something that
+    // does not work yet (§26.2), and its value depends on a policy this driver has not got.
+    true
+}
+
+/// Send a firmware command whose payload is one little-endian 32-bit integer.
+///
+/// ```c
+/// data = htole32(data);
+/// return bwfm_fwvar_cmd_set_data(sc, cmd, &data, sizeof(data));
+/// ```
+///
+/// **Four bytes, not none.** `BRCMF_C_UP` was sent here with a zero-byte payload, and the firmware accepted a
+/// well-formed command carrying no value and did nothing with it - accepted, status 0, no effect, and a scan
+/// still refused with `BCME_NOTUP`. An integer command without its integer is not the command.
+pub fn set_cmd_int(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    cmd: u32,
+    value: u32,
+    what: &str,
+    ctx: &ServiceContext,
+) -> bool {
+    set_cmd(h, w, s, cmd, &value.to_le_bytes(), what, ctx)
+}
+
+/// Ask the firmware to send the events this driver needs. Without this it sends NONE.
+///
+/// Both references do the same three steps - read the mask, set bits in it, write it back:
+///
+/// ```c
+/// if (bwfm_fwvar_var_set_data(sc, "event_msgs", evmask, sizeof(evmask)))
+/// ```
+///
+/// **Read before write, deliberately.** It is what the references do, and it means the mask's length comes
+/// from the firmware rather than from a constant this driver would have to guess (`BWFM_EVENT_MASK_LEN` is
+/// `roundup(BWFM_E_LAST, 8) / 8`, and `BWFM_E_LAST` is not a number I have). A bit is
+/// `mask[code / 8] |= 1 << (code % 8)`.
+///
+/// This is why the event channel has produced nothing so far, and it would have kept a correctly-accepted
+/// scan silent.
+pub fn enable_events(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    codes: &[u32],
+    ctx: &ServiceContext,
+) -> bool {
+    // 24 bytes covers 192 event codes, which is past every code this driver names. The firmware answers with
+    // its own length and only that much is written back.
+    let mut mask = [0u8; 24];
+    let n = match query_iovar(h, w, s, "event_msgs", &mut mask, ctx) {
+        Some(n) if n > 0 => n,
+        _ => {
+            ctx.log(
+                "wifi-driver: could not read `event_msgs`, so the firmware's event mask is unknown and is \
+                 NOT overwritten - guessing its length could disable events that already work",
+            );
+            return false;
+        }
+    };
+    for &c in codes {
+        let byte = (c / 8) as usize;
+        if byte >= n {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: event {} needs byte {} of the mask but the firmware's mask is {} byte(s) - not \
+                 enabling it",
+                c, byte, n
+            ));
+            continue;
+        }
+        mask[byte] |= 1 << (c % 8);
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: enabling {} event(s) in the firmware's {}-byte event mask",
+        codes.len(), n
+    ));
+    set_iovar(h, w, s, "event_msgs", &mask[..n], ctx)
 }
 
 /// Ask the firmware for its own MAC address - the first thing only a running radio can answer.

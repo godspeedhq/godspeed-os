@@ -428,6 +428,22 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
         return false;
     }
 
+    // ASK FOR THE EVENTS FIRST. The firmware sends NONE until the host sets this mask, so a scan accepted
+    // without it would run and report nothing - which is indistinguishable from an empty room.
+    if !ctrl::enable_events(
+        h,
+        w,
+        &mut session,
+        &[code::ESCAN_RESULT, code::LINK, code::SET_SSID, code::ASSOC],
+        ctx,
+    ) {
+        ctx.log(
+            "wifi-driver: the event mask was not set, so a scan would produce no results even if accepted \
+             - not attempting one",
+        );
+        return false;
+    }
+
     let mut scan = Scan::new();
     if !ctrl::set_iovar(h, w, &mut session, "escan", &request, ctx) {
         // NO VERSION HINT HERE. This message used to say the params VERSION was the first thing to change,

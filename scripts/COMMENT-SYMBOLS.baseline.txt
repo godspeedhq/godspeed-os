@@ -345,3 +345,13 @@ BCME_BADOPTION                     # Linux brcmfmac - error -3 - external, 26.14
 BCME_NOTREADY                      # Linux brcmfmac - error -26 - external, 26.14
 BCME_EPERM                         # Linux brcmfmac - error -27 - external, 26.14
 BCME_NOMEM                         # Linux brcmfmac - error -28 - external, 26.14
+BWFM_E_LAST                        # OpenBSD bwfm - the event-code count its mask length derives from; deliberately NOT needed here because the mask is read from the firmware before it is written - external, 26.14
+BWFM_EVENT_MASK_LEN                # OpenBSD bwfm - roundup(BWFM_E_LAST, 8) / 8; cited to explain why the mask is read rather than sized from a constant - external, 26.14
+BWFM_C_SET_INFRA                   # OpenBSD bwfm - command 20, infrastructure mode; named CMD_SET_INFRA here - external, 26.14
+BWFM_C_SET_AP                      # OpenBSD bwfm - command 118, access-point mode; named CMD_SET_AP here - external, 26.14
+BWFM_C_SET_PM                      # OpenBSD bwfm - command 86, power management; deliberately not sent (26.2) - external, 26.14
+BWFM_C_UP                          # OpenBSD bwfm - command 2, raise the interface, sent with the value 0 - external, 26.14
+bwfm_fwvar_cmd_set_data            # OpenBSD bwfm - what its int setter calls with sizeof(data), proving an integer command carries FOUR bytes - external, 26.14
+bwfm_fwvar_cmd_set_int             # OpenBSD bwfm - the integer-command helper; the source of set_cmd_int - external, 26.14
+bwfm_fwvar_var_set_data            # OpenBSD bwfm - how it writes the event_msgs mask back - external, 26.14
+brcmf_c_preinit_dcmds              # Linux brcmfmac common.c - the bring-up command sequence read to find what precedes a scan - external, 26.14
