@@ -95,6 +95,29 @@ pub const CHANNEL_GLOM: u8 = 0x03;
 /// `BWFM_ETHERTYPE_LINK_CTL` - the ethertype that marks a frame as an event rather than traffic.
 const ETHERTYPE_LINK_CTL: u16 = 0x886C;
 
+/// `BCDC_HEADER_LEN` - the header a DATA or EVENT frame carries before its ethernet frame.
+///
+/// ```c
+/// struct brcmf_proto_bcdc_header { u8 flags; u8 priority; u8 flags2; u8 data_offset; };
+/// #define BCDC_HEADER_LEN 4
+///
+/// skb_pull(pktbuf, BCDC_HEADER_LEN);
+/// ...
+/// skb_pull(pktbuf, h->data_offset << 2);
+/// ```
+///
+/// **Two pulls, not one**, and the second is scaled by four because `data_offset` counts words.
+///
+/// **This is a DIFFERENT header from the one a control reply carries.** A CONTROL frame's body begins with
+/// the 16-byte `brcmf_proto_bcdc_dcmd` (cmd/len/flags/status); a DATA or EVENT frame's begins with this
+/// 4-byte one. Same protocol, two shapes, chosen by the SDPCM channel - which is why treating "the BCDC
+/// header" as a single thing put every event's ethertype 4 bytes out and produced `0x541c`, two bytes of the
+/// device's own MAC.
+const BDC_HEADER: usize = 4;
+
+/// Where `data_offset` sits in that header, in words.
+const BDC_DATA_OFFSET: usize = 3;
+
 /// Offsets into an event frame, computed from the quoted declarations. See `docs/wifi.md` §30.2.
 mod ev {
     /// `ether_header` is 14 bytes; the ethertype is its last field.
@@ -299,7 +322,38 @@ fn le32(b: &[u8], at: usize) -> u32 {
 /// **The self-check is `datalen`.** If the offsets in `ev` are wrong, `datalen` is nonsense against the
 /// frame length, so the arithmetic checks itself the way `frmlen ^ cksum` checks a frame's existence. A
 /// frame that fails it is reported rather than parsed.
-fn parse_event(frame: &[u8], ctx: &ServiceContext) -> Option<(u32, u32, usize, usize)> {
+fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<(u32, u32, usize, usize)> {
+    // THE BDC HEADER FIRST. A data or event frame is not an ethernet frame: it carries four bytes of BDC
+    // header and then `data_offset << 2` more before the ethernet header starts.
+    if body.len() < BDC_HEADER {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a frame on the event channel is only {} bytes, shorter than its {}-byte BDC header",
+            body.len(),
+            BDC_HEADER
+        ));
+        return None;
+    }
+    let pad = (body[BDC_DATA_OFFSET] as usize) << 2;
+    let eth = BDC_HEADER + pad;
+    if which <= 2 {
+        // Visible rather than asserted, for the first couple of frames only.
+        ctx.log_fmt(format_args!(
+            "wifi-driver:     BDC header: flags {:#04x} priority {} flags2 {:#04x} data_offset {} \
+             (+{} bytes) -> ethernet frame at +{}",
+            body[0], body[1], body[2], body[BDC_DATA_OFFSET], pad, eth
+        ));
+    }
+    if body.len() <= eth {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a frame on the event channel has {} bytes but its BDC header puts the ethernet \
+             frame at +{}",
+            body.len(),
+            eth
+        ));
+        return None;
+    }
+    let frame = &body[eth..];
+
     if frame.len() < ev::PAYLOAD {
         ctx.log_fmt(format_args!(
             "wifi-driver: a frame arrived on the event channel but is only {} bytes, shorter than the {} \
@@ -331,7 +385,9 @@ fn parse_event(frame: &[u8], ctx: &ServiceContext) -> Option<(u32, u32, usize, u
         ));
         return None;
     }
-    Some((event_type, status, ev::PAYLOAD, datalen))
+    // The payload offset is reported relative to the BODY the caller holds, not to the ethernet frame, so
+    // the BDC skip is included rather than left for the caller to remember.
+    Some((event_type, status, eth + ev::PAYLOAD, datalen))
 }
 
 /// Pull the networks out of one escan-result payload.
@@ -407,7 +463,7 @@ pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &Service
                 scan.events += 1;
                 let p = f.off;
                 if let Some((event_type, status, at, datalen)) =
-                    parse_event(&frame[p..p + f.len], ctx)
+                    parse_event(&frame[p..p + f.len], scan.events, ctx)
                 {
                     ctx.log_fmt(format_args!(
                         "wifi-driver:   event {} ({}), status {}, {} byte payload",

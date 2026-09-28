@@ -381,3 +381,7 @@ BWFM_SDIO_SWHDR_CHANNEL_GLOM       # OpenBSD bwfm - SDPCM channel 3, firmware-ag
 MAX_RX_DATASZ                      # Linux brcmfmac sdio.c - 2048, the receive frame size; the source of FRAME - external, 26.14
 bus:txglom                         # Linux brcmfmac - the TX-only glom iovar; cited to say there is no RX equivalent to turn aggregation off - external, 26.14
 bus:rxglom                         # Linux brcmfmac - does NOT exist; cited where this driver explains why glom cannot be disabled by the host - external, 26.14
+BCDC_HEADER_LEN                    # Linux brcmfmac bcdc.c - 4, the DATA/EVENT frame header (distinct from the 16-byte dcmd a CONTROL reply carries); named BDC_HEADER here - external, 26.14
+brcmf_proto_bcdc_header            # Linux brcmfmac bcdc.c - flags/priority/flags2/data_offset, the 4-byte header before an ethernet frame - external, 26.14
+brcmf_proto_bcdc_hdrpull           # Linux brcmfmac bcdc.c - the receive path that pulls BCDC_HEADER_LEN and then data_offset << 2 - external, 26.14
+skb_pull                           # Linux kernel - advances past a header; quoted to show the DATA frame needs TWO pulls - external, 26.14
