@@ -147,12 +147,20 @@ pub struct Core {
     pub rev: u8,
     /// Register base on the backplane.
     pub base: u32,
-    /// Wrapper base AS THE TABLE GAVE IT, or 0 if it gave none. Prefer `wrapper()`, which derives it.
+    /// Wrapper base AS THE TABLE GAVE IT, or 0 if it gave none.
+    ///
+    /// **PRIVATE on purpose.** `wrapper()` is the only way to obtain a wrapper address, because this field
+    /// is 0 for cores the EROM publishes none for - including the ARM CR4 on this chip - and a caller that
+    /// reads it directly gets a plausible-looking zero. That is not hypothetical: the report did exactly
+    /// that and told the operator there was no wrapper one line after the derivation was verified.
+    ///
+    /// The self-check does not need this field: the walk records the published values in `seen`, whose
+    /// whole purpose is being compared against the derivation.
     ///
     /// **A core is reset through its WRAPPER, not its register base**, so for the ARM core this is the
     /// address the next step needs in order to halt it before writing firmware into it. That is the whole
     /// reason the EROM walk bothers to find a second address per core.
-    pub wrap: u32,
+    wrap: u32,
 }
 
 impl Core {
@@ -473,23 +481,23 @@ impl Cores {
             // driver computes every wrapper it uses as base + 0x100000, so the pattern was the rule and
             // what was missing was a source for it. Refusing an unsourced pattern was right; calling it
             // wrong was not.
-            Some(c) if c.wrap == 0 => ctx.log_fmt(format_args!(
-                "wifi-driver: the ARM core is {} rev {} at {:#010x} and its wrapper is 0. That \
-                 blocks HALTING it later, not reading its memory now: the RAM size and the load \
-                 address come through the core base. The chip publishes only a SLAVE wrapper for \
-                 this core while the entry asks for a MASTER one, which the reference reads as 0 \
-                 too",
-                core_id::name(c.id).unwrap_or("?"),
-                c.rev,
-                c.base
-            )),
+            // THE DERIVED WRAPPER, and it says which it is. The EROM publishing none for this core is
+            // expected rather than a fault - its entry opens with a `MASTER_PORT` descriptor so
+            // `get_regaddr` requires a MASTER wrapper, and the only one the chip publishes for it is a
+            // SLAVE wrapper belonging to the entry's SECOND slave region. The reference reads 0 here
+            // too, and computes the address instead (`WRAPPER_OFFSET`).
             Some(c) => ctx.log_fmt(format_args!(
-                "wifi-driver: the ARM core is {} rev {} at {:#010x}, wrapper {:#010x} - the firmware \
-                 is loaded the way that core wants it, and the wrapper is where it is halted",
+                "wifi-driver: the ARM core is {} rev {} at {:#010x}, wrapper {:#010x} ({}) - that is \
+                 where it is halted before the upload and released after",
                 core_id::name(c.id).unwrap_or("?"),
                 c.rev,
                 c.base,
-                c.wrap
+                c.wrapper().unwrap_or(0),
+                if c.wrap == 0 {
+                    "derived; the EROM published none for this core"
+                } else {
+                    "derived, and the EROM published the same"
+                }
             )),
             None => ctx.log(
                 "wifi-driver: NO ARM core in the table, which a chip that runs uploaded firmware must \
@@ -502,7 +510,7 @@ impl Cores {
                 core_id::name(c.id).unwrap_or("?"),
                 c.rev,
                 c.base,
-                c.wrap
+                c.wrapper().unwrap_or(0)
             )),
             // Not a fault. A CR4/CA7 chip runs from TCM inside the ARM core and has no separate memory
             // core, which is exactly the case the next step has to handle differently.
