@@ -219,3 +219,10 @@ SBSDIO_ALP_AVAIL                   # cyw43-driver/brcmfmac bit 0x40 - hardware S
 CYW43_USE_SPI                      # cyw43-driver build switch; cited because the SDIO branch of that #if writes a DIFFERENT clock word from the SPI branch, which is the whole finding
 buscoreprep                        # Linux brcmfmac function (brcmf_sdio_buscoreprep) that brings the backplane clock up and clears the SDIO pull-ups - external, 26.14
 is_expected_radio                  # REMOVED - it compared the CIS device code, which is not the field that identifies the part. The comment records what went and why, which is exactly what this baseline is for
+brcmf_chip_dmp_erom_scan           # Linux brcmfmac chip.c - the EROM walk services/wifi-driver/src/erom.rs reimplements - external, 26.14
+brcmf_chip_dmp_get_regaddr         # Linux brcmfmac chip.c - how a core entry yields its register and wrapper bases - external, 26.14
+brcmf_chip_dmp_get_desc            # Linux brcmfmac chip.c - reads one EROM descriptor and advances, skipping EMPTY ones - external, 26.14
+bp_addrlow                         # brcm80211 struct chipcregs field at 0xD0 - the indirect backplane window; recorded so the field count is not redone
+bp_addrhigh                        # struct chipcregs field at 0xD4 - as above
+bp_data                            # struct chipcregs field at 0xD8 - as above
+DMP_COMP_REVISION                  # Linux brcmfmac chip.c mask name, cited because ours is suffixed _MASK to avoid colliding with cccr::REVISION - external, 26.14

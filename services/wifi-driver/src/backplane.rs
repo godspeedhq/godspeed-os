@@ -126,7 +126,7 @@ const ACCESS_WIDE: u32 = 0x0000_8000;
 
 /// The chipcommon core, which is at a fixed backplane address on every part in this family. Its first
 /// register is the one worth all of the above.
-const CHIPCOMMON_BASE: u32 = 0x1800_0000;
+pub const CHIPCOMMON_BASE: u32 = 0x1800_0000;
 
 /// Whatever the chip says it is.
 pub struct ChipId {

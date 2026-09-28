@@ -41,6 +41,7 @@
 #![no_main]
 
 mod backplane;
+mod erom;
 mod host;
 mod sdio;
 
@@ -270,6 +271,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None => ctx.log(
                     "wifi-driver: no firmware is mapped for this chip id and revision, so phase 2 has \
                      nothing to upload. A finding rather than a failure - report the id and revision",
+                ),
+            }
+
+            // ---- Stage 8: enumerate the chip's internal cores. --------------------------------------
+            // The firmware goes into the chip's RAM and nothing yet knows where that is. The chip
+            // publishes a table - the EROM - naming every core on its internal bus with an ID, a
+            // revision and a register base, and finding the ARM core in it is what makes an address to
+            // write to. So this comes before the upload rather than beside it, and it is verifiable on
+            // its own: it prints a table that is either a plausible CYW43455 or it is not.
+            ctx.log("wifi-driver: stage 8 - walking the EROM to find the ARM core and the RAM");
+            match erom::scan(&h, &mut window, &ctx) {
+                Some(cores) => cores.report(&ctx),
+                None => ctx.log(
+                    "wifi-driver: the core table could not be walked, so phase 2 has no address to                      write firmware to. Everything through stage 7 stands - the chip is identified and                      its backplane reads",
                 ),
             }
         }
