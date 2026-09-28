@@ -143,6 +143,40 @@ const CHANNEL_CONTROL: u8 = 0x00;
 
 /// `BRCMF_C_GET_VAR`.
 const GET_VAR: u32 = 262;
+/// `BRCMF_C_UP` - raise the interface. A scan on a down interface is refused with `BCME_NOTUP`.
+const CMD_UP: u32 = 2;
+
+/// Name a firmware error code, because a number teaches nothing and a name teaches the fix.
+///
+/// From `brcmf_fil_errstr`, where the negative code indexes the table:
+///
+/// ```c
+/// static const char * const brcmf_fil_errstr[] = {
+/// 	"BCME_OK",                          /* 0 */
+/// 	"BCME_ERROR",                       /* 1 */
+/// 	"BCME_BADARG",                      /* 2 */
+/// 	"BCME_BADOPTION",                   /* 3 */
+/// 	"BCME_NOTUP",                       /* 4 */
+/// ```
+///
+/// Only the entries actually quoted from the reference are named; anything else prints as its number rather
+/// than being guessed at. The two that have been seen on this hardware are both here: `-4` (a scan before
+/// the interface was up) and `-24` (`BCME_BADLEN`, which is what the firmware said when a wrong `dataoff`
+/// made it read an iovar name as a header).
+fn err_name(status: i32) -> &'static str {
+    match -status {
+        0 => "BCME_OK",
+        1 => "BCME_ERROR",
+        2 => "BCME_BADARG",
+        3 => "BCME_BADOPTION",
+        4 => "BCME_NOTUP - the interface is down; BRCMF_C_UP must be issued first",
+        24 => "BCME_BADLEN",
+        26 => "BCME_NOTREADY",
+        27 => "BCME_EPERM",
+        28 => "BCME_NOMEM",
+        _ => "(not a code this driver names)",
+    }
+}
 
 /// `BCDC_DCMD_ERROR`.
 const DCMD_ERROR: u32 = 0x01;
@@ -314,9 +348,9 @@ fn query_iovar(
                 }
                 if rflags & DCMD_ERROR != 0 {
                     ctx.log_fmt(format_args!(
-                        "wifi-driver: the firmware REFUSED the request - BCDC error flag set, status \
-                         {:#010x} ({})",
-                        status, status as i32
+                        "wifi-driver: the firmware REFUSED the request - {} (status {})",
+                        err_name(status as i32),
+                        status as i32
                     ));
                     return None;
                 }
@@ -567,19 +601,54 @@ pub fn set_iovar(
     value: &[u8],
     ctx: &ServiceContext,
 ) -> bool {
-    let mut frame = [0u8; FRAME];
-    let payload = name.len() + 1 + value.len();
-    if PAYLOAD_AT + payload > FRAME {
+    // An iovar SET is `BRCMF_C_SET_VAR` whose payload is the name, a NUL, then the value. It is one shape of
+    // BCDC command among several, so it builds its payload and hands it to `set_cmd` - which is the only
+    // place the frame layout lives. A third copy of that layout is how `set_iovar` inherited the `dataoff`
+    // bug from `query_iovar` in the first place.
+    let mut payload = [0u8; FRAME];
+    let n = name.len() + 1 + value.len();
+    if PAYLOAD_AT + n > FRAME {
         ctx.log_fmt(format_args!(
             "wifi-driver: setting `{}` would need {} payload bytes, over this driver's {} byte frame",
-            name, payload, FRAME
+            name, n, FRAME
         ));
         return false;
     }
-    frame[PAYLOAD_AT..PAYLOAD_AT + name.len()].copy_from_slice(name.as_bytes());
+    payload[..name.len()].copy_from_slice(name.as_bytes());
     // The NUL is already in place - the buffer is zeroed.
-    let at = PAYLOAD_AT + name.len() + 1;
-    frame[at..at + value.len()].copy_from_slice(value);
+    let at = name.len() + 1;
+    payload[at..at + value.len()].copy_from_slice(value);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: setting `{}` - {} byte value", name, value.len()
+    ));
+    set_cmd(h, w, SET_VAR, &payload[..n], name, ctx)
+}
+
+/// Send one BCDC command with a payload, and wait for the firmware to accept or refuse it.
+///
+/// `what` names the thing being done, for the log only. A plain command like `BRCMF_C_UP` has no payload;
+/// an iovar set carries its name and value, built by `set_iovar`.
+///
+/// **The reply decides.** A command whose refusal is discarded is a silent failure (§26.7), and these
+/// commands are the ones that put the radio into a state - so "accepted" has to mean the firmware said so.
+pub fn set_cmd(
+    h: &Host,
+    w: &mut Window,
+    cmd: u32,
+    value: &[u8],
+    what: &str,
+    ctx: &ServiceContext,
+) -> bool {
+    let mut frame = [0u8; FRAME];
+    let payload = value.len();
+    if PAYLOAD_AT + payload > FRAME {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: `{}` would need {} payload bytes, over this driver's {} byte frame",
+            what, payload, FRAME
+        ));
+        return false;
+    }
+    frame[PAYLOAD_AT..PAYLOAD_AT + payload].copy_from_slice(value);
 
     let len = PAYLOAD_AT + payload;
     let r = round_to(len);
@@ -593,7 +662,7 @@ pub fn set_iovar(
     // `dataoff` points AT the BCDC header, not past it. See `DATA_OFF`.
     frame[7] = DATA_OFF as u8;
     let flags = ((reqid as u32) << DCMD_ID_SHIFT) | DCMD_SET;
-    frame[HWHDR + SWHDR..HWHDR + SWHDR + 4].copy_from_slice(&SET_VAR.to_le_bytes());
+    frame[HWHDR + SWHDR..HWHDR + SWHDR + 4].copy_from_slice(&cmd.to_le_bytes());
     frame[HWHDR + SWHDR + 4..HWHDR + SWHDR + 8].copy_from_slice(&(payload as u32).to_le_bytes());
     frame[HWHDR + SWHDR + 8..HWHDR + SWHDR + 12].copy_from_slice(&flags.to_le_bytes());
 
@@ -611,8 +680,8 @@ pub fn set_iovar(
         ]);
     }
     ctx.log_fmt(format_args!(
-        "wifi-driver: setting `{}` - {} byte value, {} byte frame padded to {}",
-        name, value.len(), len, padded
+        "wifi-driver: sending `{}` - command {}, {} byte payload, {} byte frame padded to {}",
+        what, cmd, payload, len, padded
     ));
     if !sdio::write_extended(
         h,
@@ -644,8 +713,10 @@ pub fn set_iovar(
             }
             if rflags & DCMD_ERROR != 0 {
                 ctx.log_fmt(format_args!(
-                    "wifi-driver: the firmware REFUSED `{}` - status {:#010x} ({})",
-                    name, status, status as i32
+                    "wifi-driver: the firmware REFUSED `{}` - {} (status {})",
+                    what,
+                    err_name(status as i32),
+                    status as i32
                 ));
                 return false;
             }
@@ -655,10 +726,18 @@ pub fn set_iovar(
     }
     ctx.log_fmt(format_args!(
         "wifi-driver: `{}` was sent and the firmware never acknowledged it across {} reads. It is NOT \
-         reported as set, because a set nobody confirmed is indistinguishable from one that was refused",
-        name, SET_TRIES
+         reported as done, because something nobody confirmed is indistinguishable from something refused",
+        what, SET_TRIES
     ));
     false
+}
+
+/// Raise the interface - `BRCMF_C_UP`, no payload.
+///
+/// Without this the firmware refuses a scan with `BCME_NOTUP` (-4), which is exactly what it did. brcmfmac
+/// issues this during bring-up before anything else touches the radio.
+pub fn interface_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
+    set_cmd(h, w, CMD_UP, &[], "interface up", ctx)
 }
 
 /// Ask the firmware for its own MAC address - the first thing only a running radio can answer.

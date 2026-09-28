@@ -2462,3 +2462,70 @@ controller that this driver was ignoring.
    firmware ever intended to send.
 
 If outcome 1 lands, stage 14 runs immediately after and phase 3 gets its first test.
+
+## 34. The control channel works, and the firmware starts naming its objections
+
+```
+frame 3: channel 0x00 (CONTROL), frmlen 42, dataoff 12, seq 2, nextlen 0 -> 30 byte(s) of body
+  read as BCDC: cmd 262 len 14 flags 0x00010000 status 0x00000000 -> id 1, set false, error false
+  [16] 98 fe 54 1c dc 54 68 65
+  [24] 72 61 64 64 72 00 00 00
+the reply arrived after 2 other frame(s) - 0 header-only, 2 on another channel, 0 from another exchange
+THE RADIO ANSWERED - its MAC address is 98:fe:54:1c:dc:54
+```
+
+Everything decodes: command 262 echoed, `len 14`, `id 1`, no error, the MAC at payload offset 0, and the
+untouched tail of the request buffer (`heraddr\0`) behind it - which is what a six-byte answer written into a
+fourteen-byte buffer looks like.
+
+**Independently corroborated**, which matters because the alternative is a self-consistent parse of our own
+bytes. The Raspberry Pi OS boot carried `smsc95xx.macaddr=98:FE:54:1C:DC:53` on its kernel command line - the
+ethernet MAC. Ours is `...dc:54`. Consecutive, which is how the Pi Foundation assigns the pair. Two unrelated
+sources agree.
+
+### `escan` refused: BCME_NOTUP
+
+```
+the firmware REFUSED `escan` - status 0xfffffffc (-4)
+```
+
+The error table decodes it - `brcmf_fil_errstr` index 4 is `BCME_NOTUP`: **the interface is down.** A scan
+cannot start on a down interface, and `BRCMF_C_UP` (command 2) raises it; brcmfmac issues that during
+bring-up before anything else touches the radio.
+
+**And -24 was `BCME_BADLEN`**, which confirms §33 from the firmware's own mouth. That account was
+reconstructed from byte patterns - having read `"cur_"` as the command it read `"ethe"` as the length - and
+the error table says the same thing independently.
+
+### What the refusal proves, which is more than it looks
+
+`escan` was rejected on **semantics, not structure**. The firmware parsed the 106-byte frame, found a
+well-formed BCDC header, recognised `SET_VAR`, read the iovar name, and objected only that the interface was
+down. So the frame layout, the `DATA_OFF` fix, the SET flags and the 72-byte params block all passed
+inspection by the one authority that matters. Phase 3's request layout is provisionally validated by the
+thing that refused it.
+
+### Changes
+
+- **Firmware errors decode.** `err_name` names the codes quoted from the reference and prints the number for
+  the rest rather than guessing. A refusal reading `-4` teaches nothing; `BCME_NOTUP` teaches the fix.
+- **`set_cmd` sends a raw BCDC command**, with `set_iovar` as a caller. `BRCMF_C_UP` has no payload and no
+  name, which the iovar-shaped function could not express. One frame builder, two entry points - copying it
+  is exactly how `set_iovar` inherited the `dataoff` bug.
+- **`interface_up` runs before the scan**, and its failure is reported.
+- **A misleading hint is removed.** The scan's refusal message said the params VERSION was the first thing to
+  change. That was written for the accepted-but-silent case and is wrong for a refusal, where the status code
+  states the objection. The version hint now appears only where it applies.
+
+### Prediction
+
+1. **The interface comes up, `escan` is accepted, and events arrive** - then §30.6's rungs B and C decide
+   whether results parse.
+2. **`BRCMF_C_UP` is itself refused**, naming another prerequisite. brcmfmac does more during bring-up than
+   this driver does, so a chain of these is plausible, and each one now names itself.
+3. **`escan` accepted and no `ESCAN_RESULT` events** - the case the version hint was written for, and it now
+   says so in the right place.
+
+The event path remains completely unproven: no `ESCAN_RESULT` has ever arrived. Also unexplained, and worth
+watching: the two frames on the event channel arrive with `frmlen 12` and zero body, which is a header-only
+frame on a channel that should carry events.

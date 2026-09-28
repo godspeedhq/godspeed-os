@@ -420,11 +420,22 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     let mut request = [0u8; req::SIZE];
     build_request(&mut request);
 
+    // THE INTERFACE MUST BE UP FIRST. A scan on a down interface is refused with `BCME_NOTUP` (-4), which
+    // is exactly what this driver was told the first time it tried.
+    if !ctrl::interface_up(h, w, ctx) {
+        ctx.log("wifi-driver: the interface would not come up, so no scan is attempted");
+        return false;
+    }
+
     let mut scan = Scan::new();
     if !ctrl::set_iovar(h, w, "escan", &request, ctx) {
+        // NO VERSION HINT HERE. This message used to say the params VERSION was the first thing to change,
+        // which was written for the "accepted but silent" case and is wrong for a refusal: the firmware
+        // states what it objected to, and the decoded error is printed one line above. The version matters
+        // only where the request is ACCEPTED and no results follow.
         ctx.log(
-            "wifi-driver: the firmware refused the `escan` request, so no scan started. Per \
-             docs/wifi.md 30.4 the params VERSION is the first thing to change - v0 is what this tried",
+            "wifi-driver: the firmware refused the `escan` request, so no scan started. The decoded error \
+             above says what it objected to",
         );
         return false;
     }
@@ -443,8 +454,9 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     }
     if scan.results == 0 {
         ctx.log_fmt(format_args!(
-            "wifi-driver: {} event(s) arrived but none was an ESCAN_RESULT ({}). The event path works and \
-             the scan did not produce results - which points at the request layout, docs/wifi.md 30.3",
+            "wifi-driver: {} event(s) arrived but none was an ESCAN_RESULT ({}). The request was ACCEPTED \
+             and produced no results, which is the case where the params VERSION is the first thing to \
+             change - v0 is what this tried (docs/wifi.md 30.4)",
             scan.events,
             code::ESCAN_RESULT
         ));

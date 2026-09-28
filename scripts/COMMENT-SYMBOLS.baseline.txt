@@ -336,3 +336,12 @@ MIN_FREQ                           # Raspberry Pi bcm2835-mmc.c - 400000, the cl
 TIMEOUT_VAL                        # Raspberry Pi bcm2835-mmc.c - the value it writes to SDHCI_TIMEOUT_CONTROL for a data command - external, 26.14
 bcm2835_mmc_writeb                 # Raspberry Pi bcm2835-mmc.c - wraps writel, which is why writing the timeout byte sets CONTROL1 bits 19:16 - external, 26.14
 SDHCI_BUFFER                       # SDHCI SPEC offset 0x20, the FIFO data port; this driver names it DATA - external, 26.14
+brcmf_fil_errstr                   # Linux brcmfmac fwil.c - the firmware error table the negative status indexes; the source of err_name - external, 26.14
+BCME_NOTUP                         # Linux brcmfmac - error -4, the interface is down; what the firmware answered a scan with before BRCMF_C_UP - external, 26.14
+BCME_BADLEN                        # Linux brcmfmac - error -24, which is what a wrong dataoff produced when the firmware read an iovar name as a header - external, 26.14
+BCME_OK                            # Linux brcmfmac - 0 - external, 26.14
+BCME_BADARG                        # Linux brcmfmac - error -2 - external, 26.14
+BCME_BADOPTION                     # Linux brcmfmac - error -3 - external, 26.14
+BCME_NOTREADY                      # Linux brcmfmac - error -26 - external, 26.14
+BCME_EPERM                         # Linux brcmfmac - error -27 - external, 26.14
+BCME_NOMEM                         # Linux brcmfmac - error -28 - external, 26.14
