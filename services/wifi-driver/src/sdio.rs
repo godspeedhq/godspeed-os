@@ -98,6 +98,20 @@ const OCR_3V3: u32 = 0x00FF_8000;
 /// Bits 5:4 are IO_CURRENT_STATE and are not errors.
 const R5_ERRORS: u32 = 0x80 | 0x40 | 0x08 | 0x02 | 0x01;
 
+/// A function's own Basic Registers, which live in FUNCTION 0's address space.
+///
+/// `SDIO_FBR_BASE(f) = f * 0x100` and `SDIO_FBR_BLKSIZE = 0x10`, both quoted from
+/// `include/linux/mmc/sdio.h` rather than recalled - so function 1's block size is at `0x110`/`0x111`
+/// and is written by a CMD52 to function **0**, not to function 1.
+mod fbr {
+    /// Where function `f`'s basic registers start.
+    pub const fn base(f: u8) -> u32 {
+        (f as u32) * 0x100
+    }
+    /// Block size, two bytes little-endian at `base + 0x10`.
+    pub const BLKSIZE: u32 = 0x10;
+}
+
 /// Function 0's Card Common Control Registers - the fixed part every SDIO card has.
 mod cccr {
     /// CCCR/SDIO specification revision (low nibble CCCR, high nibble SDIO).
@@ -521,6 +535,56 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
     // value as read. No byte swap: the controller hands over a 32-bit word already assembled that way,
     // which is the same assumption `block-driver` makes about its own 512-byte blocks.
     Some(word[0])
+}
+
+/// Set one function's block size, and read it back.
+///
+/// **A step this driver never performed, and the reference performs first.** `brcmf_sdiod_probe` sets
+/// function 1's block size to 64 and function 2's to 512 **before** it enables function 1 - the very
+/// stretch the fault has been narrowed to, since the window is verified and the card accepts the command
+/// and then sends nothing.
+///
+/// Whether it is required for a BYTE-mode transfer is not obvious and is not claimed here: the block size
+/// register configures block mode, and byte mode carries its length in the command. But `sdio_max_byte_size`
+/// clamps a byte-mode transfer by the function's current block size for cards that need it, so the two are
+/// less independent than the spec's wording suggests - and brcmfmac does this unconditionally on every
+/// card it supports before it will touch the chip. Doing what the reference does, in the order it does it,
+/// is the method (§26.14).
+///
+/// Read back because the last two boots taught it twice: a write the card ACCEPTED is not a register that
+/// HOLDS a value, and the difference cost several boots when it went unasked about the backplane window.
+pub fn set_block_size(h: &Host, func: u8, size: u16, ctx: &ServiceContext) -> bool {
+    let addr = fbr::base(func) + fbr::BLKSIZE;
+    let lo = (size & 0xFF) as u8;
+    let hi = (size >> 8) as u8;
+    // TO FUNCTION 0, not to `func`. The FBR block lives in function 0's address space; addressing it to
+    // the function itself would write somewhere inside that function's own registers.
+    if write_reg(h, 0, addr, lo).is_none() || write_reg(h, 0, addr + 1, hi).is_none() {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: could not set function {}'s block size to {} (FBR {:#05x}) - INT={:#010x}",
+            func, size, addr, h.last_int()
+        ));
+        return false;
+    }
+    match (read_reg(h, 0, addr), read_reg(h, 0, addr + 1)) {
+        (Some(rlo), Some(rhi)) => {
+            let got = u16::from(rlo) | (u16::from(rhi) << 8);
+            ctx.log_fmt(format_args!(
+                "wifi-driver: function {} block size set to {} (FBR {:#05x}), reads back {} - {}",
+                func, size, addr, got,
+                if got == size { "held" } else { "MISMATCH, the register did not take it" }
+            ));
+            got == size
+        }
+        _ => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: function {}'s block size was written but could not be READ BACK - \
+                 INT={:#010x}",
+                func, h.last_int()
+            ));
+            false
+        }
+    }
 }
 
 /// Enable one I/O function and wait for the card to say it is ready.

@@ -195,7 +195,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Function 1 specifically, because that is the backplane on this part - what `brcmfmac` enables
     // first, before any firmware exists inside the chip to answer. Not fatal: identification already
     // succeeded, and saying which half failed is worth more than stopping.
-    ctx.log("wifi-driver: stage 6 - opening function 1, the backplane");
+    // THE BLOCK SIZES FIRST, which is the order `brcmf_sdiod_probe` uses: function 1 to 64 and function
+    // 2 to 512, both BEFORE function 1 is enabled. This driver set neither, ever - and it is the one step
+    // the reference performs in the stretch the fault has been narrowed to (the window is verified, the
+    // card accepts the command, and then sends nothing).
+    //
+    // Function 2 is set even though nothing uses it yet, because that is what the reference does here and
+    // the firmware upload will need it. Neither is fatal: they are reported and the sequence continues, so
+    // a refusal here does not hide whatever the read does next.
+    ctx.log("wifi-driver: stage 6 - block sizes, then opening function 1, the backplane");
+    if card.funcs >= 1 {
+        sdio::set_block_size(&h, 1, 64, &ctx);
+    }
+    if card.funcs >= 2 {
+        sdio::set_block_size(&h, 2, 512, &ctx);
+    }
     let backplane_open = card.funcs >= 1 && sdio::enable_function(&h, 1, &ctx);
     if !backplane_open {
         ctx.log(

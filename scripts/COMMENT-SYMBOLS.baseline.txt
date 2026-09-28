@@ -205,3 +205,7 @@ sdhci_transfer_data                # u-boot sdhci.c - the POLLED PIO loop, close
 PRESENT_STATE                      # SDHCI SPEC register 0x24 (the BCM2835 calls it STATUS); named as the spec does because u-boot is quoted using it
 SDHCI_DATA_AVAILABLE               # u-boot/SDHCI name for PRESENT_STATE bit 11, Buffer Read Enable - the second signal a polled driver may wait on
 DATA_AVAIL                         # SDHCI SPEC interrupt-status bit 5 (SDHCI_INT_DATA_AVAIL); quoted from u-boot beside SDHCI_DATA_AVAILABLE, which is the DIFFERENT register it cross-checks
+brcmf_sdiod_probe                  # Linux brcmfmac bcmsdh.c - the ordered sequence from card-present to chip access; cited because it sets BOTH function block sizes before enabling F1 - external, 26.14
+sdio_max_byte_size                 # Linux mmc core - cited because it clamps a BYTE-mode transfer by the function block size, which is why the two are not independent - external, 26.14
+sdio_set_block_size                # Linux mmc core - cited for the FBR addresses this driver reimplements (base + 0x10, two bytes) - external, 26.14
+sdio_enable_func                   # Linux mmc core - cited for WHERE in the order function 1 is enabled, which is AFTER the block sizes - external, 26.14
