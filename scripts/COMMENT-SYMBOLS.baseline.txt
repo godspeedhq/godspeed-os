@@ -385,3 +385,5 @@ BCDC_HEADER_LEN                    # Linux brcmfmac bcdc.c - 4, the DATA/EVENT f
 brcmf_proto_bcdc_header            # Linux brcmfmac bcdc.c - flags/priority/flags2/data_offset, the 4-byte header before an ethernet frame - external, 26.14
 brcmf_proto_bcdc_hdrpull           # Linux brcmfmac bcdc.c - the receive path that pulls BCDC_HEADER_LEN and then data_offset << 2 - external, 26.14
 skb_pull                           # Linux kernel - advances past a header; quoted to show the DATA frame needs TWO pulls - external, 26.14
+brcmf_escan_result_le              # Linux brcmfmac fwil_types.h - the LITTLE-endian escan result body (buflen/version/sync_id/bss_count), which is why only the event header flips byte order - external, 26.14
+brcmf_bss_info_le                  # Linux brcmfmac fwil_types.h - the little-endian per-network record; its natural alignment lands on the same offsets as OpenBSD bwfm_bss_info - external, 26.14

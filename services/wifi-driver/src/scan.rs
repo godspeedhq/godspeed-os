@@ -317,6 +317,27 @@ fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
+/// Big-endian, for the EVENT MESSAGE HEADER only.
+///
+/// ```c
+/// struct brcmf_event_msg_be {
+/// 	__be16 version;  __be16 flags;    __be32 event_type;
+/// 	__be32 status;   __be32 reason;   __be32 auth_type;
+/// 	__be32 datalen;  ...
+/// } __packed;
+/// ```
+///
+/// The `_be` is the whole point: an event rides inside an ethernet frame and is in network byte order. The
+/// escan RESULT BODY it carries is a firmware structure and stays little-endian (`brcmf_escan_result_le`,
+/// `brcmf_bss_info_le`), so exactly one layer flips and the others do not.
+///
+/// Observed before this existed: `event_type read as 1157627904` - which is `0x45000000`, the bytes
+/// `00 00 00 45`, which is **69**, `ESCAN_RESULT`, read the wrong way round. Every one of the twelve
+/// frames the self-check rejected was a scan result with its length in the right place.
+fn be32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
 /// Parse one event frame. Returns `(event_type, status)` when it really is an event.
 ///
 /// **The self-check is `datalen`.** If the offsets in `ev` are wrong, `datalen` is nonsense against the
@@ -372,9 +393,10 @@ fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<(u32, u3
         ));
         return None;
     }
-    let event_type = le32(frame, ev::EVENT_TYPE);
-    let status = le32(frame, ev::STATUS);
-    let datalen = le32(frame, ev::DATALEN) as usize;
+    // BIG-ENDIAN. See `be32`: the header is network byte order, the body it carries is not.
+    let event_type = be32(frame, ev::EVENT_TYPE);
+    let status = be32(frame, ev::STATUS);
+    let datalen = be32(frame, ev::DATALEN) as usize;
     let avail = frame.len() - ev::PAYLOAD;
     if datalen > avail {
         ctx.log_fmt(format_args!(
