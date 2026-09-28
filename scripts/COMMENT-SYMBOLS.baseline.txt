@@ -286,3 +286,21 @@ SDPCM_PROT_VERSION_SHIFT           # OpenBSD bwfm - 16, the shift for the mailbo
 sdmmc_io_set_blocklen              # OpenBSD sdmmc core - sets a function block size; the twin of this driver set_block_size, cited in the quoted bring-up sequence - external, 26.14
 sdmmc_io_function_enable           # OpenBSD sdmmc core - enables an SDIO function; the twin of this driver enable_function - external, 26.14
 bwfm_sdio_clkctl                   # OpenBSD bwfm - its clock request helper, the source of the HT-clock step in bus::ht_clock - external, 26.14
+BCDC_DCMD_ERROR                    # Linux brcmfmac bcdc.c - 0x01, the BCDC flag meaning the firmware refused a command; named DCMD_ERROR here - external, 26.14
+BCDC_DCMD_ID_MASK                  # Linux brcmfmac bcdc.c - 0xFFFF0000, the request-id field used to match a reply to its request; named DCMD_ID_MASK here - external, 26.14
+BCDC_DCMD_ID_SHIFT                 # Linux brcmfmac bcdc.c - 16, the shift for that field; named DCMD_ID_SHIFT here - external, 26.14
+BCDC_DCMD_SET                      # Linux brcmfmac bcdc.c - 0x02, set rather than get; not used here because this driver only queries so far - external, 26.14
+BCDC_DCMD_IF_MASK                  # Linux brcmfmac bcdc.c - 0xF000, the interface index field; zero here (one interface) - external, 26.14
+BCDC_DCMD_IF_SHIFT                 # Linux brcmfmac bcdc.c - 12, the shift for that field - external, 26.14
+BRCMF_C_GET_VAR                    # Linux brcmfmac fwil.h - 262, the dongle command that reads an iovar; named GET_VAR here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_CONTROL    # OpenBSD bwfm - 0x00, the SDPCM channel a control frame rides; named CHANNEL_CONTROL here - external, 26.14
+brcmf_proto_bcdc_dcmd              # Linux brcmfmac bcdc.c - the 16-byte BCDC command header (cmd/len/flags/status) ctrl.rs builds by hand - external, 26.14
+bwfm_sdio_hwhdr                    # OpenBSD bwfm - the 4-byte SDIO hardware header (frmlen + its complement) - external, 26.14
+bwfm_sdio_swhdr                    # OpenBSD bwfm - the 8-byte SDPCM software header (seqnr/chanflag/nextlen/dataoff/flowctl/maxseqnr/res0) - external, 26.14
+bwfm_sdio_tx_ctrlframe             # OpenBSD bwfm - how a control frame is assembled and padded; the source of ctrl::query_iovar - external, 26.14
+bwfm_sdio_frame_read_write         # OpenBSD bwfm - proves a frame goes to FUNCTION 2 with the window at CHIPCOMMON, not to address 0 - external, 26.14
+bwfm_sdio_buf_write                # OpenBSD bwfm - asserts 4-byte alignment of both pointer and size, which is why ctrl.rs pads to a word - external, 26.14
+bwfm_sdio_backplane                # OpenBSD bwfm - its window setter, the twin of this driver Window::set_for - external, 26.14
+BWFM_SDIO_SB_OFT_ADDR_MASK         # OpenBSD bwfm - the 15-bit window offset mask; named OFFSET_MASK here - external, 26.14
+BWFM_SDIO_SB_ACCESS_2_4B_FLAG      # OpenBSD bwfm - the wide-access flag 0x8000; named ACCESS_WIDE here - external, 26.14
+BRCMF_C_SET_VAR                    # Linux brcmfmac fwil.h - 263, writing an iovar; not used yet, cited beside GET_VAR - external, 26.14

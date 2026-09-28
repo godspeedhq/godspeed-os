@@ -125,8 +125,8 @@ pub fn disable(
     // WAIT FOR IT TO TAKE, bounded, and report if it does not. The reference spins on this for 300 us; each
     // read here is a CMD53 of tens of microseconds, so a modest count covers it and the failure says so
     // rather than continuing into a write the core might still be servicing.
-    const TRIES: u32 = 100;
-    for attempt in 0..TRIES {
+    const RESET_TRIES: u32 = 100;
+    for attempt in 0..RESET_TRIES {
         match w.read32(h, wrapper + off::RESETCTRL, ctx) {
             Some(rc) if rc & bit::AIRC_RESET != 0 => {
                 ctx.log_fmt(format_args!(
@@ -146,7 +146,7 @@ pub fn disable(
     ctx.log_fmt(format_args!(
         "wifi-driver: core wrapper {:#010x} never reported itself in reset across {} reads - nothing \
          further is written, because a running core owns the memory the firmware goes into",
-        wrapper, TRIES
+        wrapper, RESET_TRIES
     ));
     false
 }

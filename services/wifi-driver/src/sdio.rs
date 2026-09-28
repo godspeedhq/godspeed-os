@@ -71,7 +71,20 @@ const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
 /// `block-driver`'s CMD17 gets away without it on a 512-byte block, which is why the shape was copied
 /// from there and came up short. The two differ in exactly two ways - the index and the block size - and
 /// that made this the only bit worth suspecting.
+/// The data function. Function 1 is the backplane window; function 2 carries frames.
+///
+/// Declared HERE because it is a fact about the SDIO card, not about the bus bring-up or the
+/// control protocol that both need it. It was declared in each of those and the duplicate-constant
+/// gate refused it, correctly: one fact, one place.
+pub const DATA_FUNC: u8 = 2;
+
 const CMD_IO_RW_EXTENDED_READ: u32 = 0x353A_0012;
+/// CMD53 READ in BLOCK mode - the read twin of `CMD_IO_RW_EXTENDED_WRITE_MULTI`.
+///
+/// `0x0032` = `TM_BLKCNT_EN (0x02) | TM_DAT_DIR read (0x10) | TM_MULTI_BLOCK (0x20)`, which is the
+/// write word plus the read direction. Written out rather than computed so it reads the same way as
+/// its three siblings.
+const CMD_IO_RW_EXTENDED_READ_MULTI: u32 = 0x353A_0032;
 /// CMD53, write, SINGLE block or byte mode: command flags `0x3A`, transfer mode `BLK_CNT_EN` only.
 const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x353A_0002;
 /// CMD53, write, MULTI-block: as above plus `TM_MULTI_BLOCK` (bit 5).
@@ -313,7 +326,7 @@ pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
     // CMD5 again, now WITH a voltage window, repeatedly until the card reports ready. A card still
     // powering up is entitled to answer not-ready; the spec's sequence is to repeat. Bounded, and the
     // bound is reported (a silent give-up here is indistinguishable from success on the next line).
-    const READY_TRIES: u32 = 100;
+    const OCR_TRIES: u32 = 100;
     let mut tries = 0u32;
     let ready = loop {
         match h.cmd(CMD_IO_SEND_OP_COND, OCR_3V3 & ocr) {
@@ -330,11 +343,11 @@ pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
             }
         }
         tries += 1;
-        if tries >= READY_TRIES {
+        if tries >= OCR_TRIES {
             ctx.log_fmt(format_args!(
                 "wifi-driver: the card never reported READY across {} CMD5 attempts. It is on the bus \
                  and answering, so the voltage window ({:#08x}) is the suspect",
-                READY_TRIES,
+                OCR_TRIES,
                 OCR_3V3 & ocr
             ));
             break None;
@@ -430,6 +443,56 @@ pub fn write32(h: &Host, func: u8, addr: u32, val: u32, ctx: &ServiceContext) ->
         return None;
     }
     Some(())
+}
+
+/// Read `words` from `func` at `addr` by CMD53 - the read twin of `write_extended`.
+///
+/// Until now the read side stopped at `read32`, because every backplane read is four bytes. A control frame
+/// is not: the reply header alone is twelve, and the payload follows it. Same argument layout as the write,
+/// with bit 31 clear.
+///
+/// `blocks` chooses block mode exactly as on the write side, and byte mode carries the remainder - which is
+/// what `sdio_io_rw_ext_helper` does in the reference.
+pub fn read_extended(
+    h: &Host,
+    func: u8,
+    addr: u32,
+    words: &mut [u32],
+    blk: u32,
+    blocks: Option<u32>,
+    ctx: &ServiceContext,
+) -> bool {
+    // Argument: bit31 CLEAR for a read, bits30:28 function, bit27 BLOCK mode, bit26 incrementing address,
+    // bits25:9 address, bits8:0 the count - BLOCKS in block mode, BYTES in byte mode.
+    let (block_bit, count, code) = match blocks {
+        Some(n) => (1u32 << 27, n, CMD_IO_RW_EXTENDED_READ_MULTI),
+        None => (0, (words.len() * 4) as u32, CMD_IO_RW_EXTENDED_READ),
+    };
+    let arg = ((func as u32 & 0x7) << 28)
+        | block_bit
+        | (1 << 26)
+        | ((addr & 0x1_FFFF) << 9)
+        | (count & 0x1FF);
+    if let Err(phase) = h.cmd_data(code, arg, blk, words, true) {
+        let resp = h.last_resp();
+        let (rb, cmdtm) = h.last_setup();
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CMD53 read of {} word(s) from function {} address {:#07x} failed - {} \
+             (arg={:#010x} BLKSIZECNT={:#010x} CMDTM={:#010x} R5 flags {:#04x})",
+            words.len(), func, addr, phase, arg, rb, cmdtm, (resp >> 8) & 0xFF
+        ));
+        let (si, ss) = h.seen();
+        let (df, dl) = h.dat_window();
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   during the wait: INT bits seen {:#010x}, STATUS bits seen {:#010x}, data phase \
+             active at poll {}..{} ({})",
+            si, ss, df, dl,
+            if df == 0 { "NEVER - no data phase ever started" } else { "it did start" }
+        ));
+        abort(h, func, ctx);
+        return false;
+    }
+    true
 }
 
 /// One CMD53 carrying many words - the general form of which `write32` is the four-byte case.

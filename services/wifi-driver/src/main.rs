@@ -44,6 +44,7 @@ mod aicore;
 mod armcr4;
 mod backplane;
 mod bus;
+mod ctrl;
 mod firmware;
 mod erom;
 mod host;
@@ -340,9 +341,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     // keeps refusing to build.
                                     match cores.as_ref().and_then(|c| c.sdiod.as_ref()) {
                                         Some(sdiod) => {
-                                            let _ = bus::bring_up(
-                                                &h, &mut window, sdiod.base, &ctx,
-                                            );
+                                            if bus::bring_up(&h, &mut window, sdiod.base, &ctx) {
+                                                // ---- Stage 13: ask the firmware something. ---------
+                                                // ONLY WITH A BUS THAT REPORTED ITSELF READY. A control
+                                                // frame sent into a data function that never came up
+                                                // would time out for a reason that has nothing to do
+                                                // with the protocol being built here.
+                                                let _ = ctrl::report_mac(&h, &mut window, &ctx);
+                                            }
                                         }
                                         None => ctx.log(
                                             "wifi-driver: the EROM described no SDIO device core, so \

@@ -60,6 +60,7 @@ use godspeed_sdk::ServiceContext;
 use crate::backplane::{clk, f1, Window};
 use crate::host::Host;
 use crate::sdio;
+use crate::sdio::DATA_FUNC;
 
 /// Register offsets inside the SDIO device core's register block, quoted above.
 mod sdpcmd {
@@ -74,8 +75,6 @@ const PROT_VERSION: u32 = 4;
 /// `SDPCM_PROT_VERSION_SHIFT`.
 const PROT_VERSION_SHIFT: u32 = 16;
 
-/// The data function. Function 1 is the backplane window; function 2 carries frames.
-const DATA_FUNC: u8 = 2;
 /// `sdmmc_io_set_blocklen(sc->sc_sf[2], 512)`.
 const DATA_BLOCK: u16 = 512;
 
@@ -87,7 +86,7 @@ const DATA_BLOCK: u16 = 512;
 /// No `Window` here on purpose: `CHIPCLKCSR` is a function 1 register reached by CMD52, not a backplane
 /// address, so it needs no window at all.
 fn ht_clock(h: &Host, ctx: &ServiceContext) -> bool {
-    const TRIES: u32 = 100;
+    const HT_TRIES: u32 = 100;
 
     let before = match sdio::read_reg(h, 1, f1::CHIPCLKCSR) {
         Some(v) => v,
@@ -101,7 +100,7 @@ fn ht_clock(h: &Host, ctx: &ServiceContext) -> bool {
         return false;
     }
     let mut last = before;
-    for attempt in 0..TRIES {
+    for attempt in 0..HT_TRIES {
         match sdio::read_reg(h, 1, f1::CHIPCLKCSR) {
             Some(v) => {
                 last = v;
@@ -127,7 +126,7 @@ fn ht_clock(h: &Host, ctx: &ServiceContext) -> bool {
     ctx.log_fmt(format_args!(
         "wifi-driver: the chip never reported HT_AVAIL - CHIPCLKCSR {:#04x} after {} reads over ~{} ms. It \
          is still on ALP, which carried the upload but will not carry frames",
-        last, TRIES, TRIES
+        last, HT_TRIES, HT_TRIES
     ));
     // NOT fatal by itself: the ALP clock is what the whole upload ran on, so the bus still works. Saying so
     // is better than refusing to continue over a clock the next step may not need.

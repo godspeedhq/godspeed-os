@@ -276,11 +276,11 @@ fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &Service
     const VERSION_MASK: u32 = 0x0000_00FF;
     /// `SDPCM_SHARED_VERSION` - the newest the reference understands.
     const VERSION: u32 = 0x0003;
-    const TRIES: u32 = 20;
+    const LIVENESS_TRIES: u32 = 20;
 
     let shaddr = ram.base + ram.size - 4;
     let mut last = token;
-    for attempt in 0..TRIES {
+    for attempt in 0..LIVENESS_TRIES {
         match w.read32(h, shaddr, ctx) {
             Some(v) => {
                 last = v;
@@ -339,7 +339,7 @@ fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &Service
          of reset, so what is missing is the reset vector - `brcmf_sdio_buscore_activate` writes the \
          image's first four bytes to backplane address 0 before the core is restored, and this driver \
          does not (see `aicore`)",
-        last, TRIES, TRIES * 10
+        last, LIVENESS_TRIES, LIVENESS_TRIES * 10
     ));
     false
 }

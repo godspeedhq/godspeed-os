@@ -1937,3 +1937,123 @@ up: **a claim about the system made without querying the system.** The instrumen
    driver can already reach them at `0x201cc0`.
 
 None of these sends a frame. This stage ends with a bus that could carry one.
+
+## 29. The bus is up, and the first question
+
+Stage 12 passed on every step, each confirmed by the chip rather than by a write landing:
+
+```
+the chip is on its HT clock - CHIPCLKCSR 0x69 -> 0xf9 after 1 read(s), HT_AVAIL set, then forced (0xfb)
+announced SDPCM protocol version 4 to the firmware (0x00040000 -> mailbox 0x18004048),
+  and cleared the SDIO core's INTSTATUS
+function 2 enabled and READY (IOE 0x02 -> 0x06, after 1 read(s) of IOR)
+the bus is up for frames - function 2 ready at 512 bytes a block, protocol announced, clock HT
+```
+
+`0x69 -> 0xf9` decodes without slack: the `INIT` word this driver writes is `0x29`
+(`FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ | FORCE_ALP`), plus `HT_AVAIL_REQ` is `0x39`, and the chip added
+`ALP_AVAIL` (`0x40`) and `HT_AVAIL` (`0x80`) itself. `FORCE_HT` then gives `0xfb`. `IOE 0x02 -> 0x06` is
+function 1 plus function 2.
+
+### Stage 13: three headers, all quoted
+
+A control frame is a hardware header, a software header, a BCDC command header and a payload. Every field
+is from a reference, because a wrong field produces a frame the firmware ignores in silence - the worst
+failure shape available here.
+
+From OpenBSD's `bwfm`:
+
+```c
+struct bwfm_sdio_hwhdr {  uint16_t frmlen;  uint16_t cksum;  };
+
+struct bwfm_sdio_swhdr {
+	uint8_t seqnr;    uint8_t chanflag;  uint8_t nextlen;  uint8_t dataoff;
+	uint8_t flowctl;  uint8_t maxseqnr;  uint16_t res0;
+};
+```
+
+and from Linux's `bcdc.c`, which unlike `sdio.c` does not truncate:
+
+```c
+struct brcmf_proto_bcdc_dcmd {
+	__le32 cmd;	__le32 len;	__le32 flags;	__le32 status;
+};
+#define BCDC_DCMD_ERROR		0x01
+#define BCDC_DCMD_ID_MASK	0xFFFF0000
+#define BCDC_DCMD_ID_SHIFT	16
+```
+
+with `BRCMF_C_GET_VAR 262` from `fwil.h`.
+
+### The one fact that guessing would have got wrong
+
+```c
+addr = sc->sc_cc->co_base;
+bwfm_sdio_backplane(sc, addr);
+addr &= BWFM_SDIO_SB_OFT_ADDR_MASK;
+addr |= BWFM_SDIO_SB_ACCESS_2_4B_FLAG;
+if (write)
+	err = bwfm_sdio_buf_write(sc, sc->sc_sf[2], addr, data, size);
+```
+
+A frame goes to **function 2 with the backplane window set to the CHIPCOMMON core base**, `0x18000000` -
+not to address 0, and not to the firmware's RAM. The resulting offset is `0x8000`, which looks identical to
+every other access this driver makes for a completely different reason. That coincidence is exactly what
+would have made a wrong guess look plausible.
+
+Padding is also not the obvious rule:
+
+```c
+len = sizeof(*hwhdr) + sizeof(*swhdr) + m->m_len;
+if (len > 512 && (len % 512) != 0)
+	roundto = 512;
+else
+	roundto = 4;
+```
+
+Short frames pad to four bytes. Only a frame both longer than a block and not a whole number of blocks
+rounds to 512.
+
+### What is checked, because a silent wrong answer is the hazard
+
+- **The hardware header validates itself**: `frmlen ^ cksum` must be `0xFFFF`, which is the reference's own
+  test and the only way to tell a real frame from a FIFO read that found nothing. So a reply is *waited for*
+  by re-reading until the checksum holds, not assumed ready.
+- **The reply's request id must match.** A mismatch is another exchange's answer, and it is discarded rather
+  than parsed. This is the same failure the `fs` protocol needed a correlation tag to fix.
+- **`BCDC_DCMD_ERROR` means the firmware refused**, and `status` carries its reason. Reported, never
+  swallowed.
+- **The MAC is sanity-checked.** All-zero and all-`0xFF` are rejected: both are what a successful exchange
+  that returned nothing looks like, and printing one as the radio's address would be precisely the silent
+  wrong answer this effort keeps being reshaped to avoid.
+
+The question asked is `cur_etheraddr`, because **only the firmware knows it**. No host-side arithmetic can
+fabricate a plausible MAC, so a correct-looking answer is real evidence rather than a self-consistent
+guess - the same reasoning as the NVRAM-token liveness test.
+
+### Two gates that improved the code rather than being silenced
+
+The duplicate-constant check refused this work twice, both times correctly. `DATA_FUNC` was declared in
+`bus.rs` and `ctrl.rs` with the same value, so it now lives once in `sdio.rs`, where a fact about the SDIO
+card belongs. And `TRIES` existed in three files with two different values - "two facts wearing one name".
+They are now `RESET_TRIES`, `HT_TRIES`, `REPLY_TRIES` and `LIVENESS_TRIES`, which is better code than what
+the gate rejected. A third pair inside `sdio.rs` that the cross-file rule could not see (`READY_TRIES` at
+two values, 100 and 500) was found while fixing the first two and split into `OCR_TRIES` and `READY_TRIES`.
+
+A general `read_extended` also had to be written: the read side of CMD53 stopped at four bytes, because every
+backplane read is a single word. A reply header is twelve.
+
+### Prediction
+
+1. **The radio answers.** `THE RADIO ANSWERED - its MAC address is xx:xx:xx:xx:xx:xx`, with a first byte
+   whose low bit is 0 (a unicast address) and very likely a Broadcom or Raspberry Pi OUI - `b8:27:eb`,
+   `dc:a6:32` or `e4:5f:01` are the Pi Foundation's. That is the control channel working end to end, and
+   `wifi list` becomes reachable work rather than a stub.
+2. **No valid reply frame.** The header never satisfies `frmlen ^ cksum == 0xFFFF` within 200 reads. Then the
+   frame reached the bus and the firmware did not answer it, and the next thing to read is whether the
+   firmware must be brought "up" first - `BRCMF_C_UP` is 2, and brcmfmac issues it during bus init.
+3. **A reply that fails one of the checks** - wrong request id, the error flag set with a status, or six
+   bytes of zeros. Each of those prints what it saw, and each points somewhere different: an id mismatch at
+   the framing, an error status at the iovar name, zeros at the payload offset arithmetic.
+
+Outcome 1 is the first moment this is a radio rather than a loaded chip.
