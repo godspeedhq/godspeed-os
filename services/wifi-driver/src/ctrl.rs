@@ -868,8 +868,23 @@ pub fn download_blob(
 ) -> bool {
     /// `sizeof(struct brcmf_dload_data_le)` without its trailing data.
     const DLOAD_HDR: usize = 12;
-    const DL_BEGIN: u16 = 0x0002;
-    const DL_END: u16 = 0x0004;
+    /// `BWFM_DLOAD_FLAG_BEGIN`, `(1 << 1)` - brcmfmac names the same value `DL_BEGIN` (0x0002).
+    const DL_BEGIN: u16 = 1 << 1;
+    /// `BWFM_DLOAD_FLAG_END`, `(1 << 2)` - brcmfmac names the same value `DL_END` (0x0004).
+    const DL_END: u16 = 1 << 2;
+    /// `BWFM_DLOAD_FLAG_HANDLER_VER_1`, `(1 << 12)`, with `BWFM_DLOAD_FLAG_HANDLER_VER_MASK` being
+    /// `(0xf << 12)` - so the flag's high nibble is a PROTOCOL VERSION, not a spare bit.
+    ///
+    /// **Set on every chunk, and this driver set it on none.** With the version zero the firmware cannot
+    /// interpret the rest of the header, which is why `clmload` came back with a generic `BCME_ERROR`
+    /// rather than a specific complaint.
+    ///
+    /// This is `arch/CLAUDE.md`'s rule being broken by the person who wrote it: *never assemble a register
+    /// value out of bit names; copy the one the reference writes.* brcmfmac's
+    /// `dload_buf->flag = cpu_to_le16(flag)` takes `flag` as a PARAMETER, and rather than trace where that
+    /// parameter was built I assembled a value from the two constants a `#define` list happened to name. A
+    /// constants list says what exists, not what is required.
+    const DL_HANDLER_VER_1: u16 = 1 << 12;
 
     // What is left of a frame once the SDPCM and BCDC headers, the iovar name and the download header have
     // taken their share. Rounded down to four so every chunk is a whole number of words.
@@ -891,7 +906,8 @@ pub fn download_blob(
     let mut chunks = 0u32;
     while off < blob.len() {
         let n = core::cmp::min(room, blob.len() - off);
-        let mut flag = 0u16;
+        // THE HANDLER VERSION FIRST, on every chunk, exactly as the reference does.
+        let mut flag = DL_HANDLER_VER_1;
         if off == 0 {
             flag |= DL_BEGIN;
         }
