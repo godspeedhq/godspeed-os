@@ -80,6 +80,17 @@ pub const CHANNEL_MASK: u8 = 0x0F;
 pub const CHANNEL_EVENT: u8 = 0x01;
 /// `BWFM_SDIO_SWHDR_CHANNEL_DATA`.
 pub const CHANNEL_DATA: u8 = 0x02;
+/// `BWFM_SDIO_SWHDR_CHANNEL_GLOM` - several frames aggregated into one by the firmware.
+///
+/// **Ignored, and ignored on purpose.** The reference's receive path switches on CONTROL, EVENT and DATA and
+/// has **no GLOM case at all** - a glommed frame falls through and is dropped - and its scans work. So the
+/// escan results do not arrive this way, and deaggregating would be work with nothing waiting on it (§26.2).
+///
+/// It is COUNTED rather than silently skipped, because "the firmware sent 17 frames this driver does not
+/// read" is a fact worth seeing, and because if results ever fail to arrive this is the first number to look
+/// at. There is no iovar to turn it off: `bus:txglom` exists and is TX-only, and no `bus:rxglom` appears in
+/// the reference.
+pub const CHANNEL_GLOM: u8 = 0x03;
 
 /// `BWFM_ETHERTYPE_LINK_CTL` - the ethertype that marks a frame as an event rather than traffic.
 const ETHERTYPE_LINK_CTL: u16 = 0x886C;
@@ -204,6 +215,10 @@ pub struct Scan {
     events: u32,
     /// Escan-result events specifically.
     results: u32,
+    /// Glommed frames seen and not read. See `CHANNEL_GLOM`.
+    glom: u32,
+    /// Frames on a channel this driver does not read at all.
+    other: u32,
 }
 
 impl Scan {
@@ -214,6 +229,8 @@ impl Scan {
             dropped: 0,
             events: 0,
             results: 0,
+            glom: 0,
+            other: 0,
         }
     }
 
@@ -377,9 +394,14 @@ pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &Service
     for _ in 0..ms {
         match ctrl::read_frame(h, w, &mut frame, ctx) {
             Some(f) => {
-                if f.chanflag & CHANNEL_MASK != CHANNEL_EVENT
-                    && f.chanflag & CHANNEL_MASK != CHANNEL_DATA
-                {
+                let channel = f.chanflag & CHANNEL_MASK;
+                if channel == CHANNEL_GLOM {
+                    // Counted, not read. See `CHANNEL_GLOM` for why the reference drops these too.
+                    scan.glom += 1;
+                    continue;
+                }
+                if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {
+                    scan.other += 1;
                     continue;
                 }
                 scan.events += 1;
@@ -491,6 +513,12 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
         LISTEN_MS
     ));
     collect(h, w, &mut scan, LISTEN_MS, ctx);
+
+    ctx.log_fmt(format_args!(
+        "wifi-driver: the scan window saw {} event/data frame(s), {} escan-result event(s), {} glommed \
+         frame(s) ignored, {} on other channels",
+        scan.events, scan.results, scan.glom, scan.other
+    ));
 
     if scan.events == 0 {
         ctx.log(

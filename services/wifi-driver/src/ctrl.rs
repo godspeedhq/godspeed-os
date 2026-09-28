@@ -230,12 +230,20 @@ impl Session {
     }
 }
 
-/// One control frame, bounded. A `cur_etheraddr` exchange is 48 bytes; 512 is a whole block and covers
-/// every control message this driver sends.
+/// One frame, bounded - and the bound is the WIRE's, not this driver's convenience.
+///
+/// ```c
+/// #define MAX_RX_DATASZ	2048
+/// ```
+///
+/// **This was 512, and the radio does not care.** With a scan running the firmware sent frames of 584 to
+/// 1952 bytes and 17 of them were discarded as an "impossible shape" - which was true of the buffer and not
+/// of the frame. An outgoing control message still fits in a fraction of this; what needed the room is
+/// everything the firmware sends back, and the escan results are among it.
 ///
 /// Public because the scan path reads frames into a buffer of the same size. Two constants for one wire
 /// limit is the duplicated fact the enforcement layer rejects, and rightly.
-pub const FRAME: usize = 512;
+pub const FRAME: usize = 2048;
 
 /// The frame FIFO's address: function 2, with the window set to chipcommon, offset 0, wide access.
 fn frame_offset() -> u32 {

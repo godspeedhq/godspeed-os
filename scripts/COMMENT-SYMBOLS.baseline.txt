@@ -377,3 +377,7 @@ BWFM_DLOAD_TYPE_CLM                # OpenBSD bwfm - 2, agreeing with brcmfmac DL
 BWFM_DLOAD_MAX_LEN                 # OpenBSD bwfm - 1400, its chunk limit; this driver chunks to its own 512-byte frame - external, 26.14
 bwfm_process_blob                  # OpenBSD bwfm - the chunked blob download whose flag construction showed the missing handler version - external, 26.14
 bwfm_dload_data                    # OpenBSD bwfm - the packed download header (flag/type/len/crc/data) - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_GLOM       # OpenBSD bwfm - SDPCM channel 3, firmware-aggregated frames; its receive switch has NO case for it and drops them, so this driver counts and ignores them too - external, 26.14
+MAX_RX_DATASZ                      # Linux brcmfmac sdio.c - 2048, the receive frame size; the source of FRAME - external, 26.14
+bus:txglom                         # Linux brcmfmac - the TX-only glom iovar; cited to say there is no RX equivalent to turn aggregation off - external, 26.14
+bus:rxglom                         # Linux brcmfmac - does NOT exist; cited where this driver explains why glom cannot be disabled by the host - external, 26.14
