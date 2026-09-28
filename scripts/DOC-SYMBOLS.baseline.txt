@@ -68,3 +68,4 @@ split_txn                          # docs/arm32-usb-userspace.md - the IN-KERNEL
 split_txn_periodic                 # docs/arm32-usb-userspace.md - ditto; `periodic_split_in` in services/dwc2 is what it became
 DATA_TIMEOUT                       # SDHCI SPEC interrupt-status bit 20 - this driver has no constant for it because INT_ERR (0x017E_8000) covers it as a mask; cited to say WHY a data timeout would have been reported - external, 26.14
 WRITE_TRANSFER_ACTIVE              # SDHCI SPEC present-state bit 8 - this driver has no constant for it and reads it only as part of the measured STATUS word; cited by its spec name where that word is decoded - external, 26.14
+brcmf_sdio_download_firmware       # Linux brcmfmac sdio.c - the whole download sequence; cited as where to look next if the reset vector proves necessary but not sufficient - external, 26.14

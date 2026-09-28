@@ -1697,3 +1697,94 @@ The corrected line describes what it can see and explicitly declines to call a l
    and compare them against the blob, which the FNV machinery already makes cheap.
 
 No outcome here is a working radio. Even outcome 1 means the firmware booted and nothing has spoken to it.
+
+## 26. The reset vector, and a second reference when the first will not yield
+
+The liveness check earned its place on the first boot it ran:
+
+```
+the last word of RAM still holds OUR NVRAM token 0xfe4b01b4 after 20 reads over ~200 ms,
+  so THE FIRMWARE HAS NOT RUN
+```
+
+Outcome 2 of the section 25 prediction. The image and the NVRAM load perfectly, the CPU comes out of reset,
+and no firmware runs. **Without that check this boot would have been reported as a success** - the line above
+it still says `CORE RUNNING, CPU EXECUTING`, which is true and means nothing.
+
+One correction to section 25, made here because the number was published: the token was predicted as
+`0xFE4A01B5` and is `0xFE4B01B4`. The prediction divided 1748 by 4 instead of subtracting the four-byte token
+first, so it is 436 words, not 437. Nothing depended on it - the check compares against the value actually
+written rather than a computed one, which is the reason it was built that way - but the arithmetic was wrong
+and is corrected rather than quietly left.
+
+### Why address 0
+
+The image is loaded at `0x198000`, but the CR4 **begins fetching from backplane address 0** when it comes out
+of reset. The first word of the image is the branch that gets it from there to the loaded code. Without that
+word written to address 0, the CPU executes whatever address 0 happens to hold, which is exactly the state
+measured: fetching, and the NVRAM token untouched because no firmware ever ran to consume it.
+
+The blob's first four bytes are `98 f1 3e b8`, so the vector is **`0xb83ef198`**. The words after it -
+`99f1 fcbd`, `99f1 08be`, `99f1 14be` - are the same shape with a varying second halfword, which is a
+Thumb-2 branch vector table. That is what a reset vector table should look like, and it is a weak but real
+corroboration that the first word is a branch rather than data.
+
+### Two references, because the first would not yield the function
+
+`brcmf_sdio_buscore_activate` sits near the end of Linux's `sdio.c`, and every fetch of that file truncates
+before it - three attempts, including narrow single-question prompts. Rather than reconstruct it from
+memory, which is the thing this whole effort is run to avoid, the body came from **OpenBSD's `bwfm`**, a
+clean-room reimplementation of the same driver:
+
+```c
+void
+bwfm_sdio_buscore_activate(struct bwfm_softc *bwfm, uint32_t rstvec)
+{
+	struct bwfm_sdio_softc *sc = (void *)bwfm;
+
+	bwfm_sdio_dev_write(sc, BWFM_SDPCMD_INTSTATUS, 0xFFFFFFFF);
+
+	if (rstvec)
+		bwfm_sdio_ram_read_write(sc, 0, (char *)&rstvec,
+		    sizeof(rstvec), 1);
+}
+```
+
+and its caller gives the value: `bwfm_chip_set_active(bwfm, *(uint32_t *)ucode)`.
+
+**The two references agree independently on both halves**, which is worth more than either alone. Linux
+supplies `rstvec = get_unaligned_le32(fw->data)` and `brcmf_chip_set_active(bus->ci, rstvec)`; OpenBSD
+supplies the write itself and its address. Neither was inferred from the other.
+
+The ordering is the reference's too: `brcmf_chip_cr4_set_active` calls `activate(..., rstvec)` and **only
+then** `resetcore(core, ARMCR4_BCMA_IOCTL_CPUHALT, 0, 0)`. So the vector is written while the CPU is still
+halted, before the release - which is where it goes here.
+
+### One divergence, recorded rather than dropped
+
+The reference's first action is to clear the SDIO device core's `INTSTATUS` with `0xFFFFFFFF`. That is
+housekeeping for an interrupt path this driver does not have: every transfer here is polled, and the EROM
+walk has not identified the SDIOD core's base. Stale bits in a register nobody reads cannot affect a polled
+driver, so the write is **omitted deliberately** and noted at the point of difference (§26.14). It becomes
+required the moment this driver takes SDIO interrupts.
+
+No new syscall, no new capability, no `unsafe`. It reuses `write_bytes`, which already handles address 0
+correctly: `win_off = (0 & 0x7FFF) | 0x8000`, byte mode, four bytes.
+
+### Prediction
+
+The log should first show `reset vector 0xb83ef198 (the image's first four bytes) going to backplane
+address 0`. Then:
+
+1. **The firmware is alive** - the last word of RAM changes from `0xfe4b01b4` to an address inside
+   `0x198000..0x260000`, and its `flags` word reports SDPCM version 1, 2 or 3. That is phase 2 genuinely
+   complete: a chip running its own firmware, and phase 3 (the control channel) becomes the next work.
+2. **Still our token.** Then the vector was necessary but not sufficient, and the next thing to read is what
+   else `brcmf_sdio_download_firmware` does between the NVRAM write and the release - the candidates being
+   the `INTSTATUS` clear omitted above, and whether the chip's clock must be moved from ALP to HT before the
+   core is let go.
+3. **A value outside RAM.** Something executed and went wrong early, and the next move is reading image
+   words back from `0x198000` to compare against the blob, which the existing FNV machinery makes cheap.
+
+Outcome 1 is still not a working radio. It is a chip that has booted its own firmware with nothing yet
+talking to it.

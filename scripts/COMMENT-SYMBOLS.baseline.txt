@@ -274,3 +274,8 @@ BUFFER_WRITE_ENABLE                # SDHCI SPEC present-state bit 10; this drive
 TRANSFER_COMPLETE                  # SDHCI SPEC interrupt-status bit 1; this driver names it INT_DATA_DONE - cited by its spec name in the same decode - external, 26.14
 SDPCM_SHARED_VERSION               # Linux brcmfmac sdio.c - 0x0003, the newest SDPCM shared-structure layout it understands; this driver names the constant VERSION - external, 26.14
 SDPCM_SHARED_VERSION_MASK          # Linux brcmfmac sdio.c - 0x00FF, the version field inside the shared structure flags word; this driver names it VERSION_MASK - external, 26.14
+brcmf_chip_cr4_set_active          # Linux brcmfmac chip.c - calls activate(rstvec) and only THEN resetcore, which is where the reset-vector ORDER in upload::run comes from - external, 26.14
+bwfm_sdio_buscore_activate         # OpenBSD bwfm (clean-room brcmfmac reimplementation) - the body Linux sdio.c truncates before; the reset-vector write to backplane address 0 - external, 26.14
+bwfm_sdio_ram_read_write           # OpenBSD bwfm - its windowed backplane write, the twin of brcmf_sdiod_ramrw; cited in the quoted reset-vector call - external, 26.14
+bwfm_chip_set_active               # OpenBSD bwfm - passes *(uint32_t *)ucode, confirming the reset vector is the image first four bytes - external, 26.14
+BWFM_SDPCMD_INTSTATUS              # OpenBSD bwfm - the SDIO device core INTSTATUS the reference clears first; deliberately NOT written here (this driver is polled) - external, 26.14

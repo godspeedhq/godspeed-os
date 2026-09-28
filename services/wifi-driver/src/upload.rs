@@ -491,7 +491,61 @@ pub fn run(
     // generic pattern test, which cannot know what the host put there.
     let token = u32::from_le_bytes([nv[len - 4], nv[len - 3], nv[len - 2], nv[len - 1]]);
 
-    // 5. RELEASE. `halt = false`, so the CPU runs.
+    // 5. THE RESET VECTOR, to backplane address 0, while the CPU is still halted.
+    //
+    //    The image sits at `0x198000`, but the CR4 begins fetching from backplane address 0 when it comes
+    //    out of reset. The first word of the image is the branch that gets it from there to the loaded
+    //    code, so without this write the CPU executes whatever address 0 happens to hold - which is
+    //    precisely the state the last boot measured: `CPU EXECUTING`, and the NVRAM token at the top of
+    //    RAM untouched because no firmware ever ran to consume it.
+    //
+    //    From OpenBSD's `bwfm`, a clean-room reimplementation of brcmfmac, because Linux's `sdio.c`
+    //    truncates before `brcmf_sdio_buscore_activate` on every fetch:
+    //
+    //    ```c
+    //    if (rstvec)
+    //            bwfm_sdio_ram_read_write(sc, 0, (char *)&rstvec, sizeof(rstvec), 1);
+    //    ```
+    //
+    //    and its caller gives the value: `bwfm_chip_set_active(bwfm, *(uint32_t *)ucode)` - the FIRST FOUR
+    //    BYTES of the image. Linux agrees independently, `rstvec = get_unaligned_le32(fw->data)`.
+    //
+    //    ORDER IS THE REFERENCE'S: `brcmf_chip_cr4_set_active` calls `activate(..., rstvec)` and only THEN
+    //    `resetcore(core, ARMCR4_BCMA_IOCTL_CPUHALT, 0, 0)`, so this happens before the release below.
+    //
+    //    DIVERGENCE, recorded rather than dropped (§26.14): the reference first clears the SDIO device
+    //    core's `INTSTATUS` with `0xFFFFFFFF`. That is housekeeping for an interrupt path this driver does
+    //    not have - every transfer here is polled - and stale bits in a register nobody reads cannot
+    //    affect it. Omitted deliberately; it becomes required the moment this driver takes SDIO
+    //    interrupts.
+    if firmware::IMAGE.len() < 4 {
+        ctx.log("wifi-driver: the embedded image is too short to contain a reset vector");
+        return false;
+    }
+    let rstvec = u32::from_le_bytes([
+        firmware::IMAGE[0],
+        firmware::IMAGE[1],
+        firmware::IMAGE[2],
+        firmware::IMAGE[3],
+    ]);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: reset vector {:#010x} (the image's first four bytes) going to backplane address 0 - \
+         the CR4 fetches from there on release, not from {:#08x}",
+        rstvec, ram.base
+    ));
+    if rstvec == 0 {
+        // The reference guards on this too (`if (rstvec)`), and a zero vector would mean the image does
+        // not begin with a branch - worth saying rather than writing a zero and wondering later.
+        ctx.log(
+            "wifi-driver: the image's first word is ZERO, so there is no reset vector to write. The \
+             reference skips the write in this case and so does this - but for this chip that is \
+             unexpected, and it would explain a core that runs nothing",
+        );
+    } else if !write_bytes(h, w, 0, &rstvec.to_le_bytes(), "reset vector", ctx) {
+        return false;
+    }
+
+    // 6. RELEASE. `halt = false`, so the CPU runs.
     ctx.log("wifi-driver: releasing the ARM");
     if !aicore::reset(h, w, arm_wrapper, false, ctx) {
         ctx.log(
@@ -501,7 +555,7 @@ pub fn run(
         );
         return false;
     }
-    // 6. ASK THE CHIP, rather than asserting from the reset controller. `RESETCTRL 0` means the CPU is
+    // 7. ASK THE CHIP, rather than asserting from the reset controller. `RESETCTRL 0` means the CPU is
     //    fetching; it does not mean the firmware booted, and a CPU fetching garbage reports the same
     //    thing. The firmware overwrites the NVRAM token at the last word of RAM once it has consumed it,
     //    so that word is the answer.
