@@ -573,8 +573,9 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     /// says it does (`status::SUCCESS`), which on hardware was about 2.6 s after it started.
     const MAX_EMPTY_POLLS: u32 = 500;
 
-    ctx.log("wifi-driver: stage 14 - scanning. UNVERIFIED ON HARDWARE: designed at the desk from the \
-             references, see docs/wifi.md 30");
+    // The "UNVERIFIED ON HARDWARE" banner that stood here was true when written and would have been a
+    // lie from the first successful boot on. Ten networks, names and all, on 2026-09-28.
+    ctx.log("wifi-driver: stage 14 - scanning");
 
     let mut request = [0u8; req::SIZE];
     build_request(&mut request);

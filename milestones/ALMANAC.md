@@ -1583,3 +1583,80 @@ Not one byte of any shipping binary. Eighteen checkers before, eighteen after; t
 verdicts. What changed is that a contributor can now ask, and be answered in words that name the law
 and the fix - and that the answer itself is held to a standard, because it is written down where a diff
 can see it.
+
+## 2026-09-27 to 2026-09-28 - The day the radio scanned the room
+
+The Pi 4's onboard WiFi - a Broadcom CYW43455 behind the Arasan SDIO block at `fe300000` - went from a
+device nobody had proven was a radio to one that listed the ten networks in the room, with names, signal
+strength and channel, in two days and about twenty-five boots. `docs/wifi.md` sections 13 through 35 are the
+record; this is what the record is about.
+
+### A radio is a second computer
+
+The chip has an ARM Cortex-R4 with 800 KiB of memory and no firmware of its own. Until the host writes 609 KB
+into that memory and releases the processor, there is no 802.11 anywhere inside it - nothing to ask, nothing
+to enumerate. Every other device this project has driven is fixed-function silicon that works from reset.
+This one boots from us. That single fact shaped the whole effort: phase 2 was a bootloader for someone else's
+CPU, and its bugs were bootloader bugs - the core held in reset when it should have been clocked and halted,
+the reset vector left unwritten, a token at the top of memory that the firmware overwrites to say it is alive.
+
+### The failures that read as facts
+
+The chip refused a scan with `BCME_NOTUP` through four boots of bring-up commands that were all accepted.
+The cause was regulatory data: a blob called CLM, which says which channels may be used at what power, and
+which was vendored in this repository the whole time with a comment explaining exactly how it is delivered
+and why it was not yet. A radio with no channel rules will not transmit or scan, and from outside that is
+indistinguishable from an interface that is down. The firmware was telling the truth; it was being asked the
+wrong question.
+
+Before that, the first control reply came back as sixteen bytes containing fragments of the driver's own
+request - `cur_` where a command number belonged, `dd` from `cur_ether**add**r` in the request-id field, and
+`-24`. The driver had told the firmware its header began 16 bytes after where it actually was, so the
+firmware parsed the iovar name as a header and complained about the length. The correct line from the
+reference was quoted in the driver's own documentation, three paragraphs above the code that contradicted
+it. **A correct citation next to wrong code reads as verification**, and cost three boots.
+
+### Read the whole function
+
+Ten of the twenty-five boots were spent on bugs that were mine rather than the protocol's, and they share a
+cause. Asking a reference for "the line that sets X" returns a true line that hides its neighbours: a flag
+that is a parameter, a value assembled from a constants list, a sequence returned in the order it was found
+rather than the order it runs. Every time a complete function was read in execution order - the CR4 halt,
+the bring-up sequence, the blob download - the answer was in it and correct first time. The rule already
+existed in `arch/CLAUDE.md` from an earlier bug in the same effort; this was the cost of knowing it and not
+applying it.
+
+### Boot the other operating system
+
+The single most useful line of the two days was in a Raspberry Pi OS boot log, and it was not about WiFi:
+`mmc-bcm2835 fe300000.mmcnr`. Linux does not drive this controller with generic SDHCI at all; the Pi
+Foundation has its own driver for the block, with a settling delay after every register write, a data
+timeout, and a PIO loop that moves a whole block between checks. Every host-side comparison until that boot
+had been against the wrong driver. It was the operator's idea, and it replaced a day of inference with a
+morning of transcription.
+
+### Wait on the truth
+
+The scan worked one boot before anyone could see it. Twelve result events and a completion marker arrived,
+every one decoded, and the network list never printed - because the collection loop bounded itself by a
+count of polls named as milliseconds, and each empty poll was a bus transaction plus a sleep. Four thousand
+"milliseconds" was two minutes; the capture ended first. The firmware had said `complete` at the two-second
+mark. The loop ends on that word now, and the count is a bound underneath it with an honest name. It is the
+project's oldest lesson - a count is not a duration - and the eighth Commandment as a fix rather than a rule.
+
+### What was borrowed and what was not
+
+The silicon's requirements came from Linux, OpenBSD and the Pi Foundation's driver, quoted at every point of
+use: register sequences, header layouts, byte orders, the four-byte integer an integer command carries. What
+did not come along is how those systems organise a scan - dynamic result lists, callbacks into a wireless
+subsystem, work queues. The results live in a fixed array of thirty-two on the stack that counts what it
+could not keep; the driver reads frames in its own loop; the state belongs to the call that made it. Ten
+glommed frames were dropped on the floor because the reference drops them too and its scans work.
+
+### What is not done, said plainly
+
+The driver scans at boot as its own self-test. The shell cannot ask it to yet, so `wifi` at the prompt still
+answers `unavailable`; that path, the numbered picker the operator designed, `wifi connect <ssid>`, and
+secure-versus-open from the beacon's information elements are the next work. Association, the credential
+path and data frames are phases 4 and 5. The network identifiers from the successful scan are in the
+operator's capture and not in this repository, because the neighbours did not agree to appear in it.

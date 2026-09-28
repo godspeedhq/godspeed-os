@@ -2529,3 +2529,82 @@ thing that refused it.
 The event path remains completely unproven: no `ESCAN_RESULT` has ever arrived. Also unexplained, and worth
 watching: the two frames on the event channel arrive with `frmlen 12` and zero body, which is a header-only
 frame on a channel that should carry events.
+
+## 35. Phase 3 delivered: the radio scanned the room
+
+```
+`escan` accepted - listening until the firmware says the scan is over
+  event 69 (ESCAN_RESULT), status 8, 380 byte payload
+  ... eleven more, 292 to 548 bytes each ...
+  event 69 (ESCAN_RESULT), status 0, 12 byte payload
+listening ended: complete (235 empty poll(s) of a 500 bound)
+the scan window saw 12 event/data frame(s), 12 escan-result event(s), 10 glommed frame(s) ignored
+10 network(s) from 12 escan-result event(s)
+```
+
+Ten networks, with names, BSSIDs, signal strength and channel. The operator's own network at -30 dBm on three
+radios of one access point and a guest network beside it; two hidden networks; four neighbours between -63
+and -80 dBm. Channels spanning 2.4 GHz channel 6 and 11 (`0x1006`, `0x100b`) and 5 GHz channel 42 at 80 MHz
+(`0xe02a`) and channel 155 (`0xe09b`). Values that can only have come from the air, which is the whole test.
+
+The identifiers themselves are in the operator's capture and not here: this repository is public, and the
+neighbours did not agree to appear in it.
+
+**And the wait ended on the firmware's word.** `listening ended: complete` - the `SUCCESS` event - with 235
+empty polls of a 500 bound unused. Commandment VIII, as the fix rather than the rule.
+
+### What §7 promised and what was delivered
+
+> **3** - `wifi scan` lists the SSIDs in the room. First user-visible win, and it needs no cryptography and no
+> credential.
+
+Delivered on 2026-09-28, with one honest qualification: the DRIVER lists them, at boot, as its own self-test.
+The shell cannot yet ask it to. `wifi` at the prompt still answers `unavailable`, and that IPC path - and the
+picker the operator designed in §29's discussion - is the next work. So the deliverable is met as a
+capability and not yet as a command.
+
+### What it took, counted
+
+From `escan` first being refused to networks printing: **nine boots**. What each one found, in order,
+because the order is the lesson:
+
+| boot | found | kind |
+|---|---|---|
+| 1 | `BCME_NOTUP` - the interface was down | protocol |
+| 2 | `BRCMF_C_UP` reported success it never got: every command shared request id 2 | **mine** |
+| 3 | an integer command carries four bytes, and UP is a chain, and events are off until asked for | protocol |
+| 4 | the CLM regulatory blob - vendored, unembedded, and the actual cause of `NOTUP` | protocol (and mine) |
+| 5 | the download flag carries a handler version I assembled away | **mine**, against my own rule |
+| 6 | a byte-mode CMD53 carries at most 512 bytes; and 1400 IS the protocol limit | hardware (and mine) |
+| 7 | the body READ was still byte mode - the fix landed on two writes and I counted instead of looking | **mine** |
+| 8 | byte mode must round up to a word too - a regression in the previous fix | **mine** |
+| 9 | events carry a 4-byte BDC header, and the event header is big-endian | protocol |
+| 10 | the list never printed: a count of polls is not a duration | **mine**, and deferred twice |
+
+Five of ten were the protocol. Five were mine - regressions, skipped verification, and one rule I had
+written myself. The protocol half moved at one real step per boot, every step read from a reference. The
+other half was the cost of not applying three habits that, when applied, worked every time: **read whole
+functions in execution order**, **list what changed rather than counting it**, and **check every branch of
+anything edited**.
+
+### Two things learned that are worth more than the scan
+
+**The radio needs regulatory data before it will do anything.** `BCME_NOTUP` was never about `UP`. The CLM
+blob - which channels may be used at what power - was in the repository the whole time with a comment
+explaining exactly how it is delivered and why it was not yet. A radio without channel rules cannot lawfully
+transmit or scan, and "not up" is what that looks like from outside.
+
+**Linux does not drive this controller with `sdhci`.** Booting Raspberry Pi OS on the same board showed
+`mmc-bcm2835` bound to `fe300000` - the Pi Foundation's own driver for that block - which has a settling
+delay after every register write, a data timeout, and a PIO loop that moves a whole block between checks.
+Every host-side comparison before that boot was against the wrong driver. The operator's suggestion to boot
+Linux and look was worth more than any hypothesis of mine that day.
+
+### What is not done
+
+- The shell cannot drive the driver. `wifi scan` as a command, the numbered picker, `wifi connect <ssid>`.
+- Secure-versus-open is not shown: it needs the RSN/WPA information elements parsed out of `ie_offset` /
+  `ie_length`, which are in hand but unread.
+- No association, no credential path, no data frames - phases 4 and 5.
+- The glommed frames (10 of 22 this boot) are counted and dropped. The reference does the same and its
+  scans work, so nothing waits on them; it is recorded rather than left implied.

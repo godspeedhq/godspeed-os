@@ -398,10 +398,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // and no 802.11 exists yet" - and it printed immediately AFTER "PHASE 2 COMPLETE", so the log
         // contradicted itself by one line. Third time in this effort that the code moved on and the
         // sentence did not, which is why the sentence no longer claims a phase it cannot see.
-        "wifi-driver: the radio is on the bus, identified by BOTH its CIS and its own silicon, its \
-         backplane is open, and the stages above say how far the firmware got. There is no control \
-         channel to it yet, so every request is still answered `unavailable` - a loaded chip is not a \
-         usable radio, and this line does not pretend otherwise",
+        // FOURTH TIME. This line has now been wrong in four different ways as the code moved past it, the
+        // last being "no control channel" printed directly after a list of ten networks the control channel
+        // fetched. It no longer describes the radio's state at all - the stages above do that, each on its
+        // own line, and they are read rather than asserted. What it says is the one thing still true: the
+        // SHELL has no way to ask this driver for any of it yet.
+        "wifi-driver: the stages above are the radio's state, each reported as it was read. What does not \
+         exist yet is a way for the shell to ask for any of it, so `wifi` at the prompt is still answered \
+         `unavailable` - that is the next work, and this line will be wrong again when it lands",
     );
     serve(&ctx)
 }
