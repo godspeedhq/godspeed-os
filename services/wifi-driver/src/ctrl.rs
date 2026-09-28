@@ -272,7 +272,13 @@ fn transfer_mode(bytes: usize) -> (u32, Option<u32>, usize) {
             blocks as usize * block,
         )
     } else {
-        (blk_byte_mode(bytes as u32), None, bytes)
+        // ROUNDED UP TO A WORD, for the same reason the block branch rounds to a block: the FIFO moves 32
+        // bits at a time, so a transfer is a whole number of words or the argument and BLKSIZECNT disagree.
+        // Observed exactly that way - a 30-byte body asked for 28 in the argument and 30 in the block
+        // register, and the controller errored before moving anything. This function returning the byte
+        // count unrounded is what let its caller truncate `30 / 4` to 7 words.
+        let words = (bytes + 3) & !3;
+        (blk_byte_mode(words as u32), None, words)
     }
 }
 
