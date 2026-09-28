@@ -383,10 +383,11 @@ impl Cores {
             // cores' base/wrapper pattern predicted was wrong, which is why a pattern was never going
             // into the code.
             Some(c) if c.wrap == 0 => ctx.log_fmt(format_args!(
-                "wifi-driver: the ARM core is {} rev {} at {:#010x} but its WRAPPER IS 0, which \
-                 blocks the firmware upload: the core is halted and reset through `wrapbase + \
-                 BCMA_IOCTL` and `wrapbase + BCMA_RESET_CTL`, so there is no address to write. \
-                 The address descriptors dumped above say whether the chip published one",
+                "wifi-driver: the ARM core is {} rev {} at {:#010x} and its wrapper is 0. That \
+                 blocks HALTING it later, not reading its memory now: the RAM size and the load \
+                 address come through the core base. The chip publishes only a SLAVE wrapper for \
+                 this core while the entry asks for a MASTER one, which the reference reads as 0 \
+                 too",
                 core_id::name(c.id).unwrap_or("?"),
                 c.rev,
                 c.base
