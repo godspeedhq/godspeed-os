@@ -159,6 +159,35 @@ mod code {
     }
 }
 
+/// Event status values, quoted from `bwfmreg.h`. An `ESCAN_RESULT` carrying `PARTIAL` is a batch of networks;
+/// one carrying `SUCCESS` says the scan is over. Both were observed on hardware in exactly that order.
+mod status {
+    /// `BWFM_E_STATUS_SUCCESS`.
+    pub const SUCCESS: u32 = 0;
+    /// `BWFM_E_STATUS_FAIL`.
+    pub const FAIL: u32 = 1;
+    /// `BWFM_E_STATUS_TIMEOUT`.
+    pub const TIMEOUT: u32 = 2;
+    /// `BWFM_E_STATUS_NO_NETWORKS`.
+    pub const NO_NETWORKS: u32 = 3;
+    /// `BWFM_E_STATUS_ABORT`.
+    pub const ABORT: u32 = 4;
+    /// `BWFM_E_STATUS_PARTIAL`.
+    pub const PARTIAL: u32 = 8;
+
+    /// Is this status the END of a scan, and what does it say?
+    pub fn terminal(s: u32) -> Option<&'static str> {
+        match s {
+            SUCCESS => Some("complete"),
+            FAIL => Some("FAILED"),
+            TIMEOUT => Some("TIMED OUT in the firmware"),
+            NO_NETWORKS => Some("complete - no networks"),
+            ABORT => Some("ABORTED"),
+            _ => None,
+        }
+    }
+}
+
 /// Offsets into `struct bwfm_escan_results`. See `docs/wifi.md` §30.2.
 mod res {
     pub const BUFLEN: usize = 0;
@@ -467,9 +496,23 @@ fn parse_results(payload: &[u8], scan: &mut Scan, ctx: &ServiceContext) {
 /// **Bounded, and it says which bound ended it.** The truth being waited on is the firmware reporting the
 /// scan complete; the deadline underneath is the bound §26.6 requires of every wait. Reporting which one
 /// finished is the difference between a result and a guess.
-pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &ServiceContext) {
+pub fn collect(
+    h: &Host,
+    w: &mut Window,
+    scan: &mut Scan,
+    max_empty_polls: u32,
+    ctx: &ServiceContext,
+) {
     let mut frame = [0u8; ctrl::FRAME];
-    for _ in 0..ms {
+    // THE TRUTH ENDS THE WAIT; THE COUNT ONLY BOUNDS IT. The firmware announces a finished scan with an
+    // ESCAN_RESULT carrying SUCCESS - observed on hardware after twelve PARTIAL batches - and the loop used
+    // to ignore that and run to a fixed iteration count instead. That count was named `ms` and was not
+    // milliseconds: every empty poll is a CMD53 of tens of microseconds plus a sleep, so "4000 ms" ran for
+    // about two minutes and the network list printed after the operator stopped watching. A count is not a
+    // duration; it is a bound, and it is named as one now.
+    let mut empty = 0u32;
+    let mut ended_by = "the poll bound - the firmware never said the scan was over";
+    while empty < max_empty_polls {
         match ctrl::read_frame(h, w, &mut frame, ctx) {
             Some(f) => {
                 let channel = f.chanflag & CHANNEL_MASK;
@@ -496,13 +539,27 @@ pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &Service
                     ));
                     if event_type == code::ESCAN_RESULT {
                         scan.results += 1;
-                        parse_results(&frame[p + at..p + at + datalen], scan, ctx);
+                        if status == status::PARTIAL {
+                            parse_results(&frame[p + at..p + at + datalen], scan, ctx);
+                        }
+                        if let Some(why) = status::terminal(status) {
+                            // THE FIRMWARE SAID SO. Stop asking.
+                            ended_by = why;
+                            break;
+                        }
                     }
                 }
             }
-            None => ctx.sleep_ms(1),
+            None => {
+                empty += 1;
+                ctx.sleep_ms(1);
+            }
         }
     }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: listening ended: {} ({} empty poll(s) of a {} bound)",
+        ended_by, empty, max_empty_polls
+    ));
 }
 
 /// Run a scan and report what came back.
@@ -510,9 +567,11 @@ pub fn collect(h: &Host, w: &mut Window, scan: &mut Scan, ms: u32, ctx: &Service
 /// Returns false when nothing was heard at all, which is a different outcome from "no networks here" and is
 /// reported as such.
 pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
-    /// How long to listen. A scan genuinely takes time - the radio dwells on each channel - so this is a
-    /// real duration rather than a stand-in for a condition (§30.5).
-    const LISTEN_MS: u32 = 4000;
+    /// The bound on EMPTY polls before giving up on a firmware that never says the scan is over. Not a
+    /// duration: each empty poll is one CMD53 and a 1 ms sleep, so this is on the order of tens of seconds
+    /// of silence, and the log says which of the two ended the wait. The scan itself ends when the firmware
+    /// says it does (`status::SUCCESS`), which on hardware was about 2.6 s after it started.
+    const MAX_EMPTY_POLLS: u32 = 500;
 
     ctx.log("wifi-driver: stage 14 - scanning. UNVERIFIED ON HARDWARE: designed at the desk from the \
              references, see docs/wifi.md 30");
@@ -586,11 +645,8 @@ pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
         );
         return false;
     }
-    ctx.log_fmt(format_args!(
-        "wifi-driver: `escan` accepted - listening for results for {} ms",
-        LISTEN_MS
-    ));
-    collect(h, w, &mut scan, LISTEN_MS, ctx);
+    ctx.log("wifi-driver: `escan` accepted - listening until the firmware says the scan is over");
+    collect(h, w, &mut scan, MAX_EMPTY_POLLS, ctx);
 
     ctx.log_fmt(format_args!(
         "wifi-driver: the scan window saw {} event/data frame(s), {} escan-result event(s), {} glommed \

@@ -387,3 +387,9 @@ brcmf_proto_bcdc_hdrpull           # Linux brcmfmac bcdc.c - the receive path th
 skb_pull                           # Linux kernel - advances past a header; quoted to show the DATA frame needs TWO pulls - external, 26.14
 brcmf_escan_result_le              # Linux brcmfmac fwil_types.h - the LITTLE-endian escan result body (buflen/version/sync_id/bss_count), which is why only the event header flips byte order - external, 26.14
 brcmf_bss_info_le                  # Linux brcmfmac fwil_types.h - the little-endian per-network record; its natural alignment lands on the same offsets as OpenBSD bwfm_bss_info - external, 26.14
+BWFM_E_STATUS_SUCCESS              # OpenBSD bwfm event status 0, the scan is over; this driver names it status::SUCCESS and stops listening on it - external, 26.14
+BWFM_E_STATUS_FAIL                 # OpenBSD bwfm event status 1; status::FAIL - external, 26.14
+BWFM_E_STATUS_TIMEOUT              # OpenBSD bwfm event status 2, timed out inside the firmware; status::TIMEOUT - external, 26.14
+BWFM_E_STATUS_NO_NETWORKS          # OpenBSD bwfm event status 3, complete with nothing found; status::NO_NETWORKS - external, 26.14
+BWFM_E_STATUS_ABORT                # OpenBSD bwfm event status 4; status::ABORT - external, 26.14
+BWFM_E_STATUS_PARTIAL              # OpenBSD bwfm event status 8, one batch of results; status::PARTIAL is what every result-bearing event carried on hardware - external, 26.14
