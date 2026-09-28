@@ -609,11 +609,23 @@ pub fn read_frame(
     let chanflag = b1[1];
     let dataoff = b1[3] as usize;
     if frmlen > FRAME || dataoff < HWHDR + SWHDR || dataoff > frmlen {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: a frame validated its checksum but describes an impossible shape - frmlen {}, \
-             dataoff {}, channel {:#04x} (headers are {}, buffer is {})",
-            frmlen, dataoff, chanflag, HWHDR + SWHDR, FRAME
-        ));
+        // SAY WHICH. A glommed frame (channel 3) over the buffer is a legitimate frame this driver chooses
+        // not to read - the reference drops them too - and calling it "impossible" was a lie the log told on
+        // every scan. Anything else over the buffer, or with a dataoff outside the frame, really is a shape
+        // this driver cannot account for.
+        if chanflag & 0x0F == 3 && frmlen > FRAME {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: a {} byte glommed frame (channel 3) exceeds this driver's {} byte buffer and \
+                 is not read - the reference drops glommed frames too, and the scan works without them",
+                frmlen, FRAME
+            ));
+        } else {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: a frame validated its checksum but describes an impossible shape - frmlen {}, \
+                 dataoff {}, channel {:#04x} (headers are {}, buffer is {})",
+                frmlen, dataoff, chanflag, HWHDR + SWHDR, FRAME
+            ));
+        }
         return None;
     }
 

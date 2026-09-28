@@ -1660,3 +1660,13 @@ answers `unavailable`; that path, the numbered picker the operator designed, `wi
 secure-versus-open from the beacon's information elements are the next work. Association, the credential
 path and data frames are phases 4 and 5. The network identifiers from the successful scan are in the
 operator's capture and not in this repository, because the neighbours did not agree to appear in it.
+
+### Later the same night - it became a command
+
+`wifi list` at the prompt: the shell asks the driver over IPC, the radio sweeps, eleven records print in
+the order the specification set, and a second run scans again on the same session. Neither contract
+changed - the shell already reaches drivers by name, and the driver already replies through the cap it is
+handed. It cost one boot, to the oldest bug in the notes: a peer spawned after you has to be reacquired by
+name before the first request has anywhere to go. Phase 3's deliverable - *`wifi list` lists the SSIDs in
+the room* - is met as written. Security stays `unknown` until the beacon's information elements are read,
+and quitting does not yet stop the radio's sweep; both are recorded in the driver rather than pretended.

@@ -5,23 +5,37 @@ Version reported by `wifi version`. Implementation shape: **shell built-in for `
 service for everything else** - see section 7, where the reason is a constraint rather than a
 preference.
 
-## Status, as built and honest (2026-09-27)
+## Status, as built and honest (2026-09-28)
 
-**The verb answers. The radio does not exist.** What works today, on every board:
+**`wifi list` scans and lists, on the Raspberry Pi 4.** Hardware-verified 2026-09-28: the shell asks the
+`wifi-driver` over IPC, the radio sweeps, and one record per network prints in the order this file
+specifies - `ssid signal band security`. Eleven networks on the first run, and a second run straight after
+scanned again on the same driver session. About three seconds each, ending when the firmware says the scan
+is complete rather than when a timer runs out.
 
-- `wifi`, `wifi list`, `wifi connect <ssid>`, `wifi disconnect`, `wifi status`, `wifi stored`,
-  `wifi forget <ssid>`, `wifi radio on|off` all parse, and every one of them reports **whether there
-  is a radio at all** - which is the answer, permanently, on the T630 and the Wyse, and until a driver
-  exists everywhere else. Asking on a machine with no radio is not an error.
-- Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one
-  that will not answer gets a different sentence. Neither is a timer.
+What every verb does today:
+
+- `wifi list` - a real scan, on the Pi 4. On every other board: no radio, and it says so.
+- `wifi`, `wifi status`, `wifi connect <ssid>`, `wifi disconnect`, `wifi stored`, `wifi forget <ssid>`,
+  `wifi radio on|off` - parse, report whether there is a radio, and on the Pi 4 say the driver can only be
+  asked to `list` so far, naming the verb. They arrive with the phases that need them (`docs/wifi.md` §7).
 - `wifi help`, `wifi version`, tab completion including `radio on|off`, and a row in `help`.
+- Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
+  not answer says so after a bounded wait, never a guess.
 
-What does NOT exist: the radio. No scanning, no association, no credential, no frames -
-`docs/wifi.md` has the phases and what each one needs. No opcode in this file is sent to anything
-yet, deliberately: a protocol invented against no implementation is speculative surface (§26.2), so
-the verbs below describe the intended surface and the shell currently answers all of them with the
-truth about the hardware.
+**Two things this file specifies that are NOT met yet, said here rather than discovered:**
+
+- `security` prints `unknown`. It needs the beacon's RSN/WPA information elements parsed from the scan
+  result's `ie_offset`/`ie_length`, which the driver has in hand and does not read. A guess would be worse
+  than the word.
+- Rule 11 - `q` stops the SCAN, not just the shell's interest - is not met. The driver is single-threaded
+  inside its collection loop while the radio sweeps, so `q` abandons the shell's wait and the radio finishes
+  (about 2.6 s); the late reply is dropped. Meeting it needs the driver to poll its endpoint between frames.
+
+And one limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
+spaces (`Riverside Tenant WiFi` is one that does), and `ssid` is the first field, so a positional filter on
+the second field will misread such a row. This file puts `ssid` first; the fix, if wanted, is a design
+decision about field order and not a bug in the scan.
 
 **Why this file moved here, which is a small lesson about the gates.** It was written as
 `utilities/56_wifi.md` and Commandment X refused it: a spec under `utilities/` asserts the shell

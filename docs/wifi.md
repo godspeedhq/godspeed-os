@@ -2629,3 +2629,56 @@ room differ; that is what makes the result real rather than replayed.
 
 Both message fixes hold: stage 14 no longer announces itself unverified, and the closing line describes the
 shell's state rather than contradicting the ten lines above it.
+
+## 36. `wifi list` at the prompt - phase 3 as a command
+
+```
+gsh> wifi list
+scanning  [q] quit
+wifi-driver: sending `escan` - command 263, ... seq 8, request id 9
+wifi-driver:   the firmware ACCEPTED `escan` (request id 9 matched, status 0)
+wifi-driver: listening ended: complete (225 empty poll(s) of a 500 bound)
+wifi-driver: the scan window saw 17 event/data frame(s), 17 escan-result event(s), 13 glommed frame(s) ignored
+<ssid> -58 5GHz unknown
+<ssid> -31 5GHz unknown
+(hidden) -59 5GHz unknown
+... eleven records ...
+```
+
+The shell asked, the radio swept, and one record per network printed in the spec's order. A second
+`wifi list` twenty-seven seconds later ran on the same driver session - request id 10, sequence 9 - which is
+the point of the `Session` outliving any one scan. Both ended on the firmware's `SUCCESS` event, in under
+three seconds.
+
+The identifiers are again in the operator's capture and not here.
+
+### Why neither contract changed
+
+The shell holds `ACQUIRE_ANY` and reaches the driver by name through the kernel directory, exactly as it
+reaches `net-stack`; the driver replies through the cap embedded in each request, as it already did. So the
+whole path is: one request byte, one fixed-layout reply, no new authority anywhere.
+
+### The one boot it cost, and why
+
+The first attempt said `not answering` in fifteen milliseconds. Not a lapsed deadline - the SDK reports a
+send that could not leave that way, and the driver logged nothing. The shell is spawned before the driver,
+so at spawn there was no cap to wire. `ns_abortable` handles exactly this for `net-stack` - on `Timeout`,
+reacquire by name, ask once more - and the request half of that pattern was copied without the reacquire
+half. The project's own notes had it written down already.
+
+### Bring-up once, scan many
+
+`scan::run` was split. `bring_up` sends the CLM blob, the event mask and the `UP` chain **once**, at boot -
+re-sending `clmload` to an interface that is already up would be wrong - and `scan_once` does the part that
+repeats. The boot self-test calls both; the serving loop calls only the second. A radio that never came up
+answers every `wifi list` with `radio down` at once, which is the rule above the rules: a dependency that
+cannot do the thing returns with a loud fact, never a hang.
+
+### What phase 3 leaves open, in one place
+
+- `security` prints `unknown` until the RSN/WPA information elements are parsed.
+- Rule 11: `q` does not yet stop the radio's sweep, because the driver cannot hear an abort while it is
+  inside `collect`. It needs to poll its endpoint between frames.
+- Glommed frames (channel 3) up to 3328 bytes now arrive and are dropped, as the reference drops them. The
+  log used to call them "an impossible shape"; it now says what they are.
+- The numbered picker the operator designed becomes live with `wifi connect`, which is phase 4.
