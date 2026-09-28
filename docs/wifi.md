@@ -1609,3 +1609,91 @@ already quotes and follows it. The difference is noted so the next reader knows 
 
 What is still not predicted is a working radio. A halted core that accepts 609 KB is not a radio; it is a
 loaded one.
+
+## 25. Phase 2 complete on hardware, and the difference between loaded and running
+
+The halt level was the whole fault. On the next boot every rung passed and the upload ran:
+
+```
+core wrapper 0x18102000 out of reset: RESETCTRL 0x00000000, IOCTRL 0x00000021
+  - CORE RUNNING, CPU HALTED - TCM is reachable
+  rung 1 ok (byte mode, 4 bytes) - and 0xa1a10001 read back
+  rung 2 ok (block mode, ONE 64-byte block, no MULTI) - and 0xb2b20002 read back
+  rung 3 ok (block mode, TWO 64-byte blocks, MULTI) - and 0xc3c30003 read back
+  rung 4 ok (block mode, SIXTEEN 64-byte blocks, MULTI) - and 0xd4d40004 read back
+firmware written - 609309 bytes to 0x198000 in 596 command(s)
+NVRAM 2074 bytes of text stripped to 1748 bytes (including the 4-byte token),
+  going to 0x25f92c..0x260000 - the token is the last word of RAM
+NVRAM written - 1748 bytes to 0x25f92c in 3 command(s)
+core wrapper 0x18102000 out of reset: RESETCTRL 0x00000000, IOCTRL 0x00000001
+  - CORE RUNNING, CPU EXECUTING
+```
+
+609,309 bytes in 596 commands in about 1.13 s. Every rung read its own marker back, so the data path is
+proven to carry 16 blocks of 64 rather than merely reporting that it did. The reset vector turned out **not**
+to be needed to bring the core out of reset, which the previous section had listed as a live possibility.
+
+### What that does not prove
+
+`RESETCTRL 0x00000000, IOCTRL 0x00000001` is a statement about the **reset controller**: the CPU is fetching.
+A CPU fetching garbage reports exactly the same thing. So "the ARM is running its firmware" was an assertion
+dressed as an observation, and on the strength of this project's own rules it should not have been written
+that way.
+
+The reference has a real test, and its comment is the entire idea:
+
+```c
+	/* NVRAM length at the end of memory should have been overwritten. */
+	shaddr = bus->ci->rambase + bus->ci->ramsize - 4;
+	rv = brcmf_sdiod_ramrw(bus->sdiodev, false, shaddr, (u8 *)&addr_le, 4);
+```
+
+The last word of RAM carries the NVRAM length token **the host wrote**, so the firmware can find and parse
+its calibration at boot. Having consumed it, the firmware **overwrites that word** with the address of its
+own SDPCM shared structure. So one read answers the question:
+
+- still our token, and the firmware never ran;
+- a plausible address inside TCM, and it booted - and that is where its structure lives.
+
+It lands exactly where this driver already writes. `rambase + ramsize - 4` is `0x198000 + 0xC8000 - 4` =
+`0x25FFFC`, and the NVRAM run `0x25f92c..0x260000` ends on that same word. Not a collision: the mechanism.
+
+**The check here is stronger than the reference's**, for once. brcmfmac cannot know which token the host
+wrote, so it uses a generic pattern test; this driver wrote it, so the comparison is exact - if the word
+still equals the value we put there, the firmware definitively has not touched it. The value is then
+range-checked inside TCM, and the shared structure's `flags` word is read and its version masked with
+`0x00FF` and compared against `0x0003`, which is what the reference validates.
+
+It also **retries where the reference does not**, and the reason is a limitation rather than a
+precaution: brcmfmac reaches this point late in a longer sequence, while here the read happens milliseconds
+after release, so a firmware still starting would be called dead. Twenty bounded attempts, 10 ms apart.
+
+And if the word never changes, that is reported as a **fact, not an error** - a loaded chip whose firmware
+did not start is precisely the state worth naming (§26.7), and the message says what to read next: the reset
+vector in `brcmf_sdio_buscore_activate`, which is now confirmed to be called before the ARM is restored and
+is still unimplemented here.
+
+### A log that contradicted itself
+
+`"phase 1 complete ... NO firmware is uploaded and no 802.11 exists yet"` printed **immediately after**
+`"PHASE 2 COMPLETE"`. The log contradicted itself by one line.
+
+That is the third time in this effort that the code moved on and the sentence did not - the earlier two were
+a `CHIPCLKCSR` guard that rejected a value its own prediction called healthy, and a `RUNNING` label applied
+to a halted core. The pattern is consistent enough to be worth naming as a hazard rather than three
+accidents: **a message that asserts a state, rather than reporting one it just read, goes stale silently.**
+The corrected line describes what it can see and explicitly declines to call a loaded chip a usable radio.
+
+### Prediction
+
+1. **The firmware is alive** - the last word changes from `0xFE4A01B5` to an address inside
+   `0x198000..0x260000`, and its `flags` word reports SDPCM version 1, 2 or 3. That closes phase 2 properly
+   and makes phase 3 (the control channel) the next work.
+2. **The word never changes**, and the firmware did not start despite loading cleanly. Then the reset vector
+   is the missing step, exactly as the failure message will say, and it is a small change: the image's first
+   four bytes written to backplane address 0 before the core is restored.
+3. **The word changes to something outside RAM.** Then something executed and went wrong early - a bad load
+   address or a corrupted image - and the next move is to read back a few words of the image at `0x198000`
+   and compare them against the blob, which the FNV machinery already makes cheap.
+
+No outcome here is a working radio. Even outcome 1 means the firmware booted and nothing has spoken to it.

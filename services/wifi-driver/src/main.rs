@@ -358,10 +358,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // ---- The honest end of phase 1 step 1. --------------------------------------------------------
     ctx.log(
-        "wifi-driver: phase 1 complete - the radio is on the bus, identified by BOTH its CIS and its \
-         own silicon, and its backplane is open. NO firmware is uploaded and no 802.11 exists yet - \
-         the chip runs no MAC until a host uploads one into it - so every request is answered \
-         `unavailable`",
+        // SAY WHAT IS TRUE AT THE POINT THIS PRINTS. This line used to assert "NO firmware is uploaded
+        // and no 802.11 exists yet" - and it printed immediately AFTER "PHASE 2 COMPLETE", so the log
+        // contradicted itself by one line. Third time in this effort that the code moved on and the
+        // sentence did not, which is why the sentence no longer claims a phase it cannot see.
+        "wifi-driver: the radio is on the bus, identified by BOTH its CIS and its own silicon, its \
+         backplane is open, and the stages above say how far the firmware got. There is no control \
+         channel to it yet, so every request is still answered `unavailable` - a loaded chip is not a \
+         usable radio, and this line does not pretend otherwise",
     );
     serve(&ctx)
 }

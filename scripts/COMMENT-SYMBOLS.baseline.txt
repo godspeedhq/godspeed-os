@@ -272,3 +272,5 @@ AI_RESETCTRL                       # BCMA/cyw43 SPEC register at wrapper offset 
 sdhci_transfer_pio                 # u-boot sdhci.c - the mover sdhci_transfer_data calls; cited because it moves ONE BLOCK per call with NO ready-bit re-check inside, which is the fault it fixed here - external, 26.14
 BUFFER_WRITE_ENABLE                # SDHCI SPEC present-state bit 10; this driver names it ST_BUF_WRITE_ENABLE - cited by its spec name where the measured STATUS word is decoded - external, 26.14
 TRANSFER_COMPLETE                  # SDHCI SPEC interrupt-status bit 1; this driver names it INT_DATA_DONE - cited by its spec name in the same decode - external, 26.14
+SDPCM_SHARED_VERSION               # Linux brcmfmac sdio.c - 0x0003, the newest SDPCM shared-structure layout it understands; this driver names the constant VERSION - external, 26.14
+SDPCM_SHARED_VERSION_MASK          # Linux brcmfmac sdio.c - 0x00FF, the version field inside the shared structure flags word; this driver names it VERSION_MASK - external, 26.14

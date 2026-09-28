@@ -247,6 +247,103 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
 ///
 /// It writes into the halted ARM's TCM at the firmware's own load address - where the bulk write is about
 /// to go anyway - so it needs no scratch region and costs nothing but the transfers themselves.
+/// Ask the chip whether its firmware BOOTED, rather than inferring it from the reset controller.
+///
+/// `RESETCTRL 0` says the CPU is fetching. A CPU fetching garbage says the same thing, so releasing the
+/// core is not evidence that firmware is running. The reference has a real test, and its comment is the
+/// whole idea:
+///
+/// ```c
+///	/* NVRAM length at the end of memory should have been overwritten. */
+///	shaddr = bus->ci->rambase + bus->ci->ramsize - 4;
+///	rv = brcmf_sdiod_ramrw(bus->sdiodev, false, shaddr, (u8 *)&addr_le, 4);
+/// ```
+///
+/// The last word of RAM carries the NVRAM length token the HOST wrote, so the firmware can find its
+/// calibration at boot. Having consumed it, the firmware **overwrites that word** with the address of its
+/// own SDPCM shared structure. So that one word answers the question: still our token means the firmware
+/// never ran; a plausible TCM address means it booted and that is where its structure lives.
+///
+/// This is a STRONGER check than the reference's. brcmfmac cannot know which token was written and uses a
+/// generic pattern test; we wrote it, so the comparison is exact.
+///
+/// It retries where the reference does not, and the reason is honest rather than defensive: brcmfmac
+/// reaches this point late in a longer sequence, while here it is milliseconds after release, so a
+/// firmware still starting would be called dead. If the word never changes that is REPORTED as a fact -
+/// a loaded chip whose firmware did not start is precisely the state worth naming (§26.7).
+fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &ServiceContext) -> bool {
+    /// `SDPCM_SHARED_VERSION_MASK`.
+    const VERSION_MASK: u32 = 0x0000_00FF;
+    /// `SDPCM_SHARED_VERSION` - the newest the reference understands.
+    const VERSION: u32 = 0x0003;
+    const TRIES: u32 = 20;
+
+    let shaddr = ram.base + ram.size - 4;
+    let mut last = token;
+    for attempt in 0..TRIES {
+        match w.read32(h, shaddr, ctx) {
+            Some(v) => {
+                last = v;
+                if v != token {
+                    // IN RANGE? A word that changed to something outside TCM is not a shared-structure
+                    // pointer, and saying "alive" on it would be worse than saying nothing.
+                    if v < ram.base || v >= ram.base + ram.size {
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: the last word of RAM changed from our token {:#010x} to \
+                             {:#010x}, which is OUTSIDE the chip's RAM ({:#08x}..{:#08x}) - so something \
+                             ran, but that is not a shared-structure address",
+                            token, v, ram.base, ram.base + ram.size
+                        ));
+                        return false;
+                    }
+                    let flags = w.read32(h, v, ctx);
+                    match flags {
+                        Some(f) => {
+                            let ver = f & VERSION_MASK;
+                            ctx.log_fmt(format_args!(
+                                "wifi-driver: THE FIRMWARE IS ALIVE - it overwrote our NVRAM token with \
+                                 {:#010x} after {} read(s), and its shared structure reports flags \
+                                 {:#010x} (SDPCM version {}, this driver understands up to {})",
+                                v, attempt + 1, f, ver, VERSION
+                            ));
+                            if ver > VERSION {
+                                ctx.log(
+                                    "wifi-driver: that version is NEWER than the layout this driver \
+                                     knows, so the structure's fields past `flags` are not safe to read",
+                                );
+                            }
+                            return true;
+                        }
+                        None => {
+                            ctx.log_fmt(format_args!(
+                                "wifi-driver: the firmware published a shared structure at {:#010x} but \
+                                 reading it failed, so whether it is alive is unknown",
+                                v
+                            ));
+                            return false;
+                        }
+                    }
+                }
+            }
+            None => {
+                ctx.log("wifi-driver: could not read the last word of RAM, so firmware liveness is \
+                         unknown");
+                return false;
+            }
+        }
+        ctx.sleep_ms(10);
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: the last word of RAM still holds OUR NVRAM token {:#010x} after {} reads over \
+         ~{} ms, so THE FIRMWARE HAS NOT RUN. The image and the NVRAM are in the chip and its CPU is out \
+         of reset, so what is missing is the reset vector - `brcmf_sdio_buscore_activate` writes the \
+         image's first four bytes to backplane address 0 before the core is restored, and this driver \
+         does not (see `aicore`)",
+        last, TRIES, TRIES * 10
+    ));
+    false
+}
+
 fn ladder(h: &Host, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
     // Distinct per rung, so a read-back cannot pass on a stale value another rung left behind.
     const MARKS: [u32; 4] = [0xA1A1_0001, 0xB2B2_0002, 0xC3C3_0003, 0xD4D4_0004];
@@ -389,6 +486,10 @@ pub fn run(
     if !write_bytes(h, w, nv_at, &nv[..len], "NVRAM", ctx) {
         return false;
     }
+    // KEEP THE TOKEN. It is the last four bytes just written, and it is the exact value the firmware is
+    // expected to overwrite - so comparing against it later is stronger evidence than the reference's
+    // generic pattern test, which cannot know what the host put there.
+    let token = u32::from_le_bytes([nv[len - 4], nv[len - 3], nv[len - 2], nv[len - 1]]);
 
     // 5. RELEASE. `halt = false`, so the CPU runs.
     ctx.log("wifi-driver: releasing the ARM");
@@ -400,9 +501,16 @@ pub fn run(
         );
         return false;
     }
-    ctx.log(
-        "wifi-driver: the ARM is running its firmware. There is no control channel yet, so nothing has \
-         asked it anything - that is the next step, not a result of this one",
-    );
+    // 6. ASK THE CHIP, rather than asserting from the reset controller. `RESETCTRL 0` means the CPU is
+    //    fetching; it does not mean the firmware booted, and a CPU fetching garbage reports the same
+    //    thing. The firmware overwrites the NVRAM token at the last word of RAM once it has consumed it,
+    //    so that word is the answer.
+    if !firmware_alive(h, w, ram, token, ctx) {
+        ctx.log(
+            "wifi-driver: the image and the NVRAM are in the chip and its CPU is out of reset, but \
+             nothing confirms the firmware is running - so this is NOT reported as a working radio",
+        );
+        return false;
+    }
     true
 }
