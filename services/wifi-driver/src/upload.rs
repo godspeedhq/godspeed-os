@@ -323,11 +323,26 @@ pub fn run(
     ram: &Ram,
     ctx: &ServiceContext,
 ) -> bool {
-    // 1. HALT, and refuse to continue if it does not confirm. A running core owns the memory the image goes
-    //    into, so writing anyway would be corrupting live state rather than loading firmware.
-    ctx.log("wifi-driver: halting the ARM before writing into its memory");
-    if !aicore::disable(h, w, arm_wrapper, true, ctx) {
-        ctx.log("wifi-driver: the ARM would not halt, so nothing is written");
+    // 1. HALT THE CPU, but leave the CORE OUT OF RESET - which is not the same thing, and getting it
+    //    wrong is why the first write into TCM never completed.
+    //
+    //    A running core owns the memory the image goes into, so its CPU must be stopped before anything
+    //    is written. But the TCM is INSIDE the core, so a core held in reset does not answer backplane
+    //    accesses to its own memory: the card accepts the command, the host FIFO drains, and the
+    //    transaction never completes. Measured exactly that way - `WRITE_RDY` and `BUFFER_WRITE_ENABLE`
+    //    both seen, the word written, and `TRANSFER_COMPLETE` never arriving.
+    //
+    //    `brcmf_chip_disable_arm` makes the distinction explicit, and it is the whole answer: a CM3 gets
+    //    `brcmf_chip_coredisable(core, 0, 0)` and stays in reset, while a CR4 gets
+    //    `brcmf_chip_resetcore(core, val, ARMCR4_BCMA_IOCTL_CPUHALT, ARMCR4_BCMA_IOCTL_CPUHALT)` - reset,
+    //    not disable, so the core ends up out of reset and clocked with the CPU held halted.
+    //
+    //    `aicore::reset(halt = true)` is that sequence; it was being called one level too low.
+    ctx.log("wifi-driver: bringing the ARM out of reset with its CPU HALTED - its TCM is only reachable \
+             when the core itself is running");
+    if !aicore::reset(h, w, arm_wrapper, true, ctx) {
+        ctx.log("wifi-driver: the ARM would not come out of reset with its CPU halted, so nothing is \
+                 written");
         return false;
     }
 

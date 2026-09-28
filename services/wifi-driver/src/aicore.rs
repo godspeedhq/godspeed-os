@@ -189,12 +189,20 @@ pub fn reset(
     // before anything waits on firmware that cannot be running.
     let rc = w.read32(h, wrapper + off::RESETCTRL, ctx);
     let up = matches!(rc, Some(v) if v & bit::AIRC_RESET == 0);
+    // SAY WHICH OF THE THREE STATES THIS IS, because "RUNNING" for a halted core is the kind of wrong
+    // label that costs a boot: out of reset with the CPU halted is the state the firmware is written in,
+    // and out of reset with the CPU going is the state it executes in. They are different milestones and
+    // the log has to tell them apart.
     ctx.log_fmt(format_args!(
         "wifi-driver: core wrapper {:#010x} out of reset: RESETCTRL {:#010x}, IOCTRL {:#010x} - {}",
         wrapper,
         rc.unwrap_or(0xFFFF_FFFF),
         final_ioctrl.unwrap_or(0xFFFF_FFFF),
-        if up { "RUNNING" } else { "STILL IN RESET" }
+        match (up, halt) {
+            (true, true) => "CORE RUNNING, CPU HALTED - TCM is reachable",
+            (true, false) => "CORE RUNNING, CPU EXECUTING",
+            (false, _) => "STILL IN RESET",
+        }
     ));
     up
 }

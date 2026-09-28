@@ -1519,3 +1519,93 @@ One of five outcomes, and each names its own cause:
 Whichever it is, the new `INT bits seen` / `STATUS bits seen` / `data phase active at poll` line should
 accompany it, and `dat=(0, 0)` versus a real window is the difference between a data phase that never
 started and one that started and stalled.
+
+## 24. A core in reset does not answer for its own memory
+
+The ladder failed on **rung 1** - byte mode, four bytes, the mode that had already worked - and in doing so
+answered a question nobody had asked yet:
+
+```
+CMD53 write of 1 word(s) to function 1 address 0x08000 failed - the data moved and the transfer
+  never reported complete (arg=0x95000004 BLKSIZECNT=0x00017004 CMDTM=0x353a0002 R5 flags 0x10)
+  during the wait: INT bits seen 0x00000010, STATUS bits seen 0x01ff0506, data phase active at
+  poll 1..1 (it did start)
+```
+
+`INT 0x00000010` is `WRITE_RDY`. `STATUS 0x0506` carries `BUFFER_WRITE_ENABLE` (bit 10),
+`WRITE_TRANSFER_ACTIVE` (bit 8), `DAT_ACTIVE` (bit 2) and `DAT_INHIBIT` (bit 1). So the data phase started,
+the FIFO was ready, the word went in, and `TRANSFER_COMPLETE` never arrived.
+
+**All three candidates the ladder was built to separate are eliminated at once** - block size, the `MULTI`
+bit and the block count are all irrelevant, because the failure reproduces in plain byte mode. A ladder
+built to choose between three hypotheses instead falsified all three, which is the most useful thing it
+could have done and is the argument for bisecting rather than fixing.
+
+### The one difference
+
+The same byte-mode write had succeeded minutes earlier, to `0x18102408` - the ARM's wrapper - confirmed by
+reading `RESETCTRL` back. The ladder wrote to `0x198000`, which is **TCM inside the ARM core**.
+
+The distinction that matters is not byte versus block. It is **wrapper versus core internals**, and the
+core was being held in reset.
+
+### The reference makes the distinction explicit
+
+`brcmf_chip_disable_arm` does not treat all ARM cores alike:
+
+```c
+	switch (id) {
+	case BCMA_CORE_ARM_CM3:
+		brcmf_chip_coredisable(core, 0, 0);
+		break;
+	case BCMA_CORE_ARM_CR4:
+	case BCMA_CORE_ARM_CA7:
+		cpu = container_of(core, struct brcmf_core_priv, pub);
+
+		/* clear all IOCTL bits except HALT bit */
+		val = chip->ops->read32(chip->ctx, cpu->wrapbase + BCMA_IOCTL);
+		val &= ARMCR4_BCMA_IOCTL_CPUHALT;
+		brcmf_chip_resetcore(core, val, ARMCR4_BCMA_IOCTL_CPUHALT,
+				     ARMCR4_BCMA_IOCTL_CPUHALT);
+		break;
+```
+
+A CM3 is **disabled** and stays in reset. A CR4 - which is what this chip has - is **reset**, which ends
+with the core out of reset and clocked, carrying `ARMCR4_BCMA_IOCTL_CPUHALT` (0x0020) as both the reset and
+post-reset `IOCTL` value so that the CPU is held halted while the core runs.
+
+**Halting the CPU and holding the core in reset are not the same thing**, and only the first makes the TCM
+reachable. A core in reset does not answer backplane accesses to its own memory: the card accepts the
+command, the host FIFO drains into the controller, and the backplane transaction never completes. Which is
+exactly, and only, what was measured.
+
+`aicore::reset(halt = true)` already implemented that sequence - quoted from the vendor driver and
+self-checked against `RESETCTRL` - and was simply being called one level too low. The change is **which
+function is called**, so the `unsafe` count, the syscall surface and the capability set are all untouched.
+
+The log was also lying about its own success: `aicore::reset` printed `RUNNING` for any core out of reset,
+halted or not. Out-of-reset-with-CPU-halted (the state firmware is written in) and out-of-reset-with-CPU-
+executing (the state it runs in) are different milestones, and a label that conflates them is the kind of
+thing that costs a boot. It now names all three states.
+
+**A divergence recorded rather than left silent (§26.14).** On *release*, Linux passes `postreset = 0` - an
+`IOCTL` of zero, with no `CLOCK_EN` - while the vendor's `reset_device_core` ends with `SICF_CLOCK_EN` set.
+This keeps the vendor sequence, because that driver is written for this exact chip family and `aicore.rs`
+already quotes and follows it. The difference is noted so the next reader knows it was a decision.
+
+### Prediction
+
+1. **The ladder passes all four rungs and the upload proceeds.** Most likely, because the failure was the
+   destination not answering rather than anything about the transfer, and that is now addressed for every
+   rung equally.
+2. **If a later rung fails**, the original three-way question is live again and rung 2, 3 or 4 names which
+   part, now against a destination that does answer.
+3. **If the upload completes, the release is the next thing that can fail** - and the reference has now
+   confirmed why. `brcmf_chip_cr4_set_active` calls `chip->ops->activate(chip->ctx, &chip->pub, rstvec)`
+   *before* restoring the ARM, and that is `brcmf_sdio_buscore_activate`, the reset-vector write that
+   `aicore.rs` records as unimplemented. So `STILL IN RESET` or a core that comes up and does nothing points
+   there, and it is no longer a maybe: it is a confirmed missing step held back deliberately so that this
+   boot tests one change.
+
+What is still not predicted is a working radio. A halted core that accepts 609 KB is not a radio; it is a
+loaded one.

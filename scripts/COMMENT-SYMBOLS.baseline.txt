@@ -270,3 +270,5 @@ SBSDIO_SB_OFT_ADDR_MASK            # Linux brcmfmac 0x07FFF, the window offset m
 AI_IOCTRL                          # BCMA/cyw43 SPEC register at wrapper offset 0x408; ours is off::IOCTRL - external, 26.14
 AI_RESETCTRL                       # BCMA/cyw43 SPEC register at wrapper offset 0x800; ours is off::RESETCTRL - external, 26.14
 sdhci_transfer_pio                 # u-boot sdhci.c - the mover sdhci_transfer_data calls; cited because it moves ONE BLOCK per call with NO ready-bit re-check inside, which is the fault it fixed here - external, 26.14
+BUFFER_WRITE_ENABLE                # SDHCI SPEC present-state bit 10; this driver names it ST_BUF_WRITE_ENABLE - cited by its spec name where the measured STATUS word is decoded - external, 26.14
+TRANSFER_COMPLETE                  # SDHCI SPEC interrupt-status bit 1; this driver names it INT_DATA_DONE - cited by its spec name in the same decode - external, 26.14
