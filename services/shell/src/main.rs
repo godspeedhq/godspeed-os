@@ -7379,7 +7379,20 @@ fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     const MAX_SECS: i64 = 20;
 
     out.line_fmt(ctx, format_args!("scanning  [q] quit"));
-    match ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&[OP_LIST]), MAX_SECS) {
+    // REACQUIRE ON A FAILED SEND, then ask once more - the same shape `ns_abortable` has for net-stack. The
+    // shell is spawned BEFORE the wifi driver, so at spawn there was no cap to wire and the first request
+    // has nowhere to go: the SDK reports that as an immediate Timeout (the send never left), not a lapsed
+    // deadline. Observed on hardware as "not answering" in 15 ms. The name directory resolves the driver
+    // that is running now; a driver that is genuinely dead fails the reacquire and the loud sentence
+    // below stays true.
+    let first = ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&[OP_LIST]), MAX_SECS);
+    let outcome = match first {
+        ReqOutcome::Timeout if ctx.reacquire_by_name(WIFI_DRIVER) => {
+            ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&[OP_LIST]), MAX_SECS)
+        }
+        other => other,
+    };
+    match outcome {
         ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
             match p.first().copied() {
