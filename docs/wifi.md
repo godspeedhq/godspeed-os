@@ -2380,3 +2380,85 @@ output, and a console flood jams the queue the shell reads from.
 
 In all three cases the next change is determined by the output rather than chosen from a list, which is the
 only thing that has reliably worked here.
+
+## 33. The firmware was answering all along, and saying exactly what was wrong
+
+With the header fields finally printed, the frame explains itself completely:
+
+```
+frame 3: channel 0x00 (CONTROL), frmlen 28, dataoff 12, seq 2, nextlen 0
+  -> 16 byte(s) of body, payload at +0 for 16 byte(s)
+  read as BCDC: cmd 1601336675 len 0 flags 0x64640001 status 0xffffffe8 -> id 25700, error true
+  [00] 63 75 72 5f 00 00 00 00
+  [08] 01 00 64 64 e8 ff ff ff
+```
+
+`frmlen 28` is 12 + 16: a bare BCDC header with `len 0` and no payload, which is what a **rejection** looks
+like. And its contents are this driver's own request payload, parsed as a header:
+
+| the firmware read | from my bytes | what came back | observed |
+|---|---|---|---|
+| `cmd` | `"cur_"` | echoed verbatim | `63 75 72 5f` |
+| `len` | `"ethe"` | zeroed | `00 00 00 00` |
+| `flags` | `"radd"` | upper half kept, ERROR set | `01 00 64 64` |
+| `status` | - | its own error code | `e8 ff ff ff` = **-24** |
+
+`flags = 0x64640001` is exactly `(0x6464 << 16) | BCDC_DCMD_ERROR`, and `0x6464` is the ASCII `dd` from
+`cur_ether`**`add`**`r`. **The "id 25700" that looked like nonsense for three boots was two letters of the
+iovar name sitting in the request-id field.**
+
+### The cause: one byte, and the reference had already said so
+
+`swhdr.dataoff` says where the **protocol data** begins - the BCDC header, immediately after the SDIO
+hardware and software headers:
+
+```c
+swhdr->dataoff = sizeof(*hwhdr) + sizeof(*swhdr);
+```
+
+4 + 8 = **12**. This driver wrote `PAYLOAD_AT`, which is 28 - past the BCDC header, at the iovar name. So the
+firmware skipped the real header and read `"cur_etheraddr\0"` as one, found `"cur_"` where a command number
+belongs, and rejected it.
+
+The receive side was **right the whole time** (`off = dataoff - 12`, matching the reference exactly), which is
+why the earlier boots kept clearing this code: nothing was wrong except one transmitted byte.
+
+### The part worth keeping: a correct quote next to contradicting code reads as verification
+
+That exact line from the reference was **already in this module's documentation**, quoted correctly. And the
+comment beside the write said `dataoff` "points past all three headers, **as the reference sets it**". It
+points past two.
+
+So the reference was found, read, transcribed accurately into the doc comment, and then implemented as its
+opposite - with a citation attached that made the wrong value look checked. That is worse than not having
+read it at all, because every subsequent pass over this code saw an authority for the mistake. Three boots
+went into hypotheses about the *receive* path while the transmit value sat there with a footnote.
+
+The guard is structural rather than a resolution to be careful: `DATA_OFF` is now its own named constant with
+the reference quoted on it and the trap written down, and both call sites use it - `set_iovar` had the same
+bug because it was written by copying `query_iovar`. The duplicate-constant gate would have caught two
+literals; it cannot catch one constant used for two different meanings, which is what `PAYLOAD_AT` had become.
+
+### What found it
+
+Not reasoning - the instrument. Printing `frmlen`, `dataoff`, `seq` and `nextlen`, which the driver had been
+sending and receiving all along and never showing. Four boots of permuting byte alignments produced four
+wrong answers; one boot of printing the header produced a complete account of all sixteen bytes.
+
+Also eliminated by this boot, cleanly: the settling gap and the data timeout from §32 changed nothing (byte
+for byte identical output), so they are not this bug. They stay, because they are requirements of the
+controller that this driver was ignoring.
+
+### Prediction
+
+1. **`THE RADIO ANSWERED - its MAC address is xx:xx:xx:xx:xx:xx`**, with an even first byte and plausibly a
+   Raspberry Pi OUI. Every byte of the failure is now explained, which is the strongest position any fix in
+   this effort has started from.
+2. **A different error status.** Then the frame reaches the parser correctly and the firmware objects to
+   something else - the `len` field's meaning (lower 16 is the output buffer length), or the interface index.
+   The status code will say, and this time the decode will be trustworthy because the header is in the right
+   place.
+3. **No reply at all**, which would be a surprise now, and would mean the rejection was the only thing the
+   firmware ever intended to send.
+
+If outcome 1 lands, stage 14 runs immediately after and phase 3 gets its first test.

@@ -113,8 +113,30 @@ const HWHDR: usize = 4;
 const SWHDR: usize = 8;
 /// `sizeof(struct brcmf_proto_bcdc_dcmd)`.
 const DCMD: usize = 16;
-/// Where the payload starts, which is also what `swhdr.dataoff` is set to.
+/// Where the iovar payload starts within a frame: past all three headers.
+///
+/// **This is NOT `swhdr.dataoff`.** It was used as both, and that was the bug - see `DATA_OFF`.
 const PAYLOAD_AT: usize = HWHDR + SWHDR + DCMD;
+
+/// What goes in `swhdr.dataoff`: where the PROTOCOL DATA begins, which is the BCDC header.
+///
+/// ```c
+/// swhdr->dataoff = sizeof(*hwhdr) + sizeof(*swhdr);
+/// ```
+///
+/// 4 + 8 = 12. It points **at** the BCDC header, immediately after the SDIO hardware and software headers -
+/// not past it at the payload.
+///
+/// **This driver wrote `PAYLOAD_AT` (28) here for three boots.** The firmware therefore skipped the real
+/// BCDC header and read the iovar name as one: it parsed `cmd` from `"cur_"`, kept `"dd"` from
+/// `cur_ether`**`add`**`r` in the id field, set the error bit and returned -24. Every byte of that reply was
+/// this driver's own payload coming back with a complaint attached.
+///
+/// The quote above was already in this module's documentation, and the comment beside the write claimed it
+/// "points past all three headers, as the reference sets it". It points past two. A correct citation sitting
+/// beside code that contradicts it reads as verification, which is why this constant exists: one name, one
+/// value, and the two call sites cannot disagree.
+const DATA_OFF: usize = HWHDR + SWHDR;
 
 /// `BWFM_SDIO_SWHDR_CHANNEL_CONTROL`.
 const CHANNEL_CONTROL: u8 = 0x00;
@@ -190,11 +212,14 @@ fn query_iovar(
     frame[0..2].copy_from_slice(&(len as u16).to_le_bytes());
     frame[2..4].copy_from_slice(&(!(len as u16)).to_le_bytes());
 
-    // ---- Software header. `dataoff` points past all three headers, as the reference sets it. ----
+    // ---- Software header. `dataoff` points AT the BCDC header - past the SDIO headers and no
+    // further - which is what `sizeof(*hwhdr) + sizeof(*swhdr)` means. This comment used to say
+    // "past all three headers" and cite the reference for it, while the reference says two. ----
     frame[4] = *seq;
     frame[5] = CHANNEL_CONTROL;
     frame[6] = 0; // nextlen: a hint, and zero means "no hint"
-    frame[7] = PAYLOAD_AT as u8;
+    // `dataoff` points AT the BCDC header, not past it. See `DATA_OFF`.
+    frame[7] = DATA_OFF as u8;
     // flowctl, maxseqnr and res0 stay zero - they are the CHIP's fields on receive, not the host's on send.
 
     // ---- BCDC command header. ----
@@ -565,7 +590,8 @@ pub fn set_iovar(
     frame[2..4].copy_from_slice(&(!(len as u16)).to_le_bytes());
     frame[4] = 0;
     frame[5] = CHANNEL_CONTROL;
-    frame[7] = PAYLOAD_AT as u8;
+    // `dataoff` points AT the BCDC header, not past it. See `DATA_OFF`.
+    frame[7] = DATA_OFF as u8;
     let flags = ((reqid as u32) << DCMD_ID_SHIFT) | DCMD_SET;
     frame[HWHDR + SWHDR..HWHDR + SWHDR + 4].copy_from_slice(&SET_VAR.to_le_bytes());
     frame[HWHDR + SWHDR + 4..HWHDR + SWHDR + 8].copy_from_slice(&(payload as u32).to_le_bytes());
