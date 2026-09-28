@@ -2240,3 +2240,74 @@ unprompted. **A `datalen` consistent with the frame length is the self-check** -
 The credential path for phase 4 is still open, and it is the one decision that is genuinely the operator's
 rather than mine - §6 has the question. Nothing in phase 3 touches a secret, which is exactly why §7 put a
 scan before association.
+
+## 31. The chip answered and the driver threw it away
+
+Stage 13 sent its request and reported neither success nor failure at first glance. It did report, and the
+line is the whole finding:
+
+```
+asking the firmware for `cur_etheraddr` - 42 byte frame padded to 44, seq 0, request id 1
+the reply header validated but describes an impossible frame - frmlen 12, dataoff 12 (headers are 4+8, buffer is 512)
+```
+
+**`frmlen 12, dataoff 12` is not impossible. It is a header-only frame**, exactly `HWHDR + SWHDR`, with the
+payload starting where the frame ends - which is what the chip sends for flow control. Its checksum
+validated, so it was a genuine frame, arriving **32 ms after the request**. The chip was talking to us and
+the driver called its first word nonsense.
+
+### The bug is a duplicate, and that is the part worth keeping
+
+`read_frame` handles this case, explicitly, with a comment saying why:
+
+```rust
+    if rest == 0 {
+        // A header-only frame is legitimate - the chip uses them for flow control - and carries no payload.
+        return Some((chanflag, 0));
+    }
+```
+
+`query_iovar` was written **first**, hand-rolls the same header read and the same two-step body read, and
+never learned it. Two readers of one wire, one of them out of date.
+
+That is the failure the duplicate-constant gate exists to prevent, one level up. It caught `DATA_FUNC`
+declared twice and `TRIES` meaning two things, and both catches improved the code - but it watches
+**constants**, and nothing in the enforcement layer watches duplicated **logic**. This bug lived in exactly
+that blind spot, and it is worth recording as a blind spot rather than as one mistake: the gate's own
+principle (one fact, one place) was being violated by a whole function while the gate reported green.
+
+The fix is subtraction. `query_iovar` calls `read_frame`. One parser, less code, and the next thing learned
+about the wire cannot be learned by only half the driver. `set_iovar` and `scan::collect` were both written
+later and already use it, so `query_iovar` was the only offender - which is itself the tell: the oldest copy
+is the one that rots.
+
+### The loop shape was wrong independently of that
+
+Worth separating, because fixing only the header-only case would have left this. The retry loop broke out of
+the wait on the **first** checksum-valid header and judged it afterwards, so **any** frame that was not the
+reply ended the exchange - an event, a flow-control frame, or another exchange's late answer would all have
+done it.
+
+A frame that is not the reply is now **skipped and the wait continues**, and the three reasons are counted
+separately. On timeout the message says how many frames arrived and why each was passed over, because
+"nothing answered" and "forty frames arrived and none matched" are different failures that were previously
+indistinguishable.
+
+Note the id mismatch also became a skip rather than a failure. That is deliberate: id matching exists to stop
+a protocol going one reply out of step, and a stale reply arriving late is precisely the case it guards
+against - so discarding it and waiting is the point, not an error.
+
+### Prediction
+
+1. **The radio answers** - `THE RADIO ANSWERED - its MAC address is ...`, probably preceded by
+   `the reply arrived after N other frame(s)` naming the flow-control frames skipped on the way. Then stage
+   14 runs and phase 3's own three outcomes apply (§30.6).
+2. **`no reply ... N frame(s) DID arrive`** - the wire works, frames flow, and none is a BCDC reply to this
+   request. That points at the request rather than the transport, and the counts say which way: frames that
+   are all header-only means the firmware never produced an answer, while frames on another channel means it
+   is answering somewhere this is not looking.
+3. **No frames at all** - then the 32 ms frame in this boot's log was the last thing the chip had to say, and
+   the question is what changed between reading it and not.
+
+What is no longer possible is the outcome that actually happened: a real frame being called impossible and
+ending the exchange.

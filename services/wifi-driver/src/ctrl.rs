@@ -238,112 +238,77 @@ fn query_iovar(
     }
     *seq = seq.wrapping_add(1);
 
-    // ---- The reply. -------------------------------------------------------------------------------
-    // WAIT FOR IT BY VALIDATING IT, not by assuming it is there. The hardware header validates itself
-    // (`frmlen ^ cksum == 0xFFFF`), which is exactly how the reference tells a frame from nothing, so a
-    // read that does not validate means the firmware has not answered yet.
+    // ---- The reply, read with the ONE frame reader. ----------------------------------------------
+    // This used to hand-roll the header read and the two-step body read, and the copy went stale: it
+    // rejected `frmlen 12, dataoff 12` as "impossible" when that is a legitimate HEADER-ONLY frame the chip
+    // uses for flow control - which `read_frame` has always handled. Observed on hardware, and the reply
+    // was probably one poll later. One parser now, so it cannot happen in one of two places.
+    //
+    // The loop shape was also wrong independently of that: it broke out on the FIRST checksum-valid header
+    // and judged it afterwards, so any frame that was not the reply ended the exchange. A frame that is not
+    // the reply is SKIPPED and the wait continues.
     const REPLY_TRIES: u32 = 200;
-    let mut hdr = [0u32; (HWHDR + SWHDR) / 4];
-    let mut frmlen = 0usize;
-    let mut dataoff = 0usize;
-    let mut got = false;
+    let mut rbuf = [0u8; FRAME];
+    let mut frames = 0u32;
+    let mut headers_only = 0u32;
+    let mut other_channel = 0u32;
+    let mut wrong_id = 0u32;
+
     for _ in 0..REPLY_TRIES {
-        if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
-            return None;
+        match read_frame(h, w, &mut rbuf, ctx) {
+            Some((chanflag, len)) => {
+                frames += 1;
+                if chanflag & 0x0F != CHANNEL_CONTROL {
+                    // An event or a data frame. Not this exchange's business.
+                    other_channel += 1;
+                    continue;
+                }
+                if len < DCMD {
+                    // Header-only, or too short to carry a BCDC header. Flow control, not an answer.
+                    headers_only += 1;
+                    continue;
+                }
+                let rflags = u32::from_le_bytes([rbuf[8], rbuf[9], rbuf[10], rbuf[11]]);
+                let status = u32::from_le_bytes([rbuf[12], rbuf[13], rbuf[14], rbuf[15]]);
+                let rid = ((rflags & DCMD_ID_MASK) >> DCMD_ID_SHIFT) as u16;
+                if rid != reqid {
+                    // ANOTHER EXCHANGE'S ANSWER. Skipped rather than parsed, and skipped rather than
+                    // treated as fatal: matching ids is what stops a protocol going one reply out of step,
+                    // and a stale reply arriving late is exactly what that guards against.
+                    wrong_id += 1;
+                    continue;
+                }
+                if rflags & DCMD_ERROR != 0 {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: the firmware REFUSED the request - BCDC error flag set, status \
+                         {:#010x} ({})",
+                        status, status as i32
+                    ));
+                    return None;
+                }
+                // The payload follows the 16-byte BCDC header. `read_frame` has already applied `dataoff`.
+                let avail = len - DCMD;
+                let n = core::cmp::min(avail, out.len());
+                out[..n].copy_from_slice(&rbuf[DCMD..DCMD + n]);
+                if frames > 1 {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver:   the reply arrived after {} other frame(s) - {} header-only, {} on \
+                         another channel, {} from another exchange",
+                        frames - 1, headers_only, other_channel, wrong_id
+                    ));
+                }
+                return Some(n);
+            }
+            None => ctx.sleep_ms(1),
         }
-        if !sdio::read_extended(
-            h,
-            DATA_FUNC,
-            frame_offset(),
-            &mut hdr,
-            blk_byte_mode((HWHDR + SWHDR) as u32),
-            None,
-            ctx,
-        ) {
-            return None;
-        }
-        let b0 = hdr[0].to_le_bytes();
-        let b1 = hdr[1].to_le_bytes();
-        let fl = u16::from_le_bytes([b0[0], b0[1]]);
-        let ck = u16::from_le_bytes([b0[2], b0[3]]);
-        if fl != 0 && (fl ^ ck) == 0xFFFF {
-            frmlen = fl as usize;
-            dataoff = b1[3] as usize;
-            got = true;
-            break;
-        }
-        ctx.sleep_ms(1);
     }
-    if !got {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: no valid reply frame after {} reads over ~{} ms - the hardware header never \
-             satisfied `frmlen ^ cksum == 0xFFFF`, which is how a real frame is told from an empty FIFO. \
-             The request was accepted by the bus; the firmware did not answer it",
-            REPLY_TRIES, REPLY_TRIES
-        ));
-        return None;
-    }
-    if frmlen < PAYLOAD_AT || frmlen > FRAME || dataoff < HWHDR + SWHDR || dataoff > frmlen {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: the reply header validated but describes an impossible frame - frmlen {}, \
-             dataoff {} (headers are {}+{}, buffer is {})",
-            frmlen, dataoff, HWHDR, SWHDR, FRAME
-        ));
-        return None;
-    }
-
-    // The rest of the frame. The header read already consumed the first twelve bytes, which is the
-    // reference's own two-step shape.
-    let rest = frmlen - (HWHDR + SWHDR);
-    let rest_words = (rest + 3) / 4;
-    let mut rbuf = [0u32; FRAME / 4];
-    if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
-        return None;
-    }
-    if !sdio::read_extended(
-        h,
-        DATA_FUNC,
-        frame_offset(),
-        &mut rbuf[..rest_words],
-        blk_byte_mode((rest_words * 4) as u32),
-        None,
-        ctx,
-    ) {
-        return None;
-    }
-    let mut body = [0u8; FRAME];
-    for i in 0..rest_words {
-        body[i * 4..i * 4 + 4].copy_from_slice(&rbuf[i].to_le_bytes());
-    }
-
-    // The BCDC header sits at the start of what follows the software header.
-    let rflags = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-    let status = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
-    let rid = ((rflags & DCMD_ID_MASK) >> DCMD_ID_SHIFT) as u16;
-    if rid != reqid {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: the reply's request id is {} but {} was asked - this is another exchange's \
-             answer, so it is DISCARDED rather than parsed. Matching ids is what stops a protocol \
-             silently going a reply out of step",
-            rid, reqid
-        ));
-        return None;
-    }
-    if rflags & DCMD_ERROR != 0 {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: the firmware REFUSED the request - BCDC error flag set, status {:#010x} ({})",
-            status, status as i32
-        ));
-        return None;
-    }
-
-    // `dataoff` is relative to the whole frame; the payload is that far in, minus what the header read
-    // already took.
-    let off = dataoff - (HWHDR + SWHDR);
-    let avail = rest.saturating_sub(off);
-    let n = core::cmp::min(avail, out.len());
-    out[..n].copy_from_slice(&body[off..off + n]);
-    Some(n)
+    ctx.log_fmt(format_args!(
+        "wifi-driver: no reply to `{}` across {} reads. {} frame(s) DID arrive: {} header-only (flow \
+         control), {} on another channel, {} from another exchange - so \"nothing answered\" and \"nothing \
+         MATCHED\" are told apart here rather than left to guess",
+        name, REPLY_TRIES, frames, headers_only, other_channel, wrong_id
+    ));
+    None
 }
 
 /// Read one frame off function 2, whatever channel it is on.
