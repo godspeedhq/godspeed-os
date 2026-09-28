@@ -40,12 +40,14 @@
 #![no_std]
 #![no_main]
 
+mod aicore;
 mod armcr4;
 mod backplane;
 mod firmware;
 mod erom;
 mod host;
 mod sdio;
+mod upload;
 
 use godspeed_sdk::{Message, ServiceContext};
 
@@ -313,6 +315,34 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // that 600 KB does not fit is the wrong time.
                         ctx.log("wifi-driver: stage 10 - the firmware this build carries");
                         firmware::report(ram.size, ram.base, &ctx);
+
+                        // ---- Stage 11: halt, write, release. --------------------------------------
+                        // GUARDED, not attempted. The upload needs the ARM's WRAPPER as well as the RAM
+                        // it just sized, and `wrapper()` is `None` only for a core with no register base
+                        // at all. Without it there is no address to halt the core through, and writing
+                        // into the memory of a RUNNING core is worse than not trying - which is also why
+                        // `upload::run` halts first and refuses to continue unless the halt confirms.
+                        match arm.wrapper() {
+                            Some(wrap) => {
+                                ctx.log("wifi-driver: stage 11 - uploading the firmware");
+                                if upload::run(&h, &mut window, wrap, &ram, &ctx) {
+                                    ctx.log(
+                                        "wifi-driver: PHASE 2 COMPLETE - firmware and NVRAM are in the \
+                                         chip and its processor is running them",
+                                    );
+                                } else {
+                                    ctx.log(
+                                        "wifi-driver: the upload did not complete. Everything through \
+                                         stage 10 stands, and the last line above says which step \
+                                         stopped it",
+                                    );
+                                }
+                            }
+                            None => ctx.log(
+                                "wifi-driver: the ARM core has no register base, so no wrapper can be \
+                                 derived and it cannot be halted - the upload is not attempted",
+                            ),
+                        }
                     }
                     None => ctx.log("wifi-driver: the ARM core memory could not be sized, so the upload has no destination yet"),
                 },

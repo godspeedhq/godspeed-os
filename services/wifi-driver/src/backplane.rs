@@ -296,6 +296,16 @@ impl Window {
         sdio::read32(h, 1, (addr & OFFSET_MASK) | ACCESS_WIDE, ctx)
     }
 
+    /// Point the window at `addr` WITHOUT performing an access.
+    ///
+    /// The bulk path sets the window once per 32 KiB chunk and then issues its own transfer, which is what
+    /// `brcmf_sdiod_ramrw` and `cyw43_download_resource` both do. `set` is private because the window is an
+    /// implementation detail of a read or a write; this is the one caller that legitimately needs it on its
+    /// own, and it says so by name.
+    pub fn set_for(&mut self, h: &Host, addr: u32, ctx: &ServiceContext) -> bool {
+        self.set(h, addr, ctx)
+    }
+
     /// Write one 32-bit backplane register.
     ///
     /// Same window discipline as the read, and the same wide-access flag: the bridge is being asked for a

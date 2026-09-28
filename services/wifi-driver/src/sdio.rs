@@ -72,9 +72,13 @@ const CMD_IO_RW_DIRECT: u32 = 0x3402_0000; // CMD52 -> R5
 /// from there and came up short. The two differ in exactly two ways - the index and the block size - and
 /// that made this the only bit worth suspecting.
 const CMD_IO_RW_EXTENDED_READ: u32 = 0x353A_0012;
-/// CMD53, write: the same command flags (the data-present bit is set either way) without the direction
-/// bit in the transfer mode. Used by `write32`.
+/// CMD53, write, SINGLE block or byte mode: command flags `0x3A`, transfer mode `BLK_CNT_EN` only.
 const CMD_IO_RW_EXTENDED_WRITE: u32 = 0x353A_0002;
+/// CMD53, write, MULTI-block: as above plus `TM_MULTI_BLOCK` (bit 5).
+///
+/// `sdhci_set_transfer_mode` adds `SDHCI_TRNS_MULTI` alongside `BLK_CNT_EN` whenever `data->blocks > 1`, so
+/// a multi-block transfer that omits it is asking the controller for a single block and handing it many.
+const CMD_IO_RW_EXTENDED_WRITE_MULTI: u32 = 0x353A_0022;
 
 // THE OTHER COMMANDS ARE LEFT ALONE, DELIBERATELY. Their R5/R6/R1b responses carry a CRC7 and an index
 // too, so by the same reading their check bits should be on as well - `0x341A_0000` for CMD52,
@@ -407,7 +411,7 @@ pub fn write32(h: &Host, func: u8, addr: u32, val: u32, ctx: &ServiceContext) ->
     // bytes.
     let arg = (1 << 31) | ((func as u32 & 0x7) << 28) | (1 << 26) | ((addr & 0x1_FFFF) << 9) | 4;
     let mut word = [val];
-    if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_WRITE, arg, &mut word, false) {
+    if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_WRITE, arg, crate::host::blk_byte_mode(4), &mut word, false) {
         let resp = h.last_resp();
         ctx.log_fmt(format_args!(
             "wifi-driver: CMD53 write of {:#010x} to function {} address {:#07x} failed - {} \
@@ -426,6 +430,49 @@ pub fn write32(h: &Host, func: u8, addr: u32, val: u32, ctx: &ServiceContext) ->
         return None;
     }
     Some(())
+}
+
+/// One CMD53 carrying many words - the general form of which `write32` is the four-byte case.
+///
+/// `blocks` chooses the mode: `Some(n)` is a multi-BLOCK transfer of `n` blocks, `None` is byte mode with
+/// the length in the count field. That distinction is the argument's bit 27 and the transfer mode's
+/// `TM_MULTI_BLOCK`, and both are set from this one parameter so a caller cannot set one and forget the
+/// other - the class of mistake this driver has already paid for twice.
+///
+/// `blk` is the `BLKSIZECNT` word, from `blk_block_mode` or `blk_byte_mode`.
+pub fn write_extended(
+    h: &Host,
+    func: u8,
+    addr: u32,
+    words: &mut [u32],
+    blk: u32,
+    blocks: Option<u32>,
+    ctx: &ServiceContext,
+) -> bool {
+    // Argument: bit31 write, bits30:28 function, bit27 BLOCK mode, bit26 incrementing address,
+    // bits25:9 address, bits8:0 the count - BLOCKS in block mode, BYTES in byte mode.
+    let (block_bit, count, code) = match blocks {
+        Some(n) => (1u32 << 27, n, CMD_IO_RW_EXTENDED_WRITE_MULTI),
+        None => (0, (words.len() * 4) as u32, CMD_IO_RW_EXTENDED_WRITE),
+    };
+    let arg = (1 << 31)
+        | ((func as u32 & 0x7) << 28)
+        | block_bit
+        | (1 << 26)
+        | ((addr & 0x1_FFFF) << 9)
+        | (count & 0x1FF);
+    if let Err(phase) = h.cmd_data(code, arg, blk, words, false) {
+        let resp = h.last_resp();
+        let (rb, cmdtm) = h.last_setup();
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CMD53 write of {} word(s) to function {} address {:#07x} failed - {} \
+             (arg={:#010x} BLKSIZECNT={:#010x} CMDTM={:#010x} R5 flags {:#04x} STATUS={:#010x})",
+            words.len(), func, addr, phase, arg, rb, cmdtm, (resp >> 8) & 0xFF, h.status()
+        ));
+        abort(h, func, ctx);
+        return false;
+    }
+    true
 }
 
 /// Tell the card to abandon a transfer on `func` - CCCR `IO_ABORT`, written to function 0.
@@ -478,7 +525,7 @@ pub fn read32(h: &Host, func: u8, addr: u32, ctx: &ServiceContext) -> Option<u32
     // THE PHASE IS THE DIAGNOSIS, and STATUS is printed beside INTERRUPT. `INT=0` alone narrowed
     // nothing: `CMD_DONE` is cleared once the command lands, so zero is what a healthy command looks
     // like while the FIFO is awaited. The sentence now says which of the four waits expired.
-    if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, &mut word, true) {
+    if let Err(phase) = h.cmd_data(CMD_IO_RW_EXTENDED_READ, arg, crate::host::blk_byte_mode(4), &mut word, true) {
         let resp = h.last_resp();
         let (blk, cmdtm) = h.last_setup();
         ctx.log_fmt(format_args!(

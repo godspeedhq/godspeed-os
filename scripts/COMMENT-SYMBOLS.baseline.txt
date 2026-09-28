@@ -243,3 +243,29 @@ ARMCR4_CAP                         # ARM CR4 core register 0x04 (bank counts) - 
 ARMCR4_BANKIDX                     # ARM CR4 core register 0x40 (selects the bank BANKINFO describes) - external
 ARMCR4_BANKINFO                    # ARM CR4 core register 0x44 (the selected bank size and flags) - external
 BRCM_CC_4345_CHIP_ID               # Linux brcm80211 chip-id constant (0x4345); cited beside our literal so the table entry is traceable to its source line - external, 26.14
+cyw43_download_resource            # cyw43-driver (vendor) - the chunked firmware write services/wifi-driver/src/upload.rs follows, including setting the backplane window per chunk - external, 26.14
+cyw43_set_backplane_window         # cyw43-driver (vendor) - the per-chunk window set, the vendor twin of brcmf_sdiod_set_backplane_window
+cyw43_write_backplane              # cyw43-driver (vendor) - its backplane write, cited where the NVRAM length token is placed
+reset_device_core                  # cyw43-driver (vendor) - the core halt/release sequence services/wifi-driver/src/aicore.rs reimplements - external, 26.14
+disable_device_core                # cyw43-driver (vendor) - the half of that sequence which puts a core INTO reset and checks it got there
+device_core_is_up                  # cyw43-driver (vendor) - the post-condition after release, which aicore::reset checks rather than assuming
+in_reset_configure                 # Linux brcmf_chip_ai_coredisable LABEL - cited because the already-in-reset path still configures IOCTRL, which is easy to skip
+is_nvram_char                      # Linux brcmf_fw_nvram_strip helper - defines which characters survive the NVRAM transform - external, 26.14
+brcmf_fw_nvram_strip               # Linux brcmfmac firmware.c - the NVRAM transform (comments out, entries NUL-terminated, padded, token appended) that upload::nvram_prepare reimplements
+brcmf_sdio_download_nvram          # Linux brcmfmac - gives the NVRAM address as rambase + ramsize - varsz, i.e. the top of RAM
+AI_IOCTRL_OFFSET                   # cyw43-driver name for wrapper offset 0x408 (BCMA_IOCTL) - external
+AI_RESETCTRL_OFFSET                # cyw43-driver name for wrapper offset 0x800 (BCMA_RESET_CTL) - external
+SICF_CLOCK_EN                      # cyw43-driver AI_IOCTRL bit 0x01 - external
+SICF_FGC                           # cyw43-driver AI_IOCTRL bit 0x02, force gated clock - external
+SICF_CPUHALT                       # cyw43-driver AI_IOCTRL bit 0x20, hold the CPU halted - external
+CYW43_RAM_SIZE                     # cyw43-driver constant, cited where the NVRAM top-of-RAM placement is quoted
+CYW43_BUS_MAX_BLOCK_SIZE           # cyw43-driver chunk size for a resource download - external
+SDIO_FUNC1_BLOCKSIZE               # Linux brcmfmac constant 64, function 1 block size - external
+TM_MULTI_BLOCK                     # SDHCI SPEC transfer-mode bit 5; cited beside the multi-block command word
+SDHCI_TRNS_MULTI                   # SDHCI SPEC transfer-mode bit; sdhci_set_transfer_mode adds it whenever data->blocks > 1 - external, 26.14
+brcmf_sdiod_ramrw                  # Linux brcmfmac - the chunked backplane transfer; chunks by the 32 KiB window and sets it once per chunk
+BLK_CNT_EN                         # SDHCI SPEC transfer-mode bit 1 (short for SDHCI_TRNS_BLK_CNT_EN), cited beside TM_MULTI_BLOCK
+SBSDIO_SB_OFT_ADDR_LIMIT           # Linux brcmfmac chunk bound, the 32 KiB backplane window; ours is WINDOW in upload.rs - external, 26.14
+SBSDIO_SB_OFT_ADDR_MASK            # Linux brcmfmac 0x07FFF, the window offset mask; ours is OFFSET_MASK in backplane.rs - external, 26.14
+AI_IOCTRL                          # BCMA/cyw43 SPEC register at wrapper offset 0x408; ours is off::IOCTRL - external, 26.14
+AI_RESETCTRL                       # BCMA/cyw43 SPEC register at wrapper offset 0x800; ours is off::RESETCTRL - external, 26.14

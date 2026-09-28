@@ -110,6 +110,28 @@ const C1_SRST_HC: u32 = 1 << 24;
 const C1_SRST_CMD: u32 = 1 << 25;
 const C1_SRST_DATA: u32 = 1 << 26;
 
+/// The SDMA buffer-boundary field both references put in the block-size register.
+///
+/// Linux writes `SDHCI_MAKE_BLKSZ(host->sdma_boundary, blksz)` and u-boot
+/// `SDHCI_MAKE_BLKSZ(SDHCI_DEFAULT_BOUNDARY_ARG, blocksize)`, both giving 7 in bits 12-14. Irrelevant to a
+/// PIO transfer that cannot reach a boundary, and written because being the only one of three
+/// implementations that puts something different there is not a position worth defending.
+const BLK_BOUNDARY: u32 = 7 << 12;
+
+/// `BLKSIZECNT` for a BYTE-mode transfer: one block of `bytes`.
+pub const fn blk_byte_mode(bytes: u32) -> u32 {
+    (1 << 16) | BLK_BOUNDARY | (bytes & 0xFFF)
+}
+
+/// `BLKSIZECNT` for a multi-BLOCK transfer: `blocks` blocks of `size` bytes.
+///
+/// Named rather than assembled at each call site. Building a register word out of parts is precisely the
+/// habit that cost this driver six boots on the chip clock CSR, and a block transfer has two fields where
+/// a byte transfer has one.
+pub const fn blk_block_mode(blocks: u32, size: u32) -> u32 {
+    ((blocks & 0xFFFF) << 16) | BLK_BOUNDARY | (size & 0xFFF)
+}
+
 /// A short delay. Spins rather than sleeps because these are microsecond-scale hardware settling gaps
 /// on a path that holds no lock and serves nobody yet; a count is not a duration (`arch/CLAUDE.md`),
 /// which is why nothing here uses one as a TIMEOUT - the timeouts below are separate bounded loops on
@@ -445,7 +467,7 @@ impl<'a> Host<'a> {
     /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
     /// coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware
     /// upload wants DMA is a MEASUREMENT for the phase that does one, not a guess for this one.
-    pub fn cmd_data(&self, code: u32, arg: u32, buf: &mut [u32], read: bool)
+    pub fn cmd_data(&self, code: u32, arg: u32, blk: u32, buf: &mut [u32], read: bool)
         -> Result<(), &'static str>
     {
         let bytes = buf.len() * 4;
@@ -461,17 +483,10 @@ impl<'a> Host<'a> {
                 return Err("the DAT line never came out of inhibit");
             }
         }
-        // ONE block of `bytes`: block count in the high half, block size in the low - plus the SDMA
-        // buffer-boundary field in bits 12-14, which BOTH references write and we did not. Linux uses
-        // `SDHCI_MAKE_BLKSZ(host->sdma_boundary, blksz)` and u-boot `SDHCI_MAKE_BLKSZ(
-        // SDHCI_DEFAULT_BOUNDARY_ARG, blocksize)`, and both come to 7. The BCM2835 datasheet calls those
-        // bits reserved and a four-byte transfer cannot reach any boundary, so this is unlikely to
-        // matter - it is written because being the only one of three implementations that puts something
-        // different there is not a position worth defending.
-        //
-        // Handed to `cmd_inner` rather than written here, so it lands between the argument and the
-        // command exactly as the references' shadow-flush order puts it.
-        let blk = (1 << 16) | (7 << 12) | (bytes as u32 & 0xFFFF);
+        // THE BLOCK REGISTERS COME FROM THE CALLER, because byte mode and block mode need different
+        // words and only the caller knows which it is issuing (`blk_byte_mode` / `blk_block_mode`). It is
+        // handed to `cmd_inner` rather than written here so it lands between the argument and the command,
+        // exactly as the references' shadow-flush order puts it.
 
         // THE COMMAND PHASE IS THE ONE EVERY OTHER COMMAND USES. It clears stale status, writes ARG1,
         // the block registers, CMDTM, polls CMD_DONE, captures `last_int` on failure and resets the
