@@ -7,10 +7,19 @@
 # This file may SHRINK freely - the checker says so when it can. It may not grow without
 # somebody deciding the new entry is one of those two things.
 
+AIRC_RESET                         # docs/wifi.md - cyw43-driver/BCMA name for the reset-control bit, EXTERNAL; not yet a constant here
+brcmf_chip_cr4_set_active          # docs/wifi.md - Linux brcmfmac, EXTERNAL; the release path, likewise
+brcmf_chip_disable_arm             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the halt path that needs the core wrapper
+brcmf_chip_tcm_rambase             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the per-part table giving 0x198000 for the 4345
+brcmf_sdio_buscore_activate        # docs/wifi.md - Linux brcmfmac, EXTERNAL; named as the reset-vector handoff still to be read
+brcmf_sdiod_ramrw                  # docs/wifi.md - Linux brcmfmac, EXTERNAL; cited for how a large backplane transfer is chunked
+brcmf_sdiod_set_backplane_window   # docs/wifi.md - Linux brcmfmac, EXTERNAL; cited for caching the window between transfers
 CONSOLE_RENDER                     # docs/console-service.md
 FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
 mmc_io_rw_extended                 # docs/wifi.md - Linux mmc core, EXTERNAL; cited for the CMD53 argument this driver reimplements
+request_firmware                   # docs/wifi.md - Linux firmware loader, EXTERNAL; cited for how a live distro finds a blob in RAM
+SBSDIO_SB_OFT_ADDR_LIMIT           # docs/wifi.md - Linux brcmfmac chunk bound (the 32 KiB window), EXTERNAL; not yet a constant here
 sdio_io_rw_ext_helper              # docs/wifi.md - Linux mmc core, EXTERNAL; cited for why a 4-byte read uses BYTE mode
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
 async_bulk_watchdog                # docs/arm32-usb-userspace.md

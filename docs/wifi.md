@@ -1236,3 +1236,78 @@ more than all of them.
 No firmware upload, so still no 802.11 of any kind. `wifi list` cannot work and the shell still answers
 that it cannot talk to the driver. What phase 1 delivers is the transport: the radio identified, its
 backplane readable, and the correct firmware blob named from the silicon.
+
+---
+
+## 21. Phase 2 steps 1-2 COMPLETE: everything the upload needs, verified on hardware
+
+Every line below is a reading from the board, not a plan.
+
+| fact | how it was established |
+|---|---|
+| the part is a **CYW43455** (`0x4345` rev 6) | chipcommon identity register, over the backplane |
+| firmware wanted: **`brcmfmac43455-sdio`** | brcmfmac's revision BITMASK (`0xFFFFFDC0` covers rev 6) |
+| 7 cores, EOT reached | EROM walk |
+| ARM core: **CR4 rev 9 at `0x18002000`** | EROM |
+| its wrapper: **`0x18102000`** | derived as base + `0x100000`, and the rule CHECKED against all three wrappers the EROM did publish |
+| no SOCRAM; it runs from TCM | EROM, and the correct shape for this part |
+| **800 KiB of TCM**, 8 banks | `ARMCR4_CAP` then `BANKIDX`/`BANKINFO` per bank |
+| firmware load address **`0x198000`** | `brcmf_chip_tcm_rambase`, a per-part table |
+| the image is **in the booted binary** | FNV-1a over the embedded bytes matching what `build.rs` measured on disk |
+| 611,383 bytes fits with 202 KiB spare | the chip's own size against this build's own image |
+
+Backplane reads and writes both work, the pin mux is confirmed ALT3 on all six SDIO pins, and no boot has
+panicked or wedged.
+
+### Why the firmware is embedded rather than read from `fs`
+
+GodspeedOS is a live system, and this is how a live system supplies firmware: a Linux live ISO carries
+`/lib/firmware/brcm/brcmfmac43455-sdio.bin` inside the squashfs or initramfs that was loaded into RAM at
+boot, and `request_firmware()` reads it from there. The blob travels with the kernel image.
+
+Reading it through `fs` would have been worse on this board in three separate ways: `block-driver` is built
+`storage_is_usb`, so the disk sits behind the **`xhci` service** and the radio would depend on the USB stack
+plus a stick being present; it would need an `fs` send peer, which is new authority for a driver that has
+none; and it would fail on any boot without storage, which is every first boot.
+
+**And the embedding had to be MEASURED, because the source lied about it.** `const IMAGE: &[u8] =
+include_bytes!(..)` inlines at each use site, so with only `.len()` used the bytes were discarded - a
+135,312-byte binary claiming a 609 KB image. `static` did not fix it either; dead data is dropped at link
+time regardless. What retains them is `firmware::verify` genuinely reading them, which is also the check
+that proves they are the vendored blob. The guard first written against this - `assert!(IMAGE.len() >
+64 * 1024)` - could never have fired, because `len()` is a compile-time constant either way.
+
+### What step 3 needs, all of it now read rather than guessed
+
+**Halt, upload, release.** From `cyw43-driver` and `brcmfmac/chip.c`:
+
+```text
+AI_IOCTRL    0x408   (BCMA_IOCTL)        SICF_CLOCK_EN 0x01   SICF_FGC 0x02   SICF_CPUHALT 0x20
+AI_RESETCTRL 0x800   (BCMA_RESET_CTL)    AIRC_RESET    0x01
+```
+
+and the ordering, quoted: disable first (require `AIRC_RESET` set), then write `IOCTL = FGC | CLOCK_EN |
+halt`, read it back, write `RESETCTRL = 0`, wait 1 ms, write `IOCTL = CLOCK_EN | halt`, read back, wait 1 ms.
+Both `brcmf_chip_disable_arm` and `brcmf_chip_cr4_set_active` reach these through the WRAPPER, which is why
+deriving `0x18102000` unblocked this step.
+
+**Chunking, which is the part that needed reading.** The backplane window is only 32 KiB, so a 609 KB write
+cannot be one transfer. `brcmf_sdiod_ramrw` chunks by `SBSDIO_SB_OFT_ADDR_LIMIT` and **sets the window once
+per chunk**, not per access - and `brcmf_sdiod_set_backplane_window` caches it (`if (bar0 ==
+sdiodev->sbwad) return 0;`), which `Window` here already does.
+
+That matters arithmetically: the current `write32` does one 4-byte CMD53 per call, so 609 KB would be about
+152,000 transactions. The upload needs **block-mode CMD53** instead - argument bit 27 set, the count field
+carrying a BLOCK count, and `BLKSIZECNT` as `(blocks << 16) | 64` for function 1's 64-byte block size, which
+is why that block size was set in step 2.
+
+**Still to read before writing any of it:** where exactly the NVRAM lands relative to `rambase + ramsize`
+(brcmfmac writes it to the END of RAM with a length token, not to an address anyone picks), and the
+reset-vector handoff in `brcmf_sdio_buscore_activate`, which truncates out of `sdio.c` and will have to come
+from the vendor driver's equivalent.
+
+### What is NOT done
+
+No firmware has been uploaded, so there is still no 802.11 of any kind: `wifi list` cannot work and the
+shell still answers that it cannot talk to the driver. Phase 2 delivers the transport and the destination;
+phase 3 is the radio actually running.
