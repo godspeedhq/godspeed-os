@@ -14,50 +14,49 @@ Microsoft-OUI vendor element is WPA, the Privacy bit alone is WEP). Eleven netwo
 a second run straight after scanned again on the same driver session. About three seconds each, ending
 when the firmware says the scan is complete rather than when a timer runs out.
 
-**The `scan` / `list` split is BUILT (2026-09-29) and not yet run on hardware.** Sections 2 to 4 are the
-spec; the shell and the driver now answer them: `wifi scan` starts a sweep the driver advances one frame
-at a time from its serve loop, prints rows as they are heard with `scanning  [q] quit  [b] background`
-above them, and ends in the numbered picker; `wifi list` prints the driver's cache and refuses (with the
-two sentences in section 3) while a sweep runs or when none has run. The cache lives in the driver's
-memory - not in a file, so it needs no `fs`, dies with the driver (a respawned driver says `no scan yet`),
-and never writes a neighbour's network name to the card. The first boot of this build is the test; every
-"works" below that is not marked hardware-verified is a build that compiles and passes the gate, no more.
+**Hardware-verified 2026-09-29 13:05, Raspberry Pi 4, one boot, first try.** Everything sections 2 to 4 and
+6 describe ran at the prompt and did what the sections say, except the WPA2 join itself, which this
+firmware cannot complete without the host handshake (below). The key derivation matched all four published
+vectors at boot (`stage 0`). The cache lives in the driver's memory - not in a file, so it needs no `fs`,
+dies with the driver, and never writes a network name to the card.
 
-What every verb does today:
+What every verb does, and what was seen:
 
-- `wifi scan` - built. Start, live numbered rows, `q` (stops the SWEEP with the firmware's own abort - a
-  one-channel scan of channel -1, the form Linux uses - and discards the partial), `b` (returns the
-  prompt, the sweep finishes into the cache), the picker (a number and Enter; `open` joins at once, `WEP`
-  is refused, anything else asks the passphrase). Unverified on hardware.
-- `wifi list` - built to section 3: cache only, never scans. **The scan itself is hardware-verified**
-  (2026-09-28, as the old blocking `wifi list`); the cache path is not yet.
-- `wifi status`, `wifi info`, `wifi debug` and its five views - built to sections 4f and 4g: the link read
-  from the firmware on each call (`GET_BSSID`, `GET_RSSI`, `chanspec`) except mid-sweep; the driver's
-  counters and its 64-frame trace ring. Bare `wifi` prints usage. Unverified on hardware.
-- `wifi stored`, `wifi forget <ssid>` - built to section 6: a 64-slot table holding derived keys and never
-  a passphrase. `wifi connect` asks for a passphrase only when the driver says one is needed. The key
-  derivation self-tests against four published vectors at boot (`stage 0` in the driver's log). Unverified.
-- `wifi disconnect`, `wifi radio on|off` - built as `bwfm_newstate` and `bwfm_stop` do them (`DISASSOC`
-  with no payload; `DOWN 1`, and `UP` again through the same chain boot uses). Unverified on hardware.
-- `wifi connect <ssid>` - built, and on a WPA2 network **cannot complete on this firmware as built**:
-  `sup_wpa` is refused in every form, so this firmware (7.45.265) has no supplicant and the host must run
-  the 4-way handshake (`docs/wifi.md` §37). Today it associates, reads the access point's first handshake
-  message, and reports honestly that it cannot answer it (reply 15). An OPEN network has no handshake, and
-  joining one is expected to work - that is the first join this build can complete. Unverified.
-- `wifi help`, `wifi version`, tab completion including `radio on|off`, and a row in `help`.
+- `wifi scan` - **verified.** Live numbered rows under `scanning  [q] quit  [b] background` and the header;
+  4 networks in 3 s; the picker took a number, echoed the row, and joined through the same path as
+  `connect`. `q` mid-sweep and `b` were not exercised on this boot.
+- `wifi list` - **verified**, with `saved` in NOTE for the network whose key was held.
+- `wifi status`, `wifi info` - **verified** in the not-associated state (`network  none`, the scan facts,
+  the `addressing` line). The associated state cannot be reached until the handshake exists.
+- `wifi debug`, `wifi debug trace`, `wifi debug firmware` - **verified.** The trace held the boot scan, the
+  prompt's scan, the join's six control exchanges and the handshake frames, on a clock that read real
+  milliseconds. `events`, `stats`, `transport` alone were not typed; their rows appeared under bare `debug`.
+- `wifi connect <ssid>` - **verified to the point this firmware allows**: asked the passphrase once, derived
+  the key into slot 0, associated, read six copies of the access point's handshake message 1 about a second
+  apart, and reported the deauthentication (reason 15) as the driver's inability, not the passphrase's. A
+  second `connect` of the same name **asked nothing** and joined with the held key. `wifi stored` named it.
+- `wifi disconnect`, `wifi radio on|off`, `wifi forget` - built as sections 2 and 6 say; not typed this boot.
+- `wifi help`, `wifi <verb> help`, `wifi version`, tab completion, and a row in `help`.
 - Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
   not answer says that after a bounded wait, never a guess.
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
 - The WPA2 join (the host supplicant), so `connect` and the picker's passphrase path end in reply 15.
+- **Glommed frames are dropped, and events ride in them.** The trace showed the firmware packing frames
+  into channel-3 superframes constantly - 30 of them in 74 s, in pairs of a short descriptor and a long
+  body - and no `LINK` or `ASSOC` event was ever seen although the association plainly happened (the
+  handshake frames arrived). The reference drops glommed frames on the CONTROL path but reads them on the
+  data path (`brcmf_sdio_rxglom`); this driver drops them everywhere. Reading them is the prerequisite for
+  the handshake, since message 3 may arrive the same way.
 - The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
   `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
   to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.
 - The BSSID and band in the `joined` sentence (section 4b) are not yet read from the association event;
-  the sentence names the network only. `wifi status` reads both live, so they are one command away.
-- An access point that drops the station is noticed only when `wifi status` next reads the link (section
-  4f), not the moment it happens; the driver does not yet watch `LINK` events outside a join or a sweep.
+  the sentence names the network only. `wifi info` reads both live, so they are one command away.
+- An access point that drops the station is noticed only when `wifi status` or `wifi info` next reads the
+  link (section 4f), not the moment it happens; the driver does not yet watch `LINK` events outside a join
+  or a sweep.
 
 One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
 spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.

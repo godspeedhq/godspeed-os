@@ -5355,6 +5355,41 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
 /// `<util> <sub> help` - focused help for a subcommand. Returns false if not a subcommand.
 fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
+        ("wifi", "debug") => help_block(ctx, "wifi debug", "the driver's own account of itself (utilities/56_wifi.md 4g)", &[
+            ("wifi debug", "stats, transport and events together", "wifi debug"),
+            ("wifi debug stats", "the control channel: requests sent, accepted, refused, unanswered; the session's age", "wifi debug stats"),
+            ("wifi debug transport", "the SDIO side: bytes each way, frames by channel, flow-control frames, frames lost to the scan", "wifi debug transport"),
+            ("wifi debug events", "how many of each firmware event has arrived, and the last one", "wifi debug events"),
+            ("wifi debug firmware", "chip, image, the running firmware's version and capability words, MAC, supplicant", "wifi debug firmware"),
+            ("wifi debug trace", "the last 64 frames on the bus, oldest first, on the driver's own clock", "wifi debug trace"),
+        ], false),
+        ("wifi", "scan") => help_block(ctx, "wifi scan", "sweep for networks and pick one", &[
+            ("wifi scan", "rows appear as heard, numbered; q stops the sweep, b leaves it running; then a number and Enter joins", "wifi scan"),
+        ], false),
+        ("wifi", "list") => help_block(ctx, "wifi list", "the last complete scan, as records", &[
+            ("wifi list", "NETWORK BAND SIGNAL SECURITY NOTE, one line per network; never scans - an error while a sweep runs or before any", "wifi list | match saved"),
+        ], false),
+        ("wifi", "connect") => help_block(ctx, "wifi connect", "join a network by name", &[
+            ("wifi connect <ssid>", "uses a held key, joins open, or asks the passphrase once (never on the command line)", "wifi connect Bankole-WiFi"),
+        ], false),
+        ("wifi", "disconnect") => help_block(ctx, "wifi disconnect", "leave the current network", &[
+            ("wifi disconnect", "the radio stays up; the held key is kept", "wifi disconnect"),
+        ], false),
+        ("wifi", "status") => help_block(ctx, "wifi status", "the human answer", &[
+            ("wifi status", "radio, network and band, signal as a word then dBm, security, time joined, last scan", "wifi status"),
+        ], false),
+        ("wifi", "info") => help_block(ctx, "wifi info", "the link in detail", &[
+            ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; addressing is `net status`'s", "wifi info"),
+        ], false),
+        ("wifi", "stored") => help_block(ctx, "wifi stored", "which networks a key is held for", &[
+            ("wifi stored", "names only, never a key; empty after a reboot or a driver restart", "wifi stored"),
+        ], false),
+        ("wifi", "forget") => help_block(ctx, "wifi forget", "drop a held key", &[
+            ("wifi forget <ssid>", "the key is wiped; the link, if any, is not touched", "wifi forget Bankole-WiFi"),
+        ], false),
+        ("wifi", "radio") => help_block(ctx, "wifi radio", "power the radio", &[
+            ("wifi radio on|off", "off disconnects first and says so", "wifi radio off"),
+        ], false),
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
         ], false),

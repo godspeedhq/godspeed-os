@@ -614,10 +614,10 @@ fn query_raw(
             frame[i * 4 + 3],
         ]);
     }
-    ctx.log_fmt(format_args!(
-        "wifi-driver: asking the firmware for `{}` - {} byte frame padded to {}, seq {}, request id {}",
-        name, len, padded, frame[4], reqid
-    ));
+    // Not logged per request any more: `wifi debug trace` holds every send with its id, command and
+    // length, and a refusal or a silence is still logged below. The log used to carry a line per frame,
+    // which is what the trace ring exists to replace.
+    let _ = name;
     // The third value is what the controller will actually move. For a write `round_to` has already
     // padded to a block multiple, so it equals `padded` - guaranteed by one function now rather than
     // assumed by two.
@@ -656,10 +656,10 @@ fn query_raw(
             Some(f) => {
                 frames += 1;
                 s.note_frame(ctx, &f, &rbuf, true);
-                // DESCRIBE THE FIRST FEW, before any judgement about whether they match. The point is to
-                // find out what the firmware is sending, and a frame skipped by a rule that is itself
-                // wrong would otherwise never be seen.
-                const DUMP_FRAMES: u32 = 4;
+                // The first frames used to be described here in full (`describe_frame`), which found the
+                // dataoff and header-only bugs of sections 31-33. The trace now records every frame's
+                // channel, id, command and status; the full dump is kept for a bring-up that needs it.
+                const DUMP_FRAMES: u32 = 0;
                 if frames <= DUMP_FRAMES {
                     describe_frame(frames, &f, &rbuf, ctx);
                 }
@@ -1049,11 +1049,8 @@ pub fn set_cmd(
             frame[i * 4 + 3],
         ]);
     }
-    ctx.log_fmt(format_args!(
-        "wifi-driver: sending `{}` - command {}, {} byte payload, {} byte frame padded to {}, seq {}, \
-         request id {}",
-        what, cmd, payload, len, padded, frame[4], reqid
-    ));
+    // Not logged per command: the trace holds the send with its id, command and length. A refusal or a
+    // silence is still logged below, loudly.
     // The third value is what the controller will actually move. For a write `round_to` has already
     // padded to a block multiple, so it equals `padded` - guaranteed by one function now rather than
     // assumed by two.
@@ -1099,12 +1096,10 @@ pub fn set_cmd(
                 return false;
             }
             s.note_ctrl_reply(cmd, false, status as i32);
-            // SAY SO. Success used to be silent, which is exactly why a command that matched the
-            // wrong reply looked identical to one that worked.
-            ctx.log_fmt(format_args!(
-                "wifi-driver:   the firmware ACCEPTED `{}` (request id {} matched, status {})",
-                what, reqid, status as i32
-            ));
+            // Success is not logged per command any more: the matched id, command and status are in the
+            // trace, a better record than a line per exchange. "Silent success" is not the failure this
+            // used to guard against - that was a command matched to the WRONG reply, and the id match above
+            // is what prevents it; the trace shows the match.
             return true;
         }
         ctx.sleep_ms(1);

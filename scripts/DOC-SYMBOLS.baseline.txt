@@ -85,3 +85,4 @@ brcmf_fwcap_map                    # Linux brcmfmac feature.c - the table the `c
 bwfm_rx                            # OpenBSD bwfm.c - the data receive path; hands EAPOL frames to net80211 - external, 26.14
 ieee80211_eapol_key_input          # OpenBSD net80211 - the 4-way handshake receive entry point bwfm_rx calls - external, 26.14
 sae_ext                            # a word in the firmware `cap` string (and brcmf_fwcap_map): WPA3 authentication done by the HOST; read off this board 2026-09-29 - external, 26.14
+brcmf_sdio_rxglom                  # Linux brcmfmac sdio.c - reads a glommed superframe: walks the descriptor list of sub-frame lengths and delivers each; the prerequisite this driver has not built (docs/wifi.md 38) - external, 26.14

@@ -2750,3 +2750,41 @@ Before asking the board, `strings` was run over the firmware image for `sup_wpa`
 `escan`, `wsec` and `wpa_auth` - iovars this firmware demonstrably answers - were also zero, so the iovar
 names are not stored as plain text and the zero for `sup_wpa` earned nothing. Discarded, and recorded so it
 is not run again as evidence.
+
+## 38. One boot, the whole surface: scan, list, status, info, debug, a key kept and reused (2026-09-29)
+
+Between §37 and this boot the driver stopped being a sequence of calls and became a state machine, and the
+shell grew every verb `utilities/56_wifi.md` describes except the WPA2 join. The boot at 13:05 ran all of it
+at the prompt for the first time and it behaved as the spec says, first try, with one finding.
+
+**What ran.** `stage 0`: SHA-1, HMAC-SHA1, PBKDF2 and the IEEE PSK each matched their published vector.
+`wifi scan`: the sweep as a state the serve loop advances one frame at a time; four networks in three
+seconds under the header the operator laid out, then the picker; a number joined through the same path as
+`wifi connect`. The passphrase was asked once, the pairwise master key was derived into slot 0 of the
+64-slot table, and a second `wifi connect` of the same name asked nothing. `wifi list` showed `saved` in
+NOTE. `wifi status` and `wifi info` read the link live (not associated, correctly - see below). `wifi debug`
+printed the counters; `wifi debug firmware` asked the firmware its version and words again and got the same
+answer as §37; `wifi debug trace` printed the ring.
+
+**The trace is the thing.** Sixty-four frames, timestamped by the driver's own clock in real milliseconds
+(the kernel gave it a rate), showing the boot scan, the prompt's scan, the join's six control exchanges each
+answered within 4 ms, then the handshake: `RX DATA len=131` at 27.568, 27.626, 28.605, 29.615, 30.615, 31.615
+- the access point's message 1, sent, then retried at one-second intervals - and `RX EVENT event=6` (the
+deauthentication, reason 15) at 32.615. Every line of that used to be read out of the serial log by hand.
+The per-frame and per-command log lines are removed in the same change; a refusal or a silence is still
+logged, loudly, and everything else is in the ring.
+
+**The finding: glommed frames carry events, and this driver drops them.** The trace shows channel-3 frames
+constantly - 30 in 74 s, always in pairs: a short descriptor (16 to 22 bytes) then a long body (256 to
+1952 bytes). §31 recorded that the reference drops glommed frames and so does this driver, and the scan
+works without them. What this boot showed is what is INSIDE them: no `LINK` or `ASSOC` event was ever
+delivered on the plain event channel, on either join, although both associations plainly happened - the
+handshake frames arrived. The reference drops glommed frames only on the control path; its data path reads
+them (`brcmf_sdio_rxglom`, which walks the descriptor's list of sub-frame lengths and delivers each).
+Reading them is the prerequisite for the handshake, because message 3 - which carries the encrypted group
+key and must be answered - may arrive glommed exactly as the association events did.
+
+**The sequence at the access point, for the record.** `AUTH` twice (the first with status 2, a timeout,
+the second status 0), then message 1 six times with the replay counter climbing 1 to 6 and the same
+ANonce, then `DEAUTH_IND` reason 15 - `4-Way Handshake timeout`, the reason code the standard assigns to
+exactly this. The access point did what a station that never answers deserves. The next slice answers it.
