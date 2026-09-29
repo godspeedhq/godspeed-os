@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # `wifi` - join and inspect a wireless network
 
-Version reported by `wifi version`. Implementation shape: **shell built-in for `scan` and `connect`,
+Version reported by `wifi version`. Implementation shape: **shell built-in for `scan` and `join`,
 standalone service for everything else** - see section 7, where the reason is a constraint rather than
 a preference.
 
@@ -33,7 +33,8 @@ What every verb does, and what was seen:
   milliseconds. `events`, `stats`, `transport` alone were not typed; their rows appeared under bare `debug`.
 - `wifi join <ssid>` - **verified to the point this firmware allows**: asked the passphrase once, derived
   the key into slot 0, associated, read six copies of the access point's handshake message 1 about a second
-  apart, and reported the deauthentication (reason 15) as the driver's inability, not the passphrase's. A
+  apart, and reported the deauthentication (reason 15) as the driver's inability, not the passphrase's - the state
+  before the handshake was built; the not-met list below has the build and what its first boot must show. A
   second `connect` of the same name **asked nothing** and joined with the held key. `wifi stored` named it.
 - `wifi leave`, `wifi radio on|off`, `wifi forget` - built as sections 2 and 6 say; not typed this boot.
 - `wifi help`, `wifi <verb> help`, `wifi version`, tab completion, and a row in `help`.
@@ -111,7 +112,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi status` | the human answer: radio, network and band, signal, security, time joined, last scan. Read live. Section 4f |
 | `wifi info` | the link in detail: bssid, band, channel, signal, security, time joined, scan facts - and where addressing lives. Section 4f |
 | `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |
-| `wifi forget <ssid>` | drop the held key for that network. Does not disconnect |
+| `wifi forget <ssid>` | drop the held key for that network. Does not leave the network |
 | `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
 | `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so |
 | `wifi help` | usage, with one real example per row |
@@ -141,9 +142,9 @@ forbids aliases, so `wifi connect` answers ``try `wifi join <ssid>` `` and `wifi
 Maple-House` (checked live against the firmware, not remembered - nothing is sent); `not joined - incorrect
 passphrase`; `not joined - no network named X in range`; `not joined - aborted`. "Incorrect passphrase" is
 not a guess: it is the one situation in which the access point receives our message 2 and, its MIC failing
-to verify, repeats message 1 and gives up - nothing else produces that pattern. Until the handshake is
-built the WPA2 case still ends in `not joined - X began the WPA2 handshake, which this driver cannot yet
-answer`, which is the truth in the same shape.
+to verify, repeats message 1 and gives up - nothing else produces that pattern. Before the handshake was
+built (2026-09-29) the WPA2 case ended in `not joined - X began the WPA2 handshake, which this driver did
+not answer`; that reply stays in the table so a shell can still name it, and no current driver produces it.
 
 `wifi join` takes **no** passphrase argument, in any position, and that is a security decision
 rather than an ergonomic one: an argument would be recorded in the recall ring and written to
@@ -276,7 +277,7 @@ event is the truth. `wifi status` repeats it.
 An `open` network skips the passphrase prompt. A `WEP` network is refused at the pick with `WEP is
 not supported` (section 9) rather than asked for a key it will not use. A `(hidden)` row can be picked
 - the radio knows the BSSID even though the name was withheld - but joining by name with `wifi
-connect` cannot reach it, and that is the one thing the picker can do that the name path cannot.
+join` cannot reach it, and that is the one thing the picker can do that the name path cannot.
 
 The passphrase prompt is a typing surface, so `q` is a letter there. Esc or `^Q` abandons it (rule
 10a), and `wifi status` then reports not associated. A prompt abandoned sends nothing.
@@ -408,14 +409,14 @@ feeds it - the control waits, the sweep, the join - so it is the whole traffic a
 which is what makes it the instrument this port was built without: the frames a control exchange read and
 skipped mid-sweep appear in it, and are counted under `skipped`.
 
-### 4e. What this costs the driver, said plainly
+### 4e. What this cost the driver, said plainly
 
-Today `scan::collect` blocks the driver until the firmware reports the sweep complete, which is why
-rule 11 is unmet and why `b` and `wifi list`-during-a-scan cannot exist yet. All three need the same
-one change: the scan becomes a state the driver's serve loop advances one frame at a time, so that
-between frames it can answer `list` (with the "scanning" error), `status` (with the count so far) and
-`abort` (which sends the firmware's escan abort action - read from the reference before it is written,
-not assumed). That is the remaining debt of phase 3, and this section is what pays it off.
+`scan::collect` used to block the driver until the firmware reported the sweep complete, which is why
+rule 11 was unmet and why `b` and `wifi list`-during-a-scan could not exist. All three needed one change,
+made on 2026-09-29: the scan became a state (`scan::step`) that the driver's serve loop advances one frame
+at a time, answering `list` (with the "scanning" error), `status` (with the count so far) and `abort`
+(the firmware's own abort - a one-channel scan of channel -1, read from Linux before it was written)
+between frames. That was the remaining debt of phase 3, and it is paid.
 
 `wifi join` blocks through association and is escapable with `q`. Escaping it mid-handshake leaves
 the radio not associated, and `wifi status` says so - a half-joined state is never reported as joined.
@@ -489,15 +490,16 @@ beside dangerous authority. That is the right default here and it is followed fo
 verb: `list`, `status`, `stored` hold an introspection-shaped cap to the radio service and nothing
 more, so they cannot join, forget or power anything *by construction*.
 
-**`connect` cannot follow it, for a mechanical reason.** There is one console input ring with one
+**`join` cannot follow it, for a mechanical reason.** There is one console input ring with one
 reader slot (`docs/console-service.md` §5a), and the shell is the reader. A spawned service cannot
 prompt for a passphrase: it would have to take the input ring, and while it held it the shell could
 not field the take/release messages. So the invisible-entry prompt has to happen **in the shell**,
-which makes `connect` a built-in. **`scan` follows it for the same reason**: the picker reads keys.
+which makes `join` a built-in. **`scan` follows it for the same reason**: the picker reads keys.
 
 That is not a compromise so much as the right place anyway - the shell is where authority is decided
 (CLAUDE.md Appendix D.4), and handing over a secret is exactly that decision. What the built-in must
-not do is keep the secret: it reads it, sends it to the keyring, and drops it.
+not do is keep the secret: it reads it, hands it to the driver - which derives the key and drops the
+passphrase (section 6) - and drops its own copy.
 
 ## 8. Tab completion (rule 9)
 

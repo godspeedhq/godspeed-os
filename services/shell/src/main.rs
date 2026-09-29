@@ -7437,19 +7437,18 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
 /// convention as `nic-driver` and `block-driver`.
 const WIFI_DRIVER: &str = "wifi-driver";
 
-/// `wifi` - join and inspect a wireless network (`docs/wifi-commands.md` is the full surface).
+/// `wifi` - join and inspect a wireless network (`utilities/56_wifi.md` is the surface; `docs/wifi.md` the
+/// design and the bring-up record).
 ///
-/// **AS BUILT THIS ANSWERS ONE QUESTION, TRUTHFULLY: is there a radio at all.** There is no
-/// `wifi-driver` in the tree yet, so every verb below reports its absence rather than sending an
-/// opcode the other end never agreed to - a protocol invented against no implementation is
-/// speculative surface, and 26.2 calls that architectural debt. The verbs, the help, the version and
-/// the completion are real now; the frame path lands behind them when the driver does.
+/// Every verb here is a question put to `wifi-driver` over IPC, by name, and the answers are the driver's
+/// (`services/wifi-driver/src/scan.rs`, `mod reply`); this file formats them and asks for a passphrase where
+/// the driver says one is needed. The vocabulary lives once, in `wifi_wire`.
 ///
-/// **On three of the five machines this is not a stub, it is the answer.** The T630 and the Wyse have
-/// no radio and never will, so "no wireless radio on this machine" is final there. That is why the
-/// absence path was built first rather than last: it is the only part that is correct on every board.
+/// **On three of the five machines the absence line is not a stub, it is the answer.** The T630 and the
+/// Wyse have no radio and never will, so "no wireless radio on this machine" is final there. That is why
+/// the absence path was built first rather than last: it is the only part that is correct on every board.
 ///
-/// **Absence is told apart from a wedge**, because `docs/wifi-commands.md` section 5 says the user's
+/// **Absence is told apart from a wedge**, because `utilities/56_wifi.md` section 5 says the user's
 /// real question is whose fault it is. `slot_of` - the same introspection `caps` uses - answers it: no
 /// live task by that name means no radio; a live task that will not answer is a different sentence and
 /// gets one. Neither is a timer: Commandment VIII wants the reply or the loud fact, never a guess.
@@ -7527,7 +7526,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         None => {
             out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
             // Say WHY rather than only what, so a reader on a board that HAS a radio knows where to
-            // look. Asking is never an error (`docs/wifi-commands.md` section 5), so this is Ok.
+            // look. Asking is never an error (`utilities/56_wifi.md` section 5), so this is Ok.
             out.line_fmt(ctx, format_args!("  (no `{}` is running - this machine has no radio, or none is driven yet)", WIFI_DRIVER));
             Ok(())
         }
@@ -7647,7 +7646,7 @@ fn wifi_ssid_text<'a>(ssid: &[u8], shown: &'a mut [u8; wifi_wire::SSID_MAX]) -> 
 /// The word beside a dBm figure, in every wifi view. The number is the fact and is always printed; the word
 /// is a stated rule over it, so a reader can check it: -50 or stronger excellent, -60 good, -70 fair, weaker
 /// is weak (`utilities/56_wifi.md` 3). In a row the word comes first and the header carries the unit; in
-/// `wifi status` the dBm comes first.
+/// `wifi status` and `wifi info` the word comes first too, with ` dBm` after the number (`excellent  -41 dBm`).
 fn wifi_signal_word(dbm: i32) -> &'static str {
     if dbm >= -50 {
         "excellent"
@@ -8004,8 +8003,8 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
                 Err(ShellError::Unknown)
             }
             Some(HANDSHAKE_UNIMPLEMENTED) => {
-                out.line_fmt(ctx, format_args!("not joined - {} began the WPA2 handshake, which this driver cannot yet answer", name));
-                out.line_fmt(ctx, format_args!("  (the radio's firmware has no supplicant; the host one is being built - `docs/wifi.md` 37)"));
+                out.line_fmt(ctx, format_args!("not joined - {} began the WPA2 handshake, which this driver did not answer", name));
+                out.line_fmt(ctx, format_args!("  (no current driver gives this reply; the handshake is built - `docs/wifi.md` 40)"));
                 Err(ShellError::Unknown)
             }
             Some(s) => wifi_radio_unavailable(ctx, out, s),

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The cryptography a WPA2-PSK station needs, and no more: SHA-1, HMAC-SHA1, and PBKDF2 over them.
+//! The cryptography a WPA2-PSK station needs, and no more: SHA-1, HMAC-SHA1, PBKDF2 and the 802.11 PRF over
+//! them, and AES-128 with the RFC 3394 key unwrap for message 3.
 //!
 //! This exists because the firmware has no supplicant (`docs/wifi.md` §37), so the host must derive the keys.
 //! The first of them is the pairwise master key: `PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`

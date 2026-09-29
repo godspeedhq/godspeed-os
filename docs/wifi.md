@@ -1,8 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # WiFi: two problems, one of which is not a driver
 
-**Status:** SPEC, nothing built. Written on `feat/wifi-driver` before any code, deliberately, because
-the sizing conclusion below would have been discovered four weeks late otherwise.
+**Status:** sections 1-12 are the design, written on `feat/wifi-driver` before any code, deliberately,
+because the sizing conclusion below would have been discovered four weeks late otherwise. Sections 13
+onward are the bring-up record, dated: as of 2026-09-29 the Pi 4 radio scans, associates, and (built, not
+yet run) answers the WPA2 handshake; `utilities/56_wifi.md` is the command surface and its status section is
+the current truth. Where a design section below and a later dated section disagree, the later one is what
+was built.
 
 **The one-line answer.** Once a station is associated, a WiFi link is a frame source, and this project
 already has a NIC-agnostic frame interface that two unrelated drivers speak. `net-stack` needs no
@@ -223,6 +227,12 @@ else needs it.
 ---
 
 ## 6. Where the credential lives, which is the interesting Godspeed question
+
+> **Superseded (2026-09-29).** The keyring service this section designs was not built. The decision the
+> operator made instead - the driver derives the pairwise master key from the passphrase the moment it
+> arrives, keeps up to 64 keys in its own memory, and loses them on any restart ("better that than the
+> kernel crashing") - is recorded in `utilities/56_wifi.md` section 6, which is the current truth. This
+> section stays as the argument that led there.
 
 A WiFi passphrase is a **credential**, and this project has strong opinions about authority that apply
 directly. Three claims:
@@ -2243,6 +2253,9 @@ scan before association.
 
 ## 31. The chip answered and the driver threw it away
 
+> Where this section says glommed frames are dropped as the reference drops them, section 39 supersedes
+> it: they are read now, by the descriptor's chunk lengths, and the association events travel inside them.
+
 Stage 13 sent its request and reported neither success nor failure at first glance. It did report, and the
 line is the whole finding:
 
@@ -2674,14 +2687,17 @@ repeats. The boot self-test calls both; the serving loop calls only the second. 
 answers every `wifi list` with `radio down` at once, which is the rule above the rules: a dependency that
 cannot do the thing returns with a loud fact, never a hang.
 
-### What phase 3 leaves open, in one place
+### What phase 3 left open, in one place - and where each was closed
 
-- `security` prints `unknown` until the RSN/WPA information elements are parsed.
+- `security` prints `unknown` until the RSN/WPA information elements are parsed. *Closed: `scan::sec`
+  reads the Privacy bit, the RSN element and the WPA vendor element (section 38).*
 - Rule 11: `q` does not yet stop the radio's sweep, because the driver cannot hear an abort while it is
-  inside `collect`. It needs to poll its endpoint between frames.
+  inside `collect`. It needs to poll its endpoint between frames. *Closed: the sweep is a state the serve
+  loop steps one frame at a time (`utilities/56_wifi.md` 4e).*
 - Glommed frames (channel 3) up to 3328 bytes now arrive and are dropped, as the reference drops them. The
-  log used to call them "an impossible shape"; it now says what they are.
-- The numbered picker the operator designed becomes live with `wifi join`, which is phase 4.
+  log used to call them "an impossible shape"; it now says what they are. *Closed: section 39 reads them.*
+- The numbered picker the operator designed becomes live with `wifi join`, which is phase 4. *Closed:
+  section 38.*
 
 ## 37. The firmware has no supplicant, and it said so three ways (2026-09-29)
 

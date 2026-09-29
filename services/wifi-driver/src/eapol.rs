@@ -3,8 +3,10 @@
 //!
 //! This firmware has no supplicant (`docs/wifi.md` §37), so the handshake is the host's - as it is for
 //! OpenBSD, whose `bwfm_rx` hands every frame with ethertype `ETHERTYPE_EAPOL` to
-//! `ieee80211_eapol_key_input`. This module is the first step of that: recognising the frame and reading
-//! its header. Deriving keys and answering come after, and are not pretended here.
+//! `ieee80211_eapol_key_input`. This module is the frame layer of that: recognising a key frame and
+//! reading its header (`describe`), deriving the pairwise transient key (`derive_ptk`), building and
+//! signing our own messages (`build_key_frame`), verifying the access point's (`check_mic`), and finding
+//! the group key inside message 3 (`find_gtk`). The state machine that orders them is `join.rs`.
 //!
 //! ## The frame, quoted
 //!

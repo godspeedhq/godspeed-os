@@ -183,7 +183,7 @@ pub fn join(
     if !open && !ctrl::set_iovar(h, w, s, "wpaie", &eapol::RSN_IE, ctx) {
         ctx.log(
             "wifi-driver: `wpaie` refused - the firmware will compose the association request's RSN element \
-             itself, and the handshake's message 2 cannot yet know what it sent",
+             itself, and message 2 will carry ours - if the two differ the access point may refuse",
         );
     }
 

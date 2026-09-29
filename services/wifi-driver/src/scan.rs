@@ -476,7 +476,8 @@ pub mod reply {
     /// Request op byte: scan and list.
     pub const OP_LIST: u8 = 1;
     /// Request op byte: join a network. Payload: `ssid_len, ssid[32], pass_len, pass[64]`. A `pass_len`
-    /// of 0 joins an OPEN network.
+    /// of 0 means "with what you have": the held key for that name, or open if the last sweep heard the
+    /// network as open, else `NEEDS_PASSPHRASE`.
     pub const OP_CONNECT: u8 = 2;
     /// Request op byte: start a sweep and return at once. Reply `[OK, 0]`, or `[SCANNING, heard]` when one
     /// is already running (the caller attaches to it), or `[SCAN_FAILED]` / `[RADIO_DOWN]`.
@@ -549,8 +550,8 @@ pub mod reply {
     pub const JOIN_FAILED: u8 = 13;
     /// Nothing decisive arrived within the bound.
     pub const JOIN_TIMEOUT: u8 = 14;
-    /// Associated, and the access point began the WPA2 handshake - which this driver cannot yet answer
-    /// (`docs/wifi.md` §37: the firmware has no supplicant; the host one is being built). Not joined.
+    /// Kept for the table: the reply the join gave while the host handshake was unbuilt (2026-09-29, before
+    /// the evening). No path produces it now; a shell reading it names the state it stood for.
     pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
 }
 
@@ -985,9 +986,9 @@ pub const MAX_EMPTY_POLLS: u32 = 500;
 /// Bring the radio up for scanning - ONCE, at boot. Returns the session the rest of the driver's life
 /// runs on, so request ids keep counting across every later scan.
 ///
-/// Split out of the boot self-test because `wifi list` runs a scan on request, and re-sending the CLM blob
-/// and the UP chain on every request would be wrong - the interface is already up. The bring-up happens
-/// here, once; `scan_once` does the part that repeats.
+/// Split out of the boot self-test because `wifi scan` starts a sweep on request, and re-sending the CLM
+/// blob and the UP chain on every request would be wrong - the interface is already up. The bring-up
+/// happens here, once; `start` and `step` do the part that repeats, from the serve loop.
 pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::Session> {
     let mut session = ctrl::Session::new(ctx);
 
@@ -1056,7 +1057,9 @@ pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::
     Some(session)
 }
 
-/// One scan, on a radio `bring_up` has already raised. This is what `wifi list` runs on every request.
+/// One whole scan, blocking, on a radio `bring_up` has already raised - the boot self-test's form. The
+/// serve loop does not use it: `wifi scan` runs `start` and then `step` one frame at a time, so it can
+/// answer requests between frames, and `wifi list` prints the cache the last such sweep left.
 ///
 /// Returns the `Scan` whatever it holds - an empty room is a result, not a failure - and `None` only when
 /// the firmware refused to start the scan at all, which its decoded error explains one line above.

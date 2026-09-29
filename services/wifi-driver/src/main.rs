@@ -87,9 +87,9 @@ fn serve_unavailable(ctx: &ServiceContext) -> ! {
     }
 }
 
-/// Serve `wifi list`. With a radio, a request scans and answers with the networks; without one, every
-/// request is answered "radio down" - the same loud fact `serve_unavailable` gives, so a shell can never
-/// tell the two apart by waiting.
+/// Serve the shell: sweeps as a state the loop advances, the cache, joins, keys, status, debug. Without
+/// a radio, every request is answered "radio down" - the same loud fact `serve_unavailable` gives, so a
+/// shell can never tell the two apart by waiting.
 ///
 /// **What this does NOT do, recorded rather than faked (§26.7):** `utilities/56_wifi.md` rule 11 says
 /// that `q` at the prompt must stop the SCAN, not just the shell's interest in it. This loop is single-
@@ -1039,10 +1039,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // FIFTH TIME, and the last: it now reports the one fact the serving loop is about to act on.
         if radio.is_some() {
             "wifi-driver: the stages above are the radio's state, each reported as it was read. The \
-             radio is up and the shell may ask it to scan: `wifi list`"
+             radio is up and the shell may ask it to sweep: `wifi scan`"
         } else {
             "wifi-driver: the stages above are the radio's state, each reported as it was read. The \
-             radio did NOT come up, so `wifi list` will be answered `radio down` rather than left waiting"
+             radio did NOT come up, so every `wifi` request will be answered `radio down` rather than left waiting"
         },
     );
     serve_radio(&ctx, &h, &mut window, radio)
