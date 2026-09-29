@@ -45,6 +45,7 @@ mod armcr4;
 mod backplane;
 mod bus;
 mod ctrl;
+mod eapol;
 mod scan;
 mod firmware;
 mod erom;
@@ -146,6 +147,7 @@ fn serve_radio(
                         join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,
                         join::Outcome::Failed => scan::reply::JOIN_FAILED,
                         join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
+                        join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
                     };
                     1
                 }

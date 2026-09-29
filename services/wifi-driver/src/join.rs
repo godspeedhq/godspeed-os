@@ -1,113 +1,94 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Joining a network: WPA2-PSK, with the firmware doing the handshake.
+//! Joining a network: association by the firmware, the WPA2 handshake by the host.
 //!
-//! This tree has no cryptography, so the host cannot derive the pairwise master key from a passphrase.
-//! The firmware can, and the driver that uses exactly that path from a host with no crypto is cyw43-driver
-//! (the Pico W, same firmware family), which is the reference of record for this one step; Linux's
-//! brcmfmac hands the firmware a key wpa_supplicant already derived and is quoted for everything else.
-//! The two agree on every command number.
+//! This firmware has no supplicant. `sup_wpa` - the switch that would hand it the 4-way handshake - is
+//! refused `BCME_UNSUPPORTED` in every form, including the GET Linux's own feature detection rests on
+//! (`docs/wifi.md` §37). So the model here is OpenBSD's, which sets `sup_wpa 0` on purpose and does the
+//! handshake in net80211: the firmware authenticates and associates, the access point's EAPOL-Key frames
+//! arrive on the DATA channel, the host derives the keys and installs them with the `wsec_key` iovar.
 //!
-//! ## The sequence, quoted
+//! **This slice does the first half and OBSERVES the second.** It associates, and when the access point
+//! sends message 1 of the handshake it reads and reports the frame rather than pretending to answer it.
+//! The access point will give up and deauthenticate, and that is reported for what it is - not as a refused
+//! passphrase, which it is not. Deriving keys and answering is the next slice; the crypto is not here yet.
 //!
-//! From cyw43-driver's `cyw43_ll_wifi_join`:
+//! ## The sequence, quoted from `bwfm_connect`
 //!
 //! ```c
-//! cyw43_set_ioctl_u32(self, WLC_SET_WPA_AUTH, wpa_auth, WWD_STA_INTERFACE);
-//! cyw43_set_ioctl_u32(self, WLC_SET_WSEC, auth_type & 0xff, WWD_STA_INTERFACE);
-//! cyw43_write_iovar_u32_u32(self, "bsscfg:sup_wpa", 0, auth_type == 0 ? 0 : 1, WWD_STA_INTERFACE);
-//! cyw43_put_le16(buf, key_len);
-//! cyw43_put_le16(buf + 2, 1);
-//! memcpy(buf + 4, key, key_len);
-//! cyw43_do_ioctl(self, SDPCM_SET, WLC_SET_WSEC_PMK, 4 + CYW43_WPA_MAX_PASSWORD_LEN, buf, ...);
-//! cyw43_do_ioctl(self, SDPCM_SET, WLC_SET_SSID, 36, self->last_ssid_joined, ...);
+//! /* tell firmware to add WPA/RSN IE to (re)assoc request */
+//! frm = ieee80211_add_rsn(buf, ic, ic->ic_bss);
+//! bwfm_fwvar_var_set_data(sc, "wpaie", buf, frm - buf);
+//! ...
+//! wpa |= BWFM_WPA_AUTH_WPA2_PSK;            /* (1 << 7) */
+//! wsec |= BWFM_WSEC_AES;                    /* (1 << 2) */
+//! bwfm_fwvar_var_set_int(sc, "wpa_auth", wpa);
+//! bwfm_fwvar_var_set_int(sc, "wsec", wsec);
+//! bwfm_fwvar_var_set_int(sc, "auth", BWFM_AUTH_OPEN);   /* 0 */
+//! bwfm_fwvar_var_set_int(sc, "mfp", BWFM_MFP_NONE);     /* 0 */
+//! ...
+//! bwfm_fwvar_cmd_set_data(sc, BWFM_C_SET_SSID, &join, sizeof(join));
 //! ```
 //!
-//! with `WLC_SET_INFRA (20)`, `WLC_SET_AUTH (22)`, `WLC_SET_SSID (26)`, `WLC_SET_WSEC (134)`,
-//! `WLC_SET_WPA_AUTH (165)`, `WLC_SET_WSEC_PMK (268)`, `CYW43_WPA_MAX_PASSWORD_LEN 64`,
-//! `CYW43_WPA2_AUTH_PSK (0x0080)`. brcmfmac's `fwil.h` gives the same 20/22/26/134/268, `AES_ENABLED 0x0004`
-//! and `WPA2_AUTH_PSK 0x0080`, `brcmf_set_auth_type` sets `auth` to 0 for open system, and its
-//! `brcmf_wsec_pmk_le` is `{ __le16 key_len; __le16 flags; u8 key[]; }` with `BRCMF_WSEC_PASSPHRASE BIT(0)`
-//! - the flag cyw43 writes as `1`. The SSID goes as `brcmf_ssid_le { __le32 SSID_len; u8 SSID[32]; }`, 36
-//! bytes, which is cyw43's `36` too.
+//! `wpa_auth`, `wsec` and `auth` go as the integer commands 165, 134 and 22 - brcmfmac's `fwil.h` and
+//! cyw43-driver agree on the numbers, and all three were accepted on this hardware on 2026-09-28. `wpaie`
+//! and `mfp` are iovars. `SET_SSID` (26) carries `bwfm_ssid { uint32_t len; uint8_t ssid[32]; }` - 36
+//! bytes, the form cyw43-driver sends, which lets the firmware choose the access point; `bwfm_join_params`
+//! adds a BSSID and is what the numbered picker will use to choose one itself.
 //!
-//! ## What "joined" means, and how a wrong passphrase presents
+//! ## Why `wpaie` is set at all
 //!
-//! The firmware reports in events. `LINK` (16) with `flags & 0x01` (`BRCMF_EVENT_MSG_LINK`) is the link
-//! up; `PSK_SUP` (46) with `status 6` (`BRCMF_E_STATUS_FWSUP_COMPLETED`) is the handshake done. Both are
-//! required before this reports success. A wrong passphrase does not produce a "wrong passphrase" event:
-//! the 4-way handshake fails to complete, which the firmware reports as `PSK_SUP` with `status 7`
-//! (`FWSUP_TIMEOUT`) or reasons 15-17 (`BRCMF_E_REASON_FWSUP_WPA_PSK_TMO`, `BRCMF_E_REASON_FWSUP_WPA_PSK_M1_TMO`,
-//! `BRCMF_E_REASON_FWSUP_WPA_PSK_M3_TMO`), or the access point sends a
-//! `DEAUTH_IND`. Those are what `utilities/56_wifi.md` §5's "refused the passphrase" is built on. A network
-//! that is not there answers the `SET_SSID` event with `NO_NETWORKS` (3).
+//! The station's RSN element goes in its association request, and the access point requires message 2 of
+//! the handshake to carry the SAME bytes - a mismatch is a deauthentication. Setting the element ourselves
+//! makes those bytes known (`eapol::RSN_IE`) instead of whatever the firmware would compose from `wpa_auth`
+//! and `wsec`. Linux does not set it because wpa_supplicant reads the element back out of the association
+//! request; this driver has no such path, so it follows OpenBSD.
+//!
+//! ## What the events mean
+//!
+//! `SET_SSID` with status `NO_NETWORKS` (3): nothing of that name answered. `LINK` (16) with `flags & 0x01`
+//! (`BRCMF_EVENT_MSG_LINK`): associated - the link is up at the 802.11 layer, and the handshake is now the
+//! access point's move. `DEAUTH_IND` (6) / `DISASSOC_IND` (12): the access point ended it. `PSK_SUP` (46)
+//! is the firmware supplicant's report and cannot occur on this firmware; it is not waited on.
 //!
 //! ## The passphrase
 //!
-//! It arrives in the request, is copied into one stack buffer sized for the command, sent, and the buffer
-//! is zeroed before this returns. It is never logged and never kept: the firmware holds the derived key.
+//! It arrives in the request and is not sent anywhere: the firmware has nothing to do with it now. It is
+//! held only for the host supplicant, which will derive the pairwise master key from it; until that exists
+//! the bytes are read for their length and nothing else.
 
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::Window;
 use crate::ctrl::{self, Session};
+use crate::eapol;
 use crate::host::Host;
-use crate::scan::{self, code, status, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
+use crate::scan::{self, code, ev, status, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
 /// `WLC_SET_AUTH` / `BRCMF_C_SET_AUTH`.
 const CMD_SET_AUTH: u32 = 22;
-/// `WLC_SET_SSID` / `BRCMF_C_SET_SSID`.
+/// `WLC_SET_SSID` / `BRCMF_C_SET_SSID` / `BWFM_C_SET_SSID`.
 const CMD_SET_SSID: u32 = 26;
 /// `WLC_SET_WSEC` / `BRCMF_C_SET_WSEC`.
 const CMD_SET_WSEC: u32 = 134;
 /// `WLC_SET_WPA_AUTH`.
 const CMD_SET_WPA_AUTH: u32 = 165;
-/// `WLC_SET_WSEC_PMK` / `BRCMF_C_SET_WSEC_PMK`.
-const CMD_SET_WSEC_PMK: u32 = 268;
 
-/// `WPA2_AUTH_PSK`.
+/// `BWFM_WPA_AUTH_WPA2_PSK` - `(1 << 7)`.
 const WPA2_AUTH_PSK: u32 = 0x0080;
-/// `AES_ENABLED`.
-const AES_ENABLED: u32 = 0x0004;
-/// `brcmf_set_auth_type`, open system: `val = 0`.
+/// `BWFM_WSEC_AES` - `(1 << 2)`.
+const WSEC_AES: u32 = 0x0004;
+/// `BWFM_AUTH_OPEN` - open system; the WPA2 authentication happens in the handshake, not here.
 const AUTH_OPEN_SYSTEM: u32 = 0;
-/// The firmware supplicant switch, in the form THIS firmware accepts.
-///
-/// The plain `sup_wpa` iovar - Linux's `brcmf_fil_iovar_int_set(ifp, "sup_wpa", 1)` - was refused with
-/// `BCME_UNSUPPORTED` (-23), three times out of three, on hardware. cyw43-driver, written for this firmware
-/// family, uses the bsscfg-indexed form:
-///
-/// ```c
-/// cyw43_write_iovar_u32_u32(self, "bsscfg:sup_wpa", 0, auth_type == 0 ? 0 : 1, WWD_STA_INTERFACE);
-/// ```
-///
-/// whose payload is the name, its NUL, then two little-endian u32s - the bsscfg INDEX first, the VALUE
-/// second:
-///
-/// ```c
-/// cyw43_put_le32(buf + len, val0);
-/// cyw43_put_le32(buf + len + 4, val1);
-/// ```
-///
-/// Index 0 is the primary interface; value 1 turns the supplicant on. `set_iovar` writes the name and NUL and
-/// then this value verbatim, which is exactly that layout.
-const SUP_WPA_ON: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
+/// `BWFM_MFP_NONE` - no management frame protection, as `bwfm_connect` sets it.
+const MFP_NONE: [u8; 4] = [0, 0, 0, 0];
 
-/// `BRCMF_WSEC_PASSPHRASE` - `BIT(0)`; cyw43 writes it as `1`.
-const WSEC_PASSPHRASE: u16 = 1;
-/// `CYW43_WPA_MAX_PASSWORD_LEN`.
+/// `CYW43_WPA_MAX_PASSWORD_LEN` - the longest passphrase the request carries.
 pub const MAX_PASSPHRASE: usize = 64;
 /// The SSID limit lives in `scan`; re-exported so `join::MAX_SSID` reads naturally at the request site.
 pub use crate::scan::MAX_SSID;
 
 /// `BRCMF_EVENT_MSG_LINK`: in a `LINK` event's flags, the link is up.
 const EVENT_MSG_LINK: u16 = 0x01;
-/// `BRCMF_E_STATUS_FWSUP_COMPLETED`, in a `PSK_SUP` event.
-const FWSUP_COMPLETED: u32 = 6;
-/// `BRCMF_E_STATUS_FWSUP_TIMEOUT`.
-const FWSUP_TIMEOUT: u32 = 7;
-/// `BRCMF_E_REASON_FWSUP_WPA_PSK_TMO` through `..._M3_TMO`: the handshake did not complete.
-const FWSUP_REASON_PSK_TMO_FIRST: u32 = 15;
-const FWSUP_REASON_PSK_TMO_LAST: u32 = 17;
 
 /// How a join ended. Mirrors `scan::reply`'s connect statuses one for one.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,9 +98,11 @@ pub enum Outcome {
     PassphraseRefused,
     Failed,
     Timeout,
+    /// Associated, and the access point began the handshake this driver cannot yet answer.
+    HandshakeUnimplemented,
 }
 
-/// Join `ssid` with `passphrase`, and wait for the firmware to say how it went.
+/// Join `ssid`, and wait for the firmware - and then the access point - to say how it went.
 pub fn join(
     h: &Host,
     w: &mut Window,
@@ -133,26 +116,24 @@ pub fn join(
         return Outcome::Failed;
     }
 
-    // ---- 1. Security mode, in the reference's order. ----
+    // ---- 1. The RSN element for the association request. Refusal is loud but not fatal: the firmware
+    // will then compose its own, and message 2 will have to be built from whatever it sent. ----
+    if !ctrl::set_iovar(h, w, s, "wpaie", &eapol::RSN_IE, ctx) {
+        ctx.log(
+            "wifi-driver: `wpaie` refused - the firmware will compose the association request's RSN element \
+             itself, and the handshake's message 2 cannot yet know what it sent",
+        );
+    }
+
+    // ---- 2. Security mode, in `bwfm_connect`'s order. ----
     if !ctrl::set_cmd_int(h, w, s, CMD_SET_WPA_AUTH, WPA2_AUTH_PSK, "wpa_auth WPA2-PSK", ctx)
+        || !ctrl::set_cmd_int(h, w, s, CMD_SET_WSEC, WSEC_AES, "wsec AES", ctx)
         || !ctrl::set_cmd_int(h, w, s, CMD_SET_AUTH, AUTH_OPEN_SYSTEM, "auth open-system", ctx)
-        || !ctrl::set_cmd_int(h, w, s, CMD_SET_WSEC, AES_ENABLED, "wsec AES", ctx)
-        || !ctrl::set_iovar(h, w, s, "bsscfg:sup_wpa", &SUP_WPA_ON, ctx)
     {
         return Outcome::Failed;
     }
-
-    // ---- 2. The passphrase, to the firmware's supplicant. One buffer, zeroed on the way out. ----
-    let mut pmk = [0u8; 4 + MAX_PASSPHRASE];
-    pmk[0..2].copy_from_slice(&(passphrase.len() as u16).to_le_bytes());
-    pmk[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
-    pmk[4..4 + passphrase.len()].copy_from_slice(passphrase);
-    let sent = ctrl::set_cmd(h, w, s, CMD_SET_WSEC_PMK, &pmk, "passphrase to the supplicant", ctx);
-    for b in pmk.iter_mut() {
-        *b = 0;
-    }
-    if !sent {
-        return Outcome::Failed;
+    if !ctrl::set_iovar(h, w, s, "mfp", &MFP_NONE, ctx) {
+        ctx.log("wifi-driver: `mfp` refused - continuing; management frame protection stays at the firmware's default");
     }
 
     // ---- 3. The join itself: the 36-byte SSID structure. ----
@@ -163,15 +144,17 @@ pub fn join(
         return Outcome::Failed;
     }
 
-    // ---- 4. Wait on the firmware's word. ----
-    // Two facts make a join: the link up, and the handshake completed. Either failure event ends the
-    // wait early. The poll bound underneath is exactly that - a bound - and the log says which ended it.
-    const JOIN_EMPTY_POLLS: u32 = 3000;
+    // ---- 4. Wait on the firmware's word, and then the access point's. ----
+    // The poll bound is a bound, not a duration: each empty poll sleeps a millisecond, so this is on the
+    // order of ten seconds, inside the shell's thirty. An access point retries message 1 a few times over
+    // several seconds before it deauthenticates, and this must outlast that to report it.
+    const JOIN_EMPTY_POLLS: u32 = 10_000;
     let mut frame = [0u8; ctrl::FRAME];
     let mut link_up = false;
-    let mut handshake_done = false;
     let mut empty = 0u32;
     let mut events = 0u32;
+    let mut eapol_frames = 0u32;
+    let mut other_traffic = 0u32;
     while empty < JOIN_EMPTY_POLLS {
         let f = match ctrl::read_frame(h, w, &mut frame, ctx) {
             Some(f) => f,
@@ -182,12 +165,48 @@ pub fn join(
             }
         };
         let channel = f.chanflag & CHANNEL_MASK;
-        if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {
+        let body = &frame[f.off..f.off + f.len];
+
+        if channel == CHANNEL_DATA {
+            // TRAFFIC. Before any key is installed the only frames that can matter are the handshake's.
+            let eth = match scan::ethernet_at(body) {
+                Some(eth) => eth,
+                None => {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver:   a data frame of {} bytes cannot hold its BDC header - skipped",
+                        body.len()
+                    ));
+                    continue;
+                }
+            };
+            let eth_frame = &body[eth..];
+            if eth_frame.len() < ev::ETHHDR {
+                other_traffic += 1;
+                continue;
+            }
+            let ethertype = u16::from_be_bytes([eth_frame[ev::ETHERTYPE], eth_frame[ev::ETHERTYPE + 1]]);
+            if ethertype == eapol::ETHERTYPE_EAPOL {
+                eapol_frames += 1;
+                let _ = eapol::describe(eth_frame, ctx);
+                // Not answered. Said once, at the first one, so the log explains the deauthentication that
+                // follows rather than leaving it to look like the access point's fault.
+                if eapol_frames == 1 {
+                    ctx.log(
+                        "wifi-driver:   the access point has begun the WPA2 handshake. This driver cannot yet \
+                         answer it (docs/wifi.md 37) - the access point will retry, then deauthenticate",
+                    );
+                }
+            } else {
+                other_traffic += 1;
+            }
             continue;
         }
+        if channel != CHANNEL_EVENT {
+            continue;
+        }
+
         events += 1;
-        let p = f.off;
-        let e = match scan::parse_event(&frame[p..p + f.len], events, ctx) {
+        let e = match scan::parse_event(body, events, ctx) {
             Some(e) => e,
             None => continue,
         };
@@ -198,26 +217,34 @@ pub fn join(
         match e.event_type {
             code::SET_SSID if e.status == status::NO_NETWORKS => return Outcome::NotFound,
             code::SET_SSID if e.status != status::SUCCESS => return Outcome::Failed,
-            code::LINK if e.flags & EVENT_MSG_LINK != 0 => link_up = true,
-            code::PSK_SUP if e.status == FWSUP_COMPLETED => handshake_done = true,
-            code::PSK_SUP
-                if e.status == FWSUP_TIMEOUT
-                    || (FWSUP_REASON_PSK_TMO_FIRST..=FWSUP_REASON_PSK_TMO_LAST).contains(&e.reason) =>
-            {
-                return Outcome::PassphraseRefused
+            code::LINK if e.flags & EVENT_MSG_LINK != 0 => {
+                link_up = true;
+                ctx.log("wifi-driver:   ASSOCIATED - the link is up at the 802.11 layer; the handshake is now the access point's move");
             }
-            code::DEAUTH_IND | code::DISASSOC_IND => return Outcome::PassphraseRefused,
+            code::DEAUTH_IND | code::DISASSOC_IND => {
+                return if eapol_frames > 0 {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: the access point ended the association after {} unanswered handshake \
+                         frame(s) - expected until the host supplicant exists",
+                        eapol_frames
+                    ));
+                    Outcome::HandshakeUnimplemented
+                } else {
+                    ctx.log("wifi-driver: the access point ended the association before any handshake frame arrived");
+                    Outcome::Failed
+                };
+            }
             _ => {}
-        }
-        if link_up && handshake_done {
-            ctx.log("wifi-driver: JOINED - the link is up and the firmware's supplicant completed the handshake");
-            return Outcome::Joined;
         }
     }
     ctx.log_fmt(format_args!(
-        "wifi-driver: the join produced no decision across {} empty polls ({} event(s) seen; link up: {}, \
-         handshake done: {})",
-        JOIN_EMPTY_POLLS, events, link_up, handshake_done
+        "wifi-driver: the join produced no decision across {} empty polls ({} event(s), {} handshake frame(s), \
+         {} other data frame(s); link up: {})",
+        JOIN_EMPTY_POLLS, events, eapol_frames, other_traffic, link_up
     ));
-    Outcome::Timeout
+    if link_up && eapol_frames > 0 {
+        Outcome::HandshakeUnimplemented
+    } else {
+        Outcome::Timeout
+    }
 }

@@ -438,6 +438,9 @@ pub mod reply {
     pub const JOIN_FAILED: u8 = 13;
     /// Nothing decisive arrived within the bound.
     pub const JOIN_TIMEOUT: u8 = 14;
+    /// Associated, and the access point began the WPA2 handshake - which this driver cannot yet answer
+    /// (`docs/wifi.md` §37: the firmware has no supplicant; the host one is being built). Not joined.
+    pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
 }
 
 /// Serialise a scan into a reply: `[status, count, record * count]`. Returns the bytes written.
@@ -538,35 +541,47 @@ pub(crate) struct Event {
     pub datalen: usize,
 }
 
+/// Where the ethernet frame starts inside a DATA or EVENT body: past the 4-byte BDC header and then
+/// `data_offset << 2` more (`bwfm_proto_bcdc_rx`: `m_adj(m, sizeof(*hdr) + (hdr->data_offset << 2))`).
+///
+/// One place for the arithmetic, because the event path and the traffic path both need it and two copies
+/// is how one of them drifts. `None` when the body cannot hold what its own header claims; the caller says
+/// so in its own words, since "event" and "traffic" are different sentences.
+pub(crate) fn ethernet_at(body: &[u8]) -> Option<usize> {
+    if body.len() < BDC_HEADER {
+        return None;
+    }
+    let eth = BDC_HEADER + ((body[BDC_DATA_OFFSET] as usize) << 2);
+    if body.len() <= eth {
+        None
+    } else {
+        Some(eth)
+    }
+}
+
 pub(crate) fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<Event> {
     // THE BDC HEADER FIRST. A data or event frame is not an ethernet frame: it carries four bytes of BDC
     // header and then `data_offset << 2` more before the ethernet header starts.
-    if body.len() < BDC_HEADER {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: a frame on the event channel is only {} bytes, shorter than its {}-byte BDC header",
-            body.len(),
-            BDC_HEADER
-        ));
-        return None;
-    }
-    let pad = (body[BDC_DATA_OFFSET] as usize) << 2;
-    let eth = BDC_HEADER + pad;
+    let eth = match ethernet_at(body) {
+        Some(eth) => eth,
+        None => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: a frame on the event channel is {} bytes, which cannot hold its {}-byte BDC \
+                 header plus the {} words of offset it declares",
+                body.len(),
+                BDC_HEADER,
+                body.get(BDC_DATA_OFFSET).copied().unwrap_or(0)
+            ));
+            return None;
+        }
+    };
     if which <= 2 {
         // Visible rather than asserted, for the first couple of frames only.
         ctx.log_fmt(format_args!(
             "wifi-driver:     BDC header: flags {:#04x} priority {} flags2 {:#04x} data_offset {} \
-             (+{} bytes) -> ethernet frame at +{}",
-            body[0], body[1], body[2], body[BDC_DATA_OFFSET], pad, eth
+             -> ethernet frame at +{}",
+            body[0], body[1], body[2], body[BDC_DATA_OFFSET], eth
         ));
-    }
-    if body.len() <= eth {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: a frame on the event channel has {} bytes but its BDC header puts the ethernet \
-             frame at +{}",
-            body.len(),
-            eth
-        ));
-        return None;
     }
     let frame = &body[eth..];
 
@@ -793,7 +808,16 @@ pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::
         h,
         w,
         &mut session,
-        &[code::ESCAN_RESULT, code::LINK, code::SET_SSID, code::ASSOC],
+        &[
+            code::ESCAN_RESULT,
+            code::LINK,
+            code::SET_SSID,
+            code::ASSOC,
+            code::JOIN,
+            code::AUTH,
+            code::DEAUTH_IND,
+            code::DISASSOC_IND,
+        ],
         ctx,
     ) {
         ctx.log(

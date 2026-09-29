@@ -428,3 +428,17 @@ ie_length                          # OpenBSD bwfm bss_info field - the IE run le
 ie_offset                          # OpenBSD bwfm bss_info field - where the beacon IEs start, from the START of the record (the reference copies bss + iesoff); this driver names the offset bss::IE_OFFSET - external, 26.14
 brcmf_feat_attach                  # Linux brcmfmac feature.c - where firmware features are detected, after preinit and before UP; this driver asks its three questions at the same point - external, 26.14
 brcmf_feat_firmware_capabilities   # Linux brcmfmac feature.c - matches the `cap` iovar string against brcmf_fwcap_map - external, 26.14
+BWFM_AUTH_OPEN                     # OpenBSD bwfmreg.h - 0, open-system 802.11 authentication; this driver names it AUTH_OPEN_SYSTEM - external, 26.14
+BWFM_C_SET_SSID                    # OpenBSD bwfmreg.h - command 26; this driver names it CMD_SET_SSID - external, 26.14
+BWFM_MFP_NONE                      # OpenBSD bwfmreg.h - 0, no management frame protection; this driver names it MFP_NONE - external, 26.14
+BWFM_WPA_AUTH_WPA2_PSK             # OpenBSD bwfmreg.h - (1 << 7); this driver names it WPA2_AUTH_PSK - external, 26.14
+BWFM_WSEC_AES                      # OpenBSD bwfmreg.h - (1 << 2); this driver names it WSEC_AES - external, 26.14
+EAPOL_KEY                          # OpenBSD net80211/ieee80211.h - EAPOL packet type 3, a key descriptor; this driver names it TYPE_KEY - external, 26.14
+EAPOL_KEY_DESC_IEEE80211           # OpenBSD net80211/ieee80211.h - descriptor type 2, RSN; this driver names it DESC_RSN - external, 26.14
+EAPOL_KEY_DESC_WPA                 # OpenBSD net80211/ieee80211.h - descriptor type 254, pre-standard WPA; this driver names it DESC_WPA - external, 26.14
+bwfm_connect                       # OpenBSD bwfm.c - the join sequence (wpaie, wpa_auth, wsec, auth, mfp, SET_SSID) join.rs follows - external, 26.14
+bwfm_join_params                   # OpenBSD bwfmreg.h - SSID plus assoc params (a BSSID) for SET_SSID; the numbered picker will use it - external, 26.14
+bwfm_proto_bcdc_rx                 # OpenBSD bwfm.c - strips the BCDC header plus data_offset words; scan::ethernet_at is the same arithmetic - external, 26.14
+bwfm_rx                            # OpenBSD bwfm.c - the data receive path; hands EAPOL frames to net80211 - external, 26.14
+ieee80211_add_rsn                  # OpenBSD net80211 - builds the RSN element bwfm_connect sets as wpaie; eapol::RSN_IE is that element for CCMP/PSK - external, 26.14
+ieee80211_eapol_key_input          # OpenBSD net80211 - the 4-way handshake receive entry point bwfm_rx calls - external, 26.14

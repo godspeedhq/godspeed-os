@@ -7444,6 +7444,11 @@ fn wifi_connect(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellEr
                 out.line_fmt(ctx, format_args!("wifi: no decision from {} - not joined (the driver's log has what it heard)", ssid));
                 Err(ShellError::Unknown)
             }
+            Some(15) => {
+                out.line_fmt(ctx, format_args!("wifi: associated with {}, and it began the WPA2 handshake - which this driver cannot yet answer", ssid));
+                out.line_fmt(ctx, format_args!("  (the radio's firmware has no supplicant; the host one is being built - `docs/wifi.md` 37). Not joined"));
+                Err(ShellError::Unknown)
+            }
             Some(2) => {
                 out.line_fmt(ctx, format_args!("wifi: the radio is not up - it did not come up at boot, and the driver's log says which stage stopped it"));
                 Err(ShellError::Unknown)
