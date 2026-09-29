@@ -2682,3 +2682,71 @@ cannot do the thing returns with a loud fact, never a hang.
 - Glommed frames (channel 3) up to 3328 bytes now arrive and are dropped, as the reference drops them. The
   log used to call them "an impossible shape"; it now says what they are.
 - The numbered picker the operator designed becomes live with `wifi connect`, which is phase 4.
+
+## 37. The firmware has no supplicant, and it said so three ways (2026-09-29)
+
+Phase 4's join sequence went out on hardware on 2026-09-28 and 2026-09-29. `wpa_auth WPA2-PSK`, `auth open`
+and `wsec AES` were accepted. `sup_wpa` - the switch that hands the WPA2 4-way handshake to the firmware -
+was refused **-23 BCME_UNSUPPORTED** both times: as a plain iovar, and as `bsscfg:sup_wpa` with the 23-byte
+payload `brcmf_create_bsscfg` builds (`bsscfg:sup_wpa\0`, index 0, value 1). Two refusals of two forms said
+the FORM was not the question.
+
+### What the references say
+
+- **Linux `feature.c`**: `brcmf_feat_iovar_int_get(ifp, BRCMF_FEAT_FWSUP, "sup_wpa")`. The firmware has an
+  internal supplicant iff a GET of `sup_wpa` does not return `BCME_UNSUPPORTED`. Asked at
+  `brcmf_feat_attach`: after the preinit commands, before `UP`. Nothing in the Raspberry Pi kernel's copy
+  changes this for 4345/43455.
+- **OpenBSD `bwfm.c`**: sets `sup_wpa 0` on purpose - the comment reads "the firmware supplicant can handle
+  the WPA handshake for us, but we honestly want to do this ourselves" - and net80211 runs the handshake.
+  EAPOL frames (ethertype 0x888e) come up `bwfm_rx` and go to `ieee80211_eapol_key_input`; keys go down
+  through the `wsec_key` iovar (`struct bwfm_wsec_key`: `ea`, `index`, `len`, `data`, `algo`, `flags`).
+- **Pi OS on this chip family**: users of firmware 7.45.241 (`firmware-nonfree` issue 34) and of the May
+  2026 package (issue 58) hit locally-generated `ASSOC-REJECT status_code=16` and cured it with
+  `feature_disable=0x2000` - which is the FWSUP bit. So on 7.45.241 Linux had detected the feature and was
+  using it.
+
+### What the board said, asked Linux's way
+
+`ctrl::report_firmware` asks three GETs at the point `brcmf_feat_attach` asks, before `UP`. The answers:
+
+```
+ver: wl0: Aug 29 2023 01:47:08 version 7.45.265 (28bca26 CY) FWID 01-b677b91b
+cap: ap sta wme 802.11d 802.11h rm cqa cac dualband ampdu ampdu_tx ampdu_rx amsdurx radio_pwrsave btamp
+     p2p proptxstatus mchan p2po anqpo vht-prop-rates dfrts txpwrcache stbc-tx stbc-rx-1ss epno pfnx wnm
+     bsstrans mfp sae_ext fbt
+sup_wpa: REFUSED -23 BCME_UNSUPPORTED
+```
+
+Three facts, each checked against something outside this project:
+
+1. **The version string is byte-for-byte the one Pi OS prints for this firmware file** - `7.45.265
+   (28bca26 CY) FWID 01-b677b91b` appears in Pi 4 owners' `dmesg` on the web. So the code running on the
+   radio is the file `nonfree/brcm43455/PROVENANCE` says it is, confirmed from the far side of the upload.
+2. **The capability string has `sae_ext` and lacks `idauth` and `sae `.** In `brcmf_fwcap_map`, `sae_ext`
+   means WPA3 authentication is done by the HOST (that is what the Raspberry Pi kernel's `sae_ext` support
+   was added for), and `idauth` is the firmware-side authenticator. This firmware announces that it has
+   moved authentication to the host, which is the direction the third fact confirms for WPA2.
+3. **`sup_wpa` GET is refused.** By the rule Linux itself decides on, this build has no internal
+   supplicant. On Pi OS with this exact firmware, the 4-way handshake is wpa_supplicant's, in userspace.
+
+### What this means for phase 4
+
+The passphrase-to-firmware join this project built (`join.rs`, after `cyw43-driver`) cannot work on this
+firmware, and not because of anything in the driver. The 4-way handshake has to be run by the host - as
+Linux does with wpa_supplicant and OpenBSD does in net80211, both on this same chip - and the keys installed
+with `wsec_key`. That is: EAPOL frames on the data channel in both directions, PBKDF2-SHA1 for the PMK,
+the PRF for the PTK, HMAC-SHA1 for the MIC, AES key-unwrap for the GTK, and the four-message state machine.
+The data path is needed for phase 5 regardless; the crypto is new.
+
+The alternative that exists - the older `7.45.241` firmware, which by issue 34's evidence DOES answer
+`sup_wpa` - is recorded here rather than chosen: it is the firmware Raspberry Pi moved away from, and the
+bug that made its users turn the feature off is in exactly the feature this project would be leaning on.
+Which road to take is the operator's decision, and it is open as of this section.
+
+### The instrument that was not one
+
+Before asking the board, `strings` was run over the firmware image for `sup_wpa`. Zero hits. As a control,
+`escan`, `wsec` and `wpa_auth` - iovars this firmware demonstrably answers - were also zero, so the iovar
+names are not stored as plain text and the zero for `sup_wpa` earned nothing. Discarded, and recorded so it
+is not run again as evidence.

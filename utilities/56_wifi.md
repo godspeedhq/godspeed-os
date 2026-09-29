@@ -25,9 +25,12 @@ and a reader of the prompt is not misled by the spec.
 What every verb does today:
 
 - `wifi list` - a real scan, printed as records, on the Pi 4. On every other board: no radio, and it says so.
-- `wifi connect <ssid>` - built and on the card. The firmware accepted `wpa_auth`, `auth` and `wsec` on
-  hardware on 2026-09-28; the supplicant switch (`sup_wpa`) was refused in its plain form and is now sent
-  in the `bsscfg:` form this firmware takes, **not yet verified on hardware**. A join has not been observed.
+- `wifi connect <ssid>` - built, and **cannot join on this firmware as built**. `wpa_auth`, `auth` and
+  `wsec` are accepted; `sup_wpa` - handing the WPA2 handshake to the firmware - is refused -23 in both
+  forms, and a GET of it asked Linux's way is refused too. By Linux's own rule this firmware (7.45.265) has
+  no internal supplicant: the host must run the 4-way handshake and install keys with `wsec_key`, as Linux
+  and OpenBSD both do on this chip. `docs/wifi.md` §37 has the evidence; the road is the operator's call.
+  Until then the command reports `the join failed before the network answered`, which is true.
 - `wifi scan`, `wifi`, `wifi status`, `wifi disconnect`, `wifi stored`, `wifi forget <ssid>`,
   `wifi radio on|off` - parse, report whether there is a radio, and on the Pi 4 say what the driver can be
   asked so far, naming the verb. They arrive with the phases that need them (`docs/wifi.md` §7).
