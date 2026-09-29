@@ -154,6 +154,14 @@ That is a real feature and §26.2 says it is not pulled into existence by anythi
 active link at a time**, chosen explicitly - `wifi join` means "make the radio the link". Multi-homing
 is out of scope with that as the reason, rather than unmentioned.
 
+> **Amended 2026-09-29 (phase 5): the choice is the CABLE's, not a command's.** The operator, having
+> joined the radio and pulled the cable expecting the frames to follow: *"cable always wins. unplug the
+> cable, switch to wifi automatically."* So `wifi join` makes the radio AVAILABLE, and the cable decides:
+> while the PHY reports a link the frames go over GENET; when it does not, they go to the radio if it is
+> joined; when the cable comes back, so do the frames. One link at a time still, and still no routing -
+> the rule is a single comparison in `nic-driver`'s genet backend (`Carrier`), and it lives there because
+> `nic-driver` IS the link front end. Section 41 has what it cost.
+
 ---
 
 ## 3. Full-MAC versus soft-MAC decides the size of the project
@@ -2948,3 +2956,73 @@ RNG (`iproc-rng200`, five registers, read from Linux's driver); wiring it into `
 kernel change and is small.
 
 Not yet run on hardware. What the first boot must show is in the spec's status section.
+
+## 41. Phase 5, built: the frame path, and the one rule `net-stack` needed after all (2026-09-29)
+
+**The join works.** Boot 20:01: `wifi join` with the right passphrase printed `joined ogundero_guest` on
+the first try, the log showed `setting wsec_key - 164 byte value` twice with no refusal and `JOINED -
+handshake complete, pairwise key installed, group key 2 installed`, and two more `wifi join`s answered
+`already joined` with nothing sent. The 162 was the whole of the previous boot's failure (section 40).
+
+**Then the operator pulled the cable and expected `ping` to follow the radio, and it did not**, because
+nothing above the join existed yet - phase 5 in section 7's table. This section is that phase.
+
+### What was built, in the shape section 2 said
+
+- **`wifi-driver` serves the frame interface** (`frames.rs`): `0x10` INFO answers the chip's address and
+  the driver's own word on the join; `0x11` TX is `ctrl::send_data`, the path the handshake proved,
+  refused rather than queued when there is no link; `0x12` RX hands up one ethernet frame from a bounded
+  queue of eight, filled by a PULL that reads what the chip has waiting - at most eight frames, and only
+  when the queue is empty and the radio has a link. The driver still blocks in `recv` when idle: a frame
+  the access point sends waits in the chip until `nic-driver` asks, and `nic-driver` asks on
+  `net-stack`'s pace. The pull watches the link as it reads: a `LINK` event without its up bit or a
+  deauthentication forgets the join THEN, which closes the spec's "an access point that drops the station
+  is noticed only at the next `wifi status`" item while the stack is polling.
+- **`nic-driver` on the Pi 4 has a second backend**, reached the way the Pi 2's reaches `dwc2`: one
+  bounded request, one reacquire-and-retry, every reply checked against the op it answers (the radio's
+  endpoint also serves `wifi`, so a late reply must not be read as the next answer). Which backend is
+  `Carrier`: the cable, re-read at most every 500 ms on whatever request arrives, or the radio.
+- **The supervisor** wires `nic-driver` to `wifi-driver` where the image is embedded (`NIC_PEERS` on the
+  `has_wifi_driver` board fact, not the ISA), and spawns the radio BEFORE `nic-driver` so the peer is in
+  the name-cap map when it wires. The contract, the authority pin and the send-peer list all say the
+  same thing, and `contract_check` and Commandment VII hold them to it.
+- **`net` names the carrier**: `link  up via the cable`, `up via wifi (the cable is out)`, or `down`.
+
+### The rule `net-stack` needed, and why section 2 did not see it
+
+Section 2 said `net-stack` needs no change, and for the FRAME protocol that held: it sends and drains
+the same bytes to the same name. What it did not see is that **a link which changes its address is a
+different link**. A cable pulled and put back is the same link, and `net-stack` deliberately resumes it
+without re-configuring. A cable pulled while the radio is joined swaps the frames' source address for the
+radio's, and the lease, the gateway's ARP entry and our own source MAC all belong to the old one - a
+frame sent with the cable's address through the radio is a frame from a station the access point never
+associated. So a configured stack now re-reads the link's address every two seconds on a network-using
+request (op 3 already carries it) and a changed address re-runs the dance - the same self-configure a
+fresh cable gets, for the same reason. Fifteen lines, one new helper, and it is recorded in section 2
+rather than left as a silent amendment to "unmodified".
+
+The alternative was to give the radio the cable's address (`cur_etheraddr` is settable) so the stack saw
+one link. It was not taken: the cable's address on this board is a made-up one (`backlog/21`), the radio's
+is burned in, and a station that borrows another interface's address to avoid telling its stack the truth
+is the silent substitution 26.4 names.
+
+### What is NOT done, recorded
+
+- **Group-key rekey is not answered** (`backlog/64`). The access point will drop the link at its rekey
+  interval; the driver sees it, says so, and `wifi join` brings it back. The log line will say what this
+  router's interval is.
+- Data frames that arrive DURING A SWEEP are still dropped by the sweep's own reader; RX answers zero
+  frames while a sweep runs. A sweep is a moment of no link either way.
+- `GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
+  not blocking; the Linux driver's form of the query is the next thing to read.
+
+### Prediction for the boot
+
+Cable in, `wifi join <ssid>`: `joined <ssid>`, and `net` shows `link  up via the cable` - nothing else
+changes. Pull the cable: within ~1 s `nic-driver: the cable is out - the radio carries the link (MAC ..)`,
+then on the next `ping` or `net` the stack logs `the link's address changed (.. -> ..) - re-configuring`,
+runs DHCP over the radio (`DHCP - offered ...`), and `ping 8.8.8.8` answers. `net` shows `up via wifi`.
+Plug the cable back: `the cable carries the link; the radio stands by`, another address change, another
+dance, and `ping` answers over the cable. If the address change is logged but DHCP gets no offer over the
+radio, the first suspect is TX credit (`wifi debug stats`, `tx_no_credit`) and the second is the source
+address the frames carry.

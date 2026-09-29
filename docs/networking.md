@@ -85,7 +85,8 @@ not "feature-complete."
   │   - owns the host IP + ports (a resource)    │   mints + revokes SOCKET caps (§7.10)
   │   - routes datagrams <-> sockets             │
   ├─────────────────────────────────────────────┤
-  │  nic-driver  (service, NOT IOMMU-confined)   │   per-board: e1000, RTL8168, GENET, dwmac
+  │  nic-driver  (service, NOT IOMMU-confined)   │   per-board: e1000, RTL8168, GENET, dwmac;
+  │                                              │   Pi 4: + the radio via wifi-driver (cable wins)
   │   - raw Ethernet frames in/out via DMA rings │   MMIO + DMA + IRQ caps (§12.3, §6.4)
   ├─────────────────────────────────────────────┤
   │  Kernel  (routes opaque socket caps only)    │   NO networking - delegated-resource-cap routing

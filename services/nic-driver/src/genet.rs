@@ -1269,6 +1269,145 @@ pub fn genet_main(ctx: ServiceContext) -> ! {
     serve(&ctx, &g, mac)
 }
 
+
+/// Which link carries `net-stack`'s frames.
+///
+/// **THE CABLE ALWAYS WINS.** While the PHY reports a link, frames go over GENET; the moment it does not,
+/// they go to `wifi-driver` over the same three ops this service answers upward (`docs/wifi.md` 2) - if
+/// the radio is joined - and come back to the cable the moment it returns. Decided by the operator on
+/// 2026-09-29, in these words: "cable always wins. unplug the cable, switch to wifi automatically." One
+/// link at a time, chosen by the cable rather than by a command, and the choice lives here because this
+/// service is the link front end: `net-stack` asks one name and never learns there are two links.
+///
+/// The cost of the switch is the link's ADDRESS: the radio has its own MAC, so the frames' source changes
+/// under the stack. `net-stack` notices that (its status query carries the address) and re-configures,
+/// which is the one thing a cable never did to it.
+#[derive(Clone, Copy, PartialEq)]
+enum Carrier {
+    Cable,
+    Radio,
+    None,
+}
+
+/// How often the cable is re-read on a request. A PHY read is two MDIO transactions; every drain would
+/// pay it for nothing, and a switch half a second late is not something a person can see.
+const CABLE_RECHECK_MS: u64 = 500;
+
+/// The bound on one exchange with `wifi-driver`. Its serve loop answers between frames, but a JOIN holds
+/// it for seconds, and `net-stack` budgets its own wait at a second - so this loses that race rather than
+/// winning it, and a silent radio reads as no link for one poll, never as a hang.
+const RADIO_SECS: i64 = 1;
+
+/// The radio as a backend: `wifi-driver` reached over the frame ops, the way the Pi 2's `nic-driver`
+/// reaches `dwc2` (`main.rs`, `kernel_net_main`) - one bounded request, one reacquire-and-retry when the
+/// cap is stale (the radio is spawned by the supervisor and may be respawned after us), and every reply
+/// checked against the op it answers, because the radio's endpoint also serves the `wifi` utility and a
+/// late reply would otherwise be read as the next answer.
+struct Radio {
+    timeouts: u32,
+    mismatch: u32,
+    sendfail: u32,
+    restale: u32,
+}
+
+impl Radio {
+    fn new() -> Self {
+        Radio { timeouts: 0, mismatch: 0, sendfail: 0, restale: 0 }
+    }
+
+    fn rpc(&mut self, ctx: &ServiceContext, msg: &Message) -> Option<Message> {
+        let want = msg.payload_bytes().first().copied().unwrap_or(0);
+        let got = match ctx.request_with_reply_call_err("wifi-driver", msg, RADIO_SECS) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                self.timeouts = self.timeouts.saturating_add(1);
+                return None;
+            }
+            Err(_) => {
+                if !ctx.reacquire_by_name("wifi-driver") {
+                    self.sendfail = self.sendfail.saturating_add(1);
+                    return None;
+                }
+                match ctx.request_with_reply_call_err("wifi-driver", msg, RADIO_SECS) {
+                    Ok(Some(r)) => {
+                        self.restale = self.restale.saturating_add(1);
+                        if self.restale == 1 || self.restale % 128 == 0 {
+                            ctx.log_fmt(format_args!(
+                                "nic-driver: wifi-driver cap was stale - reacquired by name and the request went through ({} so far)",
+                                self.restale));
+                        }
+                        r
+                    }
+                    Ok(None) => {
+                        self.timeouts = self.timeouts.saturating_add(1);
+                        return None;
+                    }
+                    Err(_) => {
+                        self.sendfail = self.sendfail.saturating_add(1);
+                        return None;
+                    }
+                }
+            }
+        };
+        if got.payload_bytes().first().copied() != Some(want) {
+            // A driver with no radio answers every op with one byte, "radio down"; a late reply to an
+            // earlier op is the other way this happens. Either way it is not the answer to this ask.
+            self.mismatch = self.mismatch.saturating_add(1);
+            if self.mismatch == 1 || self.mismatch % 128 == 0 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: wifi-driver answered {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} timed out, {} never sent)",
+                    got.payload_bytes().first().copied().unwrap_or(0), want,
+                    self.mismatch, self.timeouts, self.sendfail));
+            }
+            return None;
+        }
+        Some(got)
+    }
+
+    /// `[0x10]` -> `(mac, link up)`, or `None` when the radio did not answer or has no address yet.
+    fn info(&mut self, ctx: &ServiceContext) -> Option<([u8; 6], bool)> {
+        let r = self.rpc(ctx, &Message::from_bytes(&[0x10]))?;
+        let p = r.payload_bytes();
+        if p.len() < 9 || p[1] == 0 {
+            return None;
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&p[2..8]);
+        Some((mac, p[8] != 0))
+    }
+
+    fn tx(&mut self, ctx: &ServiceContext, frame: &[u8]) -> bool {
+        let mut req = [0u8; 1 + FRAME_MAX];
+        let n = frame.len().min(FRAME_MAX);
+        req[0] = 0x11;
+        req[1..1 + n].copy_from_slice(&frame[..n]);
+        match self.rpc(ctx, &Message::from_bytes(&req[..1 + n])) {
+            Some(r) => {
+                let p = r.payload_bytes();
+                p.len() > 1 && p[1] != 0
+            }
+            None => false,
+        }
+    }
+
+    fn rx(&mut self, ctx: &ServiceContext, buf: &mut [u8]) -> usize {
+        let r = match self.rpc(ctx, &Message::from_bytes(&[0x12])) {
+            Some(r) => r,
+            None => return 0,
+        };
+        let p = r.payload_bytes();
+        if p.len() < 3 {
+            return 0;
+        }
+        let n = (p[1] as usize) | ((p[2] as usize) << 8);
+        if n == 0 || p.len() < 3 + n || n > buf.len() {
+            return 0;
+        }
+        buf[..n].copy_from_slice(&p[3..3 + n]);
+        n
+    }
+}
+
 fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     let mut tx_next: u32 = 0;
     // Bounds the post-transmit counter report, so a diagnostic cannot become a console flood (§26.6).
@@ -1281,6 +1420,12 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     // a fresh transition - `bring_up` has just applied the settings for it.
     let mut link_was_up = g.link_is_up();
     let mut rxbuf = [0u8; FRAME_MAX];
+    // WHICH LINK CARRIES THE FRAMES - see `Carrier`. Between re-reads, `cable` is the answer.
+    let mut cable = link_was_up;
+    let mut cable_read_at = ctx.read_tsc();
+    let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
+    let mut radio = Radio::new();
+    let mut radio_tx_fail: u32 = 0;
 
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets on
     // every iteration and reports every time, which is the flood it exists to prevent.
@@ -1307,40 +1452,16 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
         };
         let p = req.payload_bytes();
 
-        if p.len() == 1 && p[0] == 3 {
-            // STATUS: [ok, mac(6), link] - net-stack reads the MAC at [1..7] and the link at [7]. The
-            // link is read LIVE over MDIO, so a cable pulled after bring-up reports down.
-            let mut out = [0u8; 8];
-            out[0] = 1;
-            out[1..7].copy_from_slice(&mac);
-            // RE-APPLY the link settings when a cable arrives after bring-up.
-            //
-            // `apply_link_settings` (MAC speed + DMA burst) runs only during `bring_up`. Boot WITH a
-            // cable and the PHY has negotiated by then, so the speed is programmed and the receiver
-            // works. Boot WITHOUT one and it logs "PHY has not settled on a speed - leaving the MAC at
-            // its default", and nothing ever ran it again - so when the cable appeared the MAC was
-            // still unclocked and NOTHING was received. Measured, not guessed: net-stack's DHCP dance
-            // reported "saw 0 frames" on every hot-plug attempt, against 4-5 frames per attempt on a
-            // cable-at-boot run.
-            //
-            // Done HERE because this is the one place the link is already read live, on the status
-            // request net-stack makes before it dances - so the settings are applied a moment before
-            // the frames that need them, with no polling added anywhere.
-            //
-            // Edge-triggered: only on a down -> up TRANSITION. Re-running it on every status request
-            // would rewrite MAC registers under live traffic for no reason.
+        // THE CABLE, re-read at most every CABLE_RECHECK_MS on whatever request arrives (`Carrier`). A
+        // link that came up after bring-up gets the MAC speed and DMA burst re-applied, edge-triggered,
+        // exactly as the STATUS request used to do it alone; if the re-apply does not take, the edge
+        // stays pending and is retried on the next read.
+        let now = ctx.read_tsc();
+        if now.wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
+            cable_read_at = now;
             let up_now = g.link_is_up();
             if up_now && !link_was_up {
                 ctx.log("nic-driver: genet link came up after bring-up - re-applying MAC speed and DMA burst");
-                // CONSUME THE EDGE ONLY IF THE RE-APPLY ACTUALLY WORKED (audit A5-1, Commandments V
-                // and IX). `apply_link_settings` returns 0 when the PHY has not settled - and it reads
-                // a DIFFERENT register (the aux status) from `link_is_up`'s BMSR bit, so it can fail on
-                // a link that genuinely is up, or on any failed MDIO read. Marking the edge consumed
-                // regardless meant one unlucky read left the MAC unclocked FOREVER: nothing received,
-                // and no second chance short of a physical replug.
-                //
-                // A recovery that fails must not be recorded as a recovery that happened. Leaving
-                // `link_was_up` false keeps the edge pending, so the next status request tries again.
                 if g.apply_link_settings() != 0 {
                     link_was_up = true;
                 } else {
@@ -1349,14 +1470,55 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             } else {
                 link_was_up = up_now;
             }
-            out[7] = up_now as u8;
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+            cable = up_now;
         }
+
+        if p.len() == 1 && p[0] == 3 {
+            // STATUS: [ok, mac(6), link, carrier] - net-stack reads the MAC at [1..7] and the link at
+            // [7]. The ninth byte names the carrier for `net` (1 the cable, 2 the radio, 0 neither), and
+            // is what makes this reply nine bytes where every other backend's is eight or more, so a
+            // reader can tell whose it is. The link is LIVE either way: the cable from the PHY, the radio
+            // from `wifi-driver`'s own word on its join.
+            let mut out = [0u8; 9];
+            out[0] = 1;
+            let next = if cable {
+                out[1..7].copy_from_slice(&mac);
+                out[7] = 1;
+                out[8] = 1;
+                Carrier::Cable
+            } else {
+                match radio.info(ctx) {
+                    Some((rmac, true)) => {
+                        out[1..7].copy_from_slice(&rmac);
+                        out[7] = 1;
+                        out[8] = 2;
+                        Carrier::Radio
+                    }
+                    _ => {
+                        out[1..7].copy_from_slice(&mac);
+                        out[7] = 0;
+                        out[8] = 0;
+                        Carrier::None
+                    }
+                }
+            };
+            if next != carrier {
+                match next {
+                    Carrier::Cable => ctx.log("nic-driver: the cable carries the link; the radio stands by"),
+                    Carrier::Radio => ctx.log_fmt(format_args!(
+                        "nic-driver: the cable is out - the radio carries the link (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                        out[1], out[2], out[3], out[4], out[5], out[6])),
+                    Carrier::None => ctx.log("nic-driver: the cable is out and the radio is not joined - no link"),
+                }
+                carrier = next;
+            }
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)).is_err() && !reply_failed_logged {
+                reply_failed_logged = true;
+                ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+            }
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
-            let n = g.receive(&mut rxbuf);
+            let n = if cable { g.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
             if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])).is_err() && !reply_failed_logged {
             reply_failed_logged = true;
             ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
@@ -1375,7 +1537,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                     break;
                 }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = g.receive(&mut rx);
+                let n = if cable { g.receive(&mut rx) } else { radio.rx(ctx, &mut rx) };
                 if n == 0 {
                     break;
                 }
@@ -1402,7 +1564,19 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
         }
         } else {
             // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
-            if !g.transmit(p, &mut tx_next) {
+            if !cable {
+                // The radio's turn (`Carrier`): the frame goes to `wifi-driver` as op 0x11 and the answer
+                // is its word. A refusal is counted and reported sparingly: the stack retries on its own
+                // pace, and a radio that is not joined refuses every frame, correctly.
+                if !radio.tx(ctx, p) {
+                    radio_tx_fail = radio_tx_fail.saturating_add(1);
+                    if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, no credit, or no answer",
+                            p.len(), radio_tx_fail));
+                    }
+                }
+            } else if !g.transmit(p, &mut tx_next) {
                 // A failed transmit must not be dropped on the floor: the reply would still come back
                 // normally, so net-stack would wait out its whole deadline for an answer to a frame
                 // that never left the host - a send that did not happen, reported as one that did.

@@ -1728,6 +1728,9 @@ const SNTP_TRIES: u32 = 3;
 /// request, short enough that plugging a cable in gets a clock within a minute without anyone asking.
 /// Only paid while the clock is UNSET - once it is known this costs a single cheap read.
 const RESYNC_SECS: i64 = 60;
+/// How often a configured stack re-reads the link's ADDRESS (op 3) to notice that a different link is
+/// carrying its frames. Seconds rather than a minute because a person who pulled a cable is waiting.
+const ADDR_CHECK_SECS: i64 = 2;
 
 /// SNTP: fetch the current time from an NTP server and set the wall clock. The RTC-less Pi 2 has no other
 /// time source, so `date` reads zero until this runs (auto on boot after the DHCP dance, and on `date
@@ -2615,6 +2618,19 @@ fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
     }
 }
 
+/// The link's state AND address from one status query: `(up, mac)`. `None` is a timeout or an
+/// unreadable answer, not a reading - the caller must not act on it.
+fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8; 6])> {
+    let r = nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS)?;
+    let p = r.payload_bytes();
+    if p.len() < 8 || p[0] == 0 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&p[1..7]);
+    Some((p[7] != 0, mac))
+}
+
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -2792,6 +2808,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Same, for the gateway-only ARP retry below - separate from the DHCP one so a re-dance and a
     // gateway retry cannot consume each other's budget.
     let mut last_gw_arp_at: i64 = -RESYNC_SECS;
+    let mut last_addr_check_at: i64 = 0;
     /// Latched once the wall clock is known. A clock never becomes unset, so this is asked at most once.
     let mut clock_known = false;
     // Labelled so the wait below can hand control back here when the poll step displaces a client
@@ -3207,6 +3224,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Spaced by RESYNC_SECS because `arp_resolve` blocks this loop for its whole budget, and an
         // unreachable gateway is a steady state - retrying it per request would block every caller for
         // twelve seconds each, which is the starvation the log showed as `net-stack not responding`.
+        // A LINK WHOSE ADDRESS CHANGED IS A DIFFERENT LINK. On the Pi 4 `nic-driver` carries these frames
+        // over the cable while there is one and over the radio when there is not (`Carrier` in its
+        // genet backend; the operator's rule is that the cable always wins), and the radio has its own
+        // MAC. A cable pulled and put back is the SAME link and resumes without a dance, as the note
+        // above says; a cable pulled while the radio is joined is a different link, and the lease, the
+        // gateway's ARP entry and our own source address all belong to the old one. So a configured
+        // stack re-reads the address every ADDR_CHECK_SECS on a network-using request, and a changed
+        // one re-runs the dance - the same self-configure a fresh cable gets, for the same reason.
+        //
+        // This is the one thing docs/wifi.md 2 did not foresee when it said this service needed no
+        // change: the FRAME protocol is untouched, but no cable ever changed its address under the
+        // stack, and a radio does.
+        if badge.is_none() && our_mac != [0u8; 6]
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
+            && ctx.epoch_secs_monotonic() - last_addr_check_at >= ADDR_CHECK_SECS
+        {
+            last_addr_check_at = ctx.epoch_secs_monotonic();
+            if let Some((true, mac)) = link_addr(&ctx, pending) {
+                if mac != [0u8; 6] && mac != our_mac {
+                    ctx.log_fmt(format_args!(
+                        "net-stack: the link's address changed ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) - a different link carries the frames now; re-configuring",
+                        our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5],
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+                    let d = run_dance(&ctx, pending, Some(&status));
+                    our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
+                    synced_by_dance = true;
+                }
+            }
+        }
         if badge.is_none() && leased && !gw_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && ctx.epoch_secs_monotonic() - last_gw_arp_at >= RESYNC_SECS

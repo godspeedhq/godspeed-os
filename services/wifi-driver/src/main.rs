@@ -47,6 +47,7 @@ mod bus;
 mod crypto;
 mod ctrl;
 mod eapol;
+mod frames;
 mod scan;
 mod firmware;
 mod erom;
@@ -134,6 +135,38 @@ fn serve_radio(
     // When the join was reported, and with what security - for `status`'s `joined N s ago` and `security`.
     let mut joined_at_secs: i64 = 0;
     let mut joined_security: u8 = scan::sec::OPEN;
+    // THE FRAME PATH (`frames.rs`): what `nic-driver` asks once the cable is out. The queue is bounded
+    // and on this stack; the address is asked of the chip once; the rekey count is for the log.
+    let mut rxq = frames::RxQueue::new();
+    let mut link_mac: Option<[u8; 6]> = None;
+    let mut rekey_seen: u32 = 0;
+    /// What a pull saw about the link, applied to the driver's memory of the join - here, so the frame
+    /// module need not know what a join is.
+    fn note_pull(
+        p: &frames::Pulled,
+        joined: &mut Option<([u8; join::MAX_SSID], u8)>,
+        rekey_seen: &mut u32,
+        ctx: &ServiceContext,
+    ) {
+        if let Some((event, reason)) = p.dropped_link {
+            if joined.is_some() {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: the access point dropped the link (event {} - {}, reason {}) - not joined; `wifi join` returns",
+                    event, scan::code::name(event), reason
+                ));
+            }
+            *joined = None;
+        }
+        if p.rekey > 0 {
+            let first = *rekey_seen == 0;
+            *rekey_seen = rekey_seen.wrapping_add(p.rekey);
+            if first {
+                ctx.log(
+                    "wifi-driver: an EAPOL-Key frame arrived AFTER the join - the access point is rekeying the group                      key, which this driver does not answer yet; the link drops at its rekey interval and `wifi join`                      brings it back (backlog/64)",
+                );
+            }
+        }
+    }
 
     // THE CREDENTIAL SLOTS (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
     // from its passphrase, sixty-four of them. The passphrase itself is gone the moment the key exists. When
@@ -288,6 +321,7 @@ fn serve_radio(
                 // and a stale belief here must not stop the operator leaving a network.
                 let _ = ctrl::disassoc(h, w, session, ctx);
                 joined = None;
+                rxq.clear();
                 out[0] = scan::reply::OK;
                 out[1] = was_joined as u8;
                 2
@@ -560,6 +594,7 @@ fn serve_radio(
                             if outcome == join::Outcome::Joined {
                                 joined = Some((name_of(ssid), ssid_len as u8));
                                 joined_at_secs = ctx.epoch_secs_monotonic();
+                                rxq.clear();
                                 joined_security = if matches!(secret, join::Secret::Open) {
                                     scan::sec::OPEN
                                 } else {
@@ -730,6 +765,65 @@ fn serve_radio(
                 out[0] = scan::reply::OK;
                 out[1] = dropped as u8;
                 2
+            }
+            // ---- THE FRAME INTERFACE (`frames.rs`), served to `nic-driver` alongside the `wifi` ops. The
+            // op numbers start at 0x10 for the reason `dwc2`'s do: they share an endpoint with another
+            // protocol. Every reply is tagged with its op, because the caller bounds its wait and a late
+            // answer must not be read as the next one. ----
+            (frames::OP_NET_INFO, Some(session)) => {
+                // `[op, ok, mac(6), link]`. The address is the chip's, asked once; the link is this
+                // driver's memory of the join, which every pull keeps honest. Not asked mid-sweep: a
+                // control exchange would eat the sweep's frames, and a sweep is a moment of no link.
+                out[0] = frames::OP_NET_INFO;
+                if link_mac.is_none() && sweep.is_none() {
+                    let mut mac = [0u8; 6];
+                    if matches!(ctrl::query_iovar(h, w, session, "cur_etheraddr", &mut mac, ctx), Some(n) if n >= 6) {
+                        link_mac = Some(mac);
+                    }
+                }
+                match link_mac {
+                    Some(mac) => {
+                        out[1] = 1;
+                        out[2..8].copy_from_slice(&mac);
+                    }
+                    None => {
+                        out[1] = 0;
+                        out[2..8].fill(0);
+                    }
+                }
+                out[8] = (radio_on && joined.is_some() && sweep.is_none()) as u8;
+                9
+            }
+            (frames::OP_NET_TX, Some(session)) => {
+                // `[op, sent]`. Refused, not queued, when there is no link to send on: the stack retries
+                // on its own pace and a refusal is a fact it can act on.
+                out[0] = frames::OP_NET_TX;
+                let eth = &payload[1..];
+                let mut sent = false;
+                if radio_on && joined.is_some() && sweep.is_none() && eth.len() >= scan::ev::ETHHDR {
+                    if !session.tx_ok() {
+                        // Credit comes back on received frames; a stack that only sends runs dry.
+                        let p = frames::pull(h, w, session, &mut rxq, &mut frame, ctx);
+                        note_pull(&p, &mut joined, &mut rekey_seen, ctx);
+                    }
+                    if joined.is_some() {
+                        sent = ctrl::send_data(h, w, session, eth, ctx);
+                    }
+                }
+                out[1] = sent as u8;
+                2
+            }
+            (frames::OP_NET_RX, Some(session)) => {
+                // `[op, len_lo, len_hi, frame...]`, oldest first; a length of 0 is "nothing waiting".
+                // The chip is read only when the queue is empty and the radio has a link to read.
+                out[0] = frames::OP_NET_RX;
+                if rxq.is_empty() && radio_on && joined.is_some() && sweep.is_none() {
+                    let p = frames::pull(h, w, session, &mut rxq, &mut frame, ctx);
+                    note_pull(&p, &mut joined, &mut rekey_seen, ctx);
+                }
+                let n = rxq.pop(&mut out[3..]);
+                out[1..3].copy_from_slice(&(n as u16).to_le_bytes());
+                3 + n
             }
             _ => {
                 out[0] = scan::reply::UNKNOWN_OP;

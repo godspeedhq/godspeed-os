@@ -43,6 +43,12 @@ What every verb does, and what was seen:
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
+- **The frame path is BUILT (2026-09-29, phase 5) and not yet run on hardware.** The driver serves the
+  frame interface to `nic-driver` (`docs/wifi.md` 41), which carries `net-stack`'s frames over the radio
+  whenever the cable is out and the radio is joined - and back over the cable when it returns (section
+  10). What the first boot must show: pull the cable with the radio joined, and `ping` answers; `net`
+  says `link  up via wifi`.
+
 - **The WPA2 handshake is hardware-verified through message 4 (2026-09-29, 19:44) and not yet through the
   key install.** Three joins with the right passphrase: message 2 went out, message 3 arrived and its MIC
   verified (so the PMK, the PTK derivation and the MIC path are right), the group key unwrapped, message 4
@@ -527,3 +533,23 @@ Following `docs/wifi.md` §9, and for the same reasons: no enterprise or 802.1X,
 channel selection, no hidden-SSID entry by name in the first version (the picker reaches one by
 BSSID; `wifi join <ssid>` does not), and no signal-strength monitor - `observe` is where live views
 live, and a second one here would be the duplication rule 7 exists to prevent.
+
+## 10. Which link carries the frames: the cable always wins
+
+Decided by the operator on 2026-09-29, after the first joined boot: *"cable always wins. unplug the
+cable, switch to wifi automatically."*
+
+- **`wifi join` makes the radio available; the cable decides.** While the ethernet cable reports a link,
+  every frame goes over it. Pull the cable and, within about a second, the frames go over the radio - if
+  it is joined. Plug it back and they return to the cable. Nothing is typed for either switch.
+- **`wifi leave` and `radio off` take the radio out of that choice**; with the cable out too, the link is
+  down and `net` says so.
+- **`net` names the carrier**: `link  up via the cable`, `link  up via wifi (the cable is out)`, or
+  `link  down - no cable, and the radio is not joined`. `wifi status` says whether the radio is JOINED,
+  which is a different fact: a joined radio with the cable in is standing by.
+- **A switch re-configures the network.** The radio has its own address, so the stack sees a different
+  link and asks for a lease again (`docs/wifi.md` 41). A `ping` in flight across the switch loses its
+  replies for a second or two; that is the switch, not a fault.
+- **Where the rule lives.** In `nic-driver`, which is the link front end on every board (`docs/wifi.md`
+  2) - one comparison, `Carrier` in its genet backend. `net-stack` never learns there are two links, and
+  the `wifi` utility never learns there is a cable.

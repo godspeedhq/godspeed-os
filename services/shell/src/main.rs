@@ -8846,6 +8846,16 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                     p[1], p[2], p[3], p[4], p[5], p[6],
                     if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
             }
+            // A nine-byte answer is the Pi 4's, and its last byte says which link carries the frames
+            // (`Carrier` in nic-driver's genet backend): 1 the cable, 2 the radio, 0 neither. The cable
+            // always wins; the radio carries the link only while the cable is out and it is joined.
+            if p.len() == 9 {
+                out.line_fmt(ctx, format_args!("link     {}", match p[8] {
+                    1 => "up via the cable",
+                    2 => "up via wifi (the cable is out)",
+                    _ => "down - no cable, and the radio is not joined",
+                }));
+            }
             // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
             // whole bring-up story without the serial log.
             if p.len() >= 15 {

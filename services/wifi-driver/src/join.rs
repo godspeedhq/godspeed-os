@@ -92,7 +92,7 @@ pub const MAX_PASSPHRASE: usize = 64;
 pub use crate::scan::MAX_SSID;
 
 /// `BRCMF_EVENT_MSG_LINK`: in a `LINK` event's flags, the link is up.
-const EVENT_MSG_LINK: u16 = 0x01;
+pub(crate) const EVENT_MSG_LINK: u16 = 0x01;
 
 /// How a join ended. Mirrors `scan::reply`'s connect statuses one for one.
 #[derive(Clone, Copy, PartialEq, Eq)]

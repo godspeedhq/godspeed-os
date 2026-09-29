@@ -329,6 +329,10 @@ mod board {
     /// every other board's NIC is on a bus its driver reaches directly.
     pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
         &["dwc2", "events"]
+    } else if cfg!(has_wifi_driver) {
+        // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always
+        // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops.
+        &["wifi-driver", "events"]
     } else {
         &["events"]
     };
@@ -1594,7 +1598,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // They were simply missed when adoption came in with Path C / Phase 6; `fs`, `shell`, `dwc2`,
     // `block-driver`, `time` and `control` were all converted. Nothing else about them is special.
-    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
+
+    // wifi-driver: the onboard radio (docs/wifi.md). Gated on the IMAGE being embedded and nothing
+    // else - the kernel is the one that decides whether this board actually has the controller, and it
+    // refuses the MMIO grant where its census found none. So on a radioless aarch64 machine this
+    // service starts, reports "no radio to drive on this machine", and serves; it does not die on a
+    // register read, and it does not need a second presence question here that could disagree with the
+    // kernel's.
+    //
+    // Not in the test-build feature list that guards `xhci`: those builds are x86 harness images and
+    // never carry this image at all, so the cfg above already excludes them.
+    //
+    // `ensure_mapped` ADOPTS a running instance rather than spawning a second. The supervisor is
+    // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one SD host
+    // controller is a worse failure than the one it would be fixing.
+    //
+    // BEFORE nic-driver, because nic-driver declares this service as a peer (the radio is the link's
+    // fifth backend, docs/wifi.md 2) and a peer already in the name-cap map wires at spawn; one that is
+    // not costs a round of failure and reacquire (services/CLAUDE.md, the spawn order is a dependency
+    // order). The radio's own bring-up runs in its task and holds nobody up.
+    #[cfg(has_wifi_driver)]
+    ensure_mapped(&ctx, &mut name_map, "wifi-driver", 0xFFFF);
+
+   ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
     // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
     // frames THROUGH nic-driver's frame interface, so it is spawned right AFTER nic-driver and WIRED
@@ -1610,22 +1636,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // peers are deliberately NOT re-installed: the running service still holds the caps its original
     // spawn gave it - they live in its own table and a supervisor restart does not touch them.
     ensure_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
-
-    // wifi-driver: the onboard radio (docs/wifi.md). Gated on the IMAGE being embedded and nothing
-    // else - the kernel is the one that decides whether this board actually has the controller, and it
-    // refuses the MMIO grant where its census found none. So on a radioless aarch64 machine this
-    // service starts, reports "no radio to drive on this machine", and serves; it does not die on a
-    // register read, and it does not need a second presence question here that could disagree with the
-    // kernel's.
-    //
-    // Not in the test-build feature list that guards `xhci`: those builds are x86 harness images and
-    // never carry this image at all, so the cfg above already excludes them.
-    //
-    // `ensure_mapped` ADOPTS a running instance rather than spawning a second. The supervisor is
-    // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one SD host
-    // controller is a worse failure than the one it would be fixing.
-    #[cfg(has_wifi_driver)]
-    ensure_mapped(&ctx, &mut name_map, "wifi-driver", 0xFFFF);
 
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
     // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
