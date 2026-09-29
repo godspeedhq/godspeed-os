@@ -950,7 +950,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("wifi",    &["list", "connect", "disconnect", "status", "forget", "stored", "radio"]),
+    ("wifi",    &["scan", "list", "connect", "disconnect", "status", "forget", "stored", "radio"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -5139,7 +5139,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "wifi" => help_block(ctx, "wifi", "join and inspect a wireless network", &[
             ("wifi", "radio state and which network is joined", "wifi"),
-            ("wifi list", "scan and list the networks in range", "wifi list"),
+            ("wifi scan", "sweep for networks; ends in a numbered picker (q stops the sweep, b backgrounds it)", "wifi scan"),
+            ("wifi list", "the last complete scan, one record per network; never scans", "wifi list"),
             ("wifi connect <ssid>", "join a network (prompts for the passphrase; never takes it as an argument)", "wifi connect Bankole-WiFi"),
             ("wifi disconnect", "leave the current network; the radio stays up", "wifi disconnect"),
             ("wifi status", "the same as bare `wifi`", "wifi status"),
