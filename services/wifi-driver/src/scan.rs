@@ -477,8 +477,8 @@ pub mod reply {
     /// The radio was powered off by `wifi radio off`; a sweep or a join is refused until `radio on`. Distinct
     /// from `RADIO_DOWN`, which is a radio that never came up.
     pub const RADIO_OFF: u8 = 7;
-    /// Request op byte: which network a key is held for. Reply `[OK, count(0|1), len, ssid[32]]` - the name
-    /// only, never the key (`utilities/56_wifi.md` §3).
+    /// Request op byte: which networks a key is held for. Reply `[OK, count, (len, ssid[32]) * count]` - names
+    /// only, never a key (`utilities/56_wifi.md` §3); 64 slots at most.
     pub const OP_STORED: u8 = 9;
     /// Request op byte: `[10, len, ssid[32]]` - drop the held key for that network. Reply `[OK, dropped(0|1)]`.
     pub const OP_FORGET: u8 = 10;

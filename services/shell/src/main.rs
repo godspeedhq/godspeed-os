@@ -7912,8 +7912,8 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `wifi stored` - the network a key is held for. A name, never a secret; there is one slot
-/// (`utilities/56_wifi.md` 6), and it is empty after a reboot or a driver restart.
+/// `wifi stored` - the networks a key is held for, one per line. Names, never secrets; the table
+/// (`utilities/56_wifi.md` 6) is empty after a reboot or a driver restart.
 fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
@@ -7923,20 +7923,26 @@ fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     };
     let p = r.payload_bytes();
     match p.first().copied() {
-        Some(OK) if p.len() >= 3 + SSID_MAX => {
-            if p[1] == 0 {
-                out.line_fmt(ctx, format_args!("no stored network - a passphrase is kept from the next wifi connect until reboot"));
+        Some(OK) if p.len() >= 2 => {
+            // `[OK, count, (len, ssid[32]) * count]` - one name per line, so it pipes like any list.
+            let count = p[1] as usize;
+            if count == 0 {
+                out.line_fmt(ctx, format_args!("no stored networks - a passphrase is kept from wifi connect until reboot"));
                 return Ok(());
             }
-            let len = core::cmp::min(p[2] as usize, SSID_MAX);
-            let mut shown = [b'.'; SSID_MAX];
-            let name = wifi_ssid_text(&p[3..3 + len], &mut shown);
-            out.line_fmt(ctx, format_args!("{}", name));
+            let mut at = 2;
+            for i in 0..count {
+                if at + 1 + SSID_MAX > p.len() {
+                    out.line_fmt(ctx, format_args!("wifi: the reply ended after {} of {} name(s)", i, count));
+                    break;
+                }
+                let len = core::cmp::min(p[at] as usize, SSID_MAX);
+                let mut shown = [b'.'; SSID_MAX];
+                let name = wifi_ssid_text(&p[at + 1..at + 1 + len], &mut shown);
+                out.line_fmt(ctx, format_args!("{}", name));
+                at += 1 + SSID_MAX;
+            }
             Ok(())
-        }
-        Some(OK) => {
-            out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short reply"));
-            Err(ShellError::Unknown)
         }
         Some(s) => wifi_radio_unavailable(ctx, out, s),
         None => wifi_not_answering(ctx, out),

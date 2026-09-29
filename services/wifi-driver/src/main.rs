@@ -103,8 +103,9 @@ fn serve_radio(
     w: &mut backplane::Window,
     mut radio: Option<ctrl::Session>,
 ) -> ! {
-    // Bounded: 2 status bytes plus 32 records of 44 is 1410, inside this fixed buffer, inside a 4 KiB message.
-    let mut out = [0u8; 1536];
+    // Bounded: 2 status bytes plus 32 records of 44 is 1410 for a list, and 2 plus 64 names of 33 is 2114 for
+    // `stored` - both inside this fixed buffer, inside a 4 KiB message.
+    let mut out = [0u8; 2560];
 
     // THE SWEEP IS A STATE, NOT A CALL. `wifi scan` starts one and returns; the loop below advances it one
     // frame per turn and answers requests between frames, so `wifi list`, `wifi status` and an abort are
@@ -134,16 +135,46 @@ fn serve_radio(
     let mut joined_at_secs: i64 = 0;
     let mut joined_security: u8 = scan::sec::OPEN;
 
-    // THE ONE CREDENTIAL SLOT (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
-    // from its passphrase. The passphrase itself is gone the moment the key exists. One slot, by decision:
-    // the cafe replaces home, and home is typed once more on return. It lives here and nowhere else - not on
-    // disk, so it needs no `fs` and never writes a network name to the card - and dies with this instance.
+    // THE CREDENTIAL SLOTS (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
+    // from its passphrase, sixty-four of them. The passphrase itself is gone the moment the key exists. When
+    // every slot is held, the one JOINED LONGEST AGO is replaced. They live here and nowhere else - not on
+    // disk, so they need no `fs` and never write a network name to the card - and die with this instance.
+    // About 70 bytes each, some 4.5 KiB in all, against a 16 MiB limit: the count is a BOUND (26.6), chosen
+    // so that nobody reaches it, not a fit to the memory - a table that grew to fill what is available is
+    // the elastic growth 26.6.1 says to resist.
     struct Stored {
         ssid: [u8; join::MAX_SSID],
         len: u8,
         pmk: [u8; crypto::PMK_LEN],
+        /// When this key was last used to join (or was stored), monotonic seconds - the replacement order.
+        used_at: i64,
     }
-    let mut stored: Option<Stored> = None;
+    const CREDENTIAL_SLOTS: usize = 64;
+    let mut stored: [Option<Stored>; CREDENTIAL_SLOTS] = core::array::from_fn(|_| None);
+    /// The slot holding this name, if any.
+    fn slot_of(stored: &[Option<Stored>], ssid: &[u8]) -> Option<usize> {
+        stored.iter().position(|s| {
+            s.as_ref().map(|st| st.len as usize == ssid.len() && &st.ssid[..ssid.len()] == ssid).unwrap_or(false)
+        })
+    }
+    /// Where a new key goes: the slot already holding this name, else a free one, else the one used longest ago.
+    fn slot_for(stored: &[Option<Stored>], ssid: &[u8]) -> usize {
+        if let Some(i) = slot_of(stored, ssid) {
+            return i;
+        }
+        if let Some(i) = stored.iter().position(|s| s.is_none()) {
+            return i;
+        }
+        let mut oldest = 0;
+        for (i, s) in stored.iter().enumerate() {
+            if let (Some(a), Some(b)) = (s.as_ref(), stored[oldest].as_ref()) {
+                if a.used_at < b.used_at {
+                    oldest = i;
+                }
+            }
+        }
+        oldest
+    }
 
     // The primitives that turn a passphrase into a key, checked against their published vectors. A wrong hash
     // would be refused by every access point in a way indistinguishable from a wrong passphrase, so if this
@@ -423,33 +454,41 @@ fn serve_radio(
                         name[..ssid.len()].copy_from_slice(ssid);
                         name
                     };
-                    let matches_stored = stored
-                        .as_ref()
-                        .map(|st| st.len as usize == ssid_len && &st.ssid[..ssid_len] == ssid)
-                        .unwrap_or(false);
+                    let now = ctx.epoch_secs_monotonic();
+                    let mut use_slot: Option<usize> = None;
                     if pass_len > 0 && crypto_ok {
                         let pmk = crypto::psk(pass, ssid);
-                        stored = Some(Stored { ssid: name_of(ssid), len: ssid_len as u8, pmk });
-                        ctx.log("wifi-driver: pairwise master key derived from the passphrase and kept in the one credential slot");
+                        let i = slot_for(&stored, ssid);
+                        let replaced = stored[i].is_some() && slot_of(&stored, ssid) != Some(i);
+                        stored[i] = Some(Stored { ssid: name_of(ssid), len: ssid_len as u8, pmk, used_at: now });
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: pairwise master key derived from the passphrase and kept in credential slot {}{}",
+                            i,
+                            if replaced { " (replacing the one used longest ago)" } else { "" }
+                        ));
+                        use_slot = Some(i);
+                    } else if pass_len == 0 {
+                        if let Some(i) = slot_of(&stored, ssid) {
+                            ctx.log_fmt(format_args!("wifi-driver: joining with the key in credential slot {}", i));
+                            use_slot = Some(i);
+                        }
                     }
+                    if let Some(i) = use_slot {
+                        if let Some(st) = stored[i].as_mut() {
+                            st.used_at = now;
+                        }
+                    }
+                    // A match rather than an unwrap on every slot read: a service never halts (Commandment V).
                     let secret = if pass_len > 0 {
-                        // Derived just above, or refused because the primitives failed their self-test. A
-                        // match rather than an unwrap: a service never halts the machine (Commandment V).
-                        match &stored {
-                            Some(st) if crypto_ok => Some(join::Secret::Pmk(&st.pmk)),
-                            _ => {
+                        match use_slot.and_then(|i| stored[i].as_ref()) {
+                            Some(st) => Some(join::Secret::Pmk(&st.pmk)),
+                            None => {
                                 ctx.log("wifi-driver: a passphrase arrived and the key derivation failed its self-test at boot - refused");
                                 None
                             }
                         }
-                    } else if matches_stored {
-                        match &stored {
-                            Some(st) => {
-                                ctx.log("wifi-driver: joining with the stored key");
-                                Some(join::Secret::Pmk(&st.pmk))
-                            }
-                            None => None,
-                        }
+                    } else if let Some(st) = use_slot.and_then(|i| stored[i].as_ref()) {
+                        Some(join::Secret::Pmk(&st.pmk))
                     } else if cache
                         .as_ref()
                         .and_then(|c| c.scan.find(ssid))
@@ -498,37 +537,35 @@ fn serve_radio(
                 }
             }
             (scan::reply::OP_STORED, Some(_)) => {
+                // `[OK, count, (len, ssid[32]) * count]` - names only, in slot order.
                 out[0] = scan::reply::OK;
-                match &stored {
-                    Some(st) => {
-                        out[1] = 1;
-                        out[2] = st.len;
-                        out[3..3 + join::MAX_SSID].copy_from_slice(&st.ssid);
-                    }
-                    None => {
-                        out[1] = 0;
-                        out[2] = 0;
-                        out[3..3 + join::MAX_SSID].fill(0);
-                    }
+                let mut count = 0u8;
+                let mut at = 2;
+                for st in stored.iter().flatten() {
+                    out[at] = st.len;
+                    out[at + 1..at + 1 + join::MAX_SSID].copy_from_slice(&st.ssid);
+                    at += 1 + join::MAX_SSID;
+                    count += 1;
                 }
-                3 + join::MAX_SSID
+                out[1] = count;
+                at
             }
             (scan::reply::OP_FORGET, Some(_)) => {
                 // `[10, len, ssid[32]]`.
                 let len = core::cmp::min(payload.get(1).copied().unwrap_or(0) as usize, join::MAX_SSID);
-                let dropped = match (&mut stored, payload.get(2..2 + len)) {
-                    (Some(st), Some(ssid)) if st.len as usize == len && &st.ssid[..len] == ssid => {
-                        // Zeroed, not just forgotten: the key must not linger in a slot nothing points at.
-                        st.pmk.fill(0);
-                        st.ssid.fill(0);
-                        st.len = 0;
+                let dropped = match payload.get(2..2 + len).and_then(|ssid| slot_of(&stored, ssid)) {
+                    Some(i) => {
+                        // Zeroed, not just forgotten: the key must not linger in memory nothing points at.
+                        if let Some(st) = stored[i].as_mut() {
+                            st.pmk.fill(0);
+                            st.ssid.fill(0);
+                            st.len = 0;
+                        }
+                        stored[i] = None;
                         true
                     }
-                    _ => false,
+                    None => false,
                 };
-                if dropped {
-                    stored = None;
-                }
                 out[0] = scan::reply::OK;
                 out[1] = dropped as u8;
                 2

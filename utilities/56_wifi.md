@@ -34,7 +34,7 @@ What every verb does today:
 - `wifi status` - built to section 4f: radio, network/band/BSSID, signal, security, time joined - read
   from the firmware on each call (`GET_BSSID`, `GET_RSSI`, `chanspec`) except mid-sweep - and the sweep
   state or the last scan's age. Bare `wifi` prints usage. Unverified on hardware.
-- `wifi stored`, `wifi forget <ssid>` - built to section 6: the one slot, holding a derived key and never
+- `wifi stored`, `wifi forget <ssid>` - built to section 6: a 64-slot table holding derived keys and never
   a passphrase. `wifi connect` asks for a passphrase only when the driver says one is needed. The key
   derivation self-tests against four published vectors at boot (`stage 0` in the driver's log). Unverified.
 - `wifi disconnect`, `wifi radio on|off` - built as `bwfm_newstate` and `bwfm_stop` do them (`DISASSOC`
@@ -96,7 +96,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi disconnect` | leave the current network. The radio stays up |
 | `wifi status` | what is true NOW, read from the firmware: radio, network, band, BSSID, signal, security, time joined - and the sweep or the last scan's age. Section 4f |
 | `wifi forget <ssid>` | drop the held key for that network. Does not disconnect |
-| `wifi stored` | the network a key is held for. A name, never a secret. One slot - section 6 |
+| `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
 | `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
@@ -359,7 +359,7 @@ And the rule above the rules applies throughout: a radio that is absent, wedged 
 `wifi` **return with a loud unavailable**, never hang. That is Commandment VIII at the command layer -
 wait on the driver's reply or on the loud fact of its death, never on a timer.
 
-## 6. Where the passphrase goes: one slot, in the driver's memory, holding the KEY
+## 6. Where the passphrase goes: a bounded table in the driver's memory, holding KEYS
 
 Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sketched:
 
@@ -368,9 +368,11 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   (`PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`, IEEE 802.11-2020 §12.7.1.2 - a few
   milliseconds) and the passphrase is gone. The key is the only thing ever needed again: to answer the
   handshake, to rejoin when the access point drops us, to roam. So the key is what is kept.
-- **One slot**: `(ssid, key)`, about 70 bytes, in the driver's memory. Joining a second network replaces
-  the first - the cafe replaces home, and home is typed once more on return. That is the honest cost of
-  one slot without a disk; widening it is a constant, and is not done until wanted.
+- **Sixty-four slots** of `(ssid, key)`, about 70 bytes each, in the driver's memory. Home, the cafe, the
+  office and every hotspot after them are typed once and rejoined by name. When all sixty-four are held,
+  the one JOINED LONGEST AGO is replaced. The number is a bound (CLAUDE.md §26.6) chosen so that nobody
+  reaches it, not a fit to the 16 MiB the driver may use - a table that grew to fill what was available
+  would be the elastic growth §26.6.1 says to resist, and its limit would be readable nowhere.
 - **Not on disk, on purpose.** No `fs` under a join; no "not encrypted at rest" caveat; no network name of
   the operator's written to a card. The slot dies with the driver - a reboot or a driver respawn empties
   it - and `wifi connect` simply asks again. Persistence across reboots is a separate decision that can
@@ -379,7 +381,7 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   alone first; the driver joins with the stored key if the slot holds that name, joins open if the last
   sweep heard the network as open, and otherwise answers *needs a passphrase* - at which point, and only
   then, the shell asks. A network joined once this boot is rejoined by name alone.
-- `wifi stored` prints the slot's name; `wifi forget <ssid>` zeroes the slot. Neither can print a key.
+- `wifi stored` prints the held names, one per line; `wifi forget <ssid>` zeroes that entry. Neither can print a key.
 - The primitives that derive the key are checked against their published vectors at every boot (FIPS
   180-1, RFC 2202, RFC 6070, IEEE 802.11 Annex J.4.2). A wrong hash would be refused by every access
   point in a way indistinguishable from a wrong passphrase, so if the check fails, passphrases are
