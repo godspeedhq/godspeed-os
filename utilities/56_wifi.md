@@ -43,14 +43,15 @@ What every verb does, and what was seen:
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
 - The WPA2 join (the host supplicant), so `connect` and the picker's passphrase path end in reply 15.
-- **Glommed superframes are read now, by the descriptor's chunk lengths - built 2026-09-29, the second
-  form unverified.** The boot at 13:05 showed the events riding inside channel-3 superframes; the boot at
-  13:57, with the first walker, showed `ASSOC` for the first time (sub-frame 0 of a superframe) and then
-  sub-frame 1 failing to validate at +229, +92 and +652 - the sub-frames are PADDED, so the next does not
-  start where the last one's length says. The descriptor frame that precedes every superframe lists the
-  chunk each sub-frame occupies, padding included (OpenBSD reads one chunk per entry), and `ctrl::subframes`
-  now walks by it. What the next boot must show: `LINK` on a join, `rx_glom_sub` climbing in
-  `wifi debug transport`, and no `does not validate its header` line.
+- **Glommed superframes are read, by the descriptor's chunk lengths - hardware-verified 2026-09-29 15:58.**
+  The boot at 13:05 showed the events riding inside channel-3 superframes; the boot at 13:57, with a walker
+  that assumed the sub-frames were back to back, showed `ASSOC` for the first time (sub-frame 0) and then
+  sub-frame 1 failing to validate at +229, +92 and +652 - the sub-frames are PADDED. The descriptor frame
+  before every superframe lists the chunk each sub-frame occupies, padding included, and `ctrl::subframes`
+  walks by it. The boot at 15:58 showed `join event 16 (LINK) flags 0x0001` and `ASSOCIATED` for the first
+  time in this port's life, `rx_glom_sub 40` against 24 superframes, and no `does not validate` line; the
+  trace shows `RX GLOM len=384` carrying `ASSOC` and `LINK`, then `RX GLOM len=256` carrying `JOIN` and
+  `SET_SSID`. This item is closed and kept here because of what it cost (`docs/wifi.md` §39).
 - The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
   `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
   to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.

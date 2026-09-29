@@ -2811,3 +2811,33 @@ it, or one whose entries do not add up, is not read and says so - the boundaries
 
 Recorded as a method note too: a reference's CODE was right and a summary of it was wrong, and the first
 walker was built on the summary. §26.14 says read the mechanism; that means the function, not a paraphrase.
+
+**Verified at 15:58 the same day, exactly as predicted.** On `wifi connect`:
+
+```
+join event 3 (AUTH), status 0
+join event 7 (ASSOC), status 0
+join event 16 (LINK), status 0, reason 0, flags 0x0001
+ASSOCIATED - the link is up at the 802.11 layer; the handshake is now the access point's move
+```
+
+- the first `LINK` and the first `ASSOCIATED` this port has ever printed. `wifi debug trace` showed where
+they had been all along:
+
+```
+45.788  RX GDESC         lists 2 sub-frame length(s)
+45.792  RX GLOM          len=384
+45.792  RX EVENT*        event=7 status=0 len=215
+45.792  RX EVENT*        event=16 status=0 len=104
+45.855  RX DATA          len=131
+45.905  RX GDESC         lists 2 sub-frame length(s)
+45.909  RX GLOM          len=256
+45.909  RX EVENT*        event=1 status=0 len=78
+45.909  RX EVENT*        event=0 status=0 len=92
+```
+
+`ASSOC` and `LINK` in one superframe, `JOIN` and `SET_SSID` in the next, the handshake's message 1 (the
+131-byte data frame) between them. The scan's results ride the same way - four or five `ESCAN_RESULT`
+events to a 1792- or 2368-byte superframe - and `rx_glom_sub` read 40 against 24 superframes. No sub-frame
+failed to validate. The entries of every descriptor summed to its superframe, or the walk would have said
+so. The next thing the driver must do is SEND on the data channel, which it has never done.
