@@ -497,40 +497,39 @@ fn serve_radio(
                         joined = None;
                     }
                     let now = ctx.epoch_secs_monotonic();
+                    // A KEY IS KEPT ONLY ONCE IT HAS JOINED. A passphrase typed now is derived into `pmk_buf`
+                    // and enters the table after `JOINED`, not on arrival. The first hardware run of the
+                    // handshake kept it on arrival, so a join that failed left behind a key nothing had
+                    // proved, and the next `wifi join` used it without asking - the operator had to `forget`
+                    // between every attempt. A key already in the table has joined before; it is used from
+                    // there, and dropped only when the network refuses it as incorrect (its passphrase changed).
+                    let mut pmk_buf = [0u8; crypto::PMK_LEN];
+                    let mut fresh = false;
                     let mut use_slot: Option<usize> = None;
                     if !already && pass_len > 0 && crypto_ok {
-                        let pmk = crypto::psk(pass, ssid);
-                        let i = slot_for(&stored, ssid);
-                        let replaced = stored[i].is_some() && slot_of(&stored, ssid) != Some(i);
-                        stored[i] = Some(Stored { ssid: name_of(ssid), len: ssid_len as u8, pmk, used_at: now });
-                        ctx.log_fmt(format_args!(
-                            "wifi-driver: pairwise master key derived from the passphrase and kept in credential slot {}{}",
-                            i,
-                            if replaced { " (replacing the one used longest ago)" } else { "" }
-                        ));
-                        use_slot = Some(i);
+                        pmk_buf = crypto::psk(pass, ssid);
+                        fresh = true;
+                        ctx.log("wifi-driver: pairwise master key derived from the passphrase - kept once it has joined");
                     } else if pass_len == 0 {
                         if let Some(i) = slot_of(&stored, ssid) {
                             ctx.log_fmt(format_args!("wifi-driver: joining with the key in credential slot {}", i));
+                            // A match rather than an unwrap: a service never halts (Commandment V).
+                            if let Some(st) = stored[i].as_mut() {
+                                pmk_buf = st.pmk;
+                                st.used_at = now;
+                            }
                             use_slot = Some(i);
                         }
                     }
-                    if let Some(i) = use_slot {
-                        if let Some(st) = stored[i].as_mut() {
-                            st.used_at = now;
-                        }
-                    }
-                    // A match rather than an unwrap on every slot read: a service never halts (Commandment V).
                     let secret = if pass_len > 0 {
-                        match use_slot.and_then(|i| stored[i].as_ref()) {
-                            Some(st) => Some(join::Secret::Pmk(&st.pmk)),
-                            None => {
-                                ctx.log("wifi-driver: a passphrase arrived and the key derivation failed its self-test at boot - refused");
-                                None
-                            }
+                        if fresh {
+                            Some(join::Secret::Pmk(&pmk_buf))
+                        } else {
+                            ctx.log("wifi-driver: a passphrase arrived and the key derivation failed its self-test at boot - refused");
+                            None
                         }
-                    } else if let Some(st) = use_slot.and_then(|i| stored[i].as_ref()) {
-                        Some(join::Secret::Pmk(&st.pmk))
+                    } else if use_slot.is_some() {
+                        Some(join::Secret::Pmk(&pmk_buf))
                     } else if cache
                         .as_ref()
                         .and_then(|c| c.scan.find(ssid))
@@ -566,8 +565,40 @@ fn serve_radio(
                                 } else {
                                     scan::sec::WPA2
                                 };
+                                if fresh {
+                                    let i = slot_for(&stored, ssid);
+                                    let replaced = stored[i].is_some() && slot_of(&stored, ssid) != Some(i);
+                                    stored[i] = Some(Stored { ssid: name_of(ssid), len: ssid_len as u8, pmk: pmk_buf, used_at: now });
+                                    ctx.log_fmt(format_args!(
+                                        "wifi-driver: joined - the key is kept in credential slot {}{}",
+                                        i,
+                                        if replaced { " (replacing the one used longest ago)" } else { "" }
+                                    ));
+                                }
                             } else {
                                 joined = None;
+                                if fresh {
+                                    ctx.log("wifi-driver: the key from that passphrase is NOT kept - it did not join, so the next `wifi join` asks again");
+                                } else if let Some(i) = use_slot {
+                                    if matches!(outcome, join::Outcome::PassphraseRefused) {
+                                        if let Some(st) = stored[i].as_mut() {
+                                            st.pmk.fill(0);
+                                            st.ssid.fill(0);
+                                        }
+                                        stored[i] = None;
+                                        ctx.log_fmt(format_args!(
+                                            "wifi-driver: the key in credential slot {} was refused as incorrect - dropped; the next `wifi join` asks again",
+                                            i
+                                        ));
+                                    }
+                                }
+                                // A join that failed AFTER association leaves the firmware on the network with
+                                // no keys - and `link_now` would then report it as joined, which the first
+                                // hardware run of the handshake showed as `wifi status` saying `joined 5 min
+                                // ago` to a `(hidden)` network after `wsec_key` was refused. The firmware's
+                                // state is made to match this driver's answer. Harmless when there was no
+                                // association to leave, exactly as `leave` is.
+                                let _ = ctrl::disassoc(h, w, session, ctx);
                             }
                             out[0] = match outcome {
                                 join::Outcome::Joined => scan::reply::JOINED,
@@ -577,6 +608,8 @@ fn serve_radio(
                                 join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
                                 join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
                             };
+                            // The working copy of the key does not outlive the join it was for.
+                            pmk_buf.fill(0);
                             1
                         }
                     }

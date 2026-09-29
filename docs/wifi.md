@@ -2883,10 +2883,52 @@ point it is used:
   KEK (`ieee80211_eapol_key_decrypt`, `aes_key_unwrap`, 8 bytes shorter than it arrived); inside, the GTK
   KDE - `0xdd`, OUI `00:0f:ac`, type 1, `key id | tx`, reserved, key. **Message 4** is `PAIRWISE | KEYMIC
   | SECURE`, empty, MIC'd (`ieee80211_send_4way_msg4`).
-- **Install** (`ctrl::install_key`), from `bwfm_set_key_cb`: `struct bwfm_wsec_key`, 162 bytes as
+- **Install** (`ctrl::install_key`), from `bwfm_set_key_cb`: `struct bwfm_wsec_key`, **164** bytes as
   `bwfmreg.h` lays it out - the pairwise key at index 0 with the access point's address in `ea`, the group
   key at its key id with `PRIMARY_KEY` and no address - through the `wsec_key` iovar, then `wsec`
-  re-asserted with AES.
+  re-asserted with AES. *This said 162 when first written, and the driver sent 162: the fields sum to 162,
+  the struct is not packed, and `sizeof` rounds to the 4-byte alignment. See "The first run" below.*
+
+### The first run (2026-09-29, 19:44): the handshake completed and the key was refused by two bytes
+
+Three joins with the right passphrase, and the log read the same each time:
+
+```
+EAPOL-Key ... message 1 of 4 (ANonce) ... replay 1
+message 2 of 4 sent (135 bytes, replay 1) - our nonce and the RSN element, signed
+EAPOL-Key ... message 1 of 4 (ANonce) ... replay 2
+message 2 of 4 sent (135 bytes, replay 2)
+EAPOL-Key ... message 3 of 4 (GTK, install) ... info 0x13ca [pairwise ack mic install secure encrypted] key_data 64 bytes
+message 3 verified (MIC, ANonce, 56 bytes of key data unwrapped); message 4 sent
+setting `wsec_key` - 162 byte value
+the firmware REFUSED `wsec_key` - BCME_BUFTOOSHORT (status -14)
+```
+
+**Message 3 verifying is the fact that decides everything above it.** Its MIC is computed by the access
+point with the KCK it derived from the PMK; ours matched, so the PMK, the PRF, the nonce order, the label
+and the bytes the MIC covers are all right, and the passphrase was right too. The key data unwrapped under
+the KEK, so that half of the PTK is right as well. The prediction in the commit named the MIC path as the
+first suspect if message 1 repeated - it did repeat once (replay 1, then 2), and then message 3 came, so
+the repeat was the access point's ordinary retry, not a refusal. The operator had doubted the passphrase
+and rechecked it several times; the log says it was never in question.
+
+**The refusal.** `BCME_BUFTOOSHORT` from an iovar set means the value is shorter than the struct the
+firmware expects. `struct bwfm_wsec_key` was sized here by adding up its members: 4+4+32+72+4+4+12+4+4+8+8+6
+= 162. That is the size of the fields. `sizeof` is 164, because the struct holds `uint32_t` members, is not
+packed, and C pads the tail to the alignment; `bwfm_fwvar_var_set_data(sc, "wsec_key", &key, sizeof(key))`
+therefore sends 164 and the firmware checks for 164. The fields were counted and the padding was not -
+which is the one thing a hand count of a C struct cannot see, and the argument for reading `sizeof` off a
+compiler rather than a page. Confirmed against `bwfmreg.h` (no `__packed`) before the constant changed.
+
+**Two more things the run showed, both fixed in the same change.** After the refusal the firmware was still
+associated with no keys, so `wifi status` read the link live and reported `joined 5 min ago` to a
+`(hidden)` network with `security open` - the driver's memory said not joined and the firmware said joined,
+and status believed the firmware. A join that fails after association now disassociates, so the two agree.
+And `signal excellent 0 dBm`: the firmware refused `GET_RSSI` (`BCME_BADARG`) and the shell turned the 0 it
+was handed into the best word it has. A zero RSSI is not a reading and now prints `unknown`.
+
+The trace also showed the two transmitted frames as `RX other`, because the shell's name table stopped at
+kind 9. They are `TX DATA` now.
 - **Two primitives** joined `crypto.rs` with their published vectors in the boot self-test: AES-128 both
   directions (FIPS 197 C.1 - the S-box is computed from the field inverse and the affine transform rather
   than typed, because 256 hand-copied bytes are 256 places to be wrong) and AES Key Unwrap (RFC 3394

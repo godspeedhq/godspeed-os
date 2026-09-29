@@ -1460,8 +1460,12 @@ const CRYPTO_ALGO_AES_CCM: u32 = 4;
 /// `BWFM_WSEC_PRIMARY_KEY` - `(1 << 1)`: a group key.
 const WSEC_PRIMARY_KEY: u32 = 1 << 1;
 /// `sizeof(struct bwfm_wsec_key)`: index 4, len 4, data 32, pad_1 72, algo 4, flags 4, pad_2 12,
-/// iv_initialized 4, pad_3 4, rxiv 8, pad_5 8, ea 6.
-const WSEC_KEY_SIZE: usize = 162;
+/// iv_initialized 4, pad_3 4, rxiv 8, pad_5 8, ea 6 - which is 162, and `sizeof` is **164**, because the
+/// struct is not packed, its alignment is 4, and C rounds the size up to it. The reference sends
+/// `sizeof(key)`, the firmware checks the length against its own `sizeof`, and 162 came back
+/// `BCME_BUFTOOSHORT` on the first hardware run of the handshake (2026-09-29): message 3 verified, message 4
+/// sent, and the key refused by two bytes of padding. The fields were counted; the padding was not.
+const WSEC_KEY_SIZE: usize = 164;
 
 /// Install a CCMP key in the firmware - `bwfm_set_key_cb`, quoted in shape:
 ///
@@ -1475,7 +1479,8 @@ const WSEC_KEY_SIZE: usize = 162;
 /// ```
 ///
 /// A pairwise key names the peer (`ea`) and is index 0; a group key is `PRIMARY_KEY` at its key id with no
-/// address. `struct bwfm_wsec_key` is 162 bytes, laid out as `bwfmreg.h` declares it.
+/// address. `struct bwfm_wsec_key` is 164 bytes (162 of fields, 2 of tail padding), laid out as `bwfmreg.h`
+/// declares it; `ea` sits at 156.
 pub fn install_key(
     h: &Host,
     w: &mut Window,

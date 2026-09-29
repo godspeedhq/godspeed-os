@@ -7995,7 +7995,7 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
                 Err(ShellError::Unknown)
             }
             Some(JOIN_FAILED) => {
-                out.line_fmt(ctx, format_args!("not joined - the join failed before {} answered (the driver's log names the command)", name));
+                out.line_fmt(ctx, format_args!("not joined - a step of joining {} failed (the driver's log names the command the firmware refused)", name));
                 Err(ShellError::Unknown)
             }
             Some(JOIN_TIMEOUT) => {
@@ -8103,7 +8103,13 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         let rssi = i32::from_le_bytes([p[17], p[18], p[19], p[20]]);
         let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
         out.line_fmt(ctx, format_args!("network    {}  {}", name, band));
-        out.line_fmt(ctx, format_args!("signal     {}  {} dBm", wifi_signal_word(rssi), rssi));
+        // 0 dBm is not a reading - no receiver hears a signal that strong - it is the driver saying the
+        // firmware gave none, and a word derived from it would be a strength nobody measured.
+        if rssi == 0 {
+            out.line_fmt(ctx, format_args!("signal     unknown  (the firmware gave no reading)"));
+        } else {
+            out.line_fmt(ctx, format_args!("signal     {}  {} dBm", wifi_signal_word(rssi), rssi));
+        }
         out.line_fmt(ctx, format_args!("security   {}", wifi_security_word(p[23])));
         if since >= 120 {
             out.line_fmt(ctx, format_args!("joined     {} min ago", since / 60));
@@ -8163,7 +8169,11 @@ fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         out.line_fmt(ctx, format_args!("band        {}", band));
         // chanspec: the channel number is the low 8 bits (802.11ac layout; the band bits above decode it).
         out.line_fmt(ctx, format_args!("channel     {}", chanspec & 0xFF));
-        out.line_fmt(ctx, format_args!("signal      {}  {} dBm", wifi_signal_word(rssi), rssi));
+        if rssi == 0 {
+            out.line_fmt(ctx, format_args!("signal      unknown  (the firmware gave no reading)"));
+        } else {
+            out.line_fmt(ctx, format_args!("signal      {}  {} dBm", wifi_signal_word(rssi), rssi));
+        }
         out.line_fmt(ctx, format_args!("security    {}", wifi_security_word(p[23])));
         if since >= 120 {
             out.line_fmt(ctx, format_args!("joined      {} min ago", since / 60));
@@ -8342,6 +8352,7 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
                     7 => "RX EVENT*",
                     8 => "RX DATA*",
                     9 => "RX GDESC",
+                    10 => "TX DATA",
                     _ => "RX other",
                 };
                 let stamp_ms = ms % 1000;
@@ -8351,6 +8362,7 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
                     2 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} status={} len={}", stamp_s, stamp_ms, kind_word, id, what, status, len)),
                     3 | 7 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} event={} status={} len={}", stamp_s, stamp_ms, kind_word, "", what, status, len)),
                     9 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} lists {} sub-frame length(s)", stamp_s, stamp_ms, kind_word, "", what)),
+                    10 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} seq={:<3} len={}", stamp_s, stamp_ms, kind_word, id, len)),
                     _ => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} len={}", stamp_s, stamp_ms, kind_word, "", len)),
                 }
             }

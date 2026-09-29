@@ -43,7 +43,12 @@ What every verb does, and what was seen:
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
-- **The WPA2 handshake is BUILT (2026-09-29 evening) and not yet run on hardware.** The driver answers
+- **The WPA2 handshake is hardware-verified through message 4 (2026-09-29, 19:44) and not yet through the
+  key install.** Three joins with the right passphrase: message 2 went out, message 3 arrived and its MIC
+  verified (so the PMK, the PTK derivation and the MIC path are right), the group key unwrapped, message 4
+  went out - and the firmware refused `wsec_key` with `BCME_BUFTOOSHORT`, because the driver sent the 162
+  bytes the struct's fields add up to and `sizeof` is 164 (`docs/wifi.md` 40, "The first run"). The
+  constant is fixed; the boot that shows `JOINED` is the next one. As built, the driver answers
   message 1 with message 2 (its nonce, the RSN element, MIC'd with the confirmation key derived by
   PRF-384 from the PMK), verifies message 3 (ANonce, MIC, AES-key-unwraps the group key), sends message 4,
   and installs the pairwise and group keys through `wsec_key` - every step from OpenBSD's net80211 and
@@ -450,7 +455,12 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   it. The moment it arrives the driver derives the **pairwise master key** from it and the network name
   (`PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`, IEEE 802.11-2020 §12.7.1.2 - a few
   milliseconds) and the passphrase is gone. The key is the only thing ever needed again: to answer the
-  handshake, to rejoin when the access point drops us, to roam. So the key is what is kept.
+  handshake, to rejoin when the access point drops us, to roam. So the key is what is kept - **and it is
+  kept only once it has joined.** A join that ends `not joined` keeps nothing, whatever the reason, and the
+  next `wifi join <ssid>` asks for the passphrase again. A key that joined once and is later refused as
+  incorrect (the network's passphrase changed) is dropped the same way. Asked for by the operator on
+  2026-09-29 after the first handshake run: the driver kept the key on arrival, so every failed attempt had
+  to be followed by `wifi forget` before the prompt would come back.
 - **Sixty-four slots** of `(ssid, key)`, about 70 bytes each, in the driver's memory. Home, the cafe, the
   office and every hotspot after them are typed once and rejoined by name. When all sixty-four are held,
   the one JOINED LONGEST AGO is replaced. The number is a bound (CLAUDE.md §26.6) chosen so that nobody
@@ -471,7 +481,8 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
 - **`wifi join <ssid>` asks for a passphrase only when one is needed.** The shell sends the name
   alone first; the driver joins with the stored key if the slot holds that name, joins open if the last
   sweep heard the network as open, and otherwise answers *needs a passphrase* - at which point, and only
-  then, the shell asks. A network joined once this boot is rejoined by name alone.
+  then, the shell asks. A network joined once this boot is rejoined by name alone; one that has only
+  been TRIED is asked for again.
 - `wifi stored` prints the held names, one per line; `wifi forget <ssid>` zeroes that entry. Neither can print a key.
 - The primitives that derive the key are checked against their published vectors at every boot (FIPS
   180-1, RFC 2202, RFC 6070, IEEE 802.11 Annex J.4.2). A wrong hash would be refused by every access
