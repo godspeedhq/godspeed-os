@@ -104,8 +104,74 @@ fn serve_radio(
 ) -> ! {
     // Bounded: 2 status bytes plus 32 records of 44 is 1410, inside this fixed buffer, inside a 4 KiB message.
     let mut out = [0u8; 1536];
+
+    // THE SWEEP IS A STATE, NOT A CALL. `wifi scan` starts one and returns; the loop below advances it one
+    // frame per turn and answers requests between frames, so `wifi list`, `wifi status` and an abort are
+    // heard while the radio sweeps (rule 11), and a sweep left running by `b` finishes on its own. A
+    // finished sweep becomes THE CACHE - the one list `wifi list` ever prints - and only a finished one
+    // does: an abort or a sweep that fell silent past the poll bound is discarded, never half-served.
+    struct Sweep {
+        scan: scan::Scan,
+        empty: u32,
+    }
+    struct Cache {
+        scan: scan::Scan,
+        at_secs: i64,
+    }
+    let mut sweep: Option<Sweep> = None;
+    let mut cache: Option<Cache> = None;
+    // The last sweep died by the poll bound rather than the firmware's word. Pollers are told, not handed
+    // whatever older cache exists as if it were the sweep they asked for.
+    let mut sweep_failed = false;
+    // `bring_up` ran the UP chain, so the radio starts on; `wifi radio off` is the only thing that turns
+    // it off, and `wifi radio on` re-runs the same chain.
+    let mut radio_on = true;
+    // The network the firmware last reported JOINED, cleared by a disconnect or a power-off. Only an open
+    // network can reach that state until the host supplicant exists - see `join.rs`.
+    let mut joined: Option<([u8; join::MAX_SSID], u8)> = None;
+    let mut frame = [0u8; ctrl::FRAME];
+
     loop {
-        let req = ctx.recv();
+        // ---- 1. One frame of the running sweep, if there is one. ----
+        if let Some(s) = sweep.as_mut() {
+            match scan::step(h, w, &mut s.scan, &mut frame, ctx) {
+                scan::Step::Frame => {}
+                scan::Step::Empty => {
+                    s.empty += 1;
+                    ctx.sleep_ms(1);
+                    if s.empty >= scan::MAX_EMPTY_POLLS {
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: the sweep fell silent for {} empty polls without the firmware saying it \
+                             was over - discarded ({} heard); the last complete scan stands",
+                            s.empty,
+                            s.scan.count()
+                        ));
+                        sweep = None;
+                        sweep_failed = true;
+                    }
+                }
+                scan::Step::Ended(why) => {
+                    let done = sweep.take().unwrap_or(Sweep { scan: scan::Scan::new(), empty: 0 });
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: sweep complete - {} network(s), ended by {}",
+                        done.scan.count(),
+                        why
+                    ));
+                    cache = Some(Cache { scan: done.scan, at_secs: ctx.epoch_secs_monotonic() });
+                    sweep_failed = false;
+                }
+            }
+        }
+
+        // ---- 2. A request. Blocking when idle - there is nothing else to do - and a look when sweeping. ----
+        let req = if sweep.is_some() {
+            match ctx.try_recv() {
+                Some(m) => m,
+                None => continue,
+            }
+        } else {
+            ctx.recv()
+        };
         let reply = match ctx.take_pending_cap() {
             Some(r) => r,
             None => continue, // nothing to answer on
@@ -113,18 +179,175 @@ fn serve_radio(
         let payload = req.payload_bytes();
         let op = payload.first().copied().unwrap_or(0);
         let n = match (op, radio.as_mut()) {
-            (scan::reply::OP_LIST, None) | (scan::reply::OP_CONNECT, None) => {
+            // No radio: every question has the same answer, and the log said at boot which stage stopped it.
+            (_, None) => {
                 out[0] = scan::reply::RADIO_DOWN;
                 1
             }
-            (scan::reply::OP_LIST, Some(session)) => match scan::scan_once(h, w, session, ctx) {
-                Some(scan) => scan::write_reply(&scan, &mut out),
-                None => {
-                    out[0] = scan::reply::SCAN_FAILED;
+            (scan::reply::OP_LIST, Some(_)) => match (&sweep, &cache) {
+                (Some(s), _) => {
+                    out[0] = scan::reply::SCANNING;
+                    out[1] = s.scan.count() as u8;
+                    2
+                }
+                (None, Some(c)) => scan::write_reply(&c.scan, &mut out),
+                (None, None) => {
+                    out[0] = scan::reply::NO_SCAN_YET;
                     1
                 }
             },
+            // A powered-off radio cannot sweep or join; the cache and the status are still served.
+            (scan::reply::OP_SCAN_START, Some(_)) | (scan::reply::OP_CONNECT, Some(_)) if !radio_on => {
+                out[0] = scan::reply::RADIO_OFF;
+                1
+            }
+            (scan::reply::OP_DISCONNECT, Some(session)) => {
+                if let Some(s) = sweep.take() {
+                    let _ = scan::abort(h, w, session, ctx);
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: a disconnect was asked for mid-sweep - the sweep is stopped ({} heard, not kept)",
+                        s.scan.count()
+                    ));
+                }
+                let was_joined = joined.is_some();
+                // Sent whether or not this driver believes it is associated: the firmware's state is the truth,
+                // and a stale belief here must not stop the operator leaving a network.
+                let _ = ctrl::disassoc(h, w, session, ctx);
+                joined = None;
+                out[0] = scan::reply::OK;
+                out[1] = was_joined as u8;
+                2
+            }
+            (scan::reply::OP_RADIO, Some(session)) => {
+                let on = payload.get(1).copied().unwrap_or(1) != 0;
+                let was_joined = joined.is_some();
+                if on {
+                    if !radio_on {
+                        if !ctrl::interface_up(h, w, session, ctx) {
+                            ctx.log("wifi-driver: the radio would not come back up - it stays off");
+                            out[0] = scan::reply::JOIN_FAILED;
+                            out[1] = 0;
+                            // The status byte names a refused command; the shell says so in its own words.
+                        } else {
+                            radio_on = true;
+                            out[0] = scan::reply::OK;
+                            out[1] = 0;
+                        }
+                    } else {
+                        out[0] = scan::reply::OK;
+                        out[1] = 0;
+                    }
+                } else {
+                    // `off` disconnects first (`utilities/56_wifi.md` 2), then takes the interface down.
+                    if let Some(s) = sweep.take() {
+                        let _ = scan::abort(h, w, session, ctx);
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: radio off mid-sweep - the sweep is stopped ({} heard, not kept)",
+                            s.scan.count()
+                        ));
+                    }
+                    if was_joined {
+                        let _ = ctrl::disassoc(h, w, session, ctx);
+                    }
+                    joined = None;
+                    if ctrl::radio_down(h, w, session, ctx) {
+                        radio_on = false;
+                        out[0] = scan::reply::OK;
+                    } else {
+                        ctx.log("wifi-driver: the firmware refused DOWN - the radio stays on");
+                        out[0] = scan::reply::JOIN_FAILED;
+                    }
+                    out[1] = was_joined as u8;
+                }
+                2
+            }
+            (scan::reply::OP_SCAN_START, Some(session)) => match &sweep {
+                Some(s) => {
+                    // Already sweeping: the caller attaches to it rather than starting a second - the radio
+                    // has one sweep in it at a time.
+                    out[0] = scan::reply::SCANNING;
+                    out[1] = s.scan.count() as u8;
+                    2
+                }
+                None => {
+                    if scan::start(h, w, session, ctx) {
+                        sweep = Some(Sweep { scan: scan::Scan::new(), empty: 0 });
+                        sweep_failed = false;
+                        out[0] = scan::reply::OK;
+                        out[1] = 0;
+                        2
+                    } else {
+                        out[0] = scan::reply::SCAN_FAILED;
+                        1
+                    }
+                }
+            },
+            (scan::reply::OP_SCAN_POLL, Some(_)) => {
+                let from = payload.get(1).copied().unwrap_or(0) as usize;
+                match (&sweep, &cache) {
+                    (Some(s), _) => scan::write_records(&s.scan, from, scan::reply::SCANNING, &mut out),
+                    (None, _) if sweep_failed => {
+                        out[0] = scan::reply::SCAN_FAILED;
+                        1
+                    }
+                    (None, Some(c)) => scan::write_records(&c.scan, from, scan::reply::SCAN_DONE, &mut out),
+                    (None, None) => {
+                        out[0] = scan::reply::NO_SCAN_YET;
+                        1
+                    }
+                }
+            }
+            (scan::reply::OP_SCAN_ABORT, Some(session)) => {
+                let heard = match sweep.take() {
+                    Some(s) => {
+                        if !scan::abort(h, w, session, ctx) {
+                            ctx.log("wifi-driver: the firmware did not take the abort - the sweep's events will be drained and discarded as they arrive");
+                        }
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: sweep stopped by request - {} heard, not kept",
+                            s.scan.count()
+                        ));
+                        s.scan.count()
+                    }
+                    None => 0,
+                };
+                out[0] = scan::reply::OK;
+                out[1] = heard as u8;
+                2
+            }
+            (scan::reply::OP_STATUS, Some(_)) => {
+                out[0] = scan::reply::OK;
+                out[1] = sweep.is_some() as u8;
+                out[2] = sweep.as_ref().map(|s| s.scan.count()).unwrap_or(0) as u8;
+                out[3] = cache.is_some() as u8;
+                out[4] = cache.as_ref().map(|c| c.scan.count()).unwrap_or(0) as u8;
+                let age = cache
+                    .as_ref()
+                    .map(|c| (ctx.epoch_secs_monotonic() - c.at_secs).max(0) as u32)
+                    .unwrap_or(u32::MAX);
+                out[5..9].copy_from_slice(&age.to_le_bytes());
+                out[9] = radio_on as u8;
+                match &joined {
+                    Some((ssid, len)) => {
+                        out[10] = *len;
+                        out[11..11 + join::MAX_SSID].copy_from_slice(ssid);
+                    }
+                    None => {
+                        out[10] = 0;
+                        out[11..11 + join::MAX_SSID].fill(0);
+                    }
+                }
+                11 + join::MAX_SSID
+            }
             (scan::reply::OP_CONNECT, Some(session)) => {
+                // A join and a sweep cannot share the radio. The sweep goes, and says so; the cache stays.
+                if let Some(s) = sweep.take() {
+                    let _ = scan::abort(h, w, session, ctx);
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: a join was asked for mid-sweep - the sweep is stopped ({} heard, not kept)",
+                        s.scan.count()
+                    ));
+                }
                 // `[op, ssid_len, ssid[32], pass_len, pass[64]]`. Lengths are checked against the fixed
                 // fields, and the passphrase bytes are used from the request buffer and never copied
                 // anywhere that outlives this arm.
@@ -141,7 +364,15 @@ fn serve_radio(
                     let pass_len = core::cmp::min(payload[PASS_LEN_AT] as usize, join::MAX_PASSPHRASE);
                     let ssid = &payload[SSID_AT..SSID_AT + ssid_len];
                     let pass = &payload[PASS_AT..PASS_AT + pass_len];
-                    out[0] = match join::join(h, w, session, ssid, pass, ctx) {
+                    let outcome = join::join(h, w, session, ssid, pass, ctx);
+                    if outcome == join::Outcome::Joined {
+                        let mut name = [0u8; join::MAX_SSID];
+                        name[..ssid_len].copy_from_slice(ssid);
+                        joined = Some((name, ssid_len as u8));
+                    } else {
+                        joined = None;
+                    }
+                    out[0] = match outcome {
                         join::Outcome::Joined => scan::reply::JOINED,
                         join::Outcome::NotFound => scan::reply::NOT_FOUND,
                         join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,

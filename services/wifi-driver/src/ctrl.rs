@@ -879,6 +879,24 @@ pub fn set_cmd(
 ///
 /// Without this the firmware refuses a scan with `BCME_NOTUP` (-4), which is exactly what it did. brcmfmac
 /// issues this during bring-up before anything else touches the radio.
+/// `BWFM_C_DOWN` - take the interface down. `bwfm_stop`: `bwfm_fwvar_cmd_set_int(sc, BWFM_C_DOWN, 1)`.
+const CMD_DOWN: u32 = 3;
+/// `BWFM_C_DISASSOC` - leave the network. `bwfm_newstate`, on the way back to SCAN:
+/// `bwfm_fwvar_cmd_set_data(sc, BWFM_C_DISASSOC, NULL, 0)` - no payload at all.
+const CMD_DISASSOC: u32 = 52;
+
+/// Leave whatever network the radio is on. The reference sends the bare command with nothing after it, so
+/// so does this; the radio stays up and can scan or join again at once.
+pub fn disassoc(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
+    set_cmd(h, w, s, CMD_DISASSOC, &[], "disassociate", ctx)
+}
+
+/// Power the radio down. `interface_up` is its opposite and re-runs the whole UP chain, which is what
+/// `bwfm_stop` does too (DOWN, then UP again with the mode commands between).
+pub fn radio_down(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
+    set_cmd_int(h, w, s, CMD_DOWN, 1, "down", ctx)
+}
+
 pub fn interface_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     // UP takes the VALUE 0, which reads oddly and is what the reference passes.
     if !set_cmd_int(h, w, s, CMD_UP, 0, "interface up", ctx) {

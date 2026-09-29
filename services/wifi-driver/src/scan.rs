@@ -261,6 +261,23 @@ mod req {
 
 /// `WL_ESCAN_ACTION_START`.
 const ACTION_START: u16 = 1;
+/// `WLC_SCAN` / `BRCMF_C_SCAN` - the plain scan command. Not used to scan: it is how an escan is ABORTED.
+///
+/// `brcmf_notify_escan_complete(.., fw_abort = true)`:
+///
+/// ```c
+/// /* E-Scan (or anyother type) can be aborted by SCAN */
+/// brcmf_escan_prep(cfg, &params_v2_le, NULL);   /* channel_num = 1, channel_list[0] = -1 */
+/// err = brcmf_fil_cmd_data_set(ifp, BRCMF_C_SCAN, &params_le, sizeof(params_le));
+/// ```
+///
+/// A scan of one channel numbered -1 is not a scan; the firmware reads it as "stop". The params are the
+/// escan request's own, without the 8-byte escan header and with the one-entry channel list appended.
+const CMD_SCAN: u32 = 50;
+/// Where the scan params begin inside the escan request: after `version` (4), `action` (2), `sync_id` (2).
+const SCAN_PARAMS_AT: usize = 8;
+/// `sizeof(struct brcmf_scan_params_le)` with its one-entry channel list: 64 bytes of params plus a u16.
+const ABORT_SIZE: usize = req::SIZE - SCAN_PARAMS_AT + 2;
 /// `BWFM_SCANTYPE_ACTIVE`.
 const SCANTYPE_ACTIVE: u8 = 0;
 /// `DOT11_BSSTYPE_ANY`.
@@ -406,6 +423,11 @@ impl Scan {
     pub fn networks(&self) -> &[Network] {
         &self.nets[..self.count]
     }
+
+    /// How many networks are held so far - "heard so far" while a sweep runs, the total once it ends.
+    pub fn count(&self) -> usize {
+        self.count
+    }
 }
 
 /// Reply status bytes for a `wifi list` request. One byte, first in the reply, read by the shell.
@@ -423,8 +445,38 @@ pub mod reply {
     pub const RECORD: usize = 44;
     /// Request op byte: scan and list.
     pub const OP_LIST: u8 = 1;
-    /// Request op byte: join a network. Payload: `ssid_len, ssid[32], pass_len, pass[64]`.
+    /// Request op byte: join a network. Payload: `ssid_len, ssid[32], pass_len, pass[64]`. A `pass_len`
+    /// of 0 joins an OPEN network.
     pub const OP_CONNECT: u8 = 2;
+    /// Request op byte: start a sweep and return at once. Reply `[OK, 0]`, or `[SCANNING, heard]` when one
+    /// is already running (the caller attaches to it), or `[SCAN_FAILED]` / `[RADIO_DOWN]`.
+    pub const OP_SCAN_START: u8 = 3;
+    /// Request op byte: `[4, from]` - the records heard so far from index `from`. Reply
+    /// `[SCANNING | SCAN_DONE, total, records from..total]`, `[SCAN_FAILED]` if the last sweep died by the
+    /// poll bound, `[NO_SCAN_YET]` if nothing has ever been swept.
+    pub const OP_SCAN_POLL: u8 = 4;
+    /// Request op byte: stop the sweep. The partial hearing is DISCARDED - the cache keeps the last complete
+    /// scan. Reply `[OK, heard]`.
+    pub const OP_SCAN_ABORT: u8 = 5;
+    /// Request op byte: what the radio is doing. Reply `[OK, sweeping(0|1), heard, has_cache(0|1),
+    /// cache_count, age_secs u32 LE, radio_on(0|1), joined_len, joined_ssid[32]]`.
+    pub const OP_STATUS: u8 = 6;
+    /// Request op byte: leave the current network; the radio stays up. Reply `[OK, was_joined(0|1)]`.
+    pub const OP_DISCONNECT: u8 = 7;
+    /// Request op byte: `[8, on(0|1)]` - power the radio. `off` disconnects first. Reply `[OK, was_joined]`.
+    pub const OP_RADIO: u8 = 8;
+    /// The radio was powered off by `wifi radio off`; a sweep or a join is refused until `radio on`. Distinct
+    /// from `RADIO_DOWN`, which is a radio that never came up.
+    pub const RADIO_OFF: u8 = 7;
+
+    /// A sweep is running. For `OP_LIST` this is a REFUSAL: the cache is not served while it is about to be
+    /// replaced (`utilities/56_wifi.md` §3, Commandment III). Byte 1 is the count heard so far.
+    pub const SCANNING: u8 = 4;
+    /// Nothing has been swept since the driver started, so there is no list to give - an error, not an
+    /// empty room.
+    pub const NO_SCAN_YET: u8 = 5;
+    /// `OP_SCAN_POLL` only: the sweep ended and these are its records.
+    pub const SCAN_DONE: u8 = 6;
 
     // CONNECT statuses start at 10 so they never share a byte with the list statuses above:
     // RADIO_DOWN (2) is answered to BOTH ops and must mean one thing.
@@ -448,10 +500,17 @@ pub mod reply {
 /// A FIXED layout with no framing to parse on the far side - the shell indexes into it. 32 records of 44
 /// bytes plus two is 1410 bytes, well inside a 4096-byte message, and `Scan` already bounds the count.
 pub fn write_reply(scan: &Scan, out: &mut [u8]) -> usize {
-    out[0] = reply::OK;
+    write_records(scan, 0, reply::OK, out)
+}
+
+/// The same reply from record `from` onward, under a chosen status byte. Byte 1 is always the TOTAL held,
+/// so a poller knows both how many it has been given and how many exist: a `wifi scan` surface asks for
+/// what it has not yet printed, and a `from` past the end yields the two status bytes alone.
+pub fn write_records(scan: &Scan, from: usize, status: u8, out: &mut [u8]) -> usize {
+    out[0] = status;
     out[1] = scan.count as u8;
     let mut at = 2;
-    for n in scan.networks() {
+    for n in scan.networks().iter().skip(from) {
         if at + reply::RECORD > out.len() {
             break;
         }
@@ -697,6 +756,100 @@ fn parse_results(payload: &[u8], scan: &mut Scan, ctx: &ServiceContext) {
 /// **Bounded, and it says which bound ended it.** The truth being waited on is the firmware reporting the
 /// scan complete; the deadline underneath is the bound §26.6 requires of every wait. Reporting which one
 /// finished is the difference between a result and a guess.
+/// What one turn of the sweep did.
+pub enum Step {
+    /// A frame arrived and was accounted for (read, counted or skipped - all three are progress).
+    Frame,
+    /// Nothing arrived. The caller decides how many of these it will tolerate; this does not sleep.
+    Empty,
+    /// The firmware said the sweep is over, and why.
+    Ended(&'static str),
+}
+
+/// Advance a running sweep by ONE frame. This is the body `collect` used to loop over, split out so the
+/// serve loop can do the same one frame at a time and still answer requests between frames - which is what
+/// lets `wifi list`, `wifi status` and an abort be heard mid-sweep (rule 11), and a background sweep exist
+/// at all. `frame` is the caller's buffer, so the serve loop does not put 2 KiB on its stack per turn.
+pub fn step(
+    h: &Host,
+    w: &mut Window,
+    scan: &mut Scan,
+    frame: &mut [u8; ctrl::FRAME],
+    ctx: &ServiceContext,
+) -> Step {
+    let f = match ctrl::read_frame(h, w, frame, ctx) {
+        Some(f) => f,
+        None => return Step::Empty,
+    };
+    let channel = f.chanflag & CHANNEL_MASK;
+    if channel == CHANNEL_GLOM {
+        // Counted, not read. See `CHANNEL_GLOM` for why the reference drops these too.
+        scan.glom += 1;
+        return Step::Frame;
+    }
+    if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {
+        scan.other += 1;
+        return Step::Frame;
+    }
+    scan.events += 1;
+    let p = f.off;
+    if let Some(e) = parse_event(&frame[p..p + f.len], scan.events, ctx) {
+        let (event_type, status, at, datalen) = (e.event_type, e.status, e.at, e.datalen);
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   event {} ({}), status {}, {} byte payload",
+            event_type,
+            code::name(event_type),
+            status,
+            datalen
+        ));
+        if event_type == code::ESCAN_RESULT {
+            scan.results += 1;
+            if status == status::PARTIAL {
+                parse_results(&frame[p + at..p + at + datalen], scan, ctx);
+            }
+            if let Some(why) = status::terminal(status) {
+                // THE FIRMWARE SAID SO. Stop asking.
+                return Step::Ended(why);
+            }
+        }
+    }
+    Step::Frame
+}
+
+/// Ask the firmware to begin a sweep. True when `escan` was accepted; the results then arrive as events,
+/// which `step` reads. The decoded refusal, if any, is logged by `set_iovar` one line above this one's.
+pub fn start(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceContext) -> bool {
+    let mut request = [0u8; req::SIZE];
+    build_request(&mut request);
+    if !ctrl::set_iovar(h, w, s, "escan", &request, ctx) {
+        // NO VERSION HINT HERE. This message used to say the params VERSION was the first thing to change,
+        // which was written for the "accepted but silent" case and is wrong for a refusal: the firmware
+        // states what it objected to, and the decoded error is printed one line above. The version matters
+        // only where the request is ACCEPTED and no results follow.
+        ctx.log(
+            "wifi-driver: the firmware refused the `escan` request, so no scan started. The decoded error \
+             above says what it objected to",
+        );
+        return false;
+    }
+    ctx.log("wifi-driver: `escan` accepted - listening until the firmware says the scan is over");
+    true
+}
+
+/// Stop a running sweep, the way Linux does (`CMD_SCAN`): the escan params with `channel_num` 1 and a single
+/// channel of -1. True when the firmware accepted the command. The results heard so far are the caller's
+/// to discard - and it does, because a half-heard room is not the room.
+pub fn abort(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceContext) -> bool {
+    let mut full = [0u8; req::SIZE];
+    build_request(&mut full);
+    let mut params = [0u8; ABORT_SIZE];
+    params[..req::SIZE - SCAN_PARAMS_AT].copy_from_slice(&full[SCAN_PARAMS_AT..]);
+    let channel_num = req::CHANNEL_NUM - SCAN_PARAMS_AT;
+    params[channel_num..channel_num + 4].copy_from_slice(&1u32.to_le_bytes());
+    params[channel_num + 4..channel_num + 6].copy_from_slice(&(-1i16 as u16).to_le_bytes());
+    ctrl::set_cmd(h, w, s, CMD_SCAN, &params, "scan abort (a one-channel scan of channel -1)", ctx)
+}
+
 pub fn collect(
     h: &Host,
     w: &mut Window,
@@ -714,45 +867,15 @@ pub fn collect(
     let mut empty = 0u32;
     let mut ended_by = "the poll bound - the firmware never said the scan was over";
     while empty < max_empty_polls {
-        match ctrl::read_frame(h, w, &mut frame, ctx) {
-            Some(f) => {
-                let channel = f.chanflag & CHANNEL_MASK;
-                if channel == CHANNEL_GLOM {
-                    // Counted, not read. See `CHANNEL_GLOM` for why the reference drops these too.
-                    scan.glom += 1;
-                    continue;
-                }
-                if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {
-                    scan.other += 1;
-                    continue;
-                }
-                scan.events += 1;
-                let p = f.off;
-                if let Some(e) = parse_event(&frame[p..p + f.len], scan.events, ctx) {
-                    let (event_type, status, at, datalen) = (e.event_type, e.status, e.at, e.datalen);
-                    ctx.log_fmt(format_args!(
-                        "wifi-driver:   event {} ({}), status {}, {} byte payload",
-                        event_type,
-                        code::name(event_type),
-                        status,
-                        datalen
-                    ));
-                    if event_type == code::ESCAN_RESULT {
-                        scan.results += 1;
-                        if status == status::PARTIAL {
-                            parse_results(&frame[p + at..p + at + datalen], scan, ctx);
-                        }
-                        if let Some(why) = status::terminal(status) {
-                            // THE FIRMWARE SAID SO. Stop asking.
-                            ended_by = why;
-                            break;
-                        }
-                    }
-                }
-            }
-            None => {
+        match step(h, w, scan, &mut frame, ctx) {
+            Step::Frame => {}
+            Step::Empty => {
                 empty += 1;
                 ctx.sleep_ms(1);
+            }
+            Step::Ended(why) => {
+                ended_by = why;
+                break;
             }
         }
     }
@@ -770,7 +893,7 @@ pub fn collect(
 /// duration: each empty poll is one CMD53 and a 1 ms sleep, so this is on the order of tens of seconds
 /// of silence, and the log says which of the two ended the wait. The scan itself ends when the firmware
 /// says it does (`status::SUCCESS`), which on hardware was about 2.6 s after it started.
-const MAX_EMPTY_POLLS: u32 = 500;
+pub const MAX_EMPTY_POLLS: u32 = 500;
 
 /// Bring the radio up for scanning - ONCE, at boot. Returns the session the rest of the driver's life
 /// runs on, so request ids keep counting across every later scan.
@@ -856,22 +979,10 @@ pub fn scan_once(
     s: &mut ctrl::Session,
     ctx: &ServiceContext,
 ) -> Option<Scan> {
-    let mut request = [0u8; req::SIZE];
-    build_request(&mut request);
-
     let mut scan = Scan::new();
-    if !ctrl::set_iovar(h, w, s, "escan", &request, ctx) {
-        // NO VERSION HINT HERE. This message used to say the params VERSION was the first thing to change,
-        // which was written for the "accepted but silent" case and is wrong for a refusal: the firmware
-        // states what it objected to, and the decoded error is printed one line above. The version matters
-        // only where the request is ACCEPTED and no results follow.
-        ctx.log(
-            "wifi-driver: the firmware refused the `escan` request, so no scan started. The decoded error \
-             above says what it objected to",
-        );
+    if !start(h, w, s, ctx) {
         return None;
     }
-    ctx.log("wifi-driver: `escan` accepted - listening until the firmware says the scan is over");
     collect(h, w, &mut scan, MAX_EMPTY_POLLS, ctx);
 
     ctx.log_fmt(format_args!(

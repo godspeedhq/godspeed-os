@@ -14,41 +14,49 @@ Microsoft-OUI vendor element is WPA, the Privacy bit alone is WEP). Eleven netwo
 a second run straight after scanned again on the same driver session. About three seconds each, ending
 when the firmware says the scan is complete rather than when a timer runs out.
 
-**This file now specifies TWO verbs where the shell answers ONE.** Today `wifi list` both scans and
-prints. Sections 2 to 4 below split that into `wifi scan` (ask the radio; a blocking, escapable,
-backgroundable surface that ends in a numbered picker) and `wifi list` (print the last complete scan;
-instant, records only). The split was decided on 2026-09-29 and this is the spec the code is being built
-to; until it lands, `wifi list` behaves as `wifi scan` did before the picker existed - it sweeps and
-prints, with `[q] quit` and no `[b]`. Recorded here so a reader of the spec is not misled by the prompt,
-and a reader of the prompt is not misled by the spec.
+**The `scan` / `list` split is BUILT (2026-09-29) and not yet run on hardware.** Sections 2 to 4 are the
+spec; the shell and the driver now answer them: `wifi scan` starts a sweep the driver advances one frame
+at a time from its serve loop, prints rows as they are heard with `scanning  [q] quit  [b] background`
+above them, and ends in the numbered picker; `wifi list` prints the driver's cache and refuses (with the
+two sentences in section 3) while a sweep runs or when none has run. The cache lives in the driver's
+memory - not in a file, so it needs no `fs`, dies with the driver (a respawned driver says `no scan yet`),
+and never writes a neighbour's network name to the card. The first boot of this build is the test; every
+"works" below that is not marked hardware-verified is a build that compiles and passes the gate, no more.
 
 What every verb does today:
 
-- `wifi list` - a real scan, printed as records, on the Pi 4. On every other board: no radio, and it says so.
-- `wifi connect <ssid>` - built, and **cannot join on this firmware as built**. `wpa_auth`, `auth` and
-  `wsec` are accepted; `sup_wpa` - handing the WPA2 handshake to the firmware - is refused -23 in both
-  forms, and a GET of it asked Linux's way is refused too. By Linux's own rule this firmware (7.45.265) has
-  no internal supplicant: the host must run the 4-way handshake and install keys with `wsec_key`, as Linux
-  and OpenBSD both do on this chip. `docs/wifi.md` §37 has the evidence; the road is the operator's call.
-  Until then the command reports `the join failed before the network answered`, which is true.
-- `wifi scan`, `wifi`, `wifi status`, `wifi disconnect`, `wifi stored`, `wifi forget <ssid>`,
-  `wifi radio on|off` - parse, report whether there is a radio, and on the Pi 4 say what the driver can be
-  asked so far, naming the verb. They arrive with the phases that need them (`docs/wifi.md` §7).
+- `wifi scan` - built. Start, live numbered rows, `q` (stops the SWEEP with the firmware's own abort - a
+  one-channel scan of channel -1, the form Linux uses - and discards the partial), `b` (returns the
+  prompt, the sweep finishes into the cache), the picker (a number and Enter; `open` joins at once, `WEP`
+  is refused, anything else asks the passphrase). Unverified on hardware.
+- `wifi list` - built to section 3: cache only, never scans. **The scan itself is hardware-verified**
+  (2026-09-28, as the old blocking `wifi list`); the cache path is not yet.
+- `wifi status` / bare `wifi` - built: radio on/off, joined name or `not associated`, and the sweep
+  state or the last scan's age. Unverified on hardware.
+- `wifi disconnect`, `wifi radio on|off` - built as `bwfm_newstate` and `bwfm_stop` do them (`DISASSOC`
+  with no payload; `DOWN 1`, and `UP` again through the same chain boot uses). Unverified on hardware.
+- `wifi connect <ssid>` - built, and on a WPA2 network **cannot complete on this firmware as built**:
+  `sup_wpa` is refused in every form, so this firmware (7.45.265) has no supplicant and the host must run
+  the 4-way handshake (`docs/wifi.md` §37). Today it associates, reads the access point's first handshake
+  message, and reports honestly that it cannot answer it (reply 15). An OPEN network has no handshake, and
+  joining one is expected to work - that is the first join this build can complete. Unverified.
+- `wifi stored`, `wifi forget <ssid>` - parse and say the driver cannot be asked yet. They wait on the
+  credential-storage decision (`docs/wifi.md` §6), which is the operator's.
 - `wifi help`, `wifi version`, tab completion including `radio on|off`, and a row in `help`.
 - Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
   not answer says that after a bounded wait, never a guess.
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
-- The `scan` / `list` split, the cache, the picker, `[b] background`, and the age in `wifi status`
-  (sections 2 to 4). None is built.
-- Rule 11 - `q` stops the SCAN, not just the shell's interest - is not met. The driver is single-threaded
-  inside its collection loop while the radio sweeps, so `q` abandons the shell's wait and the radio finishes
-  (about 2.6 s); the late reply is dropped. Meeting it needs the driver to advance the scan a frame at a
-  time from its serve loop, which is the same change the cache and `[b]` need (section 4).
+- The WPA2 join (the host supplicant), so `connect` and the picker's passphrase path end in reply 15.
 - The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
   `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
   to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.
+- The `joined` line in `wifi status` is the driver's memory of its last reported join, not a live read of
+  the firmware's link state. It is cleared by `disconnect` and `radio off`, but an access point that drops
+  the station is not yet noticed. Reading `LINK` events outside a join is what closes this.
+- The BSSID and band in the `joined` sentence (section 4b) are not yet read from the association event;
+  the sentence names the network only.
 
 One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
 spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.
@@ -127,27 +135,27 @@ given bars cannot recover dBm.
 
 **The columns are fixed-width, and they can be because the widest is known.** An SSID is at most 32
 bytes - that is the size of the field in the beacon, so a longer one cannot exist - and every other
-field has a bounded vocabulary. So the layout is `ssid` padded to 32, `signal` right-aligned to 7
-(`-41 dBm`), `band` padded to 6 (`2.4GHz` or `5GHz`), then `security`, two spaces between columns:
+field has a bounded vocabulary. So the layout is `ssid` padded to 32, `signal` right-aligned to 8
+(`-41 dBm`, room for `-100 dBm`), `band` padded to 6 (`2.4GHz` or `5GHz`), then `security`, two spaces between columns:
 
 ```
 gsh> wifi list
-Maple-House                       -41 dBm  5GHz    WPA2
-Maple-House                       -47 dBm  2.4GHz  WPA2
-(hidden)                          -63 dBm  5GHz    WPA2
-BT-Hub6-K7QR                      -71 dBm  2.4GHz  WPA2/WPA
-Riverside Tenant WiFi Guest Netw  -74 dBm  2.4GHz  open
-xfinitywifi                       -79 dBm  2.4GHz  open
-SKY7F2B1                          -80 dBm  5GHz    WPA2
-PrinterDirect-4A                  -82 dBm  2.4GHz  WEP
-(unprintable)                     -85 dBm  2.4GHz  WPA2
-a                                 -86 dBm  5GHz    WPA
-Free_Cafe_WiFi                    -88 dBm  2.4GHz  open
+Maple-House                        -41 dBm  5GHz    WPA2
+Maple-House                        -47 dBm  2.4GHz  WPA2
+(hidden)                           -63 dBm  5GHz    WPA2
+BT-Hub6-K7QR                       -71 dBm  2.4GHz  WPA2/WPA
+Riverside Tenant WiFi Guest Netw   -74 dBm  2.4GHz  open
+xfinitywifi                        -79 dBm  2.4GHz  open
+SKY7F2B1                           -80 dBm  5GHz    WPA2
+PrinterDirect-4A                   -82 dBm  2.4GHz  WEP
+(unprintable)                      -85 dBm  2.4GHz  WPA2
+a                                  -86 dBm  5GHz    WPA
+Free_Cafe_WiFi                     -88 dBm  2.4GHz  open
 ```
 
 Nothing is ever truncated: the fifth row is exactly 32 bytes and fills its column edge to edge. A
-network that does not announce its name prints `(hidden)`; a name that is not valid UTF-8 prints
-`(unprintable)` rather than a row of `?`. `security` is one of `open`, `WEP`, `WPA`, `WPA2`,
+network that does not announce its name prints `(hidden)`; a byte outside printable ASCII prints as a
+dot rather than reaching the terminal as a control code. `security` is one of `open`, `WEP`, `WPA`, `WPA2`,
 `WPA2/WPA`, read from the beacon. Two rows with the same name are two access points - the same
 network on 2.4 GHz and 5 GHz is the usual case, and both are listed because both were heard.
 
@@ -188,18 +196,18 @@ reports the sweep complete, the status line becomes the prompt:
 ```
 gsh> wifi scan
 scanning  [q] quit  [b] background
-    ssid                              signal   band    security
- 1  Maple-House                       -41 dBm  5GHz    WPA2
- 2  Maple-House                       -47 dBm  2.4GHz  WPA2
- 3  (hidden)                          -63 dBm  5GHz    WPA2
- 4  BT-Hub6-K7QR                      -71 dBm  2.4GHz  WPA2/WPA
- 5  Riverside Tenant WiFi Guest Netw  -74 dBm  2.4GHz  open
- 6  xfinitywifi                       -79 dBm  2.4GHz  open
- 7  SKY7F2B1                          -80 dBm  5GHz    WPA2
- 8  PrinterDirect-4A                  -82 dBm  2.4GHz  WEP
- 9  (unprintable)                     -85 dBm  2.4GHz  WPA2
-10  a                                 -86 dBm  5GHz    WPA
-11  Free_Cafe_WiFi                    -88 dBm  2.4GHz  open
+    ssid                                signal  band    security
+ 1  Maple-House                        -41 dBm  5GHz    WPA2
+ 2  Maple-House                        -47 dBm  2.4GHz  WPA2
+ 3  (hidden)                           -63 dBm  5GHz    WPA2
+ 4  BT-Hub6-K7QR                       -71 dBm  2.4GHz  WPA2/WPA
+ 5  Riverside Tenant WiFi Guest Netw   -74 dBm  2.4GHz  open
+ 6  xfinitywifi                        -79 dBm  2.4GHz  open
+ 7  SKY7F2B1                           -80 dBm  5GHz    WPA2
+ 8  PrinterDirect-4A                   -82 dBm  2.4GHz  WEP
+ 9  (unprintable)                      -85 dBm  2.4GHz  WPA2
+10  a                                  -86 dBm  5GHz    WPA
+11  Free_Cafe_WiFi                     -88 dBm  2.4GHz  open
 11 networks in 2.8 s
 join: type a number and Enter, [q] quit
 ```
@@ -220,7 +228,7 @@ echoes the row, and the join reports what was actually joined:
 
 ```
 join: 1
- 1  Maple-House                       -41 dBm  5GHz    WPA2
+ 1  Maple-House                        -41 dBm  5GHz    WPA2
 passphrase (not shown):
 joining Maple-House  [q] quit
 joined Maple-House on 5GHz, bssid 02:1a:7e:c4:09:51 - the link is up and the handshake completed
@@ -258,9 +266,9 @@ ends. The picker never appears; `wifi list` and `wifi connect <ssid>` are the wa
 ```
 gsh> wifi scan
 scanning  [q] quit  [b] background
-    ssid                              signal   band    security
- 1  Maple-House                       -41 dBm  5GHz    WPA2
- 2  Maple-House                       -47 dBm  2.4GHz  WPA2
+    ssid                                signal  band    security
+ 1  Maple-House                        -41 dBm  5GHz    WPA2
+ 2  Maple-House                        -47 dBm  2.4GHz  WPA2
 scan continues in the driver - wifi list when it finishes, wifi status meanwhile
 gsh> wifi status
 radio up, not associated
@@ -268,7 +276,7 @@ scan running - 6 heard so far
 gsh> wifi list
 scanning - 9 heard so far; wifi list when it finishes
 gsh> wifi list
-Maple-House                       -41 dBm  5GHz    WPA2
+Maple-House                        -41 dBm  5GHz    WPA2
 ...
 ```
 

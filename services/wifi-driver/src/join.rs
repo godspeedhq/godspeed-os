@@ -77,6 +77,10 @@ const CMD_SET_WPA_AUTH: u32 = 165;
 const WPA2_AUTH_PSK: u32 = 0x0080;
 /// `BWFM_WSEC_AES` - `(1 << 2)`.
 const WSEC_AES: u32 = 0x0004;
+/// `BWFM_WPA_AUTH_DISABLED` - `(0 << 0)`: an open network.
+const WPA_AUTH_DISABLED: u32 = 0;
+/// `BWFM_WSEC_NONE` - `(0 << 0)`: no cipher.
+const WSEC_NONE: u32 = 0;
 /// `BWFM_AUTH_OPEN` - open system; the WPA2 authentication happens in the handshake, not here.
 const AUTH_OPEN_SYSTEM: u32 = 0;
 /// `BWFM_MFP_NONE` - no management frame protection, as `bwfm_connect` sets it.
@@ -116,9 +120,13 @@ pub fn join(
         return Outcome::Failed;
     }
 
+    // AN EMPTY PASSPHRASE MEANS AN OPEN NETWORK - `bwfm_connect`'s final `else`: `wpa_auth` DISABLED, `wsec`
+    // NONE, no RSN element, and no handshake to wait for: the link coming up IS the join.
+    let open = passphrase.is_empty();
+
     // ---- 1. The RSN element for the association request. Refusal is loud but not fatal: the firmware
     // will then compose its own, and message 2 will have to be built from whatever it sent. ----
-    if !ctrl::set_iovar(h, w, s, "wpaie", &eapol::RSN_IE, ctx) {
+    if !open && !ctrl::set_iovar(h, w, s, "wpaie", &eapol::RSN_IE, ctx) {
         ctx.log(
             "wifi-driver: `wpaie` refused - the firmware will compose the association request's RSN element \
              itself, and the handshake's message 2 cannot yet know what it sent",
@@ -126,8 +134,13 @@ pub fn join(
     }
 
     // ---- 2. Security mode, in `bwfm_connect`'s order. ----
-    if !ctrl::set_cmd_int(h, w, s, CMD_SET_WPA_AUTH, WPA2_AUTH_PSK, "wpa_auth WPA2-PSK", ctx)
-        || !ctrl::set_cmd_int(h, w, s, CMD_SET_WSEC, WSEC_AES, "wsec AES", ctx)
+    let (wpa_auth, wsec, mode) = if open {
+        (WPA_AUTH_DISABLED, WSEC_NONE, "wpa_auth disabled (open network)")
+    } else {
+        (WPA2_AUTH_PSK, WSEC_AES, "wpa_auth WPA2-PSK")
+    };
+    if !ctrl::set_cmd_int(h, w, s, CMD_SET_WPA_AUTH, wpa_auth, mode, ctx)
+        || !ctrl::set_cmd_int(h, w, s, CMD_SET_WSEC, wsec, if open { "wsec none" } else { "wsec AES" }, ctx)
         || !ctrl::set_cmd_int(h, w, s, CMD_SET_AUTH, AUTH_OPEN_SYSTEM, "auth open-system", ctx)
     {
         return Outcome::Failed;
@@ -219,6 +232,11 @@ pub fn join(
             code::SET_SSID if e.status != status::SUCCESS => return Outcome::Failed,
             code::LINK if e.flags & EVENT_MSG_LINK != 0 => {
                 link_up = true;
+                if open {
+                    // No keys, no handshake: on an open network the link coming up is the whole join.
+                    ctx.log("wifi-driver: JOINED - the link is up on an open network");
+                    return Outcome::Joined;
+                }
                 ctx.log("wifi-driver:   ASSOCIATED - the link is up at the 802.11 layer; the handshake is now the access point's move");
             }
             code::DEAUTH_IND | code::DISASSOC_IND => {

@@ -442,3 +442,11 @@ bwfm_proto_bcdc_rx                 # OpenBSD bwfm.c - strips the BCDC header plu
 bwfm_rx                            # OpenBSD bwfm.c - the data receive path; hands EAPOL frames to net80211 - external, 26.14
 ieee80211_add_rsn                  # OpenBSD net80211 - builds the RSN element bwfm_connect sets as wpaie; eapol::RSN_IE is that element for CCMP/PSK - external, 26.14
 ieee80211_eapol_key_input          # OpenBSD net80211 - the 4-way handshake receive entry point bwfm_rx calls - external, 26.14
+BRCMF_C_SCAN                       # Linux brcmfmac fwil.h - command 50, the plain scan; how an escan is ABORTED (channel list [-1]); this driver names it CMD_SCAN - external, 26.14
+WLC_SCAN                           # cyw43-driver - command 50, the same plain scan command - external, 26.14
+BWFM_C_DISASSOC                    # OpenBSD bwfmreg.h - command 52, sent with no payload by bwfm_newstate; this driver names it CMD_DISASSOC - external, 26.14
+BWFM_C_DOWN                        # OpenBSD bwfmreg.h - command 3, sent with the value 1 by bwfm_stop; this driver names it CMD_DOWN - external, 26.14
+BWFM_WPA_AUTH_DISABLED             # OpenBSD bwfmreg.h - (0 << 0), an open network; this driver names it WPA_AUTH_DISABLED - external, 26.14
+BWFM_WSEC_NONE                     # OpenBSD bwfmreg.h - (0 << 0), no cipher; this driver names it WSEC_NONE - external, 26.14
+bwfm_newstate                      # OpenBSD bwfm.c - the net80211 state machine hook; on the way back to SCAN it sends DISASSOC with no payload - external, 26.14
+bwfm_stop                          # OpenBSD bwfm.c - the interface teardown: a zeroed SET_SSID, DOWN 1, the mode commands, UP 1 - external, 26.14
