@@ -52,9 +52,10 @@
 //!
 //! ## The passphrase
 //!
-//! It arrives in the request and is not sent anywhere: the firmware has nothing to do with it now. It is
-//! held only for the host supplicant, which will derive the pairwise master key from it; until that exists
-//! the bytes are read for their length and nothing else.
+//! It never reaches this module. The serve loop turns it into the pairwise master key the moment it arrives
+//! (`crypto::psk`, IEEE 802.11 §12.7.1.2) and keeps only the key, in the one credential slot the driver
+//! holds (`utilities/56_wifi.md` §6). `Secret::Pmk` is that key; the handshake that will use it is the next
+//! slice, and until then a WPA2 join associates and reports `HandshakeUnimplemented` rather than pretending.
 
 use godspeed_sdk::ServiceContext;
 
@@ -106,23 +107,32 @@ pub enum Outcome {
     HandshakeUnimplemented,
 }
 
+/// What the station joins WITH. The passphrase never reaches this module: it is turned into the pairwise
+/// master key the moment it arrives (`crypto::psk`) and only the key is kept.
+#[derive(Clone, Copy)]
+pub enum Secret<'a> {
+    /// No key at all - `bwfm_connect`'s final `else`: `wpa_auth` DISABLED, `wsec` NONE, no RSN element, and
+    /// no handshake to wait for. The link coming up IS the join.
+    Open,
+    /// WPA2-PSK with this pairwise master key. Held for the handshake, which is not built yet; until it is,
+    /// the join associates and reports `HandshakeUnimplemented`.
+    Pmk(&'a [u8; crate::crypto::PMK_LEN]),
+}
+
 /// Join `ssid`, and wait for the firmware - and then the access point - to say how it went.
 pub fn join(
     h: &Host,
     w: &mut Window,
     s: &mut Session,
     ssid: &[u8],
-    passphrase: &[u8],
+    secret: Secret,
     ctx: &ServiceContext,
 ) -> Outcome {
-    if ssid.is_empty() || ssid.len() > MAX_SSID || passphrase.len() > MAX_PASSPHRASE {
-        ctx.log("wifi-driver: join refused before sending - the name or passphrase length is out of range");
+    if ssid.is_empty() || ssid.len() > MAX_SSID {
+        ctx.log("wifi-driver: join refused before sending - the name length is out of range");
         return Outcome::Failed;
     }
-
-    // AN EMPTY PASSPHRASE MEANS AN OPEN NETWORK - `bwfm_connect`'s final `else`: `wpa_auth` DISABLED, `wsec`
-    // NONE, no RSN element, and no handshake to wait for: the link coming up IS the join.
-    let open = passphrase.is_empty();
+    let open = matches!(secret, Secret::Open);
 
     // ---- 1. The RSN element for the association request. Refusal is loud but not fatal: the firmware
     // will then compose its own, and message 2 will have to be built from whatever it sent. ----

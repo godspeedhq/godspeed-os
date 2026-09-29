@@ -312,11 +312,11 @@ fn round_to(len: usize) -> usize {
     }
 }
 
-/// Send one BCDC control request and read its reply. Returns the reply payload length.
+/// Ask the firmware for an iovar's value. Returns the reply payload length.
 ///
 /// `name` is the iovar, NUL-terminated on the wire. `out` receives the payload the firmware returns,
 /// which for a query begins with the value asked for.
-fn query_iovar(
+pub fn query_iovar(
     h: &Host,
     w: &mut Window,
     s: &mut Session,
@@ -324,18 +324,62 @@ fn query_iovar(
     out: &mut [u8],
     ctx: &ServiceContext,
 ) -> Option<usize> {
+    // The payload of a GET_VAR is the variable's name, NUL-terminated, followed by room for the answer.
+    let mut named = [0u8; 64];
+    if name.len() + 1 > named.len() {
+        ctx.log("wifi-driver: an iovar name longer than this driver's 63-byte bound - not sent");
+        return None;
+    }
+    named[..name.len()].copy_from_slice(name.as_bytes());
+    let want = core::cmp::max(name.len() + 1, out.len());
+    query_raw(h, w, s, GET_VAR, &named[..name.len() + 1], want, name, out, ctx)
+}
+
+/// Ask the firmware a GET COMMAND - `BRCMF_C_GET_BSSID`, `BRCMF_C_GET_RSSI` and their kind - where the
+/// payload sent is the structure the answer is written back into (`brcmf_fil_cmd_data_get`). `inout` goes
+/// out as sent and comes back overwritten. Returns the reply payload length.
+pub fn query_cmd(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    cmd: u32,
+    inout: &mut [u8],
+    what: &str,
+    ctx: &ServiceContext,
+) -> Option<usize> {
+    let mut sent = [0u8; 64];
+    if inout.len() > sent.len() {
+        ctx.log("wifi-driver: a GET command with more than 64 bytes of structure - not sent");
+        return None;
+    }
+    sent[..inout.len()].copy_from_slice(inout);
+    let n = inout.len();
+    query_raw(h, w, s, cmd, &sent[..n], n, what, inout, ctx)
+}
+
+/// Send one BCDC GET request - any command, any payload - and read its reply. Returns the reply payload
+/// length. `payload` is what goes out after the 16-byte dcmd header; `want` is the room the firmware is told
+/// it has for the answer, which lands in `out`. The two GET forms above are thin wrappers over this.
+fn query_raw(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    cmd: u32,
+    payload: &[u8],
+    want: usize,
+    name: &str,
+    out: &mut [u8],
+    ctx: &ServiceContext,
+) -> Option<usize> {
     let reqid = s.next_id();
     let mut frame = [0u8; FRAME];
 
-    // The payload of a GET_VAR is the variable's name, NUL-terminated, followed by room for the answer.
-    let name_len = name.len() + 1;
-    let want = core::cmp::max(name_len, out.len());
+    let want = core::cmp::max(want, payload.len());
     if PAYLOAD_AT + want > FRAME {
         ctx.log("wifi-driver: the control frame would not fit its bounded buffer");
         return None;
     }
-    frame[PAYLOAD_AT..PAYLOAD_AT + name.len()].copy_from_slice(name.as_bytes());
-    // The NUL is already there: the buffer is zeroed.
+    frame[PAYLOAD_AT..PAYLOAD_AT + payload.len()].copy_from_slice(payload);
 
     let len = PAYLOAD_AT + want;
     let padded = {
@@ -359,7 +403,7 @@ fn query_iovar(
 
     // ---- BCDC command header. ----
     let flags = (reqid as u32) << DCMD_ID_SHIFT; // no SET bit: this is a get. Interface index 0.
-    frame[HWHDR + SWHDR..HWHDR + SWHDR + 4].copy_from_slice(&GET_VAR.to_le_bytes());
+    frame[HWHDR + SWHDR..HWHDR + SWHDR + 4].copy_from_slice(&cmd.to_le_bytes());
     frame[HWHDR + SWHDR + 4..HWHDR + SWHDR + 8].copy_from_slice(&(want as u32).to_le_bytes());
     frame[HWHDR + SWHDR + 8..HWHDR + SWHDR + 12].copy_from_slice(&flags.to_le_bytes());
     // status stays zero on the way out; the firmware fills it on the way back.
@@ -884,6 +928,52 @@ const CMD_DOWN: u32 = 3;
 /// `BWFM_C_DISASSOC` - leave the network. `bwfm_newstate`, on the way back to SCAN:
 /// `bwfm_fwvar_cmd_set_data(sc, BWFM_C_DISASSOC, NULL, 0)` - no payload at all.
 const CMD_DISASSOC: u32 = 52;
+
+/// `BRCMF_C_GET_BSSID` - the access point's address, 6 bytes; all zeros when not associated
+/// (`brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_BSSID, bssid, ETH_ALEN)`).
+const CMD_GET_BSSID: u32 = 23;
+/// `BRCMF_C_GET_RSSI` - `brcmf_scb_val_le { __le32 val; u8 ea[6]; }`, sent with `val` 0 and `ea` zero for
+/// our own station; the firmware writes the RSSI, in dBm, into `val`.
+const CMD_GET_RSSI: u32 = 127;
+
+/// What the firmware says about the link RIGHT NOW - not what this driver remembers of its last join.
+pub struct Link {
+    /// The access point, or all zeros when the radio is not associated.
+    pub bssid: [u8; 6],
+    /// dBm. Meaningful only when associated.
+    pub rssi: i32,
+    /// The `chanspec` iovar: band in bits 15:14, channel in the low 8.
+    pub chanspec: u16,
+}
+
+impl Link {
+    pub fn associated(&self) -> bool {
+        self.bssid.iter().any(|&b| b != 0)
+    }
+}
+
+/// Three GETs that together are the truth of the link: BSSID, RSSI, chanspec. `None` only if the firmware
+/// would not answer the first; the other two degrade to zero with a log line, since an address with no
+/// signal reading is still an association.
+pub fn link_now(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<Link> {
+    let mut bssid = [0u8; 6];
+    query_cmd(h, w, s, CMD_GET_BSSID, &mut bssid, "bssid", ctx)?;
+    let mut link = Link { bssid, rssi: 0, chanspec: 0 };
+    if !link.associated() {
+        return Some(link);
+    }
+    let mut scb = [0u8; 10];
+    match query_cmd(h, w, s, CMD_GET_RSSI, &mut scb, "rssi", ctx) {
+        Some(n) if n >= 4 => link.rssi = i32::from_le_bytes([scb[0], scb[1], scb[2], scb[3]]),
+        _ => ctx.log("wifi-driver: the firmware gave no RSSI - reported as 0"),
+    }
+    let mut cs = [0u8; 4];
+    match query_iovar(h, w, s, "chanspec", &mut cs, ctx) {
+        Some(n) if n >= 2 => link.chanspec = u16::from_le_bytes([cs[0], cs[1]]),
+        _ => ctx.log("wifi-driver: the firmware gave no chanspec - reported as 0"),
+    }
+    Some(link)
+}
 
 /// Leave whatever network the radio is on. The reference sends the bare command with nothing after it, so
 /// so does this; the radio stays up and can scan or join again at once.

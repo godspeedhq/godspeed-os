@@ -31,8 +31,12 @@ What every verb does today:
   is refused, anything else asks the passphrase). Unverified on hardware.
 - `wifi list` - built to section 3: cache only, never scans. **The scan itself is hardware-verified**
   (2026-09-28, as the old blocking `wifi list`); the cache path is not yet.
-- `wifi status` / bare `wifi` - built: radio on/off, joined name or `not associated`, and the sweep
-  state or the last scan's age. Unverified on hardware.
+- `wifi status` - built to section 4f: radio, network/band/BSSID, signal, security, time joined - read
+  from the firmware on each call (`GET_BSSID`, `GET_RSSI`, `chanspec`) except mid-sweep - and the sweep
+  state or the last scan's age. Bare `wifi` prints usage. Unverified on hardware.
+- `wifi stored`, `wifi forget <ssid>` - built to section 6: the one slot, holding a derived key and never
+  a passphrase. `wifi connect` asks for a passphrase only when the driver says one is needed. The key
+  derivation self-tests against four published vectors at boot (`stage 0` in the driver's log). Unverified.
 - `wifi disconnect`, `wifi radio on|off` - built as `bwfm_newstate` and `bwfm_stop` do them (`DISASSOC`
   with no payload; `DOWN 1`, and `UP` again through the same chain boot uses). Unverified on hardware.
 - `wifi connect <ssid>` - built, and on a WPA2 network **cannot complete on this firmware as built**:
@@ -40,8 +44,6 @@ What every verb does today:
   the 4-way handshake (`docs/wifi.md` §37). Today it associates, reads the access point's first handshake
   message, and reports honestly that it cannot answer it (reply 15). An OPEN network has no handshake, and
   joining one is expected to work - that is the first join this build can complete. Unverified.
-- `wifi stored`, `wifi forget <ssid>` - parse and say the driver cannot be asked yet. They wait on the
-  credential-storage decision (`docs/wifi.md` §6), which is the operator's.
 - `wifi help`, `wifi version`, tab completion including `radio on|off`, and a row in `help`.
 - Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
   not answer says that after a bounded wait, never a guess.
@@ -52,11 +54,10 @@ What every verb does today:
 - The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
   `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
   to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.
-- The `joined` line in `wifi status` is the driver's memory of its last reported join, not a live read of
-  the firmware's link state. It is cleared by `disconnect` and `radio off`, but an access point that drops
-  the station is not yet noticed. Reading `LINK` events outside a join is what closes this.
 - The BSSID and band in the `joined` sentence (section 4b) are not yet read from the association event;
-  the sentence names the network only.
+  the sentence names the network only. `wifi status` reads both live, so they are one command away.
+- An access point that drops the station is noticed only when `wifi status` next reads the link (section
+  4f), not the moment it happens; the driver does not yet watch `LINK` events outside a join or a sweep.
 
 One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
 spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.
@@ -88,14 +89,14 @@ because an IP address has one owner and duplicating it here would make two answe
 
 | Subcommand | What it does |
 |---|---|
-| `wifi` | with no args: the association summary, the same as `wifi status` |
+| `wifi` | with no args: usage, as every utility (`0_conventions.md` rule 1). It used to alias `status`, a second way to say one thing |
 | `wifi scan` | ask the radio to sweep. Rows appear as they are heard; when the sweep ends the rows become a numbered picker. `q` stops the sweep, `b` leaves it running and returns the prompt |
 | `wifi list` | print the last complete scan: SSID, signal, band, security. Instant, records only, never scans |
 | `wifi connect <ssid>` | join a network by name. Prompts for the passphrase if one is needed and none is stored |
 | `wifi disconnect` | leave the current network. The radio stays up |
-| `wifi status` | radio state, current SSID, band, BSSID, signal, security, association time - and how old the last scan is |
-| `wifi forget <ssid>` | delete a stored credential. Does not disconnect |
-| `wifi stored` | list the SSIDs a credential is held for. Names only, never secrets |
+| `wifi status` | what is true NOW, read from the firmware: radio, network, band, BSSID, signal, security, time joined - and the sweep or the last scan's age. Section 4f |
+| `wifi forget <ssid>` | drop the held key for that network. Does not disconnect |
+| `wifi stored` | the network a key is held for. A name, never a secret. One slot - section 6 |
 | `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
@@ -293,6 +294,38 @@ Its age is always available. `wifi scan` ends with `11 networks in 2.8 s`; `wifi
 `last scan: 42 s ago, 11 networks`. `wifi list` itself stays records-only so pipes stay clean - the
 age is one command away, never mixed into the data.
 
+### 4f. `wifi status` is the now-view
+
+Labelled lines, so it pipes (`wifi status | match signal`), and every link fact on it is READ from the
+firmware when asked - `BSSID`, `RSSI`, `chanspec` - not remembered from the last join:
+
+```
+gsh> wifi status
+radio      on
+network    Maple-House  5GHz  bssid 02:1a:7e:c4:09:51
+signal     -41 dBm  excellent
+security   WPA2
+joined     3 min ago
+last scan  42 s ago, 11 networks
+```
+
+The word after the dBm is the one place this utility says more than the number, at the operator's request,
+and it is a stated rule rather than a mood so a reader can check it: -50 dBm or stronger is `excellent`,
+to -60 `good`, to -70 `fair`, weaker is `weak`. The number stays first and stays the fact (rule 7); the
+scan rows carry no word, because a pipe should not have to strip an adjective.
+
+Not associated: `network    none (not associated)`, and no signal, security or joined lines. Radio off:
+`radio      off` and the same. The scan line is one of `scan       running - N heard so far`,
+`last scan  N s ago, M networks`, or `last scan  none - run wifi scan`.
+
+One exception, stated because it is deliberate: while a sweep runs the link is NOT read - a control exchange
+takes frames off the bus and skips the ones that are not its reply, which mid-sweep would be the scan's own
+results - so the status reports the driver's memory and says the sweep is running, which is the fact that
+matters then. An access point that has dropped the station is noticed on the next `wifi status` after the
+sweep ends, and the remembered join is cleared then.
+
+Addressing is `net`'s (section 1). Nothing here is an IP address, and nothing here will be.
+
 ### 4e. What this costs the driver, said plainly
 
 Today `scan::collect` blocks the driver until the firmware reports the sweep complete, which is why
@@ -326,18 +359,31 @@ And the rule above the rules applies throughout: a radio that is absent, wedged 
 `wifi` **return with a loud unavailable**, never hang. That is Commandment VIII at the command layer -
 wait on the driver's reply or on the loud fact of its death, never on a timer.
 
-## 6. Where the passphrase goes
+## 6. Where the passphrase goes: one slot, in the driver's memory, holding the KEY
 
-The short version, because this is the command surface and `docs/wifi.md` §6 carries the argument:
+Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sketched:
 
-- The shell prompts with invisible entry and hands the secret **to the keyring service**, which is the
-  only holder. It does not pass through this utility's output, is never logged, and is never echoed.
-- `wifi connect` then asks the radio to join using a **capability to that credential**, not the bytes.
-- On a machine with a filesystem the credential is stored **capability-protected, and the boot log
-  says plainly that it is not encrypted at rest**. On a diskless machine it is a session credential
-  that dies with the keyring, and the failure when it does is "retype it", loudly.
-- `wifi forget` revokes it. Every outstanding capability to it goes stale by generation bump; nothing
-  has to be hunted down.
+- The shell prompts with invisible entry and hands the passphrase to the **driver**, which does not keep
+  it. The moment it arrives the driver derives the **pairwise master key** from it and the network name
+  (`PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`, IEEE 802.11-2020 §12.7.1.2 - a few
+  milliseconds) and the passphrase is gone. The key is the only thing ever needed again: to answer the
+  handshake, to rejoin when the access point drops us, to roam. So the key is what is kept.
+- **One slot**: `(ssid, key)`, about 70 bytes, in the driver's memory. Joining a second network replaces
+  the first - the cafe replaces home, and home is typed once more on return. That is the honest cost of
+  one slot without a disk; widening it is a constant, and is not done until wanted.
+- **Not on disk, on purpose.** No `fs` under a join; no "not encrypted at rest" caveat; no network name of
+  the operator's written to a card. The slot dies with the driver - a reboot or a driver respawn empties
+  it - and `wifi connect` simply asks again. Persistence across reboots is a separate decision that can
+  layer on top; nothing here forecloses it.
+- **`wifi connect <ssid>` asks for a passphrase only when one is needed.** The shell sends the name
+  alone first; the driver joins with the stored key if the slot holds that name, joins open if the last
+  sweep heard the network as open, and otherwise answers *needs a passphrase* - at which point, and only
+  then, the shell asks. A network joined once this boot is rejoined by name alone.
+- `wifi stored` prints the slot's name; `wifi forget <ssid>` zeroes the slot. Neither can print a key.
+- The primitives that derive the key are checked against their published vectors at every boot (FIPS
+  180-1, RFC 2202, RFC 6070, IEEE 802.11 Annex J.4.2). A wrong hash would be refused by every access
+  point in a way indistinguishable from a wrong passphrase, so if the check fails, passphrases are
+  refused with the reason rather than accepted into silence.
 
 One residual, recorded here rather than left for a reader to work out: a USB keyboard driver sees the
 passphrase as it is typed. That is the SEC-2 residual - `CONSOLE_PUSH` holders are inside the shell's

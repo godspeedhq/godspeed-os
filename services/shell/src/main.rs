@@ -5138,7 +5138,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
         "wifi" => help_block(ctx, "wifi", "join and inspect a wireless network", &[
-            ("wifi", "radio state and which network is joined", "wifi"),
+            ("wifi", "this usage (rule 1: a bare utility name teaches its verbs)", "wifi"),
             ("wifi scan", "sweep for networks; ends in a numbered picker (q stops the sweep, b backgrounds it)", "wifi scan"),
             ("wifi list", "the last complete scan, one record per network; never scans", "wifi list"),
             ("wifi connect <ssid>", "join a network (prompts for the passphrase; never takes it as an argument)", "wifi connect Bankole-WiFi"),
@@ -7289,6 +7289,12 @@ const WIFI_DRIVER: &str = "wifi-driver";
 /// gets one. Neither is a timer: Commandment VIII wants the reply or the loud fact, never a guess.
 fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let arg = arg.trim();
+    // A bare utility name prints usage (`0_conventions.md` rule 1) - on every machine, radio or not. It used
+    // to alias `wifi status`, which was a second way to say one thing (rule 3).
+    if arg.is_empty() {
+        util_help(ctx, "wifi");
+        return Ok(());
+    }
 
     // Argument shape first, because it does not depend on hardware and a usage error should not be
     // reported as a missing radio. `connect` taking no passphrase argument is a SECURITY decision, not
@@ -7349,7 +7355,8 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             match arg {
                 "scan" => return wifi_scan(ctx, out),
                 "list" => return wifi_list(ctx, out),
-                "" | "status" => return wifi_status(ctx, out),
+                "status" => return wifi_status(ctx, out),
+                "stored" => return wifi_stored(ctx, out),
                 "disconnect" => return wifi_disconnect(ctx, out),
                 "radio on" => return wifi_radio(ctx, out, true),
                 "radio off" => return wifi_radio(ctx, out, false),
@@ -7358,10 +7365,13 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             if let Some(ssid) = arg.strip_prefix("connect ") {
                 return wifi_connect(ctx, out, ssid.trim());
             }
-            // `stored` and `forget` wait on the credential-storage decision (`docs/wifi.md` 6): there is
+            if let Some(ssid) = arg.strip_prefix("forget ") {
+                return wifi_forget(ctx, out, ssid.trim());
+            }
+            // Every spec verb is routed above; what reaches here is a verb the shell parses and the driver (`docs/wifi.md` 6): there is
             // nothing to list or delete until a credential can be held. Loud and specific: the one thing
             // this must never do is imply the radio failed.
-            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell can ask it to scan, list, status, connect, disconnect and radio so far", WIFI_DRIVER));
+            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell cannot ask it that yet", WIFI_DRIVER));
             out.line_fmt(ctx, format_args!("  (`wifi {}` arrives with the phase that needs it - `docs/wifi.md` has the phases)",
                 arg.split_whitespace().next().unwrap_or("status")));
             Err(ShellError::Unknown)
@@ -7380,6 +7390,8 @@ mod wifi_wire {
     pub const OP_STATUS: u8 = 6;
     pub const OP_DISCONNECT: u8 = 7;
     pub const OP_RADIO: u8 = 8;
+    pub const OP_STORED: u8 = 9;
+    pub const OP_FORGET: u8 = 10;
 
     pub const OK: u8 = 0;
     pub const SCAN_FAILED: u8 = 1;
@@ -7394,6 +7406,7 @@ mod wifi_wire {
     pub const JOIN_FAILED: u8 = 13;
     pub const JOIN_TIMEOUT: u8 = 14;
     pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
+    pub const NEEDS_PASSPHRASE: u8 = 16;
 
     /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security.
     pub const RECORD: usize = 44;
@@ -7406,7 +7419,6 @@ mod wifi_wire {
     /// Request layout for a join: `[op, ssid_len, ssid[32], pass_len, pass[64]]`.
     pub const JOIN_REQ: usize = 1 + 1 + SSID_MAX + 1 + PASS_MAX;
     /// Security bytes, the driver's reading of the beacon.
-    pub const SEC_OPEN: u8 = 0;
     pub const SEC_WEP: u8 = 1;
 }
 
@@ -7438,6 +7450,22 @@ fn wifi_ssid_text<'a>(ssid: &[u8], shown: &'a mut [u8; wifi_wire::SSID_MAX]) -> 
         shown[k] = if (0x20..0x7F).contains(&c) { c } else { b'.' };
     }
     core::str::from_utf8(&shown[..len]).unwrap_or("(unprintable)")
+}
+
+/// The word beside the dBm in `wifi status`. The number is the fact and stays first; the word is a stated
+/// rule over it, so a reader can check it: -50 or stronger excellent, -60 good, -70 fair, weaker is weak
+/// (`utilities/56_wifi.md` 4f). The operator asked for the word here and nowhere else - `wifi list` stays
+/// raw, because a pipe should not have to strip an adjective.
+fn wifi_signal_word(dbm: i32) -> &'static str {
+    if dbm >= -50 {
+        "excellent"
+    } else if dbm >= -60 {
+        "good"
+    } else if dbm >= -70 {
+        "fair"
+    } else {
+        "weak"
+    }
 }
 
 fn wifi_security_word(sec: u8) -> &'static str {
@@ -7626,17 +7654,9 @@ fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                 out.line_fmt(ctx, format_args!("WEP is not supported, and will not be (`utilities/56_wifi.md` 9) - pick another"));
                 continue;
             }
-            SEC_OPEN => return wifi_join(ctx, out, ssid, &[]),
-            _ => {
-                let mut pass = [0u8; INPUT_MAX];
-                let n = match wifi_read_passphrase(ctx, out, &mut pass) {
-                    Some(n) => n,
-                    None => return Err(ShellError::Unknown),
-                };
-                let result = wifi_join(ctx, out, ssid, &pass[..n]);
-                for b in pass.iter_mut() { *b = 0; }
-                return result;
-            }
+            // Open, stored or asked-for: the driver decides which from the cache and its slot, and this
+            // asks for a passphrase only when it says to.
+            _ => return wifi_join(ctx, out, ssid, &[]),
         }
     }
 }
@@ -7669,14 +7689,11 @@ fn wifi_connect(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellEr
         out.line_fmt(ctx, format_args!("wifi: an SSID is 1 to {} bytes", wifi_wire::SSID_MAX));
         return Err(ShellError::Unknown);
     }
-    let mut pass = [0u8; INPUT_MAX];
-    let n = match wifi_read_passphrase(ctx, out, &mut pass) {
-        Some(n) => n,
-        None => return Err(ShellError::Unknown),
-    };
-    let result = wifi_join(ctx, out, ssid.as_bytes(), &pass[..n]);
-    for b in pass.iter_mut() { *b = 0; }
-    result
+    // No passphrase yet: the driver joins with its stored key, or open if the last sweep heard the network
+    // as open, and only otherwise says NEEDS_PASSPHRASE - at which point `wifi_join` asks. So a network
+    // joined once this boot is rejoined by name alone, and a passphrase is never asked for when it is not
+    // needed.
+    wifi_join(ctx, out, ssid.as_bytes(), &[])
 }
 
 /// Hand a name and a passphrase to the driver and report how the join went. An EMPTY passphrase means an
@@ -7699,34 +7716,64 @@ fn wifi_join(ctx: &ShellCtx, out: &mut Out, ssid: &[u8], pass: &[u8]) -> Result<
         return Err(ShellError::Unknown);
     }
 
-    let mut req = [0u8; JOIN_REQ];
-    req[0] = OP_CONNECT;
-    req[1] = ssid.len() as u8;
-    req[2..2 + ssid.len()].copy_from_slice(ssid);
-    req[2 + SSID_MAX] = pass.len() as u8;
-    req[3 + SSID_MAX..3 + SSID_MAX + pass.len()].copy_from_slice(pass);
+    // At most two sends: one without a passphrase, and - only if the driver answers NEEDS_PASSPHRASE - one
+    // with. A loop rather than a recursive call, because a reply message is a few KiB of stack and this
+    // shell's stack is not deep.
+    let mut typed = [0u8; INPUT_MAX];
+    let mut pass: &[u8] = pass;
+    let mut asked = false;
+    let result = loop {
+        let mut req = [0u8; JOIN_REQ];
+        req[0] = OP_CONNECT;
+        req[1] = ssid.len() as u8;
+        req[2..2 + ssid.len()].copy_from_slice(ssid);
+        req[2 + SSID_MAX] = pass.len() as u8;
+        req[3 + SSID_MAX..3 + SSID_MAX + pass.len()].copy_from_slice(pass);
 
-    out.line_fmt(ctx, format_args!("joining {}  [q] quit", name));
-    // Reacquire on a failed send, then ask once more - the same shape as `wifi_ask` and `ns_abortable`.
-    let first = ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS);
-    let outcome = match first {
-        ReqOutcome::Timeout if ctx.reacquire_by_name(WIFI_DRIVER) => {
-            ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS)
+        out.line_fmt(ctx, format_args!("joining {}  [q] quit", name));
+        // Reacquire on a failed send, then ask once more - the same shape as `wifi_ask` and `ns_abortable`.
+        let first = ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS);
+        let outcome = match first {
+            ReqOutcome::Timeout if ctx.reacquire_by_name(WIFI_DRIVER) => {
+                ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS)
+            }
+            other => other,
+        };
+        for b in req.iter_mut() { *b = 0; }
+
+        let status = match &outcome {
+            ReqOutcome::Reply(r) => r.payload_bytes().first().copied(),
+            _ => None,
+        };
+        if status == Some(NEEDS_PASSPHRASE) && pass.is_empty() && !asked {
+            asked = true;
+            match wifi_read_passphrase(ctx, out, &mut typed) {
+                Some(n) => {
+                    pass = &typed[..n];
+                    continue;
+                }
+                None => break Err(ShellError::Unknown),
+            }
         }
-        other => other,
+        break wifi_join_outcome(ctx, out, name, outcome);
     };
-    for b in req.iter_mut() { *b = 0; }
+    for b in typed.iter_mut() { *b = 0; }
+    result
+}
 
+/// The sentence for how a join ended - the spec's (`utilities/56_wifi.md` 5), one per reply status.
+fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutcome) -> Result<(), ShellError> {
+    use wifi_wire::*;
     match outcome {
         ReqOutcome::Reply(r) => match r.payload_bytes().first().copied() {
             Some(JOINED) => {
-                if pass.is_empty() {
-                    out.line_fmt(ctx, format_args!("joined {} - an open network, the link is up", name));
-                } else {
-                    out.line_fmt(ctx, format_args!("joined {} - the link is up and the handshake completed", name));
-                }
+                out.line_fmt(ctx, format_args!("joined {} - the link is up", name));
                 out.line_fmt(ctx, format_args!("  (addressing is `net`'s to report: `net status`)"));
                 Ok(())
+            }
+            Some(NEEDS_PASSPHRASE) => {
+                out.line_fmt(ctx, format_args!("wifi: {} needs a passphrase and none was given", name));
+                Err(ShellError::Unknown)
             }
             Some(NOT_FOUND) => {
                 out.line_fmt(ctx, format_args!("no network named {} in range", name));
@@ -7800,12 +7847,17 @@ fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `wifi status` / bare `wifi` - the radio, the association, and how old the last scan is.
+/// `wifi status` - what is true NOW, as labelled lines so it pipes (`wifi status | match signal`).
+///
+/// The link facts are READ from the firmware on each call (`BSSID`, `RSSI`, `chanspec`), not remembered from
+/// the last join - except while a sweep runs, when the driver reports its memory and says the sweep is on.
+/// Addressing is `net`'s, deliberately; nothing here is an IP address.
 fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
-    /// Reply: `[OK, sweeping, heard, has_cache, cache_count, age u32 LE, radio_on, joined_len, joined[32]]`.
-    const LEN: usize = 9 + 1 + 1 + SSID_MAX;
+    /// Reply: `[OK, sweeping, heard, has_cache, cache_count, age u32, radio_on, associated, bssid[6],
+    /// rssi i32, chanspec u16, security, joined_secs u32, ssid_len, ssid[32]]`.
+    const LEN: usize = 29 + SSID_MAX;
     let r = match wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
         Some(r) => r,
         None => return wifi_not_answering(ctx, out),
@@ -7821,26 +7873,105 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         None => return wifi_not_answering(ctx, out),
     }
     if p[9] == 0 {
-        out.line_fmt(ctx, format_args!("radio off"));
+        out.line_fmt(ctx, format_args!("radio      off"));
     } else {
-        let jlen = core::cmp::min(p[10] as usize, SSID_MAX);
-        if jlen == 0 {
-            out.line_fmt(ctx, format_args!("radio up, not associated"));
+        out.line_fmt(ctx, format_args!("radio      on"));
+    }
+    if p[10] == 0 {
+        out.line_fmt(ctx, format_args!("network    none (not associated)"));
+    } else {
+        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+        let mut shown = [b'.'; SSID_MAX];
+        let name = wifi_ssid_text(&p[29..29 + jlen], &mut shown);
+        let chanspec = u16::from_le_bytes([p[21], p[22]]);
+        let band = match chanspec >> 14 {
+            0 => "2.4GHz",
+            3 => "5GHz",
+            _ => "band?",
+        };
+        let rssi = i32::from_le_bytes([p[17], p[18], p[19], p[20]]);
+        let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+        out.line_fmt(ctx, format_args!("network    {}  {}  bssid {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            name, band, p[11], p[12], p[13], p[14], p[15], p[16]));
+        out.line_fmt(ctx, format_args!("signal     {} dBm  {}", rssi, wifi_signal_word(rssi)));
+        out.line_fmt(ctx, format_args!("security   {}", wifi_security_word(p[23])));
+        if since >= 120 {
+            out.line_fmt(ctx, format_args!("joined     {} min ago", since / 60));
         } else {
-            let mut shown = [b'.'; SSID_MAX];
-            let name = wifi_ssid_text(&p[11..11 + jlen], &mut shown);
-            out.line_fmt(ctx, format_args!("joined {}", name));
+            out.line_fmt(ctx, format_args!("joined     {} s ago", since));
         }
     }
     if p[1] != 0 {
-        out.line_fmt(ctx, format_args!("scan running - {} heard so far", p[2]));
+        out.line_fmt(ctx, format_args!("scan       running - {} heard so far", p[2]));
     } else if p[3] != 0 {
         let age = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
-        out.line_fmt(ctx, format_args!("last scan: {} s ago, {} networks", age, p[4]));
+        out.line_fmt(ctx, format_args!("last scan  {} s ago, {} networks", age, p[4]));
     } else {
-        out.line_fmt(ctx, format_args!("no scan yet - run wifi scan"));
+        out.line_fmt(ctx, format_args!("last scan  none - run wifi scan"));
     }
     Ok(())
+}
+
+/// `wifi stored` - the network a key is held for. A name, never a secret; there is one slot
+/// (`utilities/56_wifi.md` 6), and it is empty after a reboot or a driver restart.
+fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    let r = match wifi_ask(ctx, &[OP_STORED], REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.len() >= 3 + SSID_MAX => {
+            if p[1] == 0 {
+                out.line_fmt(ctx, format_args!("no stored network - a passphrase is kept from the next wifi connect until reboot"));
+                return Ok(());
+            }
+            let len = core::cmp::min(p[2] as usize, SSID_MAX);
+            let mut shown = [b'.'; SSID_MAX];
+            let name = wifi_ssid_text(&p[3..3 + len], &mut shown);
+            out.line_fmt(ctx, format_args!("{}", name));
+            Ok(())
+        }
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short reply"));
+            Err(ShellError::Unknown)
+        }
+        Some(s) => wifi_radio_unavailable(ctx, out, s),
+        None => wifi_not_answering(ctx, out),
+    }
+}
+
+/// `wifi forget <ssid>` - drop the held key for that network. Does not disconnect.
+fn wifi_forget(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    if ssid.is_empty() || ssid.len() > SSID_MAX {
+        out.line_fmt(ctx, format_args!("wifi: an SSID is 1 to {} bytes", SSID_MAX));
+        return Err(ShellError::Unknown);
+    }
+    let mut req = [0u8; 2 + SSID_MAX];
+    req[0] = OP_FORGET;
+    req[1] = ssid.len() as u8;
+    req[2..2 + ssid.len()].copy_from_slice(ssid.as_bytes());
+    let r = match wifi_ask(ctx, &req, REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.get(1).copied().unwrap_or(0) != 0 => {
+            out.line_fmt(ctx, format_args!("forgot {} - the key is gone; the link, if any, is not touched", ssid));
+            Ok(())
+        }
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("no key is held for {} - nothing to forget", ssid));
+            Ok(())
+        }
+        Some(s) => wifi_radio_unavailable(ctx, out, s),
+        None => wifi_not_answering(ctx, out),
+    }
 }
 
 /// `wifi disconnect` - leave the current network. The radio stays up.

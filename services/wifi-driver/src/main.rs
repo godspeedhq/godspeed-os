@@ -44,6 +44,7 @@ mod aicore;
 mod armcr4;
 mod backplane;
 mod bus;
+mod crypto;
 mod ctrl;
 mod eapol;
 mod scan;
@@ -129,6 +130,25 @@ fn serve_radio(
     // The network the firmware last reported JOINED, cleared by a disconnect or a power-off. Only an open
     // network can reach that state until the host supplicant exists - see `join.rs`.
     let mut joined: Option<([u8; join::MAX_SSID], u8)> = None;
+    // When the join was reported, and with what security - for `status`'s `joined N s ago` and `security`.
+    let mut joined_at_secs: i64 = 0;
+    let mut joined_security: u8 = scan::sec::OPEN;
+
+    // THE ONE CREDENTIAL SLOT (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
+    // from its passphrase. The passphrase itself is gone the moment the key exists. One slot, by decision:
+    // the cafe replaces home, and home is typed once more on return. It lives here and nowhere else - not on
+    // disk, so it needs no `fs` and never writes a network name to the card - and dies with this instance.
+    struct Stored {
+        ssid: [u8; join::MAX_SSID],
+        len: u8,
+        pmk: [u8; crypto::PMK_LEN],
+    }
+    let mut stored: Option<Stored> = None;
+
+    // The primitives that turn a passphrase into a key, checked against their published vectors. A wrong hash
+    // would be refused by every access point in a way indistinguishable from a wrong passphrase, so if this
+    // fails, passphrases are refused HERE, with the reason, rather than there, without one.
+    let crypto_ok = crypto::selftest(ctx);
     let mut frame = [0u8; ctrl::FRAME];
 
     loop {
@@ -315,7 +335,9 @@ fn serve_radio(
                 out[1] = heard as u8;
                 2
             }
-            (scan::reply::OP_STATUS, Some(_)) => {
+            (scan::reply::OP_STATUS, Some(session)) => {
+                // Reply: `[OK, sweeping, heard, has_cache, cache_count, age u32, radio_on, associated,
+                //          bssid[6], rssi i32, chanspec u16, security, joined_secs u32, ssid_len, ssid[32]]`.
                 out[0] = scan::reply::OK;
                 out[1] = sweep.is_some() as u8;
                 out[2] = sweep.as_ref().map(|s| s.scan.count()).unwrap_or(0) as u8;
@@ -327,17 +349,41 @@ fn serve_radio(
                     .unwrap_or(u32::MAX);
                 out[5..9].copy_from_slice(&age.to_le_bytes());
                 out[9] = radio_on as u8;
+
+                // THE LINK IS READ, NOT REMEMBERED - but not while a sweep runs: a control exchange reads
+                // frames off the bus and skips the ones that are not its reply, which mid-sweep would be the
+                // scan's own results. During a sweep the status is the driver's memory, and says the sweep is
+                // running, which is the fact that matters then.
+                let link = if radio_on && sweep.is_none() { ctrl::link_now(h, w, session, ctx) } else { None };
+                let (assoc, bssid, rssi, chanspec) = match &link {
+                    Some(l) if l.associated() => (true, l.bssid, l.rssi, l.chanspec),
+                    Some(_) => {
+                        if joined.is_some() {
+                            ctx.log("wifi-driver: the firmware reports no association - the remembered join is dropped");
+                            joined = None;
+                        }
+                        (false, [0u8; 6], 0, 0)
+                    }
+                    None => (joined.is_some(), [0u8; 6], 0, 0),
+                };
+                out[10] = assoc as u8;
+                out[11..17].copy_from_slice(&bssid);
+                out[17..21].copy_from_slice(&rssi.to_le_bytes());
+                out[21..23].copy_from_slice(&chanspec.to_le_bytes());
+                out[23] = joined_security;
+                let since = if assoc { (ctx.epoch_secs_monotonic() - joined_at_secs).max(0) as u32 } else { 0 };
+                out[24..28].copy_from_slice(&since.to_le_bytes());
                 match &joined {
                     Some((ssid, len)) => {
-                        out[10] = *len;
-                        out[11..11 + join::MAX_SSID].copy_from_slice(ssid);
+                        out[28] = *len;
+                        out[29..29 + join::MAX_SSID].copy_from_slice(ssid);
                     }
                     None => {
-                        out[10] = 0;
-                        out[11..11 + join::MAX_SSID].fill(0);
+                        out[28] = 0;
+                        out[29..29 + join::MAX_SSID].fill(0);
                     }
                 }
-                11 + join::MAX_SSID
+                29 + join::MAX_SSID
             }
             (scan::reply::OP_CONNECT, Some(session)) => {
                 // A join and a sweep cannot share the radio. The sweep goes, and says so; the cache stays.
@@ -364,24 +410,128 @@ fn serve_radio(
                     let pass_len = core::cmp::min(payload[PASS_LEN_AT] as usize, join::MAX_PASSPHRASE);
                     let ssid = &payload[SSID_AT..SSID_AT + ssid_len];
                     let pass = &payload[PASS_AT..PASS_AT + pass_len];
-                    let outcome = join::join(h, w, session, ssid, pass, ctx);
-                    if outcome == join::Outcome::Joined {
+
+                    // WHAT TO JOIN WITH, decided in this order and never guessed:
+                    //  1. a passphrase in the request: derive the key, keep it in the slot (replacing whatever
+                    //     was there), and join with it. The passphrase bytes live in `req`, which the next
+                    //     `recv` overwrites; nothing copies them.
+                    //  2. no passphrase, and the slot holds this name: join with the stored key.
+                    //  3. no passphrase, and the last sweep heard this name as OPEN: join open.
+                    //  4. otherwise: NEEDS_PASSPHRASE - the shell asks and sends again.
+                    let name_of = |ssid: &[u8]| {
                         let mut name = [0u8; join::MAX_SSID];
-                        name[..ssid_len].copy_from_slice(ssid);
-                        joined = Some((name, ssid_len as u8));
-                    } else {
-                        joined = None;
-                    }
-                    out[0] = match outcome {
-                        join::Outcome::Joined => scan::reply::JOINED,
-                        join::Outcome::NotFound => scan::reply::NOT_FOUND,
-                        join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,
-                        join::Outcome::Failed => scan::reply::JOIN_FAILED,
-                        join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
-                        join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
+                        name[..ssid.len()].copy_from_slice(ssid);
+                        name
                     };
-                    1
+                    let matches_stored = stored
+                        .as_ref()
+                        .map(|st| st.len as usize == ssid_len && &st.ssid[..ssid_len] == ssid)
+                        .unwrap_or(false);
+                    if pass_len > 0 && crypto_ok {
+                        let pmk = crypto::psk(pass, ssid);
+                        stored = Some(Stored { ssid: name_of(ssid), len: ssid_len as u8, pmk });
+                        ctx.log("wifi-driver: pairwise master key derived from the passphrase and kept in the one credential slot");
+                    }
+                    let secret = if pass_len > 0 {
+                        // Derived just above, or refused because the primitives failed their self-test. A
+                        // match rather than an unwrap: a service never halts the machine (Commandment V).
+                        match &stored {
+                            Some(st) if crypto_ok => Some(join::Secret::Pmk(&st.pmk)),
+                            _ => {
+                                ctx.log("wifi-driver: a passphrase arrived and the key derivation failed its self-test at boot - refused");
+                                None
+                            }
+                        }
+                    } else if matches_stored {
+                        match &stored {
+                            Some(st) => {
+                                ctx.log("wifi-driver: joining with the stored key");
+                                Some(join::Secret::Pmk(&st.pmk))
+                            }
+                            None => None,
+                        }
+                    } else if cache
+                        .as_ref()
+                        .and_then(|c| c.scan.find(ssid))
+                        .map(|n| n.security == scan::sec::OPEN)
+                        .unwrap_or(false)
+                    {
+                        ctx.log("wifi-driver: the last sweep heard this network as open - joining without a key");
+                        Some(join::Secret::Open)
+                    } else {
+                        None
+                    };
+
+                    match secret {
+                        None if pass_len > 0 => {
+                            out[0] = scan::reply::JOIN_FAILED;
+                            1
+                        }
+                        None => {
+                            out[0] = scan::reply::NEEDS_PASSPHRASE;
+                            1
+                        }
+                        Some(secret) => {
+                            let outcome = join::join(h, w, session, ssid, secret, ctx);
+                            if outcome == join::Outcome::Joined {
+                                joined = Some((name_of(ssid), ssid_len as u8));
+                                joined_at_secs = ctx.epoch_secs_monotonic();
+                                joined_security = if matches!(secret, join::Secret::Open) {
+                                    scan::sec::OPEN
+                                } else {
+                                    scan::sec::WPA2
+                                };
+                            } else {
+                                joined = None;
+                            }
+                            out[0] = match outcome {
+                                join::Outcome::Joined => scan::reply::JOINED,
+                                join::Outcome::NotFound => scan::reply::NOT_FOUND,
+                                join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,
+                                join::Outcome::Failed => scan::reply::JOIN_FAILED,
+                                join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
+                                join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
+                            };
+                            1
+                        }
+                    }
                 }
+            }
+            (scan::reply::OP_STORED, Some(_)) => {
+                out[0] = scan::reply::OK;
+                match &stored {
+                    Some(st) => {
+                        out[1] = 1;
+                        out[2] = st.len;
+                        out[3..3 + join::MAX_SSID].copy_from_slice(&st.ssid);
+                    }
+                    None => {
+                        out[1] = 0;
+                        out[2] = 0;
+                        out[3..3 + join::MAX_SSID].fill(0);
+                    }
+                }
+                3 + join::MAX_SSID
+            }
+            (scan::reply::OP_FORGET, Some(_)) => {
+                // `[10, len, ssid[32]]`.
+                let len = core::cmp::min(payload.get(1).copied().unwrap_or(0) as usize, join::MAX_SSID);
+                let dropped = match (&mut stored, payload.get(2..2 + len)) {
+                    (Some(st), Some(ssid)) if st.len as usize == len && &st.ssid[..len] == ssid => {
+                        // Zeroed, not just forgotten: the key must not linger in a slot nothing points at.
+                        st.pmk.fill(0);
+                        st.ssid.fill(0);
+                        st.len = 0;
+                        true
+                    }
+                    _ => false,
+                };
+                if dropped {
+                    stored = None;
+                }
+                out[0] = scan::reply::OK;
+                out[1] = dropped as u8;
+                2
             }
             _ => {
                 out[0] = scan::reply::UNKNOWN_OP;

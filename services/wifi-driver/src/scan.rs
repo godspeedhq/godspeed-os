@@ -428,6 +428,15 @@ impl Scan {
     pub fn count(&self) -> usize {
         self.count
     }
+
+    /// The network of this name, if the last sweep heard one. Two access points with the same name are one
+    /// network; the first heard is returned, and its security byte is what a join without a passphrase is
+    /// decided on.
+    pub fn find(&self, ssid: &[u8]) -> Option<&Network> {
+        self.networks()
+            .iter()
+            .find(|n| n.ssid_len as usize == ssid.len() && &n.ssid[..ssid.len()] == ssid)
+    }
 }
 
 /// Reply status bytes for a `wifi list` request. One byte, first in the reply, read by the shell.
@@ -468,6 +477,14 @@ pub mod reply {
     /// The radio was powered off by `wifi radio off`; a sweep or a join is refused until `radio on`. Distinct
     /// from `RADIO_DOWN`, which is a radio that never came up.
     pub const RADIO_OFF: u8 = 7;
+    /// Request op byte: which network a key is held for. Reply `[OK, count(0|1), len, ssid[32]]` - the name
+    /// only, never the key (`utilities/56_wifi.md` §3).
+    pub const OP_STORED: u8 = 9;
+    /// Request op byte: `[10, len, ssid[32]]` - drop the held key for that network. Reply `[OK, dropped(0|1)]`.
+    pub const OP_FORGET: u8 = 10;
+    /// `OP_CONNECT` with no passphrase, for a network that is neither open (by the cache) nor stored: the
+    /// shell must ask for one and send again. Never a guess about which it is.
+    pub const NEEDS_PASSPHRASE: u8 = 16;
 
     /// A sweep is running. For `OP_LIST` this is a REFUSAL: the cache is not served while it is about to be
     /// replaced (`utilities/56_wifi.md` §3, Commandment III). Byte 1 is the count heard so far.
