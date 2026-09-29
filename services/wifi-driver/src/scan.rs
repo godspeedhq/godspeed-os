@@ -165,6 +165,24 @@ pub(crate) mod code {
     /// `BWFM_E_PSK_SUP` - the firmware's own supplicant reporting on the 4-way handshake.
     pub const PSK_SUP: u32 = 46;
 
+    /// The `Stats::events` bucket for a code: the nine this driver names in order, then "other".
+    pub fn index(c: u32) -> usize {
+        match c {
+            SET_SSID => 0,
+            JOIN => 1,
+            AUTH => 2,
+            DEAUTH_IND => 3,
+            ASSOC => 4,
+            DISASSOC_IND => 5,
+            LINK => 6,
+            PSK_SUP => 7,
+            ESCAN_RESULT => 8,
+            _ => 9,
+        }
+    }
+    /// The code a bucket stands for (`index` inverted), for the shell's `wifi debug events`.
+    pub const BUCKETS: [u32; 9] = [SET_SSID, JOIN, AUTH, DEAUTH_IND, ASSOC, DISASSOC_IND, LINK, PSK_SUP, ESCAN_RESULT];
+
     /// A name for the log, so an unexpected event is legible rather than a bare number.
     pub fn name(c: u32) -> &'static str {
         match c {
@@ -488,6 +506,23 @@ pub mod reply {
     /// `OP_CONNECT` with no passphrase, for a network that is neither open (by the cache) nor stored: the
     /// shell must ask for one and send again. Never a guess about which it is.
     pub const NEEDS_PASSPHRASE: u8 = 16;
+    /// Request op byte: `[11, sub]` - the driver's own account of itself, for `wifi debug` (`dbg::*`).
+    pub const OP_DEBUG: u8 = 11;
+
+    /// Sub-codes of `OP_DEBUG`, and their reply layouts.
+    pub mod dbg {
+        /// `[OK, 29 x u32 LE]`: ctrl sent/accepted/refused/unanswered, rx ctrl/event/data/glom/header-only/
+        /// other, tx_bytes, rx_bytes, rx skipped in a control wait, the 10 event buckets, last_event_code,
+        /// last_event_status, last_refused_cmd, last_refused_status (i32), session ms, frames ever traced.
+        /// `wifi debug`, `wifi debug stats`, `wifi debug events` and `wifi debug transport` all read this;
+        /// they print different rows of it.
+        pub const STATS: u8 = 0;
+        /// `[OK, count u8, entries x 18 bytes]` - the trace ring, oldest first. Entry: ms u32, kind u8,
+        /// chanflag u8, id u16, what u32, status i32, len u16.
+        pub const TRACE: u8 = 1;
+        /// `[OK, ver_len u8, ver[128], cap_len u16 LE, cap[512], mac[6]]` - asked of the firmware now.
+        pub const FIRMWARE: u8 = 2;
+    }
 
     /// A sweep is running. For `OP_LIST` this is a REFUSAL: the cache is not served while it is about to be
     /// replaced (`utilities/56_wifi.md` §3, Commandment III). Byte 1 is the count heard so far.
@@ -640,6 +675,20 @@ pub(crate) fn ethernet_at(body: &[u8]) -> Option<usize> {
     } else {
         Some(eth)
     }
+}
+
+/// The event code and status out of a body on the event channel, with none of `parse_event`'s reporting -
+/// for the trace, which must never log. `None` for anything that is not an event frame.
+pub(crate) fn event_head(body: &[u8]) -> Option<(u32, u32)> {
+    let eth = ethernet_at(body)?;
+    let frame = &body[eth..];
+    if frame.len() < ev::PAYLOAD {
+        return None;
+    }
+    if u16::from_be_bytes([frame[ev::ETHERTYPE], frame[ev::ETHERTYPE + 1]]) != ETHERTYPE_LINK_CTL {
+        return None;
+    }
+    Some((be32(frame, ev::EVENT_TYPE), be32(frame, ev::STATUS)))
 }
 
 pub(crate) fn parse_event(body: &[u8], which: u32, ctx: &ServiceContext) -> Option<Event> {
@@ -797,6 +846,7 @@ pub enum Step {
 pub fn step(
     h: &Host,
     w: &mut Window,
+    s: &mut ctrl::Session,
     scan: &mut Scan,
     frame: &mut [u8; ctrl::FRAME],
     ctx: &ServiceContext,
@@ -805,6 +855,7 @@ pub fn step(
         Some(f) => f,
         None => return Step::Empty,
     };
+    s.note_frame(ctx, &f, frame, false);
     let channel = f.chanflag & CHANNEL_MASK;
     if channel == CHANNEL_GLOM {
         // Counted, not read. See `CHANNEL_GLOM` for why the reference drops these too.
@@ -877,6 +928,7 @@ pub fn abort(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceConte
 pub fn collect(
     h: &Host,
     w: &mut Window,
+    s: &mut ctrl::Session,
     scan: &mut Scan,
     max_empty_polls: u32,
     ctx: &ServiceContext,
@@ -891,7 +943,7 @@ pub fn collect(
     let mut empty = 0u32;
     let mut ended_by = "the poll bound - the firmware never said the scan was over";
     while empty < max_empty_polls {
-        match step(h, w, scan, &mut frame, ctx) {
+        match step(h, w, s, scan, &mut frame, ctx) {
             Step::Frame => {}
             Step::Empty => {
                 empty += 1;
@@ -926,7 +978,7 @@ pub const MAX_EMPTY_POLLS: u32 = 500;
 /// and the UP chain on every request would be wrong - the interface is already up. The bring-up happens
 /// here, once; `scan_once` does the part that repeats.
 pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::Session> {
-    let mut session = ctrl::Session::new();
+    let mut session = ctrl::Session::new(ctx);
 
     // THE CLM BLOB FIRST, and it is first for a reason rather than by habit. `bwfm_init` is preceded by
     // `bwfm_preinit`, whose brcmfmac twin `brcmf_c_preinit_dcmds` calls `brcmf_c_process_clm_blob`. CLM is
@@ -1007,7 +1059,7 @@ pub fn scan_once(
     if !start(h, w, s, ctx) {
         return None;
     }
-    collect(h, w, &mut scan, MAX_EMPTY_POLLS, ctx);
+    collect(h, w, s, &mut scan, MAX_EMPTY_POLLS, ctx);
 
     ctx.log_fmt(format_args!(
         "wifi-driver: the scan window saw {} event/data frame(s), {} escan-result event(s), {} glommed \

@@ -31,9 +31,9 @@ What every verb does today:
   is refused, anything else asks the passphrase). Unverified on hardware.
 - `wifi list` - built to section 3: cache only, never scans. **The scan itself is hardware-verified**
   (2026-09-28, as the old blocking `wifi list`); the cache path is not yet.
-- `wifi status` - built to section 4f: radio, network/band/BSSID, signal, security, time joined - read
-  from the firmware on each call (`GET_BSSID`, `GET_RSSI`, `chanspec`) except mid-sweep - and the sweep
-  state or the last scan's age. Bare `wifi` prints usage. Unverified on hardware.
+- `wifi status`, `wifi info`, `wifi debug` and its five views - built to sections 4f and 4g: the link read
+  from the firmware on each call (`GET_BSSID`, `GET_RSSI`, `chanspec`) except mid-sweep; the driver's
+  counters and its 64-frame trace ring. Bare `wifi` prints usage. Unverified on hardware.
 - `wifi stored`, `wifi forget <ssid>` - built to section 6: a 64-slot table holding derived keys and never
   a passphrase. `wifi connect` asks for a passphrase only when the driver says one is needed. The key
   derivation self-tests against four published vectors at boot (`stage 0` in the driver's log). Unverified.
@@ -94,7 +94,9 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi list` | print the last complete scan: SSID, signal, band, security. Instant, records only, never scans |
 | `wifi connect <ssid>` | join a network by name. Prompts for the passphrase if one is needed and none is stored |
 | `wifi disconnect` | leave the current network. The radio stays up |
-| `wifi status` | what is true NOW, read from the firmware: radio, network, band, BSSID, signal, security, time joined - and the sweep or the last scan's age. Section 4f |
+| `wifi status` | the human answer: radio, network and band, signal, security, time joined, last scan. Read live. Section 4f |
+| `wifi info` | the link in detail: bssid, band, channel, signal, security, time joined, scan facts - and where addressing lives. Section 4f |
+| `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |
 | `wifi forget <ssid>` | drop the held key for that network. Does not disconnect |
 | `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
 | `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so |
@@ -297,37 +299,83 @@ Its age is always available. `wifi scan` ends with `11 networks in 2.8 s`; `wifi
 `last scan: 42 s ago, 11 networks`. `wifi list` itself stays records-only so pipes stay clean - the
 age is one command away, never mixed into the data.
 
-### 4f. `wifi status` is the now-view
+### 4f. Three views of one link: `status`, `info`, `debug`
 
-Labelled lines, so it pipes (`wifi status | match signal`), and every link fact on it is READ from the
-firmware when asked - `BSSID`, `RSSI`, `chanspec` - not remembered from the last join:
+The operator drew the line: `status` is the human operational answer, `info` the detailed connection and
+device facts, `debug` the driver's own account for whoever is fixing it. All three are labelled lines, so
+they pipe (`wifi status | match signal`), and every link fact is READ from the firmware when asked -
+`BSSID`, `RSSI`, `chanspec` - not remembered from the last join.
 
 ```
 gsh> wifi status
 radio      on
-network    Maple-House  5GHz  bssid 02:1a:7e:c4:09:51
-signal     -41 dBm  excellent
+network    Maple-House  5GHz
+signal     excellent  -41 dBm
 security   WPA2
 joined     3 min ago
 last scan  42 s ago, 11 networks
 ```
 
-The word after the dBm is the one place this utility says more than the number, at the operator's request,
-and it is a stated rule rather than a mood so a reader can check it: -50 dBm or stronger is `excellent`,
-to -60 `good`, to -70 `fair`, weaker is `weak`. The number stays first and stays the fact (rule 7); the
-scan rows carry no word, because a pipe should not have to strip an adjective.
+The word before the dBm is the same stated rule as the scan rows (section 3): -50 dBm or stronger
+`excellent`, to -60 `good`, to -70 `fair`, weaker `weak`. Not associated: `network    none (not
+associated)` and no signal, security or joined lines. Radio off: `radio      off` and the same. The last
+line is one of `scan       running - N heard so far`, `last scan  N s ago, M networks`, or `last scan
+none - run wifi scan`.
 
-Not associated: `network    none (not associated)`, and no signal, security or joined lines. Radio off:
-`radio      off` and the same. The scan line is one of `scan       running - N heard so far`,
-`last scan  N s ago, M networks`, or `last scan  none - run wifi scan`.
+```
+gsh> wifi info
+radio       on
+network     Maple-House
+bssid       02:1a:7e:c4:09:51
+band        5GHz
+channel     44
+signal      excellent  -41 dBm
+security    WPA2
+joined      3 min ago
+last scan   42 s ago
+networks    11
+addressing  see net status (an IP address has one owner, and it is not this command)
+```
 
-One exception, stated because it is deliberate: while a sweep runs the link is NOT read - a control exchange
-takes frames off the bus and skips the ones that are not its reply, which mid-sweep would be the scan's own
-results - so the status reports the driver's memory and says the sweep is running, which is the fact that
-matters then. An access point that has dropped the station is noticed on the next `wifi status` after the
-sweep ends, and the remembered join is cleared then.
+`info` deliberately ends where `net` begins. Section 1 gives an IP address exactly one owner so that two
+answers are never possible; the last line says where the other half of "am I online" lives rather than
+printing a copy of it.
 
-Addressing is `net`'s (section 1). Nothing here is an IP address, and nothing here will be.
+One exception to the live read, stated because it is deliberate: while a sweep runs the link is NOT read -
+a control exchange takes frames off the bus and skips the ones that are not its reply, which mid-sweep
+would be the scan's own results - so both views report the driver's memory and say the sweep is running,
+which is the fact that matters then. An access point that has dropped the station is noticed on the next
+`status` or `info` after the sweep ends.
+
+### 4g. `wifi debug` - the driver's account of itself
+
+Five views, each a word (rule 4). Bare `wifi debug` prints `stats`, `transport` and `events` together.
+Every number is a raw count the driver keeps in its `Session` (rule 7); nothing is a verdict.
+
+| View | What it prints |
+|---|---|
+| `wifi debug stats` | the control channel: requests sent, accepted, refused (and the last refusal's command and status), unanswered; the session's age on the driver's own clock |
+| `wifi debug transport` | the SDIO side: function and block sizes, bytes each way, frames read by channel (control, event, data, glommed, flow-control, other), and the frames read during a control wait and lost to the scan |
+| `wifi debug events` | how many of each firmware event this driver names has arrived, and the last one's code and status |
+| `wifi debug firmware` | the chip, the image and its provenance, the running firmware's own version string and capability words (asked of it now, not remembered), its MAC, and the supplicant fact from `docs/wifi.md` §37 |
+| `wifi debug trace` | the last 64 frames on the bus, oldest first |
+
+```
+gsh> wifi debug trace
+        ms  frame     id     what
+    12.184  TX CTRL   id=8   cmd=263 len=108
+    12.192  RX CTRL   id=8   cmd=263 status=0 len=44
+    12.431  RX EVENT         event=69 status=8 len=572
+    12.612  RX EVENT         event=69 status=8 len=572
+    14.004  RX EVENT         event=69 status=0 len=24
+```
+
+The trace is a fixed ring of 64 entries in the driver (§26.6.1), the oldest overwritten - two full scans'
+worth. Timestamps are milliseconds since the driver's session began, by its own cycle counter; where the
+kernel gave it no rate they read `0.000` everywhere rather than inventing a clock. Every reader of frames
+feeds it - the control waits, the sweep, the join - so it is the whole traffic and not one path's view,
+which is what makes it the instrument this port was built without: the frames a control exchange read and
+skipped mid-sweep appear in it, and are counted under `skipped`.
 
 ### 4e. What this costs the driver, said plainly
 

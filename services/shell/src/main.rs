@@ -950,7 +950,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("wifi",    &["scan", "list", "connect", "disconnect", "status", "forget", "stored", "radio"]),
+    ("wifi",    &["scan", "list", "connect", "disconnect", "status", "info", "debug", "forget", "stored", "radio"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -1011,6 +1011,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("trace",  "deps",         CHAOS_RESTARTABLE),
     ("trace",  "chain",        CHAOS_RESTARTABLE),
     ("wifi",   "radio",        &["on", "off"]),
+    ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
 
 /// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
@@ -5143,7 +5144,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi list", "the last complete scan, one record per network; never scans", "wifi list"),
             ("wifi connect <ssid>", "join a network (prompts for the passphrase; never takes it as an argument)", "wifi connect Bankole-WiFi"),
             ("wifi disconnect", "leave the current network; the radio stays up", "wifi disconnect"),
-            ("wifi status", "the same as bare `wifi`", "wifi status"),
+            ("wifi status", "what is true now: radio, network, signal, security, time joined, last scan", "wifi status"),
+            ("wifi info", "the link in detail: bssid, band, channel, signal, security; addressing is `net`'s", "wifi info"),
+            ("wifi debug [events|stats|firmware|transport|trace]", "the driver's own account: counters, the firmware's words, the last 64 frames", "wifi debug trace"),
             ("wifi stored", "which networks a passphrase is held for (names only, never secrets)", "wifi stored"),
             ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
             ("wifi radio on|off", "power the radio; `off` disconnects first and says so", "wifi radio off"),
@@ -7333,7 +7336,8 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         }
     }
     let known = arg.is_empty()
-        || matches!(arg, "scan" | "list" | "status" | "disconnect" | "stored")
+        || matches!(arg, "scan" | "list" | "status" | "info" | "debug" | "disconnect" | "stored")
+        || arg.starts_with("debug ")
         || arg.starts_with("connect ") || arg.starts_with("forget ") || arg.starts_with("radio ");
     if !known {
         out.line_fmt(ctx, format_args!(
@@ -7356,6 +7360,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 "scan" => return wifi_scan(ctx, out),
                 "list" => return wifi_list(ctx, out),
                 "status" => return wifi_status(ctx, out),
+                "info" => return wifi_info(ctx, out),
                 "stored" => return wifi_stored(ctx, out),
                 "disconnect" => return wifi_disconnect(ctx, out),
                 "radio on" => return wifi_radio(ctx, out, true),
@@ -7367,6 +7372,12 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             }
             if let Some(ssid) = arg.strip_prefix("forget ") {
                 return wifi_forget(ctx, out, ssid.trim());
+            }
+            if arg == "debug" {
+                return wifi_debug(ctx, out, "");
+            }
+            if let Some(sub) = arg.strip_prefix("debug ") {
+                return wifi_debug(ctx, out, sub.trim());
             }
             // Every spec verb is routed above; what reaches here is a verb the shell parses and the driver (`docs/wifi.md` 6): there is
             // nothing to list or delete until a credential can be held. Loud and specific: the one thing
@@ -7392,6 +7403,7 @@ mod wifi_wire {
     pub const OP_RADIO: u8 = 8;
     pub const OP_STORED: u8 = 9;
     pub const OP_FORGET: u8 = 10;
+    pub const OP_DEBUG: u8 = 11;
 
     pub const OK: u8 = 0;
     pub const SCAN_FAILED: u8 = 1;
@@ -7908,9 +7920,8 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         };
         let rssi = i32::from_le_bytes([p[17], p[18], p[19], p[20]]);
         let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
-        out.line_fmt(ctx, format_args!("network    {}  {}  bssid {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            name, band, p[11], p[12], p[13], p[14], p[15], p[16]));
-        out.line_fmt(ctx, format_args!("signal     {} dBm  {}", rssi, wifi_signal_word(rssi)));
+        out.line_fmt(ctx, format_args!("network    {}  {}", name, band));
+        out.line_fmt(ctx, format_args!("signal     {}  {} dBm", wifi_signal_word(rssi), rssi));
         out.line_fmt(ctx, format_args!("security   {}", wifi_security_word(p[23])));
         if since >= 120 {
             out.line_fmt(ctx, format_args!("joined     {} min ago", since / 60));
@@ -7927,6 +7938,240 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         out.line_fmt(ctx, format_args!("last scan  none - run wifi scan"));
     }
     Ok(())
+}
+
+/// `wifi info` - the link in detail, from the same live read `wifi status` uses: name, bssid, band, channel,
+/// signal, security, time joined, and the scan facts. Addressing is `net`'s (spec section 1) and the last
+/// line says where to find it rather than printing a second copy of one truth.
+fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    const LEN: usize = 29 + SSID_MAX;
+    let r = match wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.len() >= LEN => {}
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short status reply"));
+            return Err(ShellError::Unknown);
+        }
+        Some(s) => return wifi_radio_unavailable(ctx, out, s),
+        None => return wifi_not_answering(ctx, out),
+    }
+    out.line_fmt(ctx, format_args!("radio       {}", if p[9] == 0 { "off" } else { "on" }));
+    if p[10] == 0 {
+        out.line_fmt(ctx, format_args!("network     none (not associated)"));
+    } else {
+        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+        let mut shown = [b'.'; SSID_MAX];
+        let name = wifi_ssid_text(&p[29..29 + jlen], &mut shown);
+        let chanspec = u16::from_le_bytes([p[21], p[22]]);
+        let band = match chanspec >> 14 {
+            0 => "2.4GHz",
+            3 => "5GHz",
+            _ => "band?",
+        };
+        let rssi = i32::from_le_bytes([p[17], p[18], p[19], p[20]]);
+        let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+        out.line_fmt(ctx, format_args!("network     {}", name));
+        out.line_fmt(ctx, format_args!("bssid       {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", p[11], p[12], p[13], p[14], p[15], p[16]));
+        out.line_fmt(ctx, format_args!("band        {}", band));
+        // chanspec: the channel number is the low 8 bits (802.11ac layout; the band bits above decode it).
+        out.line_fmt(ctx, format_args!("channel     {}", chanspec & 0xFF));
+        out.line_fmt(ctx, format_args!("signal      {}  {} dBm", wifi_signal_word(rssi), rssi));
+        out.line_fmt(ctx, format_args!("security    {}", wifi_security_word(p[23])));
+        if since >= 120 {
+            out.line_fmt(ctx, format_args!("joined      {} min ago", since / 60));
+        } else {
+            out.line_fmt(ctx, format_args!("joined      {} s ago", since));
+        }
+    }
+    if p[1] != 0 {
+        out.line_fmt(ctx, format_args!("scan        running - {} heard so far", p[2]));
+    } else if p[3] != 0 {
+        let age = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+        out.line_fmt(ctx, format_args!("last scan   {} s ago", age));
+        out.line_fmt(ctx, format_args!("networks    {}", p[4]));
+    } else {
+        out.line_fmt(ctx, format_args!("last scan   none - run wifi scan"));
+    }
+    out.line_fmt(ctx, format_args!("addressing  see net status (an IP address has one owner, and it is not this command)"));
+    Ok(())
+}
+
+/// `wifi debug [events|stats|firmware|transport|trace]` - the driver's own account of itself, for whoever is
+/// debugging it. Raw counts (rule 7). `trace` is the instrument this port was built without: the last 64
+/// frames on the bus, from a ring the driver keeps, timestamped by its own clock in milliseconds since it
+/// started (0 everywhere if the kernel gave it no rate - said rather than invented).
+fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    /// Sub-codes the driver answers (`scan::reply::dbg`).
+    const DBG_STATS: u8 = 0;
+    const DBG_TRACE: u8 = 1;
+    const DBG_FIRMWARE: u8 = 2;
+    /// The stats reply: 29 u32 words after the status byte.
+    const STAT_WORDS: usize = 29;
+    /// A trace entry on the wire.
+    const ENTRY: usize = 18;
+
+    let word = |p: &[u8], i: usize| -> u32 {
+        let at = 1 + 4 * i;
+        u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]])
+    };
+
+    match sub {
+        "" | "stats" | "transport" | "events" => {
+            let r = match wifi_ask(ctx, &[OP_DEBUG, DBG_STATS], REPLY_MS) {
+                Some(r) => r,
+                None => return wifi_not_answering(ctx, out),
+            };
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(OK) if p.len() >= 1 + 4 * STAT_WORDS => {}
+                Some(OK) => {
+                    out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short debug reply"));
+                    return Err(ShellError::Unknown);
+                }
+                Some(s) => return wifi_radio_unavailable(ctx, out, s),
+                None => return wifi_not_answering(ctx, out),
+            }
+            let ms = word(p, 27);
+            if sub == "" || sub == "stats" {
+                out.line_fmt(ctx, format_args!("session     {} s on the driver's clock, {} frames traced", ms / 1000, word(p, 28)));
+                out.line_fmt(ctx, format_args!("control"));
+                out.line_fmt(ctx, format_args!("  sent      {}", word(p, 0)));
+                out.line_fmt(ctx, format_args!("  accepted  {}", word(p, 1)));
+                out.line_fmt(ctx, format_args!("  refused   {}  (last: command {} status {})", word(p, 2), word(p, 25), word(p, 26) as i32));
+                out.line_fmt(ctx, format_args!("  silent    {}", word(p, 3)));
+            }
+            if sub == "" || sub == "transport" {
+                out.line_fmt(ctx, format_args!("sdio"));
+                out.line_fmt(ctx, format_args!("  function  2, block 512 (control, event and data frames); function 1, block 64 (the backplane)"));
+                out.line_fmt(ctx, format_args!("  tx_bytes  {}", word(p, 10)));
+                out.line_fmt(ctx, format_args!("  rx_bytes  {}", word(p, 11)));
+                out.line_fmt(ctx, format_args!("  rx_ctrl   {}", word(p, 4)));
+                out.line_fmt(ctx, format_args!("  rx_event  {}", word(p, 5)));
+                out.line_fmt(ctx, format_args!("  rx_data   {}", word(p, 6)));
+                out.line_fmt(ctx, format_args!("  rx_glom   {}  (read and dropped, as the reference does)", word(p, 7)));
+                out.line_fmt(ctx, format_args!("  rx_flow   {}  (header-only frames: flow control)", word(p, 8)));
+                out.line_fmt(ctx, format_args!("  rx_other  {}", word(p, 9)));
+                out.line_fmt(ctx, format_args!("  skipped   {}  (event/data frames read during a control wait - lost to the scan)", word(p, 12)));
+            }
+            if sub == "" || sub == "events" {
+                out.line_fmt(ctx, format_args!("events"));
+                const NAMES: [&str; 9] = ["set_ssid", "join", "auth", "deauth_ind", "assoc", "disassoc_ind", "link", "psk_sup", "escan_result"];
+                for (i, name) in NAMES.iter().enumerate() {
+                    let n = word(p, 13 + i);
+                    if n != 0 {
+                        out.line_fmt(ctx, format_args!("  {:<12} {}", name, n));
+                    }
+                }
+                let other = word(p, 22);
+                if other != 0 {
+                    out.line_fmt(ctx, format_args!("  {:<12} {}", "other", other));
+                }
+                out.line_fmt(ctx, format_args!("  last        code {} status {}", word(p, 23), word(p, 24)));
+            }
+            Ok(())
+        }
+        "firmware" => {
+            let r = match wifi_ask(ctx, &[OP_DEBUG, DBG_FIRMWARE], REPLY_MS) {
+                Some(r) => r,
+                None => return wifi_not_answering(ctx, out),
+            };
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(OK) if p.len() >= 1 + 1 + 128 + 2 + 512 + 6 => {}
+                Some(OK) => {
+                    out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short firmware reply"));
+                    return Err(ShellError::Unknown);
+                }
+                Some(s) => return wifi_radio_unavailable(ctx, out, s),
+                None => return wifi_not_answering(ctx, out),
+            }
+            let vlen = core::cmp::min(p[1] as usize, 128);
+            let ver = core::str::from_utf8(&p[2..2 + vlen]).unwrap_or("(not text)").trim();
+            let clen = core::cmp::min(u16::from_le_bytes([p[130], p[131]]) as usize, 512);
+            let cap = &p[132..132 + clen];
+            let mac = &p[644..650];
+            out.line_fmt(ctx, format_args!("chip        CYW43455 (chip id 0x4345 rev 6), over SDIO"));
+            out.line_fmt(ctx, format_args!("image       brcmfmac43455-sdio.bin + clm_blob + nvram (nonfree/brcm43455, PROVENANCE has the hashes)"));
+            if vlen == 0 {
+                out.line_fmt(ctx, format_args!("version     (not asked - the radio is off or a sweep is running)"));
+            } else {
+                out.line_fmt(ctx, format_args!("version     {}", ver));
+            }
+            out.line_fmt(ctx, format_args!("mac         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+            out.line_fmt(ctx, format_args!("supplicant  none in the firmware (sup_wpa refused) - the host runs the handshake"));
+            // The capability string is a few hundred bytes of words; printed in pieces a line can hold.
+            let mut at = 0;
+            let mut first = true;
+            while at < cap.len() {
+                let to = core::cmp::min(at + 88, cap.len());
+                let piece = core::str::from_utf8(&cap[at..to]).unwrap_or("(not text)");
+                out.line_fmt(ctx, format_args!("{}  {}", if first { "cap       " } else { "          " }, piece));
+                first = false;
+                at = to;
+            }
+            Ok(())
+        }
+        "trace" => {
+            let r = match wifi_ask(ctx, &[OP_DEBUG, DBG_TRACE], REPLY_MS) {
+                Some(r) => r,
+                None => return wifi_not_answering(ctx, out),
+            };
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(OK) if p.len() >= 2 => {}
+                Some(s) => return wifi_radio_unavailable(ctx, out, s),
+                None => return wifi_not_answering(ctx, out),
+            }
+            let count = p[1] as usize;
+            if count == 0 {
+                out.line_fmt(ctx, format_args!("no frames traced yet"));
+                return Ok(());
+            }
+            out.line_fmt(ctx, format_args!("{:>10}  {:<9} {:<6} {}", "ms", "frame", "id", "what"));
+            for i in 0..count {
+                let at = 2 + i * ENTRY;
+                if at + ENTRY > p.len() {
+                    break;
+                }
+                let e = &p[at..at + ENTRY];
+                let ms = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                let kind = e[4];
+                let id = u16::from_le_bytes([e[6], e[7]]);
+                let what = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+                let status = i32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+                let len = u16::from_le_bytes([e[16], e[17]]);
+                let kind_word = match kind {
+                    1 => "TX CTRL",
+                    2 => "RX CTRL",
+                    3 => "RX EVENT",
+                    4 => "RX DATA",
+                    5 => "RX GLOM",
+                    _ => "RX other",
+                };
+                let stamp_ms = ms % 1000;
+                let stamp_s = ms / 1000;
+                match kind {
+                    1 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} len={}", stamp_s, stamp_ms, kind_word, id, what, len)),
+                    2 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} status={} len={}", stamp_s, stamp_ms, kind_word, id, what, status, len)),
+                    3 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} event={} status={} len={}", stamp_s, stamp_ms, kind_word, "", what, status, len)),
+                    _ => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} len={}", stamp_s, stamp_ms, kind_word, "", len)),
+                }
+            }
+            Ok(())
+        }
+        other => {
+            out.line_fmt(ctx, format_args!("wifi debug: `{}` is not a view - try events, stats, firmware, transport or trace", other));
+            Err(ShellError::Unknown)
+        }
+    }
 }
 
 /// `wifi stored` - the networks a key is held for, one per line. Names, never secrets; the table

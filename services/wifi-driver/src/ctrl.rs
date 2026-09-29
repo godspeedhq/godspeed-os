@@ -227,12 +227,201 @@ pub struct Session {
     seq: u8,
     /// The BCDC request id, one per command, echoed by the firmware in its reply.
     reqid: u16,
+    /// Everything counted, for `wifi debug`.
+    pub stats: Stats,
+    /// The last `TRACE_FRAMES` frames, for `wifi debug trace`.
+    pub trace: Trace,
+    /// The driver's own clock: the cycle counter at `new`, and cycles per millisecond (0 if the kernel does
+    /// not know - then every timestamp reads 0 and says so rather than inventing one).
+    t0: u64,
+    cycles_per_ms: u64,
+}
+
+/// What the control channel and the frame reader have counted since the session began. Raw facts, no
+/// verdicts (rule 7); `wifi debug stats` and `wifi debug transport` print them.
+#[derive(Clone, Copy, Default)]
+pub struct Stats {
+    pub ctrl_sent: u32,
+    pub ctrl_accepted: u32,
+    pub ctrl_refused: u32,
+    pub ctrl_unanswered: u32,
+    pub rx_ctrl: u32,
+    pub rx_event: u32,
+    pub rx_data: u32,
+    pub rx_glom: u32,
+    pub rx_header_only: u32,
+    pub rx_other: u32,
+    pub tx_bytes: u32,
+    pub rx_bytes: u32,
+    /// Frames on the event or data channel that arrived DURING a control wait and were read and skipped
+    /// there - the scan's own results, if a control exchange runs mid-sweep. Counted so it is visible.
+    pub rx_skipped_in_ctrl_wait: u32,
+    /// Event counts by the codes this driver names (`code::index`), plus one bucket for the rest.
+    pub events: [u32; EVENT_BUCKETS],
+    pub last_event_code: u32,
+    pub last_event_status: u32,
+    pub last_refused_cmd: u32,
+    pub last_refused_status: i32,
+}
+
+/// `code::index` maps an event code to one of these; the last is "other".
+pub const EVENT_BUCKETS: usize = 10;
+
+/// One frame as the trace remembers it: 16 bytes, so 64 of them are one KiB.
+#[derive(Clone, Copy, Default)]
+pub struct TraceEntry {
+    /// Milliseconds since the session began (0 when the clock is unavailable).
+    pub ms: u32,
+    /// `trace_kind::*`.
+    pub kind: u8,
+    /// The SDPCM channel byte as received, or 0 for a send.
+    pub chanflag: u8,
+    /// The request id (control), or 0.
+    pub id: u16,
+    /// The command (control) or the event code (event), or 0.
+    pub what: u32,
+    /// The firmware's status (control reply or event), or 0.
+    pub status: i32,
+    /// The frame length on the wire.
+    pub len: u16,
+}
+
+pub mod trace_kind {
+    pub const TX_CTRL: u8 = 1;
+    pub const RX_CTRL: u8 = 2;
+    pub const RX_EVENT: u8 = 3;
+    pub const RX_DATA: u8 = 4;
+    pub const RX_GLOM: u8 = 5;
+    pub const RX_OTHER: u8 = 6;
+}
+
+/// How many frames the trace keeps. Fixed; the oldest is overwritten (26.6.1). 64 is two full scans.
+pub const TRACE_FRAMES: usize = 64;
+
+/// A ring of the last frames. `entries()` yields oldest first.
+pub struct Trace {
+    ring: [TraceEntry; TRACE_FRAMES],
+    next: usize,
+    total: u32,
+}
+
+impl Trace {
+    fn new() -> Self {
+        Trace { ring: [TraceEntry::default(); TRACE_FRAMES], next: 0, total: 0 }
+    }
+    fn push(&mut self, e: TraceEntry) {
+        self.ring[self.next] = e;
+        self.next = (self.next + 1) % TRACE_FRAMES;
+        self.total = self.total.wrapping_add(1);
+    }
+    /// How many are held (up to `TRACE_FRAMES`), and how many were ever pushed.
+    pub fn held(&self) -> usize {
+        core::cmp::min(self.total as usize, TRACE_FRAMES)
+    }
+    pub fn total(&self) -> u32 {
+        self.total
+    }
+    /// The held entries, oldest first.
+    pub fn entry(&self, i: usize) -> TraceEntry {
+        let held = self.held();
+        let start = if held < TRACE_FRAMES { 0 } else { self.next };
+        self.ring[(start + i) % TRACE_FRAMES]
+    }
 }
 
 impl Session {
-    pub fn new() -> Self {
+    pub fn new(ctx: &ServiceContext) -> Self {
         // brcmf_proto_bcdc_query_dcmd pre-increments, so the first request is 1 rather than 0.
-        Session { seq: 0, reqid: 0 }
+        Session {
+            seq: 0,
+            reqid: 0,
+            stats: Stats::default(),
+            trace: Trace::new(),
+            t0: ctx.read_tsc(),
+            cycles_per_ms: ctx.tsc_ticks_per_10ms() / 10,
+        }
+    }
+
+    /// Milliseconds since the session began, by the driver's own clock. 0 when the kernel gave no rate.
+    pub fn now_ms(&self, ctx: &ServiceContext) -> u32 {
+        if self.cycles_per_ms == 0 {
+            return 0;
+        }
+        (ctx.read_tsc().wrapping_sub(self.t0) / self.cycles_per_ms) as u32
+    }
+
+    /// A control request went out.
+    fn note_tx(&mut self, ctx: &ServiceContext, cmd: u32, id: u16, len: usize) {
+        self.stats.ctrl_sent += 1;
+        self.stats.tx_bytes = self.stats.tx_bytes.wrapping_add(len as u32);
+        self.trace.push(TraceEntry {
+            ms: self.now_ms(ctx), kind: trace_kind::TX_CTRL, chanflag: 0, id, what: cmd, status: 0, len: len as u16,
+        });
+    }
+
+    /// A frame was read. Classified by channel; an event's code and status are read out of it so the trace
+    /// can name it. Called by every reader, so the trace is the whole traffic and not one path's view.
+    pub fn note_frame(&mut self, ctx: &ServiceContext, f: &Frame, buf: &[u8], in_ctrl_wait: bool) {
+        self.stats.rx_bytes = self.stats.rx_bytes.wrapping_add(f.frmlen as u32);
+        let channel = f.chanflag & 0x0F;
+        let body = &buf[f.off..f.off + f.len];
+        let (kind, what, status) = if f.len < DCMD && channel == CHANNEL_CONTROL {
+            self.stats.rx_header_only += 1;
+            (trace_kind::RX_OTHER, 0, 0)
+        } else if channel == CHANNEL_CONTROL {
+            self.stats.rx_ctrl += 1;
+            let p = 0;
+            let rflags = u32::from_le_bytes([body[p + 8], body[p + 9], body[p + 10], body[p + 11]]);
+            let st = u32::from_le_bytes([body[p + 12], body[p + 13], body[p + 14], body[p + 15]]) as i32;
+            let cmd = u32::from_le_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+            let id = ((rflags & DCMD_ID_MASK) >> DCMD_ID_SHIFT) as u16;
+            self.trace.push(TraceEntry {
+                ms: self.now_ms(ctx), kind: trace_kind::RX_CTRL, chanflag: f.chanflag, id, what: cmd, status: st,
+                len: f.frmlen,
+            });
+            return;
+        } else if channel == crate::scan::CHANNEL_EVENT {
+            self.stats.rx_event += 1;
+            if in_ctrl_wait {
+                self.stats.rx_skipped_in_ctrl_wait += 1;
+            }
+            match crate::scan::event_head(body) {
+                Some((code, st)) => {
+                    let b = crate::scan::code::index(code);
+                    self.stats.events[b] += 1;
+                    self.stats.last_event_code = code;
+                    self.stats.last_event_status = st;
+                    (trace_kind::RX_EVENT, code, st as i32)
+                }
+                None => (trace_kind::RX_EVENT, 0, 0),
+            }
+        } else if channel == crate::scan::CHANNEL_DATA {
+            self.stats.rx_data += 1;
+            if in_ctrl_wait {
+                self.stats.rx_skipped_in_ctrl_wait += 1;
+            }
+            (trace_kind::RX_DATA, 0, 0)
+        } else if channel == crate::scan::CHANNEL_GLOM {
+            self.stats.rx_glom += 1;
+            (trace_kind::RX_GLOM, 0, 0)
+        } else {
+            self.stats.rx_other += 1;
+            (trace_kind::RX_OTHER, 0, 0)
+        };
+        self.trace.push(TraceEntry {
+            ms: self.now_ms(ctx), kind, chanflag: f.chanflag, id: 0, what, status, len: f.frmlen,
+        });
+    }
+
+    /// The reply to our own request was matched, and either accepted or refused.
+    fn note_ctrl_reply(&mut self, cmd: u32, refused: bool, status: i32) {
+        if refused {
+            self.stats.ctrl_refused += 1;
+            self.stats.last_refused_cmd = cmd;
+            self.stats.last_refused_status = status;
+        } else {
+            self.stats.ctrl_accepted += 1;
+        }
     }
 
     /// The next request id. Wraps at 16 bits because that is the width of the field; a wrap can only
@@ -444,6 +633,7 @@ fn query_raw(
     ) {
         return None;
     }
+    s.note_tx(ctx, cmd, reqid, len);
 
     // ---- The reply, read with the ONE frame reader. ----------------------------------------------
     // This used to hand-roll the header read and the two-step body read, and the copy went stale: it
@@ -465,6 +655,7 @@ fn query_raw(
         match read_frame(h, w, &mut rbuf, ctx) {
             Some(f) => {
                 frames += 1;
+                s.note_frame(ctx, &f, &rbuf, true);
                 // DESCRIBE THE FIRST FEW, before any judgement about whether they match. The point is to
                 // find out what the firmware is sending, and a frame skipped by a rule that is itself
                 // wrong would otherwise never be seen.
@@ -495,6 +686,7 @@ fn query_raw(
                     continue;
                 }
                 if rflags & DCMD_ERROR != 0 {
+                    s.note_ctrl_reply(cmd, true, status as i32);
                     ctx.log_fmt(format_args!(
                         "wifi-driver: the firmware REFUSED the request - {} (status {})",
                         err_name(status as i32),
@@ -502,6 +694,7 @@ fn query_raw(
                     ));
                     return None;
                 }
+                s.note_ctrl_reply(cmd, false, status as i32);
                 // The payload follows the 16-byte BCDC header. `read_frame` has already applied `dataoff`.
                 let avail = len - DCMD;
                 let n = core::cmp::min(avail, out.len());
@@ -518,6 +711,7 @@ fn query_raw(
             None => ctx.sleep_ms(1),
         }
     }
+    s.stats.ctrl_unanswered += 1;
     ctx.log_fmt(format_args!(
         "wifi-driver: no reply to `{}` across {} reads. {} frame(s) DID arrive: {} header-only (flow \
          control), {} on another channel, {} from another exchange - so \"nothing answered\" and \"nothing \
@@ -875,6 +1069,7 @@ pub fn set_cmd(
     ) {
         return false;
     }
+    s.note_tx(ctx, cmd, reqid, len);
 
     // THE REPLY DECIDES. A set whose refusal is discarded is a silent failure, and this one starts a scan -
     // so "accepted" has to mean the firmware said so.
@@ -882,6 +1077,7 @@ pub fn set_cmd(
     let mut rbuf = [0u8; FRAME];
     for _ in 0..SET_TRIES {
         if let Some(f) = read_frame(h, w, &mut rbuf, ctx) {
+            s.note_frame(ctx, &f, &rbuf, true);
             if f.chanflag & 0x0F != CHANNEL_CONTROL || f.len < DCMD {
                 continue;
             }
@@ -893,6 +1089,7 @@ pub fn set_cmd(
                 continue;
             }
             if rflags & DCMD_ERROR != 0 {
+                s.note_ctrl_reply(cmd, true, status as i32);
                 ctx.log_fmt(format_args!(
                     "wifi-driver: the firmware REFUSED `{}` - {} (status {})",
                     what,
@@ -901,6 +1098,7 @@ pub fn set_cmd(
                 ));
                 return false;
             }
+            s.note_ctrl_reply(cmd, false, status as i32);
             // SAY SO. Success used to be silent, which is exactly why a command that matched the
             // wrong reply looked identical to one that worked.
             ctx.log_fmt(format_args!(
@@ -911,6 +1109,7 @@ pub fn set_cmd(
         }
         ctx.sleep_ms(1);
     }
+    s.stats.ctrl_unanswered += 1;
     ctx.log_fmt(format_args!(
         "wifi-driver: `{}` was sent and the firmware never acknowledged it across {} reads. It is NOT \
          reported as done, because something nobody confirmed is indistinguishable from something refused",
@@ -1217,7 +1416,7 @@ pub fn enable_events(
 pub fn report_mac(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     ctx.log("wifi-driver: stage 13 - the first question put to the firmware");
 
-    let mut session = Session::new();
+    let mut session = Session::new(ctx);
     let mut mac = [0u8; 6];
     let n = match query_iovar(h, w, &mut session, "cur_etheraddr", &mut mac, ctx) {
         Some(n) => n,

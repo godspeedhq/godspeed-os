@@ -187,6 +187,7 @@ pub fn join(
                 continue;
             }
         };
+        s.note_frame(ctx, &f, &frame, false);
         let channel = f.chanflag & CHANNEL_MASK;
         let body = &frame[f.off..f.off + f.len];
 

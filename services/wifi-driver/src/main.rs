@@ -204,8 +204,8 @@ fn serve_radio(
 
     loop {
         // ---- 1. One frame of the running sweep, if there is one. ----
-        if let Some(s) = sweep.as_mut() {
-            match scan::step(h, w, &mut s.scan, &mut frame, ctx) {
+        if let (Some(s), Some(session)) = (sweep.as_mut(), radio.as_mut()) {
+            match scan::step(h, w, session, &mut s.scan, &mut frame, ctx) {
                 scan::Step::Frame => {}
                 scan::Step::Empty => {
                     s.empty += 1;
@@ -562,6 +562,85 @@ fn serve_radio(
                             };
                             1
                         }
+                    }
+                }
+            }
+            (scan::reply::OP_DEBUG, Some(session)) => {
+                let sub = payload.get(1).copied().unwrap_or(scan::reply::dbg::STATS);
+                out[0] = scan::reply::OK;
+                match sub {
+                    scan::reply::dbg::TRACE => {
+                        let held = session.trace.held();
+                        out[1] = held as u8;
+                        let mut at = 2;
+                        for i in 0..held {
+                            let e = session.trace.entry(i);
+                            out[at..at + 4].copy_from_slice(&e.ms.to_le_bytes());
+                            out[at + 4] = e.kind;
+                            out[at + 5] = e.chanflag;
+                            out[at + 6..at + 8].copy_from_slice(&e.id.to_le_bytes());
+                            out[at + 8..at + 12].copy_from_slice(&e.what.to_le_bytes());
+                            out[at + 12..at + 16].copy_from_slice(&e.status.to_le_bytes());
+                            // Entry stride is 18: len takes the last two bytes.
+                            out[at + 16..at + 18].copy_from_slice(&e.len.to_le_bytes());
+                            at += 18;
+                        }
+                        at
+                    }
+                    scan::reply::dbg::FIRMWARE => {
+                        // Asked of the firmware now, not remembered from boot - but not mid-sweep, for the
+                        // reason `OP_STATUS` gives.
+                        let mut at = 1;
+                        let mut ver = [0u8; 128];
+                        let mut cap = [0u8; 512];
+                        let mut mac = [0u8; 6];
+                        if sweep.is_none() && radio_on {
+                            let _ = ctrl::query_iovar(h, w, session, "ver", &mut ver, ctx);
+                            let _ = ctrl::query_iovar(h, w, session, "cap", &mut cap, ctx);
+                            let _ = ctrl::query_iovar(h, w, session, "cur_etheraddr", &mut mac, ctx);
+                        }
+                        let vlen = ver.iter().position(|&b| b == 0).unwrap_or(ver.len());
+                        let clen = cap.iter().position(|&b| b == 0).unwrap_or(cap.len());
+                        out[at] = vlen as u8;
+                        at += 1;
+                        out[at..at + 128].copy_from_slice(&ver);
+                        at += 128;
+                        out[at..at + 2].copy_from_slice(&(clen as u16).to_le_bytes());
+                        at += 2;
+                        out[at..at + 512].copy_from_slice(&cap);
+                        at += 512;
+                        out[at..at + 6].copy_from_slice(&mac);
+                        at + 6
+                    }
+                    _ => {
+                        let st = &session.stats;
+                        let words: [u32; 20] = [
+                            st.ctrl_sent, st.ctrl_accepted, st.ctrl_refused, st.ctrl_unanswered,
+                            st.rx_ctrl, st.rx_event, st.rx_data, st.rx_glom, st.rx_header_only, st.rx_other,
+                            st.tx_bytes, st.rx_bytes, st.rx_skipped_in_ctrl_wait,
+                            st.events[0], st.events[1], st.events[2], st.events[3], st.events[4],
+                            st.events[5], st.events[6],
+                        ];
+                        let mut at = 1;
+                        for w32 in words.iter() {
+                            out[at..at + 4].copy_from_slice(&w32.to_le_bytes());
+                            at += 4;
+                        }
+                        // The last three event buckets, then the last-seen facts.
+                        for w32 in [st.events[7], st.events[8], st.events[9]].iter() {
+                            out[at..at + 4].copy_from_slice(&w32.to_le_bytes());
+                            at += 4;
+                        }
+                        out[at..at + 4].copy_from_slice(&st.last_event_code.to_le_bytes());
+                        out[at + 4..at + 8].copy_from_slice(&st.last_event_status.to_le_bytes());
+                        out[at + 8..at + 12].copy_from_slice(&st.last_refused_cmd.to_le_bytes());
+                        out[at + 12..at + 16].copy_from_slice(&st.last_refused_status.to_le_bytes());
+                        at += 16;
+                        // And the driver's clock, so the shell can say how long the session has run.
+                        out[at..at + 4].copy_from_slice(&session.now_ms(ctx).to_le_bytes());
+                        at += 4;
+                        out[at..at + 4].copy_from_slice(&session.trace.total().to_le_bytes());
+                        at + 4
                     }
                 }
             }
