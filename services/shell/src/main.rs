@@ -1017,6 +1017,17 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
 /// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
 /// has one - `events persist start <path> <size> [sticky]` is the deepest thing in the shell, and
 /// `sticky` was reachable by typing it in full and no other way.
+/// Offer `cands` plus the word `help`, deduped, at a position below the first. Position 1 appends
+/// `version` and `help` itself; below it only `help` applies (a subcommand has no version of its own,
+/// rule 5), and it applies everywhere because every depth answers it (rule 2).
+fn complete_with_help(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
+    let mut all: [&str; 40] = [""; 40];
+    let mut n = 0usize;
+    for &c in cands { if n < all.len() { all[n] = c; n += 1; } }
+    if !cands.contains(&"help") && n < all.len() { all[n] = "help"; n += 1; }
+    complete_from_list(ctx, line, tok_start, &all[..n])
+}
+
 const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
     ("events", "persist", "start", &["sticky"]),
 ];
@@ -1201,14 +1212,16 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
         if let (Some(a1), Some(a2)) = (first_arg, second_arg) {
             if let Some((_, _, _, cands)) = SUBCMD_THIRD.iter().find(
                 |(c, f, sd, _)| c.as_bytes() == cmd && f.as_bytes() == a1 && sd.as_bytes() == a2) {
-                // Offer only what is not already present, like the trailing-modifier table.
-                let mut avail = [""; 8];
+                // Offer only what is not already present, like the trailing-modifier table - plus `help`,
+                // which every depth answers (rule 2) and so every depth completes (rule 9).
+                let mut avail = [""; 9];
                 let mut a = 0usize;
                 for &k in *cands {
                     let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
                     if !used && a < avail.len() { avail[a] = k; a += 1; }
                 }
-                if a > 0 { return complete_from_list(ctx, line, tok_start, &avail[..a]); }
+                if a < avail.len() { avail[a] = "help"; a += 1; }
+                return complete_from_list(ctx, line, tok_start, &avail[..a]);
             }
         }
     }
@@ -1228,7 +1241,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             }
             if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
                 |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
-                return complete_from_list(ctx, line, tok_start, cands);
+                return complete_with_help(ctx, line, tok_start, cands);
             }
         }
     }
@@ -1881,6 +1894,14 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         }
     }
     if argc == 3 && args[2] == "help" && is_util(args[0]) {
+        if sub_help(ctx, args[0], args[1]) { return Ok(()); }
+    }
+    // DEEPER: `wifi debug trace help`, `events persist start help`, `wifi radio off help`. Rule 2 says every
+    // subcommand has help, and the surfaces three deep had none - the word `help` reached the command as an
+    // argument and was refused or acted on. The block for the word ABOVE names each of its leaves with one
+    // line, so it is the answer at any depth; `scripts/subcmd_help_check.py` holds every first-level word to
+    // having one.
+    if argc >= 4 && args[argc - 1] == "help" && is_util(args[0]) {
         if sub_help(ctx, args[0], args[1]) { return Ok(()); }
     }
 
@@ -5355,6 +5376,41 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
 /// `<util> <sub> help` - focused help for a subcommand. Returns false if not a subcommand.
 fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
+        // Commands with their own per-word help keep it in one place and are reached from here too, so
+        // `<util> <word> help` has exactly one answer whichever way it arrives.
+        ("events", v) => return events_sub_help(ctx, v),
+        ("trace", v) => return trace_sub_help(ctx, v),
+        ("chaos", v) => return chaos_sub_help(ctx, v),
+        ("net", "stats") => help_block(ctx, "net stats", "the NIC's raw registers", &[
+            ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
+        ], false),
+        ("net", "lease") => help_block(ctx, "net lease", "one word: is there a DHCP lease", &[
+            ("net lease", "prints `ok` (DHCP granted an address, or no link so nothing to lease), `none` (link up, on the fallback address), or nothing if net-stack does not answer - built for `selfcheck`", "net lease"),
+        ], false),
+        ("churn", "verify") => help_block(ctx, "churn verify", "check every file a churn wrote", &[
+            ("churn verify", "after a cut: is any file a MIX of two writes? (content, not structure) - reports each torn file, or NONE torn", "churn verify"),
+        ], false),
+        ("churn", "tear") => help_block(ctx, "churn tear", "deliberately tear one file, to prove verify sees it", &[
+            ("churn tear", "deliberately make one churn file a MIX of two generations, so `churn verify` can be seen firing - a detector never observed firing is not evidence", "churn tear"),
+        ], false),
+        ("churn", "reset") => help_block(ctx, "churn reset", "remove /churn", &[
+            ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
+        ], false),
+        ("dir", "bytes") => help_block(ctx, "dir bytes", "sizes in exact bytes", &[
+            ("dir bytes [path]", "list with sizes as exact byte counts instead of rounded units; may come before or after the path", "dir bytes /"),
+        ], false),
+        ("to", "json") => help_block(ctx, "to json", "render records as JSON", &[
+            ("<records> | to json", "a JSON array of objects, one per record; the last stage of a record pipe", "status | to json"),
+        ], false),
+        ("to", "grid") => help_block(ctx, "to grid", "render records as the plain table", &[
+            ("<records> | to grid", "the plain table - useful when a producer draws something else", "trace deps fs | to grid"),
+        ], false),
+        ("to", "yaml") => help_block(ctx, "to yaml", "render records as YAML", &[
+            ("<records> | to yaml", "a YAML list of mappings, one per record", "status | where mem>0 | to yaml"),
+        ], false),
+        ("from", "json") => help_block(ctx, "from json", "parse JSON into records", &[
+            ("<text> | from json", "parse a flat JSON array of objects into records, so `where`/`select` compose after it", "read /svc.json | from json | where core=1"),
+        ], false),
         ("wifi", "debug") => help_block(ctx, "wifi debug", "the driver's own account of itself (utilities/56_wifi.md 4g)", &[
             ("wifi debug", "stats, transport and events together", "wifi debug"),
             ("wifi debug stats", "the control channel: requests sent, accepted, refused, unanswered; the session's age", "wifi debug stats"),
@@ -10090,6 +10146,64 @@ const TRACE_SLOTS: u32 = 256;
 /// turned a reference into something you had to page through to find one line. A view's columns are
 /// only interesting once you are looking at that view, so they live with it. `events help` is now the
 /// map; this is the detail, one screen at a time, and neither needs a pager.
+/// `events <view> help` - one block per view (conventions rule 2). `sub_help` and `cmd_events` both come
+/// here, so the answer is the same whichever path the words take.
+fn events_sub_help(ctx: &ServiceContext, view: &str) -> bool {
+    match view {
+        "ipc" => help_block(ctx, "events ipc", "the IPC trace ring", &[
+            ("events ipc", "recent IPC exchanges, oldest first: who asked whom, and how each ended", "events ipc"),
+        ], false),
+        "failures" => help_block(ctx, "events failures", "only the exchanges that failed", &[
+            ("events failures", "the same ring, only the timeouts and lost peers - the instrument for a wedge", "events failures"),
+        ], false),
+        "log" => help_block(ctx, "events log", "the kernel log ring", &[
+            ("events log [n]", "the last n log lines the sink kept", "events log 20"),
+        ], false),
+        "metrics" => help_block(ctx, "events metrics", "per-service counters", &[
+            ("events metrics", "published samples: owner, metric, value, age", "events metrics"),
+        ], false),
+        "persist" => help_block(ctx, "events persist", "drain the log to a file, detached", &[
+            ("events persist start /path [service] [mib] [sticky]", "spawn `recorder` to append the log to /path; `sticky` survives a shell restart", "events persist start /log.txt"),
+            ("events persist stop", "stop the recorder; the file closes with a footer", "events persist stop"),
+            ("events persist status", "is a recorder running, where is it writing, how much so far", "events persist status"),
+        ], false),
+        "status" => help_block(ctx, "events status", "the trace ring's own state", &[
+            ("events status", "ring size, events recorded, events dropped", "events status"),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
+/// `chaos <mode> help` - one block per mode (conventions rule 2). Four of the six modes had no help at all:
+/// `chaos kill-storm help` read `help` as a service name and refused it with the list.
+fn chaos_sub_help(ctx: &ServiceContext, mode: &str) -> bool {
+    match mode {
+        "kill-storm" => help_block(ctx, "chaos kill-storm", "kill one service repeatedly and verify it recovers", &[
+            ("chaos kill-storm <svc> [n] [save <path>]", "kill <svc> n times (default 10); each round waits for the supervisor's restart; `save` writes the rounds to a file", "chaos kill-storm fs 20"),
+        ], false),
+        "flood-storm" => help_block(ctx, "chaos flood-storm", "saturate a service's queue and verify it drains", &[
+            ("chaos flood-storm <svc> [n]", "fill <svc>'s 16-deep endpoint n times; a service that wedges under a full queue is found here", "chaos flood-storm events 5"),
+        ], false),
+        "mem-pressure" => help_block(ctx, "chaos mem-pressure", "a service allocates to its limit, then frees", &[
+            ("chaos mem-pressure [n]", "spawn the mem-pressure probe n times; each allocs to its contract limit (AllocDenied is the expected loud stop) and reclaims", "chaos mem-pressure 3"),
+        ], false),
+        "spawn-storm" => help_block(ctx, "chaos spawn-storm", "spawn to the task ceiling and watch the refusal", &[
+            ("chaos spawn-storm [n]", "spawn probe tasks until the kernel refuses; the refusal must be loud and the system must stay up", "chaos spawn-storm"),
+        ], false),
+        "max-carnage" => help_block(ctx, "chaos max-carnage", "the chaos monkey: random or aimed kills every round", &[
+            ("chaos max-carnage all-services <n> [yes]", "each round kills a RANDOM restartable service (the supervisor included), plus system-wide mem-pressure and spawn-storm; `yes` skips the confirm", "chaos max-carnage all-services 100"),
+            ("chaos max-carnage <svc> <n>", "aim every round at one service", "chaos max-carnage fs 50"),
+            ("chaos max-carnage <svc>,<svc>,... <n>", "kill EVERY listed service each round - cascade stress", "chaos max-carnage fs,events 100"),
+        ], false),
+        "link-flap" => help_block(ctx, "chaos link-flap", "simulate a cable unplug and replug", &[
+            ("chaos link-flap [n]", "force the NIC's reported link DOWN then UP n times (default 1) so net-stack reconfigures on the up edge; q quits and clears the override", "chaos link-flap 3"),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
 fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     match view {
         "blocked" => help_block(ctx, "trace blocked", "every task stuck on ANOTHER task", &[
@@ -10184,7 +10298,7 @@ fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             Ok(())
         }
         // `events <view> help` - the detail for one view, before the view itself runs.
-        v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
+        v if rest == "help" && (events_sub_help(ctx, v) || trace_sub_help(ctx, v)) => Ok(()),
         "ipc" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
         // `persist` needs the whole remainder (`start /p svc 7d`), not the two tokens `sub`/`rest`.
@@ -13177,15 +13291,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
             // firehose is just a big N (`all-services 5000`) and `q` aborts a long run early. `help` = usage.
             // tok[1] = target, tok[2] = rounds.
             if ntok >= 2 && tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
-                ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
-                ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
-                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, events)");
-                ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
-                ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
-                ctx.console_writeln("  yes            optional 4th word: skip the [y/N] confirm (the warning still prints)");
-                ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
-                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,events 100");
+                chaos_sub_help(ctx, "max-carnage");
                 Ok(())
             } else {
                 // A run needs a TARGET (all-services / a service / a comma-list) AND a positive ROUNDS count.
@@ -13263,10 +13369,7 @@ fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
 /// (net-stack's link) is its own scenario (do not build a speculative framework, §26.2).
 fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok >= 2 && tok[1] == "help" {
-        ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
-        ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
-        ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
-        ctx.console_writeln("  [q] quit  (quitting clears the override)");
+        chaos_sub_help(ctx, "link-flap");
         return Ok(());
     }
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };

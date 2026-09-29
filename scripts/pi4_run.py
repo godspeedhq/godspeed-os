@@ -114,8 +114,13 @@ def main():
         except Exception as e:
             print(f"screendump FAILED: {e}")
 
+    # WAIT OUT THE BOUND EVEN WHEN COMMANDS WERE TYPED. This used to stop the moment the last command had
+    # been sent, so under TCG - where one shell command takes 10 to 30 s - the output of everything after
+    # the first command or two was simply never captured, and a run that typed seven `help` forms
+    # showed one of them and looked like a hang. `--secs` is the whole run, typing included; a command
+    # whose output is wanted needs the bound to cover its execution.
     end = time.time() + max(0.0, args.secs - (time.time() - t))
-    while time.time() < end and not args.cmd:
+    while time.time() < end:
         time.sleep(0.2)
 
     data = bytes(buf)

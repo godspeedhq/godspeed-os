@@ -17,6 +17,16 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    the system must teach its own verbs at the point of use.
 2. **Every subcommand has `help`.** `<util> <subcommand> help` describes that
    subcommand specifically (e.g. `observe now help`).
+
+   **At every depth, and checked.** Below the first word the answer is the block for the word above -
+   `wifi debug trace help` prints `wifi debug`'s block, which names `trace` with one line - because a
+   leaf's one line IS its help and a block per leaf would repeat it. Amended 2026-09-29: an audit of every
+   word Tab could reach found 22 first-level words with no help at all (`chaos kill-storm help` read `help`
+   as a service name and refused it with the list) and nothing at depth three. The answers live in one
+   place, `sub_help` in `services/shell/src/main.rs` - a command with its own per-word help (`events`,
+   `trace`, `chaos`) is reached from there by a delegating arm, so `<util> <word> help` has exactly one
+   answer whichever way the words arrive. `scripts/subcmd_help_check.py` reads `SUBCMD_FIRST` and
+   `sub_help` and fails on any word Tab offers that answers nothing; it runs on every build.
 3. **`help` is the word - the only form. No flags, no synonyms.** There is exactly
    one way to ask for help: the word `help`. No `-h`, no `--help`, no hidden
    aliases. A tolerated-but-undocumented synonym would itself be a hidden, unsaid
