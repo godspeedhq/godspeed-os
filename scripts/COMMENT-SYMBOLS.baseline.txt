@@ -426,3 +426,5 @@ WLC_SET_WSEC                       # cyw43-driver - 134 - external, 26.14
 WLC_SET_WSEC_PMK                   # cyw43-driver - 268 - external, 26.14
 ie_length                          # OpenBSD bwfm bss_info field - the IE run length; this driver names the offset bss::IE_LENGTH - external, 26.14
 ie_offset                          # OpenBSD bwfm bss_info field - where the beacon IEs start, from the START of the record (the reference copies bss + iesoff); this driver names the offset bss::IE_OFFSET - external, 26.14
+brcmf_feat_attach                  # Linux brcmfmac feature.c - where firmware features are detected, after preinit and before UP; this driver asks its three questions at the same point - external, 26.14
+brcmf_feat_firmware_capabilities   # Linux brcmfmac feature.c - matches the `cap` iovar string against brcmf_fwcap_map - external, 26.14

@@ -1139,3 +1139,78 @@ pub fn report_mac(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
     ));
     true
 }
+
+/// The firmware's own account of itself, asked the way Linux asks before it decides what the HOST must do.
+///
+/// Three GETs, at the point `brcmf_feat_attach` runs - after the preinit commands, before `UP`:
+/// - `ver`: the version string of the code RUNNING on the radio. `strings` finds `7.45.265 (28bca26 CY)`
+///   in the image; this is the same fact from the other side of the upload.
+/// - `cap`: the capability words `brcmf_feat_firmware_capabilities` matches against its table (`mbss`,
+///   `p2p`, `sae `, `idauth`, ...). Long - a few hundred bytes - so it is printed in pieces.
+/// - `sup_wpa`: `brcmf_feat_iovar_int_get(ifp, BRCMF_FEAT_FWSUP, "sup_wpa")`. Linux's rule, quoted from
+///   `feature.c`: the feature is present iff this GET does not come back `BCME_UNSUPPORTED`. When it is
+///   present the firmware runs the WPA2 4-way handshake itself and the host only supplies the passphrase;
+///   when it is absent the host must run the handshake (Linux: wpa_supplicant; OpenBSD: net80211, which
+///   in fact sets `sup_wpa 0` on purpose and does it itself) and install the keys with `wsec_key`.
+///
+/// Why this exists: two SETs of `sup_wpa` - plain on 2026-09-28, `bsscfg:` form on 2026-09-29 - were
+/// refused -23 on this board, while Pi OS on the same chip family has the feature ON (its users turn it
+/// off with `feature_disable=0x2000`). So either this build lacks it or the SET differs from the GET Linux
+/// rests on. This asks the exact question, and prints the answer rather than deciding anything from it.
+pub fn report_firmware(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) {
+    /// Print a firmware string in pieces `log_fmt`'s fixed buffer can hold.
+    fn log_text(label: &str, buf: &[u8], ctx: &ServiceContext) {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let text = &buf[..end];
+        if text.is_empty() {
+            ctx.log_fmt(format_args!("wifi-driver:   `{}` answered with an empty string", label));
+            return;
+        }
+        const PIECE: usize = 96;
+        let mut at = 0;
+        while at < text.len() {
+            let to = core::cmp::min(at + PIECE, text.len());
+            match core::str::from_utf8(&text[at..to]) {
+                Ok(t) => ctx.log_fmt(format_args!("wifi-driver:   {} {}", label, t.trim_end())),
+                Err(_) => ctx.log_fmt(format_args!(
+                    "wifi-driver:   {} bytes {}..{} are not text",
+                    label, at, to
+                )),
+            }
+            at = to;
+        }
+    }
+
+    ctx.log("wifi-driver: asking the firmware what it is, before deciding what the host must do");
+
+    let mut ver = [0u8; 128];
+    match query_iovar(h, w, s, "ver", &mut ver, ctx) {
+        Some(_) => log_text("ver:", &ver, ctx),
+        None => ctx.log("wifi-driver:   no version string - the exchange itself failed, logged above"),
+    }
+
+    let mut cap = [0u8; 512];
+    match query_iovar(h, w, s, "cap", &mut cap, ctx) {
+        Some(_) => log_text("cap:", &cap, ctx),
+        None => ctx.log("wifi-driver:   no capability string - the exchange itself failed, logged above"),
+    }
+
+    let mut sup = [0u8; 4];
+    match query_iovar(h, w, s, "sup_wpa", &mut sup, ctx) {
+        Some(n) if n >= 4 => ctx.log_fmt(format_args!(
+            "wifi-driver:   `sup_wpa` GET answered {} - by Linux's rule this firmware HAS an internal \
+             supplicant, so the two refused SETs were about the SET, not the feature",
+            u32::from_le_bytes(sup)
+        )),
+        Some(n) => ctx.log_fmt(format_args!(
+            "wifi-driver:   `sup_wpa` GET answered with {} byte(s) where an int is 4 - accepted, but the \
+             value is not readable",
+            n
+        )),
+        None => ctx.log(
+            "wifi-driver:   `sup_wpa` GET refused - by Linux's rule (`brcmf_feat_iovar_int_get`, feature.c) \
+             this firmware has NO internal supplicant. The host must run the WPA2 4-way handshake and \
+             install the keys with `wsec_key`, as OpenBSD's net80211 does on this same chip",
+        ),
+    }
+}

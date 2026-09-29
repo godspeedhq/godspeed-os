@@ -803,6 +803,10 @@ pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::
         return None;
     }
 
+    // WHAT THE FIRMWARE SAYS IT IS, asked where `brcmf_feat_attach` asks - after preinit, before UP. This
+    // decides nothing; it prints the three answers a later decision rests on (`ctrl::report_firmware`).
+    ctrl::report_firmware(h, w, &mut session, ctx);
+
     // THE BRING-UP CHAIN LAST, which is the order `bwfm_init` uses: the event mask and the scan timings are
     // set BEFORE `BWFM_C_UP`, not after. Reading that function in full rather than asking for particular
     // lines is what showed it - a list of call sites came back in the order they were found, not the order
