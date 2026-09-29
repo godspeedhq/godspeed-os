@@ -24,7 +24,7 @@ JOB  STATE    PROGRESS  COMMAND
 1    running   38%      copy /big.bin /backup/big.bin
 
 gsh> foreground 1
-[q] cancel   [b] background
+[q] quit   [b] background
 copying... 41%
 job 1 done
 ```

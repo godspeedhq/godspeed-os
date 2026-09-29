@@ -16867,7 +16867,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         return Ok(());
     }
 
-    ctx.console_writeln("[q] cancel   [b] background");
+    ctx.console_writeln("[q] quit   [b] background");
     let mut shown = 101u32; // impossible, so the first sample always prints
     loop {
         if let Some(b) = ctx.try_console_read() {

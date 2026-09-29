@@ -7797,7 +7797,7 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     // ---- ATTACH, THEN DETACH WITH `b`. `foreground` on a running job does not return a prompt -
     //      it is attached - so wait for its own marker and then press the key.
     let attached = run_until!(b"foreground 1\r", b"[b] background", 60).unwrap_or_default();
-    check!(attached.contains("[q] cancel") && attached.contains("[b] background"),
+    check!(attached.contains("[q] quit") && attached.contains("[b] background"),
            "`foreground` on a RUNNING job attaches and shows what the two keys do");
     let detached = run_until!(b"b", b"gsh>", 60).unwrap_or_default();
     check!(detached.contains("[backgrounded] job 1"),
@@ -7958,7 +7958,7 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
 
     check!(!freed.contains("failed"), "the finished copy is deleted, making room for the next job");
     check!(cancel_start.contains("[backgrounded] job 2"), "a second job runs once the first has ended");
-    check!(cancel_attach.contains("[q] cancel"), "the second job can be attached to");
+    check!(cancel_attach.contains("[q] quit"), "the second job can be attached to");
     check!(cancelled.contains("job 2 stopped"), "`q` stops the JOB, and says so");
     check!(!after_cancel.contains("cancelme.bin"),
            "THE PARTIAL DESTINATION IS GONE - a cancelled copy does not leave a full-size file with an undefined tail");
