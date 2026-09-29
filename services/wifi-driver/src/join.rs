@@ -188,8 +188,13 @@ pub fn join(
             }
         };
         s.note_frame(ctx, &f, &frame, false);
-        let channel = f.chanflag & CHANNEL_MASK;
-        let body = &frame[f.off..f.off + f.len];
+        // Every frame inside the frame: a superframe's sub-frames are handled one by one (docs/wifi.md 38 -
+        // the association events arrive glommed, and the handshake's third message may too).
+        let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
+        let nsubs = ctrl::subframes(&f, &frame, &mut subs, ctx);
+        for sub in subs.iter().take(nsubs) {
+        let channel = sub.chanflag & CHANNEL_MASK;
+        let body = &frame[sub.off..sub.off + sub.len];
 
         if channel == CHANNEL_DATA {
             // TRAFFIC. Before any key is installed the only frames that can matter are the handshake's.
@@ -264,6 +269,7 @@ pub fn join(
                 };
             }
             _ => {}
+        }
         }
     }
     ctx.log_fmt(format_args!(

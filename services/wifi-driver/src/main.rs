@@ -640,6 +640,8 @@ fn serve_radio(
                         out[at..at + 4].copy_from_slice(&session.now_ms(ctx).to_le_bytes());
                         at += 4;
                         out[at..at + 4].copy_from_slice(&session.trace.total().to_le_bytes());
+                        at += 4;
+                        out[at..at + 4].copy_from_slice(&st.rx_glom_sub.to_le_bytes());
                         at + 4
                     }
                 }

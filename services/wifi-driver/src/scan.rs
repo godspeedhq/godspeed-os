@@ -511,9 +511,10 @@ pub mod reply {
 
     /// Sub-codes of `OP_DEBUG`, and their reply layouts.
     pub mod dbg {
-        /// `[OK, 29 x u32 LE]`: ctrl sent/accepted/refused/unanswered, rx ctrl/event/data/glom/header-only/
+        /// `[OK, 30 x u32 LE]`: ctrl sent/accepted/refused/unanswered, rx ctrl/event/data/glom/header-only/
         /// other, tx_bytes, rx_bytes, rx skipped in a control wait, the 10 event buckets, last_event_code,
-        /// last_event_status, last_refused_cmd, last_refused_status (i32), session ms, frames ever traced.
+        /// last_event_status, last_refused_cmd, last_refused_status (i32), session ms, frames ever traced,
+        /// sub-frames delivered out of superframes.
         /// `wifi debug`, `wifi debug stats`, `wifi debug events` and `wifi debug transport` all read this;
         /// they print different rows of it.
         pub const STATS: u8 = 0;
@@ -856,35 +857,42 @@ pub fn step(
         None => return Step::Empty,
     };
     s.note_frame(ctx, &f, frame, false);
-    let channel = f.chanflag & CHANNEL_MASK;
-    if channel == CHANNEL_GLOM {
-        // Counted, not read. See `CHANNEL_GLOM` for why the reference drops these too.
+    if f.chanflag & CHANNEL_MASK == CHANNEL_GLOM {
+        // A superframe is READ now, its sub-frames handled below like any other frame; the descriptor that
+        // precedes it yields nothing. Counted either way, so `glom` still says how many arrived.
         scan.glom += 1;
-        return Step::Frame;
     }
-    if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {
-        scan.other += 1;
-        return Step::Frame;
-    }
-    scan.events += 1;
-    let p = f.off;
-    if let Some(e) = parse_event(&frame[p..p + f.len], scan.events, ctx) {
-        let (event_type, status, at, datalen) = (e.event_type, e.status, e.at, e.datalen);
-        ctx.log_fmt(format_args!(
-            "wifi-driver:   event {} ({}), status {}, {} byte payload",
-            event_type,
-            code::name(event_type),
-            status,
-            datalen
-        ));
-        if event_type == code::ESCAN_RESULT {
-            scan.results += 1;
-            if status == status::PARTIAL {
-                parse_results(&frame[p + at..p + at + datalen], scan, ctx);
-            }
-            if let Some(why) = status::terminal(status) {
-                // THE FIRMWARE SAID SO. Stop asking.
-                return Step::Ended(why);
+    // EVERY FRAME INSIDE THE FRAME. A plain frame is one; a superframe is each of its sub-frames - which is
+    // where the association events turned out to travel (docs/wifi.md 38).
+    let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
+    let n = ctrl::subframes(&f, frame, &mut subs, ctx);
+    for sub in subs.iter().take(n) {
+        let channel = sub.chanflag & CHANNEL_MASK;
+        if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {
+            scan.other += 1;
+            continue;
+        }
+        scan.events += 1;
+        let p = sub.off;
+        if let Some(e) = parse_event(&frame[p..p + sub.len], scan.events, ctx) {
+            let (event_type, status, at, datalen) = (e.event_type, e.status, e.at, e.datalen);
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   event {} ({}), status {}, {} byte payload{}",
+                event_type,
+                code::name(event_type),
+                status,
+                datalen,
+                if sub.glommed { " (glommed)" } else { "" }
+            ));
+            if event_type == code::ESCAN_RESULT {
+                scan.results += 1;
+                if status == status::PARTIAL {
+                    parse_results(&frame[p + at..p + at + datalen], scan, ctx);
+                }
+                if let Some(why) = status::terminal(status) {
+                    // THE FIRMWARE SAID SO. Stop asking.
+                    return Step::Ended(why);
+                }
             }
         }
     }

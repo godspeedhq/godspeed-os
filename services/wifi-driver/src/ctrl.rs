@@ -249,6 +249,8 @@ pub struct Stats {
     pub rx_event: u32,
     pub rx_data: u32,
     pub rx_glom: u32,
+    /// Sub-frames delivered out of superframes - the events and data that used to be dropped with them.
+    pub rx_glom_sub: u32,
     pub rx_header_only: u32,
     pub rx_other: u32,
     pub tx_bytes: u32,
@@ -293,6 +295,11 @@ pub mod trace_kind {
     pub const RX_DATA: u8 = 4;
     pub const RX_GLOM: u8 = 5;
     pub const RX_OTHER: u8 = 6;
+    /// An event or data frame taken out of a glommed superframe.
+    pub const RX_EVENT_GLOMMED: u8 = 7;
+    pub const RX_DATA_GLOMMED: u8 = 8;
+    /// The glom descriptor: a list of lengths, not a frame with content.
+    pub const RX_GLOMDESC: u8 = 9;
 }
 
 /// How many frames the trace keeps. Fixed; the oldest is overwritten (26.6.1). 64 is two full scans.
@@ -403,7 +410,43 @@ impl Session {
             (trace_kind::RX_DATA, 0, 0)
         } else if channel == crate::scan::CHANNEL_GLOM {
             self.stats.rx_glom += 1;
-            (trace_kind::RX_GLOM, 0, 0)
+            if f.chanflag & GLOMDESC != 0 {
+                (trace_kind::RX_GLOMDESC, ((f.frmlen as usize).saturating_sub(HWHDR + SWHDR) / 2) as u32, 0)
+            } else {
+                // The superframe itself is one trace line, then one per sub-frame inside it, so the trace
+                // shows what a glom carried rather than only that one arrived.
+                self.trace.push(TraceEntry {
+                    ms: self.now_ms(ctx), kind: trace_kind::RX_GLOM, chanflag: f.chanflag, id: 0, what: 0,
+                    status: 0, len: f.frmlen,
+                });
+                let mut subs = [Sub::default(); MAX_SUBS];
+                let n = subframes(f, buf, &mut subs, ctx);
+                for sub in subs.iter().take(n) {
+                    self.stats.rx_glom_sub += 1;
+                    let sub_body = &buf[sub.off..sub.off + sub.len];
+                    let (kind, what, status) = if sub.chanflag & 0x0F == crate::scan::CHANNEL_EVENT {
+                        self.stats.rx_event += 1;
+                        match crate::scan::event_head(sub_body) {
+                            Some((code, st)) => {
+                                let b = crate::scan::code::index(code);
+                                self.stats.events[b] += 1;
+                                self.stats.last_event_code = code;
+                                self.stats.last_event_status = st;
+                                (trace_kind::RX_EVENT_GLOMMED, code, st as i32)
+                            }
+                            None => (trace_kind::RX_EVENT_GLOMMED, 0, 0),
+                        }
+                    } else {
+                        self.stats.rx_data += 1;
+                        (trace_kind::RX_DATA_GLOMMED, 0, 0)
+                    };
+                    self.trace.push(TraceEntry {
+                        ms: self.now_ms(ctx), kind, chanflag: sub.chanflag, id: 0, what, status,
+                        len: sub.len as u16,
+                    });
+                }
+                return;
+            }
         } else {
             self.stats.rx_other += 1;
             (trace_kind::RX_OTHER, 0, 0)
@@ -452,7 +495,103 @@ impl Session {
 ///
 /// Public because the scan path reads frames into a buffer of the same size. Two constants for one wire
 /// limit is the duplicated fact the enforcement layer rejects, and rightly.
-pub const FRAME: usize = 2048;
+pub const FRAME: usize = 4096;
+
+/// `SDPCM_GLOMDESC(p)` - `(((u8 *)p)[1] & 0x80)`: in the software header's channel byte, this bit marks a glom
+/// DESCRIPTOR (a list of the sub-frame lengths that follow) as opposed to the superframe itself, which is on
+/// the same channel 3 without the bit. `brcmf_sdio_hdparse` refuses a superframe head that carries it.
+pub const GLOMDESC: u8 = 0x80;
+
+/// One frame as a reader sees it: the frame itself, or one sub-frame of a glommed superframe. `off` and
+/// `len` are the payload inside the caller's buffer, past the sub-frame's own `dataoff`, exactly as
+/// `Frame::off`/`Frame::len` are for a plain frame - so a reader treats both alike.
+#[derive(Clone, Copy, Default)]
+pub struct Sub {
+    pub chanflag: u8,
+    pub off: usize,
+    pub len: usize,
+    /// True for a sub-frame taken out of a superframe.
+    pub glommed: bool,
+}
+
+/// The most sub-frames one superframe is walked for. The descriptors seen on hardware list 2 to 5; a
+/// 4 KiB superframe of minimal frames could hold more, and past this the rest are counted as dropped.
+pub const MAX_SUBS: usize = 16;
+
+/// The frames inside `f`, written into `out`; returns how many.
+///
+/// A plain frame yields itself. A glom DESCRIPTOR yields nothing: it lists the lengths of the superframe that
+/// follows, which this driver reads by that superframe's own header rather than by the list (Linux sizes a
+/// single read from the list; OpenBSD reads one chunk per entry; both then parse the sub-frames by their own
+/// headers, and so does this). A SUPERFRAME yields its sub-frames: past its own 12-byte header they sit back
+/// to back with no padding (`brcmf_sdio_rxglom` checks each sub-frame's length against the descriptor entry
+/// and moves on by exactly that), each with a hardware header that validates itself and a software header
+/// that says its channel and `dataoff`. Only the event and data channels are allowed inside
+/// (`brcmf_sdio_hdparse`, `BRCMF_SDIO_FT_SUB`); anything else is reported and skipped.
+///
+/// This is what §38 found missing: the association events ride in here, and so may the handshake's third
+/// message. Before this, every superframe was counted and dropped.
+pub fn subframes(f: &Frame, buf: &[u8], out: &mut [Sub; MAX_SUBS], ctx: &ServiceContext) -> usize {
+    let channel = f.chanflag & 0x0F;
+    if channel != crate::scan::CHANNEL_GLOM {
+        out[0] = Sub { chanflag: f.chanflag, off: f.off, len: f.len, glommed: false };
+        return 1;
+    }
+    if f.chanflag & GLOMDESC != 0 {
+        // The descriptor. Its payload is `frmlen - 12` bytes of little-endian u16 lengths; the superframe they
+        // describe is the next frame, read by its own header.
+        return 0;
+    }
+    // `buf[..total]` is the superframe past its own header. `Frame::body` is that length.
+    let total = f.body;
+    let mut n = 0;
+    let mut at = 0usize;
+    let mut k = 0u32;
+    while at + HWHDR + SWHDR <= total {
+        let len = u16::from_le_bytes([buf[at], buf[at + 1]]) as usize;
+        let ck = u16::from_le_bytes([buf[at + 2], buf[at + 3]]);
+        if len == 0 || (len as u16) ^ ck != 0xFFFF {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: sub-frame {} of a {} byte superframe at +{} does not validate its header (len {},                  cksum {:#06x}) - the rest of the superframe is not read",
+                k, total, at, len, ck
+            ));
+            break;
+        }
+        if len < HWHDR + SWHDR || at + len > total {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: sub-frame {} at +{} claims {} bytes of a {} byte superframe - the rest is not read",
+                k, at, len, total
+            ));
+            break;
+        }
+        let chanflag = buf[at + 5];
+        let dataoff = buf[at + 7] as usize;
+        let sub_channel = chanflag & 0x0F;
+        if dataoff < HWHDR + SWHDR || dataoff > len {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: sub-frame {} at +{} has dataoff {} outside its {} bytes - skipped",
+                k, at, dataoff, len
+            ));
+        } else if sub_channel != crate::scan::CHANNEL_EVENT && sub_channel != crate::scan::CHANNEL_DATA {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: sub-frame {} at +{} is on channel {} - only event and data frames may be glommed                  (`BRCMF_SDIO_FT_SUB`); skipped",
+                k, at, sub_channel
+            ));
+        } else if n < MAX_SUBS {
+            out[n] = Sub { chanflag, off: at + dataoff, len: len - dataoff, glommed: true };
+            n += 1;
+        } else {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: a superframe holds more than {} sub-frames - the rest are dropped",
+                MAX_SUBS
+            ));
+            break;
+        }
+        at += len;
+        k += 1;
+    }
+    n
+}
 
 /// The frame FIFO's address: function 2, with the window set to chipcommon, offset 0, wide access.
 fn frame_offset() -> u32 {
@@ -873,8 +1012,8 @@ pub fn read_frame(
         // this driver cannot account for.
         if chanflag & 0x0F == 3 && frmlen > FRAME {
             ctx.log_fmt(format_args!(
-                "wifi-driver: a {} byte glommed frame (channel 3) exceeds this driver's {} byte buffer and \
-                 is not read - the reference drops glommed frames too, and the scan works without them",
+                "wifi-driver: a {} byte superframe (channel 3) exceeds this driver's {} byte buffer and is not \
+                 read - the events or data inside it are LOST; if this recurs the bound is what to raise",
                 frmlen, FRAME
             ));
         } else {

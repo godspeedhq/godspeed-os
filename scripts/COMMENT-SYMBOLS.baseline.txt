@@ -453,3 +453,5 @@ bwfm_stop                          # OpenBSD bwfm.c - the interface teardown: a 
 BRCMF_C_GET_BSSID                  # Linux brcmfmac fwil.h - command 23, the access point address (all zeros when not associated); this driver names it CMD_GET_BSSID - external, 26.14
 BRCMF_C_GET_RSSI                   # Linux brcmfmac fwil.h - command 127, answered into brcmf_scb_val_le { val; ea[6] }; this driver names it CMD_GET_RSSI - external, 26.14
 brcmf_fil_cmd_data_get             # Linux brcmfmac fwil.c - a GET command whose sent structure is written back with the answer; ctrl::query_cmd is that shape - external, 26.14
+brcmf_sdio_hdparse                 # Linux brcmfmac sdio.c - validates a frame header by type: a superframe head must be channel 3 without the descriptor flag, a sub-frame must be on the event or data channel; ctrl::subframes applies the same rules - external, 26.14
+brcmf_sdio_rxglom                  # Linux brcmfmac sdio.c - reads a superframe in one transfer and walks its sub-frames back to back, each checked against the descriptor entry; ctrl::subframes is that walk - external, 26.14

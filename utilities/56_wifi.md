@@ -43,12 +43,13 @@ What every verb does, and what was seen:
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
 - The WPA2 join (the host supplicant), so `connect` and the picker's passphrase path end in reply 15.
-- **Glommed frames are dropped, and events ride in them.** The trace showed the firmware packing frames
-  into channel-3 superframes constantly - 30 of them in 74 s, in pairs of a short descriptor and a long
-  body - and no `LINK` or `ASSOC` event was ever seen although the association plainly happened (the
-  handshake frames arrived). The reference drops glommed frames on the CONTROL path but reads them on the
-  data path (`brcmf_sdio_rxglom`); this driver drops them everywhere. Reading them is the prerequisite for
-  the handshake, since message 3 may arrive the same way.
+- **Glommed superframes are read now - built 2026-09-29, unverified.** The boot before showed the firmware
+  packing frames into channel-3 superframes constantly and no `LINK` or `ASSOC` event ever arriving on the
+  plain event channel although the associations happened; the events ride inside the glom. `ctrl::subframes`
+  walks a superframe's sub-frames as the references do (`brcmf_sdio_rxglom`; OpenBSD `bwfm_sdio_rx_glom`),
+  the sweep and the join iterate them like any frame, the frame buffer is 4 KiB to hold one, and the trace
+  marks a glommed frame with `*`. What the next boot must show: `LINK` on a join, `rx_glom_sub` climbing in
+  `wifi debug transport`, and no `does not validate its header` line.
 - The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
   `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
   to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.
@@ -368,6 +369,9 @@ gsh> wifi debug trace
     12.612  RX EVENT         event=69 status=8 len=572
     14.004  RX EVENT         event=69 status=0 len=24
 ```
+
+`RX GDESC` is a glom descriptor (it lists the lengths of the superframe that follows), `RX GLOM` the
+superframe itself, and a trailing `*` marks an event or data frame taken out of one.
 
 The trace is a fixed ring of 64 entries in the driver (§26.6.1), the oldest overwritten - two full scans'
 worth. Timestamps are milliseconds since the driver's session began, by its own cycle counter; where the

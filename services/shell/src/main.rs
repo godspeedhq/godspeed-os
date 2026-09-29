@@ -8048,8 +8048,8 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
     const DBG_STATS: u8 = 0;
     const DBG_TRACE: u8 = 1;
     const DBG_FIRMWARE: u8 = 2;
-    /// The stats reply: 29 u32 words after the status byte.
-    const STAT_WORDS: usize = 29;
+    /// The stats reply: 30 u32 words after the status byte.
+    const STAT_WORDS: usize = 30;
     /// A trace entry on the wire.
     const ENTRY: usize = 18;
 
@@ -8091,7 +8091,8 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
                 out.line_fmt(ctx, format_args!("  rx_ctrl   {}", word(p, 4)));
                 out.line_fmt(ctx, format_args!("  rx_event  {}", word(p, 5)));
                 out.line_fmt(ctx, format_args!("  rx_data   {}", word(p, 6)));
-                out.line_fmt(ctx, format_args!("  rx_glom   {}  (read and dropped, as the reference does)", word(p, 7)));
+                out.line_fmt(ctx, format_args!("  rx_glom   {}  (superframes; each descriptor and each superframe counts one)", word(p, 7)));
+                out.line_fmt(ctx, format_args!("  rx_glom_sub {}  (event and data frames delivered out of them)", word(p, 29)));
                 out.line_fmt(ctx, format_args!("  rx_flow   {}  (header-only frames: flow control)", word(p, 8)));
                 out.line_fmt(ctx, format_args!("  rx_other  {}", word(p, 9)));
                 out.line_fmt(ctx, format_args!("  skipped   {}  (event/data frames read during a control wait - lost to the scan)", word(p, 12)));
@@ -8183,12 +8184,17 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
                 let what = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
                 let status = i32::from_le_bytes([e[12], e[13], e[14], e[15]]);
                 let len = u16::from_le_bytes([e[16], e[17]]);
+                // A trailing `*` marks a frame taken out of a glommed superframe; `RX GLOM` is the superframe
+                // itself and `RX GDESC` the descriptor (its `what` is the number of lengths it lists).
                 let kind_word = match kind {
                     1 => "TX CTRL",
                     2 => "RX CTRL",
                     3 => "RX EVENT",
                     4 => "RX DATA",
                     5 => "RX GLOM",
+                    7 => "RX EVENT*",
+                    8 => "RX DATA*",
+                    9 => "RX GDESC",
                     _ => "RX other",
                 };
                 let stamp_ms = ms % 1000;
@@ -8196,7 +8202,8 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
                 match kind {
                     1 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} len={}", stamp_s, stamp_ms, kind_word, id, what, len)),
                     2 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} status={} len={}", stamp_s, stamp_ms, kind_word, id, what, status, len)),
-                    3 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} event={} status={} len={}", stamp_s, stamp_ms, kind_word, "", what, status, len)),
+                    3 | 7 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} event={} status={} len={}", stamp_s, stamp_ms, kind_word, "", what, status, len)),
+                    9 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} lists {} sub-frame length(s)", stamp_s, stamp_ms, kind_word, "", what)),
                     _ => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} len={}", stamp_s, stamp_ms, kind_word, "", len)),
                 }
             }
