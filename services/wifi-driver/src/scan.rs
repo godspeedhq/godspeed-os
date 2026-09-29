@@ -450,8 +450,11 @@ pub mod reply {
     /// Not a request this driver understands.
     pub const UNKNOWN_OP: u8 = 3;
 
-    /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] pad.
-    pub const RECORD: usize = 44;
+    /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note.
+    pub const RECORD: usize = 45;
+    /// The record's NOTE byte: bit 0 - a key for this name is held; bit 1 - this is the network joined.
+    pub const NOTE_SAVED: u8 = 1;
+    pub const NOTE_JOINED: u8 = 2;
     /// Request op byte: scan and list.
     pub const OP_LIST: u8 = 1;
     /// Request op byte: join a network. Payload: `ssid_len, ssid[32], pass_len, pass[64]`. A `pass_len`
@@ -516,14 +519,17 @@ pub mod reply {
 ///
 /// A FIXED layout with no framing to parse on the far side - the shell indexes into it. 32 records of 44
 /// bytes plus two is 1410 bytes, well inside a 4096-byte message, and `Scan` already bounds the count.
-pub fn write_reply(scan: &Scan, out: &mut [u8]) -> usize {
-    write_records(scan, 0, reply::OK, out)
+pub fn write_reply(scan: &Scan, note: &dyn Fn(&Network) -> u8, out: &mut [u8]) -> usize {
+    write_records(scan, 0, reply::OK, note, out)
 }
 
 /// The same reply from record `from` onward, under a chosen status byte. Byte 1 is always the TOTAL held,
 /// so a poller knows both how many it has been given and how many exist: a `wifi scan` surface asks for
 /// what it has not yet printed, and a `from` past the end yields the two status bytes alone.
-pub fn write_records(scan: &Scan, from: usize, status: u8, out: &mut [u8]) -> usize {
+///
+/// `note` is the serve loop's knowledge of each network - a key held for it, the one joined - which the scan
+/// itself cannot know; it is asked per record so this stays a serialiser and the loop stays the owner.
+pub fn write_records(scan: &Scan, from: usize, status: u8, note: &dyn Fn(&Network) -> u8, out: &mut [u8]) -> usize {
     out[0] = status;
     out[1] = scan.count as u8;
     let mut at = 2;
@@ -538,6 +544,7 @@ pub fn write_records(scan: &Scan, from: usize, status: u8, out: &mut [u8]) -> us
         out[at + 11..at + 11 + MAX_SSID].copy_from_slice(&n.ssid);
         // The last byte was a pad; it carries the `sec::` value now. Same record size, same offsets.
         out[at + 43] = n.security;
+        out[at + 44] = note(n);
         at += reply::RECORD;
     }
     at

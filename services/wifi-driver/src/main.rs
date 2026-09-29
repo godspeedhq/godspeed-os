@@ -157,6 +157,26 @@ fn serve_radio(
             s.as_ref().map(|st| st.len as usize == ssid.len() && &st.ssid[..ssid.len()] == ssid).unwrap_or(false)
         })
     }
+    /// The NOTE byte of one record: is a key held for this name, and is it the network joined. What a person
+    /// picking from the list most needs to know, and what only this loop knows.
+    fn note_for<'a>(
+        stored: &'a [Option<Stored>],
+        joined: &'a Option<([u8; join::MAX_SSID], u8)>,
+    ) -> impl Fn(&scan::Network) -> u8 + 'a {
+        move |n: &scan::Network| {
+            let name = &n.ssid[..n.ssid_len as usize];
+            let mut note = 0;
+            if slot_of(stored, name).is_some() {
+                note |= scan::reply::NOTE_SAVED;
+            }
+            if let Some((j, jl)) = joined {
+                if *jl as usize == name.len() && &j[..name.len()] == name {
+                    note |= scan::reply::NOTE_JOINED;
+                }
+            }
+            note
+        }
+    }
     /// Where a new key goes: the slot already holding this name, else a free one, else the one used longest ago.
     fn slot_for(stored: &[Option<Stored>], ssid: &[u8]) -> usize {
         if let Some(i) = slot_of(stored, ssid) {
@@ -241,7 +261,10 @@ fn serve_radio(
                     out[1] = s.scan.count() as u8;
                     2
                 }
-                (None, Some(c)) => scan::write_reply(&c.scan, &mut out),
+                (None, Some(c)) => {
+                    let note = note_for(&stored, &joined);
+                    scan::write_reply(&c.scan, &note, &mut out)
+                }
                 (None, None) => {
                     out[0] = scan::reply::NO_SCAN_YET;
                     1
@@ -336,12 +359,18 @@ fn serve_radio(
             (scan::reply::OP_SCAN_POLL, Some(_)) => {
                 let from = payload.get(1).copied().unwrap_or(0) as usize;
                 match (&sweep, &cache) {
-                    (Some(s), _) => scan::write_records(&s.scan, from, scan::reply::SCANNING, &mut out),
+                    (Some(s), _) => {
+                        let note = note_for(&stored, &joined);
+                        scan::write_records(&s.scan, from, scan::reply::SCANNING, &note, &mut out)
+                    }
                     (None, _) if sweep_failed => {
                         out[0] = scan::reply::SCAN_FAILED;
                         1
                     }
-                    (None, Some(c)) => scan::write_records(&c.scan, from, scan::reply::SCAN_DONE, &mut out),
+                    (None, Some(c)) => {
+                        let note = note_for(&stored, &joined);
+                        scan::write_records(&c.scan, from, scan::reply::SCAN_DONE, &note, &mut out)
+                    }
                     (None, None) => {
                         out[0] = scan::reply::NO_SCAN_YET;
                         1

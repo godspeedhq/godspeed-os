@@ -7408,8 +7408,11 @@ mod wifi_wire {
     pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
     pub const NEEDS_PASSPHRASE: u8 = 16;
 
-    /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security.
-    pub const RECORD: usize = 44;
+    /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note.
+    pub const RECORD: usize = 45;
+    /// The record's NOTE byte: a key is held for this name / this is the network joined.
+    pub const NOTE_SAVED: u8 = 1;
+    pub const NOTE_JOINED: u8 = 2;
     /// The most records the driver holds, and so the most a sweep can number.
     pub const MAX_RECORDS: usize = 32;
     /// `IEEE80211_MAX_SSID_LEN`.
@@ -7452,10 +7455,10 @@ fn wifi_ssid_text<'a>(ssid: &[u8], shown: &'a mut [u8; wifi_wire::SSID_MAX]) -> 
     core::str::from_utf8(&shown[..len]).unwrap_or("(unprintable)")
 }
 
-/// The word beside the dBm in `wifi status`. The number is the fact and stays first; the word is a stated
-/// rule over it, so a reader can check it: -50 or stronger excellent, -60 good, -70 fair, weaker is weak
-/// (`utilities/56_wifi.md` 4f). The operator asked for the word here and nowhere else - `wifi list` stays
-/// raw, because a pipe should not have to strip an adjective.
+/// The word beside a dBm figure, in every wifi view. The number is the fact and is always printed; the word
+/// is a stated rule over it, so a reader can check it: -50 or stronger excellent, -60 good, -70 fair, weaker
+/// is weak (`utilities/56_wifi.md` 3). In a row the word comes first and the header carries the unit; in
+/// `wifi status` the dBm comes first.
 fn wifi_signal_word(dbm: i32) -> &'static str {
     if dbm >= -50 {
         "excellent"
@@ -7496,10 +7499,24 @@ fn wifi_row(ctx: &ShellCtx, out: &mut Out, number: Option<usize>, rec: &[u8]) {
         _ => "band?",
     };
     let security = wifi_security_word(rec[43]);
+    // NOTE: what a person picking this row most needs to know - is it the network we are on, is its key held.
+    let note = match rec[44] & (wifi_wire::NOTE_JOINED | wifi_wire::NOTE_SAVED) {
+        n if n & wifi_wire::NOTE_JOINED != 0 => "joined",
+        n if n & wifi_wire::NOTE_SAVED != 0 => "saved",
+        _ => "",
+    };
+    // NETWORK 32, BAND 6, SIGNAL as word then dBm (the header carries the unit once), SECURITY 8, NOTE.
+    // 78 columns with the number, so a serial terminal does not wrap.
+    let word = wifi_signal_word(rssi as i32);
     match number {
-        Some(n) => out.line_fmt(ctx, format_args!("{:>2}  {:<32}  {:>4} dBm  {:<6}  {}", n, name, rssi, band, security)),
-        None => out.line_fmt(ctx, format_args!("{:<32}  {:>4} dBm  {:<6}  {}", name, rssi, band, security)),
+        Some(n) => out.line_fmt(ctx, format_args!("{:>2}  {:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", n, name, band, word, rssi, security, note)),
+        None => out.line_fmt(ctx, format_args!("{:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", name, band, word, rssi, security, note)),
     }
+}
+
+/// The header above the numbered rows of `wifi scan`. `wifi list` prints none, so its output is records only.
+fn wifi_header(ctx: &ShellCtx, out: &mut Out) {
+    out.line_fmt(ctx, format_args!("    {:<32}  {:<6}  {:<14}  {:<8}  {}", "NETWORK", "BAND", "SIGNAL (dBm)", "SECURITY", "NOTE"));
 }
 
 /// The sentence for a driver that did not answer at all - the same one everywhere it can happen.
@@ -7547,7 +7564,7 @@ fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
 
     out.line_fmt(ctx, format_args!("scanning  [q] quit  [b] background"));
-    out.line_fmt(ctx, format_args!("    {:<32}  {:>8}  {:<6}  {}", "ssid", "signal", "band", "security"));
+    wifi_header(ctx, out);
 
     let t0 = ctx.epoch_secs_monotonic();
     let mut records = [0u8; MAX_RECORDS * RECORD];

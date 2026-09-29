@@ -130,28 +130,31 @@ wifi list | count
 wifi list | write /networks.txt
 ```
 
-Fields, in order: `ssid`, `signal`, `band`, `security`. Signal is reported as **dBm, a raw fact**, not
-as bars or as a "good/fair/poor" verdict - rule 7. A reader who wants bars can derive them; a reader
-given bars cannot recover dBm.
+Fields, in order: network, band, signal, security, note. Signal is the **dBm, a raw fact** (rule 7), with a
+word beside it that is a STATED RULE over the number, so a reader can check it: -50 dBm or stronger is
+`excellent`, to -60 `good`, to -70 `fair`, weaker is `weak`. The number is always printed; a reader given
+only the word could not recover it.
 
 **The columns are fixed-width, and they can be because the widest is known.** An SSID is at most 32
 bytes - that is the size of the field in the beacon, so a longer one cannot exist - and every other
-field has a bounded vocabulary. So the layout is `ssid` padded to 32, `signal` right-aligned to 8
-(`-41 dBm`, room for `-100 dBm`), `band` padded to 6 (`2.4GHz` or `5GHz`), then `security`, two spaces between columns:
+field has a bounded vocabulary. So the layout is NETWORK padded to 32, BAND to 6 (`2.4GHz` or `5GHz`),
+SIGNAL as a word padded to 9 then the dBm right-aligned to 4 (the header carries the unit once),
+SECURITY to 8, then NOTE - `joined` for the network the radio is on, `saved` for one whose key the
+driver holds, else blank - two spaces between columns, 78 columns with the number:
 
 ```
 gsh> wifi list
-Maple-House                        -41 dBm  5GHz    WPA2
-Maple-House                        -47 dBm  2.4GHz  WPA2
-(hidden)                           -63 dBm  5GHz    WPA2
-BT-Hub6-K7QR                       -71 dBm  2.4GHz  WPA2/WPA
-Riverside Tenant WiFi Guest Netw   -74 dBm  2.4GHz  open
-xfinitywifi                        -79 dBm  2.4GHz  open
-SKY7F2B1                           -80 dBm  5GHz    WPA2
-PrinterDirect-4A                   -82 dBm  2.4GHz  WEP
-(unprintable)                      -85 dBm  2.4GHz  WPA2
-a                                  -86 dBm  5GHz    WPA
-Free_Cafe_WiFi                     -88 dBm  2.4GHz  open
+Maple-House                       5GHz    excellent  -41  WPA2      joined
+Maple-House                       2.4GHz  excellent  -47  WPA2
+(hidden)                          5GHz    fair       -63  WPA2
+BT-Hub6-K7QR                      2.4GHz  weak       -71  WPA2/WPA  saved
+Riverside Tenant WiFi Guest Netw  2.4GHz  weak       -74  open
+xfinitywifi                       2.4GHz  weak       -79  open
+SKY7F2B1                          5GHz    weak       -80  WPA2
+PrinterDirect-4A                  2.4GHz  weak       -82  WEP
+(unprintable)                     2.4GHz  weak       -85  WPA2
+a                                 5GHz    weak       -86  WPA
+Free_Cafe_WiFi                    2.4GHz  weak       -88  open
 ```
 
 Nothing is ever truncated: the fifth row is exactly 32 bytes and fills its column edge to edge. A
@@ -197,20 +200,20 @@ reports the sweep complete, the status line becomes the prompt:
 ```
 gsh> wifi scan
 scanning  [q] quit  [b] background
-    ssid                                signal  band    security
- 1  Maple-House                        -41 dBm  5GHz    WPA2
- 2  Maple-House                        -47 dBm  2.4GHz  WPA2
- 3  (hidden)                           -63 dBm  5GHz    WPA2
- 4  BT-Hub6-K7QR                       -71 dBm  2.4GHz  WPA2/WPA
- 5  Riverside Tenant WiFi Guest Netw   -74 dBm  2.4GHz  open
- 6  xfinitywifi                        -79 dBm  2.4GHz  open
- 7  SKY7F2B1                           -80 dBm  5GHz    WPA2
- 8  PrinterDirect-4A                   -82 dBm  2.4GHz  WEP
- 9  (unprintable)                      -85 dBm  2.4GHz  WPA2
-10  a                                  -86 dBm  5GHz    WPA
-11  Free_Cafe_WiFi                     -88 dBm  2.4GHz  open
-11 networks in 2.8 s
-join: type a number and Enter, [q] quit
+    NETWORK                           BAND    SIGNAL (dBm)    SECURITY  NOTE
+ 1  Maple-House                       5GHz    excellent  -41  WPA2      joined
+ 2  Maple-House                       2.4GHz  excellent  -47  WPA2
+ 3  (hidden)                          5GHz    fair       -63  WPA2
+ 4  BT-Hub6-K7QR                      2.4GHz  weak       -71  WPA2/WPA  saved
+ 5  Riverside Tenant WiFi Guest Netw  2.4GHz  weak       -74  open
+ 6  xfinitywifi                       2.4GHz  weak       -79  open
+ 7  SKY7F2B1                          5GHz    weak       -80  WPA2
+ 8  PrinterDirect-4A                  2.4GHz  weak       -82  WEP
+ 9  (unprintable)                     2.4GHz  weak       -85  WPA2
+10  a                                 5GHz    weak       -86  WPA
+11  Free_Cafe_WiFi                    2.4GHz  weak       -88  open
+11 networks in 3 s
+join: type a number and Enter, [q] quit:
 ```
 
 The header row and the numbers exist only here. `wifi list` prints the same columns without either,
@@ -229,7 +232,7 @@ echoes the row, and the join reports what was actually joined:
 
 ```
 join: 1
- 1  Maple-House                        -41 dBm  5GHz    WPA2
+ 1  Maple-House                       5GHz    excellent  -41  WPA2      joined
 passphrase (not shown):
 joining Maple-House  [q] quit
 joined Maple-House on 5GHz, bssid 02:1a:7e:c4:09:51 - the link is up and the handshake completed
@@ -267,9 +270,9 @@ ends. The picker never appears; `wifi list` and `wifi connect <ssid>` are the wa
 ```
 gsh> wifi scan
 scanning  [q] quit  [b] background
-    ssid                                signal  band    security
- 1  Maple-House                        -41 dBm  5GHz    WPA2
- 2  Maple-House                        -47 dBm  2.4GHz  WPA2
+    NETWORK                           BAND    SIGNAL (dBm)    SECURITY  NOTE
+ 1  Maple-House                       5GHz    excellent  -41  WPA2      joined
+ 2  Maple-House                       2.4GHz  excellent  -47  WPA2
 scan continues in the driver - wifi list when it finishes, wifi status meanwhile
 gsh> wifi status
 radio up, not associated
@@ -277,7 +280,7 @@ scan running - 6 heard so far
 gsh> wifi list
 scanning - 9 heard so far; wifi list when it finishes
 gsh> wifi list
-Maple-House                        -41 dBm  5GHz    WPA2
+Maple-House                       5GHz    excellent  -41  WPA2      joined
 ...
 ```
 
