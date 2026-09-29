@@ -191,7 +191,7 @@ pub fn join(
         // Every frame inside the frame: a superframe's sub-frames are handled one by one (docs/wifi.md 38 -
         // the association events arrive glommed, and the handshake's third message may too).
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
-        let nsubs = ctrl::subframes(&f, &frame, &mut subs, ctx);
+        let nsubs = ctrl::subframes(&f, &frame, s.glom_descriptor(), &mut subs, ctx);
         for sub in subs.iter().take(nsubs) {
         let channel = sub.chanflag & CHANNEL_MASK;
         let body = &frame[sub.off..sub.off + sub.len];

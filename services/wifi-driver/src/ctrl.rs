@@ -235,6 +235,11 @@ pub struct Session {
     /// not know - then every timestamp reads 0 and says so rather than inventing one).
     t0: u64,
     cycles_per_ms: u64,
+    /// The last glom DESCRIPTOR's chunk lengths, for the superframe that follows it. The firmware pads each
+    /// sub-frame, so where the next one starts is known only from here: on hardware, sub-frame 1 was looked
+    /// for at sub-frame 0's own length (+229, +92, +652) and found padding every time.
+    glom_lengths: [u16; MAX_SUBS],
+    glom_count: usize,
 }
 
 /// What the control channel and the frame reader have counted since the session began. Raw facts, no
@@ -346,7 +351,14 @@ impl Session {
             trace: Trace::new(),
             t0: ctx.read_tsc(),
             cycles_per_ms: ctx.tsc_ticks_per_10ms() / 10,
+            glom_lengths: [0; MAX_SUBS],
+            glom_count: 0,
         }
+    }
+
+    /// The chunk lengths of the superframe expected next, from the last descriptor seen. Empty if none.
+    pub fn glom_descriptor(&self) -> &[u16] {
+        &self.glom_lengths[..self.glom_count]
     }
 
     /// Milliseconds since the session began, by the driver's own clock. 0 when the kernel gave no rate.
@@ -411,7 +423,14 @@ impl Session {
         } else if channel == crate::scan::CHANNEL_GLOM {
             self.stats.rx_glom += 1;
             if f.chanflag & GLOMDESC != 0 {
-                (trace_kind::RX_GLOMDESC, ((f.frmlen as usize).saturating_sub(HWHDR + SWHDR) / 2) as u32, 0)
+                // THE DESCRIPTOR: `body` bytes of little-endian u16 chunk lengths, right after the 12-byte
+                // header (`skb_pull(pkt, SDPCM_HDRLEN); bus->glomd = pkt` - dataoff is not applied to it).
+                let n = core::cmp::min(f.body / 2, MAX_SUBS);
+                for i in 0..n {
+                    self.glom_lengths[i] = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+                }
+                self.glom_count = n;
+                (trace_kind::RX_GLOMDESC, n as u32, 0)
             } else {
                 // The superframe itself is one trace line, then one per sub-frame inside it, so the trace
                 // shows what a glom carried rather than only that one arrived.
@@ -420,7 +439,8 @@ impl Session {
                     status: 0, len: f.frmlen,
                 });
                 let mut subs = [Sub::default(); MAX_SUBS];
-                let n = subframes(f, buf, &mut subs, ctx);
+                let desc = self.glom_lengths;
+                let n = subframes(f, buf, &desc[..self.glom_count], &mut subs, ctx);
                 for sub in subs.iter().take(n) {
                     self.stats.rx_glom_sub += 1;
                     let sub_body = &buf[sub.off..sub.off + sub.len];
@@ -531,38 +551,79 @@ pub const MAX_SUBS: usize = 16;
 ///
 /// This is what §38 found missing: the association events ride in here, and so may the handshake's third
 /// message. Before this, every superframe was counted and dropped.
-pub fn subframes(f: &Frame, buf: &[u8], out: &mut [Sub; MAX_SUBS], ctx: &ServiceContext) -> usize {
+pub fn subframes(f: &Frame, buf: &[u8], desc: &[u16], out: &mut [Sub; MAX_SUBS], ctx: &ServiceContext) -> usize {
     let channel = f.chanflag & 0x0F;
     if channel != crate::scan::CHANNEL_GLOM {
         out[0] = Sub { chanflag: f.chanflag, off: f.off, len: f.len, glommed: false };
         return 1;
     }
     if f.chanflag & GLOMDESC != 0 {
-        // The descriptor. Its payload is `frmlen - 12` bytes of little-endian u16 lengths; the superframe they
-        // describe is the next frame, read by its own header.
+        // The descriptor. Its payload is `frmlen - 12` bytes of little-endian u16 chunk lengths; `Session::
+        // note_frame` keeps them, and the superframe they describe is the next frame, read by its own header.
         return 0;
     }
-    // `buf[..total]` is the superframe past its own header. `Frame::body` is that length.
+    // `buf[..total]` is the superframe past its own 12-byte header. `Frame::body` is that length.
+    //
+    // WHERE EACH SUB-FRAME STARTS COMES FROM THE DESCRIPTOR, NOT FROM THE PREVIOUS SUB-FRAME'S LENGTH. The
+    // firmware pads sub-frames: on hardware the second was looked for at the first one's `frmlen` and found
+    // padding at +229, +92 and +652. The descriptor lists the CHUNK each sub-frame occupies, padding included
+    // (OpenBSD reads one chunk per entry; Linux checks each sub-frame against its entry). Chunk 0 also holds
+    // the superframe's own 12-byte header, so its sub-frame begins 12 bytes in.
     let total = f.body;
+    let described: usize = desc.iter().map(|&l| l as usize).sum();
+    if desc.is_empty() {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a {} byte superframe arrived with no descriptor before it - not read (the chunk \
+             boundaries are unknown without one)",
+            total + HWHDR + SWHDR
+        ));
+        return 0;
+    }
+    if described != total + HWHDR + SWHDR {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: the descriptor lists {} chunk(s) totalling {} bytes but the superframe is {} - not \
+             read, since the boundaries would be guesses",
+            desc.len(), described, total + HWHDR + SWHDR
+        ));
+        return 0;
+    }
     let mut n = 0;
-    let mut at = 0usize;
-    let mut k = 0u32;
-    while at + HWHDR + SWHDR <= total {
+    let mut chunk_at = 0usize; // in superframe coordinates, header included
+    for (k, &chunk) in desc.iter().enumerate() {
+        let chunk = chunk as usize;
+        // The sub-frame's header: 12 bytes into chunk 0 (past the superframe header), at the start of the rest.
+        // `buf` is the superframe MINUS its header, so subtract those 12 bytes to index it.
+        let start = if k == 0 { chunk_at + HWHDR + SWHDR } else { chunk_at };
+        let chunk_end = chunk_at + chunk;
+        chunk_at = chunk_end;
+        if start < HWHDR + SWHDR || chunk_end < start + HWHDR + SWHDR {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: chunk {} of a superframe is {} bytes, too short for a sub-frame header - skipped",
+                k, chunk
+            ));
+            continue;
+        }
+        let at = start - (HWHDR + SWHDR);
+        if at + HWHDR + SWHDR > total {
+            break;
+        }
         let len = u16::from_le_bytes([buf[at], buf[at + 1]]) as usize;
         let ck = u16::from_le_bytes([buf[at + 2], buf[at + 3]]);
         if len == 0 || (len as u16) ^ ck != 0xFFFF {
             ctx.log_fmt(format_args!(
-                "wifi-driver: sub-frame {} of a {} byte superframe at +{} does not validate its header (len {},                  cksum {:#06x}) - the rest of the superframe is not read",
-                k, total, at, len, ck
+                "wifi-driver: sub-frame {} of a {} byte superframe, chunk of {} at +{}, does not validate its \
+                 header (len {}, cksum {:#06x}) - skipped",
+                k, total, chunk, at, len, ck
             ));
-            break;
+            continue;
         }
-        if len < HWHDR + SWHDR || at + len > total {
+        let room = chunk_end - start;
+        if len < HWHDR + SWHDR || len > room || at + len > total {
             ctx.log_fmt(format_args!(
-                "wifi-driver: sub-frame {} at +{} claims {} bytes of a {} byte superframe - the rest is not read",
-                k, at, len, total
+                "wifi-driver: sub-frame {} at +{} claims {} bytes of a {} byte chunk - skipped",
+                k, at, len, room
             ));
-            break;
+            continue;
         }
         let chanflag = buf[at + 5];
         let dataoff = buf[at + 7] as usize;
@@ -574,25 +635,17 @@ pub fn subframes(f: &Frame, buf: &[u8], out: &mut [Sub; MAX_SUBS], ctx: &Service
             ));
         } else if sub_channel != crate::scan::CHANNEL_EVENT && sub_channel != crate::scan::CHANNEL_DATA {
             ctx.log_fmt(format_args!(
-                "wifi-driver: sub-frame {} at +{} is on channel {} - only event and data frames may be glommed                  (`BRCMF_SDIO_FT_SUB`); skipped",
+                "wifi-driver: sub-frame {} at +{} is on channel {} - only event and data frames may be glommed \
+                 (`BRCMF_SDIO_FT_SUB`); skipped",
                 k, at, sub_channel
             ));
         } else if n < MAX_SUBS {
             out[n] = Sub { chanflag, off: at + dataoff, len: len - dataoff, glommed: true };
             n += 1;
-        } else {
-            ctx.log_fmt(format_args!(
-                "wifi-driver: a superframe holds more than {} sub-frames - the rest are dropped",
-                MAX_SUBS
-            ));
-            break;
         }
-        at += len;
-        k += 1;
     }
     n
 }
-
 /// The frame FIFO's address: function 2, with the window set to chipcommon, offset 0, wide access.
 fn frame_offset() -> u32 {
     (CHIPCOMMON_BASE & OFFSET_MASK) | ACCESS_WIDE

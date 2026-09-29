@@ -2788,3 +2788,26 @@ key and must be answered - may arrive glommed exactly as the association events 
 the second status 0), then message 1 six times with the replay counter climbing 1 to 6 and the same
 ANonce, then `DEAUTH_IND` reason 15 - `4-Way Handshake timeout`, the reason code the standard assigns to
 exactly this. The access point did what a station that never answers deserves. The next slice answers it.
+
+## 39. Reading the superframes: the sub-frames are padded, and the descriptor is the map (2026-09-29)
+
+The first walker assumed what a summary of `brcmf_sdio_rxglom` said - sub-frames back to back, each
+starting where the previous one's length ends - and the boot at 13:57 refuted it precisely: sub-frame 0 of
+every superframe parsed (an `ASSOC` event appeared for the first time in this port's life), and sub-frame 1
+failed to validate at +229, +92, +652, +392 - offsets that are the first sub-frame's own `frmlen`, and where
+the bytes were padding, not a header (`len 1976, cksum 0x0000`; `len 0, cksum 0xb800`).
+
+The references never made that assumption; the summary did. OpenBSD's `bwfm_sdio_rx_glom` reads ONE CHUNK
+PER DESCRIPTOR ENTRY and then parses each chunk's header, using the header's length for the payload and
+letting the rest of the chunk be padding. Linux reads the whole superframe in one transfer and checks each
+sub-frame against its descriptor entry. Either way the descriptor - the short channel-3 frame with bit 0x80
+that precedes every superframe, whose payload is a list of little-endian u16 lengths starting right after
+its 12-byte header - is the map, and the sum of its entries is the superframe's `frmlen`, header included.
+
+So `Session` keeps the last descriptor, `subframes` walks by its chunks (chunk 0 holds the superframe's own
+12-byte header, so its sub-frame begins 12 bytes in), checks that the entries sum to the frame, and names any
+chunk whose header does not validate rather than stopping the walk. A superframe with no descriptor before
+it, or one whose entries do not add up, is not read and says so - the boundaries would be guesses.
+
+Recorded as a method note too: a reference's CODE was right and a summary of it was wrong, and the first
+walker was built on the summary. §26.14 says read the mechanism; that means the function, not a paraphrase.

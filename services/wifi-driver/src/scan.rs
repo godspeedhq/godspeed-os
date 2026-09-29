@@ -865,7 +865,7 @@ pub fn step(
     // EVERY FRAME INSIDE THE FRAME. A plain frame is one; a superframe is each of its sub-frames - which is
     // where the association events turned out to travel (docs/wifi.md 38).
     let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
-    let n = ctrl::subframes(&f, frame, &mut subs, ctx);
+    let n = ctrl::subframes(&f, frame, s.glom_descriptor(), &mut subs, ctx);
     for sub in subs.iter().take(n) {
         let channel = sub.chanflag & CHANNEL_MASK;
         if channel != CHANNEL_EVENT && channel != CHANNEL_DATA {

@@ -43,12 +43,13 @@ What every verb does, and what was seen:
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
 - The WPA2 join (the host supplicant), so `connect` and the picker's passphrase path end in reply 15.
-- **Glommed superframes are read now - built 2026-09-29, unverified.** The boot before showed the firmware
-  packing frames into channel-3 superframes constantly and no `LINK` or `ASSOC` event ever arriving on the
-  plain event channel although the associations happened; the events ride inside the glom. `ctrl::subframes`
-  walks a superframe's sub-frames as the references do (`brcmf_sdio_rxglom`; OpenBSD `bwfm_sdio_rx_glom`),
-  the sweep and the join iterate them like any frame, the frame buffer is 4 KiB to hold one, and the trace
-  marks a glommed frame with `*`. What the next boot must show: `LINK` on a join, `rx_glom_sub` climbing in
+- **Glommed superframes are read now, by the descriptor's chunk lengths - built 2026-09-29, the second
+  form unverified.** The boot at 13:05 showed the events riding inside channel-3 superframes; the boot at
+  13:57, with the first walker, showed `ASSOC` for the first time (sub-frame 0 of a superframe) and then
+  sub-frame 1 failing to validate at +229, +92 and +652 - the sub-frames are PADDED, so the next does not
+  start where the last one's length says. The descriptor frame that precedes every superframe lists the
+  chunk each sub-frame occupies, padding included (OpenBSD reads one chunk per entry), and `ctrl::subframes`
+  now walks by it. What the next boot must show: `LINK` on a join, `rx_glom_sub` climbing in
   `wifi debug transport`, and no `does not validate its header` line.
 - The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
   `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
