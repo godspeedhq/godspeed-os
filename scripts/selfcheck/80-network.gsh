@@ -27,7 +27,7 @@ echo '===== wifi: the command shape (the radio is phase 1, docs/wifi.md) ====='
 assert ok wifi help
 assert ok wifi version
 # A bare subcommand that needs an argument must say so rather than guess.
-assert fails wifi connect
+assert fails wifi join
 assert fails wifi forget
 assert fails wifi radio
 # `radio` takes two words and no others.
@@ -38,7 +38,7 @@ assert fails wifi nonsense
 # decision rather than a behaviour: a passphrase on the command line is recalled by up-arrow and
 # written to /.gsh_history, so `connect` takes an SSID and nothing else. If this ever starts passing,
 # somebody has added a convenience that leaks a secret to disk.
-assert fails wifi connect SomeSSID hunter2
+assert fails wifi join SomeSSID hunter2
 # And the radio itself, reported rather than asserted (see the note above).
 for line in (wifi) { echo $line }
 

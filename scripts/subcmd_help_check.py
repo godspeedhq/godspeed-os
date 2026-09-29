@@ -73,15 +73,16 @@ def main():
 
     direct = set(re.findall(r'\(\s*"([^"]+)",\s*"([^"]+)"\s*\)\s*=>', sub_help))
     delegated = {}
-    for util, fn in re.findall(r'\(\s*"([^"]+)",\s*v\s*\)\s*=>\s*return\s+(\w+)\(ctx,\s*v\)', sub_help):
-        body = fn_body(src, fn)
-        delegated[util] = (fn, set(re.findall(r'^\s*"([^"]+)"(?:\s*\|\s*"([^"]+)")*\s*=>', body, re.M)))
-        # `"a" | "b" =>` arms: collect every quoted word on an arm line.
+    # `("util", v) => return a(ctx, v) || b(ctx, v),` - every named function's arms count.
+    for util, tail in re.findall(r'\(\s*"([^"]+)",\s*v\s*\)\s*=>\s*return\s+(.+?),\s*$', sub_help, re.M):
+        fns = re.findall(r'(\w+)\(ctx,\s*v\)', tail)
         arm_words = set()
-        for line in body.split('\n'):
-            if '=>' in line and line.strip().startswith('"'):
-                arm_words.update(re.findall(r'"([^"]+)"', line.split('=>')[0]))
-        delegated[util] = (fn, arm_words)
+        for fn in fns:
+            body = fn_body(src, fn)
+            for line in body.split('\n'):
+                if '=>' in line and line.strip().startswith('"'):
+                    arm_words.update(re.findall(r'"([^"]+)"', line.split('=>')[0]))
+        delegated[util] = (" / ".join(fns), arm_words)
 
     missing = []
     skipped = []

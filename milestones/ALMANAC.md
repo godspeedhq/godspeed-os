@@ -1656,7 +1656,7 @@ glommed frames were dropped on the floor because the reference drops them too an
 ### What is not done, said plainly
 
 The driver scans at boot as its own self-test. The shell cannot ask it to yet, so `wifi` at the prompt still
-answers `unavailable`; that path, the numbered picker the operator designed, `wifi connect <ssid>`, and
+answers `unavailable`; that path, the numbered picker the operator designed, `wifi join <ssid>`, and
 secure-versus-open from the beacon's information elements are the next work. Association, the credential
 path and data frames are phases 4 and 5. The network identifiers from the successful scan are in the
 operator's capture and not in this repository, because the neighbours did not agree to appear in it.

@@ -297,7 +297,8 @@ pub fn run(image_path: &Path, smp: u32) {
     // what is already permanent. A QEMU x86 guest has no wireless hardware and never will, so the
     // absence line is the FINAL answer on this machine rather than an interim one - the same status the
     // T630 and the Wyse have. Nothing below would break by finishing phase 1.
-    send(&mut write_half, b"wifi\r");
+    // Bare `wifi` prints usage now (conventions rule 1, 2026-09-29); the hardware question is `wifi status`.
+    send(&mut write_half, b"wifi status\r");
     let wifi_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(wifi_out.contains("no wireless radio on this machine"),
            "wifi: says there is no radio, on a machine that has none");
@@ -308,7 +309,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // ASKING IS NOT AN ERROR. `wifi` on a radioless machine is a legitimate question with a definite
     // answer, so it must not report failure - `result` would otherwise read as a fault where there is
     // none, and a suite that accepts that teaches the reader to discount the result model.
-    send(&mut write_half, b"wifi\rresult\r");
+    send(&mut write_half, b"wifi status\rresult\r");
     let wifi_res = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     let wifi_res2 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(!format!("{wifi_res}{wifi_res2}").contains("1"),
@@ -317,15 +318,15 @@ pub fn run(image_path: &Path, smp: u32) {
     // THE SECURITY ASSERTION, and the one most worth having. A passphrase given as an argument would be
     // recalled by up-arrow and written to /.gsh_history, so `connect` takes an SSID and nothing else.
     // If this ever stops refusing, somebody has added a convenience that leaks a secret to disk.
-    send(&mut write_half, b"wifi connect SomeSSID hunter2\r");
+    send(&mut write_half, b"wifi join SomeSSID hunter2\r");
     let wifi_pw = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(wifi_pw.contains("passphrase is asked for"),
            "wifi: refuses a passphrase on the command line (it would land in /.gsh_history)");
 
     // Usage and unknown-word refusals, which are permanent on every board.
-    send(&mut write_half, b"wifi connect\r");
+    send(&mut write_half, b"wifi join\r");
     let wifi_usage = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(wifi_usage.contains("usage: wifi connect <ssid>"),
+    check!(wifi_usage.contains("usage: wifi join <ssid>"),
            "wifi: connect with no SSID prints usage rather than guessing");
     send(&mut write_half, b"wifi nonsense\r");
     let wifi_bogus = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
@@ -342,7 +343,7 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(wifiver.contains(&format!("wifi {ver}")), "wifi: version reports the current version");
     send(&mut write_half, b"wifi help\r");
     let wifihelp = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(wifihelp.contains("wifi connect <ssid>"), "wifi: help lists the connect row with an example");
+    check!(wifihelp.contains("wifi join <ssid>"), "wifi: help lists the join row with an example");
 
     // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
     // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the

@@ -31,11 +31,11 @@ What every verb does, and what was seen:
 - `wifi debug`, `wifi debug trace`, `wifi debug firmware` - **verified.** The trace held the boot scan, the
   prompt's scan, the join's six control exchanges and the handshake frames, on a clock that read real
   milliseconds. `events`, `stats`, `transport` alone were not typed; their rows appeared under bare `debug`.
-- `wifi connect <ssid>` - **verified to the point this firmware allows**: asked the passphrase once, derived
+- `wifi join <ssid>` - **verified to the point this firmware allows**: asked the passphrase once, derived
   the key into slot 0, associated, read six copies of the access point's handshake message 1 about a second
   apart, and reported the deauthentication (reason 15) as the driver's inability, not the passphrase's. A
   second `connect` of the same name **asked nothing** and joined with the held key. `wifi stored` named it.
-- `wifi disconnect`, `wifi radio on|off`, `wifi forget` - built as sections 2 and 6 say; not typed this boot.
+- `wifi leave`, `wifi radio on|off`, `wifi forget` - built as sections 2 and 6 say; not typed this boot.
 - `wifi help`, `wifi <verb> help`, `wifi version`, tab completion, and a row in `help`.
 - Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
   not answer says that after a bounded wait, never a guess.
@@ -94,8 +94,8 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi` | with no args: usage, as every utility (`0_conventions.md` rule 1). It used to alias `status`, a second way to say one thing |
 | `wifi scan` | ask the radio to sweep. Rows appear as they are heard; when the sweep ends the rows become a numbered picker. `q` stops the sweep, `b` leaves it running and returns the prompt |
 | `wifi list` | print the last complete scan: SSID, signal, band, security. Instant, records only, never scans |
-| `wifi connect <ssid>` | join a network by name. Prompts for the passphrase if one is needed and none is stored |
-| `wifi disconnect` | leave the current network. The radio stays up |
+| `wifi join <ssid>` | join a network by name. Asks the passphrase once if one is needed and none is held; `already joined` if you are on it |
+| `wifi leave` | leave the current network. The radio stays up |
 | `wifi status` | the human answer: radio, network and band, signal, security, time joined, last scan. Read live. Section 4f |
 | `wifi info` | the link in detail: bssid, band, channel, signal, security, time joined, scan facts - and where addressing lives. Section 4f |
 | `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |
@@ -119,7 +119,21 @@ filled cache. Its output is a different command, run later. The driver is alread
 it holds no console capability, does the work, and holds the result - so backgrounding a scan costs
 no new service and no `jobs` row. The state lives in `wifi status` instead.
 
-`wifi connect` takes **no** passphrase argument, in any position, and that is a security decision
+**`join` and `leave`, not `connect` and `disconnect` - renamed 2026-09-29 at the operator's call.** `join`
+is what the 802.11 layer calls it (a station joins a BSS) and what the driver's log has said since the first
+association; `connect` is the socket word and stays with `tcp`. `leave` is its natural opposite. Rule 3
+forbids aliases, so `wifi connect` answers ``try `wifi join <ssid>` `` and `wifi disconnect` answers
+``try `wifi leave` ``, the way `ls` answers `try dir`.
+
+**The outcome is one confident word, or `not joined - <why>`.** `joined Maple-House`; `already joined
+Maple-House` (checked live against the firmware, not remembered - nothing is sent); `not joined - incorrect
+passphrase`; `not joined - no network named X in range`; `not joined - aborted`. "Incorrect passphrase" is
+not a guess: it is the one situation in which the access point receives our message 2 and, its MIC failing
+to verify, repeats message 1 and gives up - nothing else produces that pattern. Until the handshake is
+built the WPA2 case still ends in `not joined - X began the WPA2 handshake, which this driver cannot yet
+answer`, which is the truth in the same shape.
+
+`wifi join` takes **no** passphrase argument, in any position, and that is a security decision
 rather than an ergonomic one: an argument would be recorded in the recall ring and written to
 `/.gsh_history`, where an up-arrow recovers it. The passphrase is only ever read through the shell's
 invisible-entry path (`input secret`, `docs/scripting.md` §8), which is already excluded from both.
@@ -269,7 +283,7 @@ scan stopped - 4 heard, not kept; the last complete scan (11 networks, 3 min ago
 **`b` returns the prompt and leaves the radio sweeping.** The same key `foreground` uses for the same
 meaning (`55_background.md` §2). Nothing is printed to the console after that - a detached scan has
 no console, exactly as a detached copy has none - and the results land in the cache when the sweep
-ends. The picker never appears; `wifi list` and `wifi connect <ssid>` are the way in:
+ends. The picker never appears; `wifi list` and `wifi join <ssid>` are the way in:
 
 ```
 gsh> wifi scan
@@ -391,7 +405,7 @@ between frames it can answer `list` (with the "scanning" error), `status` (with 
 `abort` (which sends the firmware's escan abort action - read from the reference before it is written,
 not assumed). That is the remaining debt of phase 3, and this section is what pays it off.
 
-`wifi connect` blocks through association and is escapable with `q`. Escaping it mid-handshake leaves
+`wifi join` blocks through association and is escapable with `q`. Escaping it mid-handshake leaves
 the radio not associated, and `wifi status` says so - a half-joined state is never reported as joined.
 
 ## 5. Failure is loud and says which half failed
@@ -403,8 +417,8 @@ look like "no internet":
 |---|---|
 | No radio on this machine | `no wireless hardware on this machine` - and it is not an error to ask |
 | Radio present, driver not running | `wifi: the radio driver is not answering` (peer is dead; not a timeout guess) |
-| SSID not found in a scan | `no network named <ssid> in range` - naming what was searched for |
-| Wrong passphrase | `<ssid> refused the passphrase` - never "connection failed", which hides it |
+| SSID not found in a scan | `not joined - no network named <ssid> in range` - naming what was searched for |
+| Wrong passphrase | `not joined - incorrect passphrase` - never "connection failed", which hides it |
 | Associated, no lease | association reported as good; `net` owns the lease and says its own piece |
 
 The fourth row is the one worth being careful about. A wrong passphrase and a missing DHCP server both
@@ -432,7 +446,7 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
 - **Not on disk, on purpose.** No `fs` under a join; no "not encrypted at rest" caveat; no network name of
   the operator's written to a card. The table dies with the driver - a reboot, a crash, a `kill`, a
   `chaos` run, ANY respawn empties it, and the respawned driver is off the network besides, since its
-  bring-up resets the radio - and `wifi connect` simply asks again. **Decided by the operator on
+  bring-up resets the radio - and `wifi join` simply asks again. **Decided by the operator on
   2026-09-29, in these words: "if anything restarts that driver, the user will put in their creds again.
   Better that than the kernel crashing."** That is the constitution's own ranking (CLAUDE.md §25):
   nothing above the kernel may be the thing that must survive, and a key that had to survive would be
@@ -441,7 +455,7 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   the in-memory table stays the working set, disk is where it is loaded from and written to, and where `fs`
   is absent or mid-restart the driver runs on the table alone, exactly as it does today. Its caveats (not
   encrypted at rest; network names on the card) are stated when it is built, not before.
-- **`wifi connect <ssid>` asks for a passphrase only when one is needed.** The shell sends the name
+- **`wifi join <ssid>` asks for a passphrase only when one is needed.** The shell sends the name
   alone first; the driver joins with the stored key if the slot holds that name, joins open if the last
   sweep heard the network as open, and otherwise answers *needs a passphrase* - at which point, and only
   then, the shell asks. A network joined once this boot is rejoined by name alone.
@@ -486,5 +500,5 @@ completing from a scan would leak the names of networks in range into a shell's 
 Following `docs/wifi.md` §9, and for the same reasons: no enterprise or 802.1X, no WPA3, no WEP ever
 (a WEP row is listed because it was heard, and refused at the pick), no access-point mode, no manual
 channel selection, no hidden-SSID entry by name in the first version (the picker reaches one by
-BSSID; `wifi connect <ssid>` does not), and no signal-strength monitor - `observe` is where live views
+BSSID; `wifi join <ssid>` does not), and no signal-strength monitor - `observe` is where live views
 live, and a second one here would be the duplication rule 7 exists to prevent.

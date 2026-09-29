@@ -950,7 +950,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("wifi",    &["scan", "list", "connect", "disconnect", "status", "info", "debug", "forget", "stored", "radio"]),
+    ("wifi",    &["scan", "list", "join", "leave", "status", "info", "debug", "forget", "stored", "radio"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -5163,8 +5163,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi", "this usage (rule 1: a bare utility name teaches its verbs)", "wifi"),
             ("wifi scan", "sweep for networks; ends in a numbered picker (q stops the sweep, b backgrounds it)", "wifi scan"),
             ("wifi list", "the last complete scan, one record per network; never scans", "wifi list"),
-            ("wifi connect <ssid>", "join a network (prompts for the passphrase; never takes it as an argument)", "wifi connect Bankole-WiFi"),
-            ("wifi disconnect", "leave the current network; the radio stays up", "wifi disconnect"),
+            ("wifi join <ssid>", "join a network (asks the passphrase once if needed; never takes it as an argument)", "wifi join Bankole-WiFi"),
+            ("wifi leave", "leave the current network; the radio stays up", "wifi leave"),
             ("wifi status", "what is true now: radio, network, signal, security, time joined, last scan", "wifi status"),
             ("wifi info", "the link in detail: bssid, band, channel, signal, security; addressing is `net`'s", "wifi info"),
             ("wifi debug [events|stats|firmware|transport|trace]", "the driver's own account: counters, the firmware's words, the last 64 frames", "wifi debug trace"),
@@ -5378,7 +5378,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
         // Commands with their own per-word help keep it in one place and are reached from here too, so
         // `<util> <word> help` has exactly one answer whichever way it arrives.
-        ("events", v) => return events_sub_help(ctx, v),
+        // `trace_sub_help` explains a view's COLUMNS (`events ipc help` used to, and the suite checks it);
+        // `events_sub_help` fills only the two words it does not cover.
+        ("events", v) => return trace_sub_help(ctx, v) || events_sub_help(ctx, v),
         ("trace", v) => return trace_sub_help(ctx, v),
         ("chaos", v) => return chaos_sub_help(ctx, v),
         ("net", "stats") => help_block(ctx, "net stats", "the NIC's raw registers", &[
@@ -5425,11 +5427,11 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("wifi", "list") => help_block(ctx, "wifi list", "the last complete scan, as records", &[
             ("wifi list", "NETWORK BAND SIGNAL SECURITY NOTE, one line per network; never scans - an error while a sweep runs or before any", "wifi list | match saved"),
         ], false),
-        ("wifi", "connect") => help_block(ctx, "wifi connect", "join a network by name", &[
-            ("wifi connect <ssid>", "uses a held key, joins open, or asks the passphrase once (never on the command line)", "wifi connect Bankole-WiFi"),
+        ("wifi", "join") => help_block(ctx, "wifi join", "join a network by name", &[
+            ("wifi join <ssid>", "uses a held key, joins open, or asks the passphrase once (never on the command line); `already joined` if you are on it", "wifi join Bankole-WiFi"),
         ], false),
-        ("wifi", "disconnect") => help_block(ctx, "wifi disconnect", "leave the current network", &[
-            ("wifi disconnect", "the radio stays up; the held key is kept", "wifi disconnect"),
+        ("wifi", "leave") => help_block(ctx, "wifi leave", "leave the current network", &[
+            ("wifi leave", "the radio stays up; the held key is kept", "wifi leave"),
         ], false),
         ("wifi", "status") => help_block(ctx, "wifi status", "the human answer", &[
             ("wifi status", "radio, network and band, signal as a word then dBm, security, time joined, last scan", "wifi status"),
@@ -7395,8 +7397,16 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     // an ergonomic one (it would land in /.gsh_history, where an up-arrow recovers it), so a second
     // word here is refused by name rather than ignored.
     match arg {
-        "connect" => {
-            out.line_fmt(ctx, format_args!("wifi: usage: wifi connect <ssid>  (e.g. wifi connect Bankole-WiFi)"));
+        "join" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi join <ssid>  (e.g. wifi join Bankole-WiFi)"));
+            return Err(ShellError::Unknown);
+        }
+        // The words this utility used until 2026-09-29. Not aliases (rule 3): a hint that teaches the word,
+        // the way `ls` answers `try dir`. `join` is what the 802.11 layer calls it and what the driver's log
+        // has always said; `connect` is the socket word and stays with `tcp`.
+        "connect" | "disconnect" => {
+            out.line_fmt(ctx, format_args!("wifi: `{}` is not a word here - try `wifi {}`", arg,
+                if arg == "connect" { "join <ssid>" } else { "leave" }));
             return Err(ShellError::Unknown);
         }
         "forget" => {
@@ -7410,12 +7420,17 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         _ => {}
     }
     if let Some(rest) = arg.strip_prefix("connect ") {
+        out.line_fmt(ctx, format_args!("wifi: `connect` is not a word here - try `wifi join {}`",
+            rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
+        return Err(ShellError::Unknown);
+    }
+    if let Some(rest) = arg.strip_prefix("join ") {
         if rest.trim().split_whitespace().count() > 1 {
             out.line_fmt(ctx, format_args!(
-                "wifi: connect takes only an SSID - the passphrase is asked for, never typed on the"));
+                "wifi: join takes only an SSID - the passphrase is asked for, never typed on the"));
             out.line_fmt(ctx, format_args!(
                 "      command line, because a command line is recalled by up-arrow and written to"));
-            out.line_fmt(ctx, format_args!("      /.gsh_history. Try: wifi connect {}", rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
+            out.line_fmt(ctx, format_args!("      /.gsh_history. Try: wifi join {}", rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
             return Err(ShellError::Unknown);
         }
     }
@@ -7427,12 +7442,12 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         }
     }
     let known = arg.is_empty()
-        || matches!(arg, "scan" | "list" | "status" | "info" | "debug" | "disconnect" | "stored")
+        || matches!(arg, "scan" | "list" | "status" | "info" | "debug" | "leave" | "stored")
         || arg.starts_with("debug ")
-        || arg.starts_with("connect ") || arg.starts_with("forget ") || arg.starts_with("radio ");
+        || arg.starts_with("join ") || arg.starts_with("forget ") || arg.starts_with("radio ");
     if !known {
         out.line_fmt(ctx, format_args!(
-            "wifi: unknown subcommand - try wifi, wifi scan, wifi list, wifi connect <ssid>, wifi disconnect,"));
+            "wifi: unknown subcommand - try wifi, wifi scan, wifi list, wifi join <ssid>, wifi leave,"));
         out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off, or wifi help"));
         return Err(ShellError::Unknown);
     }
@@ -7453,13 +7468,13 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 "status" => return wifi_status(ctx, out),
                 "info" => return wifi_info(ctx, out),
                 "stored" => return wifi_stored(ctx, out),
-                "disconnect" => return wifi_disconnect(ctx, out),
+                "leave" => return wifi_leave(ctx, out),
                 "radio on" => return wifi_radio(ctx, out, true),
                 "radio off" => return wifi_radio(ctx, out, false),
                 _ => {}
             }
-            if let Some(ssid) = arg.strip_prefix("connect ") {
-                return wifi_connect(ctx, out, ssid.trim());
+            if let Some(ssid) = arg.strip_prefix("join ") {
+                return wifi_join_by_name(ctx, out, ssid.trim());
             }
             if let Some(ssid) = arg.strip_prefix("forget ") {
                 return wifi_forget(ctx, out, ssid.trim());
@@ -7510,6 +7525,7 @@ mod wifi_wire {
     pub const JOIN_TIMEOUT: u8 = 14;
     pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
     pub const NEEDS_PASSPHRASE: u8 = 16;
+    pub const ALREADY_JOINED: u8 = 17;
 
     /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note.
     pub const RECORD: usize = 45;
@@ -7797,14 +7813,14 @@ fn wifi_read_passphrase(ctx: &ShellCtx, out: &mut Out, pass: &mut [u8; INPUT_MAX
     Some(n)
 }
 
-/// `wifi connect <ssid>` - the stable-identity path: a name, a passphrase asked for invisibly, a join.
+/// `wifi join <ssid>` - the stable-identity path: a name, a passphrase asked for invisibly, a join.
 ///
 /// The passphrase is read through `read_input_line(.., secret = true, ..)` - the same invisible-entry path
 /// `input secret` uses, which never echoes and is excluded from the recall ring and `/.gsh_history`
 /// (`utilities/56_wifi.md` 2 says why this is a security decision and not an ergonomic one). It lives in
 /// one stack buffer here and one request buffer in `wifi_join`, both zeroed before they return, and is
 /// never printed.
-fn wifi_connect(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellError> {
+fn wifi_join_by_name(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellError> {
     if ssid.is_empty() || ssid.len() > wifi_wire::SSID_MAX {
         out.line_fmt(ctx, format_args!("wifi: an SSID is 1 to {} bytes", wifi_wire::SSID_MAX));
         return Err(ShellError::Unknown);
@@ -7887,40 +7903,46 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
     match outcome {
         ReqOutcome::Reply(r) => match r.payload_bytes().first().copied() {
             Some(JOINED) => {
-                out.line_fmt(ctx, format_args!("joined {} - the link is up", name));
+                out.line_fmt(ctx, format_args!("joined {}", name));
                 out.line_fmt(ctx, format_args!("  (addressing is `net`'s to report: `net status`)"));
                 Ok(())
             }
+            Some(ALREADY_JOINED) => {
+                out.line_fmt(ctx, format_args!("already joined {}", name));
+                Ok(())
+            }
             Some(NEEDS_PASSPHRASE) => {
-                out.line_fmt(ctx, format_args!("wifi: {} needs a passphrase and none was given", name));
+                out.line_fmt(ctx, format_args!("not joined - {} needs a passphrase and none was given", name));
                 Err(ShellError::Unknown)
             }
             Some(NOT_FOUND) => {
-                out.line_fmt(ctx, format_args!("no network named {} in range", name));
+                out.line_fmt(ctx, format_args!("not joined - no network named {} in range", name));
                 Err(ShellError::Unknown)
             }
             Some(PASSPHRASE_REFUSED) => {
-                out.line_fmt(ctx, format_args!("{} refused the passphrase", name));
+                // The one way this arises: our message 2 carried a MIC the access point could not verify, so
+                // it repeated message 1 and gave up. Nothing else produces that pattern.
+                out.line_fmt(ctx, format_args!("not joined - incorrect passphrase"));
                 Err(ShellError::Unknown)
             }
             Some(JOIN_FAILED) => {
-                out.line_fmt(ctx, format_args!("wifi: the join failed before the network answered - the driver's log names the command"));
+                out.line_fmt(ctx, format_args!("not joined - the join failed before {} answered (the driver's log names the command)", name));
                 Err(ShellError::Unknown)
             }
             Some(JOIN_TIMEOUT) => {
-                out.line_fmt(ctx, format_args!("wifi: no decision from {} - not joined (the driver's log has what it heard)", name));
+                out.line_fmt(ctx, format_args!("not joined - no decision from {} (the driver's log has what it heard)", name));
                 Err(ShellError::Unknown)
             }
             Some(HANDSHAKE_UNIMPLEMENTED) => {
-                out.line_fmt(ctx, format_args!("wifi: associated with {}, and it began the WPA2 handshake - which this driver cannot yet answer", name));
-                out.line_fmt(ctx, format_args!("  (the radio's firmware has no supplicant; the host one is being built - `docs/wifi.md` 37). Not joined"));
+                out.line_fmt(ctx, format_args!("not joined - {} began the WPA2 handshake, which this driver cannot yet answer", name));
+                out.line_fmt(ctx, format_args!("  (the radio's firmware has no supplicant; the host one is being built - `docs/wifi.md` 37)"));
                 Err(ShellError::Unknown)
             }
             Some(s) => wifi_radio_unavailable(ctx, out, s),
             None => wifi_not_answering(ctx, out),
         },
         ReqOutcome::Aborted => {
-            out.line_fmt(ctx, format_args!("wifi connect: aborted - the radio is not associated"));
+            out.line_fmt(ctx, format_args!("not joined - aborted"));
             Ok(())
         }
         ReqOutcome::Timeout => wifi_not_answering(ctx, out),
@@ -8287,7 +8309,7 @@ fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             // `[OK, count, (len, ssid[32]) * count]` - one name per line, so it pipes like any list.
             let count = p[1] as usize;
             if count == 0 {
-                out.line_fmt(ctx, format_args!("no stored networks - a passphrase is kept from wifi connect until reboot"));
+                out.line_fmt(ctx, format_args!("no stored networks - a passphrase is kept from wifi join until reboot"));
                 return Ok(());
             }
             let mut at = 2;
@@ -8340,8 +8362,8 @@ fn wifi_forget(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellErr
     }
 }
 
-/// `wifi disconnect` - leave the current network. The radio stays up.
-fn wifi_disconnect(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+/// `wifi leave` - leave the current network. The radio stays up.
+fn wifi_leave(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
     const REPLY_MS: u64 = 5000;
     let r = match wifi_ask(ctx, &[OP_DISCONNECT], REPLY_MS) {
@@ -8351,11 +8373,11 @@ fn wifi_disconnect(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let p = r.payload_bytes();
     match p.first().copied() {
         Some(OK) if p.get(1).copied().unwrap_or(0) != 0 => {
-            out.line_fmt(ctx, format_args!("disconnected - the radio stays up"));
+            out.line_fmt(ctx, format_args!("left - the radio stays up"));
             Ok(())
         }
         Some(OK) => {
-            out.line_fmt(ctx, format_args!("not associated - nothing to leave (the radio was told anyway)"));
+            out.line_fmt(ctx, format_args!("not joined - nothing to leave (the radio was told anyway)"));
             Ok(())
         }
         Some(s) => wifi_radio_unavailable(ctx, out, s),
@@ -8377,7 +8399,7 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
             let was_joined = p.get(1).copied().unwrap_or(0) != 0;
             match (on, was_joined) {
                 (true, _) => out.line_fmt(ctx, format_args!("radio on")),
-                (false, true) => out.line_fmt(ctx, format_args!("disconnected, then radio off")),
+                (false, true) => out.line_fmt(ctx, format_args!("left the network, then radio off")),
                 (false, false) => out.line_fmt(ctx, format_args!("radio off")),
             }
             Ok(())
@@ -10146,29 +10168,16 @@ const TRACE_SLOTS: u32 = 256;
 /// turned a reference into something you had to page through to find one line. A view's columns are
 /// only interesting once you are looking at that view, so they live with it. `events help` is now the
 /// map; this is the detail, one screen at a time, and neither needs a pager.
-/// `events <view> help` - one block per view (conventions rule 2). `sub_help` and `cmd_events` both come
-/// here, so the answer is the same whichever path the words take.
+/// `events <view> help` for the two views `trace_sub_help` does not explain (`log`, `metrics`). Every other
+/// view's help - columns and all - is `trace_sub_help`'s, and both `sub_help` and `cmd_events` try that
+/// first, so the answer is the same whichever path the words take.
 fn events_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     match view {
-        "ipc" => help_block(ctx, "events ipc", "the IPC trace ring", &[
-            ("events ipc", "recent IPC exchanges, oldest first: who asked whom, and how each ended", "events ipc"),
-        ], false),
-        "failures" => help_block(ctx, "events failures", "only the exchanges that failed", &[
-            ("events failures", "the same ring, only the timeouts and lost peers - the instrument for a wedge", "events failures"),
-        ], false),
         "log" => help_block(ctx, "events log", "the kernel log ring", &[
             ("events log [n]", "the last n log lines the sink kept", "events log 20"),
         ], false),
         "metrics" => help_block(ctx, "events metrics", "per-service counters", &[
             ("events metrics", "published samples: owner, metric, value, age", "events metrics"),
-        ], false),
-        "persist" => help_block(ctx, "events persist", "drain the log to a file, detached", &[
-            ("events persist start /path [service] [mib] [sticky]", "spawn `recorder` to append the log to /path; `sticky` survives a shell restart", "events persist start /log.txt"),
-            ("events persist stop", "stop the recorder; the file closes with a footer", "events persist stop"),
-            ("events persist status", "is a recorder running, where is it writing, how much so far", "events persist status"),
-        ], false),
-        "status" => help_block(ctx, "events status", "the trace ring's own state", &[
-            ("events status", "ring size, events recorded, events dropped", "events status"),
         ], false),
         _ => return false,
     }
@@ -10298,7 +10307,7 @@ fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             Ok(())
         }
         // `events <view> help` - the detail for one view, before the view itself runs.
-        v if rest == "help" && (events_sub_help(ctx, v) || trace_sub_help(ctx, v)) => Ok(()),
+        v if rest == "help" && (trace_sub_help(ctx, v) || events_sub_help(ctx, v)) => Ok(()),
         "ipc" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
         // `persist` needs the whole remainder (`start /p svc 7d`), not the two tokens `sub`/`rest`.

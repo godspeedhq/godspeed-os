@@ -147,7 +147,7 @@ to `wifi-driver`, and `net-stack` is purely reactive. It never learns that wirel
 The Pi 4 has GENET ethernet **and** a radio, so both drivers can run at once. Two simultaneous links is
 routing: interface selection, source-address selection, metrics, and a policy for which one wins.
 That is a real feature and §26.2 says it is not pulled into existence by anything here, so **v1 has one
-active link at a time**, chosen explicitly - `wifi connect` means "make the radio the link". Multi-homing
+active link at a time**, chosen explicitly - `wifi join` means "make the radio the link". Multi-homing
 is out of scope with that as the reason, rather than unmentioned.
 
 ---
@@ -560,7 +560,7 @@ Each of these means stop and investigate rather than shrug:
 - **`wifi` reporting an error** (a non-zero `result`). Asking about wireless on a machine with no radio is
   a legitimate question with a definite answer, and reporting it as a fault is the silent-failure inversion
   invariant 12 forbids. Pinned in QEMU; if hardware disagrees, the pin is wrong.
-- **`wifi connect Some hunter2` being ACCEPTED.** It must refuse, by name, with the reason. If any board
+- **`wifi join Some hunter2` being ACCEPTED.** It must refuse, by name, with the reason. If any board
   takes it, a passphrase reaches `/.gsh_history` and this is a security regression, not a cosmetic one.
 - **`help` missing the row.** Then the verb exists and nobody can find it, which is what `facts_check`
   caught in QEMU.
@@ -2602,7 +2602,7 @@ Linux and look was worth more than any hypothesis of mine that day.
 
 ### What is not done
 
-- The shell cannot drive the driver. `wifi scan` as a command, the numbered picker, `wifi connect <ssid>`.
+- The shell cannot drive the driver. `wifi scan` as a command, the numbered picker, `wifi join <ssid>`.
 - Secure-versus-open is not shown: it needs the RSN/WPA information elements parsed out of `ie_offset` /
   `ie_length`, which are in hand but unread.
 - No association, no credential path, no data frames - phases 4 and 5.
@@ -2681,7 +2681,7 @@ cannot do the thing returns with a loud fact, never a hang.
   inside `collect`. It needs to poll its endpoint between frames.
 - Glommed frames (channel 3) up to 3328 bytes now arrive and are dropped, as the reference drops them. The
   log used to call them "an impossible shape"; it now says what they are.
-- The numbered picker the operator designed becomes live with `wifi connect`, which is phase 4.
+- The numbered picker the operator designed becomes live with `wifi join`, which is phase 4.
 
 ## 37. The firmware has no supplicant, and it said so three ways (2026-09-29)
 
@@ -2760,8 +2760,8 @@ at the prompt for the first time and it behaved as the spec says, first try, wit
 **What ran.** `stage 0`: SHA-1, HMAC-SHA1, PBKDF2 and the IEEE PSK each matched their published vector.
 `wifi scan`: the sweep as a state the serve loop advances one frame at a time; four networks in three
 seconds under the header the operator laid out, then the picker; a number joined through the same path as
-`wifi connect`. The passphrase was asked once, the pairwise master key was derived into slot 0 of the
-64-slot table, and a second `wifi connect` of the same name asked nothing. `wifi list` showed `saved` in
+`wifi join`. The passphrase was asked once, the pairwise master key was derived into slot 0 of the
+64-slot table, and a second `wifi join` of the same name asked nothing. `wifi list` showed `saved` in
 NOTE. `wifi status` and `wifi info` read the link live (not associated, correctly - see below). `wifi debug`
 printed the counters; `wifi debug firmware` asked the firmware its version and words again and got the same
 answer as §37; `wifi debug trace` printed the ring.
@@ -2812,7 +2812,7 @@ it, or one whose entries do not add up, is not read and says so - the boundaries
 Recorded as a method note too: a reference's CODE was right and a summary of it was wrong, and the first
 walker was built on the summary. §26.14 says read the mechanism; that means the function, not a paraphrase.
 
-**Verified at 15:58 the same day, exactly as predicted.** On `wifi connect`:
+**Verified at 15:58 the same day, exactly as predicted.** On `wifi join`:
 
 ```
 join event 3 (AUTH), status 0

@@ -506,6 +506,9 @@ pub mod reply {
     /// `OP_CONNECT` with no passphrase, for a network that is neither open (by the cache) nor stored: the
     /// shell must ask for one and send again. Never a guess about which it is.
     pub const NEEDS_PASSPHRASE: u8 = 16;
+    /// `OP_CONNECT` for the network the radio is already on, checked live (`GET_BSSID`), not from memory.
+    /// Nothing is sent to the firmware.
+    pub const ALREADY_JOINED: u8 = 17;
     /// Request op byte: `[11, sub]` - the driver's own account of itself, for `wifi debug` (`dbg::*`).
     pub const OP_DEBUG: u8 = 11;
 

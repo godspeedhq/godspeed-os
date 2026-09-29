@@ -483,9 +483,22 @@ fn serve_radio(
                         name[..ssid.len()].copy_from_slice(ssid);
                         name
                     };
+                    // ALREADY ON IT? Asked of the firmware, not remembered: `joined` names the network and
+                    // `GET_BSSID` says whether the link is still up. A join of the network we are on sends
+                    // nothing and says so; a stale memory of one is cleared and the join proceeds.
+                    let on_this = joined
+                        .as_ref()
+                        .map(|(j, jl)| *jl as usize == ssid_len && &j[..ssid_len] == ssid)
+                        .unwrap_or(false);
+                    let already = on_this
+                        && matches!(ctrl::link_now(h, w, session, ctx), Some(l) if l.associated());
+                    if on_this && !already {
+                        ctx.log("wifi-driver: the remembered join is not on the air any more - joining afresh");
+                        joined = None;
+                    }
                     let now = ctx.epoch_secs_monotonic();
                     let mut use_slot: Option<usize> = None;
-                    if pass_len > 0 && crypto_ok {
+                    if !already && pass_len > 0 && crypto_ok {
                         let pmk = crypto::psk(pass, ssid);
                         let i = slot_for(&stored, ssid);
                         let replaced = stored[i].is_some() && slot_of(&stored, ssid) != Some(i);
@@ -530,6 +543,10 @@ fn serve_radio(
                         None
                     };
 
+                    if already {
+                        out[0] = scan::reply::ALREADY_JOINED;
+                        1
+                    } else {
                     match secret {
                         None if pass_len > 0 => {
                             out[0] = scan::reply::JOIN_FAILED;
@@ -562,6 +579,7 @@ fn serve_radio(
                             };
                             1
                         }
+                    }
                     }
                 }
             }
