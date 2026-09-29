@@ -1017,6 +1017,54 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
 /// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
 /// has one - `events persist start <path> <size> [sticky]` is the deepest thing in the shell, and
 /// `sticky` was reachable by typing it in full and no other way.
+/// `wifi join <Tab>` / `wifi forget <Tab>`: the names a key is held for, asked of the driver now, plus `help`.
+///
+/// Never the last scan (spec 56_wifi.md 8): completion writes into a line that history records, and a
+/// neighbour's network name has no business there. A driver that does not answer within the bound, or is
+/// not running, leaves `help` alone on offer - a completion is not the place for a loud sentence.
+fn complete_wifi_stored(ctx: &ServiceContext, line: &mut Line, tok_start: usize) -> bool {
+    /// One record in the reply: `len, ssid[32]`.
+    const ENTRY: usize = 1 + 32;
+    /// The driver holds at most 64.
+    const MAX: usize = 64;
+    let mut store = [0u8; MAX * 32];
+    let mut lens = [0usize; MAX];
+    let mut count = 0usize;
+    let msg = Message::from_bytes(&[9u8]);
+    let reply = match ctx.request_with_reply_ms(WIFI_DRIVER, &msg, 1500) {
+        Some(r) => Some(r),
+        None if ctx.reacquire_by_name(WIFI_DRIVER) => ctx.request_with_reply_ms(WIFI_DRIVER, &msg, 1500),
+        None => None,
+    };
+    if let Some(r) = reply {
+        let p = r.payload_bytes();
+        if p.first() == Some(&0) && p.len() >= 2 {
+            let n = core::cmp::min(p[1] as usize, MAX);
+            for i in 0..n {
+                let at = 2 + i * ENTRY;
+                if at + ENTRY > p.len() { break; }
+                let len = core::cmp::min(p[at] as usize, 32);
+                // Only names that are plain text can be typed back; a binary SSID cannot be completed.
+                if len == 0 || !p[at + 1..at + 1 + len].iter().all(|&b| (0x21..0x7F).contains(&b)) { continue; }
+                store[count * 32..count * 32 + len].copy_from_slice(&p[at + 1..at + 1 + len]);
+                lens[count] = len;
+                count += 1;
+            }
+        }
+    }
+    let mut cands: [&str; MAX + 1] = [""; MAX + 1];
+    let mut n = 0usize;
+    for i in 0..count {
+        if let Ok(s) = core::str::from_utf8(&store[i * 32..i * 32 + lens[i]]) {
+            cands[n] = s;
+            n += 1;
+        }
+    }
+    cands[n] = "help";
+    n += 1;
+    complete_from_list(ctx, line, tok_start, &cands[..n])
+}
+
 /// Offer `cands` plus the word `help`, deduped, at a position below the first. Position 1 appends
 /// `version` and `help` itself; below it only `help` applies (a subcommand has no version of its own,
 /// rule 5), and it applies everywhere because every depth answers it (rule 2).
@@ -1223,6 +1271,16 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
                 if a < avail.len() { avail[a] = "help"; a += 1; }
                 return complete_from_list(ctx, line, tok_start, &avail[..a]);
             }
+            // `wifi debug trace h<Tab>`, `wifi radio off h<Tab>`: a keyword of a keyword, with no table of
+            // its own. It answers `help` (rule 2, the parent's block), so it offers it (rule 9).
+            if prior == 2 && NO_PATH_CMDS.iter().any(|c| c.as_bytes() == cmd) {
+                if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
+                    |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
+                    if cands.iter().any(|w| w.as_bytes() == a2) {
+                        return complete_from_list(ctx, line, tok_start, &["help"]);   // depth-3 help
+                    }
+                }
+            }
         }
     }
 
@@ -1242,6 +1300,18 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
                 |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
                 return complete_with_help(ctx, line, tok_start, cands);
+            }
+            // A FIRST-LEVEL WORD WITH NO TABLE BELOW IT, on a keyword utility: `wifi join h<Tab>`, `wifi list
+            // h<Tab>`, `net dns h<Tab>`. The word answers `help`, so Tab offers it - and for the two wifi words
+            // that take a network NAME, the names a key is held for (spec 8: from `wifi stored`, never from a
+            // scan, so a neighbour's name never lands in a history a completion writes).
+            if NO_PATH_CMDS.iter().any(|c| c.as_bytes() == cmd)
+                && SUBCMD_FIRST.iter().any(|(c, ws)| c.as_bytes() == cmd && ws.iter().any(|w| w.as_bytes() == a1))
+            {
+                if cmd == b"wifi" && (a1 == b"join" || a1 == b"forget") {
+                    return complete_wifi_stored(ctx, line, tok_start);
+                }
+                return complete_from_list(ctx, line, tok_start, &["help"]);   // depth-2 help
             }
         }
     }

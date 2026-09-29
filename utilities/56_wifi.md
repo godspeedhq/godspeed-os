@@ -42,7 +42,19 @@ What every verb does, and what was seen:
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
-- The WPA2 join (the host supplicant), so `connect` and the picker's passphrase path end in reply 15.
+- **The WPA2 handshake is BUILT (2026-09-29 evening) and not yet run on hardware.** The driver answers
+  message 1 with message 2 (its nonce, the RSN element, MIC'd with the confirmation key derived by
+  PRF-384 from the PMK), verifies message 3 (ANonce, MIC, AES-key-unwraps the group key), sends message 4,
+  and installs the pairwise and group keys through `wsec_key` - every step from OpenBSD's net80211 and
+  bwfm, named at the step in `join.rs`. Two primitives were added with published vectors (AES-128, FIPS 197
+  C.1; key unwrap, RFC 3394 4.1) and self-test at boot with the others. A wrong passphrase is decided by
+  the one pattern that means it: message 1 repeated after two answers, or a deauthentication after an
+  answer. What the first boot must show: `message 2 of 4 sent`, `message 3 verified`, `JOINED`, and then
+  `joined <name>` at the prompt; with a wrong passphrase, `not joined - incorrect passphrase`. **One
+  weakness, recorded not hidden:** the aarch64 kernel exposes no hardware RNG yet, so the station's nonce
+  is hashed from the cycle counter, the access point's nonce and our address, and the driver's log says so
+  every time. The Pi 4 has an RNG (`iproc-rng200`); wiring it up is a small `arch/aarch64` change and is
+  the next kernel work.
 - **Glommed superframes are read, by the descriptor's chunk lengths - hardware-verified 2026-09-29 15:58.**
   The boot at 13:05 showed the events riding inside channel-3 superframes; the boot at 13:57, with a walker
   that assumed the sub-frames were back to back, showed `ASSOC` for the first time (sub-frame 0) and then

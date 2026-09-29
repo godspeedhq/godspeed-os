@@ -101,6 +101,139 @@ pub struct Key {
     pub key_len: u16,
     pub replay: u64,
     pub pay_len: u16,
+    /// The authenticator's nonce (message 1 and 3 carry it; 2 and 4 carry ours).
+    pub nonce: [u8; 32],
+    /// The access point's address - the ethernet source, which is also the AA of the key derivation.
+    pub from: [u8; 6],
+    /// Where the key data begins in the frame this was read from, and how long it is (`pay_len`, bounded
+    /// by what actually arrived).
+    pub key_data_at: usize,
+    pub key_data_len: usize,
+}
+
+/// The pairwise transient key, as IEEE 802.11-2020 §12.7.1.3 cuts the 384 PRF bits: the confirmation key
+/// signs the handshake, the encryption key opens message 3's key data, the temporal key encrypts frames.
+pub struct Ptk {
+    pub kck: [u8; 16],
+    pub kek: [u8; 16],
+    pub tk: [u8; 16],
+}
+
+/// `ieee80211_derive_ptk`, quoted: `PRF-384(PMK, "Pairwise key expansion", Min(AA,SPA) || Max(AA,SPA) ||
+/// Min(ANonce,SNonce) || Max(ANonce,SNonce))`. The label goes in WITH its NUL (23 bytes) for the SHA-1 PRF.
+pub fn derive_ptk(pmk: &[u8; 32], aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], snonce: &[u8; 32]) -> Ptk {
+    let mut ctx = [0u8; 12 + 64];
+    let aa_first = aa < spa;
+    ctx[0..6].copy_from_slice(if aa_first { aa } else { spa });
+    ctx[6..12].copy_from_slice(if aa_first { spa } else { aa });
+    let a_first = anonce < snonce;
+    ctx[12..44].copy_from_slice(if a_first { anonce } else { snonce });
+    ctx[44..76].copy_from_slice(if a_first { snonce } else { anonce });
+    let mut out = [0u8; 48];
+    crate::crypto::prf_sha1(pmk, b"Pairwise key expansion\0", &ctx, &mut out);
+    let mut ptk = Ptk { kck: [0; 16], kek: [0; 16], tk: [0; 16] };
+    ptk.kck.copy_from_slice(&out[0..16]);
+    ptk.kek.copy_from_slice(&out[16..32]);
+    ptk.tk.copy_from_slice(&out[32..48]);
+    ptk
+}
+
+/// Build an EAPOL-Key frame from the station, as `ieee80211_send_eapol_key` does: ethernet header, then
+/// the 99-byte key descriptor, then `key_data`; `key->len` is the byte count after the 4-byte 802.1X
+/// header; the descriptor version is 2 (CCMP, HMAC-SHA1 MIC); the MIC - if `kck` is given - is
+/// `HMAC-SHA1(KCK, version .. end)` with the MIC field zeroed, truncated to its first 16 bytes
+/// (`ieee80211_eapol_key_mic`, `EAPOL_KEY_DESC_V2`). Returns the frame length, or 0 if `out` is too small.
+pub fn build_key_frame(
+    out: &mut [u8],
+    to: &[u8; 6],
+    from: &[u8; 6],
+    info: u16,
+    replay: u64,
+    nonce: &[u8; 32],
+    key_data: &[u8],
+    kck: Option<&[u8; 16]>,
+) -> usize {
+    let total = ev::ETHHDR + at::KEY_HEADER + key_data.len();
+    if out.len() < total {
+        return 0;
+    }
+    out[..total].fill(0);
+    out[0..6].copy_from_slice(to);
+    out[6..12].copy_from_slice(from);
+    out[12..14].copy_from_slice(&ETHERTYPE_EAPOL.to_be_bytes());
+    let k = &mut out[ev::ETHHDR..total];
+    k[at::PKT_VERSION] = 1;
+    k[at::PKT_TYPE] = TYPE_KEY;
+    let body_len = (at::KEY_HEADER - 4 + key_data.len()) as u16;
+    k[at::PKT_LEN..at::PKT_LEN + 2].copy_from_slice(&body_len.to_be_bytes());
+    k[at::KEY_DESC] = DESC_RSN;
+    let info = info | 2; // descriptor version 2: HMAC-SHA1 MIC, AES key wrap
+    k[at::KEY_INFO..at::KEY_INFO + 2].copy_from_slice(&info.to_be_bytes());
+    // `keylen` stays 0 for RSN - only WPA sets it in message 2 (`ieee80211_send_4way_msg2`).
+    k[at::KEY_REPLAY..at::KEY_REPLAY + 8].copy_from_slice(&replay.to_be_bytes());
+    k[at::KEY_NONCE..at::KEY_NONCE + 32].copy_from_slice(nonce);
+    k[at::KEY_PAYLEN..at::KEY_PAYLEN + 2].copy_from_slice(&(key_data.len() as u16).to_be_bytes());
+    k[at::KEY_HEADER..].copy_from_slice(key_data);
+    if let Some(kck) = kck {
+        let mic = mic_over(k, kck);
+        k[at::KEY_MIC..at::KEY_MIC + 16].copy_from_slice(&mic);
+    }
+    total
+}
+
+/// The MIC of an EAPOL-Key frame body (from `version` to the end of the key data), MIC field as it stands.
+fn mic_over(eapol: &[u8], kck: &[u8; 16]) -> [u8; 16] {
+    let d = crate::crypto::hmac_sha1(kck, eapol);
+    let mut mic = [0u8; 16];
+    mic.copy_from_slice(&d[..16]);
+    mic
+}
+
+/// `ieee80211_eapol_key_check_mic`: recompute with the MIC field zeroed and compare. `eapol` is the frame
+/// from the `version` byte to the end of the key data. Bounded copy: a key frame this driver accepts is at
+/// most `MAX_KEY_FRAME` bytes.
+pub const MAX_KEY_FRAME: usize = 1024;
+pub fn check_mic(eapol: &[u8], kck: &[u8; 16]) -> bool {
+    if eapol.len() < at::KEY_HEADER || eapol.len() > MAX_KEY_FRAME {
+        return false;
+    }
+    let mut copy = [0u8; MAX_KEY_FRAME];
+    let c = &mut copy[..eapol.len()];
+    c.copy_from_slice(eapol);
+    c[at::KEY_MIC..at::KEY_MIC + 16].fill(0);
+    let want = mic_over(c, kck);
+    // Compared in full, then decided - not byte by byte with an early exit.
+    let mut diff = 0u8;
+    for i in 0..16 {
+        diff |= want[i] ^ eapol[at::KEY_MIC + i];
+    }
+    diff == 0
+}
+
+/// The GTK KDE inside message 3's (decrypted) key data (`ieee80211_recv_4way_msg3`): element 0xdd, OUI
+/// 00:0f:ac, data type 1, then `key id (2 bits) | tx (bit 2)`, a reserved byte, the key. Returns
+/// `(key id, tx, key)`.
+pub fn find_gtk(key_data: &[u8]) -> Option<(u8, bool, &[u8])> {
+    let mut at = 0usize;
+    while at + 2 <= key_data.len() {
+        let id = key_data[at];
+        let len = key_data[at + 1] as usize;
+        if at + 2 + len > key_data.len() {
+            return None;
+        }
+        // The key data is padded with 0xdd 0x00.. after the last element; a zero-length vendor element is
+        // that padding and ends the walk.
+        if id == 0xdd && len >= 6 && &key_data[at + 2..at + 5] == &[0x00, 0x0f, 0xac] && key_data[at + 5] == 1 {
+            let kid = key_data[at + 6] & 3;
+            let tx = key_data[at + 6] & 4 != 0;
+            return Some((kid, tx, &key_data[at + 8..at + 2 + len]));
+        }
+        if id == 0xdd && len == 0 {
+            return None;
+        }
+        at += 2 + len;
+    }
+    None
 }
 
 impl Key {
@@ -154,6 +287,13 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
         ));
         return None;
     }
+    let pay_len = be16(at::KEY_PAYLEN);
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&k[at::KEY_NONCE..at::KEY_NONCE + 32]);
+    let mut from = [0u8; 6];
+    from.copy_from_slice(&frame[6..12]);
+    let key_data_at = ev::ETHHDR + at::KEY_HEADER;
+    let key_data_len = core::cmp::min(pay_len as usize, frame.len().saturating_sub(key_data_at));
     let key = Key {
         desc,
         info: be16(at::KEY_INFO),
@@ -168,7 +308,11 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
             k[at::KEY_REPLAY + 6],
             k[at::KEY_REPLAY + 7],
         ]),
-        pay_len: be16(at::KEY_PAYLEN),
+        pay_len,
+        nonce,
+        from,
+        key_data_at,
+        key_data_len,
     };
     let i = key.info;
     ctx.log_fmt(format_args!(

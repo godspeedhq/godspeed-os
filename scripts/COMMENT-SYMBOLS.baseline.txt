@@ -455,3 +455,18 @@ BRCMF_C_GET_RSSI                   # Linux brcmfmac fwil.h - command 127, answer
 brcmf_fil_cmd_data_get             # Linux brcmfmac fwil.c - a GET command whose sent structure is written back with the answer; ctrl::query_cmd is that shape - external, 26.14
 brcmf_sdio_hdparse                 # Linux brcmfmac sdio.c - validates a frame header by type: a superframe head must be channel 3 without the descriptor flag, a sub-frame must be on the event or data channel; ctrl::subframes applies the same rules - external, 26.14
 brcmf_sdio_rxglom                  # Linux brcmfmac sdio.c - reads a superframe in one transfer and walks its sub-frames back to back, each checked against the descriptor entry; ctrl::subframes is that walk - external, 26.14
+BWFM_CRYPTO_ALGO_AES_CCM           # OpenBSD bwfmreg.h - 4, the CCMP key algorithm in struct bwfm_wsec_key; this driver names it CRYPTO_ALGO_AES_CCM - external, 26.14
+BWFM_WSEC_PRIMARY_KEY              # OpenBSD bwfmreg.h - (1 << 1), the flag a GROUP key carries in bwfm_wsec_key; this driver names it WSEC_PRIMARY_KEY - external, 26.14
+EAPOL_KEY_DESC_V2                  # OpenBSD net80211/ieee80211.h - key descriptor version 2 (HMAC-SHA1 MIC, AES key wrap), the low bits of the key-info field - external, 26.14
+bwfm_sdio_rx_frames                # OpenBSD if_bwfm_sdio.c - the receive loop; sets sc_tx_max_seq from every frame`s swhdr->maxseqnr, as Session::note_frame does - external, 26.14
+bwfm_sdio_tx_dataframe             # OpenBSD if_bwfm_sdio.c - builds hwhdr + swhdr (channel DATA) + BCDC header + the ethernet frame; ctrl::send_data is that frame - external, 26.14
+bwfm_sdio_tx_ok                    # OpenBSD if_bwfm_sdio.c - the transmit credit check ((max_seq - seq) non-zero and below 0x80); Session::tx_ok is that check - external, 26.14
+bwfm_set_key_cb                    # OpenBSD bwfm.c - fills struct bwfm_wsec_key (pairwise: ea set, flags 0; group: PRIMARY_KEY) and sends the wsec_key iovar; ctrl::install_key is that - external, 26.14
+ieee80211_derive_ptk               # OpenBSD net80211/ieee80211_crypto.c - PRF-384 over min/max of the two addresses and nonces; eapol::derive_ptk is that - external, 26.14
+ieee80211_eapol_key_check_mic      # OpenBSD net80211/ieee80211_crypto.c - recompute the MIC with the field zeroed and compare; eapol::check_mic is that - external, 26.14
+ieee80211_eapol_key_mic            # OpenBSD net80211/ieee80211_crypto.c - HMAC-SHA1 over the EAPOL body, truncated to 16 (descriptor v2); eapol::mic_over is that - external, 26.14
+ieee80211_prf                      # OpenBSD net80211/ieee80211_crypto.c - the 802.11 PRF over HMAC-SHA1 with the label`s NUL included; crypto::prf_sha1 is that - external, 26.14
+ieee80211_recv_4way_msg1           # OpenBSD net80211/ieee80211_pae_input.c - message 1: save the ANonce, draw the SNonce, derive the PTK, send message 2; join.rs does the same - external, 26.14
+ieee80211_send_4way_msg2           # OpenBSD net80211/ieee80211_pae_output.c - message 2: PAIRWISE|KEYMIC, the AP`s replay counter, the SNonce, the RSN element, MIC`d - external, 26.14
+ieee80211_send_4way_msg4           # OpenBSD net80211/ieee80211_pae_output.c - message 4: PAIRWISE|KEYMIC|SECURE, empty key data, MIC`d - external, 26.14
+ieee80211_send_eapol_key           # OpenBSD net80211/ieee80211_pae_output.c - the frame builder: ethernet header, descriptor version by cipher, key->len and paylen, then the MIC; eapol::build_key_frame is that - external, 26.14

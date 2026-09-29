@@ -2841,3 +2841,52 @@ they had been all along:
 events to a 1792- or 2368-byte superframe - and `rx_glom_sub` read 40 against 24 superframes. No sub-frame
 failed to validate. The entries of every descriptor summed to its superframe, or the walk would have said
 so. The next thing the driver must do is SEND on the data channel, which it has never done.
+
+## 40. The handshake, built (2026-09-29, evening) - the first frames this driver has ever sent
+
+Everything above association was reference-read before a line was written, and each piece is quoted at the
+point it is used:
+
+- **Transmit** (`ctrl::send_data`), from `bwfm_sdio_tx_dataframe`: hardware header (length and its
+  complement), software header (sequence, channel DATA, `dataoff` 12), a 4-byte BCDC header with protocol
+  version 2 in the flags' high nibble, then the ethernet frame; rounded to 4 or to a 512-byte block as
+  every control frame already was. Sent only with CREDIT: every received frame's `swhdr->maxseqnr` is the
+  highest sequence the firmware will take next (`bwfm_sdio_rx_frames` stores it from every frame, header-
+  only ones included), and `bwfm_sdio_tx_ok` says a frame may go while `(max - seq)` is non-zero and below
+  0x80. `Session` keeps it and refuses loudly without it.
+- **The key derivation** (`eapol::derive_ptk`), from `ieee80211_derive_ptk`: `PRF-384(PMK, "Pairwise key
+  expansion", Min(AA,SPA) || Max(AA,SPA) || Min(ANonce,SNonce) || Max(ANonce,SNonce))`, the label with its
+  NUL included as `ieee80211_prf` is called with it (23 bytes). The 48 bytes cut into KCK, KEK, TK.
+- **Message 2** (`eapol::build_key_frame`), from `ieee80211_send_4way_msg2` and `ieee80211_send_eapol_key`:
+  `PAIRWISE | KEYMIC | version 2`, the access point's replay counter, the SNonce, the RSN element from the
+  association request as key data, `key->len` = body after the 4-byte 802.1X header, `paylen` = key data;
+  the MIC is HMAC-SHA1 over the body from `version` to the end with the MIC field zeroed, first 16 bytes
+  (`ieee80211_eapol_key_mic`, `EAPOL_KEY_DESC_V2`).
+- **Message 3**, from `ieee80211_recv_4way_msg3`: the ANonce must equal message 1's; the MIC must verify
+  under the KCK (`ieee80211_eapol_key_check_mic`); the key data must be `ENCRYPTED` and unwraps under the
+  KEK (`ieee80211_eapol_key_decrypt`, `aes_key_unwrap`, 8 bytes shorter than it arrived); inside, the GTK
+  KDE - `0xdd`, OUI `00:0f:ac`, type 1, `key id | tx`, reserved, key. **Message 4** is `PAIRWISE | KEYMIC
+  | SECURE`, empty, MIC'd (`ieee80211_send_4way_msg4`).
+- **Install** (`ctrl::install_key`), from `bwfm_set_key_cb`: `struct bwfm_wsec_key`, 162 bytes as
+  `bwfmreg.h` lays it out - the pairwise key at index 0 with the access point's address in `ea`, the group
+  key at its key id with `PRIMARY_KEY` and no address - through the `wsec_key` iovar, then `wsec`
+  re-asserted with AES.
+- **Two primitives** joined `crypto.rs` with their published vectors in the boot self-test: AES-128 both
+  directions (FIPS 197 C.1 - the S-box is computed from the field inverse and the affine transform rather
+  than typed, because 256 hand-copied bytes are 256 places to be wrong) and AES Key Unwrap (RFC 3394
+  §4.1). The PRF has no vector here: it is HMAC-SHA1 concatenated with a counter, and a wrong construction
+  would show as a rejected message 2 - which is why, if the RIGHT passphrase ever prints "incorrect
+  passphrase", the PRF and MIC path is the first suspect, and this sentence says so.
+
+**How "incorrect passphrase" is decided.** The access point never says it. It receives message 2, cannot
+verify a MIC made with the wrong PMK, repeats message 1, and eventually deauthenticates with reason 15.
+The driver therefore decides it: message 1 arriving a third time after two answers, or a deauthentication
+after any answer. Nothing else produces that pattern.
+
+**The one weakness, recorded.** The SNonce should come from a hardware RNG and the aarch64 kernel's
+`hw_random` is a stub. Until it is not, the nonce is SHA-1 over the cycle counter, the monotonic clock, the
+access point's nonce and our address, and the driver logs that sentence on every handshake. The Pi 4 has an
+RNG (`iproc-rng200`, five registers, read from Linux's driver); wiring it into `arch/aarch64` is the next
+kernel change and is small.
+
+Not yet run on hardware. What the first boot must show is in the spec's status section.

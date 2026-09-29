@@ -112,6 +112,10 @@ def main():
         problems.append("position 2 does not complete `help` (`complete_with_help` is not used for SUBCMD_SECOND)")
     if 'avail[a] = "help"' not in src:
         problems.append("position 3 does not complete `help` (the `avail[a] = \"help\"` line is gone)")
+    if '// depth-2 help' not in src:
+        problems.append("a first-level word with no table below it no longer completes `help` (the depth-2 fallback is gone)")
+    if '// depth-3 help' not in src:
+        problems.append("a keyword of a keyword no longer completes `help` (the depth-3 fallback is gone)")
 
     if problems:
         print("SUBCOMMAND HELP CHECK FAILED:")

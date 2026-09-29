@@ -174,6 +174,221 @@ pub fn psk(passphrase: &[u8], ssid: &[u8]) -> [u8; PMK_LEN] {
     pmk
 }
 
+/// The 802.11 PRF (IEEE 802.11-2020 §12.7.1.2, `ieee80211_prf`): `HMAC-SHA1(key, label || context || i)`
+/// for i = 0, 1, ... until `out` is full. `label` is passed WITH its terminating NUL, as OpenBSD passes it
+/// (`"Pairwise key expansion", 23 /* PRF uses \0 */`) - the NUL is part of the input, not a C artefact.
+pub fn prf_sha1(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
+    let mut msg = [0u8; 160];
+    let n = label.len() + context.len() + 1;
+    if n > msg.len() {
+        // The PTK context is 76 bytes and the label 23; anything larger is a caller error, and a PRF that
+        // silently truncated its input would derive a key that fails everywhere downstream.
+        out.fill(0);
+        return;
+    }
+    msg[..label.len()].copy_from_slice(label);
+    msg[label.len()..label.len() + context.len()].copy_from_slice(context);
+    let mut at = 0;
+    let mut count = 0u8;
+    while at < out.len() {
+        msg[n - 1] = count;
+        let d = hmac_sha1(key, &msg[..n]);
+        let take = core::cmp::min(SHA1_LEN, out.len() - at);
+        out[at..at + take].copy_from_slice(&d[..take]);
+        at += take;
+        count = count.wrapping_add(1);
+    }
+}
+
+/// AES-128, FIPS 197. Both directions: the key-data unwrap in message 3 of the handshake is the INVERSE
+/// cipher (RFC 3394 §2.2.2), which is why a stack that only ever encrypts cannot finish a WPA2 join.
+///
+/// The S-box is computed, not typed: 256 bytes copied by hand are 256 chances to be wrong in a way that the
+/// self-test would catch but nobody could read. Each byte is the multiplicative inverse in GF(2^8) followed
+/// by the affine transform, exactly as §5.1.1 defines it.
+pub struct Aes128 {
+    round_keys: [[u8; 16]; 11],
+    sbox: [u8; 256],
+    inv_sbox: [u8; 256],
+}
+
+fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            p ^= a;
+        }
+        let carry = a & 0x80 != 0;
+        a <<= 1;
+        if carry {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    p
+}
+
+impl Aes128 {
+    pub fn new(key: &[u8; 16]) -> Self {
+        // S-box: inverse in GF(2^8) (0 maps to 0), then the affine transform b ^ rotl(b,1..4) ^ 0x63.
+        let mut sbox = [0u8; 256];
+        let mut inv_sbox = [0u8; 256];
+        for x in 0..256usize {
+            let inv = if x == 0 {
+                0u8
+            } else {
+                // x^254 is the inverse in GF(2^8).
+                let mut r = 1u8;
+                let mut base = x as u8;
+                let mut e = 254u32;
+                while e > 0 {
+                    if e & 1 != 0 {
+                        r = gf_mul(r, base);
+                    }
+                    base = gf_mul(base, base);
+                    e >>= 1;
+                }
+                r
+            };
+            let s = inv ^ inv.rotate_left(1) ^ inv.rotate_left(2) ^ inv.rotate_left(3) ^ inv.rotate_left(4) ^ 0x63;
+            sbox[x] = s;
+            inv_sbox[s as usize] = x as u8;
+        }
+        // Key expansion (§5.2): 44 words, the first 4 the key itself.
+        let mut w = [[0u8; 4]; 44];
+        for i in 0..4 {
+            w[i].copy_from_slice(&key[4 * i..4 * i + 4]);
+        }
+        let mut rcon = 1u8;
+        for i in 4..44 {
+            let mut t = w[i - 1];
+            if i % 4 == 0 {
+                t = [sbox[t[1] as usize] ^ rcon, sbox[t[2] as usize], sbox[t[3] as usize], sbox[t[0] as usize]];
+                rcon = gf_mul(rcon, 2);
+            }
+            for k in 0..4 {
+                w[i][k] = w[i - 4][k] ^ t[k];
+            }
+        }
+        let mut round_keys = [[0u8; 16]; 11];
+        for r in 0..11 {
+            for c in 0..4 {
+                round_keys[r][4 * c..4 * c + 4].copy_from_slice(&w[4 * r + c]);
+            }
+        }
+        Aes128 { round_keys, sbox, inv_sbox }
+    }
+
+    fn add_round_key(state: &mut [u8; 16], rk: &[u8; 16]) {
+        for i in 0..16 {
+            state[i] ^= rk[i];
+        }
+    }
+
+    /// State is column-major: byte `4*c + r` is row r, column c (§3.4).
+    fn shift_rows(s: &mut [u8; 16]) {
+        let t = *s;
+        for c in 0..4 {
+            for r in 0..4 {
+                s[4 * c + r] = t[4 * ((c + r) % 4) + r];
+            }
+        }
+    }
+
+    fn inv_shift_rows(s: &mut [u8; 16]) {
+        let t = *s;
+        for c in 0..4 {
+            for r in 0..4 {
+                s[4 * ((c + r) % 4) + r] = t[4 * c + r];
+            }
+        }
+    }
+
+    fn mix_columns(s: &mut [u8; 16]) {
+        for c in 0..4 {
+            let a = [s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]];
+            s[4 * c] = gf_mul(a[0], 2) ^ gf_mul(a[1], 3) ^ a[2] ^ a[3];
+            s[4 * c + 1] = a[0] ^ gf_mul(a[1], 2) ^ gf_mul(a[2], 3) ^ a[3];
+            s[4 * c + 2] = a[0] ^ a[1] ^ gf_mul(a[2], 2) ^ gf_mul(a[3], 3);
+            s[4 * c + 3] = gf_mul(a[0], 3) ^ a[1] ^ a[2] ^ gf_mul(a[3], 2);
+        }
+    }
+
+    fn inv_mix_columns(s: &mut [u8; 16]) {
+        for c in 0..4 {
+            let a = [s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]];
+            s[4 * c] = gf_mul(a[0], 14) ^ gf_mul(a[1], 11) ^ gf_mul(a[2], 13) ^ gf_mul(a[3], 9);
+            s[4 * c + 1] = gf_mul(a[0], 9) ^ gf_mul(a[1], 14) ^ gf_mul(a[2], 11) ^ gf_mul(a[3], 13);
+            s[4 * c + 2] = gf_mul(a[0], 13) ^ gf_mul(a[1], 9) ^ gf_mul(a[2], 14) ^ gf_mul(a[3], 11);
+            s[4 * c + 3] = gf_mul(a[0], 11) ^ gf_mul(a[1], 13) ^ gf_mul(a[2], 9) ^ gf_mul(a[3], 14);
+        }
+    }
+
+    pub fn encrypt_block(&self, block: &mut [u8; 16]) {
+        Self::add_round_key(block, &self.round_keys[0]);
+        for round in 1..10 {
+            for b in block.iter_mut() {
+                *b = self.sbox[*b as usize];
+            }
+            Self::shift_rows(block);
+            Self::mix_columns(block);
+            Self::add_round_key(block, &self.round_keys[round]);
+        }
+        for b in block.iter_mut() {
+            *b = self.sbox[*b as usize];
+        }
+        Self::shift_rows(block);
+        Self::add_round_key(block, &self.round_keys[10]);
+    }
+
+    pub fn decrypt_block(&self, block: &mut [u8; 16]) {
+        Self::add_round_key(block, &self.round_keys[10]);
+        for round in (1..10).rev() {
+            Self::inv_shift_rows(block);
+            for b in block.iter_mut() {
+                *b = self.inv_sbox[*b as usize];
+            }
+            Self::add_round_key(block, &self.round_keys[round]);
+            Self::inv_mix_columns(block);
+        }
+        Self::inv_shift_rows(block);
+        for b in block.iter_mut() {
+            *b = self.inv_sbox[*b as usize];
+        }
+        Self::add_round_key(block, &self.round_keys[0]);
+    }
+}
+
+/// AES Key Unwrap (RFC 3394 §2.2.2) with a 128-bit KEK - how message 3's key data is opened. `wrapped` is
+/// 8 more bytes than the plaintext; `out` receives the plaintext. False if the integrity check value does not
+/// come out as `A6A6A6A6A6A6A6A6`, which is the RFC's only verdict on a wrong key or a damaged input.
+pub fn aes_key_unwrap(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> bool {
+    if wrapped.len() < 24 || wrapped.len() % 8 != 0 || out.len() < wrapped.len() - 8 {
+        return false;
+    }
+    let n = wrapped.len() / 8 - 1;
+    let aes = Aes128::new(kek);
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&wrapped[..8]);
+    let r = &mut out[..n * 8];
+    r.copy_from_slice(&wrapped[8..]);
+    for j in (0..6).rev() {
+        for i in (1..=n).rev() {
+            let t = (n * j + i) as u64;
+            let mut b = [0u8; 16];
+            let tb = t.to_be_bytes();
+            for k in 0..8 {
+                b[k] = a[k] ^ tb[k];
+            }
+            b[8..].copy_from_slice(&r[(i - 1) * 8..i * 8]);
+            aes.decrypt_block(&mut b);
+            a.copy_from_slice(&b[..8]);
+            r[(i - 1) * 8..i * 8].copy_from_slice(&b[8..]);
+        }
+    }
+    a == [0xA6; 8]
+}
+
 /// Every primitive against its published vector. Logs one line per vector and returns whether all held.
 /// Run at boot, before the radio is touched: a key derived by a wrong hash is refused by the access point
 /// in a way that is indistinguishable from a wrong passphrase, so this is the only place the error is visible.
@@ -243,6 +458,52 @@ pub fn selftest(ctx: &ServiceContext) -> bool {
             0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,
         ],
     );
+
+    // FIPS 197 appendix C.1: AES-128, key 000102..0f, plaintext 00112233..ff.
+    let aes = Aes128::new(&[
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    ]);
+    let mut block = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    ];
+    aes.encrypt_block(&mut block);
+    check(
+        "AES-128 encrypt (FIPS 197 C.1)",
+        &block,
+        &[
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a,
+        ],
+    );
+    aes.decrypt_block(&mut block);
+    check(
+        "AES-128 decrypt (FIPS 197 C.1, back to the plaintext)",
+        &block,
+        &[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ],
+    );
+
+    // RFC 3394 section 4.1: 128-bit key data wrapped with a 128-bit KEK.
+    let kek = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+    ];
+    let wrapped = [
+        0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47, 0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A, 0x7B, 0x82,
+        0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
+    ];
+    let mut unwrapped = [0u8; 16];
+    let unwrap_ok = aes_key_unwrap(&kek, &wrapped, &mut unwrapped);
+    check(
+        "AES key unwrap (RFC 3394 4.1)",
+        &unwrapped,
+        &[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        ],
+    );
+    if !unwrap_ok {
+        ok = false;
+        ctx.log("wifi-driver:   AES key unwrap - WRONG: the integrity value did not come out as A6A6A6A6A6A6A6A6");
+    }
 
     if ok {
         ctx.log("wifi-driver: stage 0 - every primitive matches its vector; a passphrase will derive the key the standard says");

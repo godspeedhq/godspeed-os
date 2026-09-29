@@ -240,6 +240,9 @@ pub struct Session {
     /// for at sub-frame 0's own length (+229, +92, +652) and found padding every time.
     glom_lengths: [u16; MAX_SUBS],
     glom_count: usize,
+    /// The firmware's transmit credit: `swhdr->maxseqnr` from the last frame received. A frame may go out
+    /// only while `(tx_max_seq - seq) as u8` is non-zero and below 0x80 (`bwfm_sdio_tx_ok`).
+    tx_max_seq: u8,
 }
 
 /// What the control channel and the frame reader have counted since the session began. Raw facts, no
@@ -260,6 +263,9 @@ pub struct Stats {
     pub rx_other: u32,
     pub tx_bytes: u32,
     pub rx_bytes: u32,
+    /// Data frames sent, and sends refused for want of credit.
+    pub tx_data: u32,
+    pub tx_no_credit: u32,
     /// Frames on the event or data channel that arrived DURING a control wait and were read and skipped
     /// there - the scan's own results, if a control exchange runs mid-sweep. Counted so it is visible.
     pub rx_skipped_in_ctrl_wait: u32,
@@ -305,6 +311,8 @@ pub mod trace_kind {
     pub const RX_DATA_GLOMMED: u8 = 8;
     /// The glom descriptor: a list of lengths, not a frame with content.
     pub const RX_GLOMDESC: u8 = 9;
+    /// A data frame this driver SENT - an EAPOL handshake message, so far.
+    pub const TX_DATA: u8 = 10;
 }
 
 /// How many frames the trace keeps. Fixed; the oldest is overwritten (26.6.1). 64 is two full scans.
@@ -353,7 +361,14 @@ impl Session {
             cycles_per_ms: ctx.tsc_ticks_per_10ms() / 10,
             glom_lengths: [0; MAX_SUBS],
             glom_count: 0,
+            tx_max_seq: 0,
         }
+    }
+
+    /// `bwfm_sdio_tx_ok`: is there credit to send one more frame.
+    pub fn tx_ok(&self) -> bool {
+        let credit = self.tx_max_seq.wrapping_sub(self.seq);
+        credit != 0 && credit & 0x80 == 0
     }
 
     /// The chunk lengths of the superframe expected next, from the last descriptor seen. Empty if none.
@@ -382,6 +397,8 @@ impl Session {
     /// can name it. Called by every reader, so the trace is the whole traffic and not one path's view.
     pub fn note_frame(&mut self, ctx: &ServiceContext, f: &Frame, buf: &[u8], in_ctrl_wait: bool) {
         self.stats.rx_bytes = self.stats.rx_bytes.wrapping_add(f.frmlen as u32);
+        // Every frame refreshes the credit, as the reference does before it looks at the channel.
+        self.tx_max_seq = f.maxseqnr;
         let channel = f.chanflag & 0x0F;
         let body = &buf[f.off..f.off + f.len];
         let (kind, what, status) = if f.len < DCMD && channel == CHANNEL_CONTROL {
@@ -930,6 +947,10 @@ pub struct Frame {
     pub frmlen: u16,
     /// `swhdr->dataoff` - where the payload starts, measured from the start of the whole frame.
     pub dataoff: u8,
+    /// `swhdr->maxseqnr` - the highest transmit sequence number the firmware will accept next: its tx
+    /// credit. Every received frame carries it, header-only ones included (`sc->sc_tx_max_seq =
+    /// swhdr->maxseqnr` in `bwfm_sdio_rx_frames`).
+    pub maxseqnr: u8,
     /// How many bytes of body arrived: `frmlen - 12`. `buf[..body]` is all of it.
     pub body: usize,
     /// Where the payload starts within `buf`: `dataoff - 12`.
@@ -1050,6 +1071,7 @@ pub fn read_frame(
     }
     let b0 = hdr[0].to_le_bytes();
     let b1 = hdr[1].to_le_bytes();
+    let b2 = hdr[2].to_le_bytes();
     let frmlen = u16::from_le_bytes([b0[0], b0[1]]);
     let cksum = u16::from_le_bytes([b0[2], b0[3]]);
     if frmlen == 0 || (frmlen ^ cksum) != 0xFFFF {
@@ -1088,6 +1110,7 @@ pub fn read_frame(
             nextlen: b1[2],
             frmlen: frmlen as u16,
             dataoff: dataoff as u8,
+            maxseqnr: b2[1],
             body: 0,
             off: 0,
             len: 0,
@@ -1139,6 +1162,7 @@ pub fn read_frame(
         nextlen: b1[2],
         frmlen: frmlen as u16,
         dataoff: dataoff as u8,
+        maxseqnr: b2[1],
         body: rest,
         off,
         len: rest - off,
@@ -1360,6 +1384,126 @@ pub fn link_now(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext)
     }
     Some(link)
 }
+
+/// `BWFM_BCDC_FLAG_VER(BWFM_BCDC_FLAG_PROTO_VER)` - protocol version 2 in the high nibble of the BCDC flags.
+const BCDC_FLAGS_TX: u8 = 2 << 4;
+
+/// Send one ethernet frame on the DATA channel - the first thing this driver has ever transmitted that is
+/// not a control request. `bwfm_sdio_tx_dataframe`, quoted in shape:
+///
+/// ```c
+/// len = sizeof(*hwhdr) + sizeof(*swhdr) + sizeof(*bcdc) + m->m_pkthdr.len;
+/// roundto = (len > 512 && (len % 512) != 0) ? 512 : 4;
+/// hwhdr->frmlen = htole16(len); hwhdr->cksum = htole16(~len);
+/// swhdr->seqnr = sc->sc_tx_seq++; swhdr->chanflag = BWFM_SDIO_SWHDR_CHANNEL_DATA;
+/// swhdr->nextlen = 0; swhdr->dataoff = sizeof(*hwhdr) + sizeof(*swhdr); swhdr->maxseqnr = 0;
+/// bcdc->data_offset = 0; bcdc->priority = ...; bcdc->flags = BWFM_BCDC_FLAG_VER(2); bcdc->flags2 = 0;
+/// ```
+///
+/// The frame goes only if the firmware has given credit (`tx_ok`); without it the reference queues, and
+/// this driver - which sends one frame at a time and only when a reply is due - refuses loudly instead.
+pub fn send_data(h: &Host, w: &mut Window, s: &mut Session, eth: &[u8], ctx: &ServiceContext) -> bool {
+    const BCDC: usize = 4;
+    let len = HWHDR + SWHDR + BCDC + eth.len();
+    if len > FRAME {
+        ctx.log_fmt(format_args!("wifi-driver: a {} byte data frame is over this driver's {} byte frame", len, FRAME));
+        return false;
+    }
+    if !s.tx_ok() {
+        s.stats.tx_no_credit += 1;
+        ctx.log_fmt(format_args!(
+            "wifi-driver: no transmit credit (seq {}, firmware max {}) - the frame is NOT sent",
+            s.seq, s.tx_max_seq
+        ));
+        return false;
+    }
+    let mut frame = [0u8; FRAME];
+    frame[0..2].copy_from_slice(&(len as u16).to_le_bytes());
+    frame[2..4].copy_from_slice(&(!(len as u16)).to_le_bytes());
+    let seq = s.next_seq();
+    frame[4] = seq;
+    frame[5] = crate::scan::CHANNEL_DATA;
+    frame[6] = 0;
+    frame[7] = (HWHDR + SWHDR) as u8;
+    frame[HWHDR + SWHDR] = BCDC_FLAGS_TX;
+    // priority 0, flags2 0 (interface 0), data_offset 0 - the zeroed buffer already says so.
+    frame[HWHDR + SWHDR + BCDC..len].copy_from_slice(eth);
+    let padded = {
+        let r = round_to(len);
+        (len + r - 1) / r * r
+    };
+    if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
+        return false;
+    }
+    let words = padded / 4;
+    let mut wbuf = [0u32; FRAME / 4];
+    for i in 0..words {
+        wbuf[i] = u32::from_le_bytes([frame[i * 4], frame[i * 4 + 1], frame[i * 4 + 2], frame[i * 4 + 3]]);
+    }
+    let (blk, blocks, _moved) = transfer_mode(padded);
+    if !sdio::write_extended(h, DATA_FUNC, frame_offset(), &mut wbuf[..words], blk, blocks, ctx) {
+        ctx.log("wifi-driver: the data frame did not go out - the SDIO write failed");
+        return false;
+    }
+    s.stats.tx_data += 1;
+    s.stats.tx_bytes = s.stats.tx_bytes.wrapping_add(len as u32);
+    let ms = s.now_ms(ctx);
+    s.trace.push(TraceEntry {
+        ms, kind: trace_kind::TX_DATA, chanflag: crate::scan::CHANNEL_DATA, id: seq as u16, what: 0, status: 0,
+        len: len as u16,
+    });
+    true
+}
+
+/// `BWFM_CRYPTO_ALGO_AES_CCM`.
+const CRYPTO_ALGO_AES_CCM: u32 = 4;
+/// `BWFM_WSEC_PRIMARY_KEY` - `(1 << 1)`: a group key.
+const WSEC_PRIMARY_KEY: u32 = 1 << 1;
+/// `sizeof(struct bwfm_wsec_key)`: index 4, len 4, data 32, pad_1 72, algo 4, flags 4, pad_2 12,
+/// iv_initialized 4, pad_3 4, rxiv 8, pad_5 8, ea 6.
+const WSEC_KEY_SIZE: usize = 162;
+
+/// Install a CCMP key in the firmware - `bwfm_set_key_cb`, quoted in shape:
+///
+/// ```c
+/// if (ext_key && !IEEE80211_IS_MULTICAST(ni->ni_macaddr)) memcpy(key.ea, ni->ni_macaddr, ...);
+/// key.index = htole32(k->k_id); key.len = htole32(k->k_len); memcpy(key.data, k->k_key, ...);
+/// if (!ext_key) key.flags = htole32(BWFM_WSEC_PRIMARY_KEY);
+/// key.algo = htole32(BWFM_CRYPTO_ALGO_AES_CCM);
+/// bwfm_fwvar_var_set_data(sc, "wsec_key", &key, sizeof(key));
+/// bwfm_fwvar_var_get_int(sc, "wsec", &wsec); wsec |= BWFM_WSEC_AES; bwfm_fwvar_var_set_int(sc, "wsec", wsec);
+/// ```
+///
+/// A pairwise key names the peer (`ea`) and is index 0; a group key is `PRIMARY_KEY` at its key id with no
+/// address. `struct bwfm_wsec_key` is 162 bytes, laid out as `bwfmreg.h` declares it.
+pub fn install_key(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    index: u32,
+    key: &[u8; 16],
+    peer: Option<&[u8; 6]>,
+    ctx: &ServiceContext,
+) -> bool {
+    let mut k = [0u8; WSEC_KEY_SIZE];
+    k[0..4].copy_from_slice(&index.to_le_bytes());
+    k[4..8].copy_from_slice(&16u32.to_le_bytes());
+    k[8..24].copy_from_slice(key);
+    k[112..116].copy_from_slice(&CRYPTO_ALGO_AES_CCM.to_le_bytes());
+    let flags = if peer.is_some() { 0 } else { WSEC_PRIMARY_KEY };
+    k[116..120].copy_from_slice(&flags.to_le_bytes());
+    if let Some(ea) = peer {
+        k[156..162].copy_from_slice(ea);
+    }
+    if !set_iovar(h, w, s, "wsec_key", &k, ctx) {
+        return false;
+    }
+    // `wsec` re-asserted with AES, as the reference does after every key.
+    set_cmd_int(h, w, s, CMD_SET_WSEC_AFTER_KEY, 4, "wsec AES (after key install)", ctx)
+}
+
+/// `WLC_SET_WSEC` - the same command `join.rs` sends before the join; named here for the re-assertion above.
+const CMD_SET_WSEC_AFTER_KEY: u32 = 134;
 
 /// Leave whatever network the radio is on. The reference sends the bare command with nothing after it, so
 /// so does this; the radio stays up and can scan or join again at once.
