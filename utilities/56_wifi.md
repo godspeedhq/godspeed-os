@@ -51,10 +51,11 @@ What every verb does, and what was seen:
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
-- **The group-key rekey is answered (built 2026-09-30, `docs/wifi.md` 42) and not yet seen on hardware** -
-  it happens when the access point decides, commonly hourly, and cannot be provoked. A pairwise rekey (the
-  access point restarting the four-way handshake) is still not answered; the log says so once, and `wifi
-  join` recovers the link (`backlog/64`).
+- **Both rekeys are answered (built 2026-09-30, `docs/wifi.md` 42) and neither has yet been seen on
+  hardware** - they happen when the access point decides, commonly hourly, and cannot be provoked. The
+  group-key rekey re-installs the group key and acknowledges; a pairwise rekey (the access point restarting
+  the four-way handshake) is run to completion by the same handshake the join uses and replaces both keys.
+  If either fails the log names the step and `wifi join` recovers the link (`backlog/64`).
 
 - **The WPA2 handshake joins - hardware-verified 2026-09-29, 20:01** (`joined` first try, `already
   joined` twice, the keys installed; the previous evening's boot had verified it through message 4 and
@@ -81,9 +82,8 @@ What every verb does, and what was seen:
   time in this port's life, `rx_glom_sub 40` against 24 superframes, and no `does not validate` line; the
   trace shows `RX GLOM len=384` carrying `ASSOC` and `LINK`, then `RX GLOM len=256` carrying `JOIN` and
   `SET_SSID`. This item is closed and kept here because of what it cost (`docs/wifi.md` §39).
-- The passphrase prompt cannot be abandoned. `read_input_line` ignores every control byte, so Esc and
-  `^Q` do nothing and the only ways out are Enter (which sends what was typed) or a passphrase too short
-  to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.
+- ~~The passphrase prompt cannot be abandoned.~~ *Closed 2026-09-30: Esc or `^Q` ends the entry, zeroes
+  what was typed, and prints `passphrase entry abandoned - nothing was sent`.*
 - The BSSID and band in the `joined` sentence (section 4b) are not yet read from the association event;
   the sentence names the network only. `wifi info` reads both live, so they are one command away.
 - An access point that drops the station is noticed by the frame pull - the next time the stack asks for

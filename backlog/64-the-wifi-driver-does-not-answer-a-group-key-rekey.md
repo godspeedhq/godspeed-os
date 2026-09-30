@@ -1,8 +1,9 @@
 # 64. The wifi driver does not answer a group-key rekey, so the link drops at the access point's rekey interval
 
-**Status: OPEN, narrowed 2026-09-30 - the GROUP-key half is BUILT (`frames::group_rekey`, awaiting the first
-rekey on hardware to be closed); the PAIRWISE half (an access point restarting the four-way handshake after
-the join) is what remains.**
+**Status: BUILT in full 2026-09-30 - the group-key half (`frames::group_rekey`) and, that evening, the pairwise
+half (`frames::pairwise_rekey`, driving the same `join::Handshake` the join uses). OPEN only for the evidence:
+neither has yet been seen on hardware, because the access point decides when to rekey. CLOSED when one of
+each has run with the link staying up.**
 **Opened:** 2026-09-29, with phase 5 of `docs/wifi.md` (the frame path).
 
 ## What happens
@@ -43,10 +44,11 @@ key data, signed. Every refusal is logged with its reason. `docs/wifi.md` 42.
 - ~~The group half~~ - built, above. To CLOSE it: one rekey observed on hardware, the log showing
   `group key N re-installed and acknowledged (replay R) - the access point rekeyed` and the link staying
   up past it.
-- The PTK rekey (a full four-way handshake initiated by the access point after the join) is the same
-  work one step larger: `join.rs`'s message-1 path run from the pull rather than from a join, with the
-  PMK - which the credential slot holds - and a fresh SNonce. Seen as `the access point began a NEW
-  four-way handshake after the join` in the log, once per join.
+- ~~The PTK rekey~~ - built the same evening: the four-way handshake became `join::Handshake`, a struct
+  fed one key frame at a time, and `frames::pairwise_rekey` drives it from the pull with the PMK the
+  association was made with (kept in `join::Keys`), reading the frames that follow for up to two seconds
+  and queueing any data frames among them. Success replaces the keys in place; the log says `pairwise
+  rekey complete - new pairwise and group keys installed, the link continues`.
 
 ## Why it is recorded and not done in the same change
 

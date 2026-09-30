@@ -6666,10 +6666,23 @@ const INPUT_MAX: usize = 256;
 /// (invisible entry, like `sudo`). Backspace erases the last char (and un-echoes it for a visible
 /// line). Returns bytes read. Blocks for a real user - `input` is interactive (docs/scripting.md §8).
 fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize {
+    read_input_line_abortable(ctx, secret, buf).unwrap_or(0)
+}
+
+/// `read_input_line`, with a way out: Escape or Ctrl+Q ends the entry and returns `None`, and whatever
+/// was typed is zeroed before the return. A secret prompt in particular must be abandonable - the
+/// `wifi` spec says so (`utilities/56_wifi.md` 4) - and the only ways out used to be Enter, which SENDS
+/// what was typed, or a passphrase too short to send.
+fn read_input_line_abortable(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> Option<usize> {
     let mut len = 0usize;
     loop {
         let c = ctx.console_read();
         match c {
+            0x1b | 0x11 => {
+                for b in buf.iter_mut().take(len) { *b = 0; }
+                ctx.console_write("\r\n");
+                return None;
+            }
             b'\r' | b'\n' => { ctx.console_write("\r\n"); break; }
             0x7f | 0x08 => { if len > 0 { len -= 1; if !secret { ctx.console_write("\x08 \x08"); } } }
             b if (0x20..0x7f).contains(&b) => {
@@ -6678,10 +6691,10 @@ fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize 
                     if !secret { let one = [b]; if let Ok(t) = core::str::from_utf8(&one) { ctx.console_write(t); } }
                 }
             }
-            _ => {} // ignore control / escape bytes
+            _ => {} // ignore other control bytes
         }
     }
-    len
+    Some(len)
 }
 
 /// `input [secret] "prompt"` - print the prompt to the CONSOLE, read one line, emit it to `out`
@@ -7960,7 +7973,13 @@ fn wifi_read_passphrase(ctx: &ShellCtx, out: &mut Out, pass: &mut [u8; INPUT_MAX
     const MIN_PASS: usize = 8;
     const MAX_PASS_CHARS: usize = 63;
     ctx.console_write("passphrase (not shown): ");
-    let n = read_input_line(ctx, true, pass);
+    let n = match read_input_line_abortable(ctx, true, pass) {
+        Some(n) => n,
+        None => {
+            out.line_fmt(ctx, format_args!("wifi: passphrase entry abandoned - nothing was sent"));
+            return None;
+        }
+    };
     if n < MIN_PASS || n > MAX_PASS_CHARS {
         for b in pass.iter_mut() { *b = 0; }
         out.line_fmt(ctx, format_args!("wifi: a WPA2 passphrase is {} to {} characters - nothing was sent", MIN_PASS, MAX_PASS_CHARS));

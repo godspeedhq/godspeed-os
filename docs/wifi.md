@@ -3130,8 +3130,17 @@ Every refusal logs its reason. The frame is copied out of the read buffer and ha
 that read, once per pull, because answering needs the session that the walk is borrowing; an access
 point retries, so a second key frame in one read is not lost by being left for the next pull.
 
-**Not yet run on hardware**, because it cannot be made to happen: the access point decides when to rekey.
-What the log will show, when it does:
+**The pairwise rekey too (same evening).** An access point may also restart the whole four-way handshake on
+a live link. The join's handshake was lifted into `join::Handshake` - one struct, fed one key frame at a
+time, answering `Continue`, `Joined(keys)`, `PassphraseRefused` or `Failed` - and `join` now drives it from
+its own frame loop while `frames::pairwise_rekey` drives it from the pull: message 1 arrives, a new PTK is
+derived from the PMK the association was made with (`Keys` carries it now), messages 2 and 4 go out,
+message 3 is verified, both keys are installed, and the keys are replaced in place. Data frames that arrive
+during the exchange are queued as any pull would queue them; a wait of two seconds bounds it. One state
+machine, two callers, the same words in the log.
+
+**Not yet run on hardware**, either of them, because it cannot be made to happen: the access point decides
+when to rekey. What the log will show, when it does:
 
 ```
 wifi-driver: group key N re-installed and acknowledged (replay R) - the access point rekeyed

@@ -27,7 +27,7 @@ use crate::backplane::Window;
 use crate::ctrl::{self, Session};
 use crate::eapol::{self, info};
 use crate::host::Host;
-use crate::join::{Keys, EVENT_MSG_LINK};
+use crate::join::{Handshake, Keys, Step, EVENT_MSG_LINK};
 use crate::scan::{self, code, ev, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
 /// `[0x10]` -> `[0x10, ok, mac(6), link]`.
@@ -117,9 +117,12 @@ pub struct Pulled {
     /// data that would not unwrap, no group key inside, or a refused install. Each is logged where it
     /// happens; the count is for the caller.
     pub rekey_failed: u32,
-    /// EAPOL-Key frames of the PAIRWISE kind after the join: the access point starting a new four-way
-    /// handshake. Not answered here (`backlog/64`, the half that remains).
-    pub pairwise_after_join: u32,
+    /// Pairwise rekeys answered: the access point restarted the four-way handshake on the live link, and
+    /// it ran to message 4 with new keys installed.
+    pub pairwise_rekeyed: u32,
+    /// Pairwise rekeys that did not complete - the log names the step; the access point will drop the
+    /// link and `wifi join` brings it back.
+    pub pairwise_failed: u32,
     /// The link went down: `(event code, reason)`. A `LINK` event without the up bit, or a
     /// deauthentication or disassociation, in either direction.
     pub dropped_link: Option<(u32, u32)>,
@@ -141,7 +144,7 @@ pub fn pull(
     mut keys: Option<&mut Keys>,
     ctx: &ServiceContext,
 ) -> Pulled {
-    let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_after_join: 0, dropped_link: None };
+    let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None };
     let mut reads = 0u32;
     while reads < PULL_MAX_READS && q.has_room() {
         let f = match ctrl::read_frame(h, w, frame, ctx) {
@@ -201,7 +204,16 @@ pub fn pull(
             match group_rekey(h, w, s, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
                 Rekey::Answered => got.rekeyed += 1,
                 Rekey::Refused => got.rekey_failed += 1,
-                Rekey::Pairwise => got.pairwise_after_join += 1,
+                Rekey::Pairwise => {
+                    // The access point restarted the four-way handshake. It is run here to completion,
+                    // reading the frames that follow; data frames that arrive meanwhile are queued as
+                    // they would be by any pull.
+                    if pairwise_rekey(h, w, s, q, frame, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
+                        got.pairwise_rekeyed += 1;
+                    } else {
+                        got.pairwise_failed += 1;
+                    }
+                }
                 Rekey::NotAKey => {}
             }
         }
@@ -323,4 +335,90 @@ fn group_rekey(
         key.replay
     ));
     Rekey::Answered
+}
+
+/// Reads of the count register before a pairwise rekey gives up: frames are polled a millisecond apart, so
+/// this is about two seconds - the access point's own retry window is longer.
+const REKEY_EMPTY_POLLS: u32 = 2_000;
+
+/// A PAIRWISE REKEY: message 1 of a new four-way handshake arrived on a live link. Answer it and run the
+/// handshake to message 4 with the same state machine the join uses (`join::Handshake`), from the PMK the
+/// association was made with. The keys are replaced in place on success; the access point drops the link
+/// on failure and the log names the step.
+fn pairwise_rekey(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    q: &mut RxQueue,
+    frame: &mut [u8; ctrl::FRAME],
+    first: &[u8],
+    keys: Option<&mut Keys>,
+    ctx: &ServiceContext,
+) -> bool {
+    let keys = match keys {
+        Some(k) => k,
+        None => {
+            ctx.log("wifi-driver: the access point began a four-way handshake and this driver holds no keys for it - not answered");
+            return false;
+        }
+    };
+    ctx.log("wifi-driver: the access point began a NEW four-way handshake on the live link - answering (pairwise rekey)");
+    let mut hs = Handshake::new(keys.pmk, keys.mac);
+    match hs.on_key_frame(h, w, s, first, ctx) {
+        Step::Continue => {}
+        Step::Joined(k) => { *keys = k; return true; }
+        Step::PassphraseRefused | Step::Failed => return false,
+    }
+    let mut empty = 0u32;
+    while empty < REKEY_EMPTY_POLLS {
+        let f = match ctrl::read_frame(h, w, frame, ctx) {
+            Some(f) => f,
+            None => {
+                empty += 1;
+                ctx.sleep_ms(1);
+                continue;
+            }
+        };
+        s.note_frame(ctx, &f, &frame[..], false);
+        let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
+        let nsubs = ctrl::subframes(&f, &frame[..], s.glom_descriptor(), &mut subs, ctx);
+        for sub in subs.iter().take(nsubs) {
+            let channel = sub.chanflag & CHANNEL_MASK;
+            let body = &frame[sub.off..sub.off + sub.len];
+            if channel == CHANNEL_DATA {
+                let eth = match scan::ethernet_at(body) {
+                    Some(eth) => eth,
+                    None => continue,
+                };
+                let eth_frame = &body[eth..];
+                if eth_frame.len() < ev::ETHHDR {
+                    continue;
+                }
+                let ethertype = u16::from_be_bytes([eth_frame[ev::ETHERTYPE], eth_frame[ev::ETHERTYPE + 1]]);
+                if ethertype != eapol::ETHERTYPE_EAPOL {
+                    let _ = q.push(eth_frame);
+                    continue;
+                }
+                match hs.on_key_frame(h, w, s, eth_frame, ctx) {
+                    Step::Continue => {}
+                    Step::Joined(k) => {
+                        *keys = k;
+                        ctx.log("wifi-driver: pairwise rekey complete - new pairwise and group keys installed, the link continues");
+                        return true;
+                    }
+                    Step::PassphraseRefused | Step::Failed => return false,
+                }
+            } else if channel == CHANNEL_EVENT {
+                if let Some(e) = scan::parse_event(body, s.stats.rx_event, ctx) {
+                    match e.event_type {
+                        code::LINK if e.flags & EVENT_MSG_LINK == 0 => return false,
+                        code::DEAUTH | code::DEAUTH_IND | code::DISASSOC | code::DISASSOC_IND => return false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    ctx.log("wifi-driver: the pairwise rekey did not complete inside its wait - the access point will decide the link");
+    false
 }

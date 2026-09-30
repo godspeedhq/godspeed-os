@@ -141,7 +141,7 @@ fn serve_radio(
     // and on this stack; the address is asked of the chip once; the rekey count is for the log.
     let mut rxq = frames::RxQueue::new();
     let mut link_mac: Option<[u8; 6]> = None;
-    // Pairwise rekeys seen after the join (the unanswered half of `backlog/64`), for one log line.
+    // Pairwise rekeys that did not complete, for the log.
     let mut rekey_seen: u32 = 0;
     // The network last JOINED this boot - name, length, security - so `radio on` after `radio off` can
     // go back to it without being asked (`utilities/56_wifi.md` 2). Set on every successful join, cleared
@@ -267,16 +267,12 @@ fn serve_radio(
             *joined = None;
             join::forget(keys);
         }
-        if p.pairwise_after_join > 0 {
-            // The other half of `backlog/64`: a new four-way handshake, begun by the access point. Not
-            // answered; said once per join.
-            let first = *rekey_seen == 0;
-            *rekey_seen = rekey_seen.wrapping_add(p.pairwise_after_join);
-            if first {
-                ctx.log(
-                    "wifi-driver: the access point began a NEW four-way handshake after the join (a pairwise                      rekey) - not answered yet; if it insists, the link drops and `wifi join` brings it back                      (backlog/64)",
-                );
-            }
+        if p.pairwise_failed > 0 {
+            // The pull answered a restarted four-way handshake and it did not complete; the step is in
+            // the log above. The access point decides what happens to the link next, and if it drops it
+            // the pull sees that too.
+            *rekey_seen = rekey_seen.wrapping_add(p.pairwise_failed);
+            ctx.log("wifi-driver: a pairwise rekey did not complete - if the access point drops the link, `wifi join` brings it back");
         }
     }
 

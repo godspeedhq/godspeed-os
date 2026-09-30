@@ -115,6 +115,9 @@ pub enum Outcome {
 pub struct Keys {
     pub kck: [u8; 16],
     pub kek: [u8; 16],
+    /// The pairwise master key the association was made with, for a pairwise rekey: the access point
+    /// may restart the four-way handshake at any time, and answering it derives a new PTK from this.
+    pub pmk: [u8; crate::crypto::PMK_LEN],
     /// The highest replay counter accepted; a frame at or below it is a replay (`ni_replaycnt`).
     pub replay: u64,
     /// Our address, for the frames we send.
@@ -126,6 +129,7 @@ pub fn forget(keys: &mut Option<Keys>) {
     if let Some(k) = keys.as_mut() {
         k.kck.fill(0);
         k.kek.fill(0);
+        k.pmk.fill(0);
         k.replay = 0;
     }
     *keys = None;
@@ -176,6 +180,174 @@ fn snonce(ctx: &ServiceContext, anonce: &[u8; 32], mac: &[u8; 6]) -> [u8; 32] {
         out[half as usize * 20..half as usize * 20 + take].copy_from_slice(&d[..take]);
     }
     out
+}
+
+
+/// The station's side of the WPA2 four-way handshake, one message at a time - `ieee80211_recv_4way_msg1`
+/// and `_msg3` from OpenBSD's net80211, as `join` first carried them inline. A struct rather than a loop
+/// because two callers drive it: `join` feeds it the frames of a fresh association, and `frames::pull`
+/// feeds it the frames of a PAIRWISE REKEY, when the access point restarts the handshake on a link that is
+/// already up. The steps, the checks and the words are the same in both.
+pub struct Handshake {
+    pmk: [u8; crate::crypto::PMK_LEN],
+    our_mac: [u8; 6],
+    anonce: [u8; 32],
+    have_anonce: bool,
+    our_nonce: [u8; 32],
+    ptk: Option<eapol::Ptk>,
+    /// Message 2s sent. A THIRD message 1 with the same ANonce after two answers is the access point
+    /// saying our key is not its key - the one pattern that means "incorrect passphrase".
+    pub msg2_sent: u32,
+}
+
+/// What one key frame did to the handshake.
+pub enum Step {
+    /// Read, answered if it needed answering; keep reading.
+    Continue,
+    /// Message 3 verified and answered, both keys installed: the association has keys.
+    Joined(Keys),
+    /// The access point does not accept our answers: our key is not its key.
+    PassphraseRefused,
+    /// A step failed for a reason that is not the key; the log has it.
+    Failed,
+}
+
+impl Handshake {
+    pub fn new(pmk: [u8; crate::crypto::PMK_LEN], our_mac: [u8; 6]) -> Self {
+        Handshake { pmk, our_mac, anonce: [0; 32], have_anonce: false, our_nonce: [0; 32], ptk: None, msg2_sent: 0 }
+    }
+
+    /// One EAPOL-Key frame (a whole ethernet frame), from the access point.
+    pub fn on_key_frame(
+        &mut self,
+        h: &Host,
+        w: &mut Window,
+        s: &mut Session,
+        eth_frame: &[u8],
+        ctx: &ServiceContext,
+    ) -> Step {
+        let key = match eapol::describe(eth_frame, ctx) {
+            Some(k) => k,
+            None => return Step::Continue,
+        };
+        let is_pairwise = key.info & info::PAIRWISE != 0;
+        let is_ack = key.info & info::KEYACK != 0;
+        let is_mic = key.info & info::KEYMIC != 0;
+        let mut tx = [0u8; ev::ETHHDR + 99 + 64];
+
+        // ---- Message 1: the access point's nonce. Derive the PTK, answer with ours. ----
+        if is_pairwise && is_ack && !is_mic {
+            if self.msg2_sent >= 2 && self.have_anonce && key.nonce == self.anonce {
+                ctx.log("wifi-driver: the access point repeated message 1 after two answers - our key is not its key: INCORRECT PASSPHRASE");
+                return Step::PassphraseRefused;
+            }
+            self.anonce = key.nonce;
+            self.have_anonce = true;
+            if self.msg2_sent == 0 {
+                self.our_nonce = snonce(ctx, &self.anonce, &self.our_mac);
+            }
+            let derived = eapol::derive_ptk(&self.pmk, &key.from, &self.our_mac, &self.anonce, &self.our_nonce);
+            let n = eapol::build_key_frame(
+                &mut tx, &key.from, &self.our_mac,
+                info::PAIRWISE | info::KEYMIC,
+                key.replay, &self.our_nonce, &eapol::RSN_IE, Some(&derived.kck),
+            );
+            self.ptk = Some(derived);
+            if n == 0 || !ctrl::send_data(h, w, s, &tx[..n], ctx) {
+                ctx.log("wifi-driver: message 2 of the handshake could not be sent - not joined");
+                return Step::Failed;
+            }
+            self.msg2_sent += 1;
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   message 2 of 4 sent ({} bytes, replay {}) - our nonce and the RSN element, signed",
+                n, key.replay
+            ));
+            return Step::Continue;
+        }
+
+        // ---- Message 3: verify, unwrap the group key, answer, install both keys. ----
+        if is_pairwise && is_ack && is_mic {
+            let p = match self.ptk.as_ref() {
+                Some(p) => p,
+                None => {
+                    ctx.log("wifi-driver:   message 3 before any message 1 - ignored");
+                    return Step::Continue;
+                }
+            };
+            if !self.have_anonce || key.nonce != self.anonce {
+                ctx.log("wifi-driver:   message 3's ANonce does not match message 1's - ignored (`ieee80211_recv_4way_msg3`)");
+                return Step::Continue;
+            }
+            let eapol_body = &eth_frame[ev::ETHHDR..];
+            if !eapol::check_mic(eapol_body, &p.kck) {
+                ctx.log("wifi-driver: message 3's MIC does not verify under our KCK - the keys disagree; not joined");
+                return Step::PassphraseRefused;
+            }
+            if key.info & info::ENCRYPTED == 0 {
+                ctx.log("wifi-driver: message 3's key data is not encrypted - refused (a group key in the clear is not one this driver installs)");
+                return Step::Failed;
+            }
+            let wrapped = &eth_frame[key.key_data_at..key.key_data_at + key.key_data_len];
+            let mut key_data = [0u8; 512];
+            if wrapped.len() < 24 || wrapped.len() > key_data.len() + 8
+                || !crate::crypto::aes_key_unwrap(&p.kek, wrapped, &mut key_data)
+            {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: message 3's {} bytes of key data did not unwrap under our KEK - not joined",
+                    wrapped.len()
+                ));
+                return Step::Failed;
+            }
+            let plain = &key_data[..wrapped.len() - 8];
+            let (kid, gtk_tx, gtk) = match eapol::find_gtk(plain) {
+                Some(g) => g,
+                None => {
+                    ctx.log("wifi-driver: message 3 carried no group key - not joined");
+                    return Step::Failed;
+                }
+            };
+            if gtk.len() != 16 {
+                ctx.log_fmt(format_args!("wifi-driver: the group key is {} bytes, not the 16 of CCMP - not joined", gtk.len()));
+                return Step::Failed;
+            }
+            let mut gtk16 = [0u8; 16];
+            gtk16.copy_from_slice(gtk);
+            let n = eapol::build_key_frame(
+                &mut tx, &key.from, &self.our_mac,
+                info::PAIRWISE | info::KEYMIC | info::SECURE,
+                key.replay, &[0u8; 32], &[], Some(&p.kck),
+            );
+            if n == 0 || !ctrl::send_data(h, w, s, &tx[..n], ctx) {
+                ctx.log("wifi-driver: message 4 of the handshake could not be sent - not joined");
+                return Step::Failed;
+            }
+            ctx.log_fmt(format_args!(
+                "wifi-driver:   message 3 verified (MIC, ANonce, {} bytes of key data unwrapped); message 4 sent",
+                plain.len()
+            ));
+            let tk = p.tk;
+            if !ctrl::install_key(h, w, s, 0, &tk, Some(&key.from), ctx) {
+                ctx.log("wifi-driver: the firmware refused the pairwise key - not joined");
+                return Step::Failed;
+            }
+            if !ctrl::install_key(h, w, s, kid as u32, &gtk16, None, ctx) {
+                ctx.log("wifi-driver: the firmware refused the group key - not joined");
+                return Step::Failed;
+            }
+            ctx.log_fmt(format_args!(
+                "wifi-driver: JOINED - handshake complete, pairwise key installed, group key {} installed{}",
+                kid,
+                if gtk_tx { " (tx)" } else { "" }
+            ));
+            return Step::Joined(Keys { kck: p.kck, kek: p.kek, pmk: self.pmk, replay: key.replay, mac: self.our_mac });
+        }
+
+        ctx.log_fmt(format_args!(
+            "wifi-driver:   an EAPOL-Key frame this handshake does not expect (info {:#06x}) - ignored",
+            key.info
+        ));
+        Step::Continue
+    }
 }
 
 /// Join `ssid`, run the handshake if there is one, install the keys, and say how it went.
@@ -253,12 +425,10 @@ pub fn join(
 
     // The handshake's state: the AP's nonce, ours, the derived keys, and how many times we have answered
     // message 1 - which is what tells a repeated message 1 apart from a first one.
-    let mut anonce = [0u8; 32];
-    let mut have_anonce = false;
-    let mut our_nonce = [0u8; 32];
-    let mut ptk: Option<eapol::Ptk> = None;
-    let mut msg2_sent = 0u32;
-    let mut tx = [0u8; ev::ETHHDR + 99 + 64];
+    let mut hs = match secret {
+        Secret::Pmk(p) => Some(Handshake::new(*p, our_mac)),
+        Secret::Open => None,
+    };
 
     while empty < JOIN_EMPTY_POLLS {
         let f = match ctrl::read_frame(h, w, &mut frame, ctx) {
@@ -300,138 +470,22 @@ pub fn join(
                     continue;
                 }
                 eapol_frames += 1;
-                let key = match eapol::describe(eth_frame, ctx) {
-                    Some(k) => k,
-                    None => continue,
-                };
-                let pmk = match secret {
-                    Secret::Pmk(p) => p,
-                    Secret::Open => {
+                let hs = match hs.as_mut() {
+                    Some(hs) => hs,
+                    None => {
                         ctx.log("wifi-driver:   a handshake frame on an OPEN join - ignored; the network is not what the scan said it was");
                         continue;
                     }
                 };
-                let is_pairwise = key.info & info::PAIRWISE != 0;
-                let is_ack = key.info & info::KEYACK != 0;
-                let is_mic = key.info & info::KEYMIC != 0;
-
-                // ---- MESSAGE 1: pairwise, ack, no MIC. ----
-                if is_pairwise && is_ack && !is_mic {
-                    if msg2_sent >= 2 && have_anonce && key.nonce == anonce {
-                        // The access point did not accept two answers and is asking a third time. The one cause
-                        // is a MIC it could not verify: our PMK is not its PMK.
-                        ctx.log("wifi-driver: the access point repeated message 1 after two answers - our key is not its key: INCORRECT PASSPHRASE");
-                        return Outcome::PassphraseRefused;
+                match hs.on_key_frame(h, w, s, eth_frame, ctx) {
+                    Step::Continue => continue,
+                    Step::Joined(k) => {
+                        *keys = Some(k);
+                        return Outcome::Joined;
                     }
-                    anonce = key.nonce;
-                    have_anonce = true;
-                    if msg2_sent == 0 {
-                        our_nonce = snonce(ctx, &anonce, &our_mac);
-                    }
-                    let derived = eapol::derive_ptk(pmk, &key.from, &our_mac, &anonce, &our_nonce);
-                    let n = eapol::build_key_frame(
-                        &mut tx, &key.from, &our_mac,
-                        info::PAIRWISE | info::KEYMIC,
-                        key.replay, &our_nonce, &eapol::RSN_IE, Some(&derived.kck),
-                    );
-                    ptk = Some(derived);
-                    if n == 0 || !ctrl::send_data(h, w, s, &tx[..n], ctx) {
-                        ctx.log("wifi-driver: message 2 of the handshake could not be sent - not joined");
-                        return Outcome::Failed;
-                    }
-                    msg2_sent += 1;
-                    ctx.log_fmt(format_args!(
-                        "wifi-driver:   message 2 of 4 sent ({} bytes, replay {}) - our nonce and the RSN element, signed",
-                        n, key.replay
-                    ));
-                    continue;
+                    Step::PassphraseRefused => return Outcome::PassphraseRefused,
+                    Step::Failed => return Outcome::Failed,
                 }
-
-                // ---- MESSAGE 3: pairwise, ack, MIC, install; the key data encrypted. ----
-                if is_pairwise && is_ack && is_mic {
-                    let p = match ptk.as_ref() {
-                        Some(p) => p,
-                        None => {
-                            ctx.log("wifi-driver:   message 3 before any message 1 - ignored");
-                            continue;
-                        }
-                    };
-                    if !have_anonce || key.nonce != anonce {
-                        ctx.log("wifi-driver:   message 3's ANonce does not match message 1's - ignored (`ieee80211_recv_4way_msg3`)");
-                        continue;
-                    }
-                    let eapol_body = &eth_frame[ev::ETHHDR..];
-                    if !eapol::check_mic(eapol_body, &p.kck) {
-                        ctx.log("wifi-driver: message 3's MIC does not verify under our KCK - the keys disagree; not joined");
-                        return Outcome::PassphraseRefused;
-                    }
-                    if key.info & info::ENCRYPTED == 0 {
-                        ctx.log("wifi-driver: message 3's key data is not encrypted - refused (a group key in the clear is not one this driver installs)");
-                        return Outcome::Failed;
-                    }
-                    let wrapped = &eth_frame[key.key_data_at..key.key_data_at + key.key_data_len];
-                    let mut key_data = [0u8; 512];
-                    if wrapped.len() < 24 || wrapped.len() > key_data.len() + 8
-                        || !crate::crypto::aes_key_unwrap(&p.kek, wrapped, &mut key_data)
-                    {
-                        ctx.log_fmt(format_args!(
-                            "wifi-driver: message 3's {} bytes of key data did not unwrap under our KEK - not joined",
-                            wrapped.len()
-                        ));
-                        return Outcome::Failed;
-                    }
-                    let plain = &key_data[..wrapped.len() - 8];
-                    let (kid, gtk_tx, gtk) = match eapol::find_gtk(plain) {
-                        Some(g) => g,
-                        None => {
-                            ctx.log("wifi-driver: message 3 carried no group key - not joined");
-                            return Outcome::Failed;
-                        }
-                    };
-                    if gtk.len() != 16 {
-                        ctx.log_fmt(format_args!("wifi-driver: the group key is {} bytes, not the 16 of CCMP - not joined", gtk.len()));
-                        return Outcome::Failed;
-                    }
-                    let mut gtk16 = [0u8; 16];
-                    gtk16.copy_from_slice(gtk);
-                    // Message 4: pairwise, MIC, secure; empty; the AP's replay counter.
-                    let n = eapol::build_key_frame(
-                        &mut tx, &key.from, &our_mac,
-                        info::PAIRWISE | info::KEYMIC | info::SECURE,
-                        key.replay, &[0u8; 32], &[], Some(&p.kck),
-                    );
-                    if n == 0 || !ctrl::send_data(h, w, s, &tx[..n], ctx) {
-                        ctx.log("wifi-driver: message 4 of the handshake could not be sent - not joined");
-                        return Outcome::Failed;
-                    }
-                    ctx.log_fmt(format_args!(
-                        "wifi-driver:   message 3 verified (MIC, ANonce, {} bytes of key data unwrapped); message 4 sent",
-                        plain.len()
-                    ));
-                    // Install: the pairwise key at index 0 for the access point, then the group key.
-                    let tk = p.tk;
-                    if !ctrl::install_key(h, w, s, 0, &tk, Some(&key.from), ctx) {
-                        ctx.log("wifi-driver: the firmware refused the pairwise key - not joined");
-                        return Outcome::Failed;
-                    }
-                    if !ctrl::install_key(h, w, s, kid as u32, &gtk16, None, ctx) {
-                        ctx.log("wifi-driver: the firmware refused the group key - not joined");
-                        return Outcome::Failed;
-                    }
-                    ctx.log_fmt(format_args!(
-                        "wifi-driver: JOINED - handshake complete, pairwise key installed, group key {} installed{}",
-                        kid,
-                        if gtk_tx { " (tx)" } else { "" }
-                    ));
-                    // Kept for the rekeys to come (`Keys`); the PTK on this stack goes with the frame.
-                    *keys = Some(Keys { kck: p.kck, kek: p.kek, replay: key.replay, mac: our_mac });
-                    return Outcome::Joined;
-                }
-                ctx.log_fmt(format_args!(
-                    "wifi-driver:   an EAPOL-Key frame this handshake does not expect (info {:#06x}) - ignored",
-                    key.info
-                ));
-                continue;
             }
             if channel != CHANNEL_EVENT {
                 continue;
@@ -459,6 +513,7 @@ pub fn join(
                     ctx.log("wifi-driver:   ASSOCIATED - the link is up at the 802.11 layer; the handshake is now the access point's move");
                 }
                 code::DEAUTH_IND | code::DISASSOC_IND => {
+                    let msg2_sent = hs.as_ref().map_or(0, |h| h.msg2_sent);
                     return if msg2_sent > 0 {
                         // We answered and were dropped anyway: the access point could not verify our MIC.
                         ctx.log_fmt(format_args!(
@@ -481,7 +536,7 @@ pub fn join(
     ctx.log_fmt(format_args!(
         "wifi-driver: the join produced no decision across {} empty polls ({} event(s), {} handshake frame(s), \
          {} other data frame(s); link up: {}, message 2 sent {} time(s))",
-        JOIN_EMPTY_POLLS, events, eapol_frames, other_traffic, link_up, msg2_sent
+        JOIN_EMPTY_POLLS, events, eapol_frames, other_traffic, link_up, hs.as_ref().map_or(0, |h| h.msg2_sent)
     ));
     Outcome::Timeout
 }
